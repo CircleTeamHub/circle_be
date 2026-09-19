@@ -287,6 +287,14 @@ export function createEnvValidationSchema(
     // 高德 Web 服务密钥。不配则地名反查与地点搜索静默关闭，位置消息退回显示
     // 经纬度——和接高德之前的行为一致，所以这里是可选的。
     AMAP_WEB_SERVICE_KEY: Joi.string().optional(),
+    // JPush is optional (Expo remains the default), but a partially configured
+    // provider is unsafe: it would register devices that can never be sent to.
+    JPUSH_APP_KEY: Joi.string().trim().allow('').optional(),
+    JPUSH_MASTER_SECRET: Joi.string().trim().allow('').optional(),
+    JPUSH_APNS_PRODUCTION: Joi.boolean()
+      .truthy('true')
+      .falsy('false')
+      .optional(),
   })
     .unknown(true)
     .custom((value, helpers) => {
@@ -303,6 +311,15 @@ export function createEnvValidationSchema(
       });
       if (bypass.status === 'misconfigured' && bypass.reason) {
         return helpers.message({ custom: bypass.reason });
+      }
+
+      const hasJPushAppKey = Boolean(value.JPUSH_APP_KEY);
+      const hasJPushMasterSecret = Boolean(value.JPUSH_MASTER_SECRET);
+      if (hasJPushAppKey !== hasJPushMasterSecret) {
+        return helpers.message({
+          custom:
+            'JPUSH_APP_KEY and JPUSH_MASTER_SECRET must be configured together',
+        });
       }
 
       const accessTtl = parseDurationMilliseconds(value.JWT_EXPIRES_IN);

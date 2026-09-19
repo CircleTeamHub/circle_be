@@ -26,6 +26,26 @@ const RECEIPT_BATCH_SIZE = 300;
 // 有上限只是防御性兜底（雪崩恢复时不至于一轮跑穿全表）。
 const RECEIPT_MAX_BATCHES_PER_RUN = 20;
 const MAX_ACTIVE_TOKENS_PER_PROVIDER = 20;
+const MAX_PUSH_BODY_BYTES = 1024;
+
+class JPushHttpError extends Error {
+  constructor(
+    message: string,
+    readonly status: number,
+  ) {
+    super(message);
+    this.name = 'JPushHttpError';
+  }
+}
+
+function truncateUtf8(value: string, maxBytes: number): string {
+  if (Buffer.byteLength(value, 'utf8') <= maxBytes) return value;
+  let end = Math.min(value.length, maxBytes);
+  while (end > 0 && Buffer.byteLength(value.slice(0, end), 'utf8') > maxBytes) {
+    end -= 1;
+  }
+  return value.slice(0, end);
+}
 
 type ExpoPushTicket = {
   status?: string;
@@ -87,10 +107,15 @@ export class NotificationPushService {
     this.jpushAppKey = this.config.get<string>('JPUSH_APP_KEY')?.trim() ?? '';
     this.jpushMasterSecret =
       this.config.get<string>('JPUSH_MASTER_SECRET')?.trim() ?? '';
-    const apnsProduction = this.config.get<string>('JPUSH_APNS_PRODUCTION');
-    this.jpushApnsProduction = apnsProduction
-      ? apnsProduction.trim().toLowerCase() === 'true'
-      : this.config.get<string>('NODE_ENV') === 'production';
+    const apnsProduction = this.config.get<boolean | string>(
+      'JPUSH_APNS_PRODUCTION',
+    );
+    this.jpushApnsProduction =
+      typeof apnsProduction === 'boolean'
+        ? apnsProduction
+        : apnsProduction
+          ? apnsProduction.trim().toLowerCase() === 'true'
+          : this.config.get<string>('NODE_ENV') === 'production';
   }
 
   isJPushConfigured(): boolean {
@@ -115,7 +140,7 @@ export class NotificationPushService {
           this.fallbackBody(notification.type);
     return {
       title: notification.type === 'SYSTEM' ? '系统通知' : actor,
-      body,
+      body: truncateUtf8(body, MAX_PUSH_BODY_BYTES),
       data: {
         notificationId: notification.id,
         type: notification.type,
@@ -191,17 +216,27 @@ export class NotificationPushService {
 
     const jpushTokens = tokens.filter((token) => token.provider === 'jpush');
     const expoTokens = tokens.filter((token) => token.provider !== 'jpush');
-    const outcomes: TokenDeliveryOutcome[] = [];
-    if (jpushTokens.length > 0) {
-      outcomes.push(
-        ...(await this.sendJPush(
-          jpushTokens.map((row) => row.token),
-          payload,
-        )),
-      );
-    }
-    if (expoTokens.length === 0) return outcomes;
+    const [jpushOutcomes, expoOutcomes] = await Promise.all([
+      jpushTokens.length > 0
+        ? this.sendJPush(
+            jpushTokens.map((row) => row.token),
+            payload,
+          )
+        : Promise.resolve([] as TokenDeliveryOutcome[]),
+      expoTokens.length > 0
+        ? this.sendExpoTokens(expoTokens, payload)
+        : Promise.resolve([] as TokenDeliveryOutcome[]),
+    ]);
+    const outcomes = [...jpushOutcomes, ...expoOutcomes];
 
+    return this.finalizeTokenOutcomes(outcomes);
+  }
+
+  private async sendExpoTokens(
+    expoTokens: Array<{ token: string; projectId: string | null }>,
+    payload: ExpoPushPayload,
+  ): Promise<TokenDeliveryOutcome[]> {
+    const outcomes: TokenDeliveryOutcome[] = [];
     // Expo project IDs must not be mixed in a single request when enhanced
     // security is enabled. Group first, then batch each project independently.
     const byProject = new Map<string, typeof expoTokens>();
@@ -224,6 +259,12 @@ export class NotificationPushService {
       }
     }
 
+    return outcomes;
+  }
+
+  private async finalizeTokenOutcomes(
+    outcomes: TokenDeliveryOutcome[],
+  ): Promise<TokenDeliveryOutcome[]> {
     // 只有「令牌已死」类错误才停用 token —— MessageTooBig 等消息级终态
     // 与 token 健康无关，误停会把活设备静音。
     const deadTokens = outcomes
@@ -293,7 +334,9 @@ export class NotificationPushService {
         body: JSON.stringify(message),
         signal: AbortSignal.timeout(EXPO_PUSH_TIMEOUT_MS),
       });
-      if (!response.ok) throw new Error(`HTTP ${response.status}`);
+      if (!response.ok) {
+        throw new JPushHttpError(`HTTP ${response.status}`, response.status);
+      }
       await response.json();
       return tokens.map((token) => ({ token, status: 'CONFIRMED' }));
     } catch (error) {
@@ -311,9 +354,15 @@ export class NotificationPushService {
         operation: 'sendToTokens',
         kind: 'jpush',
       });
+      const status =
+        error instanceof JPushHttpError &&
+        ![408, 429].includes(error.status) &&
+        error.status < 500
+          ? 'TERMINAL'
+          : 'RETRYABLE';
       return tokens.map((token) => ({
         token,
-        status: 'RETRYABLE',
+        status: status as 'TERMINAL' | 'RETRYABLE',
         error: messageText,
       }));
     }

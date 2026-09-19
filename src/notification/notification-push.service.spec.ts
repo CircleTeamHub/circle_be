@@ -76,6 +76,17 @@ describe('NotificationPushService (#88 per-token delivery)', () => {
         replyId: 'reply-1',
       });
     });
+
+    it('bounds multibyte push previews by UTF-8 bytes', () => {
+      const message = service.composeMessage('user-1', {
+        id: 'n1',
+        type: 'SYSTEM',
+        content: '你'.repeat(2000),
+      } as any);
+
+      expect(Buffer.byteLength(message.body, 'utf8')).toBeLessThanOrEqual(1024);
+      expect(message.body.length).toBeLessThan(2000);
+    });
   });
 
   describe('sendToTokens', () => {
@@ -268,6 +279,68 @@ describe('NotificationPushService (#88 per-token delivery)', () => {
         }),
       );
       expect(prisma.devicePushToken.updateMany).not.toHaveBeenCalled();
+    });
+
+    it('starts Expo delivery without waiting for a slow JPush request', async () => {
+      configValues.JPUSH_APP_KEY = 'jpush-app';
+      configValues.JPUSH_MASTER_SECRET = 'jpush-secret';
+      service = new NotificationPushService(
+        prisma as unknown as PrismaService,
+        config as any,
+      );
+      let releaseJPush!: () => void;
+      const jpushPending = new Promise<void>((resolve) => {
+        releaseJPush = resolve;
+      });
+      fetchMock.mockImplementation((url: string) =>
+        url.includes('jpush')
+          ? jpushPending.then(() => ({ ok: true, json: async () => ({}) }))
+          : Promise.resolve({
+              ok: true,
+              json: async () => ({
+                data: [{ status: 'ok', id: 'expo-ticket' }],
+              }),
+            }),
+      );
+
+      const sending = service.sendToTokens(
+        [
+          { token: 'jpush-registration', projectId: null, provider: 'jpush' },
+          { token: 'ExponentPushToken[expo]', projectId: null },
+        ],
+        payload,
+      );
+      await Promise.resolve();
+      expect(fetchMock).toHaveBeenCalledWith(
+        expect.stringContaining('exp.host'),
+        expect.anything(),
+      );
+      releaseJPush();
+      await expect(sending).resolves.toHaveLength(2);
+    });
+
+    it.each([
+      [400, 'TERMINAL'],
+      [429, 'RETRYABLE'],
+    ] as const)('classifies JPush HTTP %s as %s', async (status, expected) => {
+      configValues.JPUSH_APP_KEY = 'jpush-app';
+      configValues.JPUSH_MASTER_SECRET = 'jpush-secret';
+      service = new NotificationPushService(
+        prisma as unknown as PrismaService,
+        config as any,
+      );
+      fetchMock.mockResolvedValue({
+        ok: false,
+        status,
+        json: async () => ({}),
+      });
+
+      const outcomes = await service.sendToTokens(
+        [{ token: 'jpush-registration', projectId: null, provider: 'jpush' }],
+        payload,
+      );
+
+      expect(outcomes[0].status).toBe(expected);
     });
   });
 
