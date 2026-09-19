@@ -2,6 +2,8 @@
 
 > Base URL: `http://localhost:3000`（开发环境）
 > 所有请求和响应均为 `application/json`
+> 所有响应都包一层统一信封 `{ code, message, data }`：成功时 `code` 为 `0`、`message` 为 `ok`，
+> 业务数据在 `data` 里。下文各节的「Response」展示的就是 `data` 的内容。
 
 ---
 
@@ -28,7 +30,7 @@
 
 ### Token 说明
 
-登录/注册成功后会返回三个 token：
+登录/注册成功后会返回两个 token：
 
 | Token | 用途 | 有效期 |
 |---|---|---|
@@ -54,11 +56,31 @@ Authorization: Bearer <accessToken>
 
 ---
 
-nickname": "Test User",       // 可选，1-30位，默认同username
-  "email": "user@example.com",   // 可选
-  "phoneNumber": "+8613800138000" // 可选
+## Auth 接口
+
+### 注册
+
+```
+POST /auth/register
+```
+
+**Request Headers（可选）：**
+```
+x-device-name: iPhone 15 Pro    // 设备名，用于会话管理
+```
+
+**Request Body：**
+```json
+{
+  "email": "user@example.com",        // 必填，登录邮箱
+  "password": "password123",          // 必填，6-64 位
+  "confirmPassword": "password123",   // 必填，与 password 一致
+  "nickname": "Test User",            // 必填，1-50 位，首尾空格会被去掉
+  "inviteCode": "ABC123"              // 可选，邀请人的账号 ID
 }
 ```
+
+> 请求体只接受以上字段。全局校验开着 forbidNonWhitelisted，多送任何字段都会 400。
 
 **Response 201：**
 ```json
@@ -67,6 +89,10 @@ nickname": "Test User",       // 可选，1-30位，默认同username
   "refreshToken": "c8c1f46b2b9c..."
 }
 ```
+
+**错误：**
+- `409` `AUTH_EMAIL_TAKEN` — 该邮箱已注册
+- `400` — 字段缺失或格式不对，也包括多送了上表以外的字段
 
 > 聊天不再需要独立的 IM token：`/chat-ws` 用同一个 `accessToken` 握手（见
 > [self-hosted-chat.md](self-hosted-chat.md)）。
@@ -87,12 +113,13 @@ POST /auth/login
 }
 ```
 
-`identifier` 可填写邮箱或用户 ID。
+`identifier` 填邮箱或账号 ID（账号 ID 为 4-32 位字母、数字、下划线或短横线）。旧客户端用的
+`email` 字段仍然接受，但已废弃，新代码一律用 `identifier`。
 
 **Response 201：** 同注册
 
 **错误：**
-- `403` — 用户名/密码错误，或账号未激活
+- `403` `AUTH_INVALID_CREDENTIALS` — 账号不存在、密码不对或账号未激活。三种情况回同一个错误，避免被用来探测某个邮箱是否注册过。
 
 ---
 
@@ -108,6 +135,8 @@ POST /auth/refresh
   "refreshToken": "c8c1f46b2b9c..."
 }
 ```
+
+> `refreshToken` 是 128 位十六进制字符串，长度不符会直接 400。登出用同一个请求体。
 
 **Response 201：**
 ```json
@@ -199,25 +228,7 @@ Authorization: Bearer <accessToken>
 ```
 
 **Response 200：** `{}`
-## Auth 接口
 
-### 注册
-
-```
-POST /auth/register
-```
-
-**Request Headers（可选）：**
-```
-x-device-name: iPhone 15 Pro    // 设备名，用于会话管理
-```
-
-**Request Body：**
-```json
-{
-  "username": "testuser",        // 必填，4-20位
-  "password": "password123",     // 必填，6-64位
-  "
 ---
 
 ## User 接口
@@ -228,7 +239,6 @@ x-device-name: iPhone 15 Pro    // 设备名，用于会话管理
 {
   "id": "3f2a1b4c-8d9e-4f5a-b6c7-d8e9f0a1b2c3",
   "accountId": "ab12cd",
-  "username": "testuser",
   "nickname": "Test User",
   "avatarUrl": "http://localhost:9000/circle/avatars/xxx.jpg",
   "avatarFrame": null,
@@ -389,16 +399,25 @@ notes     — 笔记图片/视频（私有）
 chat      — 聊天媒体（私有）
 ```
 
-> `fileUrl` 只对公开目录（与桶策略同源：`PUBLIC_READ_UPLOAD_FOLDERS`）可直接读取、可直接写进资料/圈子/帖子。
-> `notes`、`chat` 是私有目录：直连 `fileUrl` 会被拒绝，必须保存 `key`，读取走对应接口按 key 签发的短时 URL。
-> 私有目录目前仍返回 `fileUrl` 只是为了兼容已装机 App 的必填校验，客户端不要依赖它。
+> `fileUrl` 只对公开目录（与桶策略同源：`PUBLIC_READ_UPLOAD_FOLDERS`）有值，可直接读取、可直接写进资料/圈子/帖子。
+> `notes`、`chat` 是私有目录：对象直连会被拒绝，`fileUrl` **固定为 `null`**，必须保存 `key`，读取走对应接口按 key 签发的短时 URL。
+> 客户端解析 presign 响应时 `fileUrl` 要按可空处理（私有目录不再有任何可存的直链）。
 
-**Response 201：**
+**Response 201（公开目录）：**
 ```json
 {
   "uploadUrl": "http://localhost:9000/circle/avatars/uuid.jpg?X-Amz-Algorithm=...（5分钟内有效，视频30分钟）",
   "fileUrl": "http://localhost:9000/circle/avatars/uuid.jpg",
   "key": "avatars/uuid.jpg"
+}
+```
+
+**Response 201（私有目录 `notes` / `chat`）：**
+```json
+{
+  "uploadUrl": "http://localhost:9000/circle/notes/user-1/uuid.jpg?X-Amz-Algorithm=...",
+  "fileUrl": null,
+  "key": "notes/user-1/uuid.jpg"
 }
 ```
 
@@ -1114,7 +1133,6 @@ Authorization: Bearer <accessToken>
     {
       "type": "VIDEO",
       "objectKey": "notes/user-1/file.mp4",
-      "url": "http://localhost:9000/circle/notes/user-1/file.mp4",
       "mimeType": "video/mp4",
       "size": 3456789,
       "durationMs": 12000,
@@ -1124,6 +1142,10 @@ Authorization: Bearer <accessToken>
   ]
 }
 ```
+
+> `media[].url` 可省：`notes` 是私有目录，presign 的 `fileUrl` 是 `null`，只需回传 `objectKey`，
+> 服务端按它拼出落库用的持久地址（读取一律按 `objectKey` 现签短时 URL）。
+> 传了的话仍须是本站存储地址（编辑时回传读到的签名 URL 也可以，服务端会去掉签名 query）。
 
 **Response 201/200：** `NoteDetail`
 
@@ -1513,15 +1535,19 @@ Authorization: Bearer <accessToken>
 
 ## 错误处理
 
-所有错误响应格式：
+错误与成功共用同一个信封：
 
 ```json
 {
-  "statusCode": 400,
-  "message": "错误描述",
-  "error": "Bad Request"
+  "code": 403,                                  // 与 HTTP 状态码相同
+  "message": "邮箱或密码错误",                   // 面向用户的文案，可能调整
+  "data": null,                                 // 个别错误在这里带细节
+  "errorCode": "AUTH_INVALID_CREDENTIALS"       // 稳定错误码，只有部分错误带
 }
 ```
+
+判断具体原因请认 `errorCode`，它是稳定契约；没有 `errorCode` 时再退回 HTTP 状态码。
+`message` 只用于展示，不要拿来做分支。
 
 | HTTP 状态码 | 含义 | 常见场景 |
 |---|---|---|
@@ -1529,7 +1555,7 @@ Authorization: Bearer <accessToken>
 | `401` | 未授权 | accessToken 缺失或过期 |
 | `403` | 无权限 | 密码错误、账号禁用、操作他人数据 |
 | `404` | 资源不存在 | 用户不存在 |
-| `409` | 冲突 | 用户名已被注册 |
+| `409` | 冲突 | 邮箱已被注册 |
 
 ---
 

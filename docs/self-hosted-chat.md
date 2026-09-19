@@ -21,8 +21,10 @@
 |---|---|
 | 乱序 | `ChatMessage @@unique(conversationID, height)`;height 在事务内会话行锁(`SELECT..FOR UPDATE`)下由 `nextHeight` 计数器分配(批4 起;此前为 advisory lock + max 聚合) |
 | 断线重发重复 | `@@unique(conversationID, senderID, clientMessageId)`;撞库返回原行(`reused`),不重广播 |
+| 同一个 d 换了内容 | 落库时记下请求指纹 `requestHash`(type / content / 引用 / 转发源的规范化 sha256);撞库而指纹不同 → `CHAT_DELIVERY_ID_CONFLICT`,不再把库里那条当成功返回。媒体的 object key 与展示地址不进指纹(重发时重新上传会换 key,那仍是同一条);迁移前的行 `requestHash` 为空,一律放行 |
 | 丢消息 | 先落库后 ack:ack 返回 = 已持久化;客户端超时未 ack 可安全重发(幂等兜底) |
 | 已读回退 | `ChatMember.lastReadHeight` 只前进不后退(`updateMany` 带 `lt` 条件) |
+| 离线变更丢失 | 变更序号流(2026-09-16):新消息、撤回、编辑、表情回应、焚毁墓碑都由触发器在会话行锁下从 `nextRevision` 取号写进 `ChatMessage.revision`;客户端凭一个 `afterRevision` 游标追平,见下文 |
 
 ## Socket 事件(跨仓契约,FE 镜像在 chat-core/protocol.ts)
 
@@ -33,14 +35,27 @@
 | `chat:send` | `{conversationId, type, content, d, replyToId?}` | `{ok:true, messageId, height, d}` \| `{ok:false, code, message?}` |
 | `chat:read` | `{conversationId, height}` | `{ok:true}` \| `{ok:false, code}` |
 | `chat:typing` | `{conversationId}` | 无 ack,尽力而为 |
+| `chat:background` / `chat:foreground` | 任意(可不带载荷只传 ack) | `{ok:true}` \| `{ok:false, code}` |
+
+握手 `auth.appState = 'background'` 表示这条连接在后台建立(安卓后台重连等),一开始就按后台登记。
 
 服务端 → 客户端:
 
 | 事件 | 载荷 |
 |---|---|
-| `chat:msg` | `ChatMessageDto`(发送者也收,靠 `d` 对账本地乐观消息) |
+| `chat:msg` | `ChatMessageDto`(发送者也收,靠 `d` 对账本地乐观消息;带 `revision`) |
 | `chat:read` | `{conversationId, userId, height}` |
 | `chat:typing` | `{conversationId, userId}` |
+| `chat:revoke` | `{conversationId, messageId, revokedBy, height, senderId, revision}` |
+| `chat:edit` | `{conversationId, messageId, height, content, editedAt, revision}` |
+| `chat:reaction` | `{conversationId, messageId, emoji, op, userId, revision}` |
+| `chat:burned_messages` | `{conversationId, messageIds, revisions}`(两数组一一对应) |
+| `chat:history_cleared` | `{conversationId, clearedBeforeHeight, clearedBy}`:全员清空发会话房;只清自己发本人个人房 |
+| `chat:session_expired` | `{reason:'token_expired'}`,紧接着服务端断开;客户端刷新 token 后重连 |
+
+`d` 只发给它的作者本人:实时投递按收件人逐份塑形(发送者的个人房收原值,其余成员收
+`null`),REST 的历史、搜索、会话末条与离线增量同一口径。字段保持存在且可空,客户端
+只对非 `null` 的键建索引,去重仍按消息 id。
 
 房间:连接即入个人房 `u:{userId}` + 按 `ChatMember` 派生的全部会话房
 `c:{conversationId}`(服务端派生,客户端无法自选)。
@@ -56,6 +71,43 @@ REST 与 socket ack 共用;敏感词命中 = `CHAT_SENSITIVE_WORD_BLOCKED`
   (directKey = 两 userID 码位序拼接,唯一约束防并发重建;拉黑双向拒建)。
 - `GET /api/v1/chat/conversations/:id/messages?beforeHeight&limit` —
   height 键集分页,页内升序,`nextBeforeHeight=null` 表示到头。
+- `GET /api/v1/chat/conversations/:id/sync?afterRevision&limit` — 增量同步(见下文)。
+  取代已删除的 `GET /api/v1/chat/messages/mutations`。
+
+### 变更序号流与增量同步(2026-09-16)
+
+- **取号**:迁移 `20260916000000_add_chat_revision_stream` 的两个触发器。
+  `ChatMessage` 的 INSERT 与客户端可见列(content/deleted/revokedAt/editedAt)变化时
+  取 `GREATEST(nextRevision, nextHeight) + 1` 写回 `ChatConversation.nextRevision`;
+  `ChatMessageReaction` 增删时给所属消息同样取号。应用代码不写 `revision`/`nextRevision`。
+  计数器更新拿会话行锁到提交:读到水位 = N,<= N 的变更一定都已可见 —— 旧时间戳通道
+  那种「早时间戳、晚提交」被游标越过的行不再存在。
+- **水位**:会话的序号水位是 `max(nextRevision, nextHeight)`(`conversationSyncRevision`),
+  同步接口的 `throughRevision` 与会话 DTO 的 `syncRevision` 都用它。存量消息回填成
+  `revision = height`,计数器没有整表初始化 —— 从没变过的会话 `nextRevision` 还是 0。
+- **发布**:拆成三个迁移,蓝绿窗口旧色照常写入。`…000000` 加列 + 触发器 + 回填过程
+  (瞬时 DDL,一个事务);`…000100` 分批回填,每 5000 行提交一次;`…000200`
+  `CREATE INDEX CONCURRENTLY`。本地 150 万条消息实测:迁移约 16 秒,期间模拟旧色发消息/
+  撤回/加回应 1.6 万次 0 报错、最慢一条 42ms,迁移后无漏填、无重号。为什么这样拆见
+  `docs/migration-baseline.md`「迁移文件是不是一个事务」。旧 mutations 通道的三条索引
+  (revokedAt/editedAt/deletedAt)这一版保留:回滚目标(旧二进制)还在用,下一个版本删。
+- **锁顺序**:任何改消息行的事务必须**先**锁会话行(撤回、焚毁清扫、放宽焚毁都补了
+  `SELECT … FOR UPDATE`),否则与「先锁会话行再改消息」的编辑/回应交叉死锁。
+- **同步语义**:返回 `(afterRevision, throughRevision]` 里变过的消息的当前状态,
+  同一条中间变过几次只回最后一版;焚毁墓碑只带 id/height/revision 与 `deleted:true`。
+  可见性(清空水位、查看者保留期、会话焚毁窗口)只决定回不回这一行,**不决定游标**。
+  `resetRequired` = 游标超过服务端当前序号(库被恢复/重建过),客户端丢掉该会话缓存重来。
+- **会话 DTO** 新增 `syncRevision`(客户端游标落后才需要同步)、`readHeight`、
+  `clearedBeforeHeight`(max(座位, 会话级))与单聊的 `peerDeliveredHeight`。
+
+### 推送判定(2026-09-16)
+
+- 「在线」(对端看到的在线状态)与「收得到」(要不要推送)分开:客户端退到后台报
+  `chat:background`,注册表把这条连接的租约记进 `chat:bg:z:{userId}`;推送只把至少有一条
+  前台连接的人当收得到。
+- 同一会话的推送按 1 秒窗口合并(从第一条起算、不顺延),只推最新一条;窗口内的
+  @提及 / @所有人 照样穿透免打扰且预览用点名那条;发推前剔除窗口期间已读到/清掉的人,
+  以及已撤回/焚毁的消息。推送角标不计撤回、不计免打扰会话,与 app 内角标同口径。
 
 ### 群管理 + 群日志(2026-09-08)
 
@@ -102,7 +154,7 @@ REST 与 socket ack 共用;敏感词命中 = `CHAT_SENSITIVE_WORD_BLOCKED`
 
 ## 防刷
 
-每 socket 滑动窗口:send 20/10s、read 30/10s、typing 10/5s
+每 socket 滑动窗口:send 20/10s、read 30/10s、typing 10/5s、前后台切换 30/10s
 (`chat-rate-limiter.ts`;批4 起配 Redis 时为 ZSET 滑动窗口全局配额,缺 Redis 回退每实例独立计数)。
 REST 面沿用 ThrottlerGuard 每路由限流。
 

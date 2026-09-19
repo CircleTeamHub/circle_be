@@ -814,3 +814,24 @@ DATABASE_STATEMENT_TIMEOUT_MS 默认 15s，超时的写会被 Postgres 掐掉，
 - **ack 之后的 outbox 删除是 fire-and-forget**：ack 回来后进程立刻被杀，那条已成功
   的 outbox 行会留下，冷启动可能把已确认的消息换成失败气泡、诱导一次无意义的重发。
   窗口极窄（ack 与 delete 之间），且重发本身是幂等的。
+
+---
+
+## 14. 时间戳增量通道退役(2026-09-16)
+
+`GET /chat/messages/mutations`(§10–§12.6 那条按 revokedAt/editedAt/deletedAt 扫的通道)
+已删除,由会话变更序号流取代,设计与语义见 [self-hosted-chat.md](./self-hosted-chat.md)
+「变更序号流与增量同步」。对照 squady 同名机制做的迁移,顺带解掉了本文档里几条留档项:
+
+- §12.6 的 60 秒安全水位、复合时间戳游标、14 天回溯窗口:序号在会话行锁下分配并与行
+  同事务提交,不存在「早时间戳晚提交」,这些补丁整体不再需要。
+- §10.4 焚毁物删对离线设备的传播:墓碑也占序号,离线设备同步时拿到 `deleted:true`。
+- 表情回应、编辑(含回应)的离线追平:回应增删触发器给所属消息换号,同步时整条消息
+  (含完整回应列表)重新下发 —— 原通道的 DTO 不带回应,编辑补同步会冲掉本地回应。
+- 清空聊天记录到不了离线设备:会话 DTO 与同步响应都带 `clearedBeforeHeight`。
+
+对应的三条索引 `[conversationID, revokedAt|editedAt|deletedAt]` 按 expand/contract
+留到下一个版本删除:蓝绿发布的回滚目标(旧二进制)在迁移之后仍会服务
+`GET /chat/messages/mutations`。删除时 `DROP INDEX CONCURRENTLY` 每条单独一个迁移文件
+(见 `docs/migration-baseline.md`)。
+

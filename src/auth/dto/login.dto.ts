@@ -1,17 +1,11 @@
 import {
-  IsIn,
   IsNotEmpty,
   IsEmail,
-  IsOptional,
   IsString,
   Length,
   ValidateIf,
 } from 'class-validator';
-import {
-  ApiHideProperty,
-  ApiProperty,
-  ApiPropertyOptional,
-} from '@nestjs/swagger';
+import { ApiProperty, ApiPropertyOptional } from '@nestjs/swagger';
 
 /**
  * identifier 到底「填了没有」—— 判据必须与 auth.service 的
@@ -66,15 +60,4 @@ export class LoginDto {
   @IsNotEmpty()
   @Length(6, 64)
   password: string;
-
-  /**
-   * @deprecated accepted and ignored — installed app builds still send it;
-   * remove once the minimum supported app version no longer does.
-   * (Former OpenIM platform ID: 1=iOS, 2=Android, 5=Web.) Still validated as
-   * before, because forbidNonWhitelisted would 400 those logins if it vanished.
-   */
-  @ApiHideProperty()
-  @IsOptional()
-  @IsIn([1, 2, 5])
-  platform?: 1 | 2 | 5;
 }

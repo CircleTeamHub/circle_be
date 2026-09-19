@@ -39,12 +39,12 @@ import {
 export interface PresignResult {
   uploadUrl: string;
   /**
-   * 对象直链。只有 PUBLIC_READ_UPLOAD_FOLDERS 里的目录能凭它直连读取;notes/、chat/
-   * 是私有对象(直连 403),读取要凭 key 走各自读路径的短时签名 GET。私有目录暂时仍
-   * 返回它,只因已装机 App 的 presign 校验把它当必填字段 —— 最低支持的 App 版本不再
-   * 要求之后,私有目录可改回 null。
+   * 对象直链,只有 PUBLIC_READ_UPLOAD_FOLDERS 里的目录才有。notes/、chat/ 是私有
+   * 对象(直连 403),一律返回 null:发一条注定 403 的地址比不发更糟 —— 客户端会把它
+   * 当持久地址存进笔记/消息体,坏在读取那天。私有目录只保存 key,读取凭 key 走各自
+   * 读路径(笔记详情 / 聊天媒体)签发的短时 GET。
    */
-  fileUrl: string;
+  fileUrl: string | null;
   key: string;
   requiredHeaders: Record<string, string>;
 }
@@ -87,6 +87,11 @@ export const PUBLIC_READ_UPLOAD_FOLDERS = [
   'friends',
   'uploads',
 ] as const;
+
+/** 同一份白名单的查表形态，presign 每次都要判一下目录是否匿名可读。 */
+const PUBLIC_READ_UPLOAD_FOLDER_SET: ReadonlySet<string> = new Set(
+  PUBLIC_READ_UPLOAD_FOLDERS,
+);
 
 export function buildPublicReadBucketPolicy(bucket: string) {
   return JSON.stringify({
@@ -492,7 +497,7 @@ export class UploadService implements OnModuleInit {
     // `split('.').pop()` returns the whole string when there is no dot, so
     // gate on an actual extension and fall back to `bin`.
     //
-    // 扩展名会原样拼进 object key 和 `fileUrl`(裸字符串拼接,不做 URL 编码),
+    // 扩展名会原样拼进 object key(公开目录还会拼进 `fileUrl`;裸字符串拼接,不做 URL 编码),
     // 所以这里必须自己收口,不能依赖调用方 DTO 的 filename 正则:访客那份为了
     // 放行 Unicode 文件名已经放宽到「只禁路径分隔符与控制字符」,`a.mp4?x=y`
     // 这种名字会造出带 `?`/`#` 的 key,让签名 URL 与公开 URL 的解析全部错位。
@@ -543,8 +548,10 @@ export class UploadService implements OnModuleInit {
       });
     }
 
-    // 把 uploadUrl 里的内网地址替换为公开访问地址
-    const fileUrl = `${this.publicObjectBase}/${key}`;
+    // 公开目录才给直链(内网地址换成公开访问地址);私有目录给 null,见 PresignResult。
+    const fileUrl = PUBLIC_READ_UPLOAD_FOLDER_SET.has(folder)
+      ? `${this.publicObjectBase}/${key}`
+      : null;
 
     return {
       uploadUrl,

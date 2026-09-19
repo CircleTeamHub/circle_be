@@ -7,7 +7,7 @@ import {
 } from '@nestjs/common';
 import { HttpAdapterHost } from '@nestjs/core';
 import { Test } from '@nestjs/testing';
-import { ThrottlerGuard } from '@nestjs/throttler';
+import { UserThrottlerGuard } from 'src/guards/user-throttler.guard';
 import request from 'supertest';
 import { ChatErrorCode } from 'src/common/app-error-codes';
 import { AllExceptionFilter } from 'src/filters/all-exception.filter';
@@ -66,7 +66,7 @@ describe('/chat/conversations/:id/burn HTTP pipeline', () => {
       .useValue(asMember)
       .overrideGuard(AppAudienceGuard)
       .useValue({ canActivate: () => true })
-      .overrideGuard(ThrottlerGuard)
+      .overrideGuard(UserThrottlerGuard)
       .useValue({ canActivate: () => true })
       .compile();
 

@@ -130,12 +130,25 @@ export class ChatBroadcastService implements OnModuleInit, OnModuleDestroy {
     );
   }
 
-  /** 已读水位推进 → 会话房。 */
-  emitRead(payload: ChatReadBroadcast): void {
+  /**
+   * 已读水位推进 → 会话房(单聊对端据此渲染「已读」)。
+   *
+   * readerOnly:只发给读者本人的个人房,同步他其它设备上的未读。群聊用这个 ——
+   * 群里没人渲染「谁读到了哪」(逐条已读是按需查询),发到会话房就是每读一次
+   * 向每个在线成员投一帧,千人在线的群是平方级的帧数。
+   */
+  emitRead(
+    payload: ChatReadBroadcast,
+    options: { readerOnly?: boolean } = {},
+  ): void {
     const server = this.requireServer('emitRead');
     if (!server) return;
     server
-      .to(conversationRoom(payload.conversationId))
+      .to(
+        options.readerOnly
+          ? userRoom(payload.userId)
+          : conversationRoom(payload.conversationId),
+      )
       .emit(CHAT_EVENTS.read, payload);
   }
 
@@ -148,6 +161,14 @@ export class ChatBroadcastService implements OnModuleInit, OnModuleDestroy {
       .emit(CHAT_EVENTS.historyCleared, payload);
   }
 
+  /** 只清自己的记录 → 本人个人房(其它在线设备跟着清本地缓存)。 */
+  emitHistoryClearedToUser(
+    userId: string,
+    payload: ChatHistoryClearedBroadcast,
+  ): void {
+    this.emitToUser(userId, CHAT_EVENTS.historyCleared, payload);
+  }
+
   /**
    * 阅后即焚墓碑已提交 → 当前在座成员的个人房(与 chat:msg 同一条授权边界)。
    *
@@ -158,10 +179,15 @@ export class ChatBroadcastService implements OnModuleInit, OnModuleDestroy {
    */
   async emitBurnedMessages(
     conversationId: string,
-    messageIds: readonly string[],
+    burned: ReadonlyArray<{ id: string; revision: number }>,
   ): Promise<void> {
-    const ids = [...new Set(messageIds)].filter((id) => id.length > 0);
-    if (ids.length === 0) return;
+    const seen = new Set<string>();
+    const items = burned.filter((item) => {
+      if (item.id.length === 0 || seen.has(item.id)) return false;
+      seen.add(item.id);
+      return true;
+    });
+    if (items.length === 0) return;
     const server = this.requireServer('emitBurnedMessages');
     if (!server) return;
     try {
@@ -173,12 +199,14 @@ export class ChatBroadcastService implements OnModuleInit, OnModuleDestroy {
       if (rooms.length === 0) return;
       for (
         let start = 0;
-        start < ids.length;
+        start < items.length;
         start += BURNED_MESSAGES_BROADCAST_MAX
       ) {
+        const chunk = items.slice(start, start + BURNED_MESSAGES_BROADCAST_MAX);
         const payload: ChatBurnedMessagesBroadcast = {
           conversationId,
-          messageIds: ids.slice(start, start + BURNED_MESSAGES_BROADCAST_MAX),
+          messageIds: chunk.map((item) => item.id),
+          revisions: chunk.map((item) => item.revision),
         };
         server.to(rooms).emit(CHAT_EVENTS.burnedMessages, payload);
       }
@@ -221,27 +249,42 @@ export class ChatBroadcastService implements OnModuleInit, OnModuleDestroy {
     return sockets.length > 0;
   }
 
-  /** 会话房内当前在线的 userId 集合(离线推送分流用);注册表优先。 */
-  async getOnlineUserIdsInConversation(
+  /**
+   * 会话成员里正开着 App 的设备 → 这些设备登记的推送 token(推送时跳过它们)。
+   *
+   * 按设备而不是按人:电脑上开着网页版(没有推送 token)不挡手机的推送;只有手机
+   * 自己正开着 App 时才不推给这台手机。
+   */
+  async getForegroundPushTokensInConversation(
     conversationId: string,
-  ): Promise<Set<string>> {
-    const viaRegistry = await this.presence.getOnlineUserIds(conversationId);
-    if (viaRegistry !== null) return new Set(viaRegistry);
-    // Redis 配了却读不到:返回空集。这个集合在 ChatPushService 里用来**排除**
-    // 收件人 —— 空集 = 谁都不排除 = 全员收到推送。反过来把人当在线会让他
-    // 彻底收不到消息:重复推送好过丢消息。
-    if (this.presence.isRedisConfigured()) return new Set();
-    const server = this.requireServer('getOnlineUserIdsInConversation');
-    if (!server) return new Set();
+  ): Promise<Map<string, Set<string>>> {
+    const viaRegistry =
+      await this.presence.getForegroundPushTokens(conversationId);
+    if (viaRegistry !== null) return viaRegistry;
+    // Redis 配了却读不到:谁都不排除。这个结果在 ChatPushService 里用来**排除**
+    // 推送目标 —— 空 = 全员收到推送。反过来把设备当前台会让人彻底收不到消息:
+    // 重复推送好过丢消息。
+    if (this.presence.isRedisConfigured()) return new Map();
+    const server = this.requireServer('getForegroundPushTokensInConversation');
+    if (!server) return new Map();
     const sockets = await server
       .in(conversationRoom(conversationId))
       .fetchSockets();
-    const ids = new Set<string>();
+    const tokensByUser = new Map<string, Set<string>>();
     for (const socket of sockets) {
-      const userId = (socket.data as { userId?: unknown })?.userId;
-      if (typeof userId === 'string') ids.add(userId);
+      const data = socket.data as {
+        userId?: unknown;
+        background?: unknown;
+        pushToken?: unknown;
+      };
+      if (data?.background === true) continue;
+      if (typeof data?.userId !== 'string') continue;
+      if (typeof data?.pushToken !== 'string') continue;
+      const tokens = tokensByUser.get(data.userId) ?? new Set<string>();
+      tokens.add(data.pushToken);
+      tokensByUser.set(data.userId, tokens);
     }
-    return ids;
+    return tokensByUser;
   }
 
   /** 断开某用户全部在线 socket(临时房结束/访客清退用)。 */

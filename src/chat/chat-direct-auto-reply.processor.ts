@@ -452,6 +452,8 @@ export class ChatDirectAutoReplyProcessor {
         },
         replyToId: null,
         d: created.clientMessageId,
+        // 触发器在 INSERT 时分配;create 的 RETURNING 已经带回来。
+        revision: created.revision,
         createdAt: created.createdAt.toISOString(),
       };
     });

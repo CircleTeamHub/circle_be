@@ -11,6 +11,7 @@ function dto(overrides: Partial<ChatMessageDto>): ChatMessageDto {
     id: 'm1',
     conversationId: 'c1',
     height: 1,
+    revision: 1,
     type: 'text',
     content: {},
     sender: null,

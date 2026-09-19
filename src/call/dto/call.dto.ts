@@ -1,9 +1,7 @@
-import { ApiHideProperty } from '@nestjs/swagger';
 import {
   ArrayMaxSize,
   IsArray,
   IsEnum,
-  IsOptional,
   IsString,
   IsUUID,
   Matches,
@@ -46,22 +44,4 @@ export class CreateDirectCallDto {
 
   @IsEnum(CallType)
   callType!: CallType;
-}
-
-export class LeaveCallDto {
-  /**
-   * @deprecated accepted and ignored.
-   *
-   * 已装机的 App 挂断时固定发 `{ reason: 'NORMAL' }`,服务端从不读它:结束原因
-   * (CallSession.endReason)由服务端按状态机推导(NORMAL / ALL_LEFT / NO_ANSWER …),
-   * 不接受客户端自报 —— 那等于允许伪造通话留痕。
-   * 移除条件:最低支持的 App 版本已不再发送该字段(circle-im 自
-   * fix/audit-backend-contract-drift 起不再发送)。在那之前必须继续接受:全局
-   * ValidationPipe 开着 forbidNonWhitelisted,删掉它旧客户端的挂断会被拒成 400。
-   */
-  @ApiHideProperty()
-  @IsOptional()
-  @IsString()
-  @MaxLength(32)
-  reason?: string;
 }

@@ -15,11 +15,7 @@ import type { RequestWithUser } from 'src/auth/types';
 import { AppAudienceGuard } from 'src/guards/app-audience.guard';
 import { JwtGuard } from 'src/guards/jwt.guard';
 import { CallService } from './call.service';
-import {
-  CreateDirectCallDto,
-  CreateGroupCallDto,
-  LeaveCallDto,
-} from './dto/call.dto';
+import { CreateDirectCallDto, CreateGroupCallDto } from './dto/call.dto';
 
 @ApiTags('Calls')
 @ApiBearerAuth()
@@ -83,11 +79,14 @@ export class CallController {
     return this.callService.rejectCall(req.user.userId, callId);
   }
 
+  // 挂断刻意不收 @Body():结束原因(CallSession.endReason)由服务端按状态机推导,
+  // 客户端自报本来就不作数。不登记 body 参数,全局 ValidationPipe 的
+  // forbidNonWhitelisted 就打不到旧安装包多发的字段上(历史上是 reason)——
+  // 挂断是最不能被拒成 400 的一步,否则通话会卡在 ACTIVE。
   @Post(':callId/leave')
   @Throttle({ default: { limit: 30, ttl: 60_000 } })
   leaveCall(
     @Param('callId', ParseUUIDPipe) callId: string,
-    @Body() _dto: LeaveCallDto,
     @Req() req: RequestWithUser,
   ) {
     return this.callService.leaveCall(req.user.userId, callId);
