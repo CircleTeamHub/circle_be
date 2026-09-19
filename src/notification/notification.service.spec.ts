@@ -61,6 +61,7 @@ describe('NotificationService', () => {
   };
   const pushService = {
     sendNotification: jest.fn(),
+    isJPushConfigured: jest.fn(),
   };
   const auditService = {
     record: jest.fn(),
@@ -89,6 +90,7 @@ describe('NotificationService', () => {
       nested.mockReset();
     }
     pushService.sendNotification.mockReset();
+    pushService.isJPushConfigured.mockReset();
     auditService.record.mockReset();
     auditService.recordStrict.mockReset();
     prisma.$queryRaw.mockReset();
@@ -630,6 +632,20 @@ describe('NotificationService', () => {
   });
 
   describe('push tokens', () => {
+    it('rejects JPush registration when server credentials are absent', async () => {
+      pushService.isJPushConfigured.mockReturnValue(false);
+
+      await expect(
+        service.registerPushToken('user-1', {
+          token: 'registration-id',
+          platform: 'android',
+          provider: 'jpush',
+        }),
+      ).rejects.toMatchObject({ status: 503 });
+      expect(prisma.devicePushToken.updateMany).not.toHaveBeenCalled();
+      expect(prisma.devicePushToken.create).not.toHaveBeenCalled();
+    });
+
     it('registers a brand-new device push token', async () => {
       prisma.devicePushToken.updateMany.mockResolvedValue({ count: 0 });
       prisma.devicePushToken.create.mockResolvedValue({ id: 'token-row-1' });

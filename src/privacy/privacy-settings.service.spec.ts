@@ -274,6 +274,9 @@ describe('PrivacySettingsService', () => {
         messageSelfDestructSec: 604800,
         momentsVisibility: 'FRIENDS_ONLY',
         allowStrangerMessages: false,
+        // 传了 messageSelfDestructSec 就会连带落一个开启边界;其余未提供的
+        // 设置仍然一个都不该出现在 update 里 —— 这条断言保持精确匹配。
+        messageSelfDestructStartedAt: expect.any(Date),
       },
     });
   });
@@ -376,6 +379,92 @@ describe('PrivacySettingsService', () => {
       expect(service.momentsVisibleFor(settings, false, true)).toBe(true);
       expect(service.momentsVisibleFor(settings, false, false)).toBe(false);
     });
+  });
+
+  // ——— 全局阅后即焚的开启边界 ———
+  // 只有窗口下沿而没有开启时间,打开开关等于把此前的历史一次性隐藏。
+  // 语义与会话级 burnStartedAt 对齐:开启时落一个边界,关闭时清掉。
+
+  const storedRow = (over: Record<string, unknown> = {}) => ({
+    userID: 'user-1',
+    messageSelfDestructSec: 0,
+    messageSelfDestructStartedAt: null,
+    ...over,
+  });
+
+  it('stamps an activation boundary when global self-destruct is switched on', async () => {
+    prisma.userPrivacySetting.findUnique.mockResolvedValue(storedRow());
+    prisma.userPrivacySetting.upsert.mockResolvedValue(
+      storedRow({ messageSelfDestructSec: 3600 }),
+    );
+
+    await service.updateSettings('user-1', {
+      messageSelfDestructSec: 3600,
+    } as UpdatePrivacySettingsDto);
+
+    const { update } = prisma.userPrivacySetting.upsert.mock.calls[0][0];
+    expect(update.messageSelfDestructStartedAt).toBeInstanceOf(Date);
+  });
+
+  it('keeps the original boundary when only the duration changes', async () => {
+    const original = new Date('2026-09-01T00:00:00.000Z');
+    prisma.userPrivacySetting.findUnique.mockResolvedValue(
+      storedRow({
+        messageSelfDestructSec: 3600,
+        messageSelfDestructStartedAt: original,
+      }),
+    );
+    prisma.userPrivacySetting.upsert.mockResolvedValue(
+      storedRow({
+        messageSelfDestructSec: 7200,
+        messageSelfDestructStartedAt: original,
+      }),
+    );
+
+    await service.updateSettings('user-1', {
+      messageSelfDestructSec: 7200,
+    } as UpdatePrivacySettingsDto);
+
+    const { update } = prisma.userPrivacySetting.upsert.mock.calls[0][0];
+    // 改档位不是重新开启 —— 边界一旦挪动,原本受保护的历史会被重新纳入窗口。
+    expect(update.messageSelfDestructStartedAt).toEqual(original);
+  });
+
+  it('clears the boundary when global self-destruct is switched off', async () => {
+    prisma.userPrivacySetting.findUnique.mockResolvedValue(
+      storedRow({
+        messageSelfDestructSec: 3600,
+        messageSelfDestructStartedAt: new Date('2026-09-01T00:00:00.000Z'),
+      }),
+    );
+    prisma.userPrivacySetting.upsert.mockResolvedValue(storedRow());
+
+    await service.updateSettings('user-1', {
+      messageSelfDestructSec: 0,
+    } as UpdatePrivacySettingsDto);
+
+    const { update } = prisma.userPrivacySetting.upsert.mock.calls[0][0];
+    // 留着旧边界的话,下次开启会沿用一个早已过时的时间点。
+    expect(update.messageSelfDestructStartedAt).toBeNull();
+  });
+
+  it('leaves the boundary untouched when the update does not mention self-destruct', async () => {
+    prisma.userPrivacySetting.findUnique.mockResolvedValue(
+      storedRow({
+        messageSelfDestructSec: 3600,
+        messageSelfDestructStartedAt: new Date('2026-09-01T00:00:00.000Z'),
+      }),
+    );
+    prisma.userPrivacySetting.upsert.mockResolvedValue(
+      storedRow({ messageSelfDestructSec: 3600 }),
+    );
+
+    await service.updateSettings('user-1', {
+      showPhone: true,
+    } as UpdatePrivacySettingsDto);
+
+    const { update } = prisma.userPrivacySetting.upsert.mock.calls[0][0];
+    expect(update).not.toHaveProperty('messageSelfDestructStartedAt');
   });
 });
 

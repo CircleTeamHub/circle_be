@@ -50,6 +50,7 @@ import type {
   ChatReadAck,
   ChatReadPayload,
   ChatDeliveredPayload,
+  ChatHandshakeAuth,
   ChatEditPayload,
   ChatReactionPayload,
   ChatRevokePayload,
@@ -57,6 +58,9 @@ import type {
   ChatSendPayload,
   ChatTypingPayload,
 } from './chat.types';
+
+/** 握手 auth 帧的字段名来自共享类型(改名会编译失败),值一律当不可信输入读。 */
+type UntrustedHandshakeAuth = { [K in keyof ChatHandshakeAuth]?: unknown };
 
 type CorsOrigin = (
   origin: string | undefined,
@@ -191,6 +195,13 @@ export class ChatGateway implements OnModuleDestroy {
   private readonly deliveredLimiter: DistributedRateLimiter;
   private readonly reactionLimiter: DistributedRateLimiter;
   private readonly editLimiter: DistributedRateLimiter;
+  private readonly appStateLimiter: DistributedRateLimiter;
+  /**
+   * 同一连接上的前后台切换串行生效。两次切换的 Redis 写交错时,慢的那次后落地
+   * 会把状态改回去 —— 回到前台的人被当成还在后台(多推),或者反过来锁屏的人
+   * 一条推送都收不到。
+   */
+  private readonly appStateChains = new WeakMap<Socket, Promise<void>>();
 
   private static readonly SUBSCRIBE_RETRY_BASE_MS = 1_000;
   private static readonly SUBSCRIBE_RETRY_MAX_MS = 30_000;
@@ -267,6 +278,7 @@ export class ChatGateway implements OnModuleDestroy {
     this.deliveredLimiter = make('delivered');
     this.reactionLimiter = make('reaction');
     this.editLimiter = make('edit');
+    this.appStateLimiter = make('appState');
   }
 
   /**
@@ -356,7 +368,7 @@ export class ChatGateway implements OnModuleDestroy {
       socket.handshake.headers[CONNECTION_TRACE_HEADER],
     );
     const authTrace = (
-      socket.handshake.auth as Record<string, unknown> | undefined
+      socket.handshake.auth as UntrustedHandshakeAuth | undefined
     )?.traceId;
     const traceId = resolveConnectionTraceId(
       safeConnectionTraceId(header) ?? safeConnectionTraceId(authTrace),
@@ -591,7 +603,7 @@ export class ChatGateway implements OnModuleDestroy {
    * 只会被另一把钥匙拒掉,不构成绕过。
    */
   private async authenticate(socket: Socket): Promise<string | null> {
-    const token = (socket.handshake.auth as Record<string, unknown> | undefined)
+    const token = (socket.handshake.auth as UntrustedHandshakeAuth | undefined)
       ?.token;
     if (typeof token !== 'string' || token.length === 0) {
       return this.rejectAuth(socket, 'missing_token');
@@ -649,14 +661,22 @@ export class ChatGateway implements OnModuleDestroy {
   private scheduleExpiryDisconnect(socket: Socket): void {
     const expMs = socket.data.expMs as number | null | undefined;
     if (typeof expMs !== 'number') return;
+    // 先说原因再断开。服务端主动断开的连接 socket.io 客户端不会自动重连,
+    // 只收到一个 disconnect 的话 App 分不清「token 过期、刷新后重连」和「被踢」,
+    // 于是停在断开状态,直到下一次 REST 请求碰巧触发刷新。engine.io 关闭前会
+    // 先把写缓冲刷完,这一帧一定排在断开之前送达。
+    const expire = (): void => {
+      socket.emit(CHAT_EVENTS.sessionExpired, { reason: 'token_expired' });
+      socket.disconnect(true);
+    };
     const ttl = expMs - Date.now();
     if (ttl <= 0) {
-      socket.disconnect(true);
+      expire();
       return;
     }
     const timer = setTimeout(() => {
       this.expiryTimers.delete(socket);
-      socket.disconnect(true);
+      expire();
     }, ttl);
     timer.unref?.();
     this.expiryTimers.set(socket, timer);
@@ -780,6 +800,10 @@ export class ChatGateway implements OnModuleDestroy {
     const preReadyQueue: Array<() => Promise<void>> = [];
     let drainingPreReadyQueue = false;
     let conversationIds: string[] = [];
+    // 上下线广播只发往这些会话房:群房间不播。在线状态只在单聊头部和资料页用
+    // (资料页打开时另查一次),每次上下线都向全部群房间广播,千人在线的群就是
+    // 在线人数平方级的帧数。群房间照常入房,消息/输入状态不受影响。
+    let presenceConversationIds: string[] = [];
     // 上下线广播要剔掉互相拉黑的人 —— 座位还在,不剔就等于换个通道继续推送。
     let blockedPeers: string[] = [];
     // 本人的「显示在线时间」开关:关着就不广播上线(下线那侧现读,见 announceOffline)。
@@ -904,6 +928,24 @@ export class ChatGateway implements OnModuleDestroy {
         }
       },
     );
+    const onAppState =
+      (background: boolean) =>
+      (payload?: unknown, maybeAck?: AckFn<ChatReadAck>): void => {
+        // 客户端不带载荷直接传 ack 时,ack 落在第一个参数上。
+        const ack =
+          typeof payload === 'function'
+            ? (payload as AckFn<ChatReadAck>)
+            : maybeAck;
+        if (
+          !whenReady(() => this.handleAppState(socket, userId, background, ack))
+        ) {
+          this.ackOnce(ack)(
+            this.ackError(ChatErrorCode.RateLimited, '连接初始化请求过多'),
+          );
+        }
+      };
+    socket.on(CHAT_EVENTS.background, onAppState(true));
+    socket.on(CHAT_EVENTS.foreground, onAppState(false));
     socket.on(
       CHAT_EVENTS.presence,
       (
@@ -955,7 +997,7 @@ export class ChatGateway implements OnModuleDestroy {
       // WebSocket 就能把整个后端打死)。
       void this.announceOffline(
         userId,
-        conversationIds,
+        presenceConversationIds,
         blockedPeers,
         guestConversationId !== null,
       );
@@ -964,7 +1006,14 @@ export class ChatGateway implements OnModuleDestroy {
     // G-04:上限还要按**全局**计一遍 —— 本实例的 Map 在多实例下会放大成 10×N。
     // 租约 id 用 socket.id:断开时按它精确摘除,不会误伤同一用户在别处
     // 那条活着的连接(共享标量 DECR 会)。
-    const globalCount = await this.presence.registerSocket(userId, socket.id);
+    // 这台设备登记的推送 token:它正开着 App 时,推送只跳过它(按设备,不按人)。
+    const pushToken = this.handshakePushToken(socket);
+    socket.data.pushToken = pushToken;
+    const globalCount = await this.presence.registerSocket(
+      userId,
+      socket.id,
+      pushToken,
+    );
     // presence 注册期间断开时,上面的监听器先清理一次；await 返回后再清一次,
     // 覆盖“删除先于注册落地”的时序,避免留下跨实例在线脏数据。
     if (socket.disconnected) {
@@ -990,16 +1039,28 @@ export class ChatGateway implements OnModuleDestroy {
       return;
     }
     this.scheduleExpiryDisconnect(socket);
+    // 在后台建立的连接(安卓后台重连、iOS 后台唤醒)一开始就按后台登记。等连上
+    // 之后客户端再补发 chat:background 的话,中间这一段它会被当成收得到、不推送。
+    if (this.handshakeAppState(socket) === 'background') {
+      void this.applyAppState(socket, userId, true);
+    }
 
     try {
       if (guestConversationId) {
         conversationIds = [guestConversationId];
+        presenceConversationIds = [guestConversationId];
       } else {
-        [conversationIds, blockedPeers, presenceVisible] = await Promise.all([
-          this.chatService.listConversationIds(userId),
+        let seats: Awaited<ReturnType<ChatService['listConversationSeats']>> =
+          [];
+        [seats, blockedPeers, presenceVisible] = await Promise.all([
+          this.chatService.listConversationSeats(userId),
           this.chatService.listBlockedCounterparties(userId),
           this.chatService.isPresenceVisible(userId),
         ]);
+        conversationIds = seats.map((seat) => seat.conversationId);
+        presenceConversationIds = seats
+          .filter((seat) => seat.type !== 'GROUP')
+          .map((seat) => seat.conversationId);
       }
       await socket.join(userRoom(userId));
       // 访客只进个人房:消息/编辑按在座成员逐个个人房投递,照样送得到;会话房里的
@@ -1046,7 +1107,7 @@ export class ChatGateway implements OnModuleDestroy {
     if (presenceVisible) {
       this.observeBroadcast('presence', () =>
         this.broadcast.emitPresence(
-          conversationIds,
+          presenceConversationIds,
           { userId, online: true },
           blockedPeers,
         ),
@@ -1331,12 +1392,12 @@ export class ChatGateway implements OnModuleDestroy {
       reply({ ok: true });
       if (result.advanced) {
         // 播落库后的高度,不是客户端报的那个 —— 后者可能被钳过。
+        // 群聊只同步读者自己的其它设备,见 emitRead。
         this.observeBroadcast('read', () =>
-          this.broadcast.emitRead({
-            conversationId,
-            userId,
-            height: result.height,
-          }),
+          this.broadcast.emitRead(
+            { conversationId, userId, height: result.height },
+            { readerOnly: result.conversationType === 'GROUP' },
+          ),
         );
       }
     } catch (error) {
@@ -1413,13 +1474,14 @@ export class ChatGateway implements OnModuleDestroy {
         op,
       );
       reply({ ok: true });
-      if (result.changed) {
+      if (result.changed && result.revision !== null) {
         this.broadcast.emitReaction({
           conversationId,
           messageId,
           emoji,
           op,
           userId,
+          revision: result.revision,
         });
       }
     } catch (error) {
@@ -1461,6 +1523,7 @@ export class ChatGateway implements OnModuleDestroy {
           height: dto.height,
           content: dto.content,
           editedAt: dto.editedAt ?? new Date().toISOString(),
+          revision: dto.revision,
         });
       } catch (error) {
         // 编辑已经提交且 ack 已成功。授权查询/投递失败时安全地不广播，
@@ -1502,6 +1565,63 @@ export class ChatGateway implements OnModuleDestroy {
     } catch (error) {
       reply(this.toAckError(error, 'revoke', userId, payload?.conversationId));
     }
+  }
+
+  private handshakeAppState(socket: Socket): 'background' | 'foreground' {
+    const auth = socket.handshake.auth as UntrustedHandshakeAuth | undefined;
+    return auth?.appState === 'background' ? 'background' : 'foreground';
+  }
+
+  /**
+   * 握手里带的 Expo 推送 token(App 登记过推送才有;网页版没有)。只接受 Expo token
+   * 的形状:它会写进在线登记表的租约成员,那里用 | 分隔。
+   */
+  private handshakePushToken(socket: Socket): string | null {
+    const auth = socket.handshake.auth as UntrustedHandshakeAuth | undefined;
+    const token = auth?.pushToken;
+    return typeof token === 'string' &&
+      token.length <= 256 &&
+      /^Expo(?:nent)?PushToken\[[^\]|]+\]$/.test(token)
+      ? token
+      : null;
+  }
+
+  private async handleAppState(
+    socket: Socket,
+    userId: string,
+    background: boolean,
+    ack?: AckFn<ChatReadAck>,
+  ): Promise<void> {
+    const reply = this.ackOnce(ack);
+    if (!(await this.appStateLimiter.tryAcquire(userId))) {
+      reply(this.ackError(ChatErrorCode.RateLimited));
+      return;
+    }
+    await this.applyAppState(socket, userId, background);
+    reply({ ok: true });
+  }
+
+  /** 记下期望状态并排进这条连接的切换队列;失败只记日志(最坏多推或少推几条)。 */
+  private applyAppState(
+    socket: Socket,
+    userId: string,
+    background: boolean,
+  ): Promise<void> {
+    socket.data.background = background;
+    const previous = this.appStateChains.get(socket) ?? Promise.resolve();
+    const next = previous
+      .then(() =>
+        this.presence.setSocketBackground(userId, socket.id, background),
+      )
+      .catch((error: unknown) => {
+        reportOperationalError(error, {
+          component: 'ChatGateway',
+          operation: 'appState',
+          kind: 'websocket',
+        });
+      });
+    this.appStateChains.set(socket, next);
+    return next;
   }
 
   private async handleTyping(

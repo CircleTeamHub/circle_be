@@ -12,12 +12,15 @@ import {
   IsNotEmpty,
   IsOptional,
   IsString,
-  Matches,
   MaxLength,
   MinLength,
   IsInt,
   Min,
   Max,
+  Validate,
+  ValidatorConstraint,
+  ValidatorConstraintInterface,
+  ValidationArguments,
 } from 'class-validator';
 
 export class NotificationPageQueryDto {
@@ -59,25 +62,42 @@ export class PublishSystemAnnouncementResponseDto {
 }
 
 export const PUSH_TOKEN_PLATFORMS = ['ios', 'android', 'web'] as const;
-export const PUSH_TOKEN_PROVIDERS = ['expo'] as const;
+export const PUSH_TOKEN_PROVIDERS = ['expo', 'jpush'] as const;
 
 export type PushTokenPlatform = (typeof PUSH_TOKEN_PLATFORMS)[number];
 export type PushTokenProvider = (typeof PUSH_TOKEN_PROVIDERS)[number];
 
+const EXPO_PUSH_TOKEN_PATTERN = /^Expo(nent)?PushToken\[[^\s\]]+\]$/;
+
+@ValidatorConstraint({ name: 'pushTokenShape', async: false })
+class PushTokenShapeConstraint implements ValidatorConstraintInterface {
+  validate(value: unknown, args: ValidationArguments) {
+    if (typeof value !== 'string') return true;
+    const provider = (args.object as { provider?: PushTokenProvider }).provider;
+    return provider === 'expo'
+      ? EXPO_PUSH_TOKEN_PATTERN.test(value)
+      : /^\S+$/.test(value);
+  }
+
+  defaultMessage(args: ValidationArguments) {
+    const provider = (args.object as { provider?: PushTokenProvider }).provider;
+    return provider === 'expo'
+      ? 'token must be an Expo push token (ExponentPushToken[...])'
+      : 'token must not contain whitespace';
+  }
+}
+
 export class RegisterPushTokenDto {
-  // #98：provider 目前只有 expo，Expo push token 有公开的稳定形状 ——
-  // ExponentPushToken[...]（旧版 ExpoPushToken[...] 同被接受）。在边界拒绝
-  // 杂讯，而不是等到投递时被 Expo 以 DeviceNotRegistered 打回。
+  // Expo token 使用稳定的 Expo 格式；JPush token 是 SDK 分配的
+  // Registration ID，格式可能随版本和平台变化，只要求无空白。
   @ApiProperty({
     maxLength: 512,
-    example: 'ExponentPushToken[xxxxxxxxxxxxxxxxxxxxxx]',
+    example: 'ExponentPushToken[xxxxxxxxxxxxxxxxxxxxxx] or 190e35e4f...',
   })
   @IsString()
   @IsNotEmpty()
   @MaxLength(512)
-  @Matches(/^Expo(nent)?PushToken\[[^\s\]]+\]$/, {
-    message: 'token must be an Expo push token (ExponentPushToken[...])',
-  })
+  @Validate(PushTokenShapeConstraint)
   token: string;
 
   @ApiProperty({ enum: PUSH_TOKEN_PLATFORMS })

@@ -1334,6 +1334,9 @@ model UserPrivacySetting {
   /// 白名单是两张表;20260907120000 迁移已按 *86400 回填到这一列。
   /// 旧列留到下一版再删(expand/contract:蓝绿窗口里旧二进制还在读它)。
   messageSelfDestructSec  Int      @default(0)
+  /// 全局阅后即焚的开启时间；仅该时间之后发出的消息受 messageSelfDestructSec 约束。
+  /// NULL = 从未开启过。不带它的窗口会把开关打开之前的历史一次性隐藏。
+  messageSelfDestructStartedAt DateTime?
   messageSelfDestructDays Int      @default(0)
   momentsVisibility       String   @default("ALL")
   allowStrangerMessages   Boolean  @default(true)
@@ -2115,6 +2118,18 @@ model ChatConversation {
   /// 也按 max(座位水位, 会话水位) 兜底。
   /// 只前进不后退，与座位水位同义。
   clearedBeforeHeight Int @default(0)
+  /// 会话变更序号流的计数器：触发器最后一次分配的 revision。
+  ///
+  /// 新消息、撤回、编辑、表情回应、焚毁墓碑都在这里取号，由数据库触发器
+  /// `chat_message_assign_revision` / `chat_message_reaction_bump_revision`
+  /// 在同一事务里分配（迁移 20260916000000_add_chat_revision_stream）。
+  /// 行锁持有到提交，所以任何读者都看不到「小号未提交、大号已可见」——
+  /// 客户端只凭一个 afterRevision 游标就能追平所有变更，不再需要按时间戳扫的增量通道。
+  ///
+  /// 会话的序号水位是 max(nextRevision, nextHeight)，不是这一列本身：存量消息回填成
+  /// revision = height，计数器没有整表初始化（取号用的也是 GREATEST）。读侧一律走
+  /// ChatService 的 conversationSyncRevision。应用代码不要手写这一列。
+  nextRevision Int @default(0)
   createdAt  DateTime             @default(now())
   updatedAt  DateTime             @updatedAt
 
@@ -2207,6 +2222,9 @@ model ChatMessage {
   content         Json
   /// 客户端幂等键；系统消息为 null（null 不参与唯一约束冲突）。
   clientMessageId String?  @db.VarChar(128)
+  /// 客户端发送请求的指纹（chatSendRequestHash，sha256 hex）。同一个 d 带着不同内容
+  /// 重发时拒收；服务端/系统消息与本列加上之前的历史行为 null（不比对）。
+  requestHash     String?  @db.VarChar(64)
   replyToID       String?
   deleted         Boolean  @default(false)
   /// Timestamp when the message was burned. Unlike revokedAt/editedAt this is
@@ -2220,6 +2238,9 @@ model ChatMessage {
   editedAt        DateTime?
   /// 编辑前的历史 content 数组（留痕，不外发）。
   contentHistory  Json?
+  /// 这条消息最近一次客户端可见变更占用的会话序号（见 ChatConversation.nextRevision）。
+  /// 创建时即分配；height 是它在时间线上的位置，永不改变。由触发器维护，应用代码不写。
+  revision        Int      @default(0)
   createdAt       DateTime @default(now())
 
   conversation ChatConversation @relation(fields: [conversationID], references: [id], onDelete: Cascade)
@@ -2231,13 +2252,14 @@ model ChatMessage {
   @@unique([conversationID, senderID, clientMessageId])
   // 按日期查聊天记录（chat-history 模块 Phase 2 将从 OpenIM 迁到此索引）。
   @@index([conversationID, createdAt])
-  /// 重连追平（GET /chat/messages/mutations）按变更时刻扫。没有这两条的话，
-  /// 高频群里每次重连都要全表扫那个会话的整段历史，只为捞出几条撤回/编辑。
-  /// 查询里的粗筛写成 `revokedAt >= x OR editedAt >= x` 正是为了走它们
-  /// （GREATEST 表达式本身走不了索引，只用于排序与游标）。
+  /// 旧重连追平（GET /chat/messages/mutations）按变更时刻扫的三条索引。接口已被
+  /// 增量同步取代，但蓝绿发布的回滚目标（旧二进制）还在用它们：按 expand/contract
+  /// 留到下一个版本再删。
   @@index([conversationID, revokedAt])
   @@index([conversationID, editedAt])
   @@index([conversationID, deletedAt])
+  /// 增量同步（GET /chat/conversations/:id/sync）按序号区间扫。
+  @@index([conversationID, revision])
 }
 
 /// 普通 DIRECT 客户端消息同事务写入的 durable inbox。服务端自动回复绕过

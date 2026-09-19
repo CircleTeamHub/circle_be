@@ -18,6 +18,7 @@ function fakeSocket(overrides: Record<string, unknown> = {}) {
       headers: { 'x-connection-trace-id': 'ws-header-trace' },
     },
     join: jest.fn().mockResolvedValue(undefined),
+    emit: jest.fn(),
     disconnect: jest.fn(),
     disconnected: false,
     on: jest.fn((event: string, handler: Handler) => {
@@ -31,11 +32,15 @@ function fakeSocket(overrides: Record<string, unknown> = {}) {
 describe('ChatGateway', () => {
   const jwtService = { verify: jest.fn(), decode: jest.fn() };
   const sessionVerifier = { verify: jest.fn() };
+  // 连接时一次读回全部在座会话和它们的类型(在线状态不进群房间);默认都是单聊。
+  const seats = (...ids: string[]) =>
+    ids.map((conversationId) => ({ conversationId, type: 'DIRECT' }));
   const chatService = {
-    listConversationIds: jest.fn(),
+    listConversationSeats: jest.fn(),
     sendMessage: jest.fn(),
     markRead: jest.fn(),
     editMessage: jest.fn(),
+    toggleReaction: jest.fn(),
     getActiveTempChat: jest.fn(),
     hasSeat: jest.fn(),
     filterVisiblePresenceTargets: jest.fn(),
@@ -55,6 +60,7 @@ describe('ChatGateway', () => {
     emitRead: jest.fn(),
     emitTyping: jest.fn(),
     emitEdit: jest.fn(),
+    emitReaction: jest.fn(),
     emitPresence: jest.fn(),
     isUserOnline: jest.fn().mockResolvedValue(false),
   };
@@ -74,6 +80,7 @@ describe('ChatGateway', () => {
     registerSocket: jest.fn().mockResolvedValue(null),
     registerConversations: jest.fn().mockResolvedValue(undefined),
     socketDisconnected: jest.fn().mockResolvedValue(undefined),
+    setSocketBackground: jest.fn().mockResolvedValue(undefined),
     conversationJoined: jest.fn().mockResolvedValue(undefined),
     conversationLeft: jest.fn().mockResolvedValue(undefined),
     getOnlineUserIds: jest.fn().mockResolvedValue(null),
@@ -385,7 +392,7 @@ describe('ChatGateway', () => {
         const socket = fakeSocket({
           conn: { transport: { name: 'websocket' } },
         });
-        chatService.listConversationIds.mockResolvedValue(['conv-1']);
+        chatService.listConversationSeats.mockResolvedValue(seats('conv-1'));
         broadcast.isUserOnline.mockRejectedValue(
           new Error('Connection is closed.'),
         );
@@ -410,7 +417,7 @@ describe('ChatGateway', () => {
       const socket = fakeSocket({
         conn: { transport: { name: 'websocket' } },
       });
-      chatService.listConversationIds.mockResolvedValue(['conv-1']);
+      chatService.listConversationSeats.mockResolvedValue(seats('conv-1'));
 
       await gateway['handleConnection'](socket as never);
       socket.handlers.get('disconnect')?.('transport error');
@@ -439,7 +446,7 @@ describe('ChatGateway', () => {
         .spyOn((gateway as any).logger, 'error')
         .mockImplementation(() => undefined);
       const socket = fakeSocket({ conn: { transport: { name: 'websocket' } } });
-      chatService.listConversationIds.mockRejectedValue(new Error('db down'));
+      chatService.listConversationSeats.mockRejectedValue(new Error('db down'));
 
       await gateway['handleConnection'](socket as never);
       socket.handlers.get('disconnect')?.('transport error');
@@ -455,6 +462,162 @@ describe('ChatGateway', () => {
         reason: 'transport_error',
         traceId: 'ws-header-trace',
       });
+    });
+  });
+
+  describe('app state (background / foreground)', () => {
+    const settle = async () => {
+      for (let i = 0; i < 5; i += 1) {
+        await new Promise((resolve) => setImmediate(resolve));
+      }
+    };
+
+    // 网关实例在整个文件里共用,每个用户有连接数上限:不断开就会占掉后面用例的名额。
+    const opened: Array<ReturnType<typeof fakeSocket>> = [];
+    afterEach(() => {
+      for (const socket of opened.splice(0)) {
+        socket.handlers.get('disconnect')?.('client namespace disconnect');
+      }
+    });
+
+    async function connect(overrides: Record<string, unknown> = {}) {
+      const socket = fakeSocket({
+        conn: { transport: { name: 'websocket' } },
+        ...overrides,
+      });
+      chatService.listConversationSeats.mockResolvedValue(seats('conv-1'));
+      await gateway['handleConnection'](socket as never);
+      opened.push(socket);
+      return socket;
+    }
+
+    it('marks the connection backgrounded, then foregrounded again, and acks both', async () => {
+      const socket = await connect();
+      const ack = jest.fn();
+
+      socket.handlers.get('chat:background')?.({}, ack);
+      await settle();
+      expect(presence.setSocketBackground).toHaveBeenCalledWith(
+        'u1',
+        'socket-1',
+        true,
+      );
+      expect(socket.data.background).toBe(true);
+      expect(ack).toHaveBeenCalledWith({ ok: true });
+
+      socket.handlers.get('chat:foreground')?.({}, ack);
+      await settle();
+      expect(presence.setSocketBackground).toHaveBeenLastCalledWith(
+        'u1',
+        'socket-1',
+        false,
+      );
+      expect(socket.data.background).toBe(false);
+    });
+
+    it('applies rapid switches in arrival order so the last one wins', async () => {
+      const socket = await connect();
+      let release: () => void = () => undefined;
+      presence.setSocketBackground.mockImplementationOnce(
+        () =>
+          new Promise<void>((resolve) => {
+            release = resolve;
+          }),
+      );
+
+      socket.handlers.get('chat:background')?.({});
+      socket.handlers.get('chat:foreground')?.({});
+      await settle();
+      // 第一次写还卡着:第二次不能抢先落地,否则慢的那次后写会把状态改回后台。
+      expect(presence.setSocketBackground).toHaveBeenCalledTimes(1);
+
+      release();
+      await settle();
+      expect(presence.setSocketBackground.mock.calls).toEqual([
+        ['u1', 'socket-1', true],
+        ['u1', 'socket-1', false],
+      ]);
+    });
+
+    it('accepts an ack passed without a payload', async () => {
+      const socket = await connect();
+      const ack = jest.fn();
+
+      socket.handlers.get('chat:background')?.(ack);
+      await settle();
+
+      expect(ack).toHaveBeenCalledWith({ ok: true });
+    });
+
+    it('registers a connection opened in the background as backgrounded before it joins any online set', async () => {
+      const socket = await connect({
+        handshake: {
+          auth: {
+            token: 'jwt',
+            traceId: 'ws-auth-trace',
+            appState: 'background',
+          },
+          headers: { 'x-connection-trace-id': 'ws-header-trace' },
+        },
+      });
+      await settle();
+
+      expect(socket.data.background).toBe(true);
+      expect(presence.setSocketBackground).toHaveBeenCalledWith(
+        'u1',
+        'socket-1',
+        true,
+      );
+      expect(
+        presence.setSocketBackground.mock.invocationCallOrder[0],
+      ).toBeLessThan(
+        presence.registerConversations.mock.invocationCallOrder[0],
+      );
+    });
+
+    it('keeps a normal connection in the foreground', async () => {
+      const socket = await connect();
+      await settle();
+
+      expect(socket.data.background).toBeUndefined();
+      expect(presence.setSocketBackground).not.toHaveBeenCalled();
+    });
+  });
+
+  describe('access token expiry', () => {
+    afterEach(() => jest.useRealTimers());
+
+    it('tells the client the session expired before disconnecting it', () => {
+      jest.useFakeTimers();
+      const socket = fakeSocket({
+        data: { userId: 'u1', expMs: Date.now() + 1_000 },
+      });
+
+      gateway['scheduleExpiryDisconnect'](socket as never);
+      jest.advanceTimersByTime(1_000);
+
+      // 服务端主动断开的连接 socket.io 客户端不会自动重连;只给一个 disconnect,
+      // App 分不清「token 过期、刷新后重连」和「被踢」。
+      expect(socket.emit).toHaveBeenCalledWith('chat:session_expired', {
+        reason: 'token_expired',
+      });
+      expect(socket.disconnect).toHaveBeenCalledWith(true);
+      expect(socket.emit.mock.invocationCallOrder[0]).toBeLessThan(
+        socket.disconnect.mock.invocationCallOrder[0],
+      );
+    });
+
+    it('says the same thing when the token is already expired at connect', () => {
+      const socket = fakeSocket({
+        data: { userId: 'u1', expMs: Date.now() - 1 },
+      });
+
+      gateway['scheduleExpiryDisconnect'](socket as never);
+
+      expect(socket.emit).toHaveBeenCalledWith('chat:session_expired', {
+        reason: 'token_expired',
+      });
+      expect(socket.disconnect).toHaveBeenCalledWith(true);
     });
   });
 
@@ -525,7 +688,9 @@ describe('ChatGateway', () => {
   describe('handleConnection', () => {
     it('joins the personal room plus every membership conversation room', async () => {
       const socket = fakeSocket();
-      chatService.listConversationIds.mockResolvedValue(['conv-1', 'conv-2']);
+      chatService.listConversationSeats.mockResolvedValue(
+        seats('conv-1', 'conv-2'),
+      );
       await gateway['handleConnection'](socket as never);
       expect(socket.join).toHaveBeenCalledWith('u:u1');
       expect(socket.join).toHaveBeenCalledWith(['c:conv-1', 'c:conv-2']);
@@ -540,7 +705,7 @@ describe('ChatGateway', () => {
         .spyOn(errorAggregation, 'reportOperationalError')
         .mockImplementation(() => undefined);
       const socket = fakeSocket();
-      chatService.listConversationIds.mockRejectedValue(new Error('db down'));
+      chatService.listConversationSeats.mockRejectedValue(new Error('db down'));
       await gateway['handleConnection'](socket as never);
       expect(socket.disconnect).toHaveBeenCalledWith(true);
       expect(metrics.observeConnectionRejected).toHaveBeenCalledWith(
@@ -570,7 +735,7 @@ describe('ChatGateway', () => {
     // (开关翻回来时要有数可显示)。
     it('stays silent on connect and disconnect when the user hid presence', async () => {
       const socket = fakeSocket();
-      chatService.listConversationIds.mockResolvedValue(['conv-1']);
+      chatService.listConversationSeats.mockResolvedValue(seats('conv-1'));
       chatService.isPresenceVisible.mockResolvedValue(false);
       broadcast.isUserOnline.mockResolvedValue(false);
 
@@ -591,7 +756,7 @@ describe('ChatGateway', () => {
 
     it('records last-seen and broadcasts offline with that timestamp on the last disconnect', async () => {
       const socket = fakeSocket();
-      chatService.listConversationIds.mockResolvedValue(['conv-1']);
+      chatService.listConversationSeats.mockResolvedValue(seats('conv-1'));
       broadcast.isUserOnline.mockResolvedValue(false);
 
       await gateway['handleConnection'](socket as never);
@@ -640,9 +805,80 @@ describe('ChatGateway', () => {
       );
     });
 
+    // 在线状态只在单聊头部和资料页用(资料页打开时另查一次)。每次上下线都向
+    // 所有群房间广播,千人在线的群就是在线人数平方级的帧;群房间只照常入房。
+    it('keeps group rooms out of online and offline presence broadcasts', async () => {
+      const socket = fakeSocket();
+      chatService.listConversationSeats.mockResolvedValue([
+        { conversationId: 'dm-1', type: 'DIRECT' },
+        { conversationId: 'group-1', type: 'GROUP' },
+        { conversationId: 'support-1', type: 'SUPPORT' },
+      ]);
+      broadcast.isUserOnline.mockResolvedValue(false);
+
+      await gateway['handleConnection'](socket as never);
+      expect(socket.join).toHaveBeenCalledWith([
+        'c:dm-1',
+        'c:group-1',
+        'c:support-1',
+      ]);
+      expect(broadcast.emitPresence).toHaveBeenCalledWith(
+        ['dm-1', 'support-1'],
+        { userId: 'u1', online: true },
+        [],
+      );
+
+      broadcast.emitPresence.mockClear();
+      socket.handlers.get('disconnect')?.('transport close');
+      await new Promise((resolve) => setImmediate(resolve));
+      await new Promise((resolve) => setImmediate(resolve));
+      expect(broadcast.emitPresence).toHaveBeenCalledWith(
+        ['dm-1', 'support-1'],
+        expect.objectContaining({ userId: 'u1', online: false }),
+        [],
+      );
+    });
+
+    // 推送按设备跳过「正开着 App 的那台」,靠的是握手里带上的推送 token。只收 Expo
+    // token 的形状:它会写进在线登记表的租约成员(用 | 分隔)。
+    it('registers the device push token from the handshake, rejecting anything else', async () => {
+      chatService.listConversationSeats.mockResolvedValue(seats('conv-1'));
+      const phone = fakeSocket({
+        handshake: {
+          auth: { token: 'jwt', pushToken: 'ExponentPushToken[abc-123_x]' },
+          headers: {},
+        },
+      });
+      await gateway['handleConnection'](phone as never);
+      expect(presence.registerSocket).toHaveBeenLastCalledWith(
+        'u1',
+        'socket-1',
+        'ExponentPushToken[abc-123_x]',
+      );
+      phone.handlers.get('disconnect')?.('client namespace disconnect');
+
+      for (const pushToken of [
+        'ExponentPushToken[a|b]',
+        'not-a-token',
+        42,
+        `ExponentPushToken[${'x'.repeat(300)}]`,
+      ]) {
+        const socket = fakeSocket({
+          handshake: { auth: { token: 'jwt', pushToken }, headers: {} },
+        });
+        await gateway['handleConnection'](socket as never);
+        expect(presence.registerSocket).toHaveBeenLastCalledWith(
+          'u1',
+          'socket-1',
+          null,
+        );
+        socket.handlers.get('disconnect')?.('client namespace disconnect');
+      }
+    });
+
     it('excludes blocked counterparties from the online broadcast', async () => {
       const socket = fakeSocket();
-      chatService.listConversationIds.mockResolvedValue(['conv-1']);
+      chatService.listConversationSeats.mockResolvedValue(seats('conv-1'));
       chatService.listBlockedCounterparties.mockResolvedValue(['blocked-1']);
 
       await gateway['handleConnection'](socket as never);
@@ -657,9 +893,9 @@ describe('ChatGateway', () => {
     it('registers event handlers before awaiting room setup', async () => {
       const socket = fakeSocket();
       let handlersAtLookup = 0;
-      chatService.listConversationIds.mockImplementation(() => {
+      chatService.listConversationSeats.mockImplementation(() => {
         handlersAtLookup = socket.handlers.size;
-        return Promise.resolve(['conv-1']);
+        return Promise.resolve(seats('conv-1'));
       });
       await gateway['handleConnection'](socket as never);
       expect(handlersAtLookup).toBeGreaterThan(0);
@@ -943,7 +1179,7 @@ describe('ChatGateway', () => {
         data: { userId: 'g1', guestConversationId: 'conv-9' },
       });
       await gateway['handleConnection'](socket as never);
-      expect(chatService.listConversationIds).not.toHaveBeenCalled();
+      expect(chatService.listConversationSeats).not.toHaveBeenCalled();
       expect(socket.join).toHaveBeenCalledWith('u:g1');
       expect(socket.join).not.toHaveBeenCalledWith(['c:conv-9']);
     });
@@ -1399,8 +1635,10 @@ describe('ChatGateway', () => {
   describe('handleEdit', () => {
     it('keeps the committed success ack and fails closed when authorized edit delivery rejects', async () => {
       chatService.editMessage.mockResolvedValue({
+        height: 3,
         content: { text: 'updated private content' },
         editedAt: '2026-09-03T00:00:00.000Z',
+        revision: 8,
       });
       broadcast.emitEdit.mockRejectedValueOnce(
         new Error('private edit adapter detail'),
@@ -1425,8 +1663,11 @@ describe('ChatGateway', () => {
       expect(broadcast.emitEdit).toHaveBeenCalledWith({
         conversationId: 'conv-1',
         messageId: 'message-1',
+        height: 3,
         content: { text: 'updated private content' },
         editedAt: '2026-09-03T00:00:00.000Z',
+        // 客户端据此推进本会话的同步游标。
+        revision: 8,
       });
       expect(broadcast.emitMessage).not.toHaveBeenCalled();
       expect(warn).toHaveBeenCalledWith(
@@ -1439,9 +1680,64 @@ describe('ChatGateway', () => {
     });
   });
 
+  describe('handleReaction', () => {
+    it('broadcasts the new revision the reaction was assigned', async () => {
+      chatService.toggleReaction.mockResolvedValue({
+        changed: true,
+        revision: 12,
+      });
+      const ack = jest.fn();
+
+      await gateway['handleReaction'](
+        'u1',
+        {
+          conversationId: 'conv-1',
+          messageId: 'message-1',
+          emoji: '👍',
+          op: 'add',
+        },
+        ack,
+      );
+
+      expect(ack).toHaveBeenCalledWith({ ok: true });
+      expect(broadcast.emitReaction).toHaveBeenCalledWith({
+        conversationId: 'conv-1',
+        messageId: 'message-1',
+        emoji: '👍',
+        op: 'add',
+        userId: 'u1',
+        revision: 12,
+      });
+    });
+
+    it('stays silent when nothing changed', async () => {
+      chatService.toggleReaction.mockResolvedValue({
+        changed: false,
+        revision: null,
+      });
+
+      await gateway['handleReaction'](
+        'u1',
+        {
+          conversationId: 'conv-1',
+          messageId: 'message-1',
+          emoji: '👍',
+          op: 'add',
+        },
+        jest.fn(),
+      );
+
+      expect(broadcast.emitReaction).not.toHaveBeenCalled();
+    });
+  });
+
   describe('handleRead', () => {
     it('acks and broadcasts only when the watermark advanced', async () => {
-      chatService.markRead.mockResolvedValue({ advanced: true, height: 5 });
+      chatService.markRead.mockResolvedValue({
+        advanced: true,
+        height: 5,
+        conversationType: 'DIRECT',
+      });
       const ack = jest.fn();
       await gateway['handleRead'](
         fakeSocket() as never,
@@ -1450,14 +1746,17 @@ describe('ChatGateway', () => {
         ack,
       );
       expect(ack).toHaveBeenCalledWith({ ok: true });
-      expect(broadcast.emitRead).toHaveBeenCalledWith({
-        conversationId: 'conv-1',
-        userId: 'u1',
-        height: 5,
-      });
+      expect(broadcast.emitRead).toHaveBeenCalledWith(
+        { conversationId: 'conv-1', userId: 'u1', height: 5 },
+        { readerOnly: false },
+      );
 
       broadcast.emitRead.mockClear();
-      chatService.markRead.mockResolvedValue({ advanced: false, height: 4 });
+      chatService.markRead.mockResolvedValue({
+        advanced: false,
+        height: 4,
+        conversationType: 'DIRECT',
+      });
       await gateway['handleRead'](
         fakeSocket() as never,
         'u1',
@@ -1465,6 +1764,26 @@ describe('ChatGateway', () => {
         jest.fn(),
       );
       expect(broadcast.emitRead).not.toHaveBeenCalled();
+    });
+
+    // 群聊的「已读」只在本人的未读和逐条已读(按需查询)里用,别人的界面不渲染
+    // 谁读到了哪 —— 广播给全群就是每读一次向每个在线成员投一帧。只同步本人的其它设备。
+    it('sends group read receipts only to the reader own devices', async () => {
+      chatService.markRead.mockResolvedValue({
+        advanced: true,
+        height: 7,
+        conversationType: 'GROUP',
+      });
+      await gateway['handleRead'](
+        fakeSocket() as never,
+        'u1',
+        { conversationId: 'group-1', height: 7 },
+        jest.fn(),
+      );
+      expect(broadcast.emitRead).toHaveBeenCalledWith(
+        { conversationId: 'group-1', userId: 'u1', height: 7 },
+        { readerOnly: true },
+      );
     });
 
     // 其他带 ack 的处理器都先做 typeof 校验;read 把 payload.conversationId 原样

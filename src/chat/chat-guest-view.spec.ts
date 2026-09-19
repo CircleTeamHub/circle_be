@@ -14,6 +14,7 @@ function message(overrides: Partial<ChatMessageDto> = {}): ChatMessageDto {
     id: 'message-1',
     conversationId: 'conv-temp',
     height: 3,
+    revision: 3,
     type: 'text',
     content: { text: 'hi' },
     sender: { id: HOST_ID, nickname: '房主', avatarUrl: null, alias: null },

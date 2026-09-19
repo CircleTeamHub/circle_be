@@ -121,6 +121,7 @@ export class ChatSystemMessageService {
       sender,
       replyToId: null,
       d: row.clientMessageId,
+      revision: row.revision,
       createdAt: row.createdAt.toISOString(),
     };
     // 服务端也会产 image（充值收款码）。数据库只存 object key，实时广播前必须
@@ -224,6 +225,7 @@ export class ChatSystemMessageService {
       sender: null,
       replyToId: null,
       d: null,
+      revision: created.revision,
       createdAt: created.createdAt.toISOString(),
     };
   }

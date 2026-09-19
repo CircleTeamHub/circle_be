@@ -101,10 +101,11 @@ describe('LoginDto identifier / email fallback', () => {
   });
 });
 
-// platform 是装机的旧版 APP 仍在发的字段（登录、注册都带 getClientPlatformID()，
-// 取值 1/2/5）。服务端早就不读它；可在 forbidNonWhitelisted 下属性一删，这些安装包的
-// 登录就会 400。所以属性保留、照旧校验，只从 OpenAPI 里隐藏。
-describe('LoginDto platform (deprecated: accepted and ignored)', () => {
+// platform 曾是旧安装包登录时固定发的字段（OpenIM 的端标识，取值 1/2/5）。OpenIM 已
+// 下线，服务端从来不读它，App 新版、管理台、网页版也都不发了，所以属性整个删掉。
+// 后果是明确的破坏性变更：全局 ValidationPipe 开着 forbidNonWhitelisted，仍在发
+// platform 的旧安装包登录会被拒成 400。产品尚未对外发布，这个代价可以接受。
+describe('LoginDto no longer accepts platform', () => {
   // 与全局 ValidationPipe 同一组选项（src/setup.ts）。
   const validateLikePipe = (input: Record<string, unknown>) =>
     validate(
@@ -112,37 +113,23 @@ describe('LoginDto platform (deprecated: accepted and ignored)', () => {
       { whitelist: true, forbidNonWhitelisted: true },
     );
 
+  const credentials = {
+    identifier: 'user@example.com',
+    password: 'password1',
+  };
+
   it.each([1, 2, 5])(
-    'still accepts platform %s from installed app builds',
+    'rejects platform %s as an unknown property',
     async (platform) => {
+      const errors = await validateLikePipe({ ...credentials, platform });
+
       expect(
-        await validateLikePipe({
-          identifier: 'user@example.com',
-          password: 'password1',
-          platform,
-        }),
-      ).toHaveLength(0);
+        errors.find((error) => error.property === 'platform')?.constraints,
+      ).toHaveProperty('whitelistValidation');
     },
   );
 
-  it('keeps validating the value as before', async () => {
-    const errors = await validateLikePipe({
-      identifier: 'user@example.com',
-      password: 'password1',
-      platform: 3,
-    });
-    expect(
-      errors.find((error) => error.property === 'platform')?.constraints,
-    ).toHaveProperty('isIn');
-  });
-
-  it('is no longer documented in the OpenAPI schema', () => {
-    const documented: string[] =
-      Reflect.getMetadata(
-        'swagger/apiModelPropertiesArray',
-        LoginDto.prototype,
-      ) ?? [];
-    expect(documented).toContain(':password');
-    expect(documented).not.toContain(':platform');
+  it('accepts the payload current clients send', async () => {
+    expect(await validateLikePipe(credentials)).toHaveLength(0);
   });
 });

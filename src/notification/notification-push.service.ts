@@ -10,7 +10,11 @@ import { reportOperationalError } from 'src/logging/error-aggregation.service';
 
 const EXPO_PUSH_URL = 'https://exp.host/--/api/v2/push/send';
 const EXPO_RECEIPT_URL = 'https://exp.host/--/api/v2/push/getReceipts';
+const JPUSH_PUSH_URL = 'https://api.jpush.cn/v3/push';
 const EXPO_BATCH_SIZE = 100;
+// 一次扇出里同时在途的 Expo 请求数:3000 人的群是 30 批,串行发太慢,全并发又会
+// 撞 Expo 的速率限制。
+const EXPO_SEND_CONCURRENCY = 4;
 const EXPO_MAX_ATTEMPTS = 3;
 // Hard cap on the Expo call. Node's global fetch (undici) applies no response
 // timeout by default — a hung Expo endpoint would stall the outbox sweep.
@@ -24,6 +28,46 @@ const RECEIPT_BATCH_SIZE = 300;
 // review 修复：单轮最多抽多少批 —— 300×20=6000 行/轮，远超预期峰值；
 // 有上限只是防御性兜底（雪崩恢复时不至于一轮跑穿全表）。
 const RECEIPT_MAX_BATCHES_PER_RUN = 20;
+// 每个用户每家推送服务最多推几台设备(按最近注册的算);与登记时的配额一致。
+const MAX_ACTIVE_TOKENS_PER_PROVIDER = 20;
+const MAX_PUSH_BODY_BYTES = 1024;
+// 极光单次推送的 registration_id 上限。
+const JPUSH_MAX_AUDIENCE = 1000;
+// 一次扇出里同时在途的极光请求数(聊天大群每个收件人的角标不同,各发一个请求)。
+const JPUSH_SEND_CONCURRENCY = 4;
+
+/** 一个用户的一台活跃推送设备。 */
+export type ActivePushToken = {
+  token: string;
+  projectId: string | null;
+  provider: string;
+};
+
+type IndexedMessage = {
+  index: number;
+  token: string;
+  projectId: string | null;
+  payload: ExpoPushPayload;
+};
+
+class JPushHttpError extends Error {
+  constructor(
+    message: string,
+    readonly status: number,
+  ) {
+    super(message);
+    this.name = 'JPushHttpError';
+  }
+}
+
+function truncateUtf8(value: string, maxBytes: number): string {
+  if (Buffer.byteLength(value, 'utf8') <= maxBytes) return value;
+  let end = Math.min(value.length, maxBytes);
+  while (end > 0 && Buffer.byteLength(value.slice(0, end), 'utf8') > maxBytes) {
+    end -= 1;
+  }
+  return value.slice(0, end);
+}
 
 type ExpoPushTicket = {
   status?: string;
@@ -39,7 +83,7 @@ type ExpoPushReceipt = {
 /** 单 token 的一次投递结果（#88：不再聚合成整通知一个结论）。 */
 export type TokenDeliveryOutcome = {
   token: string;
-  status: 'SENT' | 'RETRYABLE' | 'TERMINAL';
+  status: 'SENT' | 'CONFIRMED' | 'RETRYABLE' | 'TERMINAL';
   ticketId?: string;
   error?: string;
 };
@@ -50,6 +94,19 @@ export type ExpoPushPayload = {
   data: Record<string, unknown>;
   /** iOS 图标角标数(G-18);缺省不改角标。 */
   badge?: number;
+  /**
+   * 以下是 Expo 的投递选项,缺省时不出现在消息里(沿用各平台默认)。
+   * priority:安卓默认 normal,省电模式下会被延后;即时消息要 high。
+   */
+  priority?: 'default' | 'normal' | 'high';
+  /** 安卓通知渠道;设备上没建这个渠道时 expo-notifications 回落到默认渠道。 */
+  channelId?: string;
+  /** 安卓:同 tag 的新通知替换已显示的旧通知。 */
+  tag?: string;
+  /** iOS:按线程分组显示。 */
+  threadId?: string;
+  /** 设备离线时服务商保留多久(秒);缺省为服务商默认的 4 周。 */
+  ttl?: number;
 };
 
 const RETRYABLE_TICKET_ERRORS = new Set([
@@ -72,6 +129,9 @@ export class NotificationPushService {
   // Optional. Required only when the Expo project has "Enhanced Security for
   // Push Notifications" enabled — Expo then rejects unauthenticated sends.
   private readonly expoAccessToken: string;
+  private readonly jpushAppKey: string;
+  private readonly jpushMasterSecret: string;
+  private readonly jpushApnsProduction: boolean;
 
   constructor(
     private readonly prisma: PrismaService,
@@ -79,6 +139,22 @@ export class NotificationPushService {
   ) {
     this.expoAccessToken =
       this.config.get<string>('EXPO_ACCESS_TOKEN')?.trim() ?? '';
+    this.jpushAppKey = this.config.get<string>('JPUSH_APP_KEY')?.trim() ?? '';
+    this.jpushMasterSecret =
+      this.config.get<string>('JPUSH_MASTER_SECRET')?.trim() ?? '';
+    const apnsProduction = this.config.get<boolean | string>(
+      'JPUSH_APNS_PRODUCTION',
+    );
+    this.jpushApnsProduction =
+      typeof apnsProduction === 'boolean'
+        ? apnsProduction
+        : apnsProduction
+          ? apnsProduction.trim().toLowerCase() === 'true'
+          : this.config.get<string>('NODE_ENV') === 'production';
+  }
+
+  isJPushConfigured(): boolean {
+    return Boolean(this.jpushAppKey && this.jpushMasterSecret);
   }
 
   /** 组装推送 payload。外置成公开方法：outbox 第一次处理时快照进 DB（#88）。 */
@@ -99,7 +175,7 @@ export class NotificationPushService {
           this.fallbackBody(notification.type);
     return {
       title: notification.type === 'SYSTEM' ? '系统通知' : actor,
-      body,
+      body: truncateUtf8(body, MAX_PUSH_BODY_BYTES),
       data: {
         notificationId: notification.id,
         type: notification.type,
@@ -130,17 +206,67 @@ export class NotificationPushService {
     };
   }
 
-  /** 当前活跃 token 清单（含 Expo projectId 分组信息），供 outbox 建投递行。 */
-  async listActiveTokens(
-    userId: string,
-  ): Promise<Array<{ token: string; projectId: string | null }>> {
+  private activeProviders(): string[] {
+    // 极光没配凭据时它的 token 不参与投递:发不出去的请求只会把 outbox 重试耗尽。
+    return this.isJPushConfigured() ? ['expo', 'jpush'] : ['expo'];
+  }
+
+  /** 当前活跃 token 清单（含 provider/projectId 元数据），供 outbox 建投递行。 */
+  async listActiveTokens(userId: string): Promise<ActivePushToken[]> {
     const rows = await this.prisma.devicePushToken.findMany({
-      where: { userID: userId, provider: 'expo', disabledAt: null },
-      select: { token: true, projectId: true },
+      where: {
+        userID: userId,
+        provider: { in: this.activeProviders() },
+        disabledAt: null,
+      },
+      select: { token: true, projectId: true, provider: true },
       orderBy: { updatedAt: 'desc' },
-      take: 20,
     });
-    return rows;
+    const rowsByProvider = new Map<string, typeof rows>();
+    for (const row of rows) {
+      const providerRows = rowsByProvider.get(row.provider) ?? [];
+      if (providerRows.length < MAX_ACTIVE_TOKENS_PER_PROVIDER) {
+        providerRows.push(row);
+        rowsByProvider.set(row.provider, providerRows);
+      }
+    }
+    return [...rowsByProvider.values()].flat();
+  }
+
+  /**
+   * 多个用户的活跃 token 一次查回(每人每家服务最近的 MAX_ACTIVE_TOKENS_PER_PROVIDER
+   * 个)。聊天大群扇出用:原来每个收件人一次查询,3000 人的群一条消息就是 3000 次往返。
+   * 没有活跃 token 的用户不出现在结果里。
+   */
+  async listActiveTokensForUsers(
+    userIds: string[],
+  ): Promise<Map<string, ActivePushToken[]>> {
+    const byUser = new Map<string, ActivePushToken[]>();
+    if (userIds.length === 0) return byUser;
+    const rows = await this.prisma.devicePushToken.findMany({
+      where: {
+        userID: { in: userIds },
+        provider: { in: this.activeProviders() },
+        disabledAt: null,
+      },
+      select: { userID: true, token: true, projectId: true, provider: true },
+      orderBy: { updatedAt: 'desc' },
+    });
+    const perProvider = new Map<string, number>();
+    for (const row of rows) {
+      const key = `${row.userID}\u0000${row.provider}`;
+      const count = perProvider.get(key) ?? 0;
+      if (count >= MAX_ACTIVE_TOKENS_PER_PROVIDER) continue;
+      perProvider.set(key, count + 1);
+      const tokens = byUser.get(row.userID) ?? [];
+      tokens.push({
+        token: row.token,
+        projectId: row.projectId,
+        provider: row.provider,
+      });
+      byUser.set(row.userID, tokens);
+    }
+    return byUser;
   }
 
   /**
@@ -149,34 +275,127 @@ export class NotificationPushService {
    * 返回每 token 的结论 + Expo ticket id。
    */
   async sendToTokens(
-    tokens: Array<{ token: string; projectId: string | null }>,
+    tokens: Array<{
+      token: string;
+      projectId: string | null;
+      provider?: string;
+    }>,
     payload: ExpoPushPayload,
   ): Promise<TokenDeliveryOutcome[]> {
-    if (tokens.length === 0) return [];
+    return this.sendMessages(tokens.map((token) => ({ ...token, payload })));
+  }
 
+  /**
+   * 每条消息各带载荷(聊天扇出里每个收件人的角标不同)。Expo 按单次上限 100 条分批、
+   * 极光按载荷分组,各自有限并发发出;两家互不等待,一家卡在超时上不拖另一家。
+   * 结论与入参一一对应(同一下标);死令牌就地停用。
+   */
+  async sendMessages(
+    messages: Array<{
+      token: string;
+      projectId: string | null;
+      provider?: string;
+      payload: ExpoPushPayload;
+    }>,
+  ): Promise<TokenDeliveryOutcome[]> {
+    if (messages.length === 0) return [];
+
+    const outcomes = new Array<TokenDeliveryOutcome>(messages.length);
+    const expo: IndexedMessage[] = [];
+    const jpush: IndexedMessage[] = [];
+    messages.forEach((message, index) => {
+      (message.provider === 'jpush' ? jpush : expo).push({
+        index,
+        token: message.token,
+        projectId: message.projectId,
+        payload: message.payload,
+      });
+    });
+    await Promise.all([
+      this.deliverExpo(expo, outcomes),
+      this.deliverJPush(jpush, outcomes),
+    ]);
+
+    return this.finalizeTokenOutcomes(outcomes);
+  }
+
+  private async deliverExpo(
+    messages: IndexedMessage[],
+    outcomes: TokenDeliveryOutcome[],
+  ): Promise<void> {
+    if (messages.length === 0) return;
     // Expo project IDs must not be mixed in a single request when enhanced
     // security is enabled. Group first, then batch each project independently.
-    const byProject = new Map<string, typeof tokens>();
-    for (const token of tokens) {
-      const key = token.projectId ?? '';
+    const byProject = new Map<string, IndexedMessage[]>();
+    for (const message of messages) {
+      const key = message.projectId ?? '';
       const group = byProject.get(key) ?? [];
-      group.push(token);
+      group.push(message);
       byProject.set(key, group);
     }
-
-    const outcomes: TokenDeliveryOutcome[] = [];
-    for (const projectTokens of byProject.values()) {
-      for (let i = 0; i < projectTokens.length; i += EXPO_BATCH_SIZE) {
-        const batch = projectTokens.slice(i, i + EXPO_BATCH_SIZE);
-        outcomes.push(
-          ...(await this.sendBatch(
-            batch.map((row) => row.token),
-            payload,
-          )),
-        );
+    const batches: IndexedMessage[][] = [];
+    for (const projectMessages of byProject.values()) {
+      for (let i = 0; i < projectMessages.length; i += EXPO_BATCH_SIZE) {
+        batches.push(projectMessages.slice(i, i + EXPO_BATCH_SIZE));
       }
     }
 
+    for (let i = 0; i < batches.length; i += EXPO_SEND_CONCURRENCY) {
+      const chunk = batches.slice(i, i + EXPO_SEND_CONCURRENCY);
+      const settled = await Promise.all(
+        chunk.map((batch) => this.sendBatch(batch)),
+      );
+      chunk.forEach((batch, batchIndex) => {
+        batch.forEach((entry, entryIndex) => {
+          outcomes[entry.index] = settled[batchIndex][entryIndex];
+        });
+      });
+    }
+  }
+
+  /**
+   * 极光一个请求发给一批 registration_id,载荷相同的共用一个请求:通知 outbox 是同一
+   * 用户的几台设备共用一份载荷;聊天扇出里每个收件人的角标不同,各发一个。
+   */
+  private async deliverJPush(
+    messages: IndexedMessage[],
+    outcomes: TokenDeliveryOutcome[],
+  ): Promise<void> {
+    if (messages.length === 0) return;
+    const byPayload = new Map<ExpoPushPayload, IndexedMessage[]>();
+    for (const message of messages) {
+      const group = byPayload.get(message.payload) ?? [];
+      group.push(message);
+      byPayload.set(message.payload, group);
+    }
+    const requests: IndexedMessage[][] = [];
+    for (const group of byPayload.values()) {
+      for (let i = 0; i < group.length; i += JPUSH_MAX_AUDIENCE) {
+        requests.push(group.slice(i, i + JPUSH_MAX_AUDIENCE));
+      }
+    }
+
+    for (let i = 0; i < requests.length; i += JPUSH_SEND_CONCURRENCY) {
+      const chunk = requests.slice(i, i + JPUSH_SEND_CONCURRENCY);
+      const settled = await Promise.all(
+        chunk.map((request) =>
+          this.sendJPush(
+            request.map((entry) => entry.token),
+            request[0].payload,
+          ),
+        ),
+      );
+      chunk.forEach((request, requestIndex) => {
+        request.forEach((entry, entryIndex) => {
+          outcomes[entry.index] = settled[requestIndex][entryIndex];
+        });
+      });
+    }
+  }
+
+  private async finalizeTokenOutcomes(
+    outcomes: TokenDeliveryOutcome[],
+  ): Promise<TokenDeliveryOutcome[]> {
     // 只有「令牌已死」类错误才停用 token —— MessageTooBig 等消息级终态
     // 与 token 健康无关，误停会把活设备静音。
     const deadTokens = outcomes
@@ -193,6 +412,91 @@ export class NotificationPushService {
       });
     }
     return outcomes;
+  }
+
+  /**
+   * JPush 接受 registration_id 数组后返回一个 msg_id，但没有 Expo 那种
+   * 每设备 receipt。这里成功直接标记 CONFIRMED，不写 ticketID，避免
+   * Expo receipt poller 把 JPush msg_id 当成 Expo receipt 查询。
+   */
+  private async sendJPush(
+    tokens: string[],
+    payload: ExpoPushPayload,
+  ): Promise<TokenDeliveryOutcome[]> {
+    if (!this.isJPushConfigured()) {
+      return tokens.map((token) => ({
+        token,
+        status: 'RETRYABLE',
+        error: 'JPushCredentialsMissing',
+      }));
+    }
+
+    const message = {
+      platform: 'all',
+      audience: { registration_id: tokens },
+      notification: {
+        alert: payload.body,
+        android: {
+          alert: payload.body,
+          title: payload.title,
+          extras: payload.data,
+        },
+        ios: {
+          alert: { title: payload.title, body: payload.body },
+          sound: 'default',
+          ...(payload.badge !== undefined ? { badge: payload.badge } : {}),
+          extras: payload.data,
+        },
+      },
+      options: {
+        apns_production: this.jpushApnsProduction,
+      },
+    };
+
+    try {
+      const response = await fetch(JPUSH_PUSH_URL, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Basic ${Buffer.from(
+            `${this.jpushAppKey}:${this.jpushMasterSecret}`,
+          ).toString('base64')}`,
+        },
+        body: JSON.stringify(message),
+        signal: AbortSignal.timeout(EXPO_PUSH_TIMEOUT_MS),
+      });
+      if (!response.ok) {
+        throw new JPushHttpError(`HTTP ${response.status}`, response.status);
+      }
+      await response.json();
+      return tokens.map((token) => ({ token, status: 'CONFIRMED' }));
+    } catch (error) {
+      const messageText =
+        error instanceof Error ? error.message : String(error);
+      this.logger.warn(`JPush send failed: ${messageText}`);
+      logExternalCallFailure(this.logger, {
+        enabled: this.loggingConfig.externalLogOn,
+        service: 'jpush',
+        operation: 'send',
+        error,
+      });
+      reportOperationalError(error, {
+        component: 'NotificationPushService',
+        operation: 'sendToTokens',
+        kind: 'jpush',
+      });
+      const status =
+        error instanceof JPushHttpError &&
+        ![408, 429].includes(error.status) &&
+        error.status < 500
+          ? 'TERMINAL'
+          : 'RETRYABLE';
+      return tokens.map((token) => ({
+        token,
+        status: status as 'TERMINAL' | 'RETRYABLE',
+        error: messageText,
+      }));
+    }
   }
 
   /**
@@ -469,16 +773,23 @@ export class NotificationPushService {
 
   /** 单批发送：HTTP 层重试后返回逐 token 结论（ticket 顺序与请求一一对应）。 */
   private async sendBatch(
-    tokens: string[],
-    payload: ExpoPushPayload,
+    batch: Array<{ token: string; payload: ExpoPushPayload }>,
   ): Promise<TokenDeliveryOutcome[]> {
-    const messages = tokens.map((token) => ({
+    const tokens = batch.map((entry) => entry.token);
+    const messages = batch.map(({ token, payload }) => ({
       to: token,
       sound: 'default',
       title: payload.title,
       body: payload.body,
       data: payload.data,
       ...(payload.badge !== undefined ? { badge: payload.badge } : {}),
+      ...(payload.priority !== undefined ? { priority: payload.priority } : {}),
+      ...(payload.channelId !== undefined
+        ? { channelId: payload.channelId }
+        : {}),
+      ...(payload.tag !== undefined ? { tag: payload.tag } : {}),
+      ...(payload.threadId !== undefined ? { threadId: payload.threadId } : {}),
+      ...(payload.ttl !== undefined ? { ttl: payload.ttl } : {}),
     }));
 
     for (let attempt = 1; attempt <= EXPO_MAX_ATTEMPTS; attempt += 1) {

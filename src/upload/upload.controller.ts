@@ -70,9 +70,9 @@ export class UploadController {
     summary: '获取预签名上传 URL',
     description:
       `返回 uploadUrl（PUT 上传用；图片 5 分钟、视频 30 分钟有效）、key 与 fileUrl。` +
-      `fileUrl 只对公开目录（${PUBLIC_READ_UPLOAD_FOLDERS.join('、')}）可直接读取；` +
-      `私有目录（${PRIVATE_UPLOAD_FOLDERS.join('、')}）的对象直连会被拒绝，须保存 key，` +
-      `由对应读路径（聊天消息 / 笔记详情）按 key 签发短时 GET URL 读取。`,
+      `fileUrl 只对公开目录（${PUBLIC_READ_UPLOAD_FOLDERS.join('、')}）有值，可直接读取；` +
+      `私有目录（${PRIVATE_UPLOAD_FOLDERS.join('、')}）的对象直连会被拒绝，fileUrl 固定为 null，` +
+      `一律保存 key，由对应读路径（聊天消息 / 笔记详情）按 key 签发短时 GET URL 读取。`,
   })
   async presign(@Body() dto: PresignDto, @Req() req: RequestWithUser) {
     await this.checkUserPresignLimit(req.user.userId, dto.sizeBytes);

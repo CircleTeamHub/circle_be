@@ -261,13 +261,12 @@ export class NotificationPushOutboxProcessor {
           continue;
         }
 
-        const projectByToken = new Map(
-          tokens.map((row) => [row.token, row.projectId]),
-        );
+        const tokenMetaByToken = new Map(tokens.map((row) => [row.token, row]));
         const outcomes = await this.pushService.sendToTokens(
           pendingDeliveries.map((delivery) => ({
             token: delivery.token,
-            projectId: projectByToken.get(delivery.token) ?? null,
+            projectId: tokenMetaByToken.get(delivery.token)?.projectId ?? null,
+            provider: tokenMetaByToken.get(delivery.token)?.provider,
           })),
           payload,
         );
@@ -280,11 +279,11 @@ export class NotificationPushOutboxProcessor {
         for (const outcome of outcomes) {
           const deliveryId = deliveryByToken.get(outcome.token);
           if (!deliveryId) continue;
-          if (outcome.status === 'SENT') {
+          if (outcome.status === 'SENT' || outcome.status === 'CONFIRMED') {
             await this.prisma.notificationPushDelivery.update({
               where: { id: deliveryId },
               data: {
-                status: 'SENT',
+                status: outcome.status,
                 ticketID: outcome.ticketId ?? null,
                 sentAt,
                 attempts: { increment: 1 },

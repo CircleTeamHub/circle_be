@@ -114,6 +114,36 @@ describe('ChatBroadcastService.emitHistoryCleared', () => {
   });
 });
 
+describe('ChatBroadcastService.emitRead', () => {
+  const read = { conversationId: 'conv-1', userId: 'u1', height: 7 };
+
+  function serviceWithServer() {
+    const emit = jest.fn();
+    const to = jest.fn(() => ({ emit }));
+    const service = new ChatBroadcastService(
+      {} as never,
+      prismaWithActiveUsers([]) as never,
+    );
+    service.setServer({ to } as never);
+    return { service, to, emit };
+  }
+
+  it('goes to the conversation room by default (the peer renders 已读)', () => {
+    const { service, to, emit } = serviceWithServer();
+    service.emitRead(read);
+    expect(to).toHaveBeenCalledWith('c:conv-1');
+    expect(emit).toHaveBeenCalledWith('chat:read', read);
+  });
+
+  it('goes only to the reader personal room when readerOnly', () => {
+    const { service, to, emit } = serviceWithServer();
+    service.emitRead(read, { readerOnly: true });
+    expect(to).toHaveBeenCalledWith('u:u1');
+    expect(to).not.toHaveBeenCalledWith('c:conv-1');
+    expect(emit).toHaveBeenCalledWith('chat:read', read);
+  });
+});
+
 describe('ChatBroadcastService member eviction', () => {
   it('uses the real void RemoteSocket leave contract without pretending it is an acknowledgement', async () => {
     const adapter = { delSockets: jest.fn() };
@@ -497,6 +527,7 @@ describe('ChatBroadcastService content-bearing edit privacy', () => {
       height: 5,
       content: { text: 'private edit' },
       editedAt: '2026-09-03T00:00:00.000Z',
+      revision: 6,
     });
 
     expect(findMany).toHaveBeenCalledWith({
@@ -548,6 +579,7 @@ describe('ChatBroadcastService content-bearing edit privacy', () => {
       height: 5,
       content: { text: 'private edit' },
       editedAt: '2026-09-03T00:00:00.000Z',
+      revision: 6,
     });
 
     expect(removedSocket.rooms.has('c:conv-1')).toBe(true);
@@ -582,6 +614,7 @@ describe('ChatBroadcastService presence fallback under Redis outage', () => {
       // 注册表答不上来（读失败或没配）
       isOnline: jest.fn().mockResolvedValue(null),
       getOnlineUserIds: jest.fn().mockResolvedValue(null),
+      getForegroundPushTokens: jest.fn().mockResolvedValue(null),
       isRedisConfigured: jest.fn().mockReturnValue(redisConfigured),
       conversationJoined: jest.fn(),
     };
@@ -607,15 +640,40 @@ describe('ChatBroadcastService presence fallback under Redis outage', () => {
     await expect(service.isUserOnline('u1')).resolves.toBe(true);
   });
 
-  it('getOnlineUserIdsInConversation 读不到时返回空集——宁可重复推送也不丢消息', async () => {
-    // 这个集合在 ChatPushService 里用来**排除**收件人。返回空集 = 谁都不排除
-    // = 全员收到推送；反过来把人当在线会让他彻底收不到。
+  it('getForegroundPushTokensInConversation 读不到时谁都不排除——宁可重复推送也不丢消息', async () => {
+    // 这个结果在 ChatPushService 里用来**排除**推送目标。空 = 谁都不排除
+    // = 全员收到推送；反过来把设备当前台会让人彻底收不到。
     const { service, fetchSockets } = buildHarness(true);
 
     await expect(
-      service.getOnlineUserIdsInConversation('conv-1'),
-    ).resolves.toEqual(new Set());
+      service.getForegroundPushTokensInConversation('conv-1'),
+    ).resolves.toEqual(new Map());
     expect(fetchSockets).not.toHaveBeenCalled();
+  });
+
+  it('单实例回退时只算开着 App 的设备——后台连接和没带推送 token 的网页版都不挡推送', async () => {
+    const { service, fetchSockets } = buildHarness(false);
+    fetchSockets.mockResolvedValue([
+      {
+        id: 's1',
+        data: { userId: 'u1', pushToken: 'ExponentPushToken[phone]' },
+      },
+      {
+        id: 's2',
+        data: {
+          userId: 'u1',
+          pushToken: 'ExponentPushToken[tablet]',
+          background: true,
+        },
+      },
+      { id: 's3', data: { userId: 'u2' } },
+    ]);
+
+    await expect(
+      service.getForegroundPushTokensInConversation('conv-1'),
+    ).resolves.toEqual(
+      new Map([['u1', new Set(['ExponentPushToken[phone]'])]]),
+    );
   });
 
   it('Redis 没配的单实例部署仍然走 fetchSockets（内存 adapter，本来就该降级到它）', async () => {
@@ -787,7 +845,11 @@ describe('ChatBroadcastService.emitBurnedMessages', () => {
       .mockResolvedValue([{ userID: 'u1' }, { userID: 'u2' }]);
     const { service, to, emit } = harness(findMany);
 
-    await service.emitBurnedMessages('conv-1', ['m1', 'm2', 'm1']);
+    await service.emitBurnedMessages('conv-1', [
+      { id: 'm1', revision: 11 },
+      { id: 'm2', revision: 12 },
+      { id: 'm1', revision: 11 },
+    ]);
 
     expect(findMany).toHaveBeenCalledWith({
       where: { conversationID: 'conv-1', leftAt: null },
@@ -798,6 +860,8 @@ describe('ChatBroadcastService.emitBurnedMessages', () => {
     expect(emit).toHaveBeenCalledWith('chat:burned_messages', {
       conversationId: 'conv-1',
       messageIds: ['m1', 'm2'],
+      // 与 messageIds 一一对应:客户端据此推进本会话的同步游标。
+      revisions: [11, 12],
     });
   });
 
@@ -807,16 +871,23 @@ describe('ChatBroadcastService.emitBurnedMessages', () => {
     const { service, emit } = harness(findMany);
     const ids = Array.from({ length: 1001 }, (_, i) => `m${i}`);
 
-    await service.emitBurnedMessages('conv-1', ids);
+    await service.emitBurnedMessages(
+      'conv-1',
+      ids.map((id, index) => ({ id, revision: index + 1 })),
+    );
 
     expect(findMany).toHaveBeenCalledTimes(1);
     const payloads = emit.mock.calls.map(
-      ([, payload]) => payload as { messageIds: string[] },
+      ([, payload]) => payload as { messageIds: string[]; revisions: number[] },
     );
     expect(payloads.map((payload) => payload.messageIds.length)).toEqual([
       500, 500, 1,
     ]);
     expect(payloads.flatMap((payload) => payload.messageIds)).toEqual(ids);
+    // 分片不能把 id 与序号的对应关系打乱。
+    expect(payloads.flatMap((payload) => payload.revisions)).toEqual(
+      ids.map((_, index) => index + 1),
+    );
   });
 
   it('emits nothing for an empty batch', async () => {
@@ -833,7 +904,7 @@ describe('ChatBroadcastService.emitBurnedMessages', () => {
     const findMany = jest.fn().mockResolvedValue([]);
     const { service, to } = harness(findMany);
 
-    await service.emitBurnedMessages('conv-1', ['m1']);
+    await service.emitBurnedMessages('conv-1', [{ id: 'm1', revision: 3 }]);
 
     expect(to).not.toHaveBeenCalled();
   });
@@ -844,7 +915,7 @@ describe('ChatBroadcastService.emitBurnedMessages', () => {
     const { service, to } = harness(findMany);
 
     await expect(
-      service.emitBurnedMessages('conv-1', ['m1']),
+      service.emitBurnedMessages('conv-1', [{ id: 'm1', revision: 3 }]),
     ).resolves.toBeUndefined();
     expect(to).not.toHaveBeenCalled();
   });
@@ -857,7 +928,7 @@ describe('ChatBroadcastService.emitBurnedMessages', () => {
     );
 
     await expect(
-      service.emitBurnedMessages('conv-1', ['m1']),
+      service.emitBurnedMessages('conv-1', [{ id: 'm1', revision: 3 }]),
     ).resolves.toBeUndefined();
     expect(findMany).not.toHaveBeenCalled();
   });

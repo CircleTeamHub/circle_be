@@ -118,8 +118,9 @@ describe('RegisterDto existing fields', () => {
   });
 });
 
-// 与 LoginDto.platform 同理：旧安装包注册时仍带 platform，属性保留、照旧校验、不进文档。
-describe('RegisterDto platform (deprecated: accepted and ignored)', () => {
+// 与 LoginDto.platform 同理：旧安装包注册时也带 platform，服务端从来不读，属性整个删掉。
+// 同样是明确的破坏性变更 —— forbidNonWhitelisted 会把仍在发它的旧安装包注册拒成 400。
+describe('RegisterDto no longer accepts platform', () => {
   // 与全局 ValidationPipe 同一组选项（src/setup.ts）。
   const validateLikePipe = (input: Record<string, unknown>) =>
     validate(
@@ -128,28 +129,17 @@ describe('RegisterDto platform (deprecated: accepted and ignored)', () => {
     );
 
   it.each([1, 2, 5])(
-    'still accepts platform %s from installed app builds',
+    'rejects platform %s as an unknown property',
     async (platform) => {
+      const errors = await validateLikePipe({ ...validPayload, platform });
+
       expect(
-        await validateLikePipe({ ...validPayload, platform }),
-      ).toHaveLength(0);
+        errors.find((error) => error.property === 'platform')?.constraints,
+      ).toHaveProperty('whitelistValidation');
     },
   );
 
-  it('keeps validating the value as before', async () => {
-    const errors = await validateLikePipe({ ...validPayload, platform: 3 });
-    expect(
-      errors.find((error) => error.property === 'platform')?.constraints,
-    ).toHaveProperty('isIn');
-  });
-
-  it('is no longer documented in the OpenAPI schema', () => {
-    const documented: string[] =
-      Reflect.getMetadata(
-        'swagger/apiModelPropertiesArray',
-        RegisterDto.prototype,
-      ) ?? [];
-    expect(documented).toContain(':nickname');
-    expect(documented).not.toContain(':platform');
+  it('accepts the payload current clients send', async () => {
+    expect(await validateLikePipe(validPayload)).toHaveLength(0);
   });
 });

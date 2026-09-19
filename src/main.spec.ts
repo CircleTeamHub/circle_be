@@ -3,8 +3,15 @@ import {
   createGracefulShutdownHandler,
   resolveAppPort,
   resolveCorsOriginChecker,
+  runBootstrap,
 } from './main';
-import { Controller, Get, INestApplication, Module } from '@nestjs/common';
+import {
+  Controller,
+  Get,
+  INestApplication,
+  Module,
+  ServiceUnavailableException,
+} from '@nestjs/common';
 import { NestFactory } from '@nestjs/core';
 import request from 'supertest';
 
@@ -210,5 +217,72 @@ describe('createGracefulShutdownHandler', () => {
     expect(app.close).toHaveBeenCalledTimes(1);
     expect(errorAggregation.flush).toHaveBeenCalledTimes(1);
     expect(onExit).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe('runBootstrap', () => {
+  function recordingSinks() {
+    const calls: string[] = [];
+    const logged: string[] = [];
+    return {
+      calls,
+      logged,
+      logError: jest.fn((message: string) => {
+        calls.push('log');
+        logged.push(message);
+      }),
+      exit: jest.fn((code: number) => {
+        calls.push(`exit:${code}`);
+      }),
+    };
+  }
+
+  it('logs why startup failed, with message and stack, then exits non-zero', async () => {
+    // The test server on 2026-09-18: an external bucket without a delivery URL
+    // makes UploadService.onModuleInit throw inside app.init(). The rejection
+    // used to land in the unhandled-rejection guard, which only reports it, so
+    // the process stayed up with no listener and not a single log line.
+    const failure = new ServiceUnavailableException(
+      'External media must use an explicitly configured rate-limited delivery URL',
+    );
+    const sinks = recordingSinks();
+
+    await runBootstrap(() => Promise.reject(failure), sinks);
+
+    expect(sinks.calls).toEqual(['log', 'exit:1']);
+    expect(sinks.logged[0]).toContain(
+      'External media must use an explicitly configured rate-limited delivery URL',
+    );
+    // V8 stack frames: the reason alone does not say where it was thrown.
+    expect(sinks.logged[0]).toContain('\n    at ');
+  });
+
+  it('leaves a successful start alone', async () => {
+    const sinks = recordingSinks();
+
+    await runBootstrap(() => Promise.resolve(), sinks);
+
+    expect(sinks.logError).not.toHaveBeenCalled();
+    expect(sinks.exit).not.toHaveBeenCalled();
+  });
+
+  it('is fatal for a rejection that is not an Error', async () => {
+    const sinks = recordingSinks();
+
+    await runBootstrap(() => Promise.reject('APP_PORT missing'), sinks);
+
+    expect(sinks.logged[0]).toContain('APP_PORT missing');
+    expect(sinks.exit).toHaveBeenCalledWith(1);
+  });
+
+  it('still exits when the log line itself cannot be written', async () => {
+    const sinks = recordingSinks();
+    sinks.logError.mockImplementation(() => {
+      throw new Error('stderr closed');
+    });
+
+    await runBootstrap(() => Promise.reject(new Error('boom')), sinks);
+
+    expect(sinks.exit).toHaveBeenCalledWith(1);
   });
 });
