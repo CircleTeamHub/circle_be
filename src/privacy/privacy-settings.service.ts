@@ -537,7 +537,8 @@ export class PrivacySettingsService {
     const current = await this.getSelfDestructPolicy(userId, tx);
     return {
       ...update,
-      messageSelfDestructStartedAt: current.startedAt ?? new Date(),
+      messageSelfDestructStartedAt:
+        current.sec && current.startedAt ? current.startedAt : new Date(),
     };
   }
 
