@@ -9,25 +9,32 @@
  * 兜底只做「上报 + 继续跑」，不做静默吞：rejection 会进错误聚合/Sentry，
  * 漏网的 .catch 照样看得见，只是不再以停服为代价。
  *
- * 注意边界：这里只接管 unhandledRejection。uncaughtException 保持 Node 默认的
- * 快速失败 —— 那种情况下进程状态未知，继续跑比崩掉更危险。
+ * 注意边界：rejection 继续运行；uncaughtException 必须在限时刷新后非零退出。
  */
 import { installUnhandledRejectionGuard } from './unhandled-rejection-guard';
-import { reportOperationalError } from './error-aggregation.service';
+import {
+  flushErrorAggregation,
+  reportOperationalError,
+} from './error-aggregation.service';
 
 jest.mock('./error-aggregation.service', () => ({
   reportOperationalError: jest.fn(),
+  flushErrorAggregation: jest.fn().mockResolvedValue(true),
 }));
 
 const reportMock = reportOperationalError as jest.MockedFunction<
   typeof reportOperationalError
+>;
+const flushMock = flushErrorAggregation as jest.MockedFunction<
+  typeof flushErrorAggregation
 >;
 
 describe('installUnhandledRejectionGuard', () => {
   let uninstall: (() => void) | undefined;
 
   beforeEach(() => {
-    jest.clearAllMocks();
+    jest.resetAllMocks();
+    flushMock.mockResolvedValue(true);
   });
 
   afterEach(() => {
@@ -91,5 +98,38 @@ describe('installUnhandledRejectionGuard', () => {
     uninstall = installUnhandledRejectionGuard();
 
     expect(() => emitRejection(new Error('boom'))).not.toThrow();
+  });
+
+  it('captures an uncaught exception once, safely diagnoses, flushes, and exits nonzero', async () => {
+    const logError = jest.fn();
+    const exit = jest.fn();
+    uninstall = installUnhandledRejectionGuard({ logError, exit });
+
+    (process as NodeJS.EventEmitter).emit(
+      'uncaughtException',
+      new Error('private prose'),
+    );
+    await new Promise((resolve) => setImmediate(resolve));
+
+    expect(reportMock).toHaveBeenCalledTimes(1);
+    expect(flushMock).toHaveBeenCalledWith(2000);
+    expect(logError).toHaveBeenCalledWith(
+      '[fatal] Uncaught exception; exiting.',
+    );
+    expect(JSON.stringify(logError.mock.calls)).not.toContain('private prose');
+    expect(exit).toHaveBeenCalledWith(1);
+  });
+
+  it('still exits when the bounded flush reports failure', async () => {
+    flushMock.mockResolvedValue(false);
+    const exit = jest.fn();
+    uninstall = installUnhandledRejectionGuard({ logError: jest.fn(), exit });
+
+    (process as NodeJS.EventEmitter).emit(
+      'uncaughtException',
+      new Error('boom'),
+    );
+    await new Promise((resolve) => setImmediate(resolve));
+    expect(exit).toHaveBeenCalledWith(1);
   });
 });

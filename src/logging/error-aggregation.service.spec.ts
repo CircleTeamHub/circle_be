@@ -9,13 +9,14 @@ import {
   createErrorAggregationConfig,
   createErrorAggregationProvider,
   createSentryInitOptions,
+  flushWithDeadline,
   reportOperationalError,
   type ErrorAggregationProvider,
   type SentryClientLike,
   sanitizeAutomaticTransaction,
   sanitizeTransactionName,
 } from './error-aggregation.service';
-import { execFileSync } from 'node:child_process';
+import { spawnSync } from 'node:child_process';
 
 function createFakeClient(): jest.Mocked<SentryClientLike> {
   return {
@@ -104,6 +105,17 @@ describe('createErrorAggregationProvider', () => {
     const provider = createErrorAggregationProvider(
       { provider: 'sentry', dsn: 'https://x@o/1', environment: 'production' },
       () => undefined,
+    );
+
+    expect(provider.name).toBe('none');
+  });
+
+  it('falls back to no-op when the sentry client factory throws', () => {
+    const provider = createErrorAggregationProvider(
+      { provider: 'sentry', dsn: 'https://x@o/1', environment: 'production' },
+      () => {
+        throw new Error('SDK initialization failed with private config');
+      },
     );
 
     expect(provider.name).toBe('none');
@@ -224,8 +236,8 @@ describe('SentryErrorAggregationProvider', () => {
       client.captureException.mock.calls.map((call) => call[1]?.tags?.path),
     );
 
-    // 200 unknown-route budget + the /__other__ bucket everything else folds into.
-    expect(pathTags.size).toBeLessThanOrEqual(201);
+    // Even the first unregistered path can contain secrets.
+    expect(pathTags.size).toBe(1);
     expect(pathTags.has(OTHER_ROUTE)).toBe(true);
   });
 
@@ -248,11 +260,7 @@ describe('SentryErrorAggregationProvider', () => {
     expect(calls[calls.length - 1]?.[1]?.tags?.path).toBe('/api/v1/circle/:id');
   });
 
-  it('keeps a budget independent of the app-wide metrics limiter', () => {
-    // The HTTP middleware's limiter sees every request, including 404 scans, so
-    // its 200-slot unknown budget is the first thing an attacker exhausts.
-    // Sharing it would bucket the first genuine 5xx on a drifted route into
-    // /__other__ — losing the path exactly when Sentry needs it most.
+  it('never reveals unknown paths regardless of the metrics limiter budget', () => {
     for (let index = 0; index < 250; index += 1) {
       limitRouteCardinality(`/api/v1/scan-${index}`);
     }
@@ -265,7 +273,7 @@ describe('SentryErrorAggregationProvider', () => {
     });
 
     const [, captureContext] = client.captureException.mock.calls[0];
-    expect(captureContext?.tags?.path).toBe('/api/v1/drifted/first-real-5xx');
+    expect(captureContext?.tags?.path).toBe(OTHER_ROUTE);
   });
 
   it('does not send expected 4xx client errors', () => {
@@ -379,6 +387,87 @@ describe('reportOperationalError', () => {
 });
 
 describe('createSentryInitOptions', () => {
+  it('leaves unhandled rejection ownership to the application guard', () => {
+    const options = createSentryInitOptions({
+      provider: 'sentry',
+      dsn: 'https://public@example.invalid/1',
+      environment: 'test',
+    }) as {
+      integrations: (
+        defaults: Array<{ name: string }>,
+      ) => Array<{ name: string }>;
+    };
+    expect(
+      options
+        .integrations([
+          { name: 'OnUnhandledRejection' },
+          { name: 'OnUncaughtException' },
+          { name: 'Other' },
+        ])
+        .map(({ name }) => name),
+    ).toEqual(['Other']);
+  });
+  it('preserves only validated SDK mechanism and hexadecimal trace identifiers', () => {
+    const options = createSentryInitOptions({
+      provider: 'sentry',
+      dsn: 'https://public@example.invalid/1',
+      environment: 'test',
+    }) as { beforeSend: (event: unknown) => any };
+
+    const event = options.beforeSend({
+      exception: {
+        values: [
+          {
+            type: 'Error',
+            value: 'private',
+            mechanism: {
+              type: 'onunhandledrejection',
+              handled: false,
+              synthetic: true,
+              data: { secret: 'drop-me' },
+            },
+          },
+        ],
+      },
+      contexts: {
+        trace: {
+          trace_id: '0123456789abcdef0123456789abcdef',
+          span_id: '0123456789abcdef',
+          parent_span_id: 'not-hex',
+          private: 'drop-me',
+        },
+      },
+    });
+
+    expect(event.exception.values[0].mechanism).toEqual({
+      type: 'onunhandledrejection',
+      handled: false,
+      synthetic: true,
+    });
+    expect(event.contexts).toEqual({
+      trace: {
+        trace_id: '0123456789abcdef0123456789abcdef',
+        span_id: '0123456789abcdef',
+      },
+    });
+  });
+
+  it('keeps safe operation job/run ids without adding them to fingerprints', () => {
+    const options = createSentryInitOptions({
+      provider: 'sentry',
+      dsn: 'https://public@example.invalid/1',
+      environment: 'test',
+    }) as { beforeSend: (event: unknown) => any };
+    const event = options.beforeSend({
+      tags: { job: 'notification-outbox', runId: 'run-123', private: 'drop' },
+      fingerprint: ['run-123'],
+    });
+    expect(event.tags).toEqual({
+      job: 'notification-outbox',
+      runId: 'run-123',
+    });
+    expect(event.fingerprint).toBeUndefined();
+  });
   it('keeps default crash integrations and applies a final privacy filter', () => {
     const options = createSentryInitOptions({
       provider: 'sentry',
@@ -429,34 +518,39 @@ describe('createSentryInitOptions', () => {
     ]);
   });
 
-  it('captures and sanitizes an uncaught child-process exception through the default integrations', () => {
+  it('captures and sanitizes an uncaught child-process exception through the application guard', () => {
     const script = `
-      const { createSentryInitOptions } = require('./src/logging/error-aggregation.service');
+      const aggregation = require('./src/logging/error-aggregation.service');
+      const { installUnhandledRejectionGuard } = require('./src/logging/unhandled-rejection-guard');
       const Sentry = require('@sentry/node');
-      const envelopes = [];
       Sentry.init({
-        ...createSentryInitOptions({ provider: 'sentry', dsn: 'https://a@o/1', environment: 'test' }),
+        ...aggregation.createSentryInitOptions({ provider: 'sentry', dsn: 'https://a@o/1', environment: 'test' }),
         transport: () => ({
           send: async (envelope) => {
-            envelopes.push(envelope);
+            process.stdout.write(JSON.stringify(envelope) + '\\n');
             return { status: 'success' };
           },
           flush: async () => true,
         }),
       });
-      process.on('uncaughtException', () => {
-        setTimeout(async () => {
-          await Sentry.flush(500);
-          process.stdout.write(JSON.stringify(envelopes));
-          process.exit(0);
-        }, 50);
-      });
+      aggregation.configureErrorAggregationProvider(
+        aggregation.createErrorAggregationProvider(
+          { provider: 'sentry', dsn: 'https://a@o/1', environment: 'test' },
+          () => ({
+            captureException: (error, context, mechanism) => Sentry.captureException(
+              error, mechanism ? { captureContext: context, mechanism } : context,
+            ),
+            flush: Sentry.flush,
+          }),
+        ),
+      );
+      installUnhandledRejectionGuard();
       setTimeout(() => {
         throw new Error('private message person@example.test Bearer child-secret');
       }, 0);
     `;
 
-    const output = execFileSync(
+    const child = spawnSync(
       process.execPath,
       ['-r', 'ts-node/register/transpile-only', '-e', script],
       {
@@ -469,22 +563,139 @@ describe('createSentryInitOptions', () => {
       },
     );
 
-    expect(output).not.toContain('private message');
-    expect(output).not.toContain('person@example.test');
-    expect(output).not.toContain('child-secret');
-    const eventEnvelopes = JSON.parse(output).filter(
-      (envelope: unknown) =>
-        Array.isArray(envelope) &&
-        Array.isArray(envelope[1]) &&
-        envelope[1].some(
-          (item: unknown) =>
-            Array.isArray(item) &&
-            item[0] &&
-            typeof item[0] === 'object' &&
-            (item[0] as { type?: unknown }).type === 'event',
-        ),
-    );
+    expect(child.status).toBe(1);
+    expect(child.stderr).toBe('[fatal] Uncaught exception; exiting.\n');
+    expect(child.stdout).not.toContain('private message');
+    expect(child.stdout).not.toContain('person@example.test');
+    expect(child.stdout).not.toContain('child-secret');
+    const eventEnvelopes = child.stdout
+      .trim()
+      .split('\n')
+      .map((line) => JSON.parse(line))
+      .filter(
+        (envelope: unknown) =>
+          Array.isArray(envelope) &&
+          Array.isArray(envelope[1]) &&
+          envelope[1].some(
+            (item: unknown) =>
+              Array.isArray(item) &&
+              item[0] &&
+              typeof item[0] === 'object' &&
+              (item[0] as { type?: unknown }).type === 'event',
+          ),
+      );
     expect(eventEnvelopes).toHaveLength(1);
+    const fatalEvent = eventEnvelopes[0][1].find(
+      (item: unknown) =>
+        Array.isArray(item) && (item[0] as { type?: string }).type === 'event',
+    )[1];
+    expect(fatalEvent.exception.values[0].mechanism).toEqual({
+      type: 'onuncaughtexception',
+      handled: false,
+    });
+  });
+
+  it('serializes one unhandled-rejection event as unhandled and keeps running', () => {
+    const script = `
+      const aggregation = require('./src/logging/error-aggregation.service');
+      const { installUnhandledRejectionGuard } = require('./src/logging/unhandled-rejection-guard');
+      const Sentry = require('@sentry/node');
+      Sentry.init({
+        ...aggregation.createSentryInitOptions({ provider: 'sentry', dsn: 'https://a@o/1', environment: 'test' }),
+        transport: () => ({
+          send: async (envelope) => { process.stdout.write(JSON.stringify(envelope) + '\\n'); return { status: 'success' }; },
+          flush: async () => true,
+        }),
+      });
+      aggregation.configureErrorAggregationProvider(aggregation.createErrorAggregationProvider(
+        { provider: 'sentry', dsn: 'https://a@o/1', environment: 'test' },
+        () => ({
+          captureException: (error, context, mechanism) => Sentry.captureException(
+            error, mechanism ? { captureContext: context, mechanism } : context,
+          ),
+          flush: Sentry.flush,
+        }),
+      ));
+      installUnhandledRejectionGuard();
+      Promise.reject(new Error('private rejection prose'));
+      setTimeout(async () => { await Sentry.flush(500); process.stdout.write('TIMER_RAN\\n'); }, 50);
+    `;
+    const child = spawnSync(
+      process.execPath,
+      ['-r', 'ts-node/register/transpile-only', '-e', script],
+      {
+        cwd: process.cwd(),
+        encoding: 'utf8',
+        env: {
+          ...process.env,
+          TS_NODE_COMPILER_OPTIONS: JSON.stringify({ rootDir: '.' }),
+        },
+      },
+    );
+    expect(child.status).toBe(0);
+    expect(child.stderr).toBe('');
+    expect(child.stdout).toContain('TIMER_RAN');
+    expect(child.stdout).not.toContain('private rejection prose');
+    const eventEnvelopes = child.stdout
+      .trim()
+      .split('\n')
+      .filter((line) => line.startsWith('['))
+      .map((line) => JSON.parse(line))
+      .filter(
+        (envelope: unknown) =>
+          Array.isArray(envelope) &&
+          Array.isArray(envelope[1]) &&
+          envelope[1].some(
+            (item: unknown) =>
+              Array.isArray(item) &&
+              item[0] &&
+              typeof item[0] === 'object' &&
+              (item[0] as { type?: unknown }).type === 'event',
+          ),
+      );
+    expect(eventEnvelopes).toHaveLength(1);
+    const event = eventEnvelopes[0][1].find(
+      (item: unknown) =>
+        Array.isArray(item) && (item[0] as { type?: string }).type === 'event',
+    )[1];
+    expect(event.exception.values[0].mechanism).toEqual({
+      type: 'onunhandledrejection',
+      handled: false,
+    });
+  });
+
+  it('keeps a fatal process alive for the hard deadline when flush never settles', () => {
+    const script = `
+      const aggregation = require('./src/logging/error-aggregation.service');
+      const { installUnhandledRejectionGuard } = require('./src/logging/unhandled-rejection-guard');
+      aggregation.configureErrorAggregationProvider({
+        name: 'sentry',
+        captureError: () => undefined,
+        flush: () => new Promise(() => undefined),
+      });
+      installUnhandledRejectionGuard();
+      throw new Error('private fatal prose');
+    `;
+    const startedAt = Date.now();
+    const child = spawnSync(
+      process.execPath,
+      ['-r', 'ts-node/register/transpile-only', '-e', script],
+      {
+        cwd: process.cwd(),
+        encoding: 'utf8',
+        env: {
+          ...process.env,
+          TS_NODE_COMPILER_OPTIONS: JSON.stringify({ rootDir: '.' }),
+        },
+      },
+    );
+    const elapsedMs = Date.now() - startedAt;
+
+    expect(child.status).toBe(1);
+    expect(child.stderr).toBe('[fatal] Uncaught exception; exiting.\n');
+    expect(child.stderr).not.toContain('private fatal prose');
+    expect(elapsedMs).toBeGreaterThanOrEqual(1800);
+    expect(elapsedMs).toBeLessThan(5000);
   });
 });
 
@@ -496,6 +707,20 @@ describe('NoopErrorAggregationProvider', () => {
       provider.captureError(new Error('x'), { statusCode: 500 }),
     ).not.toThrow();
     await expect(provider.flush()).resolves.toBe(true);
+  });
+});
+
+describe('flushWithDeadline', () => {
+  it('returns false at the hard deadline and cleans up its timer', async () => {
+    jest.useFakeTimers();
+    const result = flushWithDeadline(
+      { flush: jest.fn(() => new Promise<boolean>(() => undefined)) },
+      2000,
+    );
+    await jest.advanceTimersByTimeAsync(2000);
+    await expect(result).resolves.toBe(false);
+    expect(jest.getTimerCount()).toBe(0);
+    jest.useRealTimers();
   });
 });
 

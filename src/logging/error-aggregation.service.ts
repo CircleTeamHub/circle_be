@@ -12,10 +12,8 @@
  * or tokens) accompany the captured exception.
  */
 
-import {
-  createRouteCardinalityLimiter,
-  normalizeRoute,
-} from '../metrics/route-normalizer';
+import { safeLogPath } from './log-sanitizer';
+import { getOperationContext } from './operation-context';
 
 export type ErrorAggregationProviderName = 'none' | 'sentry';
 
@@ -40,6 +38,8 @@ export interface ErrorAggregationContext {
   component?: string;
   operation?: string;
   kind?: string;
+  job?: string;
+  runId?: string;
 }
 
 export interface ErrorAggregationProvider {
@@ -60,6 +60,7 @@ export interface SentryClientLike {
       extra?: Record<string, unknown>;
       user?: { id?: string };
     },
+    mechanism?: { type: string; handled: boolean },
   ): string;
   flush(timeoutMs?: number): Promise<boolean>;
 }
@@ -191,6 +192,18 @@ function sanitizeEventException(value: unknown): unknown {
       }
       const stacktrace = sanitizeEventStacktrace(source.stacktrace);
       if (stacktrace) safe.stacktrace = stacktrace;
+      const mechanism = source.mechanism;
+      if (mechanism && typeof mechanism === 'object') {
+        const input = mechanism as Record<string, unknown>;
+        const output: Record<string, unknown> = {};
+        if (typeof input.type === 'string' && stableTagSegment(input.type)) {
+          output.type = input.type;
+        }
+        if (typeof input.handled === 'boolean') output.handled = input.handled;
+        if (typeof input.synthetic === 'boolean')
+          output.synthetic = input.synthetic;
+        if (Object.keys(output).length > 0) safe.mechanism = output;
+      }
       return safe;
     }),
   };
@@ -219,6 +232,23 @@ function sanitizeAutomaticEvent(event: unknown): unknown {
   if (exception) safe.exception = exception;
   const stacktrace = sanitizeEventStacktrace(source.stacktrace);
   if (stacktrace) safe.stacktrace = stacktrace;
+  const trace = (source.contexts as Record<string, unknown> | undefined)?.trace;
+  if (trace && typeof trace === 'object') {
+    const input = trace as Record<string, unknown>;
+    const output: Record<string, string> = {};
+    if (
+      typeof input.trace_id === 'string' &&
+      /^[0-9a-f]{32}$/i.test(input.trace_id)
+    ) {
+      output.trace_id = input.trace_id;
+    }
+    for (const key of ['span_id', 'parent_span_id']) {
+      const value = input[key];
+      if (typeof value === 'string' && /^[0-9a-f]{16}$/i.test(value))
+        output[key] = value;
+    }
+    if (Object.keys(output).length > 0) safe.contexts = { trace: output };
+  }
   if (source.tags && typeof source.tags === 'object') {
     const sourceTags = source.tags as Record<string, unknown>;
     const safeTags: Record<string, unknown> = {};
@@ -231,9 +261,17 @@ function sanitizeAutomaticEvent(event: unknown): unknown {
       'component',
       'operation',
       'kind',
+      'job',
+      'runId',
     ]) {
-      if (key in sourceTags)
-        safeTags[key] = sanitizeEventValue(sourceTags[key], 0);
+      if (key in sourceTags) {
+        safeTags[key] =
+          key === 'path'
+            ? safeLogPath(
+                typeof sourceTags[key] === 'string' ? sourceTags[key] : '',
+              )
+            : sanitizeEventValue(sourceTags[key], 0);
+      }
     }
     if (Object.keys(safeTags).length > 0) safe.tags = safeTags;
   }
@@ -262,8 +300,6 @@ export function readSampleRate(value: unknown): number {
   return Number.isFinite(parsed) && parsed >= 0 && parsed <= 1 ? parsed : 0;
 }
 
-const transactionPathLimiter = createRouteCardinalityLimiter();
-
 /**
  * Transaction names come from the http/express instrumentation as
  * `GET /api/v1/users/<id>`; normalize the path exactly like error tags so ids
@@ -274,7 +310,7 @@ export function sanitizeTransactionName(value: unknown): string {
   const match = /^([A-Z]+\s+)?(\/\S*)$/.exec(value.trim());
   if (!match) return '[REDACTED_TRANSACTION]';
   const path = match[2].split('?')[0];
-  return `${match[1] ?? ''}${transactionPathLimiter(normalizeRoute(path))}`;
+  return `${match[1] ?? ''}${safeLogPath(path)}`;
 }
 
 function sanitizeSpan(span: unknown): Record<string, unknown> {
@@ -384,21 +420,7 @@ export class NoopErrorAggregationProvider implements ErrorAggregationProvider {
 export class SentryErrorAggregationProvider implements ErrorAggregationProvider {
   readonly name = 'sentry';
 
-  /**
-   * Own limiter instance rather than the app-wide `limitRouteCardinality`: that
-   * one is fed by the HTTP middleware on every request, so 404 scanning spends
-   * its unknown-route budget long before any 5xx happens — sharing it would
-   * bucket the first genuine drifted-route error into `/__other__` and lose the
-   * path exactly when Sentry needs it. Sentry tags and Prometheus labels also
-   * price cardinality differently (indexed retention vs series memory), so the
-   * budgets are better kept independent.
-   */
-  constructor(
-    private readonly client: SentryClientLike,
-    private readonly limitPathCardinality: (
-      route: string,
-    ) => string = createRouteCardinalityLimiter(),
-  ) {}
+  constructor(private readonly client: SentryClientLike) {}
 
   captureError(error: unknown, context: ErrorAggregationContext): void {
     if (
@@ -408,13 +430,16 @@ export class SentryErrorAggregationProvider implements ErrorAggregationProvider 
       return;
     }
 
-    const captureContext: {
-      tags: Record<string, string>;
-    } = {
-      tags: buildTags(context, this.limitPathCardinality),
+    const captureContext: { tags: Record<string, string> } = {
+      tags: buildTags(context),
     };
-
-    this.client.captureException(toSafeError(error, context), captureContext);
+    const mechanism = processFailureMechanism(context);
+    const safeError = toSafeError(error, context);
+    if (mechanism) {
+      this.client.captureException(safeError, captureContext, mechanism);
+    } else {
+      this.client.captureException(safeError, captureContext);
+    }
   }
 
   flush(timeoutMs?: number): Promise<boolean> {
@@ -422,10 +447,20 @@ export class SentryErrorAggregationProvider implements ErrorAggregationProvider 
   }
 }
 
-function buildTags(
+function processFailureMechanism(
   context: ErrorAggregationContext,
-  limitPathCardinality: (route: string) => string,
-): Record<string, string> {
+): { type: string; handled: boolean } | undefined {
+  if (context.component !== 'process' || context.kind !== 'process') return;
+  if (context.operation === 'unhandledRejection') {
+    return { type: 'onunhandledrejection', handled: false };
+  }
+  if (context.operation === 'uncaughtException') {
+    return { type: 'onuncaughtexception', handled: false };
+  }
+  return undefined;
+}
+
+function buildTags(context: ErrorAggregationContext): Record<string, string> {
   const tags: Record<string, string> = {};
   if (context.statusCode !== undefined) {
     tags.statusCode = String(context.statusCode);
@@ -436,14 +471,10 @@ function buildTags(
   if (context.component) tags.component = sanitizeString(context.component);
   if (context.operation) tags.operation = sanitizeString(context.operation);
   if (context.kind) tags.kind = sanitizeString(context.kind);
-  // Normalize before tagging: the raw path carries id/link-token segments
-  // (e.g. /temp-chat/by-token/<token>/join) — sending those to Sentry would
-  // leak secrets into an indexed, retained tag. Normalizing alone is not enough:
-  // a path with no matching template is returned verbatim, so route drift or a
-  // 5xx storm on unlisted paths would still mint unbounded tag values. Cap them.
-  if (context.path) {
-    tags.path = limitPathCardinality(normalizeRoute(context.path));
-  }
+  if (context.job) tags.job = sanitizeString(context.job);
+  if (context.runId) tags.runId = sanitizeString(context.runId);
+  // Unknown paths may contain private tokens from their very first occurrence.
+  if (context.path) tags.path = safeLogPath(context.path);
   return tags;
 }
 
@@ -481,6 +512,30 @@ export function configureErrorAggregationProvider(
   operationalErrorLastReportedAt.clear();
 }
 
+export function getErrorAggregationProvider(): ErrorAggregationProvider {
+  return activeErrorAggregationProvider;
+}
+
+export function flushWithDeadline(
+  provider: Pick<ErrorAggregationProvider, 'flush'>,
+  timeoutMs = 2000,
+): Promise<boolean> {
+  return new Promise((resolve) => {
+    const timer = setTimeout(() => resolve(false), timeoutMs);
+    Promise.resolve()
+      .then(() => provider.flush(timeoutMs))
+      .then(
+        (result) => resolve(result),
+        () => resolve(false),
+      )
+      .finally(() => clearTimeout(timer));
+  });
+}
+
+export function flushErrorAggregation(timeoutMs = 2000): Promise<boolean> {
+  return flushWithDeadline(activeErrorAggregationProvider, timeoutMs);
+}
+
 /**
  * Reports a caught WebSocket/background failure through the same sanitized
  * provider as HTTP 5xx errors. Callers supply only stable, content-free tags.
@@ -505,7 +560,13 @@ export function reportOperationalError(
     const lastReportedAt = operationalErrorLastReportedAt.get(signature) ?? 0;
     if (now - lastReportedAt < OPERATIONAL_ERROR_DEDUP_MS) return;
     operationalErrorLastReportedAt.set(signature, now);
-    const aggregationContext: ErrorAggregationContext = { ...context };
+    const operationContext = getOperationContext();
+    const aggregationContext: ErrorAggregationContext = {
+      ...context,
+      ...(operationContext
+        ? { job: operationContext.job, runId: operationContext.runId }
+        : {}),
+    };
     activeErrorAggregationProvider.captureError(
       toSafeError(error, aggregationContext),
       aggregationContext,
@@ -528,7 +589,14 @@ export function createErrorAggregationProvider(
     return new NoopErrorAggregationProvider();
   }
 
-  const client = clientFactory(config);
+  let client: SentryClientLike | undefined;
+  try {
+    client = clientFactory(config);
+  } catch {
+    // Loading or initializing an optional SDK must not prevent application
+    // startup. The caller can still surface its primary bootstrap failure.
+    return new NoopErrorAggregationProvider();
+  }
   if (!client) {
     return new NoopErrorAggregationProvider();
   }
@@ -551,8 +619,14 @@ function defaultSentryClientFactory(
   Sentry.init(createSentryInitOptions(config));
 
   return {
-    captureException: (error, captureContext) =>
-      Sentry.captureException(error, captureContext),
+    captureException: (error, captureContext, mechanism) => {
+      return Sentry.captureException(
+        error,
+        mechanism
+          ? ({ captureContext, mechanism } as Record<string, unknown>)
+          : captureContext,
+      );
+    },
     flush: (timeoutMs) => Sentry.flush(timeoutMs),
   };
 }
@@ -565,9 +639,13 @@ export function createSentryInitOptions(
     environment: config.environment,
     release: config.release,
     sendDefaultPii: false,
-    // Keep the SDK's process-level crash integrations. beforeSend rebuilds every
-    // event from an allowlist, so global events cannot include request data,
-    // local variables, breadcrumbs, extras, or account identifiers.
+    integrations: (defaults: Array<{ name?: string }>) =>
+      defaults.filter(
+        ({ name }) =>
+          name !== 'OnUnhandledRejection' && name !== 'OnUncaughtException',
+      ),
+    // Application-owned process guards provide exactly-once capture, a hard
+    // flush deadline and safe diagnostics. Other default integrations remain.
     beforeSend: sanitizeAutomaticEvent,
     // Performance tracing is opt-in (SENTRY_TRACES_SAMPLE_RATE, default 0).
     // When on, transactions are rebuilt from an allowlist as well: normalized
