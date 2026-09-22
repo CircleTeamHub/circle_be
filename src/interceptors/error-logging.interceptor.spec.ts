@@ -270,21 +270,21 @@ describe('ErrorLoggingInterceptor status mapping & handled-error markers', () =>
     const serverError = new Error('boom');
     const forbidden = new HttpException('Forbidden', HttpStatus.FORBIDDEN);
 
-    for (const error of [serverError, forbidden]) {
-      await expect(
-        runWithRequestContext(requestContext, () =>
+    await runWithRequestContext(requestContext, async () => {
+      for (const error of [serverError, forbidden]) {
+        await expect(
           lastValueFrom(
             interceptor.intercept({} as any, {
               handle: () => throwError(() => error),
             }),
           ),
-        ),
-      ).rejects.toBe(error);
-    }
+        ).rejects.toBe(error);
+      }
 
-    expect(wasErrorCaptured(serverError)).toBe(true);
-    expect(wasErrorCaptured(forbidden)).toBe(false);
-    expect(wasSecurityEventLogged(forbidden)).toBe(true);
-    expect(wasSecurityEventLogged(serverError)).toBe(false);
+      expect(wasErrorCaptured(serverError)).toBe(true);
+      expect(wasErrorCaptured(forbidden)).toBe(false);
+      expect(wasSecurityEventLogged(forbidden)).toBe(true);
+      expect(wasSecurityEventLogged(serverError)).toBe(false);
+    });
   });
 });

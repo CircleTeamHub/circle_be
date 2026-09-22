@@ -32,9 +32,11 @@ export class ErrorLoggingInterceptor implements NestInterceptor {
     _context: ExecutionContext,
     next: CallHandler,
   ): Observable<unknown> {
+    // Capture before the observable crosses an async boundary. Older supported
+    // Node runtimes do not preserve AsyncLocalStorage through every RxJS path.
+    const requestContext = getRequestContext();
     return next.handle().pipe(
       catchError((error: unknown) => {
-        const requestContext = getRequestContext();
         // Known Prisma codes become 4xx in PrismaExceptionFilter; classifying
         // them as 500 here would log every unique-constraint race as an
         // incident and forward it to Sentry.
@@ -71,7 +73,7 @@ export class ErrorLoggingInterceptor implements NestInterceptor {
             });
             // AllExceptionFilter sees this same exception next; the marker
             // keeps it from logging the security event a second time.
-            markSecurityEventLogged(error);
+            markSecurityEventLogged(error, requestContext?.requestId);
           } catch (loggingError) {
             this.logger.error(
               {
@@ -101,7 +103,7 @@ export class ErrorLoggingInterceptor implements NestInterceptor {
               path: requestContext?.path,
               userId: requestContext?.userId,
             });
-            markErrorCaptured(error);
+            markErrorCaptured(error, requestContext?.requestId);
           } catch (aggregationError) {
             this.logger.error(
               {
