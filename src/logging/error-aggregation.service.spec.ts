@@ -102,23 +102,32 @@ describe('createErrorAggregationProvider', () => {
   });
 
   it('falls back to no-op when the sentry client cannot be created', () => {
+    const reportInitializationFailure = jest.fn();
     const provider = createErrorAggregationProvider(
       { provider: 'sentry', dsn: 'https://x@o/1', environment: 'production' },
       () => undefined,
+      reportInitializationFailure,
     );
 
     expect(provider.name).toBe('none');
+    expect(reportInitializationFailure).toHaveBeenCalledTimes(1);
   });
 
   it('falls back to no-op when the sentry client factory throws', () => {
+    const reportInitializationFailure = jest.fn();
     const provider = createErrorAggregationProvider(
       { provider: 'sentry', dsn: 'https://x@o/1', environment: 'production' },
       () => {
         throw new Error('SDK initialization failed with private config');
       },
+      reportInitializationFailure,
     );
 
     expect(provider.name).toBe('none');
+    expect(reportInitializationFailure).toHaveBeenCalledTimes(1);
+    expect(
+      JSON.stringify(reportInitializationFailure.mock.calls),
+    ).not.toContain('private config');
   });
 
   it('builds a sentry provider with the resolved config when dsn is present', () => {
@@ -564,7 +573,12 @@ describe('createSentryInitOptions', () => {
     );
 
     expect(child.status).toBe(1);
-    expect(child.stderr).toBe('[fatal] Uncaught exception; exiting.\n');
+    expect(child.stderr).toMatch(
+      /^\[fatal\] Uncaught exception; errorName=Error source=at [^\n]+:\d+:\d+; exiting\.\n$/,
+    );
+    expect(child.stderr).not.toContain('private message');
+    expect(child.stderr).not.toContain('person@example.test');
+    expect(child.stderr).not.toContain('child-secret');
     expect(child.stdout).not.toContain('private message');
     expect(child.stdout).not.toContain('person@example.test');
     expect(child.stdout).not.toContain('child-secret');
@@ -692,7 +706,9 @@ describe('createSentryInitOptions', () => {
     const elapsedMs = Date.now() - startedAt;
 
     expect(child.status).toBe(1);
-    expect(child.stderr).toBe('[fatal] Uncaught exception; exiting.\n');
+    expect(child.stderr).toMatch(
+      /^\[fatal\] Uncaught exception; errorName=Error source=at [^\n]+:\d+:\d+; exiting\.\n$/,
+    );
     expect(child.stderr).not.toContain('private fatal prose');
     expect(elapsedMs).toBeGreaterThanOrEqual(1800);
     expect(elapsedMs).toBeLessThan(5000);
