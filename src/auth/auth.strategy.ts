@@ -10,7 +10,10 @@ import { ConfigService } from '@nestjs/config';
 import { ConfigEnum } from 'src/enum/config.enum';
 import { markSecurityEventLogged } from 'src/logging/handled-errors';
 import { createLoggingConfig } from 'src/logging/logging.config';
-import { setRequestUserId } from 'src/logging/request-context';
+import {
+  getRequestContext,
+  setRequestUserId,
+} from 'src/logging/request-context';
 import { logSecurityEvent } from 'src/logging/security-event.logger';
 import type { AuthenticatedUser, JwtPayload } from './types';
 import { SessionVerifier } from './session-verifier.service';
@@ -33,6 +36,7 @@ export class JwtStrategy extends PassportStrategy(Strategy) {
 
   // Passport attaches whatever this returns to `req.user`.
   async validate(payload: JwtPayload): Promise<AuthenticatedUser> {
+    const requestId = getRequestContext()?.requestId;
     // Bind the caller to the request context as early as possible: the access
     // log only learns the user on `finish`, so without this every http_error /
     // security_event / Sentry tag emitted during the request had no userId.
@@ -46,7 +50,7 @@ export class JwtStrategy extends PassportStrategy(Strategy) {
     // same verdict the WebSocket gateways use (see SessionVerifier for rules).
     const verdict = await this.sessions.verify(payload);
     if (verdict === 'revoked') {
-      this.rejectRevokedSession(payload);
+      this.rejectRevokedSession(payload, requestId);
     }
     if (verdict === 'unavailable') {
       // Not a revocation: neither Redis nor the database answered. A 401 would
@@ -64,7 +68,7 @@ export class JwtStrategy extends PassportStrategy(Strategy) {
     };
   }
 
-  private rejectRevokedSession(payload: JwtPayload): never {
+  private rejectRevokedSession(payload: JwtPayload, requestId?: string): never {
     // A revoked-but-valid token being replayed is the one 401 worth its own
     // security event: it means a session that was explicitly killed is
     // still in someone's hands.
@@ -78,7 +82,7 @@ export class JwtStrategy extends PassportStrategy(Strategy) {
     // That event *is* the security record for this rejection; mark it so
     // AllExceptionFilter does not add a generic `auth_unauthorized` on top.
     const exception = new UnauthorizedException('Session revoked');
-    markSecurityEventLogged(exception);
+    markSecurityEventLogged(exception, requestId);
     throw exception;
   }
 }
