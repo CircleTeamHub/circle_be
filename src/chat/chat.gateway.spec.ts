@@ -266,7 +266,7 @@ describe('ChatGateway', () => {
       );
     });
 
-    it('ignores an unsafe proxy trace and falls back to the validated auth copy', () => {
+    it('ignores client-controlled auth traces even when they look like UUIDs', () => {
       const socket = fakeSocket({
         handshake: {
           auth: {
@@ -279,9 +279,11 @@ describe('ChatGateway', () => {
         },
       });
 
-      expect(gateway['connectionTraceId'](socket as never)).toBe(
-        'ws-33333333-3333-4333-8333-333333333333',
+      const traceId = gateway['connectionTraceId'](socket as never);
+      expect(traceId).toMatch(
+        /^ws-[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/,
       );
+      expect(traceId).not.toContain('33333333-3333-4333-8333-333333333333');
     });
 
     it('rejects account and phone-shaped connection trace values', () => {
@@ -293,7 +295,7 @@ describe('ChatGateway', () => {
           },
         });
         expect(gateway['connectionTraceId'](socket as never)).toMatch(
-          /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/,
+          /^ws-[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/,
         );
       }
     });

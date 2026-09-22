@@ -138,7 +138,10 @@ describe('RealtimeGateway failure logging privacy', () => {
     const report = jest
       .spyOn(errorAggregation, 'reportOperationalError')
       .mockImplementation();
-    const failure = new Error('SELECT private_messages private-chat-text');
+    const failure = Object.assign(
+      new Error('SELECT private_messages private-chat-text'),
+      { code: 'ECONNRESET', privateValue: 'private-socket-metadata' },
+    );
     const realtime = {
       getConnectionCount: jest.fn().mockReturnValue(0),
       registerPendingClient: jest.fn(),
@@ -166,6 +169,7 @@ describe('RealtimeGateway failure logging privacy', () => {
         expect.objectContaining({
           event: 'realtime_socket_error',
           operation: 'handleConnection',
+          errorCode: 'ECONNRESET',
         }),
       );
       socket.emit(
@@ -179,6 +183,7 @@ describe('RealtimeGateway failure logging privacy', () => {
           event: 'realtime_socket_error',
           operation: 'acceptAuthenticatedSocket',
           userId: 'user-1',
+          errorCode: 'ECONNRESET',
         }),
       );
       expect(warn).toHaveBeenCalledWith(
@@ -189,7 +194,7 @@ describe('RealtimeGateway failure logging privacy', () => {
         }),
       );
       expect(JSON.stringify(warn.mock.calls)).not.toMatch(
-        /SELECT|private_messages|private-chat-text/,
+        /SELECT|private_messages|private-chat-text|private-socket-metadata/,
       );
       expect(report).toHaveBeenCalledWith(failure, {
         component: 'RealtimeGateway',

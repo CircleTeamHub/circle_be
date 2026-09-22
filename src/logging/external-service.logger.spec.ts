@@ -88,4 +88,47 @@ describe('logExternalCallFailure', () => {
       error: { stack: expect.stringContaining('provider.ts:5:2') },
     });
   });
+
+  it('keeps bounded system and HTTP failure categories distinguishable', () => {
+    const logger = { warn: jest.fn() };
+    const refused = Object.assign(new Error('private smtp details'), {
+      code: 'ECONNREFUSED',
+    });
+    const denied = Object.assign(new Error('private object-store details'), {
+      $metadata: { httpStatusCode: 403, requestId: 'private-request-id' },
+    });
+
+    for (const error of [refused, denied]) {
+      logExternalCallFailure(logger as any, {
+        enabled: true,
+        service: 'provider',
+        operation: 'call',
+        error,
+      });
+    }
+
+    expect(logger.warn.mock.calls[0][0]).toMatchObject({
+      failureCode: 'ECONNREFUSED',
+    });
+    expect(logger.warn.mock.calls[1][0]).toMatchObject({
+      failureCode: 'HTTP_403',
+    });
+    expect(JSON.stringify(logger.warn.mock.calls)).not.toContain(
+      'private-request-id',
+    );
+  });
+
+  it('does not treat arbitrary provider codes as safe diagnostics', () => {
+    const logger = { warn: jest.fn() };
+    logExternalCallFailure(logger as any, {
+      enabled: true,
+      service: 'provider',
+      operation: 'call',
+      error: Object.assign(new Error('private'), { code: 'secret-value' }),
+    });
+    expect(logger.warn.mock.calls[0][0].failureCode).toBeUndefined();
+    expect(JSON.stringify(logger.warn.mock.calls)).not.toContain(
+      'secret-value',
+    );
+  });
 });

@@ -29,6 +29,16 @@ const REALTIME_PATH = '/realtime';
 const UNVERIFIABLE_CLOSE_CODE = 1013;
 const UNVERIFIABLE_CLOSE_REASON = 'Try again later';
 
+function safeSystemErrorCode(error: unknown): string | undefined {
+  const code =
+    error && typeof error === 'object'
+      ? Object.getOwnPropertyDescriptor(error, 'code')?.value
+      : undefined;
+  return typeof code === 'string' && /^E[A-Z0-9_]{1,31}$/.test(code)
+    ? code
+    : undefined;
+}
+
 /** 与 ws 的 shouldHandle 同一套取法:只切掉 query,不做任何归一化。 */
 function pathnameOf(url: string | undefined): string {
   if (!url) return '';
@@ -206,6 +216,7 @@ export class RealtimeGateway implements OnModuleDestroy {
         sanitizeLogValue({
           event: 'realtime_socket_error',
           operation: 'handleConnection',
+          errorCode: safeSystemErrorCode(error),
           error,
         }),
       );
@@ -272,6 +283,7 @@ export class RealtimeGateway implements OnModuleDestroy {
           event: 'realtime_socket_error',
           operation: 'acceptAuthenticatedSocket',
           userId,
+          errorCode: safeSystemErrorCode(error),
           error,
         }),
       );

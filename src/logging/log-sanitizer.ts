@@ -4,91 +4,80 @@ import {
   OTHER_ROUTE,
   STATIC_ROUTES,
 } from '../metrics/route-normalizer';
+import { isIP } from 'node:net';
 
 const REDACTED = '[redacted]';
 const MAX_STRING = 2048;
+const MAX_SANITIZE_INPUT = MAX_STRING * 2;
 const MAX_DEPTH = 5;
 const MAX_ENTRIES = 50;
 const MAX_NODES = 500;
-// Node 24+ exposes Error.stack through one shared native accessor. Only this
-// exact getter is allowed; application-defined accessors are never evaluated.
 const NATIVE_STACK_GETTER = Object.getOwnPropertyDescriptor(
   new Error(),
   'stack',
 )?.get;
 const KNOWN_ROUTES = new Set([...STATIC_ROUTES, ...DYNAMIC_ROUTE_TEMPLATES]);
 const PRIVATE_KEY =
-  /password|token|secret|authorization|cookie|email|phone|mobile|device|useragent|address|latitude|longitude/;
-const PRIVATE_FIELDS = new Set([
-  'body',
-  'requestbody',
-  'responsebody',
-  'payload',
-  'request',
-  'response',
-  'req',
-  'res',
-  'headers',
-  'query',
-  'params',
-  'content',
-  'text',
-  'word',
-  'messages',
-  'chat',
-  'chatmessage',
-  'data',
-  'args',
-  'arguments',
-  'sql',
-  'cause',
-  'ip',
-  'remoteaddress',
-  'name',
-  'username',
-  'nickname',
-  'displayname',
-  'code',
-  'securitycode',
-  'verificationcode',
-  'filename',
-  'objectkey',
-  'key',
-]);
+  /password|token|secret|authorization|cookie|email|phone|mobile|device|useragent|address|latitude|longitude|(?:api|private|signing|encryption)key/;
+const PRIVATE_FIELDS = new Set(
+  'body requestbody responsebody payload request response req res headers query params content text word messages chat chatmessage data args arguments sql cause ip remoteaddress name username nickname displayname code securitycode verificationcode filename objectkey key wechat qq whatsup birthday city region'.split(
+    ' ',
+  ),
+);
+const IP_CANDIDATE = /[0-9A-Fa-f:.]+/g;
 
-/** Only route templates are loggable; even the first unknown path is private. */
+function redactIpAddresses(value: string): string {
+  return value.replace(
+    IP_CANDIDATE,
+    (address: string, offset: number, input: string) => {
+      const preceding = input.slice(Math.max(0, offset - 16), offset);
+      return isIP(address) &&
+        !/\b(?:version|release|build)\s*$/i.test(preceding)
+        ? '[redacted-ip]'
+        : address;
+    },
+  );
+}
+
 export function safeLogPath(path: string): string {
   if (typeof path !== 'string' || path.length > MAX_STRING) return OTHER_ROUTE;
   const normalized = normalizeRoute(path.split('#')[0]);
   return KNOWN_ROUTES.has(normalized) ? normalized : OTHER_ROUTE;
 }
 
-/** Defense in depth for legacy prose. New logs should use structured events. */
 export function sanitizeLogText(value: string): string {
-  const bounded = value.slice(0, MAX_STRING);
-  return (
+  const bounded = value.slice(0, MAX_SANITIZE_INPUT);
+  const sanitized = redactIpAddresses(
     bounded
+      .replace(
+        /-----BEGIN [A-Z0-9 ]*(?:PRIVATE|SECRET) KEY-----[\s\S]*?(?:-----END [A-Z0-9 ]*(?:PRIVATE|SECRET) KEY-----|$)/gi,
+        '[redacted-key]',
+      )
       .replace(/https?:\/\/[^\s<>"']+/gi, '[redacted-url]')
-      .replace(/Bearer\s+[^\s,"'}]+/gi, `Bearer ${REDACTED}`)
+      .replace(/\b(Bearer|Basic)\s+[A-Za-z0-9._~+/=-]+/gi, `$1 ${REDACTED}`)
       .replace(/eyJ[A-Za-z0-9_-]*\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]*/g, REDACTED)
       .replace(/[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}/gi, '[redacted-email]')
+      .replace(
+        /(^|[^\w.])(\+?(?:\d[\s().-]?){9,14}\d)(?![\w.])/g,
+        '$1[redacted-phone]',
+      )
       .replace(
         /\b(?:authorization|cookie)\s*[=:]\s*[^\r\n]*/gi,
         (match) => `${match.split(/[=:]/)[0]}=${REDACTED}`,
       )
       .replace(
-        /\b([A-Za-z][A-Za-z_-]{0,63})\s*[=:]\s*(?:"[^"]*(?:"|$)|'[^']*(?:'|$)|[^\s,;]+)/g,
-        (match, key: string) => {
+        /(^|[^A-Za-z0-9_])(["']?)([A-Za-z][A-Za-z0-9_-]{0,63})\2\s*[=:]\s*(?:"(?:\\.|[^"\\])*(?:"|$)|'(?:\\.|[^'\\])*(?:'|$)|[^\s,;]+)/g,
+        (match, prefix: string, quote: string, key: string) => {
           const normalized = key.toLowerCase().replace(/[^a-z]/g, '');
           return PRIVATE_KEY.test(normalized) ||
             PRIVATE_FIELDS.has(normalized) ||
             normalized === 'apikey'
-            ? `${key}=${REDACTED}`
+            ? `${prefix}${quote}${key}${quote}=${REDACTED}`
             : match;
         },
       )
       .replace(
-        /(^|[\s("'=])(\/[^\s<>"']+)/g,
+        /(^|[\s("'=:])(\/[^\s<>"']+)/g,
         (_match, prefix: string, path: string) =>
           `${prefix}${safeLogPath(path)}`,
       )
@@ -96,7 +85,10 @@ export function sanitizeLogText(value: string): string {
         /\b(body|payload|content|sql|query)\s*[=:][^\r\n]*/gi,
         `$1=${REDACTED}`,
       )
-      .replace(/[\u0000-\u001f\u007f]/g, ' ') +
+      .replace(/[\u0000-\u001f\u007f]/g, ' '),
+  );
+  return (
+    sanitized.slice(0, MAX_STRING) +
     (value.length > MAX_STRING ? '[truncated]' : '')
   );
 }
@@ -113,7 +105,6 @@ function errorName(value: unknown): string {
     : 'Error';
 }
 
-/** Preserve source call sites, never the first line or arbitrary stack prose. */
 function safeStack(value: unknown): string | undefined {
   let stack = typeof value === 'string' ? value : '';
   if (Array.isArray(value)) {
@@ -137,7 +128,6 @@ function safeStack(value: unknown): string | undefined {
 }
 
 function hasErrorTextAccessor(error: Error): boolean {
-  // Native lazy stack generation reads name/message via Error#toString.
   let target: object | null = error;
   for (let depth = 0; target && depth < MAX_DEPTH; depth++) {
     if (
@@ -151,11 +141,6 @@ function hasErrorTextAccessor(error: Error): boolean {
   return target !== null;
 }
 
-/**
- * Bounded, non-mutating serialization boundary. Accessors/toJSON and symbol
- * metadata are intentionally not copied. Account/entity/request identifiers
- * remain for operational correlation; contact and device identifiers do not.
- */
 export function sanitizeLogValue(value: unknown): unknown {
   const ancestors = new WeakSet<object>();
   let remaining = MAX_NODES;
@@ -258,8 +243,6 @@ export function sanitizeLogValue(value: unknown): unknown {
               ? visit(descriptor.value, depth + 1, entryKey)
               : '[accessor]';
         }
-        // Error-shaped objects include ORM/HTTP library errors that are not
-        // Error subclasses. Their message can contain SQL, bodies or contacts.
         if (
           'message' in result &&
           ('event' in result ||
