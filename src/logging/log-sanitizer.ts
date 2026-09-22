@@ -33,6 +33,7 @@ const PRIVATE_FIELDS = new Set([
   'params',
   'content',
   'text',
+  'word',
   'messages',
   'chat',
   'chatmessage',

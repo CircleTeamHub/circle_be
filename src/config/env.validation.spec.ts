@@ -123,12 +123,12 @@ describe('createEnvValidationSchema', () => {
 
     expect(error).toBeUndefined();
     expect(value).toMatchObject({
-      LOG_FILE_ON: false,
       LOG_SERVICE_NAME: 'circle-be',
       LOG_LEVEL: 'info',
       SLOW_EXTERNAL_MS: 1000,
       SLOW_DB_OPERATION_MS: 1000,
     });
+    expect(value.LOG_FILE_ON).toBeUndefined();
   });
 
   it.each([

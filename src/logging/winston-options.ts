@@ -103,12 +103,14 @@ export function createWinstonOptions(
   const rawFileOn = configService.get('LOG_FILE_ON');
   const normalizedFileOn =
     typeof rawFileOn === 'string' ? rawFileOn.trim().toLowerCase() : rawFileOn;
-  // File logging is opt-in. Existing deployments created before LOG_FILE_ON
-  // was introduced must not start filling a persistent host volume merely
-  // because their existing LOG_ON master switch is enabled.
-  const fileOn =
-    loggingConfig.logOn &&
-    (normalizedFileOn === true || normalizedFileOn === 'true');
+  // One-release compatibility window: deployments that predate LOG_FILE_ON
+  // keep their previous LOG_ON-controlled file behavior. New deployments set
+  // the flag explicitly, and can independently choose stdout-only logging.
+  const fileSetting =
+    normalizedFileOn === undefined || normalizedFileOn === null
+      ? loggingConfig.logOn
+      : normalizedFileOn === true || normalizedFileOn === 'true';
+  const fileOn = loggingConfig.logOn && fileSetting;
   const consoleFormat = production
     ? winston.format.combine(winston.format.timestamp(), winston.format.json())
     : winston.format.combine(
