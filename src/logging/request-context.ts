@@ -12,13 +12,17 @@ export interface RequestContext {
 }
 
 const requestContextStorage = new AsyncLocalStorage<RequestContext>();
-const SAFE_REQUEST_ID = /^[A-Za-z0-9._:-]{1,128}$/;
+// Request IDs cross the log/Sentry boundary. Only accept the UUID shape our
+// clients generate; arbitrary opaque strings can be account IDs, phone numbers
+// or credentials even when they contain no whitespace.
+const SAFE_REQUEST_ID =
+  /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 
 export function resolveRequestId(value?: unknown): string {
   const requestId = Array.isArray(value) ? value[0] : value;
 
   if (typeof requestId === 'string' && SAFE_REQUEST_ID.test(requestId)) {
-    return requestId;
+    return requestId.toLowerCase();
   }
 
   return randomUUID();
