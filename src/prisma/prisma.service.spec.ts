@@ -82,6 +82,12 @@ describe('resolveDatabasePoolConfig', () => {
     });
   });
 
+  it('parses numeric notation accepted by Joi without truncating it', () => {
+    expect(
+      resolveDatabasePoolConfig({ DATABASE_STATEMENT_TIMEOUT_MS: '1e4' }),
+    ).toMatchObject({ statement_timeout: 10_000 });
+  });
+
   it('falls back to defaults for unusable values rather than failing boot', () => {
     expect(
       resolveDatabasePoolConfig({

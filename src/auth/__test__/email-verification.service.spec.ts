@@ -4,7 +4,12 @@ import {
   ServiceUnavailableException,
 } from '@nestjs/common';
 import * as argon2 from 'argon2';
-import { EmailVerificationService } from '../email-verification.service';
+import { readFileSync } from 'node:fs';
+import { join } from 'node:path';
+import {
+  EmailVerificationService,
+  PRODUCTION_EMAIL_BYPASS_EVENT,
+} from '../email-verification.service';
 import { PrismaService } from '../../prisma/prisma.service';
 import { MAILER } from '../mailer/mailer.interface';
 import { sanitizeLogValue } from '../../logging/log-sanitizer';
@@ -614,6 +619,18 @@ describe('EmailVerificationService', () => {
     );
     expect(JSON.stringify(error.mock.calls)).not.toContain(PRODUCTION_CODE);
     error.mockRestore();
+  });
+
+  it('keeps every release checklist aligned with the emitted bypass event', () => {
+    for (const filename of [
+      '.env.example',
+      '.env.production.example',
+      'docs/pre-launch-checklist.md',
+    ]) {
+      expect(readFileSync(join(process.cwd(), filename), 'utf8')).toContain(
+        PRODUCTION_EMAIL_BYPASS_EVENT,
+      );
+    }
   });
 
   it('logs a security banner when the production bypass is opted in but rejected', () => {

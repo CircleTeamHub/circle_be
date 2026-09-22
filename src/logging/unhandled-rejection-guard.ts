@@ -2,6 +2,7 @@ import {
   flushErrorAggregation,
   reportOperationalError,
 } from './error-aggregation.service';
+import { sanitizeLogValue } from './log-sanitizer';
 
 /**
  * 进程级兜底：未捕获的 promise rejection 上报后继续跑，不再终止进程。
@@ -28,6 +29,21 @@ const processFatalSinks: FatalSinks = {
   logError: (message) => console.error(message),
   exit: (code) => process.exit(code),
 };
+
+function fatalDiagnostic(error: unknown): string {
+  const sanitized = sanitizeLogValue(error);
+  if (!sanitized || typeof sanitized !== 'object') return 'errorName=Unknown';
+
+  const value = sanitized as { name?: unknown; stack?: unknown };
+  const errorName = typeof value.name === 'string' ? value.name : 'Unknown';
+  const source =
+    typeof value.stack === 'string'
+      ? value.stack.split('\n').find((line) => line.startsWith('at '))
+      : undefined;
+  return source
+    ? `errorName=${errorName} source=${source}`
+    : `errorName=${errorName}`;
+}
 
 export function installUnhandledRejectionGuard(
   sinks: FatalSinks = processFatalSinks,
@@ -60,7 +76,9 @@ export function installUnhandledRejectionGuard(
       // Reporting must not prevent the fatal flush/exit path.
     } finally {
       try {
-        sinks.logError('[fatal] Uncaught exception; exiting.');
+        sinks.logError(
+          `[fatal] Uncaught exception; ${fatalDiagnostic(error)}; exiting.`,
+        );
       } catch {
         // The process must still terminate if stderr is unavailable.
       }

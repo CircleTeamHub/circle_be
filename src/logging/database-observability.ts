@@ -19,8 +19,26 @@ export function observeDatabaseAdapter(
   logger: LoggerService,
   config: { performanceLogOn: boolean; slowDbOperationMs: number },
   elapsedMs = () => performance.now(),
+  warningNowMs = () => performance.now(),
 ): PrismaPg {
   if (!config.performanceLogOn) return factory;
+  const warningIntervalMs = 60_000;
+  const warningStates = new Map<
+    string,
+    { lastEmittedAt: number; suppressedCount: number }
+  >();
+
+  function shouldEmitWarning(key: string): number | null {
+    const now = warningNowMs();
+    const state = warningStates.get(key);
+    if (!state || now - state.lastEmittedAt >= warningIntervalMs) {
+      const suppressedCount = state?.suppressedCount ?? 0;
+      warningStates.set(key, { lastEmittedAt: now, suppressedCount: 0 });
+      return suppressedCount;
+    }
+    state.suppressedCount += 1;
+    return null;
+  }
 
   async function timed<T>(
     operation: 'queryRaw' | 'executeRaw',
@@ -36,7 +54,11 @@ export function observeDatabaseAdapter(
     } finally {
       try {
         const durationMs = elapsedMs() - startedAt;
-        if (durationMs >= config.slowDbOperationMs) {
+        const suppressedCount =
+          durationMs >= config.slowDbOperationMs
+            ? shouldEmitWarning(`${operation}:${result}`)
+            : null;
+        if (suppressedCount !== null) {
           const requestContext = getRequestContext();
           logger.warn(
             {
@@ -46,6 +68,7 @@ export function observeDatabaseAdapter(
               durationMs,
               thresholdMs: config.slowDbOperationMs,
               result,
+              suppressedCount,
               requestId: requestContext?.requestId,
               traceId: requestContext?.traceId,
               ...getOperationContext(),

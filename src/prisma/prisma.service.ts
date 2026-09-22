@@ -48,9 +48,7 @@ export interface DatabasePoolConfig {
 
 function readPositiveInt(value: unknown, fallback: number): number {
   const parsed =
-    typeof value === 'number'
-      ? value
-      : Number.parseInt(String(value ?? ''), 10);
+    typeof value === 'number' ? value : Number(String(value ?? ''));
   return Number.isInteger(parsed) && parsed > 0 ? parsed : fallback;
 }
 

@@ -584,6 +584,19 @@ export function reportOperationalError(
 export function createErrorAggregationProvider(
   config: ErrorAggregationConfig,
   clientFactory: SentryClientFactory = defaultSentryClientFactory,
+  reportInitializationFailure: () => void = () => {
+    try {
+      process.stderr.write(
+        `${JSON.stringify({
+          level: 'error',
+          event: 'error_aggregation_init_failed',
+          provider: 'sentry',
+        })}\n`,
+      );
+    } catch {
+      // An unavailable stderr must not turn optional telemetry into a boot failure.
+    }
+  },
 ): ErrorAggregationProvider {
   if (config.provider !== 'sentry' || !config.dsn) {
     return new NoopErrorAggregationProvider();
@@ -594,10 +607,13 @@ export function createErrorAggregationProvider(
     client = clientFactory(config);
   } catch {
     // Loading or initializing an optional SDK must not prevent application
-    // startup. The caller can still surface its primary bootstrap failure.
+    // startup. Emit a fixed, non-sensitive diagnostic so the disabled provider
+    // is still visible to operators.
+    reportInitializationFailure();
     return new NoopErrorAggregationProvider();
   }
   if (!client) {
+    reportInitializationFailure();
     return new NoopErrorAggregationProvider();
   }
 

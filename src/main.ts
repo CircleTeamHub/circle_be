@@ -29,7 +29,9 @@ export function resolveAppPort(value: unknown): number {
     }
   }
 
-  throw new Error(`Invalid APP_PORT value: ${String(value)}`);
+  throw Object.assign(new Error(`Invalid APP_PORT value: ${String(value)}`), {
+    startupCode: 'INVALID_APP_PORT',
+  });
 }
 
 type CorsOriginCallback = (err: Error | null, allow?: boolean) => void;
@@ -82,6 +84,13 @@ export function buildNestFactoryOptions() {
     cors: {
       origin: resolveCorsOriginChecker(),
       credentials: true,
+      allowedHeaders: [
+        'Authorization',
+        'Content-Type',
+        'X-Request-Id',
+        'X-Device-Name',
+        'Idempotency-Key',
+      ],
       // GET /note and /note/recycle-bin signal truncation through this header
       // while the body stays an array; browsers hide unlisted response headers
       // from cross-origin callers.
@@ -155,13 +164,32 @@ function safeBootstrapFailureDetails(error: unknown): string {
 
   const record = sanitized as Record<string, unknown>;
   const errorName = typeof record.name === 'string' ? record.name : 'Error';
+  const rawStartupCode =
+    error && typeof error === 'object'
+      ? Object.getOwnPropertyDescriptor(error, 'startupCode')?.value
+      : undefined;
+  const startupCode =
+    typeof rawStartupCode === 'string' &&
+    [
+      'INVALID_APP_PORT',
+      'OBJECT_STORAGE_NOT_CONFIGURED',
+      'OBJECT_STORAGE_DELIVERY_URL_INVALID',
+      'OBJECT_STORAGE_DELIVERY_URL_REQUIRED',
+      'OBJECT_STORAGE_POLICY_UNAVAILABLE',
+    ].includes(rawStartupCode)
+      ? rawStartupCode
+      : undefined;
   const source =
     typeof record.stack === 'string'
       ? record.stack.split('\n').find((line) => line.startsWith('at '))
       : undefined;
-  return source
-    ? `errorName=${errorName} source=${source}`
-    : `errorName=${errorName}`;
+  return [
+    `errorName=${errorName}`,
+    startupCode ? `startupCode=${startupCode}` : undefined,
+    source ? `source=${source}` : undefined,
+  ]
+    .filter(Boolean)
+    .join(' ');
 }
 
 /**
