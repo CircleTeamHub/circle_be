@@ -84,6 +84,13 @@ export function buildNestFactoryOptions() {
     cors: {
       origin: resolveCorsOriginChecker(),
       credentials: true,
+      allowedHeaders: [
+        'Authorization',
+        'Content-Type',
+        'X-Request-Id',
+        'X-Device-Name',
+        'Idempotency-Key',
+      ],
       // GET /note and /note/recycle-bin signal truncation through this header
       // while the body stays an array; browsers hide unlisted response headers
       // from cross-origin callers.

@@ -10,15 +10,18 @@ import {
   Get,
   INestApplication,
   Module,
+  Res,
   ServiceUnavailableException,
 } from '@nestjs/common';
 import { NestFactory } from '@nestjs/core';
+import type { Response } from 'express';
 import request from 'supertest';
 
 @Controller('cors-probe')
 class CorsProbeController {
   @Get()
-  probe() {
+  probe(@Res({ passthrough: true }) response: Response) {
+    response.setHeader('X-Request-Id', 'server-request-id');
     return { ok: true };
   }
 }
@@ -127,13 +130,20 @@ describe('production HTTP CORS integration', () => {
     const allowed = await request(app.getHttpServer())
       .options('/cors-probe')
       .set('Origin', 'https://web.example.test')
-      .set('Access-Control-Request-Method', 'GET');
+      .set('Access-Control-Request-Method', 'GET')
+      .set(
+        'Access-Control-Request-Headers',
+        'Authorization, Content-Type, X-Request-Id, X-Device-Name, Idempotency-Key',
+      );
 
     expect(allowed.status).toBe(204);
     expect(allowed.headers['access-control-allow-origin']).toBe(
       'https://web.example.test',
     );
     expect(allowed.headers['access-control-allow-credentials']).toBe('true');
+    expect(allowed.headers['access-control-allow-headers']).toContain(
+      'X-Request-Id',
+    );
 
     const blocked = await request(app.getHttpServer())
       .options('/cors-probe')
@@ -141,6 +151,18 @@ describe('production HTTP CORS integration', () => {
       .set('Access-Control-Request-Method', 'GET');
 
     expect(blocked.headers['access-control-allow-origin']).toBeUndefined();
+  });
+
+  it('exposes the server request id to an allowed browser origin', async () => {
+    const response = await request(app.getHttpServer())
+      .get('/cors-probe')
+      .set('Origin', 'https://web.example.test');
+
+    expect(response.status).toBe(200);
+    expect(response.headers['x-request-id']).toBe('server-request-id');
+    expect(response.headers['access-control-expose-headers']).toContain(
+      'X-Request-Id',
+    );
   });
 });
 
@@ -172,6 +194,18 @@ describe('buildNestFactoryOptions', () => {
   it('exposes the X-Request-Id correlation header to browser clients', () => {
     expect(buildNestFactoryOptions().cors.exposedHeaders).toEqual(
       expect.arrayContaining(['X-Request-Id']),
+    );
+  });
+
+  it('allows every custom request header used by the browser client', () => {
+    expect(buildNestFactoryOptions().cors.allowedHeaders).toEqual(
+      expect.arrayContaining([
+        'Authorization',
+        'Content-Type',
+        'X-Request-Id',
+        'X-Device-Name',
+        'Idempotency-Key',
+      ]),
     );
   });
 });
