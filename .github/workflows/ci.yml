@@ -334,7 +334,7 @@ jobs:
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
-      - name: Verify protected env and persistent log-volume ownership
+      - name: Verify both non-root app colors can read the protected env and reuse log volumes
         run: |
           set -euo pipefail
           test ! -e .env.production
