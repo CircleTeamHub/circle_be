@@ -93,7 +93,11 @@ export function createWinstonOptions(
 ): WinstonModuleOptions {
   const rawConfig = getRawConfig(configService);
   const loggingConfig = createLoggingConfig(rawConfig, nodeEnv);
-  const timestampEnabled = configService.get(LogEnum.TIMESTAMP) === 'true';
+  const rawTimestamp = configService.get(LogEnum.TIMESTAMP);
+  const timestampEnabled =
+    rawTimestamp === true ||
+    (typeof rawTimestamp === 'string' &&
+      rawTimestamp.trim().toLowerCase() === 'true');
   const production = nodeEnv === 'production';
   const identifiers = {
     serviceName: identifier(configService.get('LOG_SERVICE_NAME'), 'circle-be'),

@@ -240,6 +240,9 @@ describe('UploadService', () => {
         expect.objectContaining({
           event: 'object_storage_bootstrap_failed',
           operation: 'put_bucket_policy',
+          providerCode: 'AccessDenied',
+          providerRequestId: 'req-123',
+          attempts: 1,
           upstreamStatus: 403,
         }),
       );
@@ -248,8 +251,39 @@ describe('UploadService', () => {
       ).toMatchObject({
         event: 'object_storage_bootstrap_failed',
         operation: 'put_bucket_policy',
+        providerCode: 'AccessDenied',
+        providerRequestId: 'req-123',
+        attempts: 1,
         upstreamStatus: 403,
       });
+    });
+
+    it('drops malformed object-store correlation metadata', async () => {
+      const failure = Object.assign(new Error('private'), {
+        Code: 'Access Denied: private',
+        $metadata: {
+          httpStatusCode: 503,
+          requestId: 'Bearer private-token',
+          attempts: 1000,
+        },
+      });
+      const service = buildService(
+        jest.fn().mockResolvedValueOnce({}).mockRejectedValueOnce(failure),
+      );
+      const logger = { error: jest.fn(), log: jest.fn(), warn: jest.fn() };
+      (service as any).logger = logger;
+
+      await service.onModuleInit();
+
+      expect(logger.error.mock.calls[0][0]).toMatchObject({
+        providerCode: null,
+        providerRequestId: null,
+        attempts: null,
+        upstreamStatus: 503,
+      });
+      expect(JSON.stringify(logger.error.mock.calls)).not.toContain(
+        'private-token',
+      );
     });
 
     it('never passes provider messages, payloads or stack prose to a logger', async () => {
