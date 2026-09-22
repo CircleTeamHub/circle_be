@@ -148,7 +148,7 @@ export function createEnvValidationSchema(
     // File logging stays opt-in for existing deployments. When enabled, Alloy
     // tails these JSON files, so malformed values must fail boot instead of
     // silently leaving the collector with no input.
-    LOG_FILE_ON: Joi.boolean().default(false),
+    LOG_FILE_ON: Joi.boolean(),
     LOG_SERVICE_NAME: Joi.string()
       .pattern(
         /^(?![^@]+@[^@]+\.[A-Za-z]{2,}$)[A-Za-z0-9][A-Za-z0-9._@+-]{0,99}$/,
