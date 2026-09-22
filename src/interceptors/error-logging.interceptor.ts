@@ -35,9 +35,11 @@ export class ErrorLoggingInterceptor implements NestInterceptor {
     _context: ExecutionContext,
     next: CallHandler,
   ): Observable<unknown> {
+    // Capture before the observable crosses an async boundary. Older supported
+    // Node runtimes do not preserve AsyncLocalStorage through every RxJS path.
+    const requestContext = getRequestContext();
     return next.handle().pipe(
       catchError((error: unknown) => {
-        const requestContext = getRequestContext();
         // Known Prisma failures have the same classification as their filter.
         const statusCode = resolveErrorStatusCode(error);
         logHttpFailure(this.logger, error, statusCode);
@@ -56,13 +58,13 @@ export class ErrorLoggingInterceptor implements NestInterceptor {
                   getAuthFailureReason(error) ??
                   (statusCode === 401 ? 'unauthorized' : 'forbidden'),
               });
-              markSecurityEventLogged(error);
+              markSecurityEventLogged(error, requestContext?.requestId);
             },
             () =>
               this.logger.error(
                 {
                   event: 'security_event_log_failed',
-                  requestId: getRequestContext()?.requestId,
+                  requestId: requestContext?.requestId,
                 },
                 'HttpError',
               ),
@@ -80,13 +82,13 @@ export class ErrorLoggingInterceptor implements NestInterceptor {
                 path: requestContext?.path,
                 userId: requestContext?.userId,
               });
-              markErrorCaptured(error);
+              markErrorCaptured(error, requestContext?.requestId);
             },
             () =>
               this.logger.error(
                 {
                   event: 'error_aggregation_failed',
-                  requestId: getRequestContext()?.requestId,
+                  requestId: requestContext?.requestId,
                 },
                 'HttpError',
               ),
