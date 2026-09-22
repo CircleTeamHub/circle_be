@@ -59,6 +59,15 @@ describe('log sanitizer', () => {
     expect(value).toContain('failed');
   });
 
+  it('redacts moderation terms embedded in legacy prose', () => {
+    const sanitized = sanitizeLogText(
+      'friend-request replay dropped (request=req-1, word=private-slur)',
+    );
+    expect(sanitized).toContain('request=[redacted]');
+    expect(sanitized).toContain('word=[redacted]');
+    expect(sanitized).not.toContain('private-slur');
+  });
+
   it('uses known route templates and buckets all unmatched paths', () => {
     expect(
       safeLogPath('/api/v1/note/share-links/private-link?code=secret'),
