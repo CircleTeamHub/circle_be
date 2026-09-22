@@ -166,8 +166,7 @@ export function sanitizeLogValue(value: unknown): unknown {
       if (
         PRIVATE_KEY.test(normalizedKey) ||
         PRIVATE_FIELDS.has(normalizedKey) ||
-        (normalizedKey === 'message' &&
-          (depth > 1 || typeof current === 'string'))
+        (normalizedKey === 'message' && depth > 1)
       )
         return REDACTED;
       if (normalizedKey === 'stack' || normalizedKey === 'trace')
@@ -263,7 +262,8 @@ export function sanitizeLogValue(value: unknown): unknown {
         // Error subclasses. Their message can contain SQL, bodies or contacts.
         if (
           'message' in result &&
-          ('stack' in result ||
+          ('event' in result ||
+            'stack' in result ||
             'error' in result ||
             result.level === 'error' ||
             key === 'error')
