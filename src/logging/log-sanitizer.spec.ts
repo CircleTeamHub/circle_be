@@ -83,15 +83,9 @@ describe('log sanitizer', () => {
   });
 
   it('keeps sanitized legacy logger prose readable', () => {
-    const result = sanitizeLogValue({
-      level: 'info',
-      message: 'server started Authorization: Bearer private-token',
-    });
-    expect(result).toMatchObject({
-      level: 'info',
-      message: expect.stringContaining('server started'),
-    });
-    expect(JSON.stringify(result)).not.toContain('private-token');
+    expect(
+      sanitizeLogValue({ level: 'info', message: 'started token=x' }),
+    ).toEqual({ level: 'info', message: 'started token=[redacted]' });
   });
 
   it('uses known route templates and buckets all unmatched paths', () => {
