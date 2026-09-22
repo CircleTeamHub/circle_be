@@ -628,3 +628,34 @@ describe('METRICS_AUTH_TOKEN', () => {
     expect(error).toBeUndefined();
   });
 });
+
+describe('JPush credentials', () => {
+  const base = {
+    NODE_ENV: 'development',
+    SECRET: 'test-secret',
+    DATABASE_URL: 'postgresql://user:pass@localhost:5432/db',
+  };
+
+  it.each([
+    { JPUSH_APP_KEY: 'app-key' },
+    { JPUSH_MASTER_SECRET: 'master-secret' },
+  ])('rejects an incomplete credential pair: %o', (partial) => {
+    const env = { ...base, ...partial };
+    const { error } = createEnvValidationSchema(env).validate(env);
+    expect(error?.message).toContain(
+      'JPUSH_APP_KEY and JPUSH_MASTER_SECRET must be configured together',
+    );
+  });
+
+  it('accepts a complete credential pair and boolean APNs target', () => {
+    const env = {
+      ...base,
+      JPUSH_APP_KEY: 'app-key',
+      JPUSH_MASTER_SECRET: 'master-secret',
+      JPUSH_APNS_PRODUCTION: 'true',
+    };
+    const { error, value } = createEnvValidationSchema(env).validate(env);
+    expect(error).toBeUndefined();
+    expect(value.JPUSH_APNS_PRODUCTION).toBe(true);
+  });
+});

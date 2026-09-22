@@ -262,14 +262,17 @@ export class NotificationPushOutboxProcessor {
           continue;
         }
 
-        const projectByToken = new Map(
-          tokens.map((row) => [row.token, row.projectId]),
-        );
+        const projectByToken = new Map(tokens.map((row) => [row.token, row]));
         const outcomes = await this.pushService.sendToTokens(
-          pendingDeliveries.map((delivery) => ({
-            token: delivery.token,
-            projectId: projectByToken.get(delivery.token) ?? null,
-          })),
+          pendingDeliveries.map((delivery) => {
+            const target = projectByToken.get(delivery.token);
+            return {
+              token: delivery.token,
+              projectId: target?.projectId ?? null,
+              provider: target?.provider ?? 'expo',
+              ...(target?.platform ? { platform: target.platform } : {}),
+            };
+          }),
           payload,
         );
 
@@ -285,9 +288,10 @@ export class NotificationPushOutboxProcessor {
             await this.prisma.notificationPushDelivery.update({
               where: { id: deliveryId },
               data: {
-                status: 'SENT',
+                status: outcome.receiptFinal ? 'CONFIRMED' : 'SENT',
                 ticketID: outcome.ticketId ?? null,
                 sentAt,
+                ...(outcome.receiptFinal ? { receiptCheckedAt: sentAt } : {}),
                 attempts: { increment: 1 },
                 lastError: null,
               },
