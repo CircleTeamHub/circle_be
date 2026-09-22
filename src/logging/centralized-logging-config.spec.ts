@@ -50,6 +50,9 @@ describe('optional centralized log deployment', () => {
     expect(read('Dockerfile.prod')).toContain(
       'install -d -o app -g app /app/logs',
     );
+    expect(read('Dockerfile.prod')).toMatch(
+      /ARG APP_UID=10001[\s\S]*ARG APP_GID=10001/,
+    );
   });
 
   it('isolates unauthenticated log endpoints and needs no Docker or host access', () => {
@@ -107,13 +110,24 @@ describe('optional centralized log deployment', () => {
     expect(loki.limits_config.discover_service_name).toEqual([]);
   });
 
-  it('keeps correlation IDs in JSON, legacy rollback lines, and only bounded labels', () => {
+  it('keeps bounded labels and replaces unsafe rollback prose wholesale', () => {
     expect(alloy).toMatch(
       /stage\.label_keep\s*\{\s*values\s*=\s*\["service", "environment", "level"\]/,
     );
     expect(alloy).toContain('error|warn|info|http|verbose|debug|silly');
     expect(alloy).toContain('drop_malformed = false');
     expect(alloy).toContain('values = { level = "unknown" }');
+    const legacyGate =
+      /selector = "\{level!~\\"[^\n]+"\}"[\s\S]*?stage\.replace\s*\{\s*expression = "([^"]+)"\s*replace\s*= "([^"]+)"/.exec(
+        alloy,
+      );
+    expect(legacyGate).not.toBeNull();
+    expect(legacyGate![1]).toBe('.+');
+    const unsafe =
+      'userId=42 email=alice@example.test object=chat/42/private.jpg token=secret';
+    expect(unsafe.replace(/.+/, legacyGate![2])).toBe(
+      'legacy rollback log content redacted by collector',
+    );
     expect(alloy).toContain('/var/log/circle/{blue,green}/application-*.log*');
     expect(alloy).not.toContain('error-*.log');
   });
@@ -135,5 +149,11 @@ describe('optional centralized log deployment', () => {
       uid: 'loki',
       isDefault: false,
     });
+  });
+
+  it('reconciles Prometheus when the optional overlay is enabled or removed', () => {
+    const runbook = read('monitoring/logs.md');
+    expect(runbook).toMatch(/up -d --no-deps loki alloy grafana prometheus/);
+    expect(runbook).toMatch(/--force-recreate prometheus grafana/);
   });
 });

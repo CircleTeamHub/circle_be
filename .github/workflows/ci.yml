@@ -334,7 +334,7 @@ jobs:
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
-      - name: Verify both non-root app colors can read the protected env
+      - name: Verify protected env and persistent log-volume ownership
         run: |
           set -euo pipefail
           test ! -e .env.production
@@ -361,7 +361,11 @@ jobs:
             docker compose -p "$project" \
               -f docker-compose.prod.yml -f docker-compose.release.yml \
               run --rm --no-deps --entrypoint node "$service" \
-              -e "const fs=require('node:fs'); if(process.getuid()===0) throw new Error('app is root'); fs.accessSync('/app/.env.production',fs.constants.R_OK)"
+              -e "const fs=require('node:fs'); if(process.getuid()!==10001) throw new Error('unexpected app uid'); fs.accessSync('/app/.env.production',fs.constants.R_OK); fs.writeFileSync('/app/logs/.volume-compatibility','first')"
+            docker compose -p "$project" \
+              -f docker-compose.prod.yml -f docker-compose.release.yml \
+              run --rm --no-deps --entrypoint node "$service" \
+              -e "require('node:fs').appendFileSync('/app/logs/.volume-compatibility','-replacement')"
           done
 
       - name: Build Caddy edge image

@@ -29,6 +29,12 @@ loki.process "circle" {
   }
   stage.match {
     selector = "{level!~\"error|warn|info|http|verbose|debug|silly\"}"
+    // Pre-sanitizer rollback images can emit arbitrary prose. Keep a safe
+    // occurrence marker for rollback visibility, never the untrusted content.
+    stage.replace {
+      expression = ".+"
+      replace    = "legacy rollback log content redacted by collector"
+    }
     stage.static_labels {
       values = { level = "unknown" }
     }

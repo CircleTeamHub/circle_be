@@ -420,6 +420,12 @@ jobs:
             deploy/offsite-backup.sh
             deploy/Caddyfile.admin
             monitoring/sync-metrics-token.sh
+            monitoring/docker-compose.logs.yml
+            monitoring/alloy/config.alloy
+            monitoring/loki/config.yml
+            monitoring/grafana/provisioning/datasources/loki.yml
+            monitoring/grafana/provisioning/datasources/loki.yml.example
+            monitoring/prometheus/logs-targets.yml
             Dockerfile.caddy
             docker-compose.prod.yml
             docker-compose.release.yml

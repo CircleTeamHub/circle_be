@@ -62,7 +62,8 @@ Do not point a test deployment at production volumes.
    not the monitoring project's name. Defaults are `circle-be_app_logs_blue`
    and `circle-be_app_logs_green`. Inspect them with `docker volume inspect`
    before enabling collection; Alloy deliberately fails if they do not exist.
-4. Validate and start only the additional services and Grafana:
+4. Validate and enable the overlay. Prometheus must be included so Compose adds
+   the private network and collector target mount to its existing container:
 
    ```bash
    docker compose --env-file monitoring/.env \
@@ -71,8 +72,11 @@ Do not point a test deployment at production volumes.
 
    docker compose --env-file monitoring/.env \
      -f monitoring/docker-compose.yml -f monitoring/docker-compose.prod.yml \
-     -f monitoring/docker-compose.logs.yml up -d --no-deps loki alloy grafana
+     -f monitoring/docker-compose.logs.yml up -d --no-deps loki alloy grafana prometheus
    ```
+
+   Confirm Prometheus lists healthy `component="loki"` and `component="alloy"`
+   targets under the `logs-pipeline` job before treating collection as enabled.
 
 The overlay publishes no Loki/Alloy ports and connects only Grafana to their
 internal Docker network. Loki has no authentication of its own; never expose
@@ -132,21 +136,27 @@ also be rejected by Loki. Do not delete offsets as routine troubleshooting.
 
 To pause collection, use the full Compose file set and `stop alloy`; to pause
 the entire log service, `stop alloy loki`. Application logging continues.
-To remove the optional datasource, stop those services then recreate Grafana
-with just the base + production monitoring files; the provisioned Loki
-datasource is automatically removed through provisioning's `prune: true`.
+To remove the overlay, stop Alloy/Loki with all three files, then reconcile the
+two changed base services without the overlay:
+
+```bash
+docker compose -f monitoring/docker-compose.yml -f monitoring/docker-compose.prod.yml \
+  -f monitoring/docker-compose.logs.yml stop alloy loki
+docker compose -f monitoring/docker-compose.yml -f monitoring/docker-compose.prod.yml \
+  up -d --no-deps --force-recreate prometheus grafana
+```
+
+Recreating Prometheus removes the collector targets/network; recreating Grafana
+removes the Loki datasource through provisioning's `prune: true`.
 Preserve all named volumes.
 Do not use `down -v`: it also destroys other monitoring history. Re-enable using
 the same overlay and volume names to resume from saved positions.
 
-During the application JSON-log migration window, Alloy deliberately accepts
-both current JSON lines and legacy text lines. Legacy lines are retained with
-`level="unknown"`; they are not parsed for correlation fields. This keeps
-centralized logs available if an emergency rollback starts a previous app image
-against the same log volumes. Do not switch `drop_malformed` back to `true`
-until every rollback candidate writes JSON and the compatibility window has
-closed. Preserve the source files during any rollback even when collection is
-paused.
+During the JSON-log migration window, malformed or unknown-level rollback lines
+are replaced wholesale with `legacy rollback log content redacted by collector`
+and `level="unknown"`. This preserves safe timing/count visibility without
+copying pre-sanitizer prose, user IDs, object keys, or exception messages into
+Loki. Restricted source volumes remain available for incident handling.
 
 ## Validate changes without starting the stack
 
