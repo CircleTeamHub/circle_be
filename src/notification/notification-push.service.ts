@@ -702,7 +702,12 @@ export class NotificationPushService {
         }));
       }
       const retryable =
-        response.status === 429 || response.status >= 500 || code === 1000;
+        response.status === 401 ||
+        response.status === 403 ||
+        response.status === 429 ||
+        response.status >= 500 ||
+        code === 1000 ||
+        code === 1004;
       return batch.map(({ token }) => ({
         token,
         status: retryable ? 'RETRYABLE' : 'TERMINAL',
