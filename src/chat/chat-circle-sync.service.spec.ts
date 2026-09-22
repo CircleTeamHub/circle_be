@@ -185,7 +185,9 @@ describe('ChatCircleSyncService', () => {
     });
 
     it('records a fixed scan failure event without exposing the database exception', async () => {
-      prisma.$queryRaw.mockRejectedValueOnce(privateFailure());
+      prisma.$queryRaw.mockRejectedValueOnce(
+        Object.assign(privateFailure(), { code: 'P2024' }),
+      );
       await expect(sync.reconcileRecent()).resolves.toBeUndefined();
       expect(lines.join('')).not.toMatch(
         /private_chat_content|private-person|SELECT/,
@@ -195,6 +197,7 @@ describe('ChatCircleSyncService', () => {
           expect.objectContaining({
             event: 'chat_circle_sync_failed',
             operation: 'reconcile_scan',
+            errorCode: 'P2024',
           }),
         ]),
       );

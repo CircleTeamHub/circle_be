@@ -5,6 +5,16 @@ const { spawnSync } = require('node:child_process');
 const test = require('node:test');
 const assert = require('node:assert/strict');
 
+test('Caddy owns the chat trace used by both proxy and gateway logs', () => {
+  const caddy = fs.readFileSync(
+    path.join(__dirname, '..', 'deploy', 'Caddyfile.admin'),
+    'utf8',
+  );
+  assert.match(caddy, /log_append @chat_ws traceId ws-\{http\.request\.uuid\}/);
+  assert.match(caddy, /header_up X-Connection-Trace-Id ws-\{http\.request\.uuid\}/);
+  assert.doesNotMatch(caddy, /header_regexp connection_trace/);
+});
+
 test('release workflow signs and stages the exact immutable release manifest', () => {
   const workflow = fs.readFileSync(
     path.join(__dirname, '..', '.github', 'workflows', 'release.yml'),

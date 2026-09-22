@@ -30,6 +30,14 @@ const DISABLED_ADMIN_STATES = new Set<string>([
   'DISMISSED',
 ]);
 
+function safePrismaCode(error: unknown): string | undefined {
+  const code =
+    error && typeof error === 'object'
+      ? Object.getOwnPropertyDescriptor(error, 'code')?.value
+      : undefined;
+  return typeof code === 'string' && /^P\d{4}$/.test(code) ? code : undefined;
+}
+
 /**
  * 圈子成员 ←→ 群会话座位的同步(自研聊天版的 group-sync)。
  *
@@ -103,6 +111,7 @@ export class ChatCircleSyncService {
               sanitizeLogValue({
                 event: 'chat_circle_sync_failed',
                 operation: 'reconcile_scan',
+                errorCode: safePrismaCode(error),
                 error,
               }),
             ),
