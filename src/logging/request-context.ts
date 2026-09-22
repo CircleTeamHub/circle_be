@@ -16,8 +16,8 @@ const requestContextStorage = new AsyncLocalStorage<RequestContext>();
 // deploys. Whitespace, URLs, emails and header syntax cannot match this grammar;
 // JWT-shaped values get an explicit second rejection below.
 const SAFE_REQUEST_ID = /^[A-Za-z0-9._:-]{1,128}$/;
-const JWT_SHAPED_REQUEST_ID =
-  /^[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+$/;
+const TOKEN_SHAPED_REQUEST_ID =
+  /^(?:[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]*|[A-Za-z0-9_-]+\.[A-Za-z0-9_-]*\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+)$/;
 
 export function resolveRequestId(value?: unknown): string {
   const requestId = Array.isArray(value) ? value[0] : value;
@@ -25,7 +25,7 @@ export function resolveRequestId(value?: unknown): string {
   if (
     typeof requestId === 'string' &&
     SAFE_REQUEST_ID.test(requestId) &&
-    !JWT_SHAPED_REQUEST_ID.test(requestId)
+    !TOKEN_SHAPED_REQUEST_ID.test(requestId)
   ) {
     return requestId;
   }
