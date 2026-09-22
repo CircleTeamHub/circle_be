@@ -157,13 +157,14 @@ program 未启用期间,一个 `maxMembers` 落在 **401–3000** 的建圈请�
 **上线前逐条确认:**
 
 - [ ] 生产 `.env.production` 里三个 `EMAIL_CODE_*` 全部删除(不是设成空字符串)。
-- [ ] 启动日志中**没有** `[SECURITY] production email code bypass is LIVE` 横幅。
+- [ ] 启动日志中**没有** `event=production_email_bypass_active` 结构化事件。
 - [ ] `circle_email_code_bypass_active` 为 `0`,且 `EmailCodeBypassActive` 告警未触发。
 - [ ] 窗口期内曾被列入允许名单的账号,确认都是测试账号(真实用户地址绝不能进名单)。
 
 **已有的防呆(不能替代上面的人工确认):** 配置不合格不会静默降级 ——
 码短于 16 位、名单畸形/缺失、用途非 `REGISTER`/`LOGIN` 都会让**启动失败**;
-生效期间启动日志有 `[SECURITY]` 横幅,`/metrics` 有可告警的硬指标。
+生效期间启动日志有 `event=production_email_bypass_active` 结构化事件,
+`/metrics` 有可告警的硬指标。
 探针 `/readyz` **有意不暴露**该状态:它未鉴权,把「此处有固定码」写进公开响应
 等于给攻击者发请柬。
 

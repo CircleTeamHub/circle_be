@@ -42,17 +42,16 @@ describe('request context', () => {
   });
 
   it('generates ids for missing or unsafe incoming values', () => {
-    expect(resolveRequestId()).toMatch(
-      /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/,
-    );
-    expect(resolveRequestId('bad value with spaces')).toMatch(
-      /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/,
-    );
-    expect(resolveRequestId('part1.part2.part3')).toMatch(
-      /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/,
-    );
-    expect(resolveRequestId('person@example.com')).toMatch(
-      /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/,
-    );
+    const generated =
+      /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
+    for (const unsafe of [
+      undefined,
+      'bad value with spaces',
+      'part1.part2.part3',
+      'eyJhbGciOiJub25lIn0.eyJzdWIiOiJ1c2VyIn0.',
+      'protected..iv.ciphertext.tag',
+      'person@example.com',
+    ])
+      expect(resolveRequestId(unsafe)).toMatch(generated);
   });
 });

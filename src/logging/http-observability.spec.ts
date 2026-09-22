@@ -224,22 +224,40 @@ describe('HTTP diagnostic privacy and reliability', () => {
   it('deduplicates one error only within the same request context', () => {
     const logger = loggerSpy();
     const error = new Error('private shared failure');
-    const write = (requestId: string) =>
-      runWithRequestContext(
-        {
-          requestId,
-          traceId: requestId,
-          method: 'GET',
-          path: '/api/v1/auth/me',
-        },
-        () => logHttpFailure(logger, error, 500),
+    const firstRequest = {
+      requestId: 'same-client-id',
+      traceId: 'same-client-id',
+      method: 'GET',
+      path: '/api/v1/auth/me',
+    };
+    const secondRequest = { ...firstRequest };
+    const write = (requestContext: typeof firstRequest) =>
+      runWithRequestContext(requestContext, () =>
+        logHttpFailure(logger, error, 500),
       );
 
-    write('9b2a7f3c-2a9e-4f1c-8d2b-124a5cc93a10');
-    write('9b2a7f3c-2a9e-4f1c-8d2b-124a5cc93a10');
-    write('4c5397be-8ce2-4acd-8a2f-64385b46f40b');
+    write(firstRequest);
+    write(firstRequest);
+    write(secondRequest);
 
     expect(logger.error).toHaveBeenCalledTimes(2);
+  });
+
+  it('deduplicates with the request object when async context is unavailable', () => {
+    const logger = loggerSpy();
+    const error = new Error('private async failure');
+    const requestObject = { method: 'GET', url: '/api/v1/auth/me' };
+    const requestContext = {
+      requestId: 'request-async',
+      traceId: 'request-async',
+      method: 'GET',
+      path: '/api/v1/auth/me',
+    };
+
+    logHttpFailure(logger, error, 500, requestObject, requestContext);
+    logHttpFailure(logger, error, 500, requestObject, undefined);
+
+    expect(logger.error).toHaveBeenCalledTimes(1);
   });
 
   it('propagates the original exception even if both primary logging and aggregation fail', async () => {

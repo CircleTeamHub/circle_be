@@ -10,15 +10,18 @@ import {
   Get,
   INestApplication,
   Module,
+  Res,
   ServiceUnavailableException,
 } from '@nestjs/common';
 import { NestFactory } from '@nestjs/core';
+import type { Response } from 'express';
 import request from 'supertest';
 
 @Controller('cors-probe')
 class CorsProbeController {
   @Get()
-  probe() {
+  probe(@Res({ passthrough: true }) response: Response) {
+    response.setHeader('X-Request-Id', 'server-request-id');
     return { ok: true };
   }
 }
@@ -127,13 +130,20 @@ describe('production HTTP CORS integration', () => {
     const allowed = await request(app.getHttpServer())
       .options('/cors-probe')
       .set('Origin', 'https://web.example.test')
-      .set('Access-Control-Request-Method', 'GET');
+      .set('Access-Control-Request-Method', 'GET')
+      .set(
+        'Access-Control-Request-Headers',
+        'Authorization, Content-Type, X-Request-Id, X-Device-Name, Idempotency-Key',
+      );
 
     expect(allowed.status).toBe(204);
     expect(allowed.headers['access-control-allow-origin']).toBe(
       'https://web.example.test',
     );
     expect(allowed.headers['access-control-allow-credentials']).toBe('true');
+    expect(allowed.headers['access-control-allow-headers']).toContain(
+      'X-Request-Id',
+    );
 
     const blocked = await request(app.getHttpServer())
       .options('/cors-probe')
@@ -142,11 +152,25 @@ describe('production HTTP CORS integration', () => {
 
     expect(blocked.headers['access-control-allow-origin']).toBeUndefined();
   });
+
+  it('exposes the server request id to an allowed browser origin', async () => {
+    const response = await request(app.getHttpServer())
+      .get('/cors-probe')
+      .set('Origin', 'https://web.example.test');
+
+    expect(response.status).toBe(200);
+    expect(response.headers['x-request-id']).toBe('server-request-id');
+    expect(response.headers['access-control-expose-headers']).toContain(
+      'X-Request-Id',
+    );
+  });
 });
 
 describe('resolveAppPort', () => {
   it('rejects malformed port strings', () => {
-    expect(() => resolveAppPort('3000{')).toThrow('Invalid APP_PORT value');
+    expect(() => resolveAppPort('3000{')).toThrow(
+      expect.objectContaining({ startupCode: 'INVALID_APP_PORT' }),
+    );
   });
 
   it('accepts numeric strings', () => {
@@ -170,6 +194,18 @@ describe('buildNestFactoryOptions', () => {
   it('exposes the X-Request-Id correlation header to browser clients', () => {
     expect(buildNestFactoryOptions().cors.exposedHeaders).toEqual(
       expect.arrayContaining(['X-Request-Id']),
+    );
+  });
+
+  it('allows every custom request header used by the browser client', () => {
+    expect(buildNestFactoryOptions().cors.allowedHeaders).toEqual(
+      expect.arrayContaining([
+        'Authorization',
+        'Content-Type',
+        'X-Request-Id',
+        'X-Device-Name',
+        'Idempotency-Key',
+      ]),
     );
   });
 });
@@ -284,6 +320,29 @@ describe('runBootstrap', () => {
 
     expect(sinks.logged[0]).not.toContain('APP_PORT missing');
     expect(sinks.exit).toHaveBeenCalledWith(1);
+  });
+
+  it('includes only allowlisted startup codes in the fatal diagnostic', async () => {
+    const sinks = recordingSinks();
+    const failure = Object.assign(new Error('private invalid port value'), {
+      startupCode: 'INVALID_APP_PORT',
+    });
+
+    await runBootstrap(() => Promise.reject(failure), sinks);
+
+    expect(sinks.logged[0]).toContain('startupCode=INVALID_APP_PORT');
+    expect(sinks.logged[0]).not.toContain('private invalid port value');
+  });
+
+  it('does not emit arbitrary attacker-controlled startup codes', async () => {
+    const sinks = recordingSinks();
+    const failure = Object.assign(new Error('private'), {
+      startupCode: 'TOKEN_secret-value',
+    });
+
+    await runBootstrap(() => Promise.reject(failure), sinks);
+
+    expect(sinks.logged[0]).not.toContain('TOKEN_secret-value');
   });
 
   it('still exits when the log line itself cannot be written', async () => {

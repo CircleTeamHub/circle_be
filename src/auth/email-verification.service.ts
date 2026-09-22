@@ -19,6 +19,9 @@ import {
   resolveEmailBypassCode,
 } from './email-code-bypass';
 
+export const PRODUCTION_EMAIL_BYPASS_EVENT =
+  'production_email_bypass_active' as const;
+
 /** SMTP 错误 → 可入日志的脱敏描述：类名 + code/responseCode + 打码正文。 */
 function describeMailerError(error: unknown): string {
   const shaped = error as {
@@ -70,7 +73,7 @@ export class EmailVerificationService implements OnModuleInit {
     const bypass = describeEmailCodeBypass();
     if (bypass.status === 'active') {
       this.logger.error({
-        event: 'production_email_bypass_active',
+        event: PRODUCTION_EMAIL_BYPASS_EVENT,
         status: bypass.status,
         identities: bypass.identities,
       });
