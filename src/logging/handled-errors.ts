@@ -12,12 +12,13 @@
  * request id is part of the marker so an SDK/cache that reuses
  * one Error object cannot suppress diagnostics for later requests.
  */
-import { getRequestContext } from './request-context';
+import { getRequestContext, type RequestContext } from './request-context';
 
-type RequestMarker = string | symbol;
-const capturedErrors = new WeakMap<object, RequestMarker>();
-const securityLoggedErrors = new WeakMap<object, RequestMarker>();
-const UNSCOPED_REQUEST = Symbol('unscoped-request');
+type RequestMarkers = WeakSet<RequestContext>;
+const capturedErrors = new WeakMap<object, RequestMarkers>();
+const securityLoggedErrors = new WeakMap<object, RequestMarkers>();
+const unscopedCapturedErrors = new WeakSet<object>();
+const unscopedSecurityLoggedErrors = new WeakSet<object>();
 
 /**
  * Why JwtGuard rejected a bearer token, taken from passport's `info` — the
@@ -43,21 +44,29 @@ function isObject(error: unknown): error is object {
 
 function setRequestMarker(
   error: object,
-  fallback: WeakMap<object, RequestMarker>,
-  requestId?: string,
+  scoped: WeakMap<object, RequestMarkers>,
+  unscoped: WeakSet<object>,
+  requestContext?: RequestContext,
 ): void {
-  fallback.set(error, requestId ?? UNSCOPED_REQUEST);
+  if (!requestContext) {
+    unscoped.add(error);
+    return;
+  }
+  const markers = scoped.get(error) ?? new WeakSet<RequestContext>();
+  markers.add(requestContext);
+  scoped.set(error, markers);
 }
 
 function hasRequestMarker(
   error: object,
-  fallback: WeakMap<object, RequestMarker>,
-  requestId?: string,
+  scoped: WeakMap<object, RequestMarkers>,
+  unscoped: WeakSet<object>,
+  requestContext?: RequestContext,
 ): boolean {
-  const value = fallback.get(error);
-  return requestId
-    ? value === requestId || value === UNSCOPED_REQUEST
-    : value !== undefined;
+  return (
+    unscoped.has(error) ||
+    Boolean(requestContext && scoped.get(error)?.has(requestContext))
+  );
 }
 
 export function markAuthFailureReason(
@@ -81,32 +90,56 @@ export function isRoutineAuthFailure(error: unknown): boolean {
 
 export function markErrorCaptured(
   error: unknown,
-  requestId = getRequestContext()?.requestId,
+  requestContext = getRequestContext(),
 ): void {
-  if (isObject(error)) setRequestMarker(error, capturedErrors, requestId);
+  if (isObject(error))
+    setRequestMarker(
+      error,
+      capturedErrors,
+      unscopedCapturedErrors,
+      requestContext,
+    );
 }
 
 export function wasErrorCaptured(
   error: unknown,
-  requestId = getRequestContext()?.requestId,
+  requestContext = getRequestContext(),
 ): boolean {
   return Boolean(
-    isObject(error) && hasRequestMarker(error, capturedErrors, requestId),
+    isObject(error) &&
+    hasRequestMarker(
+      error,
+      capturedErrors,
+      unscopedCapturedErrors,
+      requestContext,
+    ),
   );
 }
 
 export function markSecurityEventLogged(
   error: unknown,
-  requestId = getRequestContext()?.requestId,
+  requestContext = getRequestContext(),
 ): void {
-  if (isObject(error)) setRequestMarker(error, securityLoggedErrors, requestId);
+  if (isObject(error))
+    setRequestMarker(
+      error,
+      securityLoggedErrors,
+      unscopedSecurityLoggedErrors,
+      requestContext,
+    );
 }
 
 export function wasSecurityEventLogged(
   error: unknown,
-  requestId = getRequestContext()?.requestId,
+  requestContext = getRequestContext(),
 ): boolean {
   return Boolean(
-    isObject(error) && hasRequestMarker(error, securityLoggedErrors, requestId),
+    isObject(error) &&
+    hasRequestMarker(
+      error,
+      securityLoggedErrors,
+      unscopedSecurityLoggedErrors,
+      requestContext,
+    ),
   );
 }
