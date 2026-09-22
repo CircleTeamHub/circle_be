@@ -6,6 +6,10 @@ import {
 
 describe('log sanitizer', () => {
   it('recursively redacts private fields without mutating the original', () => {
+    const privateFields =
+      'apiKey xApiKey privateKey signingKey encryptionKey wechat qq whatsup birthday city region'.split(
+        ' ',
+      );
     const source = {
       event: 'business_event',
       actorId: 'user-1',
@@ -19,6 +23,9 @@ describe('log sanitizer', () => {
         ip: '127.0.0.1',
         passwordHash: 'private-hash',
         elapsedMs: 42,
+        ...Object.fromEntries(
+          privateFields.map((field) => [field, `private-${field}`]),
+        ),
       },
     };
 
@@ -38,34 +45,26 @@ describe('log sanitizer', () => {
     });
     expect(source.metadata.nested[0].Access_Token).toBe('private-token');
     expect(source.metadata.body).toEqual({ count: 12 });
+    for (const field of privateFields)
+      expect(
+        (result as { metadata: Record<string, unknown> }).metadata[field],
+      ).toBe('[redacted]');
   });
 
   it('redacts credentials and signed URLs embedded in text', () => {
     const value = sanitizeLogText(
-      'failed Authorization: Bearer private-bearer password="two private words" ' +
+      'failed Bearer private-bearer password="two private words" ' +
         'private@example.com eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJ1c2VyIn0.signature ' +
-        'https://files.example.com/private.jpg?X-Amz-Signature=private-signature',
+        'https://files.example.com/private.jpg?X-Amz-Signature=private-signature ' +
+        'Basic dXNlcjpwYXNzd29yZA== +1-555-123-4567 15551234568 203.0.113.42 2001:db8::1 ' +
+        'path:/api/v1/note/share-links/private-path {"access_token":"json-secret",' +
+        '"password":"alpha\\"omega"} word=private-slur -----BEGIN PRIVATE KEY-----pem-secret',
     );
-    for (const privateValue of [
-      'private-bearer',
-      'two private words',
-      'private@example.com',
-      'eyJhbGci',
-      'private.jpg',
-      'private-signature',
-    ]) {
-      expect(value).not.toContain(privateValue);
-    }
+    expect(value).not.toMatch(
+      /private-bearer|two private words|private@example|eyJhbGci|private\.jpg|private-signature|dXNlc|555-123|15551234568|203\.0\.113|2001:db8|private-path|json-secret|alpha|omega|pem-secret|private-slur/,
+    );
     expect(value).toContain('failed');
-  });
-
-  it('redacts moderation terms embedded in legacy prose', () => {
-    const sanitized = sanitizeLogText(
-      'friend-request replay dropped (request=req-1, word=private-slur)',
-    );
-    expect(sanitized).toContain('request=[redacted]');
-    expect(sanitized).toContain('word=[redacted]');
-    expect(sanitized).not.toContain('private-slur');
+    expect(sanitizeLogText('release 1.2.3.4')).toContain('1.2.3.4');
   });
 
   it('redacts arbitrary root logger prose while preserving structured events', () => {
@@ -80,9 +79,6 @@ describe('log sanitizer', () => {
       message: '[redacted]',
       event: 'chat_send_failed',
     });
-  });
-
-  it('keeps sanitized legacy logger prose readable', () => {
     expect(
       sanitizeLogValue({ level: 'info', message: 'started token=x' }),
     ).toEqual({ level: 'info', message: 'started token=[redacted]' });
@@ -133,6 +129,10 @@ describe('log sanitizer', () => {
     expect(JSON.stringify(result)).not.toMatch(
       /private_|private-cause|private-sql|SELECT/,
     );
+    const twice = sanitizeLogValue({ error: result });
+    expect(twice).toMatchObject({
+      error: { stack: expect.stringContaining('repository.ts:42:9') },
+    });
   });
 
   it('bounds cycles, depth, strings and breadth and never invokes accessors', () => {
@@ -209,14 +209,6 @@ describe('log sanitizer', () => {
     expect(getter).not.toHaveBeenCalled();
   });
 
-  it('keeps sanitized stack sites on subsequent sanitization', () => {
-    const once = sanitizeLogValue({ error: new TypeError('private-message') });
-    const twice = sanitizeLogValue(once);
-    expect(twice).toMatchObject({
-      error: { stack: expect.stringContaining('log-sanitizer.spec.ts:') },
-    });
-  });
-
   it('redacts private relative object keys in existing media failure warnings', () => {
     const result = sanitizeLogText(
       'chat media delete failed key=chat/room-123/private-file.jpg: AccessDenied objectKey=uploads/private-file.jpg',
@@ -226,7 +218,15 @@ describe('log sanitizer', () => {
     expect(result).toContain('AccessDenied');
   });
 
-  it('keeps truncated quoted credentials private', () => {
+  it('redacts secrets before truncating at the output boundary', () => {
+    for (const secret of [
+      'alice@example.com',
+      'eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJ1c2VyIn0.signature',
+    ]) {
+      expect(sanitizeLogText(`${'x'.repeat(2040)} ${secret}`)).not.toContain(
+        secret.slice(0, 8),
+      );
+    }
     expect(
       sanitizeLogText(`password="${'private words '.repeat(300)}"`),
     ).not.toContain('private');
