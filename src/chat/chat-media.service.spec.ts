@@ -87,6 +87,80 @@ describe('ChatMediaService', () => {
     );
   });
 
+  it('logs deletion and queue failures without object keys or raw error text', async () => {
+    const warn = jest.spyOn(Logger.prototype, 'warn').mockImplementation();
+    const errorLog = jest.spyOn(Logger.prototype, 'error').mockImplementation();
+    uploadService.deleteObjectByKey.mockRejectedValueOnce(
+      new Error('private-storage-response'),
+    );
+    prisma.chatMediaDeletion.upsert.mockRejectedValueOnce(
+      new Error('SELECT private_messages'),
+    );
+    try {
+      await expect(
+        service.deleteObjects(['chat/private-account/private-photo.jpg']),
+      ).resolves.toBeUndefined();
+      expect(warn).toHaveBeenCalledWith(
+        expect.objectContaining({
+          event: 'chat_media_delete_failed',
+          operation: 'deleteObject',
+          objectKey: '[redacted]',
+        }),
+      );
+      expect(errorLog).toHaveBeenCalledWith(
+        expect.objectContaining({
+          event: 'chat_media_delete_queue_failed',
+          operation: 'queueDelete',
+          objectKey: '[redacted]',
+        }),
+      );
+      expect(
+        JSON.stringify([warn.mock.calls, errorLog.mock.calls]),
+      ).not.toMatch(
+        /private-storage-response|SELECT|private_messages|private-account|private-photo/,
+      );
+    } finally {
+      warn.mockRestore();
+      errorLog.mockRestore();
+    }
+  });
+
+  it('logs presign and sweep failures without storage keys or error contents', async () => {
+    const warn = jest.spyOn(Logger.prototype, 'warn').mockImplementation();
+    uploadService.createPresignedGetUrl.mockRejectedValueOnce(
+      new Error('private-storage-response'),
+    );
+    prisma.chatMediaDeletion.findMany.mockRejectedValueOnce(
+      new Error('SELECT private_messages'),
+    );
+    const message = dto({
+      type: 'image',
+      content: { key: 'chat/private-account/private-photo.jpg' },
+    });
+    try {
+      await expect(service.attachMediaUrls([message])).resolves.toBeUndefined();
+      await expect(service.drainPendingDeletions()).resolves.toBeUndefined();
+      expect(warn).toHaveBeenCalledWith(
+        expect.objectContaining({
+          event: 'chat_media_presign_failed',
+          operation: 'attachMediaUrls',
+          objectKey: '[redacted]',
+        }),
+      );
+      expect(warn).toHaveBeenCalledWith(
+        expect.objectContaining({
+          event: 'chat_media_deletion_sweep_failed',
+          operation: 'drainPendingDeletions',
+        }),
+      );
+      expect(JSON.stringify(warn.mock.calls)).not.toMatch(
+        /private-storage-response|SELECT|private_messages|private-account|private-photo/,
+      );
+    } finally {
+      warn.mockRestore();
+    }
+  });
+
   it('keeps dead-lettered rows instead of dropping the key', async () => {
     const due = {
       id: 'd1',
@@ -117,6 +191,38 @@ describe('ChatMediaService', () => {
         data: expect.objectContaining({ attempts: 8 }),
       }),
     );
+  });
+
+  it('identifies dead-letter rows without logging their storage keys', async () => {
+    const log = jest.spyOn(Logger.prototype, 'error').mockImplementation();
+    const due = {
+      id: 'deletion-1',
+      objectKey: 'chat/private-account/private-photo.jpg',
+      attempts: 7,
+      nextAttemptAt: new Date(0),
+    };
+    prisma.chatMediaDeletion.findMany.mockResolvedValueOnce([due]);
+    prisma.chatMediaDeletion.findUnique.mockResolvedValueOnce(due);
+    uploadService.deleteObjectByKey.mockRejectedValueOnce(
+      new Error('private-storage-response'),
+    );
+    try {
+      await service.drainPendingDeletions();
+      expect(log).toHaveBeenCalledWith(
+        expect.objectContaining({
+          event: 'chat_media_delete_dead_lettered',
+          operation: 'deleteObject',
+          deletionId: 'deletion-1',
+          attempts: 8,
+          objectKey: '[redacted]',
+        }),
+      );
+      expect(JSON.stringify(log.mock.calls)).not.toMatch(
+        /private-account|private-photo|private-storage-response/,
+      );
+    } finally {
+      log.mockRestore();
+    }
   });
 
   it('clears the row once storage confirms the deletion', async () => {

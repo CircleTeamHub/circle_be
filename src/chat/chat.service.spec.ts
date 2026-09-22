@@ -1,6 +1,7 @@
 import {
   BadRequestException,
   ForbiddenException,
+  Logger,
   NotFoundException,
 } from '@nestjs/common';
 import { ChatErrorCode } from 'src/common/app-error-codes';
@@ -1580,6 +1581,46 @@ describe('ChatService', () => {
   });
 
   describe('last seen', () => {
+    it.each([
+      new Error('SELECT private_chat FROM messages: private chat text'),
+      'SELECT private_chat FROM messages: private chat text',
+    ])(
+      'redacts caught presence failures before logging (%p)',
+      async (error) => {
+        const warning = jest
+          .spyOn(Logger.prototype, 'warn')
+          .mockImplementation();
+        try {
+          privacySettings.getSettings.mockRejectedValueOnce(error);
+          prisma.user.updateMany.mockRejectedValueOnce(error);
+
+          await expect(service.isPresenceVisible('u1')).resolves.toBe(false);
+          await expect(service.touchLastOnline('u1')).resolves.toBeUndefined();
+
+          expect(JSON.stringify(warning.mock.calls)).not.toContain('SELECT');
+          expect(JSON.stringify(warning.mock.calls)).not.toContain(
+            'private chat text',
+          );
+          expect(warning).toHaveBeenCalledWith(
+            expect.objectContaining({
+              event: 'chat_presence_lookup_failed',
+              operation: 'isPresenceVisible',
+              userId: 'u1',
+            }),
+          );
+          expect(warning).toHaveBeenCalledWith(
+            expect.objectContaining({
+              event: 'chat_last_online_update_failed',
+              operation: 'touchLastOnline',
+              userId: 'u1',
+            }),
+          );
+        } finally {
+          warning.mockRestore();
+        }
+      },
+    );
+
     it('reads lastOnline as ISO strings and reports never-seen users as null', async () => {
       prisma.user.findMany.mockResolvedValueOnce([
         { id: 'u2', lastOnline: new Date('2026-09-11T08:00:00.000Z') },
