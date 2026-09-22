@@ -60,6 +60,7 @@ jobs:
           bash test/release-force-command.spec.sh
           bash test/sync-metrics-token.spec.sh
           node --test test/prometheus-alerts.spec.mjs
+          node --test test/monitoring-operations-dashboard.spec.mjs
 
       # prometheus-alerts.spec.mjs 断言的是规则的**语义**（阈值、选择器、
       # 用 delta 而不是存量…），它读不出 PromQL 语法错误 —— 一个打错的

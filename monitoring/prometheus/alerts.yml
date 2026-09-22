@@ -129,18 +129,18 @@ groups:
       # 由 circle_cron_interval_seconds 带过来（在 TrackedCron 装饰期写入）。
       # 为每个任务手写阈值的结果必然是新任务漏配、悄无声息。
       #
-      # max by (job)：蓝绿发布期间两个颜色同时在跑，只要有一个实例把活干了就
+      # max by (exported_job)：蓝绿发布期间两个颜色同时在跑，只要有一个实例把活干了就
       # 不该响。心跳在进程启动时就播种（不是等第一次成功），所以新容器不会
       # 立刻误报，一个从开机起就没跑过的任务也不会因为序列不存在而逃过告警。
       - alert: CronJobStalled
         expr: |
-          time() - max by (job) (circle_cron_last_success_timestamp_seconds)
-            > 3 * max by (job) (circle_cron_interval_seconds)
+          time() - max by (exported_job) (circle_cron_last_success_timestamp_seconds)
+            > 3 * max by (exported_job) (circle_cron_interval_seconds)
         for: 5m
         labels:
           severity: warning
         annotations:
-          summary: 'Scheduled job {{ $labels.job }} has not succeeded in 3x its interval'
+          summary: 'Scheduled job {{ $labels.exported_job }} has not succeeded in 3x its interval'
 
       # 用「最近一次运行的结果」而不是 rate() 窗口。
       #
@@ -150,16 +150,16 @@ groups:
       # push_stale_token_cleanup 因此可以每次调度都失败而这条始终静默，只剩
       # 晚得多的 CronJobStalled 兜底。last_result 与执行频率无关。
       #
-      # max by (job)：蓝绿期间只要有一个实例把活干成了就不该响。
+      # max by (exported_job)：蓝绿期间只要有一个实例把活干成了就不该响。
       # 注册时播种为 1，所以从没跑过的任务不会一开机就报红（那属于停摆，
       # 由 CronJobStalled 负责）。
       - alert: CronJobFailing
-        expr: max by (job) (circle_cron_last_result) == 0
+        expr: max by (exported_job) (circle_cron_last_result) == 0
         for: 15m
         labels:
           severity: warning
         annotations:
-          summary: 'Scheduled job {{ $labels.job }} last run failed (including handled failures it swallowed)'
+          summary: 'Scheduled job {{ $labels.exported_job }} last run failed (including handled failures it swallowed)'
 
       # 会话撤销队列堵死 = 登出/封禁/盗号撤销静默失效。与 RedisDown 是同一条
       # 安全路径的两个故障点：Redis 挂了撤销 fail-open，队列堵了撤销压根没执行。
@@ -243,6 +243,40 @@ groups:
   # 监控自身的存活证明。
   - name: meta
     rules:
+      - alert: AlertmanagerNotificationFailures
+        expr: increase(alertmanager_notifications_failed_total[10m]) > 0
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: 'Alertmanager failed to deliver one or more notifications in the last 10m'
+
+      - alert: AlertmanagerConfigReloadFailed
+        expr: alertmanager_config_last_reload_successful == 0
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: 'Alertmanager rejected its most recent configuration reload'
+
+      - alert: PrometheusRuleEvaluationFailures
+        expr: increase(prometheus_rule_evaluation_failures_total[10m]) > 0
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: 'Prometheus failed to evaluate one or more rules in the last 10m'
+
+      # Alloy v1.19.2 exposes this counter for entries it permanently drops.
+      # The series exists only when the optional logs overlay is running.
+      - alert: LogPipelineDroppedEntries
+        expr: increase(loki_write_dropped_entries_total[10m]) > 0
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: 'Alloy permanently dropped log entries in the last 10m'
+
       # 永远 firing，专门路由到**外部**心跳服务（healthchecks.io 等）。
       #
       # 整套监控栈和被监控对象在同一台机器上：机器宕机、磁盘写满、网络断开时，
@@ -413,7 +447,9 @@ groups:
       # 饱和却打不中写死的 5；配成 100 时六个等待者又会造成没理由的 critical。
       # 两边都套 max() 去标签，否则两条序列标签集不同、向量匹配失败恒为空。
       - alert: DbPoolExhausted
-        expr: max(circle_db_pool_waiting) > max(circle_db_pool_max) * 0.5
+        expr: |
+          max by (instance) (circle_db_pool_waiting)
+            > max by (instance) (circle_db_pool_max) * 0.5
         for: 2m
         labels:
           severity: critical

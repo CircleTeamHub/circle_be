@@ -5,11 +5,17 @@ import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
 
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), '..');
-const RULES = readFileSync(join(ROOT, 'monitoring/prometheus/alerts.yml'), 'utf8');
+const readText = (path) => readFileSync(path, 'utf8').replace(/\r\n/g, '\n');
+const RULES = readText(join(ROOT, 'monitoring/prometheus/alerts.yml'));
 const ALERTMANAGER = readFileSync(
   join(ROOT, 'monitoring/alertmanager/alertmanager.yml'),
   'utf8',
-);
+).replace(/\r\n/g, '\n');
+const PROMETHEUS = readText(join(ROOT, 'monitoring/prometheus/prometheus.yml'));
+const PROMETHEUS_PROD = readText(join(ROOT, 'monitoring/prometheus/prometheus.prod.yml'));
+const JOBS_DASHBOARD = readText(join(ROOT, 'monitoring/grafana/dashboards/circle-be-jobs.json'));
+const LOGS_COMPOSE = readText(join(ROOT, 'monitoring/docker-compose.logs.yml'));
+const RULE_TESTS = readText(join(ROOT, 'monitoring/prometheus/alerts.test.yml'));
 
 /**
  * 这里没有 PromQL 引擎(仓库里没有 promtool,为一条规则引入它不划算),
@@ -98,7 +104,7 @@ test('CronJobStalled derives its threshold from the exported interval', () => {
   // 写死阈值就必然要么让每日任务天天误报,要么让每分钟任务停摆一天才响。
   // 周期由 circle_cron_interval_seconds 从代码里带过来,新任务自动被覆盖。
   assert.match(expr, /circle_cron_interval_seconds/);
-  assert.match(expr, /time\(\) - max by \(job\)/);
+  assert.match(expr, /time\(\) - max by \(exported_job\)/);
   // max by (job):蓝绿发布期间两个颜色同时在跑,只要有一个把活干了就不该响。
   assert.doesNotMatch(expr, /min by \(job\)/);
 });
@@ -165,7 +171,16 @@ test('CronJobFailing is cadence-independent', () => {
   // for 满足之前就滑出窗口。行为断言见 monitoring/prometheus/alerts.test.yml。
   assert.doesNotMatch(expr, /rate\(/);
   assert.match(expr, /circle_cron_last_result/);
-  assert.match(expr, /max by \(job\)/);
+  assert.match(expr, /max by \(exported_job\)/);
+});
+
+test('cron alerts preserve the application job label after scraping', () => {
+  for (const name of ['CronJobStalled', 'CronJobFailing']) {
+    const expr = alertExpr(name);
+    assert.match(expr, /by \(exported_job\)/);
+    assert.doesNotMatch(expr, /by \(job\)/);
+    assert.match(expr, /summary: 'Scheduled job \{\{ \$labels\.exported_job \}\}/);
+  }
 });
 
 test('DbPoolExhausted scales with the configured pool size', () => {
@@ -173,6 +188,54 @@ test('DbPoolExhausted scales with the configured pool size', () => {
   // 写死阈值在小池子上漏报、在大池子上误报。
   assert.match(expr, /circle_db_pool_max/);
   assert.doesNotMatch(expr, />\s*5\b/);
+  assert.match(expr, /max by \(instance\) \(circle_db_pool_waiting\)/);
+  assert.match(expr, /max by \(instance\) \(circle_db_pool_max\)/);
+});
+
+test('monitoring components are scraped and their failures alert', () => {
+  for (const config of [PROMETHEUS, PROMETHEUS_PROD]) {
+    assert.match(config, /job_name: alertmanager[\s\S]*targets: \['alertmanager:9093'\]/);
+  }
+  for (const name of ['AlertmanagerNotificationFailures', 'AlertmanagerConfigReloadFailed', 'PrometheusRuleEvaluationFailures']) {
+    assert.ok(alertExpr(name));
+  }
+});
+
+test('optional log pipeline exposes private self-metrics only when its overlay is enabled', () => {
+  for (const config of [PROMETHEUS, PROMETHEUS_PROD]) {
+    assert.match(config, /file_sd_configs:[\s\S]*\/etc\/prometheus\/log-targets\/\*\.yml/);
+  }
+  assert.match(LOGS_COMPOSE, /\.\/prometheus\/logs-targets\.yml:\/etc\/prometheus\/log-targets\/targets\.yml:ro/);
+  assert.match(LOGS_COMPOSE, /--server\.http\.listen-addr=0\.0\.0\.0:12345/);
+  assert.ok(alertExpr('LogPipelineDroppedEntries'));
+});
+
+test('promtool fixtures cover post-scrape cron isolation and monitoring self-alert behavior', () => {
+  for (const scenario of [
+    '共享抓取 job 下健康任务不能掩盖失败任务',
+    '同周期健康任务不能掩盖停摆任务',
+    '同一任务蓝绿心跳有一个恢复就不报',
+    'Alertmanager 通知失败计数增长并在窗口过期后恢复',
+    'Alertmanager 配置重载失败持续后触发并在成功后恢复',
+    'Prometheus 规则评估失败计数增长并在窗口过期后恢复',
+    '监控自检指标为零或可选日志栈缺席时不报',
+    '可选日志目标宕机触发 TargetDown',
+    'Alloy 丢弃计数单次增长触发并在窗口过期后恢复',
+  ]) {
+    assert.match(RULE_TESTS, new RegExp(`name: ${scenario}`), `missing promtool scenario: ${scenario}`);
+  }
+});
+
+test('jobs dashboard uses exported cron job and reset-safe dead-letter queries', () => {
+  const dashboard = JSON.parse(JOBS_DASHBOARD);
+  const expressions = dashboard.panels.flatMap((panel) => panel.targets ?? []).map((target) => target.expr ?? '');
+  for (const expression of expressions.filter((value) => value.includes('circle_cron_'))) {
+    assert.doesNotMatch(expression, /by \(job(?:,|\))/);
+  }
+  const deadLetterChange = expressions.find((value) => value.includes('circle_outbox_dead[1h]'));
+  assert.ok(deadLetterChange, 'dead-letter change panel not found');
+  assert.doesNotMatch(deadLetterChange, /delta\(/);
+  assert.match(deadLetterChange, /min_over_time\(/);
 });
 
 test('a Postgres outage inhibits every job alert it necessarily causes', () => {

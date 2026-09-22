@@ -1,0 +1,6 @@
+- targets: ['loki:3100']
+  labels:
+    component: loki
+- targets: ['alloy:12345']
+  labels:
+    component: alloy

@@ -91,8 +91,8 @@
             "type": "prometheus",
             "uid": "prometheus"
           },
-          "expr": "(time() - max by (job) (circle_cron_last_success_timestamp_seconds)) / max by (job) (circle_cron_interval_seconds)",
-          "legendFormat": "{{job}}"
+          "expr": "(time() - max by (exported_job) (circle_cron_last_success_timestamp_seconds)) / max by (exported_job) (circle_cron_interval_seconds)",
+          "legendFormat": "{{exported_job}}"
         }
       ],
       "description": "以各任务自己的预期周期归一化，所以每分钟任务和每天 4 点的任务能画在同一张图上。1.0 = 迟了一个周期；红线 3.0 = CronJobStalled 的告警阈值。\n\n心跳在进程启动时就播种，所以从没跑过的任务会从 0 开始持续爬升，而不是因为序列不存在而完全看不见。"
@@ -154,8 +154,8 @@
             "type": "prometheus",
             "uid": "prometheus"
           },
-          "expr": "sum by (job) (rate(circle_cron_runs_total{result=\"failure\"}[15m])) / sum by (job) (rate(circle_cron_runs_total{result!=\"skipped\"}[15m]))",
-          "legendFormat": "{{job}}"
+          "expr": "sum by (exported_job) (rate(circle_cron_runs_total{result=\"failure\"}[15m])) / sum by (exported_job) (rate(circle_cron_runs_total{result!=\"skipped\"}[15m]))",
+          "legendFormat": "{{exported_job}}"
         }
       ],
       "description": "分母排除 skipped（重入闸挡掉的调度不是一次执行，算进去会把卡死任务的失败率稀释成接近 0）。注意：4 个 outbox 处理器会自己 catch 异常并写进行上的 lastError，所以队列堵死时这张图可能一直是 0 —— 那种故障要看下面的积压和死信。"
@@ -201,8 +201,8 @@
             "type": "prometheus",
             "uid": "prometheus"
           },
-          "expr": "max by (job) (circle_cron_last_duration_seconds)",
-          "legendFormat": "{{job}}"
+          "expr": "max by (exported_job) (circle_cron_last_duration_seconds)",
+          "legendFormat": "{{exported_job}}"
         }
       ],
       "description": "逼近自身周期就意味着下一轮会与本轮重叠（多数任务有重入闸，会直接跳过）。"
@@ -248,8 +248,8 @@
             "type": "prometheus",
             "uid": "prometheus"
           },
-          "expr": "sum by (job, result) (rate(circle_cron_runs_total[15m])) * 60",
-          "legendFormat": "{{job}} · {{result}}"
+          "expr": "sum by (exported_job, result) (rate(circle_cron_runs_total[15m])) * 60",
+          "legendFormat": "{{exported_job}} · {{result}}"
         }
       ],
       "description": "次/分钟，按结果拆开。掉到 0 而心跳不涨 = 调度器停了；整条线全变成 skipped = 上一轮吊死在里面、重入闸把后续每一次调度都挡掉了（心跳同时会停住，CronJobStalled 负责报出来）。"
@@ -464,7 +464,7 @@
             "type": "prometheus",
             "uid": "prometheus"
           },
-          "expr": "max by (queue) (delta(circle_outbox_dead[1h]))",
+          "expr": "max by (queue) (circle_outbox_dead - min_over_time(circle_outbox_dead[1h]))",
           "legendFormat": "{{queue}}"
         }
       ],
@@ -898,8 +898,8 @@
             "type": "prometheus",
             "uid": "prometheus"
           },
-          "expr": "max by (job) (circle_cron_last_result) == 0",
-          "legendFormat": "{{job}}"
+          "expr": "max by (exported_job) (circle_cron_last_result) == 0",
+          "legendFormat": "{{exported_job}}"
         }
       ]
     },
