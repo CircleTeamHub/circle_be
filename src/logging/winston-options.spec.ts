@@ -72,6 +72,25 @@ describe('createWinstonOptions', () => {
     expect(() => JSON.parse(lines[0])).toThrow();
   });
 
+  it('accepts Joi-coerced boolean timestamps in development', () => {
+    const options = createWinstonOptions(
+      new ConfigServiceLike({ LOG_ON: true, TIMESTAMP: true }),
+      'development',
+    );
+    const info = {
+      level: 'info',
+      message: 'server started',
+      [Symbol.for('level')]: 'info',
+    };
+    const transport = options
+      .transports?.[0] as winston.transports.ConsoleTransportInstance;
+    const transformed = transport.format?.transform(
+      info,
+      transport.format.options,
+    );
+    expect(transformed).toHaveProperty('timestamp');
+  });
+
   it('sanitizes actual Nest object logs, request context and Winston symbol metadata', () => {
     const { logger, lines } = capture({});
     const adapter = WinstonModule.createLogger({ instance: logger });
