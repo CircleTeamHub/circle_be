@@ -163,13 +163,13 @@ describe('createWinstonOptions', () => {
     expect(options.transports).toHaveLength(1);
   });
 
-  it('keeps file logging off when an existing deployment has no explicit flag', () => {
+  it('preserves legacy LOG_ON file behavior when no explicit flag is present', () => {
     const options = createWinstonOptions(
       new ConfigServiceLike({ LOG_ON: 'true' }),
       'production',
     );
     openedLoggers.push(winston.createLogger(options));
-    expect(options.transports).toHaveLength(1);
+    expect(options.transports).toHaveLength(3);
   });
 
   it('keeps the LOG_ON master gate when file logging is explicitly enabled', () => {
