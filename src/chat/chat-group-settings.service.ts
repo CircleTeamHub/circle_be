@@ -8,6 +8,7 @@ import {
 import { ConfigService } from '@nestjs/config';
 import { ChatErrorCode } from 'src/common/app-error-codes';
 import { PrismaService } from 'src/prisma/prisma.service';
+import { CircleMemberLockService } from 'src/circle/circle-member-lock';
 import type { ChatMember, Prisma } from 'src/generated/prisma';
 import {
   isUrlFromStorage,
@@ -69,6 +70,7 @@ export class ChatGroupSettingsService {
     private readonly broadcast: ChatBroadcastService,
     private readonly systemMessage: ChatSystemMessageService,
     private readonly groupEvents: ChatGroupEventService,
+    private readonly memberLock: CircleMemberLockService,
   ) {
     this.storagePublicObjectBases = storagePublicObjectBasesFromConfig(
       this.config,
@@ -327,6 +329,12 @@ export class ChatGroupSettingsService {
     this.assertManager(preflight.actorRole);
 
     const result = await this.prisma.$transaction(async (tx) => {
+      // 圈子招新策略的写侧与 invite() 共用同一把圈级策略锁。先按仓库统一
+      // 顺序取得成员锁，再取策略锁，最后才锁会话行，避免交叉等待。
+      if (preflight.circleID) {
+        await this.memberLock.lock(tx, preflight.circleID, [actorId]);
+        await this.memberLock.lockPolicy(tx, preflight.circleID);
+      }
       const locked = await this.lockGroup(tx, conversationId);
       this.assertManager(await this.actorRoleInTx(tx, locked, actorId));
       const current = await this.policiesOf(tx, locked);

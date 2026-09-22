@@ -49,6 +49,7 @@ describe('ChatGroupSettingsService', () => {
     broadcastSystemMessage: jest.fn().mockResolvedValue(undefined),
   };
   const groupEvents = { recordInTx: jest.fn().mockResolvedValue(undefined) };
+  const memberLock = { lock: jest.fn(), lockPolicy: jest.fn() };
 
   const service = new ChatGroupSettingsService(
     prisma as never,
@@ -56,6 +57,7 @@ describe('ChatGroupSettingsService', () => {
     broadcast as never,
     systemMessage as never,
     groupEvents as never,
+    memberLock as never,
   );
 
   const locked = (overrides: Record<string, unknown> = {}) => ({
@@ -435,6 +437,13 @@ describe('ChatGroupSettingsService', () => {
       });
       expect(prisma.chatConversation.update).not.toHaveBeenCalled();
       expect(result.memberCanInvite).toBe(false);
+      expect(memberLock.lock).toHaveBeenCalledWith(prisma, 'circle-1', [
+        'admin-1',
+      ]);
+      expect(memberLock.lockPolicy).toHaveBeenCalledWith(prisma, 'circle-1');
+      expect(memberLock.lockPolicy.mock.invocationCallOrder[0]).toBeLessThan(
+        prisma.$queryRaw.mock.invocationCallOrder[0],
+      );
     });
 
     it('rejects ordinary members before locking', async () => {

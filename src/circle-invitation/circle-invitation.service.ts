@@ -10,6 +10,7 @@ import { CronExpression } from '@nestjs/schedule';
 import { TrackedCron } from '../metrics/tracked-cron.decorator';
 import { Prisma } from 'src/generated/prisma';
 import {
+  ChatErrorCode,
   CircleErrorCode,
   CircleInvitationErrorCode,
 } from 'src/common/app-error-codes';
@@ -134,6 +135,8 @@ export class CircleInvitationService {
        * 跳过;拉黑是更硬的意愿表达,在下面的事务里照拦,两个方向都不放。
        */
       applicantConsented?: boolean;
+      /** 圈子二维码入圈必须在策略锁内复核会话行的动态开关。 */
+      requireQrJoinEnabled?: boolean;
     },
   ): Promise<InvitationDto> {
     if (!opts?.applicantConsented) {
@@ -168,7 +171,7 @@ export class CircleInvitationService {
       // by block, unfriend and privacy writes before rechecking authorization.
       await lockUserRelationshipState(tx, [inviterId, applicantId]);
 
-      const [inviterMembership, lockedMembership, circlePolicy] =
+      const [inviterMembership, lockedMembership, circlePolicy, qrPolicy] =
         await Promise.all([
           tx.circleMember.findUnique({
             where: {
@@ -184,6 +187,12 @@ export class CircleInvitationService {
             where: { id: circleId, deleted: false },
             select: { requiredVerifierCount: true, memberCanInvite: true },
           }),
+          opts?.requireQrJoinEnabled
+            ? tx.chatConversation.findUnique({
+                where: { circleID: circleId },
+                select: { qrJoinEnabled: true },
+              })
+            : null,
         ]);
       if (!inviterMembership || inviterMembership.status !== 'ACTIVE') {
         throw new ForbiddenException({
@@ -245,6 +254,12 @@ export class CircleInvitationService {
       // 突然变成失败。
       if (existingInvitation && opts?.applicantConsented) {
         return { created: existingInvitation, admission: null };
+      }
+      if (opts?.requireQrJoinEnabled && qrPolicy?.qrJoinEnabled === false) {
+        throw new ForbiddenException({
+          message: '该群已关闭二维码入群',
+          errorCode: ChatErrorCode.GroupQrJoinDisabled,
+        });
       }
       // 宣传期严格形态:关掉成员邀请后,只有圈主/管理员还能拉人 ——
       // requiredVerifierCount=1 时成员邀请等于「谁都能瞬间塞人进圈」,这道闸

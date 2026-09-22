@@ -244,8 +244,6 @@ export class QrService {
       };
     }
 
-    // 圈子群关掉「二维码入群」后,圈码同样失效(圈子的会话行上记着这个开关)。
-    await this.assertCircleQrJoinEnabled(row.targetID);
     // 圈子:签发人立场的邀请。快照语义(requiredVerifierCount=1 且签发人可担保)
     // 直接入圈;严格模式建担保单等验证人凑齐。策略、容量、拉黑、签发人失权
     // 都由 invite() 内的事务闸把关。
@@ -253,7 +251,7 @@ export class QrService {
       row.issuerID,
       viewerId,
       row.targetID,
-      { applicantConsented: true },
+      { applicantConsented: true, requireQrJoinEnabled: true },
     );
     const joined =
       invitation.status === 'APPROVED' ||

@@ -1,6 +1,9 @@
 import { BadRequestException, ForbiddenException } from '@nestjs/common';
 import { Test, TestingModule } from '@nestjs/testing';
-import { CircleInvitationErrorCode } from 'src/common/app-error-codes';
+import {
+  ChatErrorCode,
+  CircleInvitationErrorCode,
+} from 'src/common/app-error-codes';
 import { PrismaService } from 'src/prisma/prisma.service';
 import { RealtimeService } from 'src/realtime/realtime.service';
 import { PrivacySettingsService } from 'src/privacy/privacy-settings.service';
@@ -60,6 +63,9 @@ describe('CircleInvitationService', () => {
     },
     block: {
       findFirst: jest.fn(),
+    },
+    chatConversation: {
+      findUnique: jest.fn(),
     },
     $executeRaw: jest.fn().mockResolvedValue(0),
     $queryRaw: jest.fn(),
@@ -2094,6 +2100,27 @@ describe('CircleInvitationService', () => {
       expect(memberLock.lockPolicy.mock.invocationCallOrder[0]).toBeLessThan(
         prisma.circle.findFirst.mock.invocationCallOrder[0],
       );
+    });
+
+    it('rechecks QR admission after the circle policy lock and rejects a closed gate', async () => {
+      arrangeInviteFlow();
+      prisma.chatConversation.findUnique.mockResolvedValue({
+        qrJoinEnabled: false,
+      });
+
+      await expect(
+        service.invite('inviter-1', 'applicant-1', 'circle-1', {
+          applicantConsented: true,
+          requireQrJoinEnabled: true,
+        }),
+      ).rejects.toMatchObject({
+        response: { errorCode: ChatErrorCode.GroupQrJoinDisabled },
+      });
+
+      expect(memberLock.lockPolicy.mock.invocationCallOrder[0]).toBeLessThan(
+        prisma.chatConversation.findUnique.mock.invocationCallOrder[0],
+      );
+      expect(prisma.circleInvitation.create).not.toHaveBeenCalled();
     });
 
     it('invite rejects a plain member when memberCanInvite is off', async () => {

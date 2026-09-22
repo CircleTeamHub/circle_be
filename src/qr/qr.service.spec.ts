@@ -444,15 +444,22 @@ describe('QrService', () => {
         revokedAt: null,
         expiresAt: new Date(Date.now() + 1000_000),
       });
-      prisma.chatConversation.findUnique.mockResolvedValue({
-        qrJoinEnabled: false,
-      });
+      circleInvitation.invite.mockRejectedValue(
+        new ForbiddenException({
+          message: '该群已关闭二维码入群',
+          errorCode: ChatErrorCode.GroupQrJoinDisabled,
+        }),
+      );
 
       await expect(service.joinByToken('u1', 'tok')).rejects.toMatchObject({
         response: { errorCode: ChatErrorCode.GroupQrJoinDisabled },
       });
-      expect(circleInvitation.invite).not.toHaveBeenCalled();
-      prisma.chatConversation.findUnique.mockResolvedValue(null);
+      expect(circleInvitation.invite).toHaveBeenCalledWith(
+        'issuer-1',
+        'u1',
+        'circle-1',
+        { applicantConsented: true, requireQrJoinEnabled: true },
+      );
     });
 
     it('joins a circle through the invitation flow with issuer as inviter', async () => {
@@ -474,7 +481,7 @@ describe('QrService', () => {
         'issuer-1',
         'u1',
         'circle-1',
-        { applicantConsented: true },
+        { applicantConsented: true, requireQrJoinEnabled: true },
       );
 
       // 严格模式:建了担保单,等验证人 —— PENDING 透传给前端换文案。
