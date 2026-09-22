@@ -276,6 +276,36 @@ describe('NotificationPushService (#88 per-token delivery)', () => {
       ]);
     });
 
+    it('keeps JPush authentication failures retryable without disabling tokens', async () => {
+      configValues.JPUSH_APP_KEY = 'jpush-app-key';
+      configValues.JPUSH_MASTER_SECRET = 'expired-secret';
+      service = new NotificationPushService(prisma as any, config as any);
+      fetchMock.mockResolvedValue({
+        ok: false,
+        status: 401,
+        json: async () => ({ error: { code: 1004, message: 'auth failed' } }),
+      });
+
+      const outcomes = await service.sendMessages([
+        {
+          token: '1a0018970a9d4f4f8f1',
+          provider: 'jpush',
+          platform: 'android',
+          projectId: null,
+          payload,
+        },
+      ]);
+
+      expect(outcomes).toEqual([
+        {
+          token: '1a0018970a9d4f4f8f1',
+          status: 'RETRYABLE',
+          error: 'JPushError:1004',
+        },
+      ]);
+      expect(prisma.devicePushToken.updateMany).not.toHaveBeenCalled();
+    });
+
     it('disables only the individual invalid JPush registration id', async () => {
       configValues.JPUSH_APP_KEY = 'jpush-app-key';
       configValues.JPUSH_MASTER_SECRET = 'jpush-master-secret';
