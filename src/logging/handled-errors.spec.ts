@@ -51,6 +51,30 @@ describe('handled-errors markers', () => {
     expect(isRoutineAuthFailure(null)).toBe(false);
   });
 
+  it('can carry an explicitly captured request id across async boundaries', () => {
+    const error = new Error('async failure');
+    markErrorCaptured(error, 'request-async');
+    markSecurityEventLogged(error, 'request-async');
+
+    expect(wasErrorCaptured(error, 'request-async')).toBe(true);
+    expect(wasSecurityEventLogged(error, 'request-async')).toBe(true);
+    expect(wasErrorCaptured(error)).toBe(true);
+    expect(wasSecurityEventLogged(error)).toBe(true);
+    expect(wasErrorCaptured(error, 'other-request')).toBe(false);
+    expect(wasSecurityEventLogged(error, 'other-request')).toBe(false);
+  });
+
+  it('keeps a best-effort marker when async context is unavailable', () => {
+    const error = new Error('contextless failure');
+    markErrorCaptured(error);
+    markSecurityEventLogged(error);
+
+    runWithRequestContext(context('later-filter'), () => {
+      expect(wasErrorCaptured(error)).toBe(true);
+      expect(wasSecurityEventLogged(error)).toBe(true);
+    });
+  });
+
   it('classifies only missing / expired tokens as routine auth failures', () => {
     const unclassified = new Error('custom guard');
     expect(getAuthFailureReason(unclassified)).toBeUndefined();
