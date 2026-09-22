@@ -14,8 +14,13 @@ function fakeSocket(overrides: Record<string, unknown> = {}) {
     data: { userId: 'u1' } as Record<string, unknown>,
     rooms: new Set<string>(['socket-1', 'c:conv-1']),
     handshake: {
-      auth: { token: 'jwt', traceId: 'ws-auth-trace' },
-      headers: { 'x-connection-trace-id': 'ws-header-trace' },
+      auth: {
+        token: 'jwt',
+        traceId: 'ws-22222222-2222-4222-8222-222222222222',
+      },
+      headers: {
+        'x-connection-trace-id': 'ws-11111111-1111-4111-8111-111111111111',
+      },
     },
     join: jest.fn().mockResolvedValue(undefined),
     emit: jest.fn(),
@@ -254,15 +259,20 @@ describe('ChatGateway', () => {
     it('uses the same validated connection trace from the proxy header', () => {
       const socket = fakeSocket();
       expect(gateway['connectionTraceId'](socket as never)).toBe(
-        'ws-header-trace',
+        'ws-11111111-1111-4111-8111-111111111111',
       );
-      expect(socket.data.connectionTraceId).toBe('ws-header-trace');
+      expect(socket.data.connectionTraceId).toBe(
+        'ws-11111111-1111-4111-8111-111111111111',
+      );
     });
 
     it('ignores an unsafe proxy trace and falls back to the validated auth copy', () => {
       const socket = fakeSocket({
         handshake: {
-          auth: { token: 'jwt', traceId: 'ws-safe-auth-trace' },
+          auth: {
+            token: 'jwt',
+            traceId: 'ws-33333333-3333-4333-8333-333333333333',
+          },
           headers: {
             'x-connection-trace-id': 'Bearer attacker-controlled-secret',
           },
@@ -270,8 +280,22 @@ describe('ChatGateway', () => {
       });
 
       expect(gateway['connectionTraceId'](socket as never)).toBe(
-        'ws-safe-auth-trace',
+        'ws-33333333-3333-4333-8333-333333333333',
       );
+    });
+
+    it('rejects account and phone-shaped connection trace values', () => {
+      for (const traceId of ['ws-john-smith-account', 'ws-15551234567']) {
+        const socket = fakeSocket({
+          handshake: {
+            auth: { token: 'jwt', traceId },
+            headers: { 'x-connection-trace-id': traceId },
+          },
+        });
+        expect(gateway['connectionTraceId'](socket as never)).toMatch(
+          /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/,
+        );
+      }
     });
 
     it('records a bounded auth rejection without user or token data', () => {
@@ -355,7 +379,7 @@ describe('ChatGateway', () => {
       gateway['observeEngineConnectionError']({
         req: {
           headers: {
-            'x-connection-trace-id': 'ws-upgrade-trace',
+            'x-connection-trace-id': 'ws-44444444-4444-4444-8444-444444444444',
             authorization: 'Bearer private-token',
           },
         },
@@ -373,7 +397,7 @@ describe('ChatGateway', () => {
         reason: 'engine_forbidden',
         errorCode: 4,
         statusCode: 403,
-        traceId: 'ws-upgrade-trace',
+        traceId: 'ws-44444444-4444-4444-8444-444444444444',
       });
       expect(JSON.stringify(warn.mock.calls)).not.toMatch(
         /private-token|authorization/i,
@@ -426,13 +450,13 @@ describe('ChatGateway', () => {
         event: 'ws_connection_ready',
         stage: 'ready',
         transport: 'websocket',
-        traceId: 'ws-header-trace',
+        traceId: 'ws-11111111-1111-4111-8111-111111111111',
       });
       expect(log).toHaveBeenCalledWith({
         event: 'ws_connection_closed',
         stage: 'ready',
         reason: 'transport_error',
-        traceId: 'ws-header-trace',
+        traceId: 'ws-11111111-1111-4111-8111-111111111111',
       });
     });
 
@@ -460,7 +484,7 @@ describe('ChatGateway', () => {
         event: 'ws_connection_closed',
         stage: 'pre_ready',
         reason: 'transport_error',
-        traceId: 'ws-header-trace',
+        traceId: 'ws-11111111-1111-4111-8111-111111111111',
       });
     });
   });
@@ -554,10 +578,12 @@ describe('ChatGateway', () => {
         handshake: {
           auth: {
             token: 'jwt',
-            traceId: 'ws-auth-trace',
+            traceId: 'ws-22222222-2222-4222-8222-222222222222',
             appState: 'background',
           },
-          headers: { 'x-connection-trace-id': 'ws-header-trace' },
+          headers: {
+            'x-connection-trace-id': 'ws-11111111-1111-4111-8111-111111111111',
+          },
         },
       });
       await settle();
