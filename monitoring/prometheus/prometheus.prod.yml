@@ -41,6 +41,10 @@ scrape_configs:
     static_configs:
       - targets: ['alertmanager:9093']
 
+  - job_name: grafana
+    static_configs:
+      - targets: ['grafana:3000']
+
   # Populated only by docker-compose.logs.yml. An absent optional stack
   # contributes no target and therefore cannot make the base deployment red.
   - job_name: logs-pipeline

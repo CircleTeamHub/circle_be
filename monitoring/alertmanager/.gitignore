@@ -5,3 +5,4 @@ discord.url
 # Create from heartbeat.url.example. This is the dead-man's switch: the
 # external service pages when it STOPS receiving pings.
 heartbeat.url
+heartbeat-fail.url

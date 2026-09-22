@@ -277,6 +277,17 @@ groups:
         annotations:
           summary: 'Alloy permanently dropped log entries in the last 10m'
 
+      # A one-off retry is normal. Remaining above zero for longer than the
+      # lookback means pushes keep failing and the sender WAL can grow even
+      # while Loki and Alloy both remain scrape-healthy.
+      - alert: LogPipelineDeliveryStalled
+        expr: increase(loki_write_batch_retries_total[10m]) > 0
+        for: 15m
+        labels:
+          severity: warning
+        annotations:
+          summary: 'Alloy has continuously retried log delivery for at least 15m'
+
       # 永远 firing，专门路由到**外部**心跳服务（healthchecks.io 等）。
       #
       # 整套监控栈和被监控对象在同一台机器上：机器宕机、磁盘写满、网络断开时，

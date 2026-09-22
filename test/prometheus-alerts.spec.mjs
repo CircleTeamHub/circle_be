@@ -195,6 +195,7 @@ test('DbPoolExhausted scales with the configured pool size', () => {
 test('monitoring components are scraped and their failures alert', () => {
   for (const config of [PROMETHEUS, PROMETHEUS_PROD]) {
     assert.match(config, /job_name: alertmanager[\s\S]*targets: \['alertmanager:9093'\]/);
+    assert.match(config, /job_name: grafana[\s\S]*targets: \['grafana:3000'\]/);
   }
   for (const name of ['AlertmanagerNotificationFailures', 'AlertmanagerConfigReloadFailed', 'PrometheusRuleEvaluationFailures']) {
     assert.ok(alertExpr(name));
@@ -208,6 +209,7 @@ test('optional log pipeline exposes private self-metrics only when its overlay i
   assert.match(LOGS_COMPOSE, /\.\/prometheus\/logs-targets\.yml:\/etc\/prometheus\/log-targets\/targets\.yml:ro/);
   assert.match(LOGS_COMPOSE, /--server\.http\.listen-addr=0\.0\.0\.0:12345/);
   assert.ok(alertExpr('LogPipelineDroppedEntries'));
+  assert.ok(alertExpr('LogPipelineDeliveryStalled'));
 });
 
 test('promtool fixtures cover post-scrape cron isolation and monitoring self-alert behavior', () => {
@@ -219,8 +221,9 @@ test('promtool fixtures cover post-scrape cron isolation and monitoring self-ale
     'Alertmanager 配置重载失败持续后触发并在成功后恢复',
     'Prometheus 规则评估失败计数增长并在窗口过期后恢复',
     '监控自检指标为零或可选日志栈缺席时不报',
-    '可选日志目标宕机触发 TargetDown',
+    'Grafana 和可选日志目标宕机触发 TargetDown',
     'Alloy 丢弃计数单次增长触发并在窗口过期后恢复',
+    'Alloy 持续重试且目标健康时触发',
   ]) {
     assert.match(RULE_TESTS, new RegExp(`name: ${scenario}`), `missing promtool scenario: ${scenario}`);
   }

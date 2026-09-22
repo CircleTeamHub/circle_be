@@ -134,6 +134,7 @@ jobs:
             echo "✅ $2 $3 → $1"
           }
           assert_route external-heartbeat alertname=Watchdog severity=none
+          assert_route external-heartbeat-failure alertname=AlertmanagerNotificationFailures severity=critical
           assert_route discord-critical   alertname=RedisDown severity=critical
           assert_route discord-warning    alertname=HostCpuSaturated severity=warning
 
