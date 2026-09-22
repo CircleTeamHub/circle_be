@@ -1,4 +1,4 @@
-import { Injectable } from '@nestjs/common';
+import { Injectable, Logger } from '@nestjs/common';
 import { Test } from '@nestjs/testing';
 import {
   Cron,
@@ -14,6 +14,7 @@ import {
   TrackedCron,
 } from './tracked-cron.decorator';
 import { jobMetrics } from './job-metrics';
+import { getOperationContext } from '../logging/operation-context';
 
 jest.mock('../logging/error-aggregation.service', () => ({
   reportOperationalError: jest.fn(),
@@ -429,5 +430,158 @@ describe('runTracked error aggregation', () => {
     });
 
     expect(reportOperationalError).not.toHaveBeenCalled();
+  });
+});
+
+describe('runTracked structured summaries', () => {
+  const debug = jest.spyOn(Logger.prototype, 'debug').mockImplementation();
+  const warn = jest.spyOn(Logger.prototype, 'warn').mockImplementation();
+  const errorLog = jest.spyOn(Logger.prototype, 'error').mockImplementation();
+
+  beforeEach(() => {
+    debug.mockClear();
+    warn.mockClear();
+    errorLog.mockClear();
+  });
+
+  afterAll(() => {
+    debug.mockRestore();
+    warn.mockRestore();
+    errorLog.mockRestore();
+  });
+
+  it('emits one debug summary for a successful run without logging its result', async () => {
+    const result = { token: 'secret-result' };
+    const elapsed = jest.fn().mockReturnValueOnce(10).mockReturnValueOnce(35);
+    await expect(
+      runTracked(createJobMetrics(), 'summary_probe', () => result, {
+        elapsedMs: elapsed,
+        nowMs: () => 1_000,
+      }),
+    ).resolves.toBe(result);
+
+    expect(debug).toHaveBeenCalledTimes(1);
+    expect(debug).toHaveBeenCalledWith({
+      event: 'job_run',
+      job: 'summary_probe',
+      runId: expect.stringMatching(/^[a-f0-9-]{36}$/),
+      outcome: 'success',
+      durationMs: 25,
+    });
+    expect(JSON.stringify(debug.mock.calls)).not.toContain('secret-result');
+    expect(warn).not.toHaveBeenCalled();
+    expect(errorLog).not.toHaveBeenCalled();
+  });
+
+  it('uses distinct run IDs for overlapping invocations of the same job', async () => {
+    const metrics = createJobMetrics();
+    const contexts = await Promise.all(
+      [1, 2].map(() =>
+        runTracked(metrics, 'same_job', async () => {
+          const before = getOperationContext();
+          await new Promise<void>((resolve) => setImmediate(resolve));
+          expect(getOperationContext()).toBe(before);
+          return before;
+        }),
+      ),
+    );
+    expect(contexts[0].job).toBe('same_job');
+    expect(contexts[1].job).toBe('same_job');
+    expect(contexts[0].runId).not.toBe(contexts[1].runId);
+    for (const context of contexts) {
+      expect(debug).toHaveBeenCalledWith(expect.objectContaining(context));
+    }
+    expect(getOperationContext()).toBeUndefined();
+  });
+
+  it('keeps the run context available while reporting a thrown failure', async () => {
+    const { reportOperationalError } = jest.requireMock(
+      '../logging/error-aggregation.service',
+    ) as { reportOperationalError: jest.Mock };
+    let runId: string;
+    reportOperationalError.mockImplementationOnce(() => {
+      expect(getOperationContext()).toEqual({ job: 'report_probe', runId });
+    });
+    const original = new Error('failure');
+    await expect(
+      runTracked(createJobMetrics(), 'report_probe', () => {
+        runId = getOperationContext().runId;
+        throw original;
+      }),
+    ).rejects.toBe(original);
+  });
+
+  it('logs handled failures at warn and skipped runs at debug', async () => {
+    const metrics = createJobMetrics();
+    await runTracked(metrics, 'handled_probe', () => reportHandledJobFailure());
+    await runTracked(metrics, 'skipped_probe', () => reportJobSkipped());
+
+    expect(warn).toHaveBeenCalledWith(
+      expect.objectContaining({
+        event: 'job_run',
+        job: 'handled_probe',
+        outcome: 'failure',
+      }),
+    );
+    expect(debug).toHaveBeenCalledWith(
+      expect.objectContaining({
+        event: 'job_run',
+        job: 'skipped_probe',
+        outcome: 'skipped',
+      }),
+    );
+  });
+
+  it('summarizes a thrown failure without copying its message or stack', async () => {
+    const original = new Error('postgres://secret:password@internal/private');
+    await expect(
+      runTracked(createJobMetrics(), 'failed_probe', () => {
+        throw original;
+      }),
+    ).rejects.toBe(original);
+
+    expect(errorLog).toHaveBeenCalledWith(
+      expect.objectContaining({
+        event: 'job_run',
+        job: 'failed_probe',
+        outcome: 'failure',
+      }),
+    );
+    expect(JSON.stringify(errorLog.mock.calls)).not.toContain('password');
+  });
+
+  it('does not let a broken logger or metric change a successful result', async () => {
+    const metrics = createJobMetrics();
+    jest.spyOn(metrics, 'recordRun').mockImplementation(() => {
+      throw new Error('metrics broken');
+    });
+    debug.mockImplementationOnce(() => {
+      throw new Error('logger broken');
+    });
+
+    await expect(runTracked(metrics, 'safe_probe', () => 42)).resolves.toBe(42);
+  });
+
+  it('rethrows the original failure even when every telemetry sink throws', async () => {
+    const metrics = createJobMetrics();
+    jest.spyOn(metrics, 'recordRun').mockImplementation(() => {
+      throw new Error('metrics broken');
+    });
+    errorLog.mockImplementationOnce(() => {
+      throw new Error('logger broken');
+    });
+    const { reportOperationalError } = jest.requireMock(
+      '../logging/error-aggregation.service',
+    ) as { reportOperationalError: jest.Mock };
+    reportOperationalError.mockImplementationOnce(() => {
+      throw new Error('reporter broken');
+    });
+    const original = new Error('business failure');
+
+    await expect(
+      runTracked(metrics, 'safe_failure_probe', () => {
+        throw original;
+      }),
+    ).rejects.toBe(original);
   });
 });

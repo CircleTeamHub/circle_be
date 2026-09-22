@@ -1,8 +1,10 @@
 import { AsyncLocalStorage } from 'node:async_hooks';
+import { randomUUID } from 'node:crypto';
 import { Logger } from '@nestjs/common';
 import { Cron, CronExpression, CronOptions } from '@nestjs/schedule';
-import { jobMetrics, type JobMetrics } from './job-metrics';
+import { jobMetrics, type JobMetrics, type JobRunResult } from './job-metrics';
 import { reportOperationalError } from '../logging/error-aggregation.service';
+import { runWithOperationContext } from '../logging/operation-context';
 
 /**
  * 各 cron 表达式的预期周期（秒），导出成 `circle_cron_interval_seconds`。
@@ -126,36 +128,58 @@ export async function runTracked<T>(
 ): Promise<T> {
   const startedAt = clock.elapsedMs();
   const context: TrackedJobContext = { failed: false, skipped: false };
-  try {
-    const result = await currentJob.run(context, () => run());
-    // 「正常返回但调用过 reportHandledJobFailure()」与「抛异常」记为同一种
-    // 结果：心跳不前进，failure 计数递增。
-    if (context.failed) {
-      metrics.recordRun(job, 'failure', (clock.elapsedMs() - startedAt) / 1000);
-      return result;
-    }
-    // 跳过排在成功之前判定，但排在失败之后：一轮里既报了失败又报了跳过时
-    // （重入闸之外还有别的 catch），按更严重的失败算。
-    if (context.skipped) {
-      metrics.recordRun(job, 'skipped', (clock.elapsedMs() - startedAt) / 1000);
-      return result;
-    }
-    metrics.recordRun(
-      job,
-      'success',
-      (clock.elapsedMs() - startedAt) / 1000,
-      clock.nowMs(),
-    );
-    return result;
-  } catch (error) {
-    metrics.recordRun(job, 'failure', (clock.elapsedMs() - startedAt) / 1000);
-    reportOperationalError(error, {
-      component: 'TrackedCron',
-      operation: job,
-      kind: 'cron',
-    });
-    throw error;
-  }
+  const operationContext = { job, runId: randomUUID() };
+  return runWithOperationContext(operationContext, () =>
+    currentJob.run(context, async () => {
+      let outcome: JobRunResult = 'success';
+      let threw = false;
+      try {
+        const result = await run();
+        // Failure takes precedence when a run reports both failure and skip.
+        if (context.failed) outcome = 'failure';
+        else if (context.skipped) outcome = 'skipped';
+        return result;
+      } catch (error) {
+        outcome = 'failure';
+        threw = true;
+        try {
+          reportOperationalError(error, {
+            component: 'TrackedCron',
+            operation: job,
+            kind: 'cron',
+          });
+        } catch {
+          // Error reporting must not replace the original job failure.
+        }
+        throw error;
+      } finally {
+        const durationMs = clock.elapsedMs() - startedAt;
+        try {
+          metrics.recordRun(
+            job,
+            outcome,
+            durationMs / 1000,
+            outcome === 'success' ? clock.nowMs() : undefined,
+          );
+        } catch {
+          // Metrics are best effort and cannot change the job's outcome.
+        }
+        try {
+          const summary = {
+            event: 'job_run',
+            ...operationContext,
+            outcome,
+            durationMs,
+          };
+          if (threw) logger.error(summary);
+          else if (outcome === 'failure') logger.warn(summary);
+          else logger.debug(summary);
+        } catch {
+          // Summary logs never copy job results/errors or affect execution.
+        }
+      }
+    }),
+  );
 }
 
 /**
