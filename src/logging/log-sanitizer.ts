@@ -166,7 +166,8 @@ export function sanitizeLogValue(value: unknown): unknown {
       if (
         PRIVATE_KEY.test(normalizedKey) ||
         PRIVATE_FIELDS.has(normalizedKey) ||
-        (normalizedKey === 'message' && depth > 1)
+        (normalizedKey === 'message' &&
+          (depth > 1 || typeof current === 'string'))
       )
         return REDACTED;
       if (normalizedKey === 'stack' || normalizedKey === 'trace')
