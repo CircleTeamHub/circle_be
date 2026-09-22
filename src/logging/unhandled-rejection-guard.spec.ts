@@ -114,7 +114,9 @@ describe('installUnhandledRejectionGuard', () => {
     expect(reportMock).toHaveBeenCalledTimes(1);
     expect(flushMock).toHaveBeenCalledWith(2000);
     expect(logError).toHaveBeenCalledWith(
-      '[fatal] Uncaught exception; exiting.',
+      expect.stringMatching(
+        /^\[fatal\] Uncaught exception; errorName=Error source=at .*:\d+:\d+; exiting\.$/,
+      ),
     );
     expect(JSON.stringify(logError.mock.calls)).not.toContain('private prose');
     expect(exit).toHaveBeenCalledWith(1);
