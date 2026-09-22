@@ -71,6 +71,7 @@ describe('ChatService', () => {
     attachMediaUrls: jest.fn().mockResolvedValue(undefined),
     copyForForward: jest.fn(),
     deleteObjects: jest.fn().mockResolvedValue(undefined),
+    queueDeletions: jest.fn().mockResolvedValue(undefined),
     attachNoteImportReferences: jest.fn().mockResolvedValue(undefined),
     releaseNoteImportReferences: jest.fn().mockResolvedValue(undefined),
     drainPendingDeletions: jest.fn().mockResolvedValue(undefined),
@@ -3404,6 +3405,10 @@ describe('ChatService', () => {
         'chat/u1/a.jpg',
         'chat/u1/a.t.jpg',
       ]);
+      expect(media.queueDeletions).toHaveBeenCalledWith(prisma, [
+        'chat/u1/a.jpg',
+        'chat/u1/a.t.jpg',
+      ]);
       expect(broadcast.emitRevoke).toHaveBeenCalledWith({
         conversationId: 'conv-1',
         messageId: 'm1',
@@ -6041,6 +6046,9 @@ describe('ChatService', () => {
         }),
       );
       expect(media.deleteObjects).toHaveBeenCalledWith(['chat/u1/a.jpg']);
+      expect(media.queueDeletions).toHaveBeenCalledWith(prisma, [
+        'chat/u1/a.jpg',
+      ]);
     });
   });
 

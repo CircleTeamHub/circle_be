@@ -201,6 +201,33 @@ export class ChatMediaService implements OnModuleDestroy {
   }
 
   /**
+   * Persist deletion intent in the same transaction that erases message
+   * content. If Postgres is unavailable the tombstone transaction rolls back,
+   * so the key remains recoverable from the message instead of existing only
+   * in a best-effort callback.
+   */
+  async queueDeletions(
+    tx: Prisma.TransactionClient,
+    keys: string[],
+  ): Promise<void> {
+    const objectKeys = [...new Set(keys)].filter(
+      (key) =>
+        key.startsWith(CHAT_MEDIA_KEY_PREFIX) &&
+        !key.includes(`/${CHAT_NOTE_IMPORT_SEGMENT}`),
+    );
+    if (objectKeys.length === 0) return;
+    await tx.chatMediaDeletion.createMany({
+      data: objectKeys.map((objectKey) => ({
+        objectKey,
+        attempts: 0,
+        lastError: 'pending message media deletion',
+        nextAttemptAt: new Date(),
+      })),
+      skipDuplicates: true,
+    });
+  }
+
+  /**
    * 转发媒体时复制对象到转发者自己的命名空间。源 key 只从已通过消息可见性
    * 校验的数据库行读取；展示 URL 会被移除，目标消息只持久化新 key。
    */
