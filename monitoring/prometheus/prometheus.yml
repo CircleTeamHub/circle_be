@@ -19,6 +19,10 @@ scrape_configs:
     static_configs:
       - targets: ['alertmanager:9093']
 
+  - job_name: grafana
+    static_configs:
+      - targets: ['grafana:3000']
+
   # The optional logs overlay mounts targets into this otherwise-empty path.
   # No target series exists in metrics-only installs, so optional services do
   # not create false TargetDown alerts when the overlay is disabled.

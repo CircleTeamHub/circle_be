@@ -351,7 +351,8 @@ inverted from every other alert here: the outside service pages you when it
 
    ```bash
    cp monitoring/alertmanager/heartbeat.url.example monitoring/alertmanager/heartbeat.url
-   # then paste the real ping URL into heartbeat.url
+   cp monitoring/alertmanager/heartbeat-fail.url.example monitoring/alertmanager/heartbeat-fail.url
+   # Use the same check UUID; heartbeat-fail.url must end in /fail.
    ```
 
 3. Reload Alertmanager:

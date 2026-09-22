@@ -271,9 +271,11 @@ tests:
         exp_alerts: []
 
   - interval: 1m
-    name: 可选日志目标宕机触发 TargetDown
+    name: Grafana 和可选日志目标宕机触发 TargetDown
     input_series:
       - series: 'up{job="logs-pipeline",instance="alloy:12345",component="alloy"}'
+        values: '0+0x10'
+      - series: 'up{job="grafana",instance="grafana:3000"}'
         values: '0+0x10'
     alert_rule_test:
       - eval_time: 5m
@@ -286,6 +288,12 @@ tests:
               component: alloy
             exp_annotations:
               summary: 'Scrape target logs-pipeline is down'
+          - exp_labels:
+              severity: critical
+              job: grafana
+              instance: grafana:3000
+            exp_annotations:
+              summary: 'Scrape target grafana is down'
 
   - interval: 1m
     name: Alloy 丢弃计数单次增长触发并在窗口过期后恢复
@@ -304,6 +312,27 @@ tests:
       - eval_time: 20m
         alertname: LogPipelineDroppedEntries
         exp_alerts: []
+
+  - interval: 1m
+    name: Alloy 持续重试且目标健康时触发
+    input_series:
+      - series: 'loki_write_batch_retries_total{component_id="loki.write.local"}'
+        values: '0+1x40'
+      - series: 'loki_write_dropped_entries_total{component_id="loki.write.local"}'
+        values: '0+0x40'
+      - series: 'up{job="logs-pipeline",component="alloy"}'
+        values: '1+0x40'
+      - series: 'up{job="logs-pipeline",component="loki"}'
+        values: '1+0x40'
+    alert_rule_test:
+      - eval_time: 30m
+        alertname: LogPipelineDeliveryStalled
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              component_id: loki.write.local
+            exp_annotations:
+              summary: 'Alloy has continuously retried log delivery for at least 15m'
 
   # ── outbox 探测新鲜度 ────────────────────────────────────────────────
   - interval: 1m
