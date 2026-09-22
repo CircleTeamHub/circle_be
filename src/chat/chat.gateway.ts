@@ -95,7 +95,8 @@ type EngineConnectionError = {
 
 const CONNECTION_TRACE_HEADER = 'x-connection-trace-id';
 const GUEST_CLIENT_TYPE_SET = new Set<string>(GUEST_CLIENT_MESSAGE_TYPES);
-const SAFE_CONNECTION_TRACE_ID = /^ws-[a-z0-9-]{8,96}$/i;
+const SAFE_CONNECTION_TRACE_ID =
+  /^ws-[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 const CHAT_AUTH_FAILURE_REASONS: ReadonlySet<ChatAuthFailureReason> = new Set([
   'missing_token',
   'invalid_token',
