@@ -28,7 +28,7 @@
     "test:minio": "bash scripts/test-minio-integration.sh",
     "prisma:generate": "prisma generate",
     "prisma:migrate": "prisma migrate dev",
-    "prisma:migrate:prod": "prisma migrate deploy",
+    "prisma:migrate:prod": "node scripts/prepare-chat-message-deleted-at-migration.mjs && prisma migrate deploy",
     "prisma:studio": "prisma studio",
     "seed:admin": "node scripts/seed-admin-user.js",
     "seed:fancy-numbers": "node scripts/seed-fancy-numbers.js",
