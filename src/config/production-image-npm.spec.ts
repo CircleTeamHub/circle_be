@@ -27,7 +27,7 @@ describe('production image npm toolchain', () => {
     expect(productionStage).toContain('rm -rf /usr/local/lib/node_modules/npm');
     expect(productionStage).not.toContain('npm install -g npm@12.0.2');
     expect(compose).toContain(
-      'command: ./node_modules/.bin/prisma migrate deploy',
+      'node scripts/prepare-chat-message-deleted-at-migration.mjs && ./node_modules/.bin/prisma migrate deploy',
     );
     expect(compose).not.toContain('command: npx prisma migrate deploy');
     expect(dockerfile).not.toContain('npm@latest');
