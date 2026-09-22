@@ -110,6 +110,17 @@ describe('createErrorAggregationProvider', () => {
     expect(provider.name).toBe('none');
   });
 
+  it('falls back to no-op when the sentry client factory throws', () => {
+    const provider = createErrorAggregationProvider(
+      { provider: 'sentry', dsn: 'https://x@o/1', environment: 'production' },
+      () => {
+        throw new Error('SDK initialization failed with private config');
+      },
+    );
+
+    expect(provider.name).toBe('none');
+  });
+
   it('builds a sentry provider with the resolved config when dsn is present', () => {
     const client = createFakeClient();
     const clientFactory = jest.fn().mockReturnValue(client);
@@ -625,13 +636,25 @@ describe('createSentryInitOptions', () => {
     expect(child.stderr).toBe('');
     expect(child.stdout).toContain('TIMER_RAN');
     expect(child.stdout).not.toContain('private rejection prose');
-    const envelopes = child.stdout
+    const eventEnvelopes = child.stdout
       .trim()
       .split('\n')
       .filter((line) => line.startsWith('['))
-      .map((line) => JSON.parse(line));
-    expect(envelopes).toHaveLength(1);
-    const event = envelopes[0][1].find(
+      .map((line) => JSON.parse(line))
+      .filter(
+        (envelope: unknown) =>
+          Array.isArray(envelope) &&
+          Array.isArray(envelope[1]) &&
+          envelope[1].some(
+            (item: unknown) =>
+              Array.isArray(item) &&
+              item[0] &&
+              typeof item[0] === 'object' &&
+              (item[0] as { type?: unknown }).type === 'event',
+          ),
+      );
+    expect(eventEnvelopes).toHaveLength(1);
+    const event = eventEnvelopes[0][1].find(
       (item: unknown) =>
         Array.isArray(item) && (item[0] as { type?: string }).type === 'event',
     )[1];

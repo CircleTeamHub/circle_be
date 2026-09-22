@@ -2,7 +2,10 @@ import { HttpException, LoggerService } from '@nestjs/common';
 import { getRequestContext } from './request-context';
 import { safeLogPath, sanitizeLogValue } from './log-sanitizer';
 
-const loggedErrors = new WeakSet<object>();
+// Interceptor and exception filter may see the same object in one request.
+// Key deduplication by request, not object lifetime: SDKs sometimes reuse one
+// Error instance across requests and each request still needs diagnostics.
+const loggedErrorRequestIds = new WeakMap<object, string>();
 
 /** Diagnostics must never replace a response, rejection, or business result. */
 export function attemptDiagnostic(
@@ -39,8 +42,13 @@ export function logHttpFailure(
   attemptDiagnostic(() => {
     const object =
       typeof error === 'object' && error !== null ? error : undefined;
-    if (object && loggedErrors.has(object)) return;
     const context = getRequestContext();
+    if (
+      object &&
+      context?.requestId &&
+      loggedErrorRequestIds.get(object) === context.requestId
+    )
+      return;
     const response =
       error instanceof HttpException ? error.getResponse() : undefined;
     const candidateCode =
@@ -82,6 +90,7 @@ export function logHttpFailure(
     };
     if (statusCode >= 500) logger.error(payload, 'HttpError');
     else logger.warn(payload, 'HttpError');
-    if (object) loggedErrors.add(object);
+    if (object && context?.requestId)
+      loggedErrorRequestIds.set(object, context.requestId);
   });
 }

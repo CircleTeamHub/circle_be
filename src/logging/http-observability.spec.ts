@@ -7,6 +7,9 @@ import { AllExceptionFilter } from '../filters/all-exception.filter';
 import { ErrorLoggingInterceptor } from '../interceptors/error-logging.interceptor';
 import { PrismaExceptionFilter } from '../filters/prisma-exception.filter';
 import { Prisma } from 'src/generated/prisma';
+import { logHttpFailure } from './http-failure.logger';
+
+const TEST_REQUEST_ID = '9b2a7f3c-2a9e-4f1c-8d2b-124a5cc93a10';
 
 function loggerSpy() {
   return { log: jest.fn(), warn: jest.fn(), error: jest.fn() };
@@ -27,7 +30,7 @@ const request = () => ({
   originalUrl:
     '/api/v1/note/share-links/private-link?email=private@example.com',
   url: '/api/v1/note/share-links/private-link?email=private@example.com',
-  headers: { 'x-request-id': 'req-1', 'user-agent': 'private-device' },
+  headers: { 'x-request-id': TEST_REQUEST_ID, 'user-agent': 'private-device' },
   ip: '192.0.2.9',
   query: { email: 'private@example.com', content: 'private chat' },
 });
@@ -48,11 +51,11 @@ describe('HTTP diagnostic privacy and reliability', () => {
     });
     middleware(request() as any, res as any, () => {
       expect(getRequestContext()).toMatchObject({
-        requestId: 'req-1',
+        requestId: TEST_REQUEST_ID,
         path: '/api/v1/note/share-links/:token',
       });
     });
-    expect(res.setHeader).toHaveBeenCalledWith('x-request-id', 'req-1');
+    expect(res.setHeader).toHaveBeenCalledWith('x-request-id', TEST_REQUEST_ID);
     res.emit('finish');
     expect(logger.log).not.toHaveBeenCalled();
   });
@@ -70,7 +73,7 @@ describe('HTTP diagnostic privacy and reliability', () => {
     expect(logger.warn).toHaveBeenCalledWith(
       expect.objectContaining({
         event: 'http_aborted',
-        requestId: 'req-1',
+        requestId: TEST_REQUEST_ID,
         path: '/api/v1/note/share-links/:token',
       }),
       'HttpAccess',
@@ -190,14 +193,24 @@ describe('HTTP diagnostic privacy and reliability', () => {
     const filter = new AllExceptionFilter(logger, {
       httpAdapter: { reply: jest.fn() },
     } as any);
-    await expect(
-      lastValueFrom(
-        interceptor.intercept({} as any, {
-          handle: () => throwError(() => error),
-        }),
-      ),
-    ).rejects.toBe(error);
-    filter.catch(error, host(request()));
+    await runWithRequestContext(
+      {
+        requestId: TEST_REQUEST_ID,
+        traceId: TEST_REQUEST_ID,
+        method: 'GET',
+        path: '/api/v1/note/share-links/:token',
+      },
+      async () => {
+        await expect(
+          lastValueFrom(
+            interceptor.intercept({} as any, {
+              handle: () => throwError(() => error),
+            }),
+          ),
+        ).rejects.toBe(error);
+        filter.catch(error, host(request()));
+      },
+    );
     const httpEvents = logger.warn.mock.calls.filter(
       ([entry]) => entry?.event === 'http_error',
     );
@@ -206,6 +219,27 @@ describe('HTTP diagnostic privacy and reliability', () => {
     expect(JSON.stringify(logger.warn.mock.calls)).not.toContain(
       'private chat',
     );
+  });
+
+  it('deduplicates one error only within the same request context', () => {
+    const logger = loggerSpy();
+    const error = new Error('private shared failure');
+    const write = (requestId: string) =>
+      runWithRequestContext(
+        {
+          requestId,
+          traceId: requestId,
+          method: 'GET',
+          path: '/api/v1/auth/me',
+        },
+        () => logHttpFailure(logger, error, 500),
+      );
+
+    write('9b2a7f3c-2a9e-4f1c-8d2b-124a5cc93a10');
+    write('9b2a7f3c-2a9e-4f1c-8d2b-124a5cc93a10');
+    write('4c5397be-8ce2-4acd-8a2f-64385b46f40b');
+
+    expect(logger.error).toHaveBeenCalledTimes(2);
   });
 
   it('propagates the original exception even if both primary logging and aggregation fail', async () => {

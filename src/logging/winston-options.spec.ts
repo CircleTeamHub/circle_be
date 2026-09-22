@@ -134,7 +134,7 @@ describe('createWinstonOptions', () => {
 
   it('applies the same privacy and JSON format to every file transport', () => {
     const options = createWinstonOptions(
-      new ConfigServiceLike({ LOG_ON: 'true' }),
+      new ConfigServiceLike({ LOG_ON: 'true', LOG_FILE_ON: 'true' }),
       'production',
     );
     openedLoggers.push(winston.createLogger(options));
@@ -160,6 +160,15 @@ describe('createWinstonOptions', () => {
 
   it('lets stdout deployments disable files while other logging stays enabled', () => {
     const { options } = capture({ LOG_ON: 'true', LOG_FILE_ON: 'false' });
+    expect(options.transports).toHaveLength(1);
+  });
+
+  it('keeps file logging off when an existing deployment has no explicit flag', () => {
+    const options = createWinstonOptions(
+      new ConfigServiceLike({ LOG_ON: 'true' }),
+      'production',
+    );
+    openedLoggers.push(winston.createLogger(options));
     expect(options.transports).toHaveLength(1);
   });
 

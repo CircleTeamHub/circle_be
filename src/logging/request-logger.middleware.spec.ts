@@ -2,6 +2,8 @@ import { EventEmitter } from 'events';
 import { performance } from 'node:perf_hooks';
 import { createRequestLoggerMiddleware } from './request-logger.middleware';
 
+const TEST_REQUEST_ID = '9b2a7f3c-2a9e-4f1c-8d2b-124a5cc93a10';
+
 function createReq(overrides: Record<string, unknown> = {}) {
   return {
     method: 'GET',
@@ -11,7 +13,7 @@ function createReq(overrides: Record<string, unknown> = {}) {
     headers: {
       'user-agent': 'jest',
       authorization: 'Bearer token',
-      'x-request-id': 'req-1',
+      'x-request-id': TEST_REQUEST_ID,
     },
     body: { password: 'secret' },
     ...overrides,
@@ -53,7 +55,7 @@ describe('createRequestLoggerMiddleware', () => {
     res.emit('finish');
 
     expect(next).toHaveBeenCalled();
-    expect(res.setHeader).toHaveBeenCalledWith('x-request-id', 'req-1');
+    expect(res.setHeader).toHaveBeenCalledWith('x-request-id', TEST_REQUEST_ID);
     expect(logger.log).toHaveBeenCalledWith(
       expect.objectContaining({
         event: 'http_access',
@@ -61,7 +63,7 @@ describe('createRequestLoggerMiddleware', () => {
         path: '/api/v1/auth/me',
         statusCode: 200,
         durationMs: 123,
-        requestId: 'req-1',
+        requestId: TEST_REQUEST_ID,
       }),
       'HttpAccess',
     );

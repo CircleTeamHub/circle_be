@@ -103,9 +103,12 @@ export function createWinstonOptions(
   const rawFileOn = configService.get('LOG_FILE_ON');
   const normalizedFileOn =
     typeof rawFileOn === 'string' ? rawFileOn.trim().toLowerCase() : rawFileOn;
-  let fileOn = loggingConfig.logOn;
-  if (normalizedFileOn === false || normalizedFileOn === 'false')
-    fileOn = false;
+  // File logging is opt-in. Existing deployments created before LOG_FILE_ON
+  // was introduced must not start filling a persistent host volume merely
+  // because their existing LOG_ON master switch is enabled.
+  const fileOn =
+    loggingConfig.logOn &&
+    (normalizedFileOn === true || normalizedFileOn === 'true');
   const consoleFormat = production
     ? winston.format.combine(winston.format.timestamp(), winston.format.json())
     : winston.format.combine(

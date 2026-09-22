@@ -68,6 +68,15 @@ describe('log sanitizer', () => {
     );
     expect(safeLogPath('/api/v1/unknown/private-link')).toBe('/__other__');
     expect(
+      safeLogPath('/api/v1/chat/conversations/private-conversation/events'),
+    ).toBe('/api/v1/chat/conversations/:id/events');
+    expect(safeLogPath('/api/v1/note/private-note/exports')).toBe(
+      '/api/v1/note/:id/exports',
+    );
+    expect(safeLogPath('/api/v1/notification/profile/list')).toBe(
+      '/api/v1/notification/profile/list',
+    );
+    expect(
       sanitizeLogText('POST /api/v1/temp-chat/by-token/private-link/join'),
     ).not.toContain('private-link');
     expect(

@@ -7,12 +7,15 @@
  * interceptor forwards 5xx failures to error aggregation and logs 401/403 as
  * security events; the filter must cover the paths the interceptor cannot see
  * (a guard rejecting a revoked session, Prisma failing inside a guard, a pipe
- * throwing) without double-reporting the ones it already handled. A WeakSet
- * keyed by the exception object is the cheapest correlation that survives the
- * rethrow and never retains the error beyond the request.
+ * throwing) without double-reporting the ones it already handled. A WeakMap
+ * keyed by the exception object preserves correlation across the rethrow. The
+ * request id is part of the marker so an SDK/cache that reuses
+ * one Error object cannot suppress diagnostics for later requests.
  */
-const capturedErrors = new WeakSet<object>();
-const securityLoggedErrors = new WeakSet<object>();
+import { getRequestContext } from './request-context';
+
+const capturedErrors = new WeakMap<object, string>();
+const securityLoggedErrors = new WeakMap<object, string>();
 
 /**
  * Why JwtGuard rejected a bearer token, taken from passport's `info` — the
@@ -56,17 +59,27 @@ export function isRoutineAuthFailure(error: unknown): boolean {
 }
 
 export function markErrorCaptured(error: unknown): void {
-  if (isObject(error)) capturedErrors.add(error);
+  const requestId = getRequestContext()?.requestId;
+  if (isObject(error) && requestId) capturedErrors.set(error, requestId);
 }
 
 export function wasErrorCaptured(error: unknown): boolean {
-  return isObject(error) && capturedErrors.has(error);
+  const requestId = getRequestContext()?.requestId;
+  return Boolean(
+    isObject(error) && requestId && capturedErrors.get(error) === requestId,
+  );
 }
 
 export function markSecurityEventLogged(error: unknown): void {
-  if (isObject(error)) securityLoggedErrors.add(error);
+  const requestId = getRequestContext()?.requestId;
+  if (isObject(error) && requestId) securityLoggedErrors.set(error, requestId);
 }
 
 export function wasSecurityEventLogged(error: unknown): boolean {
-  return isObject(error) && securityLoggedErrors.has(error);
+  const requestId = getRequestContext()?.requestId;
+  return Boolean(
+    isObject(error) &&
+    requestId &&
+    securityLoggedErrors.get(error) === requestId,
+  );
 }

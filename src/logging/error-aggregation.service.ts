@@ -589,7 +589,14 @@ export function createErrorAggregationProvider(
     return new NoopErrorAggregationProvider();
   }
 
-  const client = clientFactory(config);
+  let client: SentryClientLike | undefined;
+  try {
+    client = clientFactory(config);
+  } catch {
+    // Loading or initializing an optional SDK must not prevent application
+    // startup. The caller can still surface its primary bootstrap failure.
+    return new NoopErrorAggregationProvider();
+  }
   if (!client) {
     return new NoopErrorAggregationProvider();
   }

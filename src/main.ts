@@ -13,6 +13,7 @@ import { RealtimeGateway } from './realtime/realtime.gateway';
 import { ChatGateway } from './chat/chat.gateway';
 // import { AllExceptionFilter } from './filters/all-exception.filter';
 import { getServerConfig } from './config/server.config';
+import { sanitizeLogValue } from './logging/log-sanitizer';
 
 export function resolveAppPort(value: unknown): number {
   if (typeof value === 'number' && Number.isInteger(value)) {
@@ -146,6 +147,23 @@ const processSinks: BootstrapFailureSinks = {
   exit: (code) => process.exit(code),
 };
 
+function safeBootstrapFailureDetails(error: unknown): string {
+  const sanitized = sanitizeLogValue(error);
+  if (!sanitized || typeof sanitized !== 'object' || Array.isArray(sanitized)) {
+    return 'errorName=Error';
+  }
+
+  const record = sanitized as Record<string, unknown>;
+  const errorName = typeof record.name === 'string' ? record.name : 'Error';
+  const source =
+    typeof record.stack === 'string'
+      ? record.stack.split('\n').find((line) => line.startsWith('at '))
+      : undefined;
+  return source
+    ? `errorName=${errorName} source=${source}`
+    : `errorName=${errorName}`;
+}
+
 /**
  * Runs the bootstrap and makes a failed start loud and fatal.
  *
@@ -170,20 +188,29 @@ export async function runBootstrap(
   try {
     await start();
   } catch (error) {
-    errorAggregation.captureError?.(error, {
-      component: 'bootstrap',
-      operation: 'start',
-      kind: 'process',
-    });
-    await flushWithDeadline(errorAggregation, 2000);
+    try {
+      errorAggregation.captureError?.(error, {
+        component: 'bootstrap',
+        operation: 'start',
+        kind: 'process',
+      });
+    } catch {
+      // An optional telemetry provider must never own the fatal path.
+    }
+    try {
+      await flushWithDeadline(errorAggregation, 2000);
+    } catch {
+      // Keep the process-exit guarantee even for a broken provider.
+    }
     try {
       sinks.logError(
-        '[bootstrap] Application failed to start; exiting with code 1.',
+        `[bootstrap] Application failed to start; ${safeBootstrapFailureDetails(error)}; exiting with code 1.`,
       );
     } catch {
       // Nowhere left to write the reason; exiting is what still matters.
+    } finally {
+      sinks.exit(1);
     }
-    sinks.exit(1);
   }
 }
 

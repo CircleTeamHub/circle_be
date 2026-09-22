@@ -138,10 +138,14 @@ describe('JwtStrategy request context & security events', () => {
   it('marks the revoked-session exception so the filter does not add a generic auth_unauthorized', async () => {
     jest.spyOn(Logger.prototype, 'warn').mockImplementation(() => undefined);
     const strategy = new JwtStrategy(config, verifierReturning('revoked'));
+    await runWithRequestContext(
+      { requestId: 'r-2', traceId: 'r-2', method: 'GET', path: '/api/v1/me' },
+      async () => {
+        const rejection = await strategy.validate(payload).catch((e) => e);
 
-    const rejection = await strategy.validate(payload).catch((e) => e);
-
-    expect(rejection).toBeInstanceOf(UnauthorizedException);
-    expect(wasSecurityEventLogged(rejection)).toBe(true);
+        expect(rejection).toBeInstanceOf(UnauthorizedException);
+        expect(wasSecurityEventLogged(rejection)).toBe(true);
+      },
+    );
   });
 });

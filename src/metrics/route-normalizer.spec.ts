@@ -5,6 +5,53 @@ import {
   STATIC_ROUTES,
   DYNAMIC_ROUTE_TEMPLATES,
 } from './route-normalizer';
+import { readdirSync, readFileSync } from 'node:fs';
+import { join } from 'node:path';
+import * as ts from 'typescript';
+
+function controllerFiles(directory: string): string[] {
+  return readdirSync(directory, { withFileTypes: true }).flatMap((entry) => {
+    const filePath = join(directory, entry.name);
+    if (entry.isDirectory()) return controllerFiles(filePath);
+    return entry.name.endsWith('.controller.ts') ? [filePath] : [];
+  });
+}
+
+function decorators(node: ts.Node): readonly ts.Decorator[] {
+  return ts.canHaveDecorators(node) ? (ts.getDecorators(node) ?? []) : [];
+}
+
+function literalDecoratorPaths(
+  decorator: ts.Decorator,
+  sourceFile: ts.SourceFile,
+): string[] {
+  const expression = decorator.expression;
+  if (!ts.isCallExpression(expression)) return [];
+  if (expression.arguments.length === 0) return [''];
+  const value = expression.arguments[0];
+  if (ts.isStringLiteralLike(value)) return [value.text];
+  if (ts.isArrayLiteralExpression(value)) {
+    return value.elements.map((element) => {
+      if (!ts.isStringLiteralLike(element)) {
+        throw new Error(
+          `Non-literal route decorator in ${sourceFile.fileName}: ${element.getText(sourceFile)}`,
+        );
+      }
+      return element.text;
+    });
+  }
+  throw new Error(
+    `Non-literal route decorator in ${sourceFile.fileName}: ${value.getText(sourceFile)}`,
+  );
+}
+
+function decoratorName(decorator: ts.Decorator): string | undefined {
+  const expression = decorator.expression;
+  return ts.isCallExpression(expression) &&
+    ts.isIdentifier(expression.expression)
+    ? expression.expression.text
+    : undefined;
+}
 
 describe('normalizeRoute', () => {
   it('collapses UUID segments to :id (prevents cardinality explosion)', () => {
@@ -117,6 +164,37 @@ describe('normalizeRoute', () => {
     expect(normalizeRoute('/api/v1/group/sg_group-1/members/user-2/role')).toBe(
       '/api/v1/group/:groupID/members/:userID/role',
     );
+  });
+
+  it.each([
+    [
+      '/api/v1/chat/conversations/conversation-alpha/events',
+      '/api/v1/chat/conversations/:id/events',
+    ],
+    [
+      '/api/v1/chat/conversations/conversation-alpha/sync',
+      '/api/v1/chat/conversations/:id/sync',
+    ],
+    [
+      '/api/v1/chat/conversations/conversation-alpha/messages/message-beta/readers',
+      '/api/v1/chat/conversations/:id/messages/:messageId/readers',
+    ],
+    ['/api/v1/note/note-alpha/exports', '/api/v1/note/:id/exports'],
+    ['/api/v1/notification/profile/list', '/api/v1/notification/profile/list'],
+    [
+      '/api/v1/notification/notification-alpha/open-ownership',
+      '/api/v1/notification/:id/open-ownership',
+    ],
+    ['/api/v1/geo/search', '/api/v1/geo/search'],
+    ['/api/v1/avatar-frames/me', '/api/v1/avatar-frames/me'],
+    ['/api/v1/qr/tokens/rotate', '/api/v1/qr/tokens/rotate'],
+    [
+      '/api/v1/friend/requests/request-alpha/messages',
+      '/api/v1/friend/requests/:requestId/messages',
+    ],
+  ])('recognizes the controller route %s', (path, expected) => {
+    expect(normalizeRoute(path)).toBe(expected);
+    expect(createRouteCardinalityLimiter(0)(expected)).toBe(expected);
   });
 
   it('leaves fully static routes unchanged', () => {
@@ -265,6 +343,74 @@ describe('route allowlist consistency', () => {
         .join('/');
       expect(normalizeRoute(concrete)).toBe(template);
     }
+  });
+
+  it('covers every literal HTTP route declared by controllers', () => {
+    const knownCanonicalRoutes = new Set(
+      [...STATIC_ROUTES, ...DYNAMIC_ROUTE_TEMPLATES].map((route) =>
+        route.replace(/:[^/]+/g, ':'),
+      ),
+    );
+    const httpDecorators = new Set([
+      'Get',
+      'Post',
+      'Put',
+      'Patch',
+      'Delete',
+      'Options',
+      'Head',
+      'All',
+    ]);
+    const declaredRoutes: string[] = [];
+
+    for (const fileName of controllerFiles(join(__dirname, '..'))) {
+      const sourceFile = ts.createSourceFile(
+        fileName,
+        readFileSync(fileName, 'utf8'),
+        ts.ScriptTarget.Latest,
+        true,
+      );
+      const visit = (node: ts.Node): void => {
+        if (ts.isClassDeclaration(node)) {
+          const controller = decorators(node).find(
+            (decorator) => decoratorName(decorator) === 'Controller',
+          );
+          if (controller) {
+            const controllerPaths = literalDecoratorPaths(
+              controller,
+              sourceFile,
+            );
+            for (const member of node.members) {
+              const method = decorators(member).find((decorator) => {
+                const name = decoratorName(decorator);
+                return name !== undefined && httpDecorators.has(name);
+              });
+              if (!method) continue;
+              const methodPaths = literalDecoratorPaths(method, sourceFile);
+              for (const controllerPath of controllerPaths) {
+                for (const methodPath of methodPaths) {
+                  declaredRoutes.push(
+                    `/api/v1/${[controllerPath, methodPath]
+                      .map((segment) => segment.replace(/^\/+|\/+$/g, ''))
+                      .filter(Boolean)
+                      .join('/')}`.replace(/\/+/, '/'),
+                  );
+                }
+              }
+            }
+          }
+        }
+        ts.forEachChild(node, visit);
+      };
+      visit(sourceFile);
+    }
+
+    const missing = [...new Set(declaredRoutes)]
+      .filter(
+        (route) => !knownCanonicalRoutes.has(route.replace(/:[^/]+/g, ':')),
+      )
+      .sort();
+    expect(missing).toEqual([]);
   });
 });
 

@@ -122,7 +122,9 @@ function safeConnectionTraceId(value: unknown): string | undefined {
 }
 
 function resolveConnectionTraceId(value: unknown): string {
-  return resolveRequestId(safeConnectionTraceId(value));
+  // WebSocket connection traces have their own strict, namespaced grammar.
+  // Do not feed an already-validated ws-* value through the HTTP UUID policy.
+  return safeConnectionTraceId(value) ?? resolveRequestId();
 }
 
 function engineRejectionReason(code: unknown): ChatConnectionRejectionReason {

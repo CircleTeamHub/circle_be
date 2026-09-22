@@ -262,9 +262,10 @@ describe('runBootstrap', () => {
     expect(sinks.calls).toEqual(['log', 'exit:1']);
     expect(errorAggregation.captureError).toHaveBeenCalledTimes(1);
     expect(errorAggregation.flush).toHaveBeenCalledWith(2000);
-    expect(sinks.logged[0]).toBe(
-      '[bootstrap] Application failed to start; exiting with code 1.',
+    expect(sinks.logged[0]).toContain(
+      '[bootstrap] Application failed to start; errorName=ServiceUnavailableException',
     );
+    expect(sinks.logged[0]).not.toContain('External media');
   });
 
   it('leaves a successful start alone', async () => {
@@ -293,6 +294,28 @@ describe('runBootstrap', () => {
 
     await runBootstrap(() => Promise.reject(new Error('boom')), sinks);
 
+    expect(sinks.exit).toHaveBeenCalledWith(1);
+  });
+
+  it('still logs and exits when startup error aggregation throws', async () => {
+    const sinks = recordingSinks();
+    const aggregation = {
+      captureError: jest.fn(() => {
+        throw new Error('capture failed');
+      }),
+      flush: jest.fn(() => {
+        throw new Error('flush failed');
+      }),
+    };
+
+    await runBootstrap(
+      () => Promise.reject(new TypeError('private startup error')),
+      sinks,
+      aggregation,
+    );
+
+    expect(sinks.logged[0]).toContain('errorName=TypeError');
+    expect(sinks.logged[0]).not.toContain('private startup error');
     expect(sinks.exit).toHaveBeenCalledWith(1);
   });
 
