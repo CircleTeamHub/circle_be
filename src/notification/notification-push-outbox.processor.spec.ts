@@ -62,13 +62,20 @@ function buildHarness({
   jobs,
   pendingDeliveries,
   outcomes,
-  tokens = [{ token: 'tok-a', projectId: null }],
+  tokens = [
+    { token: 'tok-a', projectId: null, provider: 'expo', platform: 'ios' },
+  ],
   circleOfflinePushEnabled = true,
 }: {
   jobs: any[];
   pendingDeliveries: any[];
   outcomes: any[];
-  tokens?: Array<{ token: string; projectId: string | null }>;
+  tokens?: Array<{
+    token: string;
+    projectId: string | null;
+    provider?: 'expo' | 'jpush';
+    platform?: 'ios' | 'android' | 'web';
+  }>;
   circleOfflinePushEnabled?: boolean;
 }) {
   const prisma = {
@@ -143,7 +150,7 @@ describe('NotificationPushOutboxProcessor (#88 per-token)', () => {
     expect(processed).toBe(1);
     // 发送目标只有待投行的 token
     expect(push.sendToTokens).toHaveBeenCalledWith(
-      [{ token: 'tok-b', projectId: null }],
+      [{ token: 'tok-b', projectId: null, provider: 'expo' }],
       { title: 'T', body: 'B', data: {} },
     );
     // ticket 落到投递行
