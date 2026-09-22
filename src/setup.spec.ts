@@ -43,6 +43,12 @@ describe('setupApp', () => {
     });
   });
 
+  it('always binds the sanitized logger, including when general logging is disabled', () => {
+    const app = buildAppMock();
+    setupApp(app as any);
+    expect(app.useLogger).toHaveBeenCalled();
+  });
+
   // 回归：Node 15 起未捕获的 promise rejection 默认终止进程 —— 代码库里
   // fire-and-forget 有几十处，漏一个 .catch 就能停服（实测过一次：Redis 抖动
   // + WebSocket 断开）。兜底必须在引导期装上，而不是指望人逐个记得写 .catch。
@@ -68,18 +74,16 @@ describe('setupApp', () => {
   });
 
   it('makes the configured aggregation provider available to non-HTTP jobs', () => {
-    const configure = jest.spyOn(
+    const getProvider = jest.spyOn(
       errorAggregation,
-      'configureErrorAggregationProvider',
+      'getErrorAggregationProvider',
     );
     const app = buildAppMock();
 
     setupApp(app as any);
 
-    expect(configure).toHaveBeenCalledWith(
-      expect.objectContaining({ captureError: expect.any(Function) }),
-    );
-    configure.mockRestore();
+    expect(getProvider).toHaveBeenCalledTimes(1);
+    getProvider.mockRestore();
   });
 
   it('registers global exception filters (All + Prisma)', () => {

@@ -1,4 +1,5 @@
 import { ConfigService } from '@nestjs/config';
+import { Logger } from '@nestjs/common';
 import { wgs84ToGcj02 } from './coordinates';
 import { GeoService } from './geo.service';
 
@@ -50,6 +51,55 @@ afterEach(() => {
 });
 
 describe('GeoService.reverse', () => {
+  it('keeps its null fallback when diagnostics are unavailable', async () => {
+    jest
+      .spyOn(globalThis, 'fetch')
+      .mockRejectedValue(new Error('provider down'));
+    jest.spyOn(Logger.prototype, 'warn').mockImplementation(() => {
+      throw new Error('sink down');
+    });
+    await expect(
+      buildService().reverse(SHENZHEN.latitude, SHENZHEN.longitude),
+    ).resolves.toBeNull();
+  });
+  it('does not log an upstream exception body or request coordinates', async () => {
+    jest
+      .spyOn(globalThis, 'fetch')
+      .mockRejectedValue(new Error('PRIVATE_LOCATION_AND_CONTENT'));
+    const warn = jest.spyOn(Logger.prototype, 'warn').mockImplementation();
+    await expect(
+      buildService().reverse(SHENZHEN.latitude, SHENZHEN.longitude),
+    ).resolves.toBeNull();
+    expect(JSON.stringify(warn.mock.calls)).not.toContain(
+      'PRIVATE_LOCATION_AND_CONTENT',
+    );
+    expect(warn).toHaveBeenCalledWith(
+      expect.objectContaining({
+        event: 'geo_request_failed',
+        operation: 'reverse_geocode',
+      }),
+    );
+  });
+  it('uses bounded provider codes instead of arbitrary response info', async () => {
+    mockFetchOnce({
+      status: '0',
+      info: 'PRIVATE_LOCATION_AND_CONTENT',
+      infocode: '10001',
+    });
+    const warn = jest.spyOn(Logger.prototype, 'warn').mockImplementation();
+    await expect(
+      buildService().reverse(SHENZHEN.latitude, SHENZHEN.longitude),
+    ).resolves.toBeNull();
+    expect(JSON.stringify(warn.mock.calls)).not.toContain(
+      'PRIVATE_LOCATION_AND_CONTENT',
+    );
+    expect(warn).toHaveBeenCalledWith(
+      expect.objectContaining({
+        event: 'geo_provider_rejected',
+        upstreamCode: '10001',
+      }),
+    );
+  });
   it('把 WGS-84 加偏成 GCJ-02 再喂给高德，且按经度在前的顺序', async () => {
     const fetchSpy = mockFetchOnce(REGEO_OK);
 

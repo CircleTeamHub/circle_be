@@ -1,6 +1,8 @@
 import { Injectable, Logger } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { gcj02ToWgs84, isOutOfChina, wgs84ToGcj02 } from './coordinates';
+import { sanitizeLogValue } from '../logging/log-sanitizer';
+import { attemptDiagnostic } from '../logging/http-failure.logger';
 
 /**
  * 一条地名结果。字段名刻意与 Nominatim 对齐 —— App 侧的地图页早就在消费这个
@@ -189,6 +191,8 @@ export class GeoService {
     endpoint: string,
     params: Record<string, string>,
   ): Promise<Record<string, unknown> | null> {
+    const operation =
+      endpoint === AMAP_REGEO_URL ? 'reverse_geocode' : 'place_search';
     const url = new URL(endpoint);
     Object.entries(params).forEach(([name, value]) => {
       url.searchParams.set(name, value);
@@ -200,20 +204,39 @@ export class GeoService {
         signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
       });
       if (!response.ok) {
-        this.logger.warn(`高德返回 HTTP ${response.status}（${endpoint}）`);
+        attemptDiagnostic(() =>
+          this.logger.warn({
+            event: 'geo_http_failed',
+            operation,
+            statusCode: response.status,
+          }),
+        );
         return null;
       }
       const payload = asRecord(await response.json());
       if (!payload) return null;
       if (payload.status !== '1') {
-        // info 里是 INVALID_USER_KEY / DAILY_QUERY_OVER_LIMIT 这类运维要看的原因。
-        this.logger.warn(`高德业务失败：${String(payload.info ?? 'unknown')}`);
+        // Provider prose can echo input. Keep only its bounded numeric code.
+        const upstreamCode =
+          typeof payload.infocode === 'string' &&
+          /^\d{5}$/.test(payload.infocode)
+            ? payload.infocode
+            : undefined;
+        attemptDiagnostic(() =>
+          this.logger.warn({
+            event: 'geo_provider_rejected',
+            operation,
+            upstreamCode,
+          }),
+        );
         return null;
       }
       return payload;
     } catch (error) {
-      this.logger.warn(
-        `高德请求异常：${error instanceof Error ? error.message : String(error)}`,
+      attemptDiagnostic(() =>
+        this.logger.warn(
+          sanitizeLogValue({ event: 'geo_request_failed', operation, error }),
+        ),
       );
       return null;
     }

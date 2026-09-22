@@ -166,6 +166,12 @@ describe('buildNestFactoryOptions', () => {
       expect.arrayContaining(['X-Has-More']),
     );
   });
+
+  it('exposes the X-Request-Id correlation header to browser clients', () => {
+    expect(buildNestFactoryOptions().cors.exposedHeaders).toEqual(
+      expect.arrayContaining(['X-Request-Id']),
+    );
+  });
 });
 
 describe('createGracefulShutdownHandler', () => {
@@ -237,7 +243,7 @@ describe('runBootstrap', () => {
     };
   }
 
-  it('logs why startup failed, with message and stack, then exits non-zero', async () => {
+  it('safe-logs startup failure without private exception prose, then exits non-zero', async () => {
     // The test server on 2026-09-18: an external bucket without a delivery URL
     // makes UploadService.onModuleInit throw inside app.init(). The rejection
     // used to land in the unhandled-rejection guard, which only reports it, so
@@ -246,15 +252,20 @@ describe('runBootstrap', () => {
       'External media must use an explicitly configured rate-limited delivery URL',
     );
     const sinks = recordingSinks();
+    const errorAggregation = {
+      captureError: jest.fn(),
+      flush: jest.fn().mockResolvedValue(true),
+    };
 
-    await runBootstrap(() => Promise.reject(failure), sinks);
+    await runBootstrap(() => Promise.reject(failure), sinks, errorAggregation);
 
     expect(sinks.calls).toEqual(['log', 'exit:1']);
+    expect(errorAggregation.captureError).toHaveBeenCalledTimes(1);
+    expect(errorAggregation.flush).toHaveBeenCalledWith(2000);
     expect(sinks.logged[0]).toContain(
-      'External media must use an explicitly configured rate-limited delivery URL',
+      '[bootstrap] Application failed to start; errorName=ServiceUnavailableException',
     );
-    // V8 stack frames: the reason alone does not say where it was thrown.
-    expect(sinks.logged[0]).toContain('\n    at ');
+    expect(sinks.logged[0]).not.toContain('External media');
   });
 
   it('leaves a successful start alone', async () => {
@@ -271,7 +282,7 @@ describe('runBootstrap', () => {
 
     await runBootstrap(() => Promise.reject('APP_PORT missing'), sinks);
 
-    expect(sinks.logged[0]).toContain('APP_PORT missing');
+    expect(sinks.logged[0]).not.toContain('APP_PORT missing');
     expect(sinks.exit).toHaveBeenCalledWith(1);
   });
 
@@ -284,5 +295,49 @@ describe('runBootstrap', () => {
     await runBootstrap(() => Promise.reject(new Error('boom')), sinks);
 
     expect(sinks.exit).toHaveBeenCalledWith(1);
+  });
+
+  it('still logs and exits when startup error aggregation throws', async () => {
+    const sinks = recordingSinks();
+    const aggregation = {
+      captureError: jest.fn(() => {
+        throw new Error('capture failed');
+      }),
+      flush: jest.fn(() => {
+        throw new Error('flush failed');
+      }),
+    };
+
+    await runBootstrap(
+      () => Promise.reject(new TypeError('private startup error')),
+      sinks,
+      aggregation,
+    );
+
+    expect(sinks.logged[0]).toContain('errorName=TypeError');
+    expect(sinks.logged[0]).not.toContain('private startup error');
+    expect(sinks.exit).toHaveBeenCalledWith(1);
+  });
+
+  it('exits after the hard deadline when startup aggregation flush hangs', async () => {
+    jest.useFakeTimers();
+    const sinks = recordingSinks();
+    const aggregation = {
+      captureError: jest.fn(),
+      flush: jest.fn(() => new Promise<boolean>(() => undefined)),
+    };
+    const startup = runBootstrap(
+      () => Promise.reject(new Error('private startup error')),
+      sinks,
+      aggregation,
+    );
+
+    await jest.advanceTimersByTimeAsync(1999);
+    expect(sinks.exit).not.toHaveBeenCalled();
+    await jest.advanceTimersByTimeAsync(1);
+    await startup;
+    expect(sinks.exit).toHaveBeenCalledWith(1);
+    expect(jest.getTimerCount()).toBe(0);
+    jest.useRealTimers();
   });
 });

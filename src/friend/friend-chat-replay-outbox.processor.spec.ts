@@ -1,6 +1,80 @@
 import { FriendChatReplayOutboxProcessor } from './friend-chat-replay-outbox.processor';
+import { WinstonModule } from 'nest-winston';
+import * as winston from 'winston';
+import { createWinstonOptions } from '../logging/winston-options';
 
 describe('FriendChatReplayOutboxProcessor', () => {
+  it('keeps replay identity but not exception prose in actual production JSON', async () => {
+    const options = createWinstonOptions(
+      {
+        get: (key) =>
+          key === 'LOG_ON' ? true : key === 'LOG_FILE_ON' ? false : undefined,
+      },
+      'production',
+    );
+    const sink = options
+      .transports[0] as winston.transports.ConsoleTransportInstance;
+    const lines: string[] = [];
+    const spy = jest.spyOn(sink, 'log').mockImplementation((info, callback) => {
+      lines.push(info[Symbol.for('message')]);
+      callback?.();
+    });
+    const logger = winston.createLogger(options);
+    const updateMany = jest.fn().mockResolvedValue({ count: 1 });
+    const processor = new FriendChatReplayOutboxProcessor(
+      {
+        friendChatReplayOutbox: {
+          findMany: jest.fn().mockResolvedValue([
+            {
+              id: 'job-safe',
+              requestId: 'friend-request-safe',
+              requesterUserID: 'u1',
+              accepterUserID: 'u2',
+              status: 'PENDING',
+              stage: 2,
+              attempts: 0,
+            },
+          ]),
+          updateMany,
+        },
+        friend: {
+          findUnique: jest
+            .fn()
+            .mockRejectedValue(new Error('arbitrary PRIVATE_CHAT_BODY')),
+        },
+        friendRequestMessage: { findMany: jest.fn().mockResolvedValue([]) },
+        user: { findUnique: jest.fn().mockResolvedValue(null) },
+      } as any,
+      {} as any,
+      {} as any,
+      {} as any,
+    );
+    (processor as any).logger = WinstonModule.createLogger({
+      instance: logger,
+    });
+    try {
+      await processor.processPending();
+      expect(lines.join('')).not.toContain('PRIVATE_CHAT_BODY');
+      expect(lines.map((line) => JSON.parse(line))).toContainEqual(
+        expect.objectContaining({
+          event: 'friend_chat_replay_failed',
+          outboxId: 'job-safe',
+          level: 'warn',
+        }),
+      );
+      expect(updateMany).toHaveBeenCalledWith(
+        expect.objectContaining({
+          data: expect.objectContaining({
+            status: 'FAILED',
+            lastError: 'arbitrary PRIVATE_CHAT_BODY',
+          }),
+        }),
+      );
+    } finally {
+      logger.close();
+      spy.mockRestore();
+    }
+  });
   it('replays a pending thread without offline push and advances progress', async () => {
     const prisma = {
       friendChatReplayOutbox: {
