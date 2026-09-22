@@ -32,3 +32,10 @@ services:
       file: docker-compose.prod.yml
       service: circle_be
     image: ${CIRCLE_BE_IMAGE:?export CIRCLE_BE_IMAGE, e.g. via deploy/release-deploy.sh}
+    volumes:
+      # Override the inherited mount by target; two live colors must never
+      # rotate the same files. Project-scoped names also isolate deployments.
+      - app_logs_green:/app/logs
+
+volumes:
+  app_logs_green:

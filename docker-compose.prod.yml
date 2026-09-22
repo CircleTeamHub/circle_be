@@ -179,6 +179,9 @@ services:
     volumes:
       # getServerConfig 读这个文件;只读挂载
       - ./.env.production:/app/.env.production:ro
+      # Survives container replacement. Docker initializes a new volume from
+      # /app/logs in the image, retaining its non-root app ownership.
+      - app_logs_blue:/app/logs
     expose:
       - '3000'
     healthcheck:
@@ -241,6 +244,7 @@ services:
       - caddy_config:/config
 
 volumes:
+  app_logs_blue:
   pg_data:
   redis_data:
   minio_data:

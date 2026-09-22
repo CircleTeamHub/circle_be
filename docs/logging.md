@@ -1,7 +1,7 @@
 # Logging Guide
 
 This project uses NestJS logging through `nest-winston`. Logs are structured
-events (one JSON-ish object per line) with a shared request context, so a
+events (one strict JSON object per line in production and files) with a shared request context, so a
 single `x-request-id` ties together access, error, security, business and
 external-service events.
 
@@ -9,16 +9,20 @@ external-service events.
 - Keep unit tests quiet by default.
 - Never log secrets, PII, or request/response bodies.
 
-Production-only work such as persistent audit logs, Datadog/Loki/CloudWatch
-aggregation, and formal retention policies is intentionally deferred. Optional
-**Sentry** error aggregation is available — see
-[Error Aggregation (Sentry)](#error-aggregation-sentry).
+The optional [Loki + Alloy collection runbook](../monitoring/logs.md) adds private,
+persistent, searchable logs to Grafana. Sentry separately groups unexpected
+errors. Existing database-backed administrator audit records remain the audit
+source of truth; diagnostic logs are not an immutable audit trail.
 
 ## Environment Defaults
 
 Development:
 
-- `LOG_ON=true`
+- `LOG_ON=true` (master gate; false silences Winston without bypassing sanitization)
+- `LOG_FILE_ON` defaults to the legacy `LOG_ON` value for one compatibility
+  release; set it explicitly (`true` in the supplied production example).
+  It can independently disable files but cannot override master-off.
+- `LOG_SERVICE_NAME=circle-be`
 - `HTTP_LOG_ON=true`
 - `SLOW_REQUEST_MS=1000`
 - `BUSINESS_LOG_ON=true`
@@ -27,8 +31,19 @@ Development:
 - `SECURITY_LOG_ON=true`
 - `PERFORMANCE_LOG_ON=true`
 - `SLOW_EXTERNAL_MS=1000`
+- `SLOW_DB_OPERATION_MS=1000`
 - Console logs are human-readable.
-- Rotated log files are written under root `logs/`.
+- Rotated JSON files are written under root `logs/`.
+- Production console and files always include ISO `timestamp`, `level`,
+  `serviceName`, `environment` and `release` (from `SENTRY_RELEASE`, otherwise
+  `unknown`). Development console remains readable.
+- Files rotate hourly or at 20 MB; retention is 14 days. This is not a maximum
+  disk quota. Files remain uncompressed for the collector; monitor free space.
+- `LOG_LEVEL` controls console verbosity; application files retain info and
+  above, error files warn and above. Debug job summaries are not archived by
+  the optional file collector.
+- Slow thresholds use positive integer milliseconds and default to 1000 ms.
+  Process environment overrides dotenv settings for logging and Sentry.
 
 Test:
 
@@ -44,22 +59,30 @@ Test:
 
 ## Request Correlation
 
-Every HTTP response includes `x-request-id`.
+Normal API requests receive `x-request-id` even with `HTTP_LOG_ON=false`.
+Early infrastructure endpoints (`/healthz`, readiness and `/metrics`) precede
+request logging intentionally and do not promise this header.
 
-If a client sends a safe `x-request-id`, the backend reuses it. Otherwise the
+If a client sends a 1–128 character ID matching `[A-Za-z0-9._:-]+`, the backend
+reuses it so existing edge-generated correlation survives rolling deploys.
+JWT-shaped or otherwise invalid values are replaced. Clients must send random
+opaque IDs, never credentials or personal information. Otherwise the
 backend generates a UUID. The request context (`requestId`, `traceId`,
 `method`, `path`, `userId`) is stored in `AsyncLocalStorage` and stamped onto
 every Winston line emitted during the request.
 
 `userId` is bound by `JwtStrategy.validate` as soon as the bearer token is
 verified — before guards, pipes and handlers run — so `http_error`,
-`security_event` and Sentry tags carry the caller even when the request fails
-early. (The access log used to learn the user only on `finish`.)
+`security_event` carry the internal caller ID even when a request fails early.
+These operational IDs are sensitive: restrict log access and retention. Sentry
+deliberately drops account identity.
 
 Use the request id to correlate:
 
 - `http_access`
 - `http_slow`
+- `http_aborted`
+- `database_operation_slow`
 - `http_error`
 - `rate_limit_hit`
 - `business_event`
@@ -69,9 +92,12 @@ Use the request id to correlate:
 
 ## Event Types
 
-- `http_access`: one event for each completed request.
+- `http_access`: one terminal event per completed request.
+- `http_aborted`: warn when a response closes prematurely; no duplicate access event.
+  An aborted response's status is the attempted status, not proof the client received it.
 - `http_slow`: warning event when request duration is above `SLOW_REQUEST_MS`.
-- `http_error`: error event for thrown HTTP or server errors. Known Prisma
+- `http_error`: one structured failure across interceptor/filter. Expected 4xx
+  are warn; unexpected 5xx are error. Known Prisma
   request errors are logged with the status they map to (`P2002` → 409,
   `P2025` → 404, `P2003` → 400), not as 500s.
 - `rate_limit_hit`: explicit limiter hit with limiter name.
@@ -84,7 +110,7 @@ Use the request id to correlate:
   `SLOW_EXTERNAL_MS`.
 - `security_event`: authentication / authorization signals — see the
   [catalogue](#security-event-catalogue).
-- `chat_media_claim_lost`: warning from the chat media deletion sweeper when its conditional write-back after an object delete matched no row — the claimed `ChatMediaDeletion` row was replaced (typically turned into a note import reservation) or removed while the delete was in flight. Carries `objectKey` and `outcome` (`deleted` / `failed`).
+- `chat_media_claim_lost`: warning from the chat media deletion sweeper when its conditional write-back after an object delete matched no row — the claimed `ChatMediaDeletion` row was replaced (typically turned into a note import reservation) or removed while the delete was in flight. Carries a redacted `objectKey` and `outcome` (`deleted` / `failed`).
 - `note_import_reservation_lost`: warning from note media import when the post-copy reservation renewal matched no row (the copy outlasted the 15 minute reservation window). The request fails with a retryable 409. Carries `noteId` and `mediaId`.
 
 Chat WebSocket lifecycle events (`ChatGateway`, correlated by the client's random `ws-...` trace ID; see `docs/metrics.md` for the lookup flow):
@@ -96,10 +122,30 @@ Chat WebSocket lifecycle events (`ChatGateway`, correlated by the client's rando
 - `ws_connection_ready`: the socket joined its rooms and is fully admitted.
 - `ws_connection_closed`: the socket closed; `stage` says whether it had reached `ready`.
 
-Deferred production events:
+Database and job diagnostics:
 
-- `audit_event`
-- `db_query_slow`
+- Startup security/storage events retain fixed names even when messages are
+  redacted: `production_email_bypass_active`,
+  `production_email_bypass_misconfigured`, `object_storage_bootstrap_failed`.
+  A production bypass-active event needs immediate operator review; it never
+  includes the bypass allowlist or credentials.
+
+- `database_operation_slow`: warn when a Prisma driver `queryRaw` or
+  `executeRaw` round trip exceeds `SLOW_DB_OPERATION_MS`, gated by
+  `PERFORMANCE_LOG_ON`. Fields: `scope=driver_adapter`, operation, duration,
+  threshold, success/failure and available request/job correlation.
+  This can include pool waiting and transaction control statements sent through
+  these methods; it is **not** PostgreSQL execution time or whole-model latency.
+  Initial adapter connection/startTransaction setup is not timed. SQL, parameters,
+  results and exception messages are never inspected.
+- `job_run`: every tracked cron execution gets an isolated UUID `runId`, job,
+  outcome and monotonic duration. Success/skipped summaries are debug; handled
+  failures warn, thrown failures error. Existing heartbeat/failure metrics remain
+  authoritative for alerting.
+- Job context is propagated inside that execution, including database calls.
+  A durable outbox processed later does not inherit the original HTTP context;
+  use existing business/entity IDs to bridge the two, then follow the job runId.
+  This is not a distributed-tracing or persisted request-to-outbox guarantee.
 
 ## Business Event Catalogue
 
@@ -158,8 +204,8 @@ Calls:
 
 Payload shape: `actorId` (who did it), `targetId` (who it was done to),
 `entityType` / `entityId` (what changed), `result` (`success` / `failure`) and
-a small `metadata` object. `metadata` is filtered through a sensitive-key
-denylist (`password`, `token`, `code`, …) before logging.
+a small `metadata` object. Metadata is recursively bounded and redacted before
+logging; avoid passing whole DTOs, Prisma models or SDK response objects.
 
 ## Security Event Catalogue
 
@@ -190,8 +236,8 @@ the request context and a sanitized `reason`:
 
 The security-log call in `AllExceptionFilter` and `ErrorLoggingInterceptor`
 is wrapped like the Sentry capture: if the log transport throws, an
-error-level `security_event_log_failed` is emitted (with `requestId`) and the
-HTTP response is unaffected.
+error-level `security_event_log_failed` is attempted (with `requestId`) and the
+HTTP response is unaffected, even if the fallback logger also throws.
 
 ## External services
 
@@ -224,12 +270,28 @@ Never log:
 - Full request or response bodies.
 - Raw upload file contents.
 - Secrets or private config values.
-- Email addresses (log the domain at most).
+- Contact details, IP/device identifiers, media object keys and private URLs.
 
-Access logs record the route path without query values. Error logs record error
-metadata and stack traces, not request payloads. Sentry receives a rebuilt
-event: sanitized stack, redacted message, normalized route tags — never the
-original message text, breadcrumbs, request data or account identity.
+Paths are registered route templates, not merely query-stripped URLs. A share
+token becomes `:token`; every unknown path becomes `/__other__` from its first
+occurrence (including Sentry transactions). Error messages are suppressed;
+safe error type and source-file line/column remain. Request/query/body/IP/device
+data never belongs in access or exception payloads.
+
+The shared sanitizer runs before serialization on both console and file paths.
+It limits depth (5), entries per container (50), traversed nodes (500), and
+strings (2048 characters); skips accessors and `toJSON`; handles cycles and
+binary data without mutating business objects. Pattern redaction of legacy
+prose is defense in depth, **not a guarantee for arbitrary text**. New events
+must use fixed names/reasons and deliberately selected structured fields.
+Free-form exception messages, chat text and arbitrary user text must never be
+interpolated into new log strings.
+
+Sentry receives rebuilt errors/transactions: sanitized stack, redacted message,
+registered route tags; never original messages, breadcrumbs, request data or
+account identity. A transport failure produces a bounded fixed
+`logging_transport_error` stderr fallback; it cannot throw back into the
+request. This fallback is not collected by the file-based Loki pipeline.
 
 ## Typical Debug Flow
 
@@ -240,15 +302,30 @@ original message text, breadcrumbs, request data or account identity.
 5. If duration is high, check for `http_slow`.
 6. If a write failed due to repeated calls, check for `rate_limit_hit`.
 7. If a dependency failed, check for `external_call_failed`.
-8. For "what did the user actually do", filter `business_event` by `actorId`.
+8. Check `database_operation_slow` for driver latency with the same requestId.
+9. For deferred work, find the existing business/entity ID and then follow
+   `job`/`runId`; consult outbox depth/dead-letter metrics if no run is found.
+10. For authorized operational investigations only, filter `business_event`
+    by internal `actorId`. Do not export the result into public issue trackers.
+
+In Grafana Explore (optional Loki):
+
+```logql
+{service="circle-be", environment="production"} | json | requestId="REQUEST_ID"
+{service="circle-be", level=~"warn|error"} | json | event="database_operation_slow"
+{service="circle-be"} | json | job="JOB_NAME" | runId="RUN_ID"
+```
+
+Request/user/entity/run IDs remain JSON fields, never index labels. See the
+collection runbook for blue/green rollout, retention, recovery and rollback.
 
 ## Error Aggregation (Sentry)
 
 Unhandled server errors can optionally be forwarded to Sentry for aggregation.
 It is **disabled by default** and provider-neutral: the app talks to an
 `ErrorAggregationProvider` interface (`src/logging/error-aggregation.service.ts`),
-so Datadog/Loki/CloudWatch can be added later behind the same interface without
-changing call sites.
+so another exception reporter can be added without changing call sites.
+Loki collection is separate and does not use this exception-only interface.
 
 ### What is sent
 
@@ -266,8 +343,17 @@ changing call sites.
   dead-letters (push notifications, transfer cards, admin group operations,
   friend chat replay), the sensitive-word filter failing open, the private
   media bucket policy not applying, Expo / SMTP / Redis / LiveKit outages.
+- **Startup/process failures** have one application-owned capture boundary.
+  Unhandled rejections report with `handled: false` and continue running;
+  uncaught exceptions report with `handled: false`, emit a fixed stderr message,
+  wait at most 2 seconds for flush, then exit 1. An independent referenced
+  deadline also covers a provider that never settles. Bootstrap failures use
+  the same bounded flush/exit policy. SDK default process listeners are disabled
+  to avoid duplicate capture and raw exception output.
 - **Sanitized tags only**: `requestId`, `traceId`, `method`, normalized `path`,
-  `statusCode`, `component` / `operation` / `kind`, plus `userId` when known.
+  `statusCode`, `component` / `operation` / `kind`, and current `job` / `runId`.
+  Validated trace IDs and exception mechanism flags survive final sanitization.
+  Account IDs are dropped; correlation IDs never enter fingerprints.
   Never request bodies, headers, cookies, or tokens — the Safe Logging Policy
   above applies.
 
@@ -284,7 +370,13 @@ changing call sites.
    SENTRY_TRACES_SAMPLE_RATE=0.05  # optional performance tracing, 0..1
    ```
 
-3. Restart the backend. `Sentry.init()` runs once at boot, inside `setupApp`.
+3. Rebuild and restart the backend. `src/startup-instrumentation.ts` is the first
+   `main.ts` import and initializes the optional provider once before Nest
+   framework imports. `setupApp` consumes that singleton. Process environment
+   overrides dotenv file values. Local source-map support is loaded at startup
+   and remains a production dependency; the image retains compiled `.js.map`
+   files. This does not upload release artifacts to Sentry: source context and
+   actual event delivery still need a release-environment acceptance check.
 
 If `LOG_AGGREGATION_PROVIDER` is unset or `none`, or `SENTRY_DSN` is missing, the
 provider is a no-op — `@sentry/node` is never loaded and nothing is sent.

@@ -137,6 +137,31 @@ jobs:
           assert_route discord-critical   alertname=RedisDown severity=critical
           assert_route discord-warning    alertname=HostCpuSaturated severity=warning
 
+      - name: Validate optional log stack compose
+        env:
+          GRAFANA_ADMIN_PASSWORD: ci-placeholder-not-for-deployment
+        run: >-
+          docker compose
+          -f monitoring/docker-compose.yml
+          -f monitoring/docker-compose.prod.yml
+          -f monitoring/docker-compose.logs.yml
+          config --quiet
+
+      - name: Validate Loki config
+        run: |
+          docker run --rm --network none --read-only \
+            -v "$PWD/monitoring/loki/config.yml:/etc/loki/config.yml:ro" \
+            grafana/loki:3.7.0 \
+            -config.file=/etc/loki/config.yml -verify-config=true
+
+      - name: Validate Alloy config
+        run: |
+          docker run --rm --network none --read-only --user 473:473 \
+            -e LOG_ENVIRONMENT=test \
+            -v "$PWD/monitoring/alloy/config.alloy:/etc/alloy/config.alloy:ro" \
+            grafana/alloy:v1.19.2 validate \
+            --stability.level=experimental /etc/alloy/config.alloy
+
       - name: Lint
         run: npx eslint "{src,apps,libs,test}/**/*.ts"
 
