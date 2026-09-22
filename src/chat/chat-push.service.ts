@@ -3,6 +3,7 @@ import { PrismaService } from 'src/prisma/prisma.service';
 import {
   type ExpoPushPayload,
   NotificationPushService,
+  type PushTokenTarget,
   type TokenDeliveryOutcome,
 } from 'src/notification/notification-push.service';
 import { ChatBroadcastService } from './chat-broadcast.service';
@@ -238,10 +239,12 @@ export class ChatPushService implements OnModuleDestroy {
     const everyone = [...groups.values()].flatMap((group) => group.recipients);
     // G-18:小规模扇出附 per-recipient 角标(iOS 杀后台也有数字)。大群跳过 ——
     // 逐人聚合未读的代价与收益不成比;拿不到就不带 badge,推送照发。
-    const badges =
+    const [badges, viewerBurnSeconds] = await Promise.all([
       everyone.length <= BADGE_TARGETS_MAX
-        ? await this.loadUnreadBadges(everyone)
-        : new Map<string, number>();
+        ? this.loadUnreadBadges(everyone)
+        : Promise.resolve(new Map<string, number>()),
+      this.loadViewerBurnSeconds(everyone),
+    ]);
     for (const { message, mention, recipients } of groups.values()) {
       const payload = {
         ...(await this.composePayload(message, conversation)),
@@ -253,6 +256,7 @@ export class ChatPushService implements OnModuleDestroy {
         payload,
         badges,
         foregroundTokens,
+        viewerBurnSeconds,
       );
     }
   }
@@ -332,13 +336,11 @@ export class ChatPushService implements OnModuleDestroy {
     payload: ExpoPushPayload,
     badges: Map<string, number>,
     foregroundTokens: Map<string, Set<string>>,
+    viewerBurnSeconds: Map<string, number>,
   ): Promise<void> {
     // 收件人的 token 一次查回、消息整批交给推送服务按 100 条一批发。原来是每个
     // 收件人各查一次 token、各发一次 HTTPS:3000 人的群一条消息就是 3000 + 3000 次。
-    let tokensByUser: Map<
-      string,
-      Array<{ token: string; projectId: string | null }>
-    >;
+    let tokensByUser: Map<string, PushTokenTarget[]>;
     try {
       tokensByUser = await this.push.listActiveTokensForUsers(recipients);
     } catch (error) {
@@ -353,7 +355,13 @@ export class ChatPushService implements OnModuleDestroy {
     const owners: string[] = [];
     const messages = recipients.flatMap((userId) => {
       const badge = badges.get(userId);
-      const perUser = badge !== undefined ? { ...payload, badge } : payload;
+      const protectedPayload = this.protectPayloadForViewer(
+        payload,
+        message,
+        viewerBurnSeconds.get(userId) ?? 0,
+      );
+      const perUser =
+        badge !== undefined ? { ...protectedPayload, badge } : protectedPayload;
       // 这台设备正开着 App:不推(消息已经实时送到它上面了)。
       const onScreen = foregroundTokens.get(userId);
       return (tokensByUser.get(userId) ?? [])
@@ -387,6 +395,42 @@ export class ChatPushService implements OnModuleDestroy {
     if (failed > 0) {
       this.logFanoutFailure(message, failed, recipients.length, firstError);
     }
+  }
+
+  private async loadViewerBurnSeconds(
+    userIds: string[],
+  ): Promise<Map<string, number>> {
+    const uniqueUserIds = [...new Set(userIds)];
+    if (uniqueUserIds.length === 0) return new Map();
+    const rows = await this.prisma.userPrivacySetting.findMany({
+      where: { userID: { in: uniqueUserIds } },
+      select: { userID: true, messageSelfDestructSec: true },
+    });
+    return new Map(
+      rows
+        .filter((row) => row.messageSelfDestructSec > 0)
+        .map((row) => [row.userID, row.messageSelfDestructSec]),
+    );
+  }
+
+  private protectPayloadForViewer(
+    payload: ExpoPushPayload,
+    message: ChatMessageDto,
+    viewerBurnSeconds: number,
+  ): ExpoPushPayload {
+    if (viewerBurnSeconds <= 0) return payload;
+    const senderPrefix = message.sender?.nickname
+      ? `${message.sender.nickname}: `
+      : '';
+    const body =
+      senderPrefix && payload.body.startsWith(senderPrefix)
+        ? `${senderPrefix}${BURN_PREVIEW}`
+        : BURN_PREVIEW;
+    return {
+      ...payload,
+      body,
+      ttl: Math.min(payload.ttl ?? CHAT_PUSH_TTL_SECONDS, viewerBurnSeconds),
+    };
   }
 
   /** 只记数量与首条原因,不逐条刷屏(3000 人的群失败就是 3000 行)。 */

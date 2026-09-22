@@ -49,6 +49,7 @@ describe('ChatPushService', () => {
     chatMember: { findMany: jest.fn() },
     chatMessage: { findMany: jest.fn() },
     chatConversation: { findUnique: jest.fn() },
+    userPrivacySetting: { findMany: jest.fn() },
     circle: { findUnique: jest.fn() },
     tempChat: { findUnique: jest.fn() },
   };
@@ -90,6 +91,7 @@ describe('ChatPushService', () => {
       type: 'DIRECT',
       circleID: null,
     });
+    prisma.userPrivacySetting.findMany.mockResolvedValue([]);
     // 默认:窗口里的消息都还在、都没撤回。
     prisma.chatMessage.findMany.mockImplementation(
       ({ where }: { where: { id: { in: string[] } } }) =>
@@ -305,6 +307,51 @@ describe('ChatPushService', () => {
         expect.objectContaining({ body: '[阅后即焚消息]', ttl: 300 }),
       );
       expect(JSON.stringify(payload)).not.toContain('只给你看的内容');
+    });
+
+    it('masks and shortens push previews for each recipient global self-destruct policy in one query', async () => {
+      prisma.chatMember.findMany.mockResolvedValue([
+        seat('u-global-burn'),
+        seat('u-plain'),
+      ]);
+      prisma.userPrivacySetting.findMany.mockResolvedValue([
+        { userID: 'u-global-burn', messageSelfDestructSec: 120 },
+      ]);
+      push.listActiveTokensForUsers.mockImplementation((userIds: string[]) =>
+        Promise.resolve(
+          new Map(
+            userIds.map((userId) => [
+              userId,
+              [{ token: `tok-${userId}`, projectId: null }],
+            ]),
+          ),
+        ),
+      );
+
+      await pushNow(msg({ content: { text: 'viewer secret' } }));
+
+      expect(prisma.userPrivacySetting.findMany).toHaveBeenCalledTimes(1);
+      expect(prisma.userPrivacySetting.findMany).toHaveBeenCalledWith({
+        where: { userID: { in: ['u-global-burn', 'u-plain'] } },
+        select: { userID: true, messageSelfDestructSec: true },
+      });
+      const byToken = new Map(
+        push.sendMessages.mock.calls[0][0].map(
+          (entry: { token: string; payload: Record<string, unknown> }) => [
+            entry.token,
+            entry.payload,
+          ],
+        ),
+      );
+      expect(byToken.get('tok-u-global-burn')).toEqual(
+        expect.objectContaining({ body: '[阅后即焚消息]', ttl: 120 }),
+      );
+      expect(JSON.stringify(byToken.get('tok-u-global-burn'))).not.toContain(
+        'viewer secret',
+      );
+      expect(byToken.get('tok-u-plain')).toEqual(
+        expect.objectContaining({ body: 'viewer secret', ttl: 24 * 60 * 60 }),
+      );
     });
 
     it('keeps a mention in its own notification so later chatter cannot replace it', async () => {
