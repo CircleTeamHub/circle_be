@@ -22,9 +22,7 @@ import { createLoggingConfig } from './logging/logging.config';
 import { createRequestLoggerMiddleware } from './logging/request-logger.middleware';
 import { createRateLimitHandler } from './logging/rate-limit-logger';
 import {
-  createErrorAggregationConfig,
-  createErrorAggregationProvider,
-  configureErrorAggregationProvider,
+  getErrorAggregationProvider,
   type ErrorAggregationProvider,
 } from './logging/error-aggregation.service';
 import { Registry } from 'prom-client';
@@ -228,16 +226,16 @@ export const setupApp = (app: INestApplication): ErrorAggregationProvider => {
   // 都可能触发它。兜底只上报不静默，见 unhandled-rejection-guard.ts。
   installUnhandledRejectionGuard();
   const isProduction = process.env.NODE_ENV === 'production';
-  const config = getServerConfig();
+  const config = { ...getServerConfig(), ...process.env };
   const loggingConfig = createLoggingConfig(
     config,
-    String(config['NODE_ENV'] || process.env.NODE_ENV || 'development'),
+    String(process.env.NODE_ENV || config['NODE_ENV'] || 'development'),
   );
 
-  const logger = loggingConfig.logOn
-    ? app.get(WINSTON_MODULE_NEST_PROVIDER)
-    : undefined;
-  logger && app.useLogger(logger);
+  // Even LOG_ON=false must not fall back to Nest's unsanitized console logger.
+  // Winston remains bound and is silent when the master switch is disabled.
+  const logger = app.get(WINSTON_MODULE_NEST_PROVIDER);
+  app.useLogger(logger);
   app.setGlobalPrefix('api/v1');
   if (isProduction) {
     const express = app.getHttpAdapter?.().getInstance?.();
@@ -272,7 +270,7 @@ export const setupApp = (app: INestApplication): ErrorAggregationProvider => {
       // So we do NOT pass on store errors — limiting must never silently fail
       // open (brute-force / account-enumeration protection lives here).
       ...(store ? { store, passOnStoreError: false } : {}),
-      ...(logger
+      ...(loggingConfig.logOn
         ? {
             handler: createRateLimitHandler(logger, {
               enabled: loggingConfig.rateLimitLogOn,
@@ -414,25 +412,17 @@ export const setupApp = (app: INestApplication): ErrorAggregationProvider => {
     ),
   );
 
-  if (logger && loggingConfig.httpLogOn) {
-    app.use(
-      createRequestLoggerMiddleware(logger, {
-        enabled: true,
-        slowRequestMs: loggingConfig.slowRequestMs,
-      }),
-    );
-  }
+  app.use(
+    createRequestLoggerMiddleware(logger ?? new Logger('HttpAccess'), {
+      enabled: loggingConfig.httpLogOn,
+      slowRequestMs: loggingConfig.slowRequestMs,
+    }),
+  );
 
   // Optional error aggregation (Sentry). A no-op unless
   // LOG_AGGREGATION_PROVIDER=sentry and SENTRY_DSN are configured; building it
   // here also runs Sentry.init() once before requests are served.
-  const errorAggregation = createErrorAggregationProvider(
-    createErrorAggregationConfig(
-      config,
-      String(config['NODE_ENV'] || process.env.NODE_ENV || 'development'),
-    ),
-  );
-  configureErrorAggregationProvider(errorAggregation);
+  const errorAggregation = getErrorAggregationProvider();
   const httpAdapterHost = app.get(HttpAdapterHost);
   // The filters get the provider too: interceptors only wrap route handlers,
   // so a guard / pipe / middleware failure (JwtStrategy hitting a dead

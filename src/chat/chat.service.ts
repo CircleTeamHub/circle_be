@@ -7,6 +7,7 @@ import {
   NotFoundException,
 } from '@nestjs/common';
 import { ChatErrorCode, GroupErrorCode } from 'src/common/app-error-codes';
+import { sanitizeLogValue } from 'src/logging/log-sanitizer';
 import { PrismaService } from 'src/prisma/prisma.service';
 import { SensitiveWordService } from 'src/sensitive-word/sensitive-word.service';
 import { PrivacySettingsService } from 'src/privacy/privacy-settings.service';
@@ -565,9 +566,12 @@ export class ChatService {
           await this.media.deleteObjects(orphanedCopies);
         } catch (error) {
           this.logger.warn(
-            `forward copy cleanup failed message=${created.row.id}: ${
-              error instanceof Error ? error.message : String(error)
-            }`,
+            sanitizeLogValue({
+              event: 'chat_forward_copy_cleanup_failed',
+              operation: 'sendMessage',
+              messageId: created.row.id,
+              error,
+            }),
           );
         }
       }
@@ -620,9 +624,12 @@ export class ChatService {
         ) ?? null;
     } catch (error) {
       this.logger.warn(
-        `sender enrichment failed after commit message=${row.id}: ${
-          error instanceof Error ? error.message : String(error)
-        }`,
+        sanitizeLogValue({
+          event: 'chat_sender_enrichment_failed',
+          operation: 'presentSentMessage',
+          messageId: row.id,
+          error,
+        }),
       );
     }
     const message = this.toMessageDto(row, sender, burnPolicy, senderUserId);
@@ -630,9 +637,12 @@ export class ChatService {
       await this.attachReplyTo([message]);
     } catch (error) {
       this.logger.warn(
-        `reply enrichment failed after commit message=${row.id}: ${
-          error instanceof Error ? error.message : String(error)
-        }`,
+        sanitizeLogValue({
+          event: 'chat_reply_enrichment_failed',
+          operation: 'presentSentMessage',
+          messageId: row.id,
+          error,
+        }),
       );
     }
     await this.media.attachMediaUrls([message]);
@@ -973,9 +983,12 @@ export class ChatService {
       return settings.shareOnlineStatus !== false;
     } catch (error) {
       this.logger.warn(
-        `presence visibility lookup failed for ${userId}: ${
-          error instanceof Error ? error.message : String(error)
-        }`,
+        sanitizeLogValue({
+          event: 'chat_presence_lookup_failed',
+          operation: 'isPresenceVisible',
+          userId,
+          error,
+        }),
       );
       return false;
     }
@@ -1015,9 +1028,12 @@ export class ChatService {
       });
     } catch (error) {
       this.logger.warn(
-        `lastOnline touch failed for ${userId}: ${
-          error instanceof Error ? error.message : String(error)
-        }`,
+        sanitizeLogValue({
+          event: 'chat_last_online_update_failed',
+          operation: 'touchLastOnline',
+          userId,
+          error,
+        }),
       );
     }
   }
@@ -1914,9 +1930,13 @@ export class ChatService {
           await this.broadcast.joinUserToConversation(memberId, conversationId);
         } catch (error: unknown) {
           this.logger.warn(
-            `join room failed user=${memberId}: ${
-              error instanceof Error ? error.message : String(error)
-            }`,
+            sanitizeLogValue({
+              event: 'chat_room_join_failed',
+              operation: 'seatMembersIntoRoom',
+              userId: memberId,
+              conversationId,
+              error,
+            }),
           );
         }
         this.broadcast.emitConversationChange(memberId, {
@@ -1946,9 +1966,12 @@ export class ChatService {
       });
     } catch (error) {
       this.logger.warn(
-        `owner transfer notice failed conversation=${conversationId}: ${
-          error instanceof Error ? error.message : String(error)
-        }`,
+        sanitizeLogValue({
+          event: 'chat_owner_transfer_notice_failed',
+          operation: 'emitOwnerTransferredNotice',
+          conversationId,
+          error,
+        }),
       );
     }
   }
@@ -1972,9 +1995,12 @@ export class ChatService {
       }
     } catch (error) {
       this.logger.warn(
-        `join notice failed conversation=${conversationId}: ${
-          error instanceof Error ? error.message : String(error)
-        }`,
+        sanitizeLogValue({
+          event: 'chat_group_join_notice_failed',
+          operation: 'emitGroupJoinNotice',
+          conversationId,
+          error,
+        }),
       );
     }
   }
@@ -2951,9 +2977,13 @@ export class ChatService {
           .joinUserToConversation(memberId, conversationId)
           .catch((error: unknown) => {
             this.logger.warn(
-              `join settlement conversation room failed user=${memberId} conv=${conversationId}: ${
-                error instanceof Error ? error.message : String(error)
-              }`,
+              sanitizeLogValue({
+                event: 'chat_room_join_failed',
+                operation: 'ensureDirectConversationForSettlement',
+                userId: memberId,
+                conversationId,
+                error,
+              }),
             );
           }),
       ),
@@ -3052,9 +3082,13 @@ export class ChatService {
           .joinUserToConversation(memberId, conv.id)
           .catch((error: unknown) => {
             this.logger.warn(
-              `join direct conversation room failed user=${memberId} conv=${conv.id}: ${
-                error instanceof Error ? error.message : String(error)
-              }`,
+              sanitizeLogValue({
+                event: 'chat_room_join_failed',
+                operation: 'getOrCreateDirectConversation',
+                userId: memberId,
+                conversationId: conv.id,
+                error,
+              }),
             );
           }),
       ),
@@ -4367,9 +4401,12 @@ export class ChatService {
         : null;
     } catch (error) {
       this.logger.warn(
-        `sender enrichment failed after commit message=${row.id}: ${
-          error instanceof Error ? error.message : String(error)
-        }`,
+        sanitizeLogValue({
+          event: 'chat_sender_enrichment_failed',
+          operation: 'decorateCommittedMessage',
+          messageId: row.id,
+          error,
+        }),
       );
     }
     const dto = this.toMessageDto(row, sender, burnPolicy, viewerId);
@@ -4377,9 +4414,12 @@ export class ChatService {
       await this.attachReplyTo([dto]);
     } catch (error) {
       this.logger.warn(
-        `reply enrichment failed after commit message=${row.id}: ${
-          error instanceof Error ? error.message : String(error)
-        }`,
+        sanitizeLogValue({
+          event: 'chat_reply_enrichment_failed',
+          operation: 'decorateCommittedMessage',
+          messageId: row.id,
+          error,
+        }),
       );
     }
     return dto;

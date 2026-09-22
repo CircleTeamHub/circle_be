@@ -1,5 +1,6 @@
 import { RefreshTokenCleanup } from './refresh-token.cleanup';
 import * as errorAggregation from '../logging/error-aggregation.service';
+import { Logger } from '@nestjs/common';
 
 describe('RefreshTokenCleanup', () => {
   const deleteMany = jest.fn();
@@ -37,5 +38,25 @@ describe('RefreshTokenCleanup', () => {
       kind: 'scheduler',
     });
     report.mockRestore();
+  });
+
+  it('logs a fixed prune failure without private database error text', async () => {
+    const log = jest.spyOn(Logger.prototype, 'error').mockImplementation();
+    const error = new Error('SELECT private_messages private-value');
+    deleteMany.mockRejectedValueOnce(error);
+    try {
+      await expect(cleanup.sweep(new Date())).resolves.toBeUndefined();
+      expect(log).toHaveBeenCalledWith(
+        expect.objectContaining({
+          event: 'refresh_token_cleanup_failed',
+          operation: 'sweep',
+        }),
+      );
+      expect(JSON.stringify(log.mock.calls)).not.toMatch(
+        /SELECT|private_messages|private-value/,
+      );
+    } finally {
+      log.mockRestore();
+    }
   });
 });

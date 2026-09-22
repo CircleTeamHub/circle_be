@@ -8,6 +8,7 @@ export interface LoggingConfig {
   securityLogOn: boolean;
   performanceLogOn: boolean;
   slowExternalMs: number;
+  slowDbOperationMs: number;
 }
 
 function readBoolean(value: unknown, defaultValue: boolean): boolean {
@@ -56,5 +57,9 @@ export function createLoggingConfig(
     performanceLogOn:
       logOn && readBoolean(rawConfig['PERFORMANCE_LOG_ON'], !isTest),
     slowExternalMs: readPositiveInteger(rawConfig['SLOW_EXTERNAL_MS'], 1000),
+    slowDbOperationMs: readPositiveInteger(
+      rawConfig['SLOW_DB_OPERATION_MS'],
+      1000,
+    ),
   };
 }

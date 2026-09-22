@@ -12,7 +12,8 @@ export interface RequestContext {
 }
 
 const requestContextStorage = new AsyncLocalStorage<RequestContext>();
-const SAFE_REQUEST_ID = /^[A-Za-z0-9._:-]{1,128}$/;
+// Correlation values are opaque IDs, never credentials, URLs, IPs or JWTs.
+const SAFE_REQUEST_ID = /^[A-Za-z0-9_-]{1,128}$/;
 
 export function resolveRequestId(value?: unknown): string {
   const requestId = Array.isArray(value) ? value[0] : value;

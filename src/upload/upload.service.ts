@@ -30,6 +30,7 @@ import { createLoggingConfig } from 'src/logging/logging.config';
 import { logExternalCallFailure } from 'src/logging/external-service.logger';
 import { logExternalCallSlow } from 'src/logging/performance-event.logger';
 import { reportOperationalError } from 'src/logging/error-aggregation.service';
+import { sanitizeLogValue } from 'src/logging/log-sanitizer';
 import {
   buildStoragePublicObjectBase,
   storagePublicObjectBaseFromConfig,
@@ -126,20 +127,6 @@ function errorRecord(error: unknown): Record<string, unknown> | null {
     : null;
 }
 
-function redactLogValue(value: string) {
-  return value.replace(
-    /(token|secret|password|authorization)=\S+/gi,
-    '$1=[redacted]',
-  );
-}
-
-function errorMessage(error: unknown, record: Record<string, unknown> | null) {
-  if (error instanceof Error && error.message.trim()) {
-    return error.message.trim();
-  }
-  return record ? stringField(record, 'message') : null;
-}
-
 function errorName(error: unknown, record: Record<string, unknown> | null) {
   if (error instanceof Error && error.name.trim()) {
     return error.name.trim();
@@ -150,32 +137,6 @@ function errorName(error: unknown, record: Record<string, unknown> | null) {
 function errorCode(record: Record<string, unknown> | null) {
   if (!record) return null;
   return stringField(record, 'Code') ?? stringField(record, 'code');
-}
-
-function formatMinioBootstrapError(error: unknown) {
-  if (typeof error === 'string' && error.trim()) {
-    return redactLogValue(error.trim());
-  }
-
-  const record = errorRecord(error);
-  const metadata = errorRecord(record?.['$metadata']);
-  const message = errorMessage(error, record);
-  const name = errorName(error, record);
-  const code = errorCode(record);
-  const status = metadata ? numberField(metadata, 'httpStatusCode') : null;
-  const requestId = metadata ? stringField(metadata, 'requestId') : null;
-  const attempts = metadata ? numberField(metadata, 'attempts') : null;
-
-  const parts = [
-    name ? `name=${redactLogValue(name)}` : null,
-    code ? `code=${redactLogValue(code)}` : null,
-    message ? `message=${redactLogValue(message)}` : null,
-    status ? `status=${status}` : null,
-    requestId ? `requestId=${redactLogValue(requestId)}` : null,
-    attempts ? `attempts=${attempts}` : null,
-  ].filter(Boolean);
-
-  return parts.length ? parts.join(' ') : 'UnknownError';
 }
 
 function isMissingBucketError(error: unknown) {
@@ -868,10 +829,16 @@ export class UploadService implements OnModuleInit {
       // error（不是 warn）并且点名后果：这条失败意味着桶策略没换上，notes/* 可能
       // 仍然匿名可读，而应用照常发预签名 URL —— 表面上一切正常。readiness 探针
       // 的 objectStore 字段会同步报 policy-unconfirmed。
+      const metadata = errorRecord(errorRecord(error)?.['$metadata']);
       this.logger.error(
-        `MinIO bootstrap attempt failed during ${step}: ${formatMinioBootstrapError(error)}. ` +
-          'The private-media bucket policy may not be in force — notes/* could still be anonymously readable.',
-        error instanceof Error ? error.stack : undefined,
+        sanitizeLogValue({
+          event: 'object_storage_bootstrap_failed',
+          operation: step,
+          upstreamStatus: metadata
+            ? numberField(metadata, 'httpStatusCode')
+            : null,
+          error,
+        }),
       );
       reportOperationalError(error, {
         component: 'UploadService',

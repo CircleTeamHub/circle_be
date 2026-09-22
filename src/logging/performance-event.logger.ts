@@ -18,18 +18,22 @@ export function logExternalCallSlow(
     return;
   }
 
-  const requestContext = getRequestContext();
-  logger.warn(
-    {
-      event: 'external_call_slow',
-      service: payload.service,
-      operation: payload.operation,
-      durationMs: payload.durationMs,
-      thresholdMs: payload.thresholdMs,
-      result: payload.result,
-      requestId: requestContext?.requestId,
-      traceId: requestContext?.traceId,
-    },
-    'Performance',
-  );
+  try {
+    const requestContext = getRequestContext();
+    logger.warn(
+      {
+        event: 'external_call_slow',
+        service: payload.service,
+        operation: payload.operation,
+        durationMs: payload.durationMs,
+        thresholdMs: payload.thresholdMs,
+        result: payload.result,
+        requestId: requestContext?.requestId,
+        traceId: requestContext?.traceId,
+      },
+      'Performance',
+    );
+  } catch {
+    // This often runs in finally; logging must not change the SDK outcome.
+  }
 }

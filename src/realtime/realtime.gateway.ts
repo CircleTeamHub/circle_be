@@ -14,6 +14,7 @@ import {
   type RealtimeSocketIdentity,
 } from './realtime.service';
 import { reportOperationalError } from 'src/logging/error-aggregation.service';
+import { sanitizeLogValue } from 'src/logging/log-sanitizer';
 
 const HEARTBEAT_INTERVAL_MS = 30_000;
 const MAX_CONNECTIONS_PER_USER = 5;
@@ -201,7 +202,13 @@ export class RealtimeGateway implements OnModuleDestroy {
     });
 
     socket.on('error', (error) => {
-      this.logger.warn(`Realtime socket error (pre-auth): ${error.message}`);
+      this.logger.warn(
+        sanitizeLogValue({
+          event: 'realtime_socket_error',
+          operation: 'handleConnection',
+          error,
+        }),
+      );
     });
 
     socket.on('close', () => {
@@ -260,7 +267,14 @@ export class RealtimeGateway implements OnModuleDestroy {
     this.realtimeService.registerPendingClient(userId, socket, identity);
 
     socket.on('error', (error) => {
-      this.logger.warn(`Realtime socket error for ${userId}: ${error.message}`);
+      this.logger.warn(
+        sanitizeLogValue({
+          event: 'realtime_socket_error',
+          operation: 'acceptAuthenticatedSocket',
+          userId,
+          error,
+        }),
+      );
     });
 
     if (expMs !== null) {
@@ -308,7 +322,12 @@ export class RealtimeGateway implements OnModuleDestroy {
         kind: 'websocket',
       });
       this.logger.warn(
-        `Failed to emit initial snapshot for ${userId}: ${error instanceof Error ? error.message : error}`,
+        sanitizeLogValue({
+          event: 'realtime_snapshot_failed',
+          operation: 'emitSnapshot',
+          userId,
+          error,
+        }),
       );
     }
   }

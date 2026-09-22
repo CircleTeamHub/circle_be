@@ -37,7 +37,14 @@ jest.mock('src/generated/prisma', () => ({
 jest.mock('@prisma/adapter-pg', () => ({
   PrismaPg: jest.fn().mockImplementation((poolOrConfig: unknown) => {
     prismaPgMock(poolOrConfig);
-    return { poolOrConfig };
+    return {
+      poolOrConfig,
+      connect: async () => ({
+        queryRaw: async () => 42,
+        executeRaw: async () => 1,
+        startTransaction: jest.fn(),
+      }),
+    };
   }),
 }));
 
@@ -165,6 +172,44 @@ describe('PrismaService', () => {
         max: 30,
       }),
     );
+  });
+
+  it('wires slow operation logging into the adapter supplied to Prisma', async () => {
+    process.env.DATABASE_URL = 'postgresql://example';
+    process.env.LOG_ON = 'true';
+    process.env.PERFORMANCE_LOG_ON = 'true';
+    process.env.SLOW_DB_OPERATION_MS = '1';
+    const service = new PrismaService();
+    const options = (
+      service as unknown as {
+        options: {
+          adapter: {
+            connect(): Promise<{ queryRaw(query: unknown): Promise<number> }>;
+          };
+        };
+      }
+    ).options;
+    const adapter = await options.adapter.connect();
+    const elapsed = jest
+      .spyOn(performance, 'now')
+      .mockReturnValueOnce(0)
+      .mockReturnValueOnce(2);
+    try {
+      await expect(adapter.queryRaw({ sql: 'SELECT secret' })).resolves.toBe(
+        42,
+      );
+      expect(warnSpy).toHaveBeenCalledWith(
+        expect.objectContaining({
+          event: 'database_operation_slow',
+          operation: 'queryRaw',
+          durationMs: 2,
+          thresholdMs: 1,
+        }),
+        'Performance',
+      );
+    } finally {
+      elapsed.mockRestore();
+    }
   });
 
   it('skips boot-time connection when PRISMA_SKIP_CONNECT_ON_BOOT is enabled', async () => {

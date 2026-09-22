@@ -37,6 +37,16 @@ scrape_configs:
     static_configs:
       - targets: ['localhost:9090']
 
+  - job_name: alertmanager
+    static_configs:
+      - targets: ['alertmanager:9093']
+
+  # Populated only by docker-compose.logs.yml. An absent optional stack
+  # contributes no target and therefore cannot make the base deployment red.
+  - job_name: logs-pipeline
+    file_sd_configs:
+      - files: ['/etc/prometheus/log-targets/*.yml']
+
   - job_name: circle-be
     metrics_path: /metrics
     # ── Reaching the backend ──────────────────────────────────────────────

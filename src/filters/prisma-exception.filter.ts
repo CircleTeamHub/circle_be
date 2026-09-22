@@ -9,6 +9,11 @@ import { Prisma } from 'src/generated/prisma';
 import type { ErrorAggregationProvider } from '../logging/error-aggregation.service';
 import { markErrorCaptured, wasErrorCaptured } from '../logging/handled-errors';
 import { getRequestContext } from '../logging/request-context';
+import {
+  attemptDiagnostic,
+  logHttpFailure,
+} from '../logging/http-failure.logger';
+import { safeLogPath } from '../logging/log-sanitizer';
 import { resolvePrismaKnownErrorStatus } from './prisma-error-status';
 
 type PrismaFilteredRequest = {
@@ -38,21 +43,9 @@ export class PrismaExceptionFilter implements ExceptionFilter {
       resolvePrismaKnownErrorStatus(exception.code) ??
       HttpStatus.INTERNAL_SERVER_ERROR;
     let message = 'Database error';
-    let extra: Record<string, unknown> | undefined;
 
     switch (exception.code) {
       case 'P2002': {
-        // Do NOT leak the conflicting column(s) to the client: naming the unique
-        // field (email / accountId / ...) turns any create/update into a
-        // user-enumeration oracle (F-06). Log it server-side for ops, return a
-        // generic message with no `conflict` payload.
-        const target = (exception.meta as { target?: string[] } | undefined)
-          ?.target;
-        if (target?.length) {
-          this.logger.warn(
-            `Unique constraint conflict on [${target.join(', ')}] at ${request.method} ${request.url}`,
-          );
-        }
         message = 'Resource already exists';
         break;
       }
@@ -63,24 +56,15 @@ export class PrismaExceptionFilter implements ExceptionFilter {
         message = 'Invalid reference';
         break;
       default:
-        // Unknown Prisma error — keep generic message to client but log
-        // full context so operators can correlate.
-        this.logger.error(
-          `Unhandled Prisma error ${exception.code} at ${request.method} ${request.url}`,
-          {
-            code: exception.code,
-            meta: exception.meta,
-            message: exception.message,
-          },
-        );
         this.captureServerError(exception, status, request);
         break;
     }
 
+    logHttpFailure(this.logger, exception, status, request);
     response.status(status).json({
       code: status,
       message,
-      data: extra ?? null,
+      data: null,
     });
   }
 
@@ -93,24 +77,26 @@ export class PrismaExceptionFilter implements ExceptionFilter {
       return;
     }
     const requestContext = getRequestContext();
-    try {
-      this.errorAggregation.captureError(exception, {
-        statusCode: status,
-        requestId: requestContext?.requestId,
-        traceId: requestContext?.traceId,
-        method: requestContext?.method ?? request.method,
-        path: requestContext?.path ?? request.url?.split('?')[0],
-        userId: requestContext?.userId ?? request.user?.userId,
-      });
-      markErrorCaptured(exception);
-    } catch (aggregationError) {
-      this.logger.error(
-        `error aggregation failed for Prisma error ${exception.code}: ${
-          aggregationError instanceof Error
-            ? aggregationError.message
-            : String(aggregationError)
-        }`,
-      );
-    }
+    attemptDiagnostic(
+      () => {
+        this.errorAggregation!.captureError(exception, {
+          statusCode: status,
+          requestId: requestContext?.requestId,
+          traceId: requestContext?.traceId,
+          method: requestContext?.method ?? request.method,
+          path: safeLogPath(requestContext?.path ?? request.url ?? ''),
+          userId: requestContext?.userId ?? request.user?.userId,
+        });
+        markErrorCaptured(exception);
+      },
+      () =>
+        this.logger.error(
+          {
+            event: 'error_aggregation_failed',
+            requestId: getRequestContext()?.requestId,
+          },
+          'HttpError',
+        ),
+    );
   }
 }

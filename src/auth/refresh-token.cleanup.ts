@@ -6,6 +6,7 @@ import {
 } from '../metrics/tracked-cron.decorator';
 import { PrismaService } from 'src/prisma/prisma.service';
 import { reportOperationalError } from 'src/logging/error-aggregation.service';
+import { sanitizeLogValue } from 'src/logging/log-sanitizer';
 
 /**
  * Prunes dead RefreshToken rows so the table doesn't grow unbounded (F-09).
@@ -52,7 +53,13 @@ export class RefreshTokenCleanup {
         kind: 'scheduler',
       });
       // Best-effort housekeeping: never let a prune failure crash the scheduler.
-      this.logger.error(`Refresh-token prune failed: ${String(err)}`);
+      this.logger.error(
+        sanitizeLogValue({
+          event: 'refresh_token_cleanup_failed',
+          operation: 'sweep',
+          error: err,
+        }),
+      );
       // 但要记成失败：不上报的话包装器会把这一轮算成成功，心跳照常前进。
       reportHandledJobFailure();
     }

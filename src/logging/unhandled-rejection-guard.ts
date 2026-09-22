@@ -1,4 +1,7 @@
-import { reportOperationalError } from './error-aggregation.service';
+import {
+  flushErrorAggregation,
+  reportOperationalError,
+} from './error-aggregation.service';
 
 /**
  * 进程级兜底：未捕获的 promise rejection 上报后继续跑，不再终止进程。
@@ -11,12 +14,24 @@ import { reportOperationalError } from './error-aggregation.service';
  * 这不是把错误藏起来：rejection 照常进错误聚合 / Sentry，漏网的 .catch 一样
  * 看得见，只是不再以停服为代价。
  *
- * 只接管 unhandledRejection。uncaughtException 保持 Node 默认的快速失败 ——
- * 那种情况下进程状态未知，继续跑比崩掉更危险。
+ * rejection 上报后继续运行；uncaughtException 则由同一所有者上报、限时刷新并
+ * 非零退出。禁用 SDK 自带的两个进程监听器可避免重复事件和原始错误写入 stderr。
  */
 let installed: (() => void) | null = null;
 
-export function installUnhandledRejectionGuard(): () => void {
+interface FatalSinks {
+  logError(message: string): void;
+  exit(code: number): void;
+}
+
+const processFatalSinks: FatalSinks = {
+  logError: (message) => console.error(message),
+  exit: (code) => process.exit(code),
+};
+
+export function installUnhandledRejectionGuard(
+  sinks: FatalSinks = processFatalSinks,
+): () => void {
   if (installed) return installed;
 
   const handler = (reason: unknown): void => {
@@ -34,9 +49,31 @@ export function installUnhandledRejectionGuard(): () => void {
   };
 
   process.on('unhandledRejection', handler);
+  const fatalHandler = (error: unknown): void => {
+    try {
+      reportOperationalError(error, {
+        component: 'process',
+        operation: 'uncaughtException',
+        kind: 'process',
+      });
+    } catch {
+      // Reporting must not prevent the fatal flush/exit path.
+    } finally {
+      try {
+        sinks.logError('[fatal] Uncaught exception; exiting.');
+      } catch {
+        // The process must still terminate if stderr is unavailable.
+      }
+      void flushErrorAggregation(2000)
+        .catch(() => false)
+        .finally(() => sinks.exit(1));
+    }
+  };
+  process.on('uncaughtException', fatalHandler);
 
   const uninstall = (): void => {
     process.off('unhandledRejection', handler);
+    process.off('uncaughtException', fatalHandler);
     if (installed === uninstall) installed = null;
   };
   installed = uninstall;

@@ -69,15 +69,21 @@ export class EmailVerificationService implements OnModuleInit {
   onModuleInit(): void {
     const bypass = describeEmailCodeBypass();
     if (bypass.status === 'active') {
-      this.logger.error(
-        `[SECURITY] production email code bypass is LIVE for ${bypass.identities} allowlisted identity/identities — anyone holding EMAIL_CODE_DEV_BYPASS can authenticate as them without a password; unset EMAIL_CODE_* before a formal release`,
-      );
+      this.logger.error({
+        event: 'production_email_bypass_active',
+        status: bypass.status,
+        identities: bypass.identities,
+      });
       return;
     }
     if (bypass.status === 'misconfigured') {
-      this.logger.error(
-        `[SECURITY] production email code bypass is opted in but disabled (fail closed): ${bypass.reason}`,
-      );
+      this.logger.error({
+        event: 'production_email_bypass_misconfigured',
+        status: bypass.status,
+        identities: 0,
+        // describeEmailCodeBypass returns fixed explanations, never env values.
+        reason: bypass.reason,
+      });
       return;
     }
     if (bypass.status === 'non-production') {

@@ -1,6 +1,8 @@
 import { readFileSync } from 'fs';
 import { join } from 'path';
 import { NotificationPushOutboxProcessor } from './notification-push-outbox.processor';
+import { Logger } from '@nestjs/common';
+import * as errorAggregation from '../logging/error-aggregation.service';
 
 // 名额分配已经从内存里的 selectFairBatch 挪进 SQL(PARTITION BY 发送者排名),
 // 因为在内存里只能对「按时间取的窗口」做调度,而窗口本身会被洪水占满 ——
@@ -117,6 +119,58 @@ function buildHarness({
 }
 
 describe('NotificationPushOutboxProcessor (#88 per-token)', () => {
+  it('logs unexpected delivery failures without leaking provider or payload text', async () => {
+    const { prisma, push, processor } = buildHarness({
+      jobs: [
+        {
+          id: 'job-1',
+          notificationID: 'notification-1',
+          status: 'PENDING',
+          attempts: 0,
+          payload: { title: 'T', body: 'B', data: {} },
+          notification,
+        },
+      ],
+      pendingDeliveries: [{ id: 'd-a', token: 'tok-a' }],
+      outcomes: [],
+    });
+    const error = new Error('SELECT private_messages private-chat-text');
+    push.sendToTokens.mockRejectedValueOnce(error);
+    const warn = jest.spyOn(Logger.prototype, 'warn').mockImplementation();
+    const report = jest
+      .spyOn(errorAggregation, 'reportOperationalError')
+      .mockImplementation();
+    try {
+      await expect(processor.processPending()).resolves.toBe(0);
+      expect(warn).toHaveBeenCalledWith(
+        expect.objectContaining({
+          event: 'notification_push_outbox_failed',
+          operation: 'processJob',
+          outboxId: 'job-1',
+        }),
+      );
+      expect(JSON.stringify(warn.mock.calls)).not.toMatch(
+        /SELECT|private_messages|private-chat-text/,
+      );
+      expect(prisma.notificationPushOutbox.updateMany).toHaveBeenCalledWith(
+        expect.objectContaining({
+          data: expect.objectContaining({
+            status: 'FAILED',
+            nextAttemptAt: expect.any(Date),
+          }),
+        }),
+      );
+      expect(report).toHaveBeenCalledWith(error, {
+        component: 'NotificationPushOutboxProcessor',
+        operation: 'processJob',
+        kind: 'delivery',
+      });
+    } finally {
+      warn.mockRestore();
+      report.mockRestore();
+    }
+  });
+
   it('only sends to pending/failed deliveries — already-delivered tokens are never re-pushed', async () => {
     const { prisma, push, processor } = buildHarness({
       jobs: [

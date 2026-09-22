@@ -1,0 +1,127 @@
+{
+  "uid": "circle-be-operations",
+  "title": "circle_be — Operations Overview",
+  "tags": ["circle", "backend", "operations"],
+  "timezone": "browser",
+  "schemaVersion": 39,
+  "version": 1,
+  "refresh": "30s",
+  "time": { "from": "now-6h", "to": "now" },
+  "templating": { "list": [] },
+  "annotations": { "list": [] },
+  "panels": [
+    {
+      "id": 1,
+      "type": "stat",
+      "title": "Active firing alerts",
+      "description": "Current Prometheus firing alerts grouped by name and severity. This shows rule state, not whether any notification was received.",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 6, "w": 8, "x": 0, "y": 0 },
+      "fieldConfig": { "defaults": { "unit": "short", "noValue": "No firing alerts" }, "overrides": [] },
+      "options": { "colorMode": "value", "graphMode": "none", "reduceOptions": { "calcs": ["lastNotNull"], "values": false } },
+      "targets": [{ "refId": "A", "datasource": { "type": "prometheus", "uid": "prometheus" }, "expr": "sum by (alertname, severity) (ALERTS{alertstate=\"firing\"})", "legendFormat": "{{severity}} · {{alertname}}", "instant": true }]
+    },
+    {
+      "id": 2,
+      "type": "stat",
+      "title": "Scrape targets up",
+      "description": "Current health of configured scrape targets (1 up, 0 down). A missing optional exporter produces No data instead of a synthetic healthy value.",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 6, "w": 8, "x": 8, "y": 0 },
+      "fieldConfig": { "defaults": { "unit": "short", "min": 0, "max": 1, "noValue": "No data", "thresholds": { "mode": "absolute", "steps": [{ "color": "red", "value": null }, { "color": "green", "value": 1 }] } }, "overrides": [] },
+      "options": { "colorMode": "background", "graphMode": "none", "reduceOptions": { "calcs": ["lastNotNull"], "values": false } },
+      "targets": [{ "refId": "A", "datasource": { "type": "prometheus", "uid": "prometheus" }, "expr": "min by (job, instance) (up)", "legendFormat": "{{job}} · {{instance}}", "instant": true }]
+    },
+    {
+      "id": 3,
+      "type": "timeseries",
+      "title": "Alertmanager notification attempt failures (10m)",
+      "description": "Failed Alertmanager delivery attempts by integration over 10 minutes. Zero failures does not prove that a receiver accepted or acted on a notification.",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 6, "w": 8, "x": 16, "y": 0 },
+      "fieldConfig": { "defaults": { "unit": "short", "min": 0 }, "overrides": [] },
+      "options": { "legend": { "displayMode": "list", "placement": "bottom" }, "tooltip": { "mode": "multi", "sort": "desc" } },
+      "targets": [{ "refId": "A", "datasource": { "type": "prometheus", "uid": "prometheus" }, "expr": "sum by (integration) (increase(alertmanager_notifications_failed_total[10m]))", "legendFormat": "{{integration}}" }]
+    },
+    {
+      "id": 4,
+      "type": "stat",
+      "title": "Alertmanager config reload",
+      "description": "Last Alertmanager configuration reload result (1 successful, 0 failed). No data means Alertmanager self-metrics are unavailable.",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 6, "w": 8, "x": 0, "y": 6 },
+      "fieldConfig": { "defaults": { "unit": "short", "min": 0, "max": 1, "noValue": "No data", "thresholds": { "mode": "absolute", "steps": [{ "color": "red", "value": null }, { "color": "green", "value": 1 }] } }, "overrides": [] },
+      "options": { "colorMode": "background", "graphMode": "none", "reduceOptions": { "calcs": ["lastNotNull"], "values": false } },
+      "targets": [{ "refId": "A", "datasource": { "type": "prometheus", "uid": "prometheus" }, "expr": "min(alertmanager_config_last_reload_successful)", "legendFormat": "reload successful", "instant": true }]
+    },
+    {
+      "id": 5,
+      "type": "timeseries",
+      "title": "Prometheus rule evaluation errors (10m)",
+      "description": "Prometheus rule evaluation failures over 10 minutes. These can prevent alerts from entering the delivery pipeline independently of application traffic.",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 6, "w": 8, "x": 8, "y": 6 },
+      "fieldConfig": { "defaults": { "unit": "short", "min": 0 }, "overrides": [] },
+      "options": { "legend": { "displayMode": "list", "placement": "bottom" }, "tooltip": { "mode": "multi", "sort": "desc" } },
+      "targets": [{ "refId": "A", "datasource": { "type": "prometheus", "uid": "prometheus" }, "expr": "sum by (rule_group) (increase(prometheus_rule_evaluation_failures_total[10m]))", "legendFormat": "{{rule_group}}" }]
+    },
+    {
+      "id": 6,
+      "type": "stat",
+      "title": "Public probe success",
+      "description": "Current blackbox HTTP probe result (1 successful, 0 failed). Production probe targets are optional; an unconfigured target file correctly shows No data.",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 6, "w": 8, "x": 16, "y": 6 },
+      "fieldConfig": { "defaults": { "unit": "short", "min": 0, "max": 1, "noValue": "No data", "thresholds": { "mode": "absolute", "steps": [{ "color": "red", "value": null }, { "color": "green", "value": 1 }] } }, "overrides": [] },
+      "options": { "colorMode": "background", "graphMode": "none", "reduceOptions": { "calcs": ["lastNotNull"], "values": false } },
+      "targets": [{ "refId": "A", "datasource": { "type": "prometheus", "uid": "prometheus" }, "expr": "min by (component, instance) (probe_success{job=\"blackbox-http\"})", "legendFormat": "{{component}} · {{instance}}", "instant": true }]
+    },
+    {
+      "id": 7,
+      "type": "timeseries",
+      "title": "Public TLS certificate lifetime",
+      "description": "Remaining TLS certificate lifetime for public probes. No data is expected when optional production probe targets are not configured.",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 8, "w": 8, "x": 0, "y": 12 },
+      "fieldConfig": { "defaults": { "unit": "s", "min": 0 }, "overrides": [] },
+      "options": { "legend": { "displayMode": "list", "placement": "bottom" }, "tooltip": { "mode": "multi", "sort": "asc" } },
+      "targets": [{ "refId": "A", "datasource": { "type": "prometheus", "uid": "prometheus" }, "expr": "min by (component, instance) (probe_ssl_earliest_cert_expiry{job=\"blackbox-http\"} - time())", "legendFormat": "{{component}} · {{instance}}" }]
+    },
+    {
+      "id": 8,
+      "type": "timeseries",
+      "title": "Host memory used",
+      "description": "Memory utilisation from node_exporter in the base monitoring stack. No data means the exporter or its scrape target is unavailable.",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 8, "w": 8, "x": 8, "y": 12 },
+      "fieldConfig": { "defaults": { "unit": "percentunit", "min": 0, "max": 1 }, "overrides": [] },
+      "options": { "legend": { "displayMode": "list", "placement": "bottom" }, "tooltip": { "mode": "multi", "sort": "desc" } },
+      "targets": [{ "refId": "A", "datasource": { "type": "prometheus", "uid": "prometheus" }, "expr": "1 - node_memory_MemAvailable_bytes / node_memory_MemTotal_bytes", "legendFormat": "{{instance}}" }]
+    },
+    {
+      "id": 9,
+      "type": "timeseries",
+      "title": "Writable host filesystem used",
+      "description": "Used capacity on writable host filesystems from node_exporter in the base monitoring stack. Read-only and image filesystems are excluded; No data means the exporter or its scrape target is unavailable.",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 8, "w": 8, "x": 16, "y": 12 },
+      "fieldConfig": { "defaults": { "unit": "percent", "min": 0, "max": 100 }, "overrides": [] },
+      "options": { "legend": { "displayMode": "list", "placement": "bottom" }, "tooltip": { "mode": "multi", "sort": "desc" } },
+      "targets": [{ "refId": "A", "datasource": { "type": "prometheus", "uid": "prometheus" }, "expr": "100 * (1 - node_filesystem_avail_bytes{fstype=~\"ext4|xfs|btrfs|zfs|ext3\",mountpoint!~\"/(boot|snap)(/.*)?\"} / node_filesystem_size_bytes{fstype=~\"ext4|xfs|btrfs|zfs|ext3\",mountpoint!~\"/(boot|snap)(/.*)?\"}) and on(instance, mountpoint, device) node_filesystem_readonly == 0", "legendFormat": "{{instance}} · {{mountpoint}}" }]
+    },
+    {
+      "id": 10,
+      "type": "timeseries",
+      "title": "Alloy log delivery retry and drop rates",
+      "description": "Optional Alloy log delivery retries and dropped entries per second. Metrics-only installs correctly show No data; absence is not converted into a healthy zero.",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 8, "w": 24, "x": 0, "y": 20 },
+      "fieldConfig": { "defaults": { "unit": "ops", "min": 0, "noValue": "No data" }, "overrides": [] },
+      "options": { "legend": { "displayMode": "list", "placement": "bottom" }, "tooltip": { "mode": "multi", "sort": "desc" } },
+      "targets": [
+        { "refId": "A", "datasource": { "type": "prometheus", "uid": "prometheus" }, "expr": "sum(rate(loki_write_batch_retries_total[5m]))", "legendFormat": "retries" },
+        { "refId": "B", "datasource": { "type": "prometheus", "uid": "prometheus" }, "expr": "sum(rate(loki_write_dropped_entries_total[5m]))", "legendFormat": "dropped entries" }
+      ]
+    }
+  ]
+}

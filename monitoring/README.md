@@ -39,18 +39,23 @@ docker compose -f monitoring/docker-compose.yml up -d
 | Prometheus   | http://localhost:9090 | —                      |
 | Alertmanager | http://localhost:9093 | —                      |
 
-In Grafana the **Prometheus** datasource and two dashboards are auto-provisioned:
+In Grafana the **Prometheus** datasource and three dashboards are auto-provisioned:
 
 | Dashboard | Covers |
 | --------- | ------ |
 | **circle_be — RED** | per-route request rate, 5xx ratio, p95 latency, process memory, chat gateway |
 | **circle_be — Jobs, Queues & Datastores** | cron heartbeat lag and failure rate, outbox backlog / dead letters, pg pool queueing, Postgres connections, Redis memory |
+| **circle_be — Operations Overview** | firing alerts, scrape and probe health, alert-delivery pipeline errors, TLS expiry, host memory and disk capacity |
 
 The jobs dashboard normalises cron heartbeat lag by each job's own expected
 interval, so a per-minute job and a daily job are readable on one axis — the
 red line at 3.0 is exactly the `CronJobStalled` threshold. Note that the
 postgres/redis panels stay empty in local dev: those exporters exist only in the
 prod overlay.
+
+Prometheus also scrapes Alertmanager itself. Notification delivery failures,
+rejected Alertmanager reloads, and Prometheus rule-evaluation failures alert
+without depending on application traffic.
 
 ### ⚠️ `GRAFANA_ADMIN_PASSWORD` only applies on the FIRST boot of the volume
 

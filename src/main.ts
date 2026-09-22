@@ -2,8 +2,9 @@
 //
 // This software is released under the MIT License.
 // https://opensource.org/licenses/MIT
+import { getStartupErrorAggregation } from './startup-instrumentation';
+import { flushWithDeadline } from './logging/error-aggregation.service';
 import 'module-alias/register';
-import { inspect } from 'node:util';
 import { NestFactory } from '@nestjs/core';
 import { DocumentBuilder, SwaggerModule } from '@nestjs/swagger';
 import { AppModule } from './app.module';
@@ -83,7 +84,7 @@ export function buildNestFactoryOptions() {
       // GET /note and /note/recycle-bin signal truncation through this header
       // while the body stays an array; browsers hide unlisted response headers
       // from cross-origin callers.
-      exposedHeaders: ['X-Has-More'],
+      exposedHeaders: ['X-Has-More', 'X-Request-Id'],
     },
     rawBody: true,
   };
@@ -162,13 +163,22 @@ const processSinks: BootstrapFailureSinks = {
 export async function runBootstrap(
   start: () => Promise<void>,
   sinks: BootstrapFailureSinks = processSinks,
+  errorAggregation: FlushableAggregation & {
+    captureError?(error: unknown, context: Record<string, string>): void;
+  } = getStartupErrorAggregation(),
 ): Promise<void> {
   try {
     await start();
   } catch (error) {
+    errorAggregation.captureError?.(error, {
+      component: 'bootstrap',
+      operation: 'start',
+      kind: 'process',
+    });
+    await flushWithDeadline(errorAggregation, 2000);
     try {
       sinks.logError(
-        `[bootstrap] Application failed to start; exiting with code 1.\n${inspect(error)}`,
+        '[bootstrap] Application failed to start; exiting with code 1.',
       );
     } catch {
       // Nowhere left to write the reason; exiting is what still matters.

@@ -7,6 +7,7 @@ import * as argon2 from 'argon2';
 import { EmailVerificationService } from '../email-verification.service';
 import { PrismaService } from '../../prisma/prisma.service';
 import { MAILER } from '../mailer/mailer.interface';
+import { sanitizeLogValue } from '../../logging/log-sanitizer';
 
 /**
  * production 下的固定码必须够长（见 PRODUCTION_BYPASS_CODE_MIN_LENGTH）：
@@ -600,11 +601,18 @@ describe('EmailVerificationService', () => {
       () => service.onModuleInit(),
     );
 
-    const banner = String(error.mock.calls[0]?.[0] ?? '');
-    expect(banner).toContain('[SECURITY]');
-    expect(banner).toContain('2 allowlisted');
+    const entry = error.mock.calls[0]?.[0] as Record<string, unknown>;
+    const banner = sanitizeLogValue({ level: 'error', ...entry });
+    expect(banner).toMatchObject({
+      event: 'production_email_bypass_active',
+      status: 'active',
+      identities: 2,
+    });
     // 允许名单里的地址不能进日志。
-    expect(banner).not.toContain('allowed@example.com');
+    expect(JSON.stringify(error.mock.calls)).not.toContain(
+      'allowed@example.com',
+    );
+    expect(JSON.stringify(error.mock.calls)).not.toContain(PRODUCTION_CODE);
     error.mockRestore();
   });
 
@@ -623,7 +631,16 @@ describe('EmailVerificationService', () => {
       () => service.onModuleInit(),
     );
 
-    expect(String(error.mock.calls[0]?.[0] ?? '')).toContain('fail closed');
+    const entry = error.mock.calls[0]?.[0] as Record<string, unknown>;
+    expect(sanitizeLogValue({ level: 'error', ...entry })).toMatchObject({
+      event: 'production_email_bypass_misconfigured',
+      status: 'misconfigured',
+      identities: 0,
+      reason: expect.stringContaining('must be at least'),
+    });
+    expect(JSON.stringify(error.mock.calls)).not.toMatch(
+      /allowed@example.com|999999/,
+    );
     error.mockRestore();
   });
 
