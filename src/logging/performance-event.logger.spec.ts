@@ -2,6 +2,37 @@ import { logExternalCallSlow } from './performance-event.logger';
 import { runWithRequestContext } from './request-context';
 
 describe('logExternalCallSlow', () => {
+  it.each(['success', 'failure'] as const)(
+    'preserves a %s provider outcome when the summary logger throws',
+    async (outcome) => {
+      const result = { id: 'provider-result' };
+      const original = new Error('provider unavailable');
+      const logger = {
+        warn: jest.fn(() => {
+          throw new Error('logger unavailable');
+        }),
+      };
+      const providerCall = async () => {
+        try {
+          if (outcome === 'failure') throw original;
+          return result;
+        } finally {
+          logExternalCallSlow(logger as any, {
+            enabled: true,
+            service: 'smtp',
+            operation: 'send',
+            durationMs: 1500,
+            thresholdMs: 1000,
+            result: outcome,
+          });
+        }
+      };
+      if (outcome === 'failure')
+        await expect(providerCall()).rejects.toBe(original);
+      else await expect(providerCall()).resolves.toBe(result);
+    },
+  );
+
   it('logs slow external calls over threshold', () => {
     const logger = { warn: jest.fn() };
 

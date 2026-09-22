@@ -1,7 +1,6 @@
 import { LoggerService } from '@nestjs/common';
 import { getRequestContext } from './request-context';
-
-const EMAIL_PATTERN = /\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b/gi;
+import { sanitizeLogValue } from './log-sanitizer';
 
 export interface ExternalCallFailurePayload {
   enabled: boolean;
@@ -9,20 +8,6 @@ export interface ExternalCallFailurePayload {
   operation: string;
   durationMs?: number;
   error: unknown;
-}
-
-function getErrorName(error: unknown): string {
-  return error instanceof Error ? error.name : 'UnknownError';
-}
-
-function getSafeErrorMessage(error: unknown): string {
-  if (!(error instanceof Error)) {
-    return 'External service call failed';
-  }
-
-  return error.message
-    .replace(/(token|secret|password|authorization)=\S+/gi, '$1=[redacted]')
-    .replace(EMAIL_PATTERN, '[redacted-email]');
 }
 
 export function logExternalCallFailure(
@@ -33,18 +18,28 @@ export function logExternalCallFailure(
     return;
   }
 
-  const requestContext = getRequestContext();
-  logger.warn(
-    {
-      event: 'external_call_failed',
-      service: payload.service,
-      operation: payload.operation,
-      durationMs: payload.durationMs,
-      requestId: requestContext?.requestId,
-      traceId: requestContext?.traceId,
-      errorName: getErrorName(payload.error),
-      message: getSafeErrorMessage(payload.error),
-    },
-    'ExternalService',
-  );
+  try {
+    const requestContext = getRequestContext();
+    const error = sanitizeLogValue(payload.error) as
+      | { name?: string }
+      | undefined;
+    logger.warn(
+      {
+        ...(sanitizeLogValue({
+          event: 'external_call_failed',
+          service: payload.service,
+          operation: payload.operation,
+          durationMs: payload.durationMs,
+          requestId: requestContext?.requestId,
+          traceId: requestContext?.traceId,
+          errorName: error?.name ?? 'Error',
+          error: payload.error,
+        }) as Record<string, unknown>),
+        message: 'External service call failed',
+      },
+      'ExternalService',
+    );
+  } catch {
+    // Preserve the original provider failure if the logging sink is unavailable.
+  }
 }
