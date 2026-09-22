@@ -73,7 +73,7 @@ export class ErrorLoggingInterceptor implements NestInterceptor {
             });
             // AllExceptionFilter sees this same exception next; the marker
             // keeps it from logging the security event a second time.
-            markSecurityEventLogged(error, requestContext?.requestId);
+            markSecurityEventLogged(error, requestContext);
           } catch (loggingError) {
             this.logger.error(
               {
@@ -103,7 +103,7 @@ export class ErrorLoggingInterceptor implements NestInterceptor {
               path: requestContext?.path,
               userId: requestContext?.userId,
             });
-            markErrorCaptured(error, requestContext?.requestId);
+            markErrorCaptured(error, requestContext);
           } catch (aggregationError) {
             this.logger.error(
               {

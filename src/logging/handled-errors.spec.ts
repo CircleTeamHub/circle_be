@@ -51,17 +51,31 @@ describe('handled-errors markers', () => {
     expect(isRoutineAuthFailure(null)).toBe(false);
   });
 
-  it('can carry an explicitly captured request id across async boundaries', () => {
+  it('can carry an explicitly captured request context across async boundaries', () => {
     const error = new Error('async failure');
-    markErrorCaptured(error, 'request-async');
-    markSecurityEventLogged(error, 'request-async');
+    const requestContext = context('request-async');
+    const otherContext = context('request-async');
+    markErrorCaptured(error, requestContext);
+    markSecurityEventLogged(error, requestContext);
 
-    expect(wasErrorCaptured(error, 'request-async')).toBe(true);
-    expect(wasSecurityEventLogged(error, 'request-async')).toBe(true);
-    expect(wasErrorCaptured(error)).toBe(true);
-    expect(wasSecurityEventLogged(error)).toBe(true);
-    expect(wasErrorCaptured(error, 'other-request')).toBe(false);
-    expect(wasSecurityEventLogged(error, 'other-request')).toBe(false);
+    expect(wasErrorCaptured(error, requestContext)).toBe(true);
+    expect(wasSecurityEventLogged(error, requestContext)).toBe(true);
+    expect(wasErrorCaptured(error)).toBe(false);
+    expect(wasSecurityEventLogged(error)).toBe(false);
+    expect(wasErrorCaptured(error, otherContext)).toBe(false);
+    expect(wasSecurityEventLogged(error, otherContext)).toBe(false);
+  });
+
+  it('does not conflate different requests that reuse the same client id', () => {
+    const error = new Error('reused singleton');
+    const firstRequest = context('same-client-id');
+    const secondRequest = context('same-client-id');
+
+    markErrorCaptured(error, firstRequest);
+    markSecurityEventLogged(error, firstRequest);
+
+    expect(wasErrorCaptured(error, secondRequest)).toBe(false);
+    expect(wasSecurityEventLogged(error, secondRequest)).toBe(false);
   });
 
   it('keeps a best-effort marker when async context is unavailable', () => {
