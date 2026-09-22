@@ -68,6 +68,20 @@ describe('log sanitizer', () => {
     expect(sanitized).not.toContain('private-slur');
   });
 
+  it('redacts arbitrary root logger prose while preserving structured events', () => {
+    expect(
+      sanitizeLogValue({
+        level: 'warn',
+        message: 'private message blue pineapple',
+        event: 'chat_send_failed',
+      }),
+    ).toEqual({
+      level: 'warn',
+      message: '[redacted]',
+      event: 'chat_send_failed',
+    });
+  });
+
   it('uses known route templates and buckets all unmatched paths', () => {
     expect(
       safeLogPath('/api/v1/note/share-links/private-link?code=secret'),
