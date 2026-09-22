@@ -49,6 +49,9 @@ describe('ChatGroupSettingsService', () => {
     broadcastSystemMessage: jest.fn().mockResolvedValue(undefined),
   };
   const groupEvents = { recordInTx: jest.fn().mockResolvedValue(undefined) };
+  const circleMemberLock = {
+    lockPolicy: jest.fn().mockResolvedValue(undefined),
+  };
 
   const service = new ChatGroupSettingsService(
     prisma as never,
@@ -56,6 +59,7 @@ describe('ChatGroupSettingsService', () => {
     broadcast as never,
     systemMessage as never,
     groupEvents as never,
+    circleMemberLock as never,
   );
 
   const locked = (overrides: Record<string, unknown> = {}) => ({
@@ -433,6 +437,10 @@ describe('ChatGroupSettingsService', () => {
         where: { id: 'circle-1' },
         data: { memberCanInvite: false },
       });
+      expect(circleMemberLock.lockPolicy).toHaveBeenCalledWith(
+        prisma,
+        'circle-1',
+      );
       expect(prisma.chatConversation.update).not.toHaveBeenCalled();
       expect(result.memberCanInvite).toBe(false);
     });

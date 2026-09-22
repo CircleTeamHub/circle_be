@@ -17,7 +17,7 @@ last_arg() {
 }
 
 new_case() {
-  unset RELEASE_DOWNTIME RELEASE_IRREVERSIBLE_MIGRATION RELEASE_MARKER_PATH RELEASE_SCHEMA_COMPATIBILITY SCHEMA_COMPATIBILITY_PATH RUNTIME_COMPATIBILITY_PATH COMPOSE_ENV_FILE APP_ENV_FILE APP_ENV_GID ENV_STAMP_FAIL KILL_AFTER_ENV_STAGE KILL_BEFORE_CADDY_RELOAD KILL_AFTER_CUTOVER_COMPLETE KILL_AFTER_CADDY_RELOAD KILL_AFTER_CADDY_RELOAD_TARGET TERM_AFTER_CADDY_RELOAD TERM_AFTER_CADDY_RELOAD_TARGET EXPECTED_SMOKE_UPSTREAM IMAGE_MISSING MIGRATE_FAIL CONTRACT_PROBE_STATE START_FAIL HEALTH_FAIL SMOKE_CODE SMOKE_CONTENT_TYPE CADDY_RELOAD_FAIL_TARGET PERSIST_FAIL_COLOR CADDY_NO_RATE_LIMIT || true
+  unset RELEASE_DOWNTIME RELEASE_IRREVERSIBLE_MIGRATION RELEASE_MARKER_PATH RELEASE_SCHEMA_COMPATIBILITY SCHEMA_COMPATIBILITY_PATH RUNTIME_COMPATIBILITY_PATH COMPOSE_ENV_FILE APP_ENV_FILE APP_ENV_GID ENV_STAMP_FAIL KILL_AFTER_ENV_STAGE KILL_BEFORE_CADDY_RELOAD KILL_AFTER_CUTOVER_COMPLETE KILL_AFTER_CADDY_RELOAD KILL_AFTER_CADDY_RELOAD_TARGET TERM_AFTER_CADDY_RELOAD TERM_AFTER_CADDY_RELOAD_TARGET EXPECTED_SMOKE_UPSTREAM IMAGE_MISSING MIGRATE_FAIL CONTRACT_PROBE_STATE DANGEROUS_MIGRATION_APPLIED START_FAIL HEALTH_FAIL SMOKE_CODE SMOKE_CONTENT_TYPE CADDY_RELOAD_FAIL_TARGET PERSIST_FAIL_COLOR CADDY_NO_RATE_LIMIT || true
   CASE_DIR="$(mktemp -d)"
   export CASE_DIR
   export TEST_STATE_DIR="$CASE_DIR/services"
@@ -76,7 +76,9 @@ if [ "${1:-}" = "compose" ]; then
       rm -f "$(service_file "$service")"
       ;;
     run)
-      if printf '%s\n' "$*" | grep -q 'User_vipLevel_check'; then
+      if printf '%s\n' "$*" | grep -q '20260913001000_add_chat_message_deleted_at'; then
+        printf '%s\n' "${DANGEROUS_MIGRATION_APPLIED:-1}"
+      elif printf '%s\n' "$*" | grep -q 'User_vipLevel_check'; then
         case "${CONTRACT_PROBE_STATE:-none}" in
           none) printf '0\n' ;;
           both) printf '4\n' ;;
@@ -284,6 +286,7 @@ run_release() {
     RELEASE_MARKER_PATH="${RELEASE_MARKER_PATH:-$CASE_DIR/no-marker}" \
     MIGRATE_FAIL="${MIGRATE_FAIL:-0}" \
     CONTRACT_PROBE_STATE="${CONTRACT_PROBE_STATE:-none}" \
+    DANGEROUS_MIGRATION_APPLIED="${DANGEROUS_MIGRATION_APPLIED:-1}" \
     START_FAIL="${START_FAIL:-0}" \
     HEALTH_FAIL="${HEALTH_FAIL:-0}" \
     SMOKE_CODE="${SMOKE_CODE:-401}" \
@@ -913,6 +916,21 @@ test_irreversible_confirmation_requires_downtime() {
   grep -q 'requires RELEASE_DOWNTIME=1' "$CASE_DIR/release.log"
 }
 
+test_pending_blocking_migration_requires_downtime() {
+  new_case
+  printf 'running\n' > "$TEST_STATE_DIR/circle_be"
+  printf 'running\n' > "$TEST_STATE_DIR/caddy"
+  printf 'running\n' > "$TEST_STATE_DIR/postgres"
+  printf 'circle_be\n' > "$RELEASE_STATE_DIR/active-color"
+  DANGEROUS_MIGRATION_APPLIED=0
+  ! run_release || return 1
+  grep -q '20260913001000_add_chat_message_deleted_at requires RELEASE_DOWNTIME=1' "$CASE_DIR/release.log" || {
+    cat "$CASE_DIR/release.log" >&2
+    cat "$TEST_COMMAND_LOG" >&2
+    return 1
+  }
+}
+
 test_marker_requires_irreversible_confirmation() {
   new_case
   RELEASE_DOWNTIME=1 RELEASE_IRREVERSIBLE_MIGRATION=0
@@ -1057,6 +1075,7 @@ for test_name in \
   test_term_during_rollback_completes_state_before_exit \
   test_state_write_failure_rolls_proxy_back_before_cleanup \
   test_irreversible_confirmation_requires_downtime \
+  test_pending_blocking_migration_requires_downtime \
   test_marker_requires_irreversible_confirmation \
   test_pre_contract_release_is_rejected_before_any_deployment_action \
   test_pre_marker_release_is_rejected_after_boundary_is_recorded \

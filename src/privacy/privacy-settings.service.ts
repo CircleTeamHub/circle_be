@@ -125,6 +125,34 @@ export class PrivacySettingsService {
     };
   }
 
+  /** 聊天推送扇出用：一次查询返回每个收件人的查看者侧焚毁窗口。 */
+  async getSelfDestructPoliciesForUsers(
+    userIds: string[],
+  ): Promise<Map<string, SelfDestructPolicy>> {
+    const uniqueIds = [...new Set(userIds.filter(Boolean))];
+    const result = new Map<string, SelfDestructPolicy>();
+    if (uniqueIds.length === 0) return result;
+    const rows = await this.prisma.userPrivacySetting.findMany({
+      where: { userID: { in: uniqueIds } },
+      select: {
+        userID: true,
+        messageSelfDestructSec: true,
+        messageSelfDestructStartedAt: true,
+      },
+    });
+    const byUser = new Map(rows.map((row) => [row.userID, row]));
+    for (const userId of uniqueIds) {
+      const row = byUser.get(userId);
+      result.set(userId, {
+        sec:
+          row?.messageSelfDestructSec ??
+          DEFAULT_PRIVACY_SETTINGS.messageSelfDestructSec,
+        startedAt: row?.messageSelfDestructStartedAt ?? null,
+      });
+    }
+    return result;
+  }
+
   /**
    * Batch variant of {@link getSettings} for callers resolving many users at
    * once (e.g. icon eligibility for a feed page). One query instead of N;

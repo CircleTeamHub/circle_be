@@ -10,6 +10,7 @@ import { CronExpression } from '@nestjs/schedule';
 import { TrackedCron } from '../metrics/tracked-cron.decorator';
 import { Prisma } from 'src/generated/prisma';
 import {
+  ChatErrorCode,
   CircleErrorCode,
   CircleInvitationErrorCode,
 } from 'src/common/app-error-codes';
@@ -134,6 +135,8 @@ export class CircleInvitationService {
        * 跳过;拉黑是更硬的意愿表达,在下面的事务里照拦,两个方向都不放。
        */
       applicantConsented?: boolean;
+      /** 圈子二维码加入：在共享策略锁内复核会话的二维码门禁。 */
+      requireQrJoinEnabled?: boolean;
     },
   ): Promise<InvitationDto> {
     if (!opts?.applicantConsented) {
@@ -163,6 +166,18 @@ export class CircleInvitationService {
       // 策略快照与 PATCH /circle/:id 串行化:成员锁两边不相交,不加这把的话
       // 收严返回成功之后,一个读到旧策略的建单仍会提交。
       await this.memberLock.lockPolicy(tx, circleId);
+      if (opts?.requireQrJoinEnabled) {
+        const conversation = await tx.chatConversation.findUnique({
+          where: { circleID: circleId },
+          select: { qrJoinEnabled: true },
+        });
+        if (conversation?.qrJoinEnabled === false) {
+          throw new ForbiddenException({
+            message: '该群已关闭二维码入群',
+            errorCode: ChatErrorCode.GroupQrJoinDisabled,
+          });
+        }
+      }
       // Serializable isolation alone does not guarantee a retry for one
       // read/write anti-dependency. Share the relationship/privacy lock used
       // by block, unfriend and privacy writes before rechecking authorization.
