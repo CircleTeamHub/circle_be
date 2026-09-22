@@ -114,6 +114,7 @@ export function createEnvValidationSchema(
       .integer()
       .min(1)
       .default(10000),
+    DATABASE_STATEMENT_TIMEOUT_MS: Joi.number().integer().min(1).default(15000),
     SECRET: Joi.string().min(secretMin).required(),
     JWT_EXPIRES_IN: Joi.string().default('1h'),
     // #84：这个键从 schema 声明之日起就没被代码读过（代码读的是从未文档化的

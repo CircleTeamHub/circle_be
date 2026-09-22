@@ -128,6 +128,7 @@ describe('createEnvValidationSchema', () => {
       LOG_LEVEL: 'info',
       SLOW_EXTERNAL_MS: 1000,
       SLOW_DB_OPERATION_MS: 1000,
+      DATABASE_STATEMENT_TIMEOUT_MS: 15000,
     });
   });
 
@@ -138,6 +139,7 @@ describe('createEnvValidationSchema', () => {
     ['LOG_LEVEL', 'trace'],
     ['SLOW_EXTERNAL_MS', 'fast'],
     ['SLOW_DB_OPERATION_MS', '15OO'],
+    ['DATABASE_STATEMENT_TIMEOUT_MS', '15OO'],
   ])('rejects malformed structured logging setting %s=%s', (key, setting) => {
     const env = {
       ...baseEnv,

@@ -213,6 +213,9 @@ jobs:
       - name: Schema/Migration Drift Check
         run: npx prisma migrate diff --from-config-datasource --to-schema prisma/schema.prisma --exit-code
 
+      - name: Verify PostgreSQL statement timeout
+        run: node -r ts-node/register -r tsconfig-paths/register test/database-statement-timeout.integration.ts
+
       # This job explicitly opts into the email-code bypass above so registration
       # stays deterministic; the suite boots the full AppModule against this DB.
       - name: E2E Tests
