@@ -931,6 +931,13 @@ test_pending_blocking_migration_requires_downtime() {
   }
 }
 
+test_pending_blocking_migration_probe_handles_fresh_database() {
+  grep -q "to_regclass('_prisma_migrations')" "$DEPLOY_SCRIPT" || {
+    echo "expected the blocking-migration probe to handle a fresh database without migration history" >&2
+    return 1
+  }
+}
+
 test_marker_requires_irreversible_confirmation() {
   new_case
   RELEASE_DOWNTIME=1 RELEASE_IRREVERSIBLE_MIGRATION=0
@@ -1076,6 +1083,7 @@ for test_name in \
   test_state_write_failure_rolls_proxy_back_before_cleanup \
   test_irreversible_confirmation_requires_downtime \
   test_pending_blocking_migration_requires_downtime \
+  test_pending_blocking_migration_probe_handles_fresh_database \
   test_marker_requires_irreversible_confirmation \
   test_pre_contract_release_is_rejected_before_any_deployment_action \
   test_pre_marker_release_is_rejected_after_boundary_is_recorded \

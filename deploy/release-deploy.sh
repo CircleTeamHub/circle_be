@@ -656,12 +656,15 @@ async function main() {
   await client.connect();
   try {
     const result = await client.query(
-      `SELECT EXISTS (
-         SELECT 1 FROM "_prisma_migrations"
-         WHERE migration_name = $1
-           AND finished_at IS NOT NULL
-           AND rolled_back_at IS NULL
-       ) AS applied`,
+      `SELECT CASE
+         WHEN to_regclass('_prisma_migrations') IS NULL THEN false
+         ELSE EXISTS (
+           SELECT 1 FROM "_prisma_migrations"
+           WHERE migration_name = $1
+             AND finished_at IS NOT NULL
+             AND rolled_back_at IS NULL
+         )
+       END AS applied`,
       [migration],
     );
     process.stdout.write(result.rows[0].applied ? '1' : '0');
