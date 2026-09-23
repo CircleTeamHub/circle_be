@@ -17,6 +17,7 @@ import {
 } from './chat.constants';
 import type { ChatMessageDto } from './chat.types';
 import { reportOperationalError } from 'src/logging/error-aggregation.service';
+import { diagnosticFailureDetails } from 'src/logging/http-failure.logger';
 import { sanitizeLogValue } from 'src/logging/log-sanitizer';
 
 /**
@@ -507,6 +508,7 @@ export class ChatMediaService implements OnModuleDestroy {
               event: 'chat_media_presign_failed',
               operation: 'attachMediaUrls',
               objectKey: key,
+              ...diagnosticFailureDetails(error),
               error,
             }),
           );
