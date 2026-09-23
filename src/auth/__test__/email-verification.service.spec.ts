@@ -4,9 +4,15 @@ import {
   ServiceUnavailableException,
 } from '@nestjs/common';
 import * as argon2 from 'argon2';
-import { EmailVerificationService } from '../email-verification.service';
+import { readFileSync } from 'node:fs';
+import { join } from 'node:path';
+import {
+  EmailVerificationService,
+  PRODUCTION_EMAIL_BYPASS_EVENT,
+} from '../email-verification.service';
 import { PrismaService } from '../../prisma/prisma.service';
 import { MAILER } from '../mailer/mailer.interface';
+import { sanitizeLogValue } from '../../logging/log-sanitizer';
 
 /**
  * production 下的固定码必须够长（见 PRODUCTION_BYPASS_CODE_MIN_LENGTH）：
@@ -600,12 +606,31 @@ describe('EmailVerificationService', () => {
       () => service.onModuleInit(),
     );
 
-    const banner = String(error.mock.calls[0]?.[0] ?? '');
-    expect(banner).toContain('[SECURITY]');
-    expect(banner).toContain('2 allowlisted');
+    const entry = error.mock.calls[0]?.[0] as Record<string, unknown>;
+    const banner = sanitizeLogValue({ level: 'error', ...entry });
+    expect(banner).toMatchObject({
+      event: 'production_email_bypass_active',
+      status: 'active',
+      identities: 2,
+    });
     // 允许名单里的地址不能进日志。
-    expect(banner).not.toContain('allowed@example.com');
+    expect(JSON.stringify(error.mock.calls)).not.toContain(
+      'allowed@example.com',
+    );
+    expect(JSON.stringify(error.mock.calls)).not.toContain(PRODUCTION_CODE);
     error.mockRestore();
+  });
+
+  it('keeps every release checklist aligned with the emitted bypass event', () => {
+    for (const filename of [
+      '.env.example',
+      '.env.production.example',
+      'docs/pre-launch-checklist.md',
+    ]) {
+      expect(readFileSync(join(process.cwd(), filename), 'utf8')).toContain(
+        PRODUCTION_EMAIL_BYPASS_EVENT,
+      );
+    }
   });
 
   it('logs a security banner when the production bypass is opted in but rejected', () => {
@@ -623,7 +648,16 @@ describe('EmailVerificationService', () => {
       () => service.onModuleInit(),
     );
 
-    expect(String(error.mock.calls[0]?.[0] ?? '')).toContain('fail closed');
+    const entry = error.mock.calls[0]?.[0] as Record<string, unknown>;
+    expect(sanitizeLogValue({ level: 'error', ...entry })).toMatchObject({
+      event: 'production_email_bypass_misconfigured',
+      status: 'misconfigured',
+      identities: 0,
+      reason: expect.stringContaining('must be at least'),
+    });
+    expect(JSON.stringify(error.mock.calls)).not.toMatch(
+      /allowed@example.com|999999/,
+    );
     error.mockRestore();
   });
 

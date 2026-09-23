@@ -1,0 +1,79 @@
+# Optional overlay, after docker-compose.yml and docker-compose.prod.yml.
+# See logs.md. The app owns the external source volumes; start the app first.
+x-log-rotation: &log-rotation
+  driver: json-file
+  options:
+    max-size: '10m'
+    max-file: '3'
+
+services:
+  loki:
+    image: grafana/loki:3.7.0
+    restart: unless-stopped
+    user: '10001:10001'
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: ['no-new-privileges:true']
+    mem_limit: 512m
+    logging: *log-rotation
+    command: ['-config.file=/etc/loki/config.yml']
+    volumes:
+      - ./loki/config.yml:/etc/loki/config.yml:ro
+      - loki_data:/loki
+    networks: [logs]
+
+  alloy:
+    image: grafana/alloy:v1.19.2
+    restart: unless-stopped
+    user: '473:473'
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: ['no-new-privileges:true']
+    mem_limit: 256m
+    stop_grace_period: 45s
+    logging: *log-rotation
+    command:
+      - run
+      - /etc/alloy/config.alloy
+      - --storage.path=/var/lib/alloy/data
+      # Private to the internal logs network; Prometheus joins that network
+      # below, and no host port is published.
+      - --server.http.listen-addr=0.0.0.0:12345
+      - --disable-reporting
+      # loki.write WAL is experimental in this pinned release; see logs.md.
+      - --stability.level=experimental
+    environment:
+      LOG_ENVIRONMENT: ${LOG_ENVIRONMENT:-production}
+    volumes:
+      - ./alloy/config.alloy:/etc/alloy/config.alloy:ro
+      - app_logs_blue:/var/log/circle/blue:ro
+      - app_logs_green:/var/log/circle/green:ro
+      - alloy_data:/var/lib/alloy/data
+    networks: [logs]
+    depends_on: [loki]
+
+  grafana:
+    networks: [default, logs]
+    volumes:
+      # Replaces the empty loki.yml mountpoint in the read-only provisioning
+      # directory; metrics-only installs have no unreachable datasource.
+      - ./grafana/provisioning/datasources/loki.yml.example:/etc/grafana/provisioning/datasources/loki.yml:ro
+
+  prometheus:
+    networks: [default, circle-be, logs]
+    volumes:
+      - ./prometheus/logs-targets.yml:/etc/prometheus/log-targets/targets.yml:ro
+
+networks:
+  logs:
+    internal: true
+
+volumes:
+  loki_data:
+  alloy_data:
+  app_logs_blue:
+    external: true
+    name: ${CIRCLE_BE_PROJECT_NAME:-circle-be}_app_logs_blue
+  app_logs_green:
+    external: true
+    name: ${CIRCLE_BE_PROJECT_NAME:-circle-be}_app_logs_green

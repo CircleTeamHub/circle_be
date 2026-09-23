@@ -8,6 +8,15 @@ route:
   repeat_interval: 4h
 
   routes:
+    # Discord 投递失败不能再发回同一个 Discord webhook。把健康检查标成失败，
+    # 同时由下方抑制规则停掉成功心跳；即使这次 /fail 请求也发不出去，外部服务
+    # 仍会因后续心跳缺失而报警。恢复后 Watchdog 自动重新把检查标绿。
+    - matchers:
+        - alertname = "AlertmanagerNotificationFailures"
+      receiver: external-heartbeat-failure
+      group_wait: 0s
+      continue: false
+
     # Watchdog 永远 firing，方向和其他所有告警相反：外部服务**收不到**它才报警。
     # 必须单独路由 —— 混进 Discord 只会得到一条每 4 小时刷一次的噪音，而且完全
     # 起不到作用（整台机器挂掉时，本地 Alertmanager 也发不出任何东西）。
@@ -36,6 +45,12 @@ route:
 # BackendHighLatencyP95 + BackendEventLoopLag + 一堆 CronJobStalled —— 一次故障
 # 五种叫法，正是本项目反复警惕的告警疲劳。
 inhibit_rules:
+  - source_matchers:
+      - alertname = "AlertmanagerNotificationFailures"
+    target_matchers:
+      - alertname = "Watchdog"
+    equal: []
+
   # 后端一个副本都不在 → 5xx/延迟/事件循环/定时任务全部是它的结果。
   - source_matchers:
       - alertname = "CircleBeNoTarget"
@@ -114,4 +129,9 @@ receivers:
   - name: external-heartbeat
     webhook_configs:
       - url_file: /etc/alertmanager/heartbeat.url
+        send_resolved: false
+
+  - name: external-heartbeat-failure
+    webhook_configs:
+      - url_file: /etc/alertmanager/heartbeat-fail.url
         send_resolved: false

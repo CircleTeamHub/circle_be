@@ -32,6 +32,7 @@ describe('ChatMediaService', () => {
     $transaction: jest.fn(),
     $queryRaw: jest.fn(),
     chatMediaDeletion: {
+      createMany: jest.fn(),
       upsert: jest.fn(),
       findUnique: jest.fn(),
       findMany: jest.fn(),
@@ -58,6 +59,7 @@ describe('ChatMediaService', () => {
     uploadService.deleteObjectByKey.mockResolvedValue(undefined);
     uploadService.copyObjectToKey.mockResolvedValue(undefined);
     prisma.chatMediaDeletion.upsert.mockResolvedValue({});
+    prisma.chatMediaDeletion.createMany.mockResolvedValue({ count: 0 });
     prisma.chatMediaDeletion.findMany.mockResolvedValue([]);
     prisma.chatMediaDeletion.update.mockResolvedValue({});
     prisma.chatMediaDeletion.updateMany.mockResolvedValue({ count: 1 });
@@ -85,6 +87,115 @@ describe('ChatMediaService', () => {
     expect(prisma.chatMediaDeletion.upsert).toHaveBeenCalledWith(
       expect.objectContaining({ where: { objectKey: 'chat/u1/a.jpg' } }),
     );
+  });
+
+  it('retains the key transactionally when deletion and retry updates both fail', async () => {
+    const key = 'chat/u1/durable.jpg';
+    await service.queueDeletions(prisma as never, [key]);
+    expect(prisma.chatMediaDeletion.createMany).toHaveBeenCalledWith(
+      expect.objectContaining({
+        data: [expect.objectContaining({ objectKey: key })],
+        skipDuplicates: true,
+      }),
+    );
+
+    uploadService.deleteObjectByKey.mockRejectedValueOnce(
+      new Error('storage down'),
+    );
+    prisma.chatMediaDeletion.upsert.mockRejectedValueOnce(
+      new Error('database temporarily down'),
+    );
+    await service.deleteObjects([key]);
+
+    const due = {
+      id: 'delete-1',
+      objectKey: key,
+      attempts: 0,
+      lastError: 'pending message media deletion',
+      nextAttemptAt: new Date(0),
+    };
+    prisma.chatMediaDeletion.findMany.mockResolvedValueOnce([due]);
+    prisma.chatMediaDeletion.findUnique.mockResolvedValueOnce(due);
+    uploadService.deleteObjectByKey.mockResolvedValueOnce(undefined);
+    await service.drainPendingDeletions();
+
+    expect(uploadService.deleteObjectByKey).toHaveBeenLastCalledWith(key);
+    expect(prisma.chatMediaDeletion.deleteMany).toHaveBeenCalledWith({
+      where: expect.objectContaining({ id: due.id }),
+    });
+  });
+
+  it('logs deletion and queue failures without object keys or raw error text', async () => {
+    const warn = jest.spyOn(Logger.prototype, 'warn').mockImplementation();
+    const errorLog = jest.spyOn(Logger.prototype, 'error').mockImplementation();
+    uploadService.deleteObjectByKey.mockRejectedValueOnce(
+      new Error('private-storage-response'),
+    );
+    prisma.chatMediaDeletion.upsert.mockRejectedValueOnce(
+      new Error('SELECT private_messages'),
+    );
+    try {
+      await expect(
+        service.deleteObjects(['chat/private-account/private-photo.jpg']),
+      ).resolves.toBeUndefined();
+      expect(warn).toHaveBeenCalledWith(
+        expect.objectContaining({
+          event: 'chat_media_delete_failed',
+          objectKey: '[redacted]',
+        }),
+      );
+      expect(errorLog).toHaveBeenCalledWith(
+        expect.objectContaining({
+          event: 'chat_media_delete_queue_failed',
+          objectKey: '[redacted]',
+        }),
+      );
+      expect(
+        JSON.stringify([warn.mock.calls, errorLog.mock.calls]),
+      ).not.toMatch(
+        /private-storage-response|SELECT|private_messages|private-account|private-photo/,
+      );
+    } finally {
+      warn.mockRestore();
+      errorLog.mockRestore();
+    }
+  });
+
+  it('logs presign and sweep failures without storage keys or error contents', async () => {
+    const warn = jest.spyOn(Logger.prototype, 'warn').mockImplementation();
+    uploadService.createPresignedGetUrl.mockRejectedValueOnce(
+      Object.assign(new Error('private-storage-response'), {
+        code: 'ECONNREFUSED',
+      }),
+    );
+    prisma.chatMediaDeletion.findMany.mockRejectedValueOnce(
+      new Error('SELECT private_messages'),
+    );
+    const message = dto({
+      type: 'image',
+      content: { key: 'chat/private-account/private-photo.jpg' },
+    });
+    try {
+      await expect(service.attachMediaUrls([message])).resolves.toBeUndefined();
+      await expect(service.drainPendingDeletions()).resolves.toBeUndefined();
+      expect(warn).toHaveBeenCalledWith(
+        expect.objectContaining({
+          event: 'chat_media_presign_failed',
+          objectKey: '[redacted]',
+          failureCode: 'ECONNREFUSED',
+        }),
+      );
+      expect(warn).toHaveBeenCalledWith(
+        expect.objectContaining({
+          event: 'chat_media_deletion_sweep_failed',
+        }),
+      );
+      expect(JSON.stringify(warn.mock.calls)).not.toMatch(
+        /private-storage-response|SELECT|private_messages|private-account|private-photo/,
+      );
+    } finally {
+      warn.mockRestore();
+    }
   });
 
   it('keeps dead-lettered rows instead of dropping the key', async () => {
@@ -117,6 +228,38 @@ describe('ChatMediaService', () => {
         data: expect.objectContaining({ attempts: 8 }),
       }),
     );
+  });
+
+  it('identifies dead-letter rows without logging their storage keys', async () => {
+    const log = jest.spyOn(Logger.prototype, 'error').mockImplementation();
+    const due = {
+      id: 'deletion-1',
+      objectKey: 'chat/private-account/private-photo.jpg',
+      attempts: 7,
+      nextAttemptAt: new Date(0),
+    };
+    prisma.chatMediaDeletion.findMany.mockResolvedValueOnce([due]);
+    prisma.chatMediaDeletion.findUnique.mockResolvedValueOnce(due);
+    uploadService.deleteObjectByKey.mockRejectedValueOnce(
+      new Error('private-storage-response'),
+    );
+    try {
+      await service.drainPendingDeletions();
+      expect(log).toHaveBeenCalledWith(
+        expect.objectContaining({
+          event: 'chat_media_delete_dead_lettered',
+          operation: 'deleteObject',
+          deletionId: 'deletion-1',
+          attempts: 8,
+          objectKey: '[redacted]',
+        }),
+      );
+      expect(JSON.stringify(log.mock.calls)).not.toMatch(
+        /private-account|private-photo|private-storage-response/,
+      );
+    } finally {
+      log.mockRestore();
+    }
   });
 
   it('clears the row once storage confirms the deletion', async () => {

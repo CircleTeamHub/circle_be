@@ -7,12 +7,18 @@
  * interceptor forwards 5xx failures to error aggregation and logs 401/403 as
  * security events; the filter must cover the paths the interceptor cannot see
  * (a guard rejecting a revoked session, Prisma failing inside a guard, a pipe
- * throwing) without double-reporting the ones it already handled. A WeakSet
- * keyed by the exception object is the cheapest correlation that survives the
- * rethrow and never retains the error beyond the request.
+ * throwing) without double-reporting the ones it already handled. A WeakMap
+ * keyed by the exception object preserves correlation across the rethrow. The
+ * request id is part of the marker so an SDK/cache that reuses
+ * one Error object cannot suppress diagnostics for later requests.
  */
-const capturedErrors = new WeakSet<object>();
-const securityLoggedErrors = new WeakSet<object>();
+import { getRequestContext, type RequestContext } from './request-context';
+
+type RequestMarkers = WeakSet<RequestContext>;
+const capturedErrors = new WeakMap<object, RequestMarkers>();
+const securityLoggedErrors = new WeakMap<object, RequestMarkers>();
+const unscopedCapturedErrors = new WeakSet<object>();
+const unscopedSecurityLoggedErrors = new WeakSet<object>();
 
 /**
  * Why JwtGuard rejected a bearer token, taken from passport's `info` — the
@@ -36,6 +42,31 @@ function isObject(error: unknown): error is object {
   return typeof error === 'object' && error !== null;
 }
 
+function setRequestMarker(
+  error: object,
+  scoped: WeakMap<object, RequestMarkers>,
+  unscoped: WeakSet<object>,
+  requestContext?: RequestContext,
+): void {
+  if (!requestContext) {
+    unscoped.add(error);
+    return;
+  }
+  const markers = scoped.get(error) ?? new WeakSet<RequestContext>();
+  markers.add(requestContext);
+  scoped.set(error, markers);
+}
+
+function hasRequestMarker(
+  error: object,
+  scoped: WeakMap<object, RequestMarkers>,
+  unscoped: WeakSet<object>,
+  requestContext?: RequestContext,
+): boolean {
+  if (unscoped.delete(error)) return true;
+  return Boolean(requestContext && scoped.get(error)?.has(requestContext));
+}
+
 export function markAuthFailureReason(
   error: unknown,
   reason: AuthFailureReason,
@@ -55,18 +86,58 @@ export function isRoutineAuthFailure(error: unknown): boolean {
   return reason !== undefined && ROUTINE_AUTH_FAILURES.has(reason);
 }
 
-export function markErrorCaptured(error: unknown): void {
-  if (isObject(error)) capturedErrors.add(error);
+export function markErrorCaptured(
+  error: unknown,
+  requestContext = getRequestContext(),
+): void {
+  if (isObject(error))
+    setRequestMarker(
+      error,
+      capturedErrors,
+      unscopedCapturedErrors,
+      requestContext,
+    );
 }
 
-export function wasErrorCaptured(error: unknown): boolean {
-  return isObject(error) && capturedErrors.has(error);
+export function wasErrorCaptured(
+  error: unknown,
+  requestContext = getRequestContext(),
+): boolean {
+  return Boolean(
+    isObject(error) &&
+    hasRequestMarker(
+      error,
+      capturedErrors,
+      unscopedCapturedErrors,
+      requestContext,
+    ),
+  );
 }
 
-export function markSecurityEventLogged(error: unknown): void {
-  if (isObject(error)) securityLoggedErrors.add(error);
+export function markSecurityEventLogged(
+  error: unknown,
+  requestContext = getRequestContext(),
+): void {
+  if (isObject(error))
+    setRequestMarker(
+      error,
+      securityLoggedErrors,
+      unscopedSecurityLoggedErrors,
+      requestContext,
+    );
 }
 
-export function wasSecurityEventLogged(error: unknown): boolean {
-  return isObject(error) && securityLoggedErrors.has(error);
+export function wasSecurityEventLogged(
+  error: unknown,
+  requestContext = getRequestContext(),
+): boolean {
+  return Boolean(
+    isObject(error) &&
+    hasRequestMarker(
+      error,
+      securityLoggedErrors,
+      unscopedSecurityLoggedErrors,
+      requestContext,
+    ),
+  );
 }

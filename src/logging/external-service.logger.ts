@@ -1,7 +1,6 @@
 import { LoggerService } from '@nestjs/common';
 import { getRequestContext } from './request-context';
-
-const EMAIL_PATTERN = /\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b/gi;
+import { sanitizeLogValue } from './log-sanitizer';
 
 export interface ExternalCallFailurePayload {
   enabled: boolean;
@@ -11,18 +10,36 @@ export interface ExternalCallFailurePayload {
   error: unknown;
 }
 
-function getErrorName(error: unknown): string {
-  return error instanceof Error ? error.name : 'UnknownError';
+function dataField(value: unknown, key: string): unknown {
+  if (!value || typeof value !== 'object') return undefined;
+  const descriptor = Object.getOwnPropertyDescriptor(value, key);
+  return descriptor && 'value' in descriptor ? descriptor.value : undefined;
 }
 
-function getSafeErrorMessage(error: unknown): string {
-  if (!(error instanceof Error)) {
-    return 'External service call failed';
-  }
+function boundedStatus(value: unknown): number | undefined {
+  return typeof value === 'number' &&
+    Number.isInteger(value) &&
+    value >= 100 &&
+    value <= 599
+    ? value
+    : undefined;
+}
 
-  return error.message
-    .replace(/(token|secret|password|authorization)=\S+/gi, '$1=[redacted]')
-    .replace(EMAIL_PATTERN, '[redacted-email]');
+/** Preserve only stable, non-content-bearing provider failure categories. */
+function externalFailureCode(error: unknown): string | undefined {
+  const systemCode = dataField(error, 'code');
+  if (typeof systemCode === 'string' && /^E[A-Z0-9_]{1,31}$/.test(systemCode)) {
+    return systemCode;
+  }
+  const responseCode = boundedStatus(dataField(error, 'responseCode'));
+  if (responseCode) return `SMTP_${responseCode}`;
+  const directStatus =
+    boundedStatus(dataField(error, 'statusCode')) ??
+    boundedStatus(dataField(error, 'status'));
+  if (directStatus) return `HTTP_${directStatus}`;
+  const metadata = dataField(error, '$metadata');
+  const metadataStatus = boundedStatus(dataField(metadata, 'httpStatusCode'));
+  return metadataStatus ? `HTTP_${metadataStatus}` : undefined;
 }
 
 export function logExternalCallFailure(
@@ -33,18 +50,29 @@ export function logExternalCallFailure(
     return;
   }
 
-  const requestContext = getRequestContext();
-  logger.warn(
-    {
-      event: 'external_call_failed',
-      service: payload.service,
-      operation: payload.operation,
-      durationMs: payload.durationMs,
-      requestId: requestContext?.requestId,
-      traceId: requestContext?.traceId,
-      errorName: getErrorName(payload.error),
-      message: getSafeErrorMessage(payload.error),
-    },
-    'ExternalService',
-  );
+  try {
+    const requestContext = getRequestContext();
+    const error = sanitizeLogValue(payload.error) as
+      | { name?: string }
+      | undefined;
+    logger.warn(
+      {
+        ...(sanitizeLogValue({
+          event: 'external_call_failed',
+          service: payload.service,
+          operation: payload.operation,
+          durationMs: payload.durationMs,
+          requestId: requestContext?.requestId,
+          traceId: requestContext?.traceId,
+          errorName: error?.name ?? 'Error',
+          failureCode: externalFailureCode(payload.error),
+          error: payload.error,
+        }) as Record<string, unknown>),
+        message: 'External service call failed',
+      },
+      'ExternalService',
+    );
+  } catch {
+    // Preserve the original provider failure if the logging sink is unavailable.
+  }
 }

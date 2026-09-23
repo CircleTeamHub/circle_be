@@ -1,0 +1,5 @@
+# Empty mountpoint for the optional log overlay inside the read-only directory.
+# Metrics-only installs provision no Loki datasource; removing the overlay prunes it.
+apiVersion: 1
+prune: true
+datasources: []

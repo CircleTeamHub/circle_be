@@ -1,4 +1,8 @@
 import { ChatCircleSyncService } from './chat-circle-sync.service';
+import { LoggerService } from '@nestjs/common';
+import { WinstonModule } from 'nest-winston';
+import * as winston from 'winston';
+import { createWinstonOptions } from '../logging/winston-options';
 
 describe('ChatCircleSyncService', () => {
   const prisma = {
@@ -60,6 +64,144 @@ describe('ChatCircleSyncService', () => {
     prisma.$queryRaw.mockResolvedValue([]);
     redis.tryAcquireLease.mockResolvedValue(undefined);
     redis.releaseLease.mockResolvedValue(undefined);
+  });
+
+  describe('failure log privacy', () => {
+    let logger: winston.Logger;
+    let sync: ChatCircleSyncService;
+    let lines: string[];
+    const privateFailure = () =>
+      new Error(
+        'SELECT private_chat_content FROM messages WHERE nickname = private-person',
+      );
+
+    beforeEach(() => {
+      lines = [];
+      const options = createWinstonOptions(
+        { get: (key) => ({ LOG_ON: 'true', LOG_FILE_ON: 'false' })[key] },
+        'production',
+      );
+      const transport = options
+        .transports[0] as winston.transports.ConsoleTransportInstance;
+      jest.spyOn(transport, 'log').mockImplementation((info, callback) => {
+        lines.push(info[Symbol.for('message')]);
+        callback?.();
+      });
+      logger = winston.createLogger(options);
+      sync = new ChatCircleSyncService(
+        prisma as never,
+        broadcast as never,
+        systemMessage as never,
+        groupEvents as never,
+        redis as never,
+      );
+      (sync as unknown as { logger: LoggerService }).logger =
+        WinstonModule.createLogger({ instance: logger });
+    });
+
+    afterEach(() => logger.close());
+
+    it('keeps join and leave failures private while preserving membership broadcasts', async () => {
+      prisma.circle.findUnique.mockResolvedValue({
+        id: 'circle-1',
+        deleted: false,
+        adminState: 'ACTIVE',
+      });
+      prisma.chatConversation.findUnique.mockResolvedValue({ id: 'conv-1' });
+      prisma.circleMember.findMany.mockResolvedValue([{ userID: 'u1' }]);
+      prisma.chatMember.findMany.mockResolvedValue([
+        { userID: 'u2', leftAt: null },
+      ]);
+      broadcast.joinUserToConversation.mockRejectedValueOnce(privateFailure());
+      broadcast.removeUserFromConversation.mockRejectedValueOnce(
+        privateFailure(),
+      );
+
+      await expect(sync.ensureCircleConversation('circle-1')).resolves.toBe(
+        'conv-1',
+      );
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      expect(lines.join('')).not.toMatch(
+        /private_chat_content|private-person|SELECT/,
+      );
+      const records = lines.map((line) => JSON.parse(line));
+      expect(records).toEqual(
+        expect.arrayContaining([
+          expect.objectContaining({
+            event: 'chat_circle_sync_failed',
+            operation: 'join_room',
+            userId: 'u1',
+          }),
+          expect.objectContaining({
+            event: 'chat_circle_sync_failed',
+            operation: 'leave_room',
+            userId: 'u2',
+          }),
+        ]),
+      );
+      expect(broadcast.emitConversationChange).toHaveBeenCalledWith(
+        'u1',
+        expect.objectContaining({ kind: 'joined' }),
+      );
+      expect(broadcast.emitConversationChange).toHaveBeenCalledWith(
+        'u2',
+        expect.objectContaining({ kind: 'removed' }),
+      );
+    });
+
+    it('keeps detach and notice errors private without skipping disconnect or removal', async () => {
+      broadcast.removeUserFromConversation.mockRejectedValueOnce(
+        privateFailure(),
+      );
+      broadcast.disconnectUserSockets.mockRejectedValueOnce(privateFailure());
+      systemMessage.emit.mockRejectedValueOnce(privateFailure());
+      await expect(
+        sync.detachSeat('u1', 'conv-1', 'removed'),
+      ).resolves.toBeUndefined();
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      expect(lines.join('')).not.toMatch(
+        /private_chat_content|private-person|SELECT/,
+      );
+      const records = lines.map((line) => JSON.parse(line));
+      for (const operation of [
+        'detach_seat',
+        'evict_sockets',
+        'member_left_notice',
+      ]) {
+        expect(records).toEqual(
+          expect.arrayContaining([
+            expect.objectContaining({
+              event: 'chat_circle_sync_failed',
+              operation,
+            }),
+          ]),
+        );
+      }
+      expect(broadcast.disconnectUserSockets).toHaveBeenCalledWith('u1');
+      expect(broadcast.emitConversationChange).toHaveBeenCalledWith(
+        'u1',
+        expect.objectContaining({ kind: 'removed' }),
+      );
+    });
+
+    it('records a fixed scan failure event without exposing the database exception', async () => {
+      prisma.$queryRaw.mockRejectedValueOnce(
+        Object.assign(privateFailure(), { code: 'P2024' }),
+      );
+      await expect(sync.reconcileRecent()).resolves.toBeUndefined();
+      expect(lines.join('')).not.toMatch(
+        /private_chat_content|private-person|SELECT/,
+      );
+      expect(lines.map((line) => JSON.parse(line))).toEqual(
+        expect.arrayContaining([
+          expect.objectContaining({
+            event: 'chat_circle_sync_failed',
+            operation: 'reconcile_scan',
+            errorCode: 'P2024',
+          }),
+        ]),
+      );
+    });
   });
 
   it('default-denies a dismissed circle and clears every seat', async () => {

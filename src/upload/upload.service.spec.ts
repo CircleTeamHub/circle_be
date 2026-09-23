@@ -5,6 +5,7 @@ import {
   matchesCorsWildcard,
 } from './upload.service';
 import { getSignedUrl } from '@aws-sdk/s3-request-presigner';
+import { sanitizeLogValue } from '../logging/log-sanitizer';
 
 jest.mock('@aws-sdk/s3-request-presigner', () => ({
   getSignedUrl: jest.fn(),
@@ -212,7 +213,7 @@ describe('UploadService', () => {
       });
     });
 
-    it('logs AWS error metadata when the SDK error message is blank', async () => {
+    it('preserves the bootstrap failure step and status through error sanitization', async () => {
       const policyError = Object.assign(new Error(''), {
         name: 'AccessDenied',
         Code: 'AccessDenied',
@@ -236,10 +237,84 @@ describe('UploadService', () => {
       await service.onModuleInit();
 
       expect(logger.error).toHaveBeenCalledWith(
-        expect.stringContaining(
-          'MinIO bootstrap attempt failed during put_bucket_policy: name=AccessDenied code=AccessDenied status=403 requestId=req-123 attempts=1',
-        ),
-        expect.any(String),
+        expect.objectContaining({
+          event: 'object_storage_bootstrap_failed',
+          operation: 'put_bucket_policy',
+          providerCode: 'AccessDenied',
+          providerRequestId: 'req-123',
+          attempts: 1,
+          upstreamStatus: 403,
+        }),
+      );
+      expect(
+        sanitizeLogValue({ level: 'error', ...logger.error.mock.calls[0][0] }),
+      ).toMatchObject({
+        event: 'object_storage_bootstrap_failed',
+        operation: 'put_bucket_policy',
+        providerCode: 'AccessDenied',
+        providerRequestId: 'req-123',
+        attempts: 1,
+        upstreamStatus: 403,
+      });
+    });
+
+    it('drops malformed object-store correlation metadata', async () => {
+      const failure = Object.assign(new Error('private'), {
+        Code: 'Access Denied: private',
+        $metadata: {
+          httpStatusCode: 503,
+          requestId: 'Bearer private-token',
+          attempts: 1000,
+        },
+      });
+      const service = buildService(
+        jest.fn().mockResolvedValueOnce({}).mockRejectedValueOnce(failure),
+      );
+      const logger = { error: jest.fn(), log: jest.fn(), warn: jest.fn() };
+      (service as any).logger = logger;
+
+      await service.onModuleInit();
+
+      expect(logger.error.mock.calls[0][0]).toMatchObject({
+        providerCode: null,
+        providerRequestId: null,
+        attempts: null,
+        upstreamStatus: 503,
+      });
+      expect(JSON.stringify(logger.error.mock.calls)).not.toContain(
+        'private-token',
+      );
+    });
+
+    it('never passes provider messages, payloads or stack prose to a logger', async () => {
+      const failure = Object.assign(
+        new Error('private recipient 15551234567'),
+        {
+          payload: 'private-body',
+        },
+      );
+      failure.stack =
+        'Error: private recipient 15551234567\n    at send (/app/src/storage.ts:5:2)';
+      const service = buildService(
+        jest.fn().mockResolvedValueOnce({}).mockRejectedValueOnce(failure),
+      );
+      const logger = { error: jest.fn(), log: jest.fn(), warn: jest.fn() };
+      (service as any).logger = logger;
+
+      await service.onModuleInit();
+
+      const entry = logger.error.mock.calls[0][0];
+      expect(entry).toMatchObject({
+        event: 'object_storage_bootstrap_failed',
+        operation: 'put_bucket_policy',
+        error: {
+          name: 'Error',
+          message: '[redacted]',
+          stack: 'at storage.ts:5:2',
+        },
+      });
+      expect(JSON.stringify(logger.error.mock.calls)).not.toMatch(
+        /private|15551234567/,
       );
     });
 

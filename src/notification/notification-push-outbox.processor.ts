@@ -15,6 +15,7 @@ import {
   type ExpoPushPayload,
 } from './notification-push.service';
 import { reportOperationalError } from 'src/logging/error-aggregation.service';
+import { sanitizeLogValue } from 'src/logging/log-sanitizer';
 
 const BATCH_SIZE = 100;
 const STALE_LOCK_MS = 10 * 60 * 1000;
@@ -339,7 +340,14 @@ export class NotificationPushOutboxProcessor {
           },
         });
         if (!(error instanceof RetryableDeliveryError)) {
-          this.logger.warn(`Push outbox job ${job.id} failed: ${error}`);
+          this.logger.warn(
+            sanitizeLogValue({
+              event: 'notification_push_outbox_failed',
+              operation: 'processJob',
+              outboxId: job.id,
+              error,
+            }),
+          );
           reportOperationalError(error, {
             component: 'NotificationPushOutboxProcessor',
             operation: 'processJob',

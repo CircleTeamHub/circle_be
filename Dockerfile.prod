@@ -36,9 +36,12 @@ RUN apt-get update \
     && apt-get install -y --no-install-recommends openssl \
     && rm -rf /var/lib/apt/lists/*
 
-# Run as non-root.
-RUN groupadd --system app \
-    && useradd --system --gid app --shell /usr/sbin/nologin app \
+# Keep the numeric identity stable: named log volumes retain ownership across
+# image replacement, regardless of future base-image account allocation.
+ARG APP_UID=10001
+ARG APP_GID=10001
+RUN groupadd --gid "$APP_GID" app \
+    && useradd --uid "$APP_UID" --gid app --no-create-home --shell /usr/sbin/nologin app \
     && install -d -o app -g app /app/logs
 
 COPY --from=build-stage --chown=app:app /app/package.json /app/package-lock.json ./

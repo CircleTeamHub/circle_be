@@ -1,16 +1,19 @@
 import { EventEmitter } from 'events';
+import { performance } from 'node:perf_hooks';
 import { createRequestLoggerMiddleware } from './request-logger.middleware';
+
+const TEST_REQUEST_ID = '9b2a7f3c-2a9e-4f1c-8d2b-124a5cc93a10';
 
 function createReq(overrides: Record<string, unknown> = {}) {
   return {
     method: 'GET',
-    originalUrl: '/api/v1/user?secret=value',
-    url: '/api/v1/user?secret=value',
+    originalUrl: '/api/v1/auth/me?secret=value',
+    url: '/api/v1/auth/me?secret=value',
     ip: '127.0.0.1',
     headers: {
       'user-agent': 'jest',
       authorization: 'Bearer token',
-      'x-request-id': 'req-1',
+      'x-request-id': TEST_REQUEST_ID,
     },
     body: { password: 'secret' },
     ...overrides,
@@ -28,15 +31,15 @@ function createRes() {
 }
 
 describe('createRequestLoggerMiddleware', () => {
-  let dateSpy: jest.SpyInstance<number, []>;
+  let clockSpy: jest.SpyInstance<number, []>;
 
   afterEach(() => {
-    dateSpy?.mockRestore();
+    clockSpy?.mockRestore();
   });
 
   it('logs one sanitized access event when the response finishes', () => {
-    dateSpy = jest
-      .spyOn(Date, 'now')
+    clockSpy = jest
+      .spyOn(performance, 'now')
       .mockReturnValueOnce(1000)
       .mockReturnValueOnce(1123);
     const logger = { log: jest.fn(), warn: jest.fn(), error: jest.fn() };
@@ -52,15 +55,15 @@ describe('createRequestLoggerMiddleware', () => {
     res.emit('finish');
 
     expect(next).toHaveBeenCalled();
-    expect(res.setHeader).toHaveBeenCalledWith('x-request-id', 'req-1');
+    expect(res.setHeader).toHaveBeenCalledWith('x-request-id', TEST_REQUEST_ID);
     expect(logger.log).toHaveBeenCalledWith(
       expect.objectContaining({
         event: 'http_access',
         method: 'GET',
-        path: '/api/v1/user',
+        path: '/api/v1/auth/me',
         statusCode: 200,
         durationMs: 123,
-        requestId: 'req-1',
+        requestId: TEST_REQUEST_ID,
       }),
       'HttpAccess',
     );
@@ -71,8 +74,8 @@ describe('createRequestLoggerMiddleware', () => {
   });
 
   it('logs slow requests as warnings and reads authenticated user at finish time', () => {
-    dateSpy = jest
-      .spyOn(Date, 'now')
+    clockSpy = jest
+      .spyOn(performance, 'now')
       .mockReturnValueOnce(1000)
       .mockReturnValueOnce(1600);
     const logger = { log: jest.fn(), warn: jest.fn(), error: jest.fn() };

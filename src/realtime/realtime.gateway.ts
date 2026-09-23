@@ -14,6 +14,7 @@ import {
   type RealtimeSocketIdentity,
 } from './realtime.service';
 import { reportOperationalError } from 'src/logging/error-aggregation.service';
+import { sanitizeLogValue } from 'src/logging/log-sanitizer';
 
 const HEARTBEAT_INTERVAL_MS = 30_000;
 const MAX_CONNECTIONS_PER_USER = 5;
@@ -27,6 +28,16 @@ const REALTIME_PATH = '/realtime';
  */
 const UNVERIFIABLE_CLOSE_CODE = 1013;
 const UNVERIFIABLE_CLOSE_REASON = 'Try again later';
+
+function safeSystemErrorCode(error: unknown): string | undefined {
+  const code =
+    error && typeof error === 'object'
+      ? Object.getOwnPropertyDescriptor(error, 'code')?.value
+      : undefined;
+  return typeof code === 'string' && /^E[A-Z0-9_]{1,31}$/.test(code)
+    ? code
+    : undefined;
+}
 
 /** 与 ws 的 shouldHandle 同一套取法:只切掉 query,不做任何归一化。 */
 function pathnameOf(url: string | undefined): string {
@@ -201,7 +212,14 @@ export class RealtimeGateway implements OnModuleDestroy {
     });
 
     socket.on('error', (error) => {
-      this.logger.warn(`Realtime socket error (pre-auth): ${error.message}`);
+      this.logger.warn(
+        sanitizeLogValue({
+          event: 'realtime_socket_error',
+          operation: 'handleConnection',
+          errorCode: safeSystemErrorCode(error),
+          error,
+        }),
+      );
     });
 
     socket.on('close', () => {
@@ -260,7 +278,15 @@ export class RealtimeGateway implements OnModuleDestroy {
     this.realtimeService.registerPendingClient(userId, socket, identity);
 
     socket.on('error', (error) => {
-      this.logger.warn(`Realtime socket error for ${userId}: ${error.message}`);
+      this.logger.warn(
+        sanitizeLogValue({
+          event: 'realtime_socket_error',
+          operation: 'acceptAuthenticatedSocket',
+          userId,
+          errorCode: safeSystemErrorCode(error),
+          error,
+        }),
+      );
     });
 
     if (expMs !== null) {
@@ -308,7 +334,12 @@ export class RealtimeGateway implements OnModuleDestroy {
         kind: 'websocket',
       });
       this.logger.warn(
-        `Failed to emit initial snapshot for ${userId}: ${error instanceof Error ? error.message : error}`,
+        sanitizeLogValue({
+          event: 'realtime_snapshot_failed',
+          operation: 'emitSnapshot',
+          userId,
+          error,
+        }),
       );
     }
   }

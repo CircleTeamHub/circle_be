@@ -9,15 +9,19 @@ import { Observable, catchError, throwError } from 'rxjs';
 import { createLoggingConfig } from 'src/logging/logging.config';
 import { resolveErrorStatusCode } from '../filters/prisma-error-status';
 import {
+  getAuthFailureReason,
+  isRoutineAuthFailure,
   markErrorCaptured,
   markSecurityEventLogged,
 } from '../logging/handled-errors';
 import { getRequestContext } from '../logging/request-context';
 import { logSecurityEvent } from '../logging/security-event.logger';
+import {
+  attemptDiagnostic,
+  diagnosticFailureDetails,
+  logHttpFailure,
+} from '../logging/http-failure.logger';
 import type { ErrorAggregationProvider } from '../logging/error-aggregation.service';
-
-/** Status codes at or above this are unexpected server errors worth aggregating. */
-const SERVER_ERROR_THRESHOLD = 500;
 
 @Injectable()
 export class ErrorLoggingInterceptor implements NestInterceptor {
@@ -29,94 +33,71 @@ export class ErrorLoggingInterceptor implements NestInterceptor {
   ) {}
 
   intercept(
-    _context: ExecutionContext,
+    executionContext: ExecutionContext,
     next: CallHandler,
   ): Observable<unknown> {
+    // Capture before the observable crosses an async boundary. Older supported
+    // Node runtimes do not preserve AsyncLocalStorage through every RxJS path.
+    const requestContext = getRequestContext();
+    const request = executionContext.switchToHttp?.().getRequest?.();
     return next.handle().pipe(
       catchError((error: unknown) => {
-        const requestContext = getRequestContext();
-        // Known Prisma codes become 4xx in PrismaExceptionFilter; classifying
-        // them as 500 here would log every unique-constraint race as an
-        // incident and forward it to Sentry.
+        // Known Prisma failures have the same classification as their filter.
         const statusCode = resolveErrorStatusCode(error);
-        const errorObject = error instanceof Error ? error : undefined;
-
-        this.logger.error(
-          {
-            event: 'http_error',
-            requestId: requestContext?.requestId,
-            traceId: requestContext?.traceId,
-            method: requestContext?.method,
-            path: requestContext?.path,
-            userId: requestContext?.userId,
-            statusCode,
-            errorName: errorObject?.name ?? 'UnknownError',
-            message: errorObject?.message ?? String(error),
-            stack: errorObject?.stack,
-          },
-          errorObject?.stack,
-          'HttpError',
-        );
-
-        // Wrapped like the aggregation call below: a throwing log transport
-        // must never replace the original error in this projection.
-        if (statusCode === 401 || statusCode === 403) {
-          try {
-            logSecurityEvent(this.logger, {
-              enabled: this.loggingConfig.securityLogOn,
-              securityEvent:
-                statusCode === 401 ? 'auth_unauthorized' : 'access_forbidden',
-              statusCode,
-              reason: errorObject?.message ?? String(error),
-            });
-            // AllExceptionFilter sees this same exception next; the marker
-            // keeps it from logging the security event a second time.
-            markSecurityEventLogged(error);
-          } catch (loggingError) {
-            this.logger.error(
-              {
-                event: 'security_event_log_failed',
-                requestId: requestContext?.requestId,
-                message:
-                  loggingError instanceof Error
-                    ? loggingError.message
-                    : String(loggingError),
-              },
-              'HttpError',
-            );
-          }
+        logHttpFailure(this.logger, error, statusCode, request, requestContext);
+        if (
+          (statusCode === 401 || statusCode === 403) &&
+          !isRoutineAuthFailure(error)
+        ) {
+          attemptDiagnostic(
+            () => {
+              logSecurityEvent(this.logger, {
+                enabled: this.loggingConfig.securityLogOn,
+                securityEvent:
+                  statusCode === 401 ? 'auth_unauthorized' : 'access_forbidden',
+                statusCode,
+                reason:
+                  getAuthFailureReason(error) ??
+                  (statusCode === 401 ? 'unauthorized' : 'forbidden'),
+              });
+              markSecurityEventLogged(error, requestContext);
+            },
+            (failure) =>
+              this.logger.error(
+                {
+                  event: 'security_event_log_failed',
+                  requestId: requestContext?.requestId,
+                  ...diagnosticFailureDetails(failure),
+                },
+                'HttpError',
+              ),
+          );
         }
-
-        // Forward only unexpected server errors to optional aggregation
-        // (Sentry). Expected 4xx client errors are never sent. Wrapped so a
-        // throwing telemetry SDK can never replace the original error in this
-        // catchError projection — the real error must always propagate.
-        if (statusCode >= SERVER_ERROR_THRESHOLD) {
-          try {
-            this.errorAggregation?.captureError(error, {
-              statusCode,
-              requestId: requestContext?.requestId,
-              traceId: requestContext?.traceId,
-              method: requestContext?.method,
-              path: requestContext?.path,
-              userId: requestContext?.userId,
-            });
-            markErrorCaptured(error);
-          } catch (aggregationError) {
-            this.logger.error(
-              {
-                event: 'error_aggregation_failed',
+        // Diagnostics may fail independently; always rethrow the original error.
+        if (statusCode >= 500 && this.errorAggregation) {
+          attemptDiagnostic(
+            () => {
+              this.errorAggregation!.captureError(error, {
+                statusCode,
                 requestId: requestContext?.requestId,
-                message:
-                  aggregationError instanceof Error
-                    ? aggregationError.message
-                    : String(aggregationError),
-              },
-              'HttpError',
-            );
-          }
+                traceId: requestContext?.traceId,
+                method: requestContext?.method,
+                path: requestContext?.path,
+                userId: requestContext?.userId,
+              });
+              markErrorCaptured(error, requestContext);
+            },
+            (failure) =>
+              this.logger.error(
+                {
+                  event: 'error_aggregation_failed',
+                  requestId: requestContext?.requestId,
+                  ...diagnosticFailureDetails(failure),
+                },
+                'HttpError',
+              ),
+          );
         }
-
         return throwError(() => error);
       }),
     );

@@ -89,10 +89,10 @@ traffic cannot create an unbounded Prometheus series set.
 
 ### Tracing a failed chat connection
 
-Each app socket lifecycle carries a random `ws-...` trace ID. It contains no
-account, conversation, message, token, IP, or device identifier. The same value
-appears in the mobile Sentry `chatConnect` event, the Caddy `/chat-ws` access
-entry, and the backend `ChatGateway` lifecycle entry.
+Each app socket lifecycle carries a random `ws-...` trace ID generated and
+overwritten by Caddy. It contains no account, conversation, message, token, IP,
+or device identifier. The same value appears in the Caddy `/chat-ws` access
+entry and the backend `ChatGateway` lifecycle entry.
 
 ```bash
 # Proxy view: HTTP upgrade status and duration. Query, headers, and IP are removed.

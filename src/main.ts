@@ -2,8 +2,9 @@
 //
 // This software is released under the MIT License.
 // https://opensource.org/licenses/MIT
+import { getStartupErrorAggregation } from './startup-instrumentation';
+import { flushWithDeadline } from './logging/error-aggregation.service';
 import 'module-alias/register';
-import { inspect } from 'node:util';
 import { NestFactory } from '@nestjs/core';
 import { DocumentBuilder, SwaggerModule } from '@nestjs/swagger';
 import { AppModule } from './app.module';
@@ -12,6 +13,7 @@ import { RealtimeGateway } from './realtime/realtime.gateway';
 import { ChatGateway } from './chat/chat.gateway';
 // import { AllExceptionFilter } from './filters/all-exception.filter';
 import { getServerConfig } from './config/server.config';
+import { sanitizeLogValue } from './logging/log-sanitizer';
 
 export function resolveAppPort(value: unknown): number {
   if (typeof value === 'number' && Number.isInteger(value)) {
@@ -27,7 +29,9 @@ export function resolveAppPort(value: unknown): number {
     }
   }
 
-  throw new Error(`Invalid APP_PORT value: ${String(value)}`);
+  throw Object.assign(new Error(`Invalid APP_PORT value: ${String(value)}`), {
+    startupCode: 'INVALID_APP_PORT',
+  });
 }
 
 type CorsOriginCallback = (err: Error | null, allow?: boolean) => void;
@@ -80,10 +84,17 @@ export function buildNestFactoryOptions() {
     cors: {
       origin: resolveCorsOriginChecker(),
       credentials: true,
+      allowedHeaders: [
+        'Authorization',
+        'Content-Type',
+        'X-Request-Id',
+        'X-Device-Name',
+        'Idempotency-Key',
+      ],
       // GET /note and /note/recycle-bin signal truncation through this header
       // while the body stays an array; browsers hide unlisted response headers
       // from cross-origin callers.
-      exposedHeaders: ['X-Has-More'],
+      exposedHeaders: ['X-Has-More', 'X-Request-Id'],
     },
     rawBody: true,
   };
@@ -145,6 +156,42 @@ const processSinks: BootstrapFailureSinks = {
   exit: (code) => process.exit(code),
 };
 
+function safeBootstrapFailureDetails(error: unknown): string {
+  const sanitized = sanitizeLogValue(error);
+  if (!sanitized || typeof sanitized !== 'object' || Array.isArray(sanitized)) {
+    return 'errorName=Error';
+  }
+
+  const record = sanitized as Record<string, unknown>;
+  const errorName = typeof record.name === 'string' ? record.name : 'Error';
+  const rawStartupCode =
+    error && typeof error === 'object'
+      ? Object.getOwnPropertyDescriptor(error, 'startupCode')?.value
+      : undefined;
+  const startupCode =
+    typeof rawStartupCode === 'string' &&
+    [
+      'INVALID_APP_PORT',
+      'OBJECT_STORAGE_NOT_CONFIGURED',
+      'OBJECT_STORAGE_DELIVERY_URL_INVALID',
+      'OBJECT_STORAGE_DELIVERY_URL_REQUIRED',
+      'OBJECT_STORAGE_POLICY_UNAVAILABLE',
+    ].includes(rawStartupCode)
+      ? rawStartupCode
+      : undefined;
+  const source =
+    typeof record.stack === 'string'
+      ? record.stack.split('\n').find((line) => line.startsWith('at '))
+      : undefined;
+  return [
+    `errorName=${errorName}`,
+    startupCode ? `startupCode=${startupCode}` : undefined,
+    source ? `source=${source}` : undefined,
+  ]
+    .filter(Boolean)
+    .join(' ');
+}
+
 /**
  * Runs the bootstrap and makes a failed start loud and fatal.
  *
@@ -162,18 +209,36 @@ const processSinks: BootstrapFailureSinks = {
 export async function runBootstrap(
   start: () => Promise<void>,
   sinks: BootstrapFailureSinks = processSinks,
+  errorAggregation: FlushableAggregation & {
+    captureError?(error: unknown, context: Record<string, string>): void;
+  } = getStartupErrorAggregation(),
 ): Promise<void> {
   try {
     await start();
   } catch (error) {
     try {
+      errorAggregation.captureError?.(error, {
+        component: 'bootstrap',
+        operation: 'start',
+        kind: 'process',
+      });
+    } catch {
+      // An optional telemetry provider must never own the fatal path.
+    }
+    try {
+      await flushWithDeadline(errorAggregation, 2000);
+    } catch {
+      // Keep the process-exit guarantee even for a broken provider.
+    }
+    try {
       sinks.logError(
-        `[bootstrap] Application failed to start; exiting with code 1.\n${inspect(error)}`,
+        `[bootstrap] Application failed to start; ${safeBootstrapFailureDetails(error)}; exiting with code 1.`,
       );
     } catch {
       // Nowhere left to write the reason; exiting is what still matters.
+    } finally {
+      sinks.exit(1);
     }
-    sinks.exit(1);
   }
 }
 

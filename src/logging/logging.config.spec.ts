@@ -13,6 +13,7 @@ describe('createLoggingConfig', () => {
     expect(config.performanceLogOn).toBe(true);
     expect(config.slowRequestMs).toBe(1000);
     expect(config.slowExternalMs).toBe(1000);
+    expect(config).toHaveProperty('slowDbOperationMs', 1000);
   });
 
   it('keeps test logging quiet by default', () => {

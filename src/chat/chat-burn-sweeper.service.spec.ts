@@ -9,6 +9,7 @@ describe('ChatBurnSweeperService', () => {
   };
   const media = {
     deleteObjects: jest.fn().mockResolvedValue(undefined),
+    queueDeletions: jest.fn().mockResolvedValue(undefined),
     releaseNoteImportReferences: jest.fn().mockResolvedValue(undefined),
     drainPendingDeletions: jest.fn().mockResolvedValue(undefined),
   };
@@ -240,6 +241,7 @@ describe('ChatBurnSweeperService', () => {
       [shared],
     );
     expect(media.deleteObjects).toHaveBeenCalledWith([owned]);
+    expect(media.queueDeletions).toHaveBeenCalledWith(prisma, [owned]);
   });
 
   it('stops the per-conversation loop on a short batch', async () => {

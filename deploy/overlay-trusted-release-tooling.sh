@@ -22,6 +22,15 @@ install -m 0644 "$SOURCE_ROOT/deploy/app-env-transaction.sh" "$TARGET_ROOT/deplo
 install -m 0644 "$SOURCE_ROOT/deploy/offsite-backup.sh" "$TARGET_ROOT/deploy/offsite-backup.sh"
 install -m 0644 "$SOURCE_ROOT/deploy/Caddyfile.admin" "$TARGET_ROOT/deploy/Caddyfile.admin"
 install -m 0755 "$SOURCE_ROOT/monitoring/sync-metrics-token.sh" "$TARGET_ROOT/monitoring/sync-metrics-token.sh"
+for file in docker-compose.logs.yml alloy/config.alloy loki/config.yml \
+  grafana/provisioning/datasources/loki.yml \
+  grafana/provisioning/datasources/loki.yml.example prometheus/logs-targets.yml \
+  prometheus/prometheus.yml prometheus/prometheus.prod.yml \
+  prometheus/alerts.yml; do
+  target="$TARGET_ROOT/monitoring/$file"
+  mkdir -p "$(dirname "$target")"
+  install -m 0644 "$SOURCE_ROOT/monitoring/$file" "$target"
+done
 install -m 0644 "$SOURCE_ROOT/Dockerfile.caddy" "$TARGET_ROOT/Dockerfile.caddy"
 install -m 0644 "$SOURCE_ROOT/docker-compose.prod.yml" "$TARGET_ROOT/docker-compose.prod.yml"
 install -m 0644 "$SOURCE_ROOT/docker-compose.release.yml" "$TARGET_ROOT/docker-compose.release.yml"

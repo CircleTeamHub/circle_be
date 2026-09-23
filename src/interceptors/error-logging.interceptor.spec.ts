@@ -21,7 +21,7 @@ const requestContext = {
   requestId: 'req-1',
   traceId: 'req-1',
   method: 'POST',
-  path: '/api/v1/secure',
+  path: '/api/v1/auth/me',
   ip: '127.0.0.1',
   userAgent: 'jest',
   userId: 'user-1',
@@ -58,7 +58,7 @@ describe('ErrorLoggingInterceptor', () => {
           requestId: 'req-1',
           traceId: 'req-1',
           method: 'POST',
-          path: '/api/v1/secure',
+          path: '/api/v1/auth/me',
           ip: '127.0.0.1',
           userAgent: 'jest',
           userId: 'user-1',
@@ -67,17 +67,16 @@ describe('ErrorLoggingInterceptor', () => {
       ),
     ).rejects.toBe(error);
 
-    expect(logger.error).toHaveBeenCalledWith(
+    expect(logger.warn).toHaveBeenCalledWith(
       expect.objectContaining({
         event: 'http_error',
         requestId: 'req-1',
         method: 'POST',
-        path: '/api/v1/secure',
+        path: '/api/v1/auth/me',
         userId: 'user-1',
         statusCode: 403,
         errorName: 'HttpException',
       }),
-      expect.any(String),
       'HttpError',
     );
 
@@ -111,7 +110,7 @@ describe('ErrorLoggingInterceptor', () => {
         statusCode: 500,
         requestId: 'req-1',
         method: 'POST',
-        path: '/api/v1/secure',
+        path: '/api/v1/auth/me',
         userId: 'user-1',
       }),
     );
@@ -121,7 +120,9 @@ describe('ErrorLoggingInterceptor', () => {
     const logger = { error: jest.fn(), warn: jest.fn() };
     const aggregation = createAggregationSpy();
     (aggregation.captureError as jest.Mock).mockImplementation(() => {
-      throw new Error('sentry SDK blew up');
+      throw Object.assign(new TypeError('sentry SDK private failure'), {
+        code: 'ECONNREFUSED',
+      });
     });
     const interceptor = new ErrorLoggingInterceptor(logger as any, aggregation);
     const error = new Error('database exploded');
@@ -135,7 +136,11 @@ describe('ErrorLoggingInterceptor', () => {
     ).rejects.toBe(error);
 
     expect(logger.error).toHaveBeenCalledWith(
-      expect.objectContaining({ event: 'error_aggregation_failed' }),
+      expect.objectContaining({
+        event: 'error_aggregation_failed',
+        failureName: 'TypeError',
+        failureCode: 'ECONNREFUSED',
+      }),
       'HttpError',
     );
   });
@@ -144,7 +149,9 @@ describe('ErrorLoggingInterceptor', () => {
     const logger = {
       error: jest.fn(),
       warn: jest.fn(() => {
-        throw new Error('transport down');
+        throw Object.assign(new Error('transport private failure'), {
+          code: 'EPIPE',
+        });
       }),
     };
     const interceptor = new ErrorLoggingInterceptor(logger as any);
@@ -161,7 +168,8 @@ describe('ErrorLoggingInterceptor', () => {
       expect.objectContaining({
         event: 'security_event_log_failed',
         requestId: 'req-1',
-        message: 'transport down',
+        failureName: 'Error',
+        failureCode: 'EPIPE',
       }),
       'HttpError',
     );
@@ -233,9 +241,8 @@ describe('ErrorLoggingInterceptor status mapping & handled-error markers', () =>
       ),
     ).rejects.toBe(error);
 
-    expect(logger.error).toHaveBeenCalledWith(
+    expect(logger.warn).toHaveBeenCalledWith(
       expect.objectContaining({ event: 'http_error', statusCode: 409 }),
-      expect.any(String),
       'HttpError',
     );
     expect(aggregation.captureError).not.toHaveBeenCalled();
@@ -270,21 +277,21 @@ describe('ErrorLoggingInterceptor status mapping & handled-error markers', () =>
     const serverError = new Error('boom');
     const forbidden = new HttpException('Forbidden', HttpStatus.FORBIDDEN);
 
-    for (const error of [serverError, forbidden]) {
-      await expect(
-        runWithRequestContext(requestContext, () =>
+    await runWithRequestContext(requestContext, async () => {
+      for (const error of [serverError, forbidden]) {
+        await expect(
           lastValueFrom(
             interceptor.intercept({} as any, {
               handle: () => throwError(() => error),
             }),
           ),
-        ),
-      ).rejects.toBe(error);
-    }
+        ).rejects.toBe(error);
+      }
 
-    expect(wasErrorCaptured(serverError)).toBe(true);
-    expect(wasErrorCaptured(forbidden)).toBe(false);
-    expect(wasSecurityEventLogged(forbidden)).toBe(true);
-    expect(wasSecurityEventLogged(serverError)).toBe(false);
+      expect(wasErrorCaptured(serverError)).toBe(true);
+      expect(wasErrorCaptured(forbidden)).toBe(false);
+      expect(wasSecurityEventLogged(forbidden)).toBe(true);
+      expect(wasSecurityEventLogged(serverError)).toBe(false);
+    });
   });
 });

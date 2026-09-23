@@ -60,6 +60,7 @@ jobs:
           bash test/release-force-command.spec.sh
           bash test/sync-metrics-token.spec.sh
           node --test test/prometheus-alerts.spec.mjs
+          node --test test/monitoring-operations-dashboard.spec.mjs
 
       # prometheus-alerts.spec.mjs 断言的是规则的**语义**（阈值、选择器、
       # 用 delta 而不是存量…），它读不出 PromQL 语法错误 —— 一个打错的
@@ -133,8 +134,34 @@ jobs:
             echo "✅ $2 $3 → $1"
           }
           assert_route external-heartbeat alertname=Watchdog severity=none
+          assert_route external-heartbeat-failure alertname=AlertmanagerNotificationFailures severity=critical
           assert_route discord-critical   alertname=RedisDown severity=critical
           assert_route discord-warning    alertname=HostCpuSaturated severity=warning
+
+      - name: Validate optional log stack compose
+        env:
+          GRAFANA_ADMIN_PASSWORD: ci-placeholder-not-for-deployment
+        run: >-
+          docker compose
+          -f monitoring/docker-compose.yml
+          -f monitoring/docker-compose.prod.yml
+          -f monitoring/docker-compose.logs.yml
+          config --quiet
+
+      - name: Validate Loki config
+        run: |
+          docker run --rm --network none --read-only \
+            -v "$PWD/monitoring/loki/config.yml:/etc/loki/config.yml:ro" \
+            grafana/loki:3.7.0 \
+            -config.file=/etc/loki/config.yml -verify-config=true
+
+      - name: Validate Alloy config
+        run: |
+          docker run --rm --network none --read-only --user 473:473 \
+            -e LOG_ENVIRONMENT=test \
+            -v "$PWD/monitoring/alloy/config.alloy:/etc/alloy/config.alloy:ro" \
+            grafana/alloy:v1.19.2 validate \
+            --stability.level=experimental /etc/alloy/config.alloy
 
       - name: Lint
         run: npx eslint "{src,apps,libs,test}/**/*.ts"
@@ -212,6 +239,9 @@ jobs:
 
       - name: Schema/Migration Drift Check
         run: npx prisma migrate diff --from-config-datasource --to-schema prisma/schema.prisma --exit-code
+
+      - name: Verify PostgreSQL statement timeout
+        run: node -r ts-node/register -r tsconfig-paths/register test/database-statement-timeout.integration.ts
 
       # This job explicitly opts into the email-code bypass above so registration
       # stays deterministic; the suite boots the full AppModule against this DB.
@@ -304,7 +334,7 @@ jobs:
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
-      - name: Verify both non-root app colors can read the protected env
+      - name: Verify both non-root app colors can read the protected env and reuse log volumes
         run: |
           set -euo pipefail
           test ! -e .env.production
@@ -331,7 +361,11 @@ jobs:
             docker compose -p "$project" \
               -f docker-compose.prod.yml -f docker-compose.release.yml \
               run --rm --no-deps --entrypoint node "$service" \
-              -e "const fs=require('node:fs'); if(process.getuid()===0) throw new Error('app is root'); fs.accessSync('/app/.env.production',fs.constants.R_OK)"
+              -e "const fs=require('node:fs'); if(process.getuid()!==10001) throw new Error('unexpected app uid'); fs.accessSync('/app/.env.production',fs.constants.R_OK); fs.writeFileSync('/app/logs/.volume-compatibility','first')"
+            docker compose -p "$project" \
+              -f docker-compose.prod.yml -f docker-compose.release.yml \
+              run --rm --no-deps --entrypoint node "$service" \
+              -e "require('node:fs').appendFileSync('/app/logs/.volume-compatibility','-replacement')"
           done
 
       - name: Build Caddy edge image

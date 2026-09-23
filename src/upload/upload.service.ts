@@ -30,6 +30,7 @@ import { createLoggingConfig } from 'src/logging/logging.config';
 import { logExternalCallFailure } from 'src/logging/external-service.logger';
 import { logExternalCallSlow } from 'src/logging/performance-event.logger';
 import { reportOperationalError } from 'src/logging/error-aggregation.service';
+import { sanitizeLogValue } from 'src/logging/log-sanitizer';
 import {
   buildStoragePublicObjectBase,
   storagePublicObjectBaseFromConfig,
@@ -126,20 +127,6 @@ function errorRecord(error: unknown): Record<string, unknown> | null {
     : null;
 }
 
-function redactLogValue(value: string) {
-  return value.replace(
-    /(token|secret|password|authorization)=\S+/gi,
-    '$1=[redacted]',
-  );
-}
-
-function errorMessage(error: unknown, record: Record<string, unknown> | null) {
-  if (error instanceof Error && error.message.trim()) {
-    return error.message.trim();
-  }
-  return record ? stringField(record, 'message') : null;
-}
-
 function errorName(error: unknown, record: Record<string, unknown> | null) {
   if (error instanceof Error && error.name.trim()) {
     return error.name.trim();
@@ -152,30 +139,29 @@ function errorCode(record: Record<string, unknown> | null) {
   return stringField(record, 'Code') ?? stringField(record, 'code');
 }
 
-function formatMinioBootstrapError(error: unknown) {
-  if (typeof error === 'string' && error.trim()) {
-    return redactLogValue(error.trim());
-  }
+function startupStorageError(code: string, message: string) {
+  return Object.assign(new ServiceUnavailableException(message), {
+    startupCode: code,
+  });
+}
 
-  const record = errorRecord(error);
-  const metadata = errorRecord(record?.['$metadata']);
-  const message = errorMessage(error, record);
-  const name = errorName(error, record);
-  const code = errorCode(record);
-  const status = metadata ? numberField(metadata, 'httpStatusCode') : null;
-  const requestId = metadata ? stringField(metadata, 'requestId') : null;
-  const attempts = metadata ? numberField(metadata, 'attempts') : null;
+function safeProviderCode(record: Record<string, unknown> | null) {
+  const value = errorCode(record);
+  return value && /^[A-Za-z][A-Za-z0-9_.-]{0,63}$/.test(value) ? value : null;
+}
 
-  const parts = [
-    name ? `name=${redactLogValue(name)}` : null,
-    code ? `code=${redactLogValue(code)}` : null,
-    message ? `message=${redactLogValue(message)}` : null,
-    status ? `status=${status}` : null,
-    requestId ? `requestId=${redactLogValue(requestId)}` : null,
-    attempts ? `attempts=${attempts}` : null,
-  ].filter(Boolean);
+function safeProviderRequestId(metadata: Record<string, unknown> | null) {
+  if (!metadata) return null;
+  const value = stringField(metadata, 'requestId');
+  return value && /^[A-Za-z0-9._:/+-]{1,128}$/.test(value) ? value : null;
+}
 
-  return parts.length ? parts.join(' ') : 'UnknownError';
+function safeProviderAttempts(metadata: Record<string, unknown> | null) {
+  if (!metadata) return null;
+  const value = numberField(metadata, 'attempts');
+  return value !== null && Number.isInteger(value) && value >= 0 && value <= 100
+    ? value
+    : null;
 }
 
 function isMissingBucketError(error: unknown) {
@@ -394,7 +380,8 @@ export class UploadService implements OnModuleInit {
   async onModuleInit() {
     if (!this.enabled) {
       if (this.production) {
-        throw new ServiceUnavailableException(
+        throw startupStorageError(
+          'OBJECT_STORAGE_NOT_CONFIGURED',
           'Private media storage is not configured',
         );
       }
@@ -406,7 +393,8 @@ export class UploadService implements OnModuleInit {
     // 显式配置了却解析不出可用地址，说明配置错了；静默回落到直连域名正是本次
     // 要禁掉的行为，所以任何环境都拒绝启动，而不是只在 production 拒绝。
     if (this.deliveryUrlUnusable) {
-      throw new ServiceUnavailableException(
+      throw startupStorageError(
+        'OBJECT_STORAGE_DELIVERY_URL_INVALID',
         'OBJECT_STORAGE_DELIVERY_URL is not a usable https delivery base',
       );
     }
@@ -415,7 +403,8 @@ export class UploadService implements OnModuleInit {
       !this.manageBucket &&
       !this.externalDeliveryConfigured
     ) {
-      throw new ServiceUnavailableException(
+      throw startupStorageError(
+        'OBJECT_STORAGE_DELIVERY_URL_REQUIRED',
         'External media must use an explicitly configured rate-limited delivery URL',
       );
     }
@@ -425,7 +414,8 @@ export class UploadService implements OnModuleInit {
     try {
       this.ready = await this.bootstrap();
       if (!this.ready && this.production) {
-        throw new ServiceUnavailableException(
+        throw startupStorageError(
+          'OBJECT_STORAGE_POLICY_UNAVAILABLE',
           'Private media storage policy could not be applied',
         );
       }
@@ -868,10 +858,20 @@ export class UploadService implements OnModuleInit {
       // error（不是 warn）并且点名后果：这条失败意味着桶策略没换上，notes/* 可能
       // 仍然匿名可读，而应用照常发预签名 URL —— 表面上一切正常。readiness 探针
       // 的 objectStore 字段会同步报 policy-unconfirmed。
+      const record = errorRecord(error);
+      const metadata = errorRecord(record?.['$metadata']);
       this.logger.error(
-        `MinIO bootstrap attempt failed during ${step}: ${formatMinioBootstrapError(error)}. ` +
-          'The private-media bucket policy may not be in force — notes/* could still be anonymously readable.',
-        error instanceof Error ? error.stack : undefined,
+        sanitizeLogValue({
+          event: 'object_storage_bootstrap_failed',
+          operation: step,
+          providerCode: safeProviderCode(record),
+          providerRequestId: safeProviderRequestId(metadata),
+          attempts: safeProviderAttempts(metadata),
+          upstreamStatus: metadata
+            ? numberField(metadata, 'httpStatusCode')
+            : null,
+          error,
+        }),
       );
       reportOperationalError(error, {
         component: 'UploadService',

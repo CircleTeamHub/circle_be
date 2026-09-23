@@ -17,6 +17,8 @@ import {
 } from './chat.constants';
 import type { ChatMessageDto } from './chat.types';
 import { reportOperationalError } from 'src/logging/error-aggregation.service';
+import { diagnosticFailureDetails } from 'src/logging/http-failure.logger';
+import { sanitizeLogValue } from 'src/logging/log-sanitizer';
 
 /**
  * 聊天媒体 presign-on-read(根治 OpenIM「URL 固化进不可变消息体」的 P0)。
@@ -200,6 +202,33 @@ export class ChatMediaService implements OnModuleDestroy {
   }
 
   /**
+   * Persist deletion intent in the same transaction that erases message
+   * content. If Postgres is unavailable the tombstone transaction rolls back,
+   * so the key remains recoverable from the message instead of existing only
+   * in a best-effort callback.
+   */
+  async queueDeletions(
+    tx: Prisma.TransactionClient,
+    keys: string[],
+  ): Promise<void> {
+    const objectKeys = [...new Set(keys)].filter(
+      (key) =>
+        key.startsWith(CHAT_MEDIA_KEY_PREFIX) &&
+        !key.includes(`/${CHAT_NOTE_IMPORT_SEGMENT}`),
+    );
+    if (objectKeys.length === 0) return;
+    await tx.chatMediaDeletion.createMany({
+      data: objectKeys.map((objectKey) => ({
+        objectKey,
+        attempts: 0,
+        lastError: 'pending message media deletion',
+        nextAttemptAt: new Date(),
+      })),
+      skipDuplicates: true,
+    });
+  }
+
+  /**
    * 转发媒体时复制对象到转发者自己的命名空间。源 key 只从已通过消息可见性
    * 校验的数据库行读取；展示 URL 会被移除，目标消息只持久化新 key。
    */
@@ -301,7 +330,14 @@ export class ChatMediaService implements OnModuleDestroy {
   /** 落一条待删记录(幂等:同 key 重复入队只刷新失败原因)。 */
   private async enqueueDeletion(key: string, error: unknown): Promise<void> {
     const reason = error instanceof Error ? error.message : String(error);
-    this.logger.warn(`chat media delete failed key=${key}: ${reason}`);
+    this.logger.warn(
+      sanitizeLogValue({
+        event: 'chat_media_delete_failed',
+        operation: 'deleteObject',
+        objectKey: key,
+        error,
+      }),
+    );
     try {
       await this.prisma.chatMediaDeletion.upsert({
         where: { objectKey: key },
@@ -321,9 +357,12 @@ export class ChatMediaService implements OnModuleDestroy {
       // 连待办都落不下(库也挂了):只能记日志。这是唯一真正会丢 key 的路径,
       // 所以用 error 级别,让它在告警里看得见。
       this.logger.error(
-        `chat media delete could not be queued key=${key}: ${
-          dbError instanceof Error ? dbError.message : String(dbError)
-        }`,
+        sanitizeLogValue({
+          event: 'chat_media_delete_queue_failed',
+          operation: 'queueDelete',
+          objectKey: key,
+          error: dbError,
+        }),
       );
       reportOperationalError(dbError, {
         component: 'ChatMediaService',
@@ -427,16 +466,25 @@ export class ChatMediaService implements OnModuleDestroy {
           }
           if (attempts >= DELETE_MAX_ATTEMPTS) {
             this.logger.error(
-              `chat media delete dead-lettered key=${claimed.objectKey} after ${attempts} attempts`,
+              sanitizeLogValue({
+                event: 'chat_media_delete_dead_lettered',
+                operation: 'deleteObject',
+                deletionId: claimed.id,
+                objectKey: claimed.objectKey,
+                attempts,
+                error,
+              }),
             );
           }
         }
       }
     } catch (error) {
       this.logger.warn(
-        `chat media deletion sweep failed: ${
-          error instanceof Error ? error.message : String(error)
-        }`,
+        sanitizeLogValue({
+          event: 'chat_media_deletion_sweep_failed',
+          operation: 'drainPendingDeletions',
+          error,
+        }),
       );
     } finally {
       this.sweeping = false;
@@ -483,9 +531,13 @@ export class ChatMediaService implements OnModuleDestroy {
           signed.set(key, result.url);
         } catch (error) {
           this.logger.warn(
-            `presign failed key=${key}: ${
-              error instanceof Error ? error.message : String(error)
-            }`,
+            sanitizeLogValue({
+              event: 'chat_media_presign_failed',
+              operation: 'attachMediaUrls',
+              objectKey: key,
+              ...diagnosticFailureDetails(error),
+              error,
+            }),
           );
         }
       }),

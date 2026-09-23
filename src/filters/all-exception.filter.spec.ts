@@ -54,10 +54,7 @@ describe('AllExceptionFilter', () => {
     filter.catch(new ForbiddenException('nope'), host);
 
     expect(logger.warn).toHaveBeenCalledTimes(1);
-    const [, payload] = logger.warn.mock.calls[0] as [
-      string,
-      { userId?: string },
-    ];
+    const [payload] = logger.warn.mock.calls[0] as [{ userId?: string }];
     expect(payload.userId).toBe('user-123');
   });
 
@@ -190,9 +187,15 @@ describe('AllExceptionFilter error aggregation & security events', () => {
 
   const request = {
     method: 'GET',
-    url: '/api/v1/secure?x=1',
+    url: '/api/v1/auth/me?x=1',
     headers: {},
     query: {},
+  };
+  const requestContext = {
+    requestId: 'request-filter',
+    traceId: 'request-filter',
+    method: 'GET',
+    path: '/api/v1/auth/me',
   };
 
   it('forwards a 5xx raised outside the interceptor (guard / pipe) with request context', () => {
@@ -204,7 +207,7 @@ describe('AllExceptionFilter error aggregation & security events', () => {
         requestId: 'req-9',
         traceId: 'req-9',
         method: 'GET',
-        path: '/api/v1/secure',
+        path: '/api/v1/auth/me',
         userId: 'user-9',
       },
       () => filter.catch(error, hostFor(request)),
@@ -216,7 +219,7 @@ describe('AllExceptionFilter error aggregation & security events', () => {
         statusCode: 500,
         requestId: 'req-9',
         method: 'GET',
-        path: '/api/v1/secure',
+        path: '/api/v1/auth/me',
         userId: 'user-9',
       }),
     );
@@ -234,7 +237,7 @@ describe('AllExceptionFilter error aggregation & security events', () => {
       expect.any(Error),
       expect.objectContaining({
         method: 'GET',
-        path: '/api/v1/secure',
+        path: '/api/v1/auth/me',
         userId: 'u-1',
       }),
     );
@@ -243,9 +246,18 @@ describe('AllExceptionFilter error aggregation & security events', () => {
   it('does not re-report an error the interceptor already captured', () => {
     const { filter, aggregation } = createFilterWithAggregation();
     const error = new Error('already captured');
-    markErrorCaptured(error);
-
-    filter.catch(error, hostFor(request));
+    runWithRequestContext(
+      {
+        requestId: 'request-1',
+        traceId: 'request-1',
+        method: 'GET',
+        path: '/api/v1/auth/me',
+      },
+      () => {
+        markErrorCaptured(error);
+        filter.catch(error, hostFor(request));
+      },
+    );
 
     expect(aggregation.captureError).not.toHaveBeenCalled();
   });
@@ -262,7 +274,9 @@ describe('AllExceptionFilter error aggregation & security events', () => {
     const { filter, reply, logger, aggregation } =
       createFilterWithAggregation();
     aggregation.captureError.mockImplementation(() => {
-      throw new Error('sentry down');
+      throw Object.assign(new TypeError('sentry private failure'), {
+        code: 'ECONNREFUSED',
+      });
     });
 
     filter.catch(new Error('boom'), hostFor(request));
@@ -273,38 +287,43 @@ describe('AllExceptionFilter error aggregation & security events', () => {
       500,
     );
     expect(logger.error).toHaveBeenCalledWith(
-      expect.objectContaining({ event: 'error_aggregation_failed' }),
+      expect.objectContaining({
+        event: 'error_aggregation_failed',
+        failureName: 'TypeError',
+        failureCode: 'ECONNREFUSED',
+      }),
       'HttpError',
     );
   });
 
   it('logs a security event for an unclassified guard-raised 401 and skips ones the interceptor logged', () => {
     const { filter, logger } = createFilterWithAggregation();
+    runWithRequestContext(requestContext, () => {
+      filter.catch(
+        new UnauthorizedException('Custom guard rejected'),
+        hostFor(request),
+      );
 
-    filter.catch(
-      new UnauthorizedException('Custom guard rejected'),
-      hostFor(request),
-    );
+      expect(logger.warn).toHaveBeenCalledWith(
+        expect.objectContaining({
+          event: 'security_event',
+          securityEvent: 'auth_unauthorized',
+          statusCode: 401,
+          reason: 'unauthorized',
+        }),
+        'SecurityEvent',
+      );
 
-    expect(logger.warn).toHaveBeenCalledWith(
-      expect.objectContaining({
-        event: 'security_event',
-        securityEvent: 'auth_unauthorized',
-        statusCode: 401,
-        reason: 'Custom guard rejected',
-      }),
-      'SecurityEvent',
-    );
+      logger.warn.mockClear();
+      const alreadyLogged = new ForbiddenException('handled upstream');
+      markSecurityEventLogged(alreadyLogged);
+      filter.catch(alreadyLogged, hostFor(request));
 
-    logger.warn.mockClear();
-    const alreadyLogged = new ForbiddenException('handled upstream');
-    markSecurityEventLogged(alreadyLogged);
-    filter.catch(alreadyLogged, hostFor(request));
-
-    expect(logger.warn).not.toHaveBeenCalledWith(
-      expect.objectContaining({ event: 'security_event' }),
-      'SecurityEvent',
-    );
+      expect(logger.warn).not.toHaveBeenCalledWith(
+        expect.objectContaining({ event: 'security_event' }),
+        'SecurityEvent',
+      );
+    });
   });
 
   it.each(['token_expired', 'token_missing'] as const)(
@@ -312,25 +331,26 @@ describe('AllExceptionFilter error aggregation & security events', () => {
     (reason) => {
       const { filter, logger, reply } = createFilterWithAggregation();
       const exception = new UnauthorizedException();
-      markAuthFailureReason(exception, reason);
+      runWithRequestContext(requestContext, () => {
+        markAuthFailureReason(exception, reason);
+        filter.catch(exception, hostFor(request));
 
-      filter.catch(exception, hostFor(request));
-
-      expect(logger.warn).not.toHaveBeenCalledWith(
-        expect.objectContaining({ event: 'security_event' }),
-        'SecurityEvent',
-      );
-      // The plain 401 warn line is still written for http debugging.
-      expect(logger.warn).toHaveBeenCalledWith(
-        'Unauthorized',
-        expect.objectContaining({ status: 401 }),
-      );
-      expect(reply).toHaveBeenCalledWith(
-        expect.anything(),
-        { code: 401, message: 'Unauthorized', data: null },
-        401,
-      );
-      expect(wasSecurityEventLogged(exception)).toBe(false);
+        expect(logger.warn).not.toHaveBeenCalledWith(
+          expect.objectContaining({ event: 'security_event' }),
+          'SecurityEvent',
+        );
+        // The plain 401 warn line is still written for http debugging.
+        expect(logger.warn).toHaveBeenCalledWith(
+          expect.objectContaining({ event: 'http_error', statusCode: 401 }),
+          'HttpError',
+        );
+        expect(reply).toHaveBeenCalledWith(
+          expect.anything(),
+          { code: 401, message: 'Unauthorized', data: null },
+          401,
+        );
+        expect(wasSecurityEventLogged(exception)).toBe(false);
+      });
     },
   );
 
@@ -339,20 +359,21 @@ describe('AllExceptionFilter error aggregation & security events', () => {
     (reason) => {
       const { filter, logger } = createFilterWithAggregation();
       const exception = new UnauthorizedException();
-      markAuthFailureReason(exception, reason);
+      runWithRequestContext(requestContext, () => {
+        markAuthFailureReason(exception, reason);
+        filter.catch(exception, hostFor(request));
 
-      filter.catch(exception, hostFor(request));
-
-      expect(logger.warn).toHaveBeenCalledWith(
-        expect.objectContaining({
-          event: 'security_event',
-          securityEvent: 'auth_unauthorized',
-          statusCode: 401,
-          metadata: { authFailureReason: reason },
-        }),
-        'SecurityEvent',
-      );
-      expect(wasSecurityEventLogged(exception)).toBe(true);
+        expect(logger.warn).toHaveBeenCalledWith(
+          expect.objectContaining({
+            event: 'security_event',
+            securityEvent: 'auth_unauthorized',
+            statusCode: 401,
+            metadata: { authFailureReason: reason },
+          }),
+          'SecurityEvent',
+        );
+        expect(wasSecurityEventLogged(exception)).toBe(true);
+      });
     },
   );
 
@@ -366,7 +387,7 @@ describe('AllExceptionFilter error aggregation & security events', () => {
         event: 'security_event',
         securityEvent: 'access_forbidden',
         statusCode: 403,
-        reason: 'wrong audience',
+        reason: 'forbidden',
       }),
       'SecurityEvent',
     );
@@ -404,7 +425,6 @@ describe('AllExceptionFilter error aggregation & security events', () => {
     expect(logger.error).toHaveBeenCalledWith(
       expect.objectContaining({
         event: 'security_event_log_failed',
-        message: 'transport down',
       }),
       'HttpError',
     );

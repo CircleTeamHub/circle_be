@@ -132,6 +132,85 @@ function waitForMessage(socket: WebSocket): Promise<unknown> {
 
 const tick = (ms = 60) => new Promise((resolve) => setTimeout(resolve, ms));
 
+describe('RealtimeGateway failure logging privacy', () => {
+  it('redacts pre-auth, authenticated socket and initial snapshot errors', async () => {
+    const warn = jest.spyOn(Logger.prototype, 'warn').mockImplementation();
+    const report = jest
+      .spyOn(errorAggregation, 'reportOperationalError')
+      .mockImplementation();
+    const failure = Object.assign(
+      new Error('SELECT private_messages private-chat-text'),
+      { code: 'ECONNRESET', privateValue: 'private-socket-metadata' },
+    );
+    const realtime = {
+      getConnectionCount: jest.fn().mockReturnValue(0),
+      registerPendingClient: jest.fn(),
+      promotePendingClient: jest.fn().mockReturnValue(true),
+      unregisterClient: jest.fn(),
+      emitSnapshot: jest.fn().mockRejectedValue(failure),
+    };
+    const gateway = new RealtimeGateway(
+      {
+        verify: jest
+          .fn()
+          .mockReturnValue({ sub: 'user-1', accountId: 'account-1' }),
+      } as any,
+      realtime as any,
+      { verify: jest.fn().mockResolvedValue('active') } as any,
+    );
+    const socket = Object.assign(new EventEmitter(), {
+      readyState: WebSocket.OPEN,
+      close: jest.fn(),
+    });
+    try {
+      await (gateway as any).handleConnection(socket);
+      socket.emit('error', failure);
+      expect(warn).toHaveBeenCalledWith(
+        expect.objectContaining({
+          event: 'realtime_socket_error',
+          operation: 'handleConnection',
+          errorCode: 'ECONNRESET',
+        }),
+      );
+      socket.emit(
+        'message',
+        Buffer.from(JSON.stringify({ type: 'auth', token: 'test-token' })),
+      );
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      socket.emit('error', failure);
+      expect(warn).toHaveBeenCalledWith(
+        expect.objectContaining({
+          event: 'realtime_socket_error',
+          operation: 'acceptAuthenticatedSocket',
+          userId: 'user-1',
+          errorCode: 'ECONNRESET',
+        }),
+      );
+      expect(warn).toHaveBeenCalledWith(
+        expect.objectContaining({
+          event: 'realtime_snapshot_failed',
+          operation: 'emitSnapshot',
+          userId: 'user-1',
+        }),
+      );
+      expect(JSON.stringify(warn.mock.calls)).not.toMatch(
+        /SELECT|private_messages|private-chat-text|private-socket-metadata/,
+      );
+      expect(report).toHaveBeenCalledWith(failure, {
+        component: 'RealtimeGateway',
+        operation: 'emitSnapshot',
+        kind: 'websocket',
+      });
+      expect(socket.close).not.toHaveBeenCalled();
+    } finally {
+      socket.emit('close');
+      gateway.onModuleDestroy();
+      warn.mockRestore();
+      report.mockRestore();
+    }
+  });
+});
+
 describe('RealtimeGateway session revocation', () => {
   let httpServer: Server;
   let gateway: RealtimeGateway;

@@ -1,6 +1,7 @@
 import {
   BadRequestException,
   ForbiddenException,
+  Logger,
   NotFoundException,
 } from '@nestjs/common';
 import { ChatErrorCode } from 'src/common/app-error-codes';
@@ -70,6 +71,7 @@ describe('ChatService', () => {
     attachMediaUrls: jest.fn().mockResolvedValue(undefined),
     copyForForward: jest.fn(),
     deleteObjects: jest.fn().mockResolvedValue(undefined),
+    queueDeletions: jest.fn().mockResolvedValue(undefined),
     attachNoteImportReferences: jest.fn().mockResolvedValue(undefined),
     releaseNoteImportReferences: jest.fn().mockResolvedValue(undefined),
     drainPendingDeletions: jest.fn().mockResolvedValue(undefined),
@@ -1580,6 +1582,38 @@ describe('ChatService', () => {
   });
 
   describe('last seen', () => {
+    it.each([
+      new Error('SELECT private_chat FROM messages: private chat text'),
+      'SELECT private_chat FROM messages: private chat text',
+    ])(
+      'redacts caught presence failures before logging (%p)',
+      async (error) => {
+        const warning = jest
+          .spyOn(Logger.prototype, 'warn')
+          .mockImplementation();
+        try {
+          privacySettings.getSettings.mockRejectedValueOnce(error);
+          prisma.user.updateMany.mockRejectedValueOnce(error);
+
+          await expect(service.isPresenceVisible('u1')).resolves.toBe(false);
+          await expect(service.touchLastOnline('u1')).resolves.toBeUndefined();
+
+          expect(JSON.stringify(warning.mock.calls)).not.toContain('SELECT');
+          expect(JSON.stringify(warning.mock.calls)).not.toContain(
+            'private chat text',
+          );
+          expect(warning).toHaveBeenCalledWith(
+            expect.objectContaining({
+              event: 'chat_presence_lookup_failed',
+              userId: 'u1',
+            }),
+          );
+        } finally {
+          warning.mockRestore();
+        }
+      },
+    );
+
     it('reads lastOnline as ISO strings and reports never-seen users as null', async () => {
       prisma.user.findMany.mockResolvedValueOnce([
         { id: 'u2', lastOnline: new Date('2026-09-11T08:00:00.000Z') },
@@ -1851,6 +1885,7 @@ describe('ChatService', () => {
     });
 
     it('still returns the conversation when joining a room fails', async () => {
+      const warning = jest.spyOn(Logger.prototype, 'warn').mockImplementation();
       prisma.user.findUnique.mockResolvedValue(peer);
       prisma.block.findFirst.mockResolvedValue(null);
       prisma.chatConversation.findUnique.mockResolvedValue(conversationRow);
@@ -1863,6 +1898,13 @@ describe('ChatService', () => {
       await expect(
         service.getOrCreateDirectConversation('u1', 'u2'),
       ).resolves.toMatchObject({ id: 'conv-9' });
+      expect(warning).toHaveBeenCalledWith(
+        expect.objectContaining({
+          event: 'chat_room_join_failed',
+          memberId: 'u2',
+        }),
+      );
+      warning.mockRestore();
     });
 
     // ─── 结算专用解析 ────────────────────────────────────────────────────
@@ -3360,6 +3402,10 @@ describe('ChatService', () => {
       );
       // 撤回即焚:对象存储里的媒体一并删,只清 DB 等于没撤。
       expect(media.deleteObjects).toHaveBeenCalledWith([
+        'chat/u1/a.jpg',
+        'chat/u1/a.t.jpg',
+      ]);
+      expect(media.queueDeletions).toHaveBeenCalledWith(prisma, [
         'chat/u1/a.jpg',
         'chat/u1/a.t.jpg',
       ]);
@@ -6000,6 +6046,9 @@ describe('ChatService', () => {
         }),
       );
       expect(media.deleteObjects).toHaveBeenCalledWith(['chat/u1/a.jpg']);
+      expect(media.queueDeletions).toHaveBeenCalledWith(prisma, [
+        'chat/u1/a.jpg',
+      ]);
     });
   });
 

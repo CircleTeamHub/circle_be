@@ -15,6 +15,21 @@ scrape_configs:
     static_configs:
       - targets: ['localhost:9090']
 
+  - job_name: alertmanager
+    static_configs:
+      - targets: ['alertmanager:9093']
+
+  - job_name: grafana
+    static_configs:
+      - targets: ['grafana:3000']
+
+  # The optional logs overlay mounts targets into this otherwise-empty path.
+  # No target series exists in metrics-only installs, so optional services do
+  # not create false TargetDown alerts when the overlay is disabled.
+  - job_name: logs-pipeline
+    file_sd_configs:
+      - files: ['/etc/prometheus/log-targets/*.yml']
+
   # The circle_be backend running on the host. Restart the backend on the new
   # code first, or this target shows DOWN (old build has no /metrics).
   - job_name: circle-be

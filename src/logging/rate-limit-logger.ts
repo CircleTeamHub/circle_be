@@ -2,6 +2,8 @@ import { LoggerService } from '@nestjs/common';
 import { Request, Response } from 'express';
 import { getRequestContext } from './request-context';
 import { logSecurityEvent } from './security-event.logger';
+import { attemptDiagnostic } from './http-failure.logger';
+import { safeLogPath } from './log-sanitizer';
 
 interface RateLimitLoggerOptions {
   enabled: boolean;
@@ -12,7 +14,7 @@ interface RateLimitLoggerOptions {
 
 function readPath(req: Request): string {
   const rawPath = req.originalUrl || req.url || '';
-  return rawPath.split('?')[0] || '/';
+  return safeLogPath(rawPath);
 }
 
 function readUserId(req: Request): string | undefined {
@@ -42,29 +44,32 @@ export function createRateLimitHandler(
     );
 
     if (options.enabled) {
-      logger.warn(
-        {
-          event: 'rate_limit_hit',
-          limiterName: options.limiterName,
-          method: req.method,
-          path: readPath(req),
-          statusCode,
-          requestId: requestContext?.requestId,
-          traceId: requestContext?.traceId,
-          userId: readUserId(req),
-          ip: req.ip || req.socket?.remoteAddress,
-        },
-        'RateLimit',
+      attemptDiagnostic(() =>
+        logger.warn(
+          {
+            event: 'rate_limit_hit',
+            limiterName: options.limiterName,
+            method: req.method,
+            path: readPath(req),
+            statusCode,
+            requestId: requestContext?.requestId,
+            traceId: requestContext?.traceId,
+            userId: readUserId(req),
+          },
+          'RateLimit',
+        ),
       );
     }
 
-    logSecurityEvent(logger, {
-      enabled: options.securityLogOn,
-      securityEvent: 'rate_limit_hit',
-      statusCode,
-      userId: readUserId(req),
-      metadata: { limiterName: options.limiterName },
-    });
+    attemptDiagnostic(() =>
+      logSecurityEvent(logger, {
+        enabled: options.securityLogOn,
+        securityEvent: 'rate_limit_hit',
+        statusCode,
+        userId: readUserId(req),
+        metadata: { limiterName: options.limiterName },
+      }),
+    );
 
     return res.status(statusCode).json(responseMessage);
   };

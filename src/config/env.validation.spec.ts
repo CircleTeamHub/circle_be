@@ -113,6 +113,45 @@ describe('createEnvValidationSchema', () => {
     expect(value.OBJECT_STORAGE_MANAGE_BUCKET).toBe(true);
   });
 
+  it('normalizes structured logging defaults', () => {
+    const env = {
+      ...baseEnv,
+      DATABASE_URL: 'postgresql://user:pass@localhost:5432/db',
+    };
+
+    const { error, value } = createEnvValidationSchema(env).validate(env);
+
+    expect(error).toBeUndefined();
+    expect(value).toMatchObject({
+      LOG_SERVICE_NAME: 'circle-be',
+      LOG_LEVEL: 'info',
+      SLOW_EXTERNAL_MS: 1000,
+      SLOW_DB_OPERATION_MS: 1000,
+      DATABASE_STATEMENT_TIMEOUT_MS: 15000,
+    });
+    expect(value.LOG_FILE_ON).toBeUndefined();
+  });
+
+  it.each([
+    ['LOG_FILE_ON', 'tru'],
+    ['LOG_SERVICE_NAME', 'service name with spaces'],
+    ['LOG_SERVICE_NAME', 'operator@example.com'],
+    ['LOG_LEVEL', 'trace'],
+    ['SLOW_EXTERNAL_MS', 'fast'],
+    ['SLOW_DB_OPERATION_MS', '15OO'],
+    ['DATABASE_STATEMENT_TIMEOUT_MS', '15OO'],
+  ])('rejects malformed structured logging setting %s=%s', (key, setting) => {
+    const env = {
+      ...baseEnv,
+      DATABASE_URL: 'postgresql://user:pass@localhost:5432/db',
+      [key]: setting,
+    };
+
+    const { error } = createEnvValidationSchema(env).validate(env);
+
+    expect(error?.message).toContain(key);
+  });
+
   it('accepts Tencent COS virtual-hosted object storage configuration', () => {
     const env = {
       ...baseEnv,

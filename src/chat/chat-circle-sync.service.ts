@@ -12,6 +12,8 @@ import { RedisService } from 'src/redis/redis.service';
 import { ChatBroadcastService } from './chat-broadcast.service';
 import { ChatGroupEventService } from './chat-group-event.service';
 import { ChatSystemMessageService } from './chat-system-message.service';
+import { sanitizeLogValue } from '../logging/log-sanitizer';
+import { attemptDiagnostic } from '../logging/http-failure.logger';
 
 /**
  * 不再持有群聊的管理态。DISABLING/RESTORING 也算在内:处理中的圈子
@@ -27,6 +29,14 @@ const DISABLED_ADMIN_STATES = new Set<string>([
   'SYNC_FAILED',
   'DISMISSED',
 ]);
+
+function safePrismaCode(error: unknown): string | undefined {
+  const code =
+    error && typeof error === 'object'
+      ? Object.getOwnPropertyDescriptor(error, 'code')?.value
+      : undefined;
+  return typeof code === 'string' && /^P\d{4}$/.test(code) ? code : undefined;
+}
 
 /**
  * 圈子成员 ←→ 群会话座位的同步(自研聊天版的 group-sync)。
@@ -96,8 +106,15 @@ export class ChatCircleSyncService {
         try {
           changed = await this.scanChangedCircles(since);
         } catch (error) {
-          this.logger.error(
-            `reconcile scan failed: ${error instanceof Error ? error.message : String(error)}`,
+          attemptDiagnostic(() =>
+            this.logger.error(
+              sanitizeLogValue({
+                event: 'chat_circle_sync_failed',
+                operation: 'reconcile_scan',
+                errorCode: safePrismaCode(error),
+                error,
+              }),
+            ),
           );
           // 扫描失败 = 这一轮一个圈子都没对账。不上报的话包装器会记成成功。
           reportHandledJobFailure();
@@ -129,10 +146,15 @@ export class ChatCircleSyncService {
         if (this.retryQueue.size < ChatCircleSyncService.RETRY_QUEUE_MAX) {
           this.retryQueue.add(circleID);
         }
-        this.logger.warn(
-          `reconcile circle ${circleID} failed: ${
-            error instanceof Error ? error.message : String(error)
-          }`,
+        attemptDiagnostic(() =>
+          this.logger.warn(
+            sanitizeLogValue({
+              event: 'chat_circle_sync_failed',
+              operation: 'reconcile_circle',
+              circleId: circleID,
+              error,
+            }),
+          ),
         );
       }
     }
@@ -322,10 +344,15 @@ export class ChatCircleSyncService {
             result.conversationId,
           );
         } catch (error: unknown) {
-          this.logger.warn(
-            `join room failed user=${userID}: ${
-              error instanceof Error ? error.message : String(error)
-            }`,
+          attemptDiagnostic(() =>
+            this.logger.warn(
+              sanitizeLogValue({
+                event: 'chat_circle_sync_failed',
+                operation: 'join_room',
+                userId: userID,
+                error,
+              }),
+            ),
           );
         }
         // 个人事件:会话即刻出现在本人列表里,不必等下一次全量拉取。
@@ -348,10 +375,15 @@ export class ChatCircleSyncService {
       void this.broadcast
         .removeUserFromConversation(userID, result.conversationId)
         .catch((error: unknown) =>
-          this.logger.warn(
-            `leave room failed user=${userID}: ${
-              error instanceof Error ? error.message : String(error)
-            }`,
+          attemptDiagnostic(() =>
+            this.logger.warn(
+              sanitizeLogValue({
+                event: 'chat_circle_sync_failed',
+                operation: 'leave_room',
+                userId: userID,
+                error,
+              }),
+            ),
           ),
         );
       // 对账分不清主动退出还是被移出,统一 removed(UI 行为一致:收走会话)。
@@ -425,22 +457,31 @@ export class ChatCircleSyncService {
     try {
       await this.broadcast.removeUserFromConversation(userId, conversationId);
     } catch (error: unknown) {
-      this.logger.warn(
-        `detach seat failed user=${userId} conversation=${conversationId}: ${
-          error instanceof Error ? error.message : String(error)
-        }`,
+      attemptDiagnostic(() =>
+        this.logger.warn(
+          sanitizeLogValue({
+            event: 'chat_circle_sync_failed',
+            operation: 'detach_seat',
+            userId,
+            conversationId,
+            error,
+          }),
+        ),
       );
       // 离不了房就断连接:重连时 handleConnection 会按当前座位重新派生房间,
       // 而他已经没有这个会话的座位了。
       try {
         await this.broadcast.disconnectUserSockets(userId);
       } catch (disconnectError: unknown) {
-        this.logger.error(
-          `detach seat could not evict sockets user=${userId}: ${
-            disconnectError instanceof Error
-              ? disconnectError.message
-              : String(disconnectError)
-          }`,
+        attemptDiagnostic(() =>
+          this.logger.error(
+            sanitizeLogValue({
+              event: 'chat_circle_sync_failed',
+              operation: 'evict_sockets',
+              userId,
+              error: disconnectError,
+            }),
+          ),
         );
       }
     }
@@ -460,10 +501,15 @@ export class ChatCircleSyncService {
       void this.systemMessage
         .emit(conversationId, { kind: 'member-left' })
         .catch((error: unknown) =>
-          this.logger.warn(
-            `member-left notice failed conversation=${conversationId}: ${
-              error instanceof Error ? error.message : String(error)
-            }`,
+          attemptDiagnostic(() =>
+            this.logger.warn(
+              sanitizeLogValue({
+                event: 'chat_circle_sync_failed',
+                operation: 'member_left_notice',
+                conversationId,
+                error,
+              }),
+            ),
           ),
         );
     }
@@ -495,10 +541,15 @@ export class ChatCircleSyncService {
       void this.broadcast
         .removeUserFromConversation(userID, conversation.id)
         .catch((error: unknown) =>
-          this.logger.warn(
-            `evict room failed user=${userID}: ${
-              error instanceof Error ? error.message : String(error)
-            }`,
+          attemptDiagnostic(() =>
+            this.logger.warn(
+              sanitizeLogValue({
+                event: 'chat_circle_sync_failed',
+                operation: 'evict_room',
+                userId: userID,
+                error,
+              }),
+            ),
           ),
         );
       this.broadcast.emitConversationChange(userID, {
@@ -547,10 +598,15 @@ export class ChatCircleSyncService {
         await this.systemMessage.emit(conversationId, { kind: 'member-left' });
       }
     } catch (error) {
-      this.logger.warn(
-        `membership notice failed conversation=${conversationId}: ${
-          error instanceof Error ? error.message : String(error)
-        }`,
+      attemptDiagnostic(() =>
+        this.logger.warn(
+          sanitizeLogValue({
+            event: 'chat_circle_sync_failed',
+            operation: 'membership_notice',
+            conversationId,
+            error,
+          }),
+        ),
       );
     }
   }

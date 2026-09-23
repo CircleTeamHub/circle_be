@@ -17,7 +17,7 @@ import {
 import { RedisService } from 'src/redis/redis.service';
 import { ChatErrorCode, type AppErrorCode } from 'src/common/app-error-codes';
 import { reportOperationalError } from 'src/logging/error-aggregation.service';
-import { resolveRequestId } from 'src/logging/request-context';
+import { randomUUID } from 'node:crypto';
 import {
   CHAT_EVENTS,
   CHAT_RATE_LIMITS,
@@ -95,7 +95,8 @@ type EngineConnectionError = {
 
 const CONNECTION_TRACE_HEADER = 'x-connection-trace-id';
 const GUEST_CLIENT_TYPE_SET = new Set<string>(GUEST_CLIENT_MESSAGE_TYPES);
-const SAFE_CONNECTION_TRACE_ID = /^ws-[a-z0-9-]{8,96}$/i;
+const SAFE_CONNECTION_TRACE_ID =
+  /^ws-[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 const CHAT_AUTH_FAILURE_REASONS: ReadonlySet<ChatAuthFailureReason> = new Set([
   'missing_token',
   'invalid_token',
@@ -121,8 +122,8 @@ function safeConnectionTraceId(value: unknown): string | undefined {
     : undefined;
 }
 
-function resolveConnectionTraceId(value: unknown): string {
-  return resolveRequestId(safeConnectionTraceId(value));
+function resolveConnectionTraceId(trustedProxyValue: unknown): string {
+  return safeConnectionTraceId(trustedProxyValue) ?? `ws-${randomUUID()}`;
 }
 
 function engineRejectionReason(code: unknown): ChatConnectionRejectionReason {
@@ -367,12 +368,9 @@ export class ChatGateway implements OnModuleDestroy {
     const header = firstHeader(
       socket.handshake.headers[CONNECTION_TRACE_HEADER],
     );
-    const authTrace = (
-      socket.handshake.auth as UntrustedHandshakeAuth | undefined
-    )?.traceId;
-    const traceId = resolveConnectionTraceId(
-      safeConnectionTraceId(header) ?? safeConnectionTraceId(authTrace),
-    );
+    // Caddy overwrites this header with its request UUID. Auth payloads are
+    // client-controlled and must never become log correlation identifiers.
+    const traceId = resolveConnectionTraceId(header);
     socket.data.connectionTraceId = traceId;
     return traceId;
   }

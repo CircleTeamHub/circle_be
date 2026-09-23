@@ -1,0 +1,66 @@
+logging {
+  level  = "warn"
+  format = "json"
+}
+
+loki.source.file "circle" {
+  targets = [{
+    __path__         = "/var/log/circle/{blue,green}/application-*.log*",
+    __path_exclude__ = "/var/log/circle/**/*.gz",
+    service         = "circle-be",
+    environment     = sys.env("LOG_ENVIRONMENT"),
+  }]
+  file_match {
+    enabled     = true
+    sync_period = "5s"
+  }
+  forward_to = [loki.process.circle.receiver]
+}
+
+loki.process "circle" {
+  stage.json {
+    expressions = { level = "level", timestamp = "timestamp" }
+    // Keep legacy text lines during the binary rollback compatibility window.
+    // They receive level=unknown below instead of disappearing from Loki.
+    drop_malformed = false
+  }
+  stage.labels {
+    values = { level = "level" }
+  }
+  stage.match {
+    selector = "{level!~\"error|warn|info|http|verbose|debug|silly\"}"
+    // Pre-sanitizer rollback images can emit arbitrary prose. Keep a safe
+    // occurrence marker for rollback visibility, never the untrusted content.
+    stage.replace {
+      expression = ".+"
+      replace    = "legacy rollback log content redacted by collector"
+    }
+    stage.static_labels {
+      values = { level = "unknown" }
+    }
+  }
+  stage.timestamp {
+    source            = "timestamp"
+    format            = "RFC3339Nano"
+    action_on_failure = "skip"
+  }
+  // File paths, release/container identities and correlation IDs must never
+  // become index labels. The safe JSON line stays available to `| json`.
+  stage.label_keep {
+    values = ["service", "environment", "level"]
+  }
+  forward_to = [loki.write.local.receiver]
+}
+
+loki.write "local" {
+  endpoint {
+    url = "http://loki:3100/loki/api/v1/push"
+    min_backoff_period  = "1s"
+    max_backoff_period  = "30s"
+    max_backoff_retries = 20
+  }
+  wal {
+    enabled         = true
+    max_segment_age = "1h"
+  }
+}

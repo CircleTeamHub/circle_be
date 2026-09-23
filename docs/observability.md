@@ -1,9 +1,12 @@
 # 可观测性总览 —— 各工具检测什么数据
 
-本项目的监控分**三条线**：
+本项目的可观测性分**四条线**：
+
+> 本文描述代码和部署配置的能力，不代表本轮已验证线上接收或完成部署。2026-09-22 补齐：客户端请求关联、Sentry启动/进程边界、cron抓取标签修复、监控系统自监控和 Operations 总览面板。真实告警投递、原生崩溃和预生产 E2E 需上线前单独验收。
 
 - **错误监控**（出了什么错 / 崩溃）→ Sentry
 - **指标监控**（系统运行状态）→ Prometheus + Grafana + exporters
+- **诊断日志**（一次请求或任务到底经历了什么）→ 脱敏 JSON + 可选 Loki / Alloy
 - **业务分析**（用户行为 / 转化）→ 待接（PostHog 等）
 
 > 详细参考：[logging.md](./logging.md)（日志）· [metrics.md](./metrics.md)（指标）· [../monitoring/README.md](../monitoring/README.md)（监控栈）
@@ -14,7 +17,8 @@
 
 | 工具                | 哪条线     | 检测 / 存储什么数据                         | 现状                      |
 | ------------------- | ---------- | ------------------------------------------- | ------------------------- |
-| **Sentry**          | 错误       | 异常、崩溃、堆栈、出错上下文；可选性能追踪  | 后端 ✅ 上线 · 前端 ✅ 代码就绪(建包配 DSN) |
+| **Sentry**          | 错误       | 异常、崩溃、堆栈、出错上下文；可选性能追踪  | 前后端代码就绪；本轮未核验线上接收 |
+| **Winston / Loki / Alloy** | 日志 | HTTP、业务、安全、外部依赖、慢数据库操作、任务运行上下文 | 代码及可选采集配置就绪；须经部署流程启用 |
 | **Prometheus**      | 指标       | 时序指标的**存储 + 抓取**（存下面所有指标） | ✅ `:9090`                |
 | 后端 `/metrics`     | 指标       | 接口 QPS/错误/延迟、业务事件、进程 CPU/内存 | ✅                        |
 | **node-exporter**   | 指标       | 机器：CPU / 内存 / 磁盘 / 网络 / 负载       | ✅（Mac 上 = Docker VM）  |
@@ -36,9 +40,10 @@
 
 ### 1. Sentry —— "哪里坏了 / 为什么"
 
-抓**出错的瞬间**：异常、崩溃，附完整上下文，给工程师修 bug。
+抓**出错的瞬间**：异常、崩溃，附白名单运维上下文，给工程师修 bug。
 
 - **后端**（`LOG_AGGREGATION_PROVIDER=sentry` + `SENTRY_DSN` 时启用）：
+  - 在 Nest 导入前初始化一次；启动失败、未处理 rejection 和 uncaught exception 由应用统一兜底，避免 SDK 重复捕获。rejection 继续运行，致命异常最多等待 2 秒 flush 后非零退出；错误消息不会原样写到 stderr
   - 自动：整条 HTTP 管线里的 **5xx** —— 路由处理器（`ErrorLoggingInterceptor`）以及
     守卫 / 管道 / 中间件 / 未知 Prisma 错误（`AllExceptionFilter`、`PrismaExceptionFilter`）；
     `handled-errors` 标记保证一次异常只报一次，Prisma 的 P2002/P2025 这类预期内 4xx 不报
@@ -46,7 +51,7 @@
     onTick 异常直接 console.error 吞掉，进程级集成收不到）
   - 运维性失败：聊天 / 实时网关处理失败、outbox 死信（推送、转账卡、管理台群操作、
     好友聊天回放）、敏感词表 fail-open、桶策略未生效、Expo / SMTP / Redis / LiveKit 故障
-  - 每条带：错误 + 堆栈 + **脱敏**标签（requestId / 归一化 route / method / userId / status /
+  - 每条带：安全错误类型 + 堆栈位置 + **脱敏**标签（requestId / 归一化 route / method / status /
     component / operation / kind）；不带 body/header/token
   - 可选性能追踪：`SENTRY_TRACES_SAMPLE_RATE`（默认 0），transaction 同样按白名单重建
 - **前端**（`EXPO_PUBLIC_SENTRY_DSN` 时启用）：
@@ -54,14 +59,15 @@
   - 手动：expo-router ErrorBoundary 接住的渲染错误（`RouteErrorBoundary`）；API 网络 / 5xx；
     业务 catch 站点统一走 `reportHandledFailure`（去重 + 面包屑；ApiError 等预期失败不进 Sentry）：
     启动 / 存储降级、聊天同步与本地库、通话、推送注册、应用更新、各屏幕的非 API 失败
-  - 带：设备型号 / OS / App 版本 / release；消息文本一律脱敏，不带账号标识
-- **现状**：后端已上线 sentry.io 并验证；前端代码就绪，**待重建 App 激活**
+  - JS 事件按白名单清洗，不带账号标识；安全 requestId 可关联后端日志，不进入 fingerprint
+  - 原生 SDK 自行生成的崩溃不经过 JS beforeSend；需单独验收原生或服务端清洗，不能声称所有原生异常文本已脱敏
+- **现状**：前后端代码已补齐；前端需带 DSN 重建，后端需按既有流程发布。本轮没有向真实 Sentry 发送事件。
 
 ### 2. Prometheus —— 指标的存储与抓取
 
 时序数据库 + 抓取器。每 **15s** 从各 target 拉 `/metrics`，存成时间序列，供 PromQL 查询、Grafana 画图、Alertmanager 判断。**本身不产生数据**，是"存储 + 查询引擎"。
 
-- 抓取目标：后端 `/metrics`、node-exporter、cAdvisor；生产还额外抓 postgres-exporter、redis-exporter
+- 抓取目标：后端 `/metrics`、node-exporter、cAdvisor、Alertmanager；生产还抓 postgres-exporter、redis-exporter 和公网 blackbox；启用日志 overlay 时增加 Loki/Alloy 自监控
 - 保留策略：15 天 / 8GB，先到者为准（`--storage.tsdb.retention.*`）
 - 入口 `:9090`：**Status → Targets** 看抓取健康；**Graph** 跑 PromQL
 
@@ -90,19 +96,20 @@
 
 ### 6. Grafana —— 可视化（不产数据）
 
-连 Prometheus 做大盘。已自动 provision：Prometheus 数据源 + 两张大盘 ——
+连 Prometheus 做大盘。配置自动 provision：Prometheus 数据源 + 三张大盘 ——
 **「circle_be — RED」**（每路由请求速率 / 5xx 错误率 / p95 延迟 / 进程内存 / 聊天指标）
 和 **「circle_be — Jobs, Queues & Datastores」**（任务心跳滞后与失败率、outbox 积压/死信、
-pg 连接池排队、Postgres 连接与状态、Redis 内存与被拒连接）。
+pg 连接池排队、Postgres 连接与状态、Redis 内存与被拒连接），以及
+**「circle_be — Operations Overview」**（告警状态、抓取目标、告警投递失败、规则执行错误、入口/TLS、主机余量、可选 Alloy 重试与丢弃）。
 入口 `:3001`，密码取自 `monitoring/.env`（**没有默认值**，且只在数据卷首次启动时生效 —— 见 monitoring/README.md 的首启动坑）。
 
 ### 7. Alertmanager —— 告警路由（不产数据）
 
-Prometheus 规则越界 → 发给它 → 去重 / 聚合 / 静默 / 路由。共 30 条规则，覆盖
-接口 RED、聊天容量、主机与容器、定时任务与 outbox、连接池与数据存储。
+Prometheus 规则越界 → 发给它 → 去重 / 聚合 / 静默 / 路由。当前规则文件有 40 条规则，覆盖
+接口 RED、聊天容量、主机与容器、定时任务与 outbox、连接池与数据存储、公网探测、监控组件自身故障。
 
 出口按 severity 分级：`critical` → Discord（10s 聚合 / 1h 重提），`warning` → Discord
-（30s / 4h），`Watchdog` → **外部**心跳服务。另有 3 条抑制规则，避免一次故障被报成
+（30s / 4h），`Watchdog` → **外部**心跳服务。另有抑制规则，避免一次故障被报成
 五种叫法（详见 monitoring/README.md「Alert tiers and inhibition」）。入口 `:9093`。
 
 ### 8. 自建聊天指标
@@ -121,15 +128,9 @@ Prometheus 规则越界 → 发给它 → 去重 / 聚合 / 静默 / 路由。�
 
 ### 9. 定时任务与 outbox —— 「什么都没发生」这类故障
 
-这一组补的是此前**完全没有信号**的盲区。理解它之前先看清两件事：
-
-- Sentry 的 `captureError` 只在 `ErrorLoggingInterceptor` 里被调用，也就是**只覆盖
-  HTTP 5xx**。定时任务抛出的异常还能被 `@sentry/node` 的进程级集成兜住，但——
-- 4 个 outbox 处理器都**自己 catch 异常**、写进行上的 `lastError` 然后继续。异常
-  永远不逃出去：Sentry 收不到事件，RED 大盘一切正常。队列堵死时没有任何人会知道。
-
-`notification-push-outbox` 甚至专门设计了 `TERMINAL` 死信状态，注释写着「让积压
-对运维可见」—— 在此之前没有任何东西在看它。
+这一组检测的是“任务没有继续执行”和“队列没有继续消化”等不能仅靠异常捕获判断的问题。
+当前 `@TrackedCron` 和处理器已经报告异常/死信，但本地 catch 后的重试、无异常的积压和缺失心跳仍需要指标规则。
+应用指标中的任务标签为 `job`，被 Prometheus 抓取后因与 scrape 标签同名而变成 `exported_job`；告警和 Jobs 大盘按后者查询，避免不同任务互相掩盖。
 
 | 指标                                          | 检测什么                                            |
 | --------------------------------------------- | --------------------------------------------------- |
@@ -250,6 +251,10 @@ Prometheus / Alertmanager / blackbox-exporter 一起没了，Discord 一条消�
   blackbox-exporter ─┘                                  ├─► Discord (critical, 1h)
   (公网入口探测)                                        └─► 外部心跳服务 (Watchdog)
 
+日志线(可选集中采集，尚须部署启用):
+  后端 JSON ─► 蓝/绿独立日志卷 ─► Alloy ─► Loki ─► Grafana Explore
+  （requestId / job + runId 关联；ID 不作索引标签）
+
 业务分析线(未做):
   前端/后端 ─────► PostHog 等   (漏斗/留存/转化)
 ```
@@ -260,12 +265,13 @@ Prometheus / Alertmanager / blackbox-exporter 一起没了，Discord 一条消�
 
 ---
 
-## 三条线 vs 三类人
+## 四条线的分工
 
 | 线       | 看什么                        | 给谁        | 工具                 | 数据形态            |
 | -------- | ----------------------------- | ----------- | -------------------- | ------------------- |
 | 错误监控 | bug / 崩溃                    | 工程        | Sentry               | 单个错误事件 + 堆栈 |
 | 指标监控 | 系统健康（RED / 机器 / 容器） | 运维        | Prometheus + Grafana | 聚合数字（时序）    |
+| 诊断日志 | 单次请求、慢操作、后台任务 | 工程 / 运维 | Winston + 可选 Loki / Alloy | 脱敏结构化事件 |
 | 业务分析 | 用户行为 / 转化               | 产品 / 增长 | PostHog 等           | per-user 事件       |
 
 > "都叫埋点"但完全不同：**指标埋点**进 Prometheus（聚合），**业务埋点**进 PostHog（per-user 漏斗）。

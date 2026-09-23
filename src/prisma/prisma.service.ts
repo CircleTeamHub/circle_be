@@ -13,6 +13,8 @@ import {
   shouldSkipPrismaConnectOnBoot,
 } from 'src/config/env.validation';
 import { getServerConfig } from 'src/config/server.config';
+import { createLoggingConfig } from 'src/logging/logging.config';
+import { observeDatabaseAdapter } from 'src/logging/database-observability';
 
 /** pg's own default pool size — keeping it as the default makes tuning opt-in. */
 const DEFAULT_POOL_MAX = 10;
@@ -46,9 +48,7 @@ export interface DatabasePoolConfig {
 
 function readPositiveInt(value: unknown, fallback: number): number {
   const parsed =
-    typeof value === 'number'
-      ? value
-      : Number.parseInt(String(value ?? ''), 10);
+    typeof value === 'number' ? value : Number(String(value ?? ''));
   return Number.isInteger(parsed) && parsed > 0 ? parsed : fallback;
 }
 
@@ -103,7 +103,8 @@ export class PrismaService
     }
 
     // process.env wins over the .env file, same precedence as DATABASE_URL above.
-    const poolConfig = resolveDatabasePoolConfig({ ...config, ...process.env });
+    const effectiveConfig = { ...config, ...process.env };
+    const poolConfig = resolveDatabasePoolConfig(effectiveConfig);
 
     // 自己建池再交给适配器，而不是把配置丢给 PrismaPg 让它内部建 ——
     // 为的是留住这个引用：pg.Pool 的 waitingCount 是「有多少请求正在排队等
@@ -116,7 +117,17 @@ export class PrismaService
       ? new Pool({ connectionString, ...poolConfig })
       : null;
 
-    super(pool ? { adapter: new PrismaPg(pool) } : {});
+    super(
+      pool
+        ? {
+            adapter: observeDatabaseAdapter(
+              new PrismaPg(pool),
+              new Logger('DatabaseOperation'),
+              createLoggingConfig(effectiveConfig),
+            ),
+          }
+        : {},
+    );
 
     this.pool = pool;
     this.poolMax = poolConfig.max;
