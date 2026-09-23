@@ -195,6 +195,7 @@ export class ChatBurnSweeperService {
           },
           select: { id: true, revision: true },
         });
+        await this.media.queueDeletions(tx, ownedMediaKeys);
         await this.media.releaseNoteImportReferences(
           tx,
           messageIds,

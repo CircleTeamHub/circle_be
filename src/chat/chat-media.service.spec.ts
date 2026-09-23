@@ -32,6 +32,7 @@ describe('ChatMediaService', () => {
     $transaction: jest.fn(),
     $queryRaw: jest.fn(),
     chatMediaDeletion: {
+      createMany: jest.fn(),
       upsert: jest.fn(),
       findUnique: jest.fn(),
       findMany: jest.fn(),
@@ -58,6 +59,7 @@ describe('ChatMediaService', () => {
     uploadService.deleteObjectByKey.mockResolvedValue(undefined);
     uploadService.copyObjectToKey.mockResolvedValue(undefined);
     prisma.chatMediaDeletion.upsert.mockResolvedValue({});
+    prisma.chatMediaDeletion.createMany.mockResolvedValue({ count: 0 });
     prisma.chatMediaDeletion.findMany.mockResolvedValue([]);
     prisma.chatMediaDeletion.update.mockResolvedValue({});
     prisma.chatMediaDeletion.updateMany.mockResolvedValue({ count: 1 });
@@ -85,6 +87,42 @@ describe('ChatMediaService', () => {
     expect(prisma.chatMediaDeletion.upsert).toHaveBeenCalledWith(
       expect.objectContaining({ where: { objectKey: 'chat/u1/a.jpg' } }),
     );
+  });
+
+  it('retains the key transactionally when deletion and retry updates both fail', async () => {
+    const key = 'chat/u1/durable.jpg';
+    await service.queueDeletions(prisma as never, [key]);
+    expect(prisma.chatMediaDeletion.createMany).toHaveBeenCalledWith(
+      expect.objectContaining({
+        data: [expect.objectContaining({ objectKey: key })],
+        skipDuplicates: true,
+      }),
+    );
+
+    uploadService.deleteObjectByKey.mockRejectedValueOnce(
+      new Error('storage down'),
+    );
+    prisma.chatMediaDeletion.upsert.mockRejectedValueOnce(
+      new Error('database temporarily down'),
+    );
+    await service.deleteObjects([key]);
+
+    const due = {
+      id: 'delete-1',
+      objectKey: key,
+      attempts: 0,
+      lastError: 'pending message media deletion',
+      nextAttemptAt: new Date(0),
+    };
+    prisma.chatMediaDeletion.findMany.mockResolvedValueOnce([due]);
+    prisma.chatMediaDeletion.findUnique.mockResolvedValueOnce(due);
+    uploadService.deleteObjectByKey.mockResolvedValueOnce(undefined);
+    await service.drainPendingDeletions();
+
+    expect(uploadService.deleteObjectByKey).toHaveBeenLastCalledWith(key);
+    expect(prisma.chatMediaDeletion.deleteMany).toHaveBeenCalledWith({
+      where: expect.objectContaining({ id: due.id }),
+    });
   });
 
   it('logs deletion and queue failures without object keys or raw error text', async () => {

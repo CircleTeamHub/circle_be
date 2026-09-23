@@ -4072,6 +4072,7 @@ export class ChatService {
         data: { content: {}, revokedAt: new Date(), revokedBy: userId },
       });
       if (claimed.count > 0) {
+        await this.media.queueDeletions(tx, mediaKeys);
         await this.media.releaseNoteImportReferences(
           tx,
           [messageId],
@@ -4694,6 +4695,7 @@ export class ChatService {
           },
           select: { id: true, revision: true },
         });
+        await this.media.queueDeletions(tx, mediaKeys);
         await this.media.releaseNoteImportReferences(
           tx,
           messageIds,
