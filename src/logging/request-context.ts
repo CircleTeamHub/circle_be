@@ -12,12 +12,10 @@ export interface RequestContext {
 }
 
 const requestContextStorage = new AsyncLocalStorage<RequestContext>();
-// Preserve the established gateway/client correlation contract during rolling
-// deploys. Whitespace, URLs, emails and header syntax cannot match this grammar;
-// JWT-shaped values get an explicit second rejection below.
+// Preserve safe gateway/client correlation IDs; reject token-shaped values.
 const SAFE_REQUEST_ID = /^[A-Za-z0-9._:-]{1,128}$/;
 const TOKEN_SHAPED_REQUEST_ID =
-  /^(?:[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]*|[A-Za-z0-9_-]+\.[A-Za-z0-9_-]*\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+)$/;
+  /^(?:[A-Za-z0-9_-]+\.[A-Za-z0-9_-]*\.[A-Za-z0-9_-]*|[A-Za-z0-9_-]+\.[A-Za-z0-9_-]*\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+)$/;
 
 export function resolveRequestId(value?: unknown): string {
   const requestId = Array.isArray(value) ? value[0] : value;

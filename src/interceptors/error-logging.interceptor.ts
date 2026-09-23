@@ -18,6 +18,7 @@ import { getRequestContext } from '../logging/request-context';
 import { logSecurityEvent } from '../logging/security-event.logger';
 import {
   attemptDiagnostic,
+  diagnosticFailureDetails,
   logHttpFailure,
 } from '../logging/http-failure.logger';
 import type { ErrorAggregationProvider } from '../logging/error-aggregation.service';
@@ -61,11 +62,12 @@ export class ErrorLoggingInterceptor implements NestInterceptor {
               });
               markSecurityEventLogged(error, requestContext);
             },
-            () =>
+            (failure) =>
               this.logger.error(
                 {
                   event: 'security_event_log_failed',
                   requestId: requestContext?.requestId,
+                  ...diagnosticFailureDetails(failure),
                 },
                 'HttpError',
               ),
@@ -85,11 +87,12 @@ export class ErrorLoggingInterceptor implements NestInterceptor {
               });
               markErrorCaptured(error, requestContext);
             },
-            () =>
+            (failure) =>
               this.logger.error(
                 {
                   event: 'error_aggregation_failed',
                   requestId: requestContext?.requestId,
+                  ...diagnosticFailureDetails(failure),
                 },
                 'HttpError',
               ),
