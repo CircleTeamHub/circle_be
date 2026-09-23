@@ -274,7 +274,9 @@ describe('AllExceptionFilter error aggregation & security events', () => {
     const { filter, reply, logger, aggregation } =
       createFilterWithAggregation();
     aggregation.captureError.mockImplementation(() => {
-      throw new Error('sentry down');
+      throw Object.assign(new TypeError('sentry private failure'), {
+        code: 'ECONNREFUSED',
+      });
     });
 
     filter.catch(new Error('boom'), hostFor(request));
@@ -285,7 +287,11 @@ describe('AllExceptionFilter error aggregation & security events', () => {
       500,
     );
     expect(logger.error).toHaveBeenCalledWith(
-      expect.objectContaining({ event: 'error_aggregation_failed' }),
+      expect.objectContaining({
+        event: 'error_aggregation_failed',
+        failureName: 'TypeError',
+        failureCode: 'ECONNREFUSED',
+      }),
       'HttpError',
     );
   });
