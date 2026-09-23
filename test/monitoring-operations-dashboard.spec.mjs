@@ -50,9 +50,10 @@ test('queries cover alerts, target health, alert delivery, probes, and host capa
   ]) {
     assert.match(joined, new RegExp(metric));
   }
-
   assert.doesNotMatch(joined, /or\s+(?:on\s*\([^)]*\)\s*)?vector\s*\(\s*1\s*\)/);
   assert.match(joined, /ALERTS\{alertstate="firing",alertname!="Watchdog"\}/);
+  const firingPanel = dashboard().panels.find(({ title }) => title === 'Active firing alerts');
+  assert.deepEqual(firingPanel.fieldConfig.defaults.thresholds.steps, [{ color: 'green', value: null }, { color: 'red', value: 1 }]);
   assert.match(joined, /increase\(alertmanager_notifications_failed_total\[10m\]\)/);
   assert.match(joined, /increase\(prometheus_rule_evaluation_failures_total\[10m\]\)/);
   assert.match(joined, /probe_ssl_earliest_cert_expiry[^\n]*- time\(\)/);
@@ -75,7 +76,6 @@ test('host panels describe node_exporter as part of the base stack', () => {
   assert.doesNotMatch(descriptions, /production-only/i);
   assert.match(descriptions, /base monitoring stack/i);
 });
-
 test('descriptions do not overstate notification receipt and explain absent optional data', () => {
   const descriptions = dashboard().panels.map(({ description }) => description).join('\n');
   assert.match(descriptions, /attempt|delivery/i);

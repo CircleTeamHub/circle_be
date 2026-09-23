@@ -206,7 +206,7 @@ test('optional log pipeline exposes private self-metrics only when its overlay i
   for (const config of [PROMETHEUS, PROMETHEUS_PROD]) {
     assert.match(config, /file_sd_configs:[\s\S]*\/etc\/prometheus\/log-targets\/\*\.yml/);
   }
-  assert.match(LOGS_COMPOSE, /\.\/prometheus\/logs-targets\.yml:\/etc\/prometheus\/log-targets\/targets\.yml:ro/);
+  assert.match(LOGS_COMPOSE, /prometheus:\n\s+networks: \[default, circle-be, logs\][\s\S]*\.\/prometheus\/logs-targets\.yml:\/etc\/prometheus\/log-targets\/targets\.yml:ro/);
   assert.match(LOGS_COMPOSE, /--server\.http\.listen-addr=0\.0\.0\.0:12345/);
   assert.ok(alertExpr('LogPipelineDroppedEntries'));
   assert.ok(alertExpr('LogPipelineDeliveryStalled'));
