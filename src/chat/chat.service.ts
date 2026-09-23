@@ -1933,7 +1933,7 @@ export class ChatService {
             sanitizeLogValue({
               event: 'chat_room_join_failed',
               operation: 'seatMembersIntoRoom',
-              userId: memberId,
+              memberId,
               conversationId,
               error,
             }),
@@ -2980,7 +2980,7 @@ export class ChatService {
               sanitizeLogValue({
                 event: 'chat_room_join_failed',
                 operation: 'ensureDirectConversationForSettlement',
-                userId: memberId,
+                memberId,
                 conversationId,
                 error,
               }),
@@ -3085,7 +3085,7 @@ export class ChatService {
               sanitizeLogValue({
                 event: 'chat_room_join_failed',
                 operation: 'getOrCreateDirectConversation',
-                userId: memberId,
+                memberId,
                 conversationId: conv.id,
                 error,
               }),

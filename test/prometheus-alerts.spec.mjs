@@ -15,6 +15,7 @@ const PROMETHEUS = readText(join(ROOT, 'monitoring/prometheus/prometheus.yml'));
 const PROMETHEUS_PROD = readText(join(ROOT, 'monitoring/prometheus/prometheus.prod.yml'));
 const JOBS_DASHBOARD = readText(join(ROOT, 'monitoring/grafana/dashboards/circle-be-jobs.json'));
 const LOGS_COMPOSE = readText(join(ROOT, 'monitoring/docker-compose.logs.yml'));
+const LOGS_DOC = readText(join(ROOT, 'monitoring/logs.md'));
 const RULE_TESTS = readText(join(ROOT, 'monitoring/prometheus/alerts.test.yml'));
 
 /**
@@ -210,6 +211,8 @@ test('optional log pipeline exposes private self-metrics only when its overlay i
   assert.match(LOGS_COMPOSE, /--server\.http\.listen-addr=0\.0\.0\.0:12345/);
   assert.ok(alertExpr('LogPipelineDroppedEntries'));
   assert.ok(alertExpr('LogPipelineDeliveryStalled'));
+  assert.match(LOGS_DOC, /docker compose --env-file monitoring\/\.env[\s\S]*stop alloy loki/);
+  assert.match(LOGS_DOC, /docker compose --env-file monitoring\/\.env[\s\S]*recreate prometheus grafana/);
 });
 
 test('promtool fixtures cover post-scrape cron isolation and monitoring self-alert behavior', () => {

@@ -120,7 +120,9 @@ describe('ErrorLoggingInterceptor', () => {
     const logger = { error: jest.fn(), warn: jest.fn() };
     const aggregation = createAggregationSpy();
     (aggregation.captureError as jest.Mock).mockImplementation(() => {
-      throw new Error('sentry SDK blew up');
+      throw Object.assign(new TypeError('sentry SDK private failure'), {
+        code: 'ECONNREFUSED',
+      });
     });
     const interceptor = new ErrorLoggingInterceptor(logger as any, aggregation);
     const error = new Error('database exploded');
@@ -134,7 +136,11 @@ describe('ErrorLoggingInterceptor', () => {
     ).rejects.toBe(error);
 
     expect(logger.error).toHaveBeenCalledWith(
-      expect.objectContaining({ event: 'error_aggregation_failed' }),
+      expect.objectContaining({
+        event: 'error_aggregation_failed',
+        failureName: 'TypeError',
+        failureCode: 'ECONNREFUSED',
+      }),
       'HttpError',
     );
   });
@@ -143,7 +149,9 @@ describe('ErrorLoggingInterceptor', () => {
     const logger = {
       error: jest.fn(),
       warn: jest.fn(() => {
-        throw new Error('transport down');
+        throw Object.assign(new Error('transport private failure'), {
+          code: 'EPIPE',
+        });
       }),
     };
     const interceptor = new ErrorLoggingInterceptor(logger as any);
@@ -160,6 +168,8 @@ describe('ErrorLoggingInterceptor', () => {
       expect.objectContaining({
         event: 'security_event_log_failed',
         requestId: 'req-1',
+        failureName: 'Error',
+        failureCode: 'EPIPE',
       }),
       'HttpError',
     );
