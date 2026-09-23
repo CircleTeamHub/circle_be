@@ -10,20 +10,42 @@ const loggedErrorRequestIds = new WeakMap<object, string>();
 /** Diagnostics must never replace a response, rejection, or business result. */
 export function attemptDiagnostic(
   write: () => void,
-  onFailure?: () => void,
+  onFailure?: (failure: unknown) => void,
 ): void {
   try {
     write();
-  } catch {
+  } catch (failure) {
     // A fallback is best-effort too; never recursively report transport failure.
     if (onFailure) {
       try {
-        onFailure();
+        onFailure(failure);
       } catch {
         /* Preserve the business result. */
       }
     }
   }
+}
+
+export function diagnosticFailureDetails(failure: unknown) {
+  const record =
+    typeof failure === 'object' && failure !== null
+      ? (failure as Record<string, unknown>)
+      : undefined;
+  const candidateName = failure instanceof Error ? failure.name : record?.name;
+  const candidateCode = record?.code;
+  return {
+    failureName:
+      typeof candidateName === 'string' &&
+      /^(?:Error|[A-Za-z][A-Za-z0-9]{0,79}(?:Error|Exception))$/.test(
+        candidateName,
+      )
+        ? candidateName
+        : 'UnknownError',
+    ...(typeof candidateCode === 'string' &&
+    /^[A-Z][A-Z0-9_]{0,63}$/.test(candidateCode)
+      ? { failureCode: candidateCode }
+      : {}),
+  };
 }
 
 type FailureRequest = {

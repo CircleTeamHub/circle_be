@@ -11,6 +11,7 @@ import { markErrorCaptured, wasErrorCaptured } from '../logging/handled-errors';
 import { getRequestContext } from '../logging/request-context';
 import {
   attemptDiagnostic,
+  diagnosticFailureDetails,
   logHttpFailure,
 } from '../logging/http-failure.logger';
 import { safeLogPath } from '../logging/log-sanitizer';
@@ -89,11 +90,12 @@ export class PrismaExceptionFilter implements ExceptionFilter {
         });
         markErrorCaptured(exception);
       },
-      () =>
+      (failure) =>
         this.logger.error(
           {
             event: 'error_aggregation_failed',
             requestId: getRequestContext()?.requestId,
+            ...diagnosticFailureDetails(failure),
           },
           'HttpError',
         ),

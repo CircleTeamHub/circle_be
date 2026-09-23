@@ -414,10 +414,10 @@ export const setupApp = (app: INestApplication): ErrorAggregationProvider => {
     ),
   );
 
-  if (logger && loggingConfig.httpLogOn) {
+  if (logger) {
     app.use(
       createRequestLoggerMiddleware(logger, {
-        enabled: true,
+        enabled: loggingConfig.httpLogOn,
         slowRequestMs: loggingConfig.slowRequestMs,
       }),
     );
