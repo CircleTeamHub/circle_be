@@ -12,12 +12,15 @@ import {
   IsNotEmpty,
   IsOptional,
   IsString,
-  Matches,
   MaxLength,
   MinLength,
   IsInt,
   Min,
   Max,
+  Validate,
+  ValidatorConstraint,
+  type ValidatorConstraintInterface,
+  type ValidationArguments,
 } from 'class-validator';
 
 export class NotificationPageQueryDto {
@@ -59,10 +62,30 @@ export class PublishSystemAnnouncementResponseDto {
 }
 
 export const PUSH_TOKEN_PLATFORMS = ['ios', 'android', 'web'] as const;
-export const PUSH_TOKEN_PROVIDERS = ['expo'] as const;
+export const PUSH_TOKEN_PROVIDERS = ['expo', 'jpush'] as const;
 
 export type PushTokenPlatform = (typeof PUSH_TOKEN_PLATFORMS)[number];
 export type PushTokenProvider = (typeof PUSH_TOKEN_PROVIDERS)[number];
+
+@ValidatorConstraint({ name: 'pushTokenMatchesProvider', async: false })
+class PushTokenMatchesProvider implements ValidatorConstraintInterface {
+  validate(value: unknown, args: ValidationArguments): boolean {
+    if (typeof value !== 'string') return false;
+    const provider = (args.object as RegisterPushTokenDto).provider;
+    if (provider === 'expo') {
+      return /^Expo(nent)?PushToken\[[^\s\]]+\]$/.test(value);
+    }
+    if (provider === 'jpush') {
+      return /^[A-Za-z0-9:_-]{10,512}$/.test(value);
+    }
+    return false;
+  }
+
+  defaultMessage(args: ValidationArguments): string {
+    const provider = (args.object as RegisterPushTokenDto).provider;
+    return `token must match the ${provider ?? 'selected'} push provider`;
+  }
+}
 
 export class RegisterPushTokenDto {
   // #98：provider 目前只有 expo，Expo push token 有公开的稳定形状 ——
@@ -75,9 +98,7 @@ export class RegisterPushTokenDto {
   @IsString()
   @IsNotEmpty()
   @MaxLength(512)
-  @Matches(/^Expo(nent)?PushToken\[[^\s\]]+\]$/, {
-    message: 'token must be an Expo push token (ExponentPushToken[...])',
-  })
+  @Validate(PushTokenMatchesProvider)
   token: string;
 
   @ApiProperty({ enum: PUSH_TOKEN_PLATFORMS })

@@ -163,6 +163,10 @@ export function createEnvValidationSchema(
     BUSINESS_LOG_ON: Joi.boolean(),
     EXTERNAL_LOG_ON: Joi.boolean(),
     RATE_LIMIT_LOG_ON: Joi.boolean(),
+    // JPush delivery is optional, but credentials are an inseparable pair.
+    JPUSH_APP_KEY: Joi.string().trim().min(1).optional(),
+    JPUSH_MASTER_SECRET: Joi.string().trim().min(1).optional(),
+    JPUSH_APNS_PRODUCTION: Joi.boolean().default(false),
     SECURITY_LOG_ON: Joi.boolean(),
     PERFORMANCE_LOG_ON: Joi.boolean(),
     SLOW_EXTERNAL_MS: Joi.number().integer().min(1).default(1000),
@@ -320,6 +324,13 @@ export function createEnvValidationSchema(
       });
       if (bypass.status === 'misconfigured' && bypass.reason) {
         return helpers.message({ custom: bypass.reason });
+      }
+
+      if (Boolean(value.JPUSH_APP_KEY) !== Boolean(value.JPUSH_MASTER_SECRET)) {
+        return helpers.message({
+          custom:
+            'JPUSH_APP_KEY and JPUSH_MASTER_SECRET must be configured together',
+        });
       }
 
       const accessTtl = parseDurationMilliseconds(value.JWT_EXPIRES_IN);

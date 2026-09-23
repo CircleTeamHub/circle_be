@@ -30,7 +30,7 @@ describe('NotificationPushService (#88 per-token delivery)', () => {
 
   let service: NotificationPushService;
   const fetchMock = jest.fn();
-  const configValues: Record<string, string | undefined> = {};
+  const configValues: Record<string, string | boolean | undefined> = {};
   const config = {
     get: jest.fn((key: string) => configValues[key]),
   };
@@ -201,6 +201,168 @@ describe('NotificationPushService (#88 per-token delivery)', () => {
 
       expect(fetchMock).toHaveBeenCalledTimes(2);
     });
+
+    it('routes JPush tokens through the JPush API with Basic auth and platform payloads', async () => {
+      configValues.JPUSH_APP_KEY = 'jpush-app-key';
+      configValues.JPUSH_MASTER_SECRET = 'jpush-master-secret';
+      configValues.JPUSH_APNS_PRODUCTION = 'true';
+      service = new NotificationPushService(prisma as any, config as any);
+      fetchMock.mockResolvedValue({
+        ok: true,
+        status: 200,
+        json: async () => ({ sendno: '1', msg_id: 'jpush-message-1' }),
+      });
+
+      const outcomes = await service.sendMessages([
+        {
+          token: '1a0018970a9d4f4f8f1',
+          provider: 'jpush',
+          platform: 'android',
+          projectId: null,
+          payload: { ...payload, badge: 7, ttl: 300, threadId: 'thread-1' },
+        },
+      ]);
+
+      expect(fetchMock).toHaveBeenCalledTimes(1);
+      const [url, init] = fetchMock.mock.calls[0] as [
+        string,
+        { headers: Record<string, string>; body: string },
+      ];
+      expect(url).toBe('https://api.jpush.cn/v3/push');
+      expect(init.headers.Authorization).toBe(
+        `Basic ${Buffer.from('jpush-app-key:jpush-master-secret').toString('base64')}`,
+      );
+      expect(JSON.parse(init.body)).toEqual(
+        expect.objectContaining({
+          platform: ['android'],
+          audience: { registration_id: ['1a0018970a9d4f4f8f1'] },
+          notification: expect.objectContaining({
+            alert: 'B',
+            android: expect.objectContaining({ title: 'T', alert: 'B' }),
+          }),
+          options: expect.objectContaining({
+            time_to_live: 300,
+            apns_production: true,
+          }),
+        }),
+      );
+      expect(outcomes).toEqual([
+        {
+          token: '1a0018970a9d4f4f8f1',
+          status: 'SENT',
+          receiptFinal: true,
+        },
+      ]);
+    });
+
+    it('accepts the boolean value produced by Joi for JPUSH_APNS_PRODUCTION', async () => {
+      configValues.JPUSH_APP_KEY = 'jpush-app-key';
+      configValues.JPUSH_MASTER_SECRET = 'jpush-master-secret';
+      configValues.JPUSH_APNS_PRODUCTION = true;
+      service = new NotificationPushService(prisma as any, config as any);
+      fetchMock.mockResolvedValue({
+        ok: true,
+        status: 200,
+        json: async () => ({ sendno: '1', msg_id: 'jpush-message-1' }),
+      });
+
+      await service.sendMessages([
+        {
+          token: '1a0018970a9d4f4f8f1',
+          provider: 'jpush',
+          platform: 'ios',
+          projectId: null,
+          payload,
+        },
+      ]);
+
+      const [, init] = fetchMock.mock.calls[0] as [string, { body: string }];
+      expect(JSON.parse(init.body).options.apns_production).toBe(true);
+    });
+
+    it('keeps JPush deliveries retryable when server credentials are absent', async () => {
+      const outcomes = await service.sendMessages([
+        {
+          token: '1a0018970a9d4f4f8f1',
+          provider: 'jpush',
+          platform: 'android',
+          projectId: null,
+          payload,
+        },
+      ]);
+
+      expect(fetchMock).not.toHaveBeenCalled();
+      expect(outcomes).toEqual([
+        {
+          token: '1a0018970a9d4f4f8f1',
+          status: 'RETRYABLE',
+          error: 'JPushNotConfigured',
+        },
+      ]);
+    });
+
+    it('keeps JPush authentication failures retryable without disabling tokens', async () => {
+      configValues.JPUSH_APP_KEY = 'jpush-app-key';
+      configValues.JPUSH_MASTER_SECRET = 'expired-secret';
+      service = new NotificationPushService(prisma as any, config as any);
+      fetchMock.mockResolvedValue({
+        ok: false,
+        status: 401,
+        json: async () => ({ error: { code: 1004, message: 'auth failed' } }),
+      });
+
+      const outcomes = await service.sendMessages([
+        {
+          token: '1a0018970a9d4f4f8f1',
+          provider: 'jpush',
+          platform: 'android',
+          projectId: null,
+          payload,
+        },
+      ]);
+
+      expect(outcomes).toEqual([
+        {
+          token: '1a0018970a9d4f4f8f1',
+          status: 'RETRYABLE',
+          error: 'JPushError:1004',
+        },
+      ]);
+      expect(prisma.devicePushToken.updateMany).not.toHaveBeenCalled();
+    });
+
+    it('disables only the individual invalid JPush registration id', async () => {
+      configValues.JPUSH_APP_KEY = 'jpush-app-key';
+      configValues.JPUSH_MASTER_SECRET = 'jpush-master-secret';
+      service = new NotificationPushService(prisma as any, config as any);
+      fetchMock.mockResolvedValue({
+        ok: false,
+        status: 400,
+        json: async () => ({ error: { code: 1003, message: 'invalid regid' } }),
+      });
+
+      const outcomes = await service.sendMessages([
+        {
+          token: '1a0018970a9d4f4f8f1',
+          provider: 'jpush',
+          platform: 'android',
+          projectId: null,
+          payload,
+        },
+      ]);
+
+      expect(outcomes).toEqual([
+        {
+          token: '1a0018970a9d4f4f8f1',
+          status: 'TERMINAL',
+          error: 'JPushInvalidRegistrationId',
+        },
+      ]);
+      expect(prisma.devicePushToken.updateMany).toHaveBeenCalledWith({
+        where: { token: { in: ['1a0018970a9d4f4f8f1'] } },
+        data: { disabledAt: expect.any(Date) },
+      });
+    });
   });
 
   describe('listActiveTokensForUsers', () => {
@@ -210,8 +372,16 @@ describe('NotificationPushService (#88 per-token delivery)', () => {
           userID: 'u1',
           token: `u1-${i}`,
           projectId: null,
+          provider: 'expo',
+          platform: 'ios',
         })),
-        { userID: 'u2', token: 'u2-0', projectId: 'proj' },
+        {
+          userID: 'u2',
+          token: 'u2-0',
+          projectId: null,
+          provider: 'jpush',
+          platform: 'android',
+        },
       ]);
 
       const byUser = await service.listActiveTokensForUsers(['u1', 'u2', 'u3']);
@@ -220,15 +390,32 @@ describe('NotificationPushService (#88 per-token delivery)', () => {
       expect(prisma.devicePushToken.findMany).toHaveBeenCalledWith({
         where: {
           userID: { in: ['u1', 'u2', 'u3'] },
-          provider: 'expo',
           disabledAt: null,
         },
-        select: { userID: true, token: true, projectId: true },
+        select: {
+          userID: true,
+          token: true,
+          projectId: true,
+          provider: true,
+          platform: true,
+        },
         orderBy: { updatedAt: 'desc' },
       });
       expect(byUser.get('u1')).toHaveLength(20);
-      expect(byUser.get('u1')?.[0]).toEqual({ token: 'u1-0', projectId: null });
-      expect(byUser.get('u2')).toEqual([{ token: 'u2-0', projectId: 'proj' }]);
+      expect(byUser.get('u1')?.[0]).toEqual({
+        token: 'u1-0',
+        projectId: null,
+        provider: 'expo',
+        platform: 'ios',
+      });
+      expect(byUser.get('u2')).toEqual([
+        {
+          token: 'u2-0',
+          projectId: null,
+          provider: 'jpush',
+          platform: 'android',
+        },
+      ]);
       expect(byUser.has('u3')).toBe(false);
     });
 

@@ -10,7 +10,9 @@ import { reportOperationalError } from 'src/logging/error-aggregation.service';
 
 const EXPO_PUSH_URL = 'https://exp.host/--/api/v2/push/send';
 const EXPO_RECEIPT_URL = 'https://exp.host/--/api/v2/push/getReceipts';
+const JPUSH_PUSH_URL = 'https://api.jpush.cn/v3/push';
 const EXPO_BATCH_SIZE = 100;
+const JPUSH_BATCH_SIZE = 1000;
 // 一次扇出里同时在途的 Expo 请求数:3000 人的群是 30 批,串行发太慢,全并发又会
 // 撞 Expo 的速率限制。
 const EXPO_SEND_CONCURRENCY = 4;
@@ -46,7 +48,16 @@ export type TokenDeliveryOutcome = {
   token: string;
   status: 'SENT' | 'RETRYABLE' | 'TERMINAL';
   ticketId?: string;
+  /** Provider has no asynchronous receipt stage; persist as CONFIRMED. */
+  receiptFinal?: boolean;
   error?: string;
+};
+
+export type PushTokenTarget = {
+  token: string;
+  projectId: string | null;
+  provider?: 'expo' | 'jpush';
+  platform?: 'ios' | 'android' | 'web';
 };
 
 export type ExpoPushPayload = {
@@ -81,6 +92,7 @@ const RETRYABLE_TICKET_ERRORS = new Set([
 // 令牌本身已死，重试无意义且应停用 token。只有 token 级错误配进来；
 // 项目级/消息级错误（InvalidCredentials/MessageTooBig）绝不 reap token。
 const TERMINAL_TOKEN_ERRORS = new Set(['DeviceNotRegistered']);
+const TERMINAL_JPUSH_TOKEN_ERRORS = new Set(['JPushInvalidRegistrationId']);
 const DELIVERY_MAX_ATTEMPTS = 5;
 
 @Injectable()
@@ -90,6 +102,9 @@ export class NotificationPushService {
   // Optional. Required only when the Expo project has "Enhanced Security for
   // Push Notifications" enabled — Expo then rejects unauthenticated sends.
   private readonly expoAccessToken: string;
+  private readonly jpushAppKey: string;
+  private readonly jpushMasterSecret: string;
+  private readonly jpushApnsProduction: boolean;
 
   constructor(
     private readonly prisma: PrismaService,
@@ -97,6 +112,16 @@ export class NotificationPushService {
   ) {
     this.expoAccessToken =
       this.config.get<string>('EXPO_ACCESS_TOKEN')?.trim() ?? '';
+    this.jpushAppKey = this.config.get<string>('JPUSH_APP_KEY')?.trim() ?? '';
+    this.jpushMasterSecret =
+      this.config.get<string>('JPUSH_MASTER_SECRET')?.trim() ?? '';
+    const configuredJpushApnsProduction = this.config.get<boolean | string>(
+      'JPUSH_APNS_PRODUCTION',
+    );
+    this.jpushApnsProduction =
+      configuredJpushApnsProduction === true ||
+      (typeof configuredJpushApnsProduction === 'string' &&
+        configuredJpushApnsProduction.trim().toLowerCase() === 'true');
   }
 
   /** 组装推送 payload。外置成公开方法：outbox 第一次处理时快照进 DB（#88）。 */
@@ -149,16 +174,24 @@ export class NotificationPushService {
   }
 
   /** 当前活跃 token 清单（含 Expo projectId 分组信息），供 outbox 建投递行。 */
-  async listActiveTokens(
-    userId: string,
-  ): Promise<Array<{ token: string; projectId: string | null }>> {
+  async listActiveTokens(userId: string): Promise<PushTokenTarget[]> {
     const rows = await this.prisma.devicePushToken.findMany({
-      where: { userID: userId, provider: 'expo', disabledAt: null },
-      select: { token: true, projectId: true },
+      where: { userID: userId, disabledAt: null },
+      select: {
+        token: true,
+        projectId: true,
+        provider: true,
+        platform: true,
+      },
       orderBy: { updatedAt: 'desc' },
       take: ACTIVE_TOKENS_PER_USER,
     });
-    return rows;
+    return rows.map((row) => ({
+      token: row.token,
+      projectId: row.projectId,
+      provider: row.provider as 'expo' | 'jpush',
+      platform: row.platform as 'ios' | 'android' | 'web',
+    }));
   }
 
   /**
@@ -168,21 +201,29 @@ export class NotificationPushService {
    */
   async listActiveTokensForUsers(
     userIds: string[],
-  ): Promise<Map<string, Array<{ token: string; projectId: string | null }>>> {
-    const byUser = new Map<
-      string,
-      Array<{ token: string; projectId: string | null }>
-    >();
+  ): Promise<Map<string, PushTokenTarget[]>> {
+    const byUser = new Map<string, PushTokenTarget[]>();
     if (userIds.length === 0) return byUser;
     const rows = await this.prisma.devicePushToken.findMany({
-      where: { userID: { in: userIds }, provider: 'expo', disabledAt: null },
-      select: { userID: true, token: true, projectId: true },
+      where: { userID: { in: userIds }, disabledAt: null },
+      select: {
+        userID: true,
+        token: true,
+        projectId: true,
+        provider: true,
+        platform: true,
+      },
       orderBy: { updatedAt: 'desc' },
     });
     for (const row of rows) {
       const tokens = byUser.get(row.userID) ?? [];
       if (tokens.length >= ACTIVE_TOKENS_PER_USER) continue;
-      tokens.push({ token: row.token, projectId: row.projectId });
+      tokens.push({
+        token: row.token,
+        projectId: row.projectId,
+        provider: row.provider as 'expo' | 'jpush',
+        platform: row.platform as 'ios' | 'android' | 'web',
+      });
       byUser.set(row.userID, tokens);
     }
     return byUser;
@@ -194,7 +235,7 @@ export class NotificationPushService {
    * 返回每 token 的结论 + Expo ticket id。
    */
   async sendToTokens(
-    tokens: Array<{ token: string; projectId: string | null }>,
+    tokens: PushTokenTarget[],
     payload: ExpoPushPayload,
   ): Promise<TokenDeliveryOutcome[]> {
     return this.sendMessages(tokens.map((token) => ({ ...token, payload })));
@@ -205,11 +246,7 @@ export class NotificationPushService {
    * 分批、有限并发发出。结论与入参一一对应(同一下标);死令牌就地停用。
    */
   async sendMessages(
-    messages: Array<{
-      token: string;
-      projectId: string | null;
-      payload: ExpoPushPayload;
-    }>,
+    messages: Array<PushTokenTarget & { payload: ExpoPushPayload }>,
   ): Promise<TokenDeliveryOutcome[]> {
     if (messages.length === 0) return [];
 
@@ -218,6 +255,7 @@ export class NotificationPushService {
     type Indexed = { index: number; token: string; payload: ExpoPushPayload };
     const byProject = new Map<string, Indexed[]>();
     messages.forEach((message, index) => {
+      if (message.provider === 'jpush') return;
       const key = message.projectId ?? '';
       const group = byProject.get(key) ?? [];
       group.push({ index, token: message.token, payload: message.payload });
@@ -243,13 +281,22 @@ export class NotificationPushService {
       });
     }
 
+    const jpushMessages = messages
+      .map((message, index) => ({ ...message, index }))
+      .filter((message) => message.provider === 'jpush');
+    const jpushOutcomes = await this.sendJPushMessages(jpushMessages);
+    jpushOutcomes.forEach(({ index, outcome }) => {
+      outcomes[index] = outcome;
+    });
+
     // 只有「令牌已死」类错误才停用 token —— MessageTooBig 等消息级终态
     // 与 token 健康无关，误停会把活设备静音。
     const deadTokens = outcomes
       .filter(
         (outcome) =>
           outcome.status === 'TERMINAL' &&
-          TERMINAL_TOKEN_ERRORS.has(outcome.error ?? ''),
+          (TERMINAL_TOKEN_ERRORS.has(outcome.error ?? '') ||
+            TERMINAL_JPUSH_TOKEN_ERRORS.has(outcome.error ?? '')),
       )
       .map((outcome) => outcome.token);
     if (deadTokens.length > 0) {
@@ -531,6 +578,164 @@ export class NotificationPushService {
     if (type === 'CIRCLE_POST_COLLABORATION_RECOGNIZED')
       return '认可了你的活动协作';
     return '你有一条新通知';
+  }
+
+  private async sendJPushMessages(
+    messages: Array<
+      PushTokenTarget & { payload: ExpoPushPayload; index: number }
+    >,
+  ): Promise<Array<{ index: number; outcome: TokenDeliveryOutcome }>> {
+    if (messages.length === 0) return [];
+    if (!this.jpushAppKey || !this.jpushMasterSecret) {
+      return messages.map(({ index, token }) => ({
+        index,
+        outcome: {
+          token,
+          status: 'RETRYABLE',
+          error: 'JPushNotConfigured',
+        },
+      }));
+    }
+
+    const groups = new Map<string, typeof messages>();
+    for (const message of messages) {
+      const key = JSON.stringify({
+        platform: message.platform ?? 'android',
+        payload: message.payload,
+      });
+      const group = groups.get(key) ?? [];
+      group.push(message);
+      groups.set(key, group);
+    }
+
+    const results: Array<{ index: number; outcome: TokenDeliveryOutcome }> = [];
+    for (const group of groups.values()) {
+      for (let offset = 0; offset < group.length; offset += JPUSH_BATCH_SIZE) {
+        const batch = group.slice(offset, offset + JPUSH_BATCH_SIZE);
+        const outcomes = await this.sendJPushBatch(batch);
+        outcomes.forEach((outcome, index) => {
+          results.push({ index: batch[index].index, outcome });
+        });
+      }
+    }
+    return results;
+  }
+
+  private async sendJPushBatch(
+    batch: Array<PushTokenTarget & { payload: ExpoPushPayload }>,
+  ): Promise<TokenDeliveryOutcome[]> {
+    const payload = batch[0].payload;
+    const platforms = [
+      ...new Set(
+        batch
+          .map((entry) => entry.platform)
+          .filter(
+            (platform): platform is 'ios' | 'android' =>
+              platform === 'ios' || platform === 'android',
+          ),
+      ),
+    ];
+    const platform = platforms.length > 0 ? platforms : ['android', 'ios'];
+    const notification = {
+      alert: payload.body,
+      ...(platform.includes('android')
+        ? {
+            android: {
+              alert: payload.body,
+              title: payload.title,
+              extras: payload.data,
+            },
+          }
+        : {}),
+      ...(platform.includes('ios')
+        ? {
+            ios: {
+              alert: { title: payload.title, body: payload.body },
+              sound: 'default',
+              ...(payload.badge !== undefined ? { badge: payload.badge } : {}),
+              ...(payload.threadId ? { 'thread-id': payload.threadId } : {}),
+              extras: payload.data,
+            },
+          }
+        : {}),
+    };
+
+    try {
+      const credentials = `${this.jpushAppKey}:${this.jpushMasterSecret}`;
+      const response = await fetch(JPUSH_PUSH_URL, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Basic ${Buffer.from(credentials).toString('base64')}`,
+        },
+        body: JSON.stringify({
+          platform,
+          audience: { registration_id: batch.map((entry) => entry.token) },
+          notification,
+          options: {
+            time_to_live: payload.ttl ?? 24 * 60 * 60,
+            apns_production: this.jpushApnsProduction,
+            ...(payload.tag ? { apns_collapse_id: payload.tag } : {}),
+          },
+        }),
+        signal: AbortSignal.timeout(EXPO_PUSH_TIMEOUT_MS),
+      });
+      if (response.ok) {
+        return batch.map(({ token }) => ({
+          token,
+          status: 'SENT',
+          receiptFinal: true,
+        }));
+      }
+
+      const body = (await response.json().catch(() => ({}))) as {
+        error?: { code?: number; message?: string };
+      };
+      const code = body.error?.code;
+      if ((code === 1003 || code === 1011) && batch.length > 1) {
+        const nested = await Promise.all(
+          batch.map((entry) => this.sendJPushBatch([entry])),
+        );
+        return nested.flat();
+      }
+      if (code === 1003 || code === 1011) {
+        return batch.map(({ token }) => ({
+          token,
+          status: 'TERMINAL',
+          error: 'JPushInvalidRegistrationId',
+        }));
+      }
+      const retryable =
+        response.status === 401 ||
+        response.status === 403 ||
+        response.status === 429 ||
+        response.status >= 500 ||
+        code === 1000 ||
+        code === 1004;
+      return batch.map(({ token }) => ({
+        token,
+        status: retryable ? 'RETRYABLE' : 'TERMINAL',
+        error: `JPushError:${code ?? response.status}`,
+      }));
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      logExternalCallFailure(this.logger, {
+        enabled: this.loggingConfig.externalLogOn,
+        service: 'jpush',
+        operation: 'send',
+        error,
+      });
+      reportOperationalError(error, {
+        component: 'NotificationPushService',
+        operation: 'sendToTokens',
+        kind: 'jpush',
+      });
+      return batch.map(({ token }) => ({
+        token,
+        status: 'RETRYABLE',
+        error: message,
+      }));
+    }
   }
 
   /** 单批发送：HTTP 层重试后返回逐 token 结论（ticket 顺序与请求一一对应）。 */
