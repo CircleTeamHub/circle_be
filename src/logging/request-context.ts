@@ -12,12 +12,19 @@ export interface RequestContext {
 }
 
 const requestContextStorage = new AsyncLocalStorage<RequestContext>();
+// Preserve safe gateway/client correlation IDs; reject token-shaped values.
 const SAFE_REQUEST_ID = /^[A-Za-z0-9._:-]{1,128}$/;
+const TOKEN_SHAPED_REQUEST_ID =
+  /^(?:[A-Za-z0-9_-]+\.[A-Za-z0-9_-]*\.[A-Za-z0-9_-]*|[A-Za-z0-9_-]+\.[A-Za-z0-9_-]*\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+)$/;
 
 export function resolveRequestId(value?: unknown): string {
   const requestId = Array.isArray(value) ? value[0] : value;
 
-  if (typeof requestId === 'string' && SAFE_REQUEST_ID.test(requestId)) {
+  if (
+    typeof requestId === 'string' &&
+    SAFE_REQUEST_ID.test(requestId) &&
+    !TOKEN_SHAPED_REQUEST_ID.test(requestId)
+  ) {
     return requestId;
   }
 

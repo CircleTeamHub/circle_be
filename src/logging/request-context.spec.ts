@@ -33,15 +33,25 @@ describe('request context', () => {
   });
 
   it('reuses safe incoming request ids', () => {
-    expect(resolveRequestId('abc-123_DEF')).toBe('abc-123_DEF');
+    expect(resolveRequestId('9B2A7F3C-2A9E-4F1C-8D2B-124A5CC93A10')).toBe(
+      '9B2A7F3C-2A9E-4F1C-8D2B-124A5CC93A10',
+    );
+    expect(resolveRequestId('edge:01JABC.def')).toBe('edge:01JABC.def');
+    expect(resolveRequestId('privateaccount123')).toBe('privateaccount123');
+    expect(resolveRequestId('15551234567')).toBe('15551234567');
   });
 
   it('generates ids for missing or unsafe incoming values', () => {
-    expect(resolveRequestId()).toMatch(
-      /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/,
-    );
-    expect(resolveRequestId('bad value with spaces')).toMatch(
-      /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/,
-    );
+    const generated =
+      /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
+    for (const unsafe of [
+      undefined,
+      'bad value with spaces',
+      'eyJhbGciOiJIUzI1NiJ9..c2lnbmF0dXJl',
+      'eyJhbGciOiJub25lIn0.eyJzdWIiOiJ1c2VyIn0.',
+      'protected..iv.ciphertext.tag',
+      'person@example.com',
+    ])
+      expect(resolveRequestId(unsafe)).toMatch(generated);
   });
 });
