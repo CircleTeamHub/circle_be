@@ -276,10 +276,7 @@ describe('NotificationPushService (#88 per-token delivery)', () => {
         },
       ]);
 
-      const [, init] = fetchMock.mock.calls[0] as [
-        string,
-        { body: string },
-      ];
+      const [, init] = fetchMock.mock.calls[0] as [string, { body: string }];
       expect(JSON.parse(init.body).options.apns_production).toBe(true);
     });
 

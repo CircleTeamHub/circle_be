@@ -115,9 +115,9 @@ export class NotificationPushService {
     this.jpushAppKey = this.config.get<string>('JPUSH_APP_KEY')?.trim() ?? '';
     this.jpushMasterSecret =
       this.config.get<string>('JPUSH_MASTER_SECRET')?.trim() ?? '';
-    const configuredJpushApnsProduction = this.config.get<
-      boolean | string
-    >('JPUSH_APNS_PRODUCTION');
+    const configuredJpushApnsProduction = this.config.get<boolean | string>(
+      'JPUSH_APNS_PRODUCTION',
+    );
     this.jpushApnsProduction =
       configuredJpushApnsProduction === true ||
       (typeof configuredJpushApnsProduction === 'string' &&
