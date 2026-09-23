@@ -25,6 +25,8 @@ const PRIVATE_FIELDS = new Set(
   ),
 );
 const IP_CANDIDATE = /[0-9A-Fa-f:.]+/g;
+const EMAIL_ADDRESS =
+  /[\p{L}\p{N}._%+-]+@(?:[\p{L}\p{N}-]+\.)+[\p{L}\p{N}-]{2,}/gu;
 
 function redactIpAddresses(value: string): string {
   return value.replace(
@@ -55,10 +57,10 @@ export function sanitizeLogText(value: string): string {
         /-----BEGIN [A-Z0-9 ]*(?:PRIVATE|SECRET) KEY-----[\s\S]*?(?:-----END [A-Z0-9 ]*(?:PRIVATE|SECRET) KEY-----|$)/gi,
         '[redacted-key]',
       )
-      .replace(/https?:\/\/[^\s<>"']+/gi, '[redacted-url]')
+      .replace(/\b[a-z][a-z0-9+.-]*:\/\/[^\s<>"']+/gi, '[redacted-url]')
       .replace(/\b(Bearer|Basic)\s+[A-Za-z0-9._~+/=-]+/gi, `$1 ${REDACTED}`)
       .replace(/eyJ[A-Za-z0-9_-]*\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]*/g, REDACTED)
-      .replace(/[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}/gi, '[redacted-email]')
+      .replace(EMAIL_ADDRESS, '[redacted-email]')
       .replace(
         /(^|[^\w.])(\+?(?:\d[\s().-]?){9,14}\d)(?![\w.])/g,
         '$1[redacted-phone]',

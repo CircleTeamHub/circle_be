@@ -47,7 +47,7 @@ describe('request context', () => {
     for (const unsafe of [
       undefined,
       'bad value with spaces',
-      'part1.part2.part3',
+      'eyJhbGciOiJIUzI1NiJ9..c2lnbmF0dXJl',
       'eyJhbGciOiJub25lIn0.eyJzdWIiOiJ1c2VyIn0.',
       'protected..iv.ciphertext.tag',
       'person@example.com',
