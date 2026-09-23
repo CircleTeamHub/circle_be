@@ -115,9 +115,13 @@ export class NotificationPushService {
     this.jpushAppKey = this.config.get<string>('JPUSH_APP_KEY')?.trim() ?? '';
     this.jpushMasterSecret =
       this.config.get<string>('JPUSH_MASTER_SECRET')?.trim() ?? '';
+    const configuredJpushApnsProduction = this.config.get<
+      boolean | string
+    >('JPUSH_APNS_PRODUCTION');
     this.jpushApnsProduction =
-      this.config.get<string>('JPUSH_APNS_PRODUCTION')?.trim().toLowerCase() ===
-      'true';
+      configuredJpushApnsProduction === true ||
+      (typeof configuredJpushApnsProduction === 'string' &&
+        configuredJpushApnsProduction.trim().toLowerCase() === 'true');
   }
 
   /** 组装推送 payload。外置成公开方法：outbox 第一次处理时快照进 DB（#88）。 */

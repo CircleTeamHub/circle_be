@@ -30,7 +30,7 @@ describe('NotificationPushService (#88 per-token delivery)', () => {
 
   let service: NotificationPushService;
   const fetchMock = jest.fn();
-  const configValues: Record<string, string | undefined> = {};
+  const configValues: Record<string, string | boolean | undefined> = {};
   const config = {
     get: jest.fn((key: string) => configValues[key]),
   };
@@ -253,6 +253,34 @@ describe('NotificationPushService (#88 per-token delivery)', () => {
           receiptFinal: true,
         },
       ]);
+    });
+
+    it('accepts the boolean value produced by Joi for JPUSH_APNS_PRODUCTION', async () => {
+      configValues.JPUSH_APP_KEY = 'jpush-app-key';
+      configValues.JPUSH_MASTER_SECRET = 'jpush-master-secret';
+      configValues.JPUSH_APNS_PRODUCTION = true;
+      service = new NotificationPushService(prisma as any, config as any);
+      fetchMock.mockResolvedValue({
+        ok: true,
+        status: 200,
+        json: async () => ({ sendno: '1', msg_id: 'jpush-message-1' }),
+      });
+
+      await service.sendMessages([
+        {
+          token: '1a0018970a9d4f4f8f1',
+          provider: 'jpush',
+          platform: 'ios',
+          projectId: null,
+          payload,
+        },
+      ]);
+
+      const [, init] = fetchMock.mock.calls[0] as [
+        string,
+        { body: string },
+      ];
+      expect(JSON.parse(init.body).options.apns_production).toBe(true);
     });
 
     it('keeps JPush deliveries retryable when server credentials are absent', async () => {
