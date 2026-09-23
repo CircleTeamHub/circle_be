@@ -81,7 +81,7 @@ test('Caddy emits privacy-safe access logs only for websocket handshakes', () =>
   assert.match(apiBlock, /@chat_ws path \/chat-ws \/chat-ws\/\*/);
   assert.match(
     apiBlock,
-    /@chat_ws_traced \{[\s\S]*path \/chat-ws \/chat-ws\/\*[\s\S]*header_regexp connection_trace X-Connection-Trace-Id \^ws-\[a-zA-Z0-9-\]\{8,96\}\$/,
+    /header_up X-Connection-Trace-Id ws-\{http\.request\.uuid\}/,
   );
   assert.match(
     apiBlock,
@@ -90,7 +90,7 @@ test('Caddy emits privacy-safe access logs only for websocket handshakes', () =>
   assert.match(apiBlock, /log_name @chat_ws chat_ws/);
   assert.match(
     apiBlock,
-    /log_append @chat_ws_traced traceId \{http\.request\.header\.X-Connection-Trace-Id\}/,
+    /log_append @chat_ws traceId ws-\{http\.request\.uuid\}/,
   );
   // filter 编码器要求 wrap 一个底层编码器,并把字段过滤放进 fields 块;把过滤
   // 直接写在 format filter 下会被 caddy validate 拒绝,而 release-deploy.sh 每次
