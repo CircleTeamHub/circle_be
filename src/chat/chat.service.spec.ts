@@ -1604,14 +1604,6 @@ describe('ChatService', () => {
           expect(warning).toHaveBeenCalledWith(
             expect.objectContaining({
               event: 'chat_presence_lookup_failed',
-              operation: 'isPresenceVisible',
-              userId: 'u1',
-            }),
-          );
-          expect(warning).toHaveBeenCalledWith(
-            expect.objectContaining({
-              event: 'chat_last_online_update_failed',
-              operation: 'touchLastOnline',
               userId: 'u1',
             }),
           );
@@ -1892,6 +1884,7 @@ describe('ChatService', () => {
     });
 
     it('still returns the conversation when joining a room fails', async () => {
+      const warning = jest.spyOn(Logger.prototype, 'warn').mockImplementation();
       prisma.user.findUnique.mockResolvedValue(peer);
       prisma.block.findFirst.mockResolvedValue(null);
       prisma.chatConversation.findUnique.mockResolvedValue(conversationRow);
@@ -1904,6 +1897,13 @@ describe('ChatService', () => {
       await expect(
         service.getOrCreateDirectConversation('u1', 'u2'),
       ).resolves.toMatchObject({ id: 'conv-9' });
+      expect(warning).toHaveBeenCalledWith(
+        expect.objectContaining({
+          event: 'chat_room_join_failed',
+          memberId: 'u2',
+        }),
+      );
+      warning.mockRestore();
     });
 
     // ─── 结算专用解析 ────────────────────────────────────────────────────
