@@ -140,9 +140,9 @@ To remove the overlay, stop Alloy/Loki with all three files, then reconcile the
 two changed base services without the overlay:
 
 ```bash
-docker compose -f monitoring/docker-compose.yml -f monitoring/docker-compose.prod.yml \
+docker compose --env-file monitoring/.env -f monitoring/docker-compose.yml -f monitoring/docker-compose.prod.yml \
   -f monitoring/docker-compose.logs.yml stop alloy loki
-docker compose -f monitoring/docker-compose.yml -f monitoring/docker-compose.prod.yml \
+docker compose --env-file monitoring/.env -f monitoring/docker-compose.yml -f monitoring/docker-compose.prod.yml \
   up -d --no-deps --force-recreate prometheus grafana
 ```
 
