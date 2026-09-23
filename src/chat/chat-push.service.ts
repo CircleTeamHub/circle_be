@@ -9,6 +9,10 @@ import { ChatBroadcastService } from './chat-broadcast.service';
 import { CHAT_PUSH_CHANNEL_ID } from './chat.constants';
 import type { ChatMessageDto } from './chat.types';
 import { reportOperationalError } from 'src/logging/error-aggregation.service';
+import {
+  PrivacySettingsService,
+  type SelfDestructPolicy,
+} from 'src/privacy/privacy-settings.service';
 
 /**
  * 聊天离线推送(best-effort):socket 广播覆盖在线端,本服务只管离线成员。
@@ -106,6 +110,7 @@ export class ChatPushService implements OnModuleDestroy {
     private readonly prisma: PrismaService,
     private readonly push: NotificationPushService,
     private readonly broadcast: ChatBroadcastService,
+    private readonly privacySettings: PrivacySettingsService,
   ) {}
 
   /**
@@ -238,10 +243,12 @@ export class ChatPushService implements OnModuleDestroy {
     const everyone = [...groups.values()].flatMap((group) => group.recipients);
     // G-18:小规模扇出附 per-recipient 角标(iOS 杀后台也有数字)。大群跳过 ——
     // 逐人聚合未读的代价与收益不成比;拿不到就不带 badge,推送照发。
-    const badges =
+    const [badges, viewerPolicies] = await Promise.all([
       everyone.length <= BADGE_TARGETS_MAX
-        ? await this.loadUnreadBadges(everyone)
-        : new Map<string, number>();
+        ? this.loadUnreadBadges(everyone)
+        : Promise.resolve(new Map<string, number>()),
+      this.privacySettings.getSelfDestructPoliciesForUsers(everyone),
+    ]);
     for (const { message, mention, recipients } of groups.values()) {
       const payload = {
         ...(await this.composePayload(message, conversation)),
@@ -253,6 +260,7 @@ export class ChatPushService implements OnModuleDestroy {
         payload,
         badges,
         foregroundTokens,
+        viewerPolicies,
       );
     }
   }
@@ -332,6 +340,7 @@ export class ChatPushService implements OnModuleDestroy {
     payload: ExpoPushPayload,
     badges: Map<string, number>,
     foregroundTokens: Map<string, Set<string>>,
+    viewerPolicies: Map<string, SelfDestructPolicy>,
   ): Promise<void> {
     // 收件人的 token 一次查回、消息整批交给推送服务按 100 条一批发。原来是每个
     // 收件人各查一次 token、各发一次 HTTPS:3000 人的群一条消息就是 3000 + 3000 次。
@@ -353,7 +362,28 @@ export class ChatPushService implements OnModuleDestroy {
     const owners: string[] = [];
     const messages = recipients.flatMap((userId) => {
       const badge = badges.get(userId);
-      const perUser = badge !== undefined ? { ...payload, badge } : payload;
+      const viewerBurnSeconds = this.viewerBurnSeconds(
+        message,
+        viewerPolicies.get(userId),
+      );
+      const privacyPayload =
+        viewerBurnSeconds === null
+          ? payload
+          : {
+              ...payload,
+              body:
+                payload.data['conversationType'] === 'private'
+                  ? BURN_PREVIEW
+                  : message.sender?.nickname
+                    ? `${message.sender.nickname}: ${BURN_PREVIEW}`
+                    : BURN_PREVIEW,
+              ttl: Math.min(
+                payload.ttl ?? CHAT_PUSH_TTL_SECONDS,
+                viewerBurnSeconds,
+              ),
+            };
+      const perUser =
+        badge !== undefined ? { ...privacyPayload, badge } : privacyPayload;
       // 这台设备正开着 App:不推(消息已经实时送到它上面了)。
       const onScreen = foregroundTokens.get(userId);
       return (tokensByUser.get(userId) ?? [])
@@ -599,5 +629,17 @@ export class ChatPushService implements OnModuleDestroy {
       default:
         return '[消息]';
     }
+  }
+
+  private viewerBurnSeconds(
+    message: ChatMessageDto,
+    policy: SelfDestructPolicy | undefined,
+  ): number | null {
+    if (!policy || policy.sec <= 0 || !policy.startedAt) return null;
+    const createdAt = new Date(message.createdAt);
+    if (Number.isNaN(createdAt.getTime()) || createdAt < policy.startedAt) {
+      return null;
+    }
+    return policy.sec;
   }
 }

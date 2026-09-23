@@ -50,6 +50,7 @@ describe('CircleInvitationService', () => {
       findUnique: jest.fn(),
       update: jest.fn(),
     },
+    chatConversation: { findUnique: jest.fn() },
     user: {
       findUnique: jest.fn(),
       findMany: jest.fn(),
@@ -98,6 +99,9 @@ describe('CircleInvitationService', () => {
     admissionPolicy.activateMembers.mockResolvedValue(['applicant-1']);
     chatCircleSync.ensureCircleConversation.mockResolvedValue('conv-1');
     chatService.ensureDirectConversationForSettlement.mockResolvedValue('dm-1');
+    prisma.chatConversation.findUnique.mockResolvedValue({
+      qrJoinEnabled: true,
+    });
     chatService.getOrCreateDirectConversation.mockResolvedValue({ id: 'dm-1' });
     chatMessages.insertServerMessage.mockResolvedValue({ id: 'msg-1' });
     // 验证人资格 = 好友 ∩ 本圈 ACTIVE 成员。既有用例大多只关心成员那一半,
@@ -1993,6 +1997,24 @@ describe('CircleInvitationService', () => {
         'applicant-1',
         { actor: 'third-party' },
       );
+    });
+
+    it('rechecks the circle QR gate under the shared policy lock', async () => {
+      arrangeInviteFlow();
+      prisma.chatConversation.findUnique.mockResolvedValue({
+        qrJoinEnabled: false,
+      });
+
+      await expect(
+        service.invite('inviter-1', 'applicant-1', 'circle-1', {
+          applicantConsented: true,
+          requireQrJoinEnabled: true,
+        }),
+      ).rejects.toMatchObject({
+        response: { errorCode: 'CHAT_GROUP_QR_JOIN_DISABLED' },
+      });
+      expect(memberLock.lockPolicy).toHaveBeenCalledWith(prisma, 'circle-1');
+      expect(prisma.circleInvitation.create).not.toHaveBeenCalled();
     });
 
     it('returns the existing pending invitation when the applicant scans again', async () => {

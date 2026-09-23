@@ -69,6 +69,7 @@ describe('ChatPushService', () => {
         messages.map((message) => message.payload),
     );
   const broadcast = { getForegroundPushTokensInConversation: jest.fn() };
+  const privacySettings = { getSelfDestructPoliciesForUsers: jest.fn() };
 
   let service: ChatPushService;
 
@@ -84,6 +85,7 @@ describe('ChatPushService', () => {
       prisma as never,
       push as never,
       broadcast as never,
+      privacySettings as never,
     );
     prisma.$queryRaw.mockResolvedValue([]);
     prisma.chatConversation.findUnique.mockResolvedValue({
@@ -115,6 +117,14 @@ describe('ChatPushService', () => {
         messages.map((message) => ({ token: message.token, status: 'SENT' })),
       ),
     );
+    privacySettings.getSelfDestructPoliciesForUsers.mockImplementation(
+      (userIds: string[]) =>
+        Promise.resolve(
+          new Map(
+            userIds.map((userId) => [userId, { sec: 0, startedAt: null }]),
+          ),
+        ),
+    );
   });
 
   afterEach(() => {
@@ -131,6 +141,47 @@ describe('ChatPushService', () => {
     await pushNow(msg());
 
     expect(sentPayloads()).toEqual([expect.objectContaining({ badge: 7 })]);
+  });
+
+  it('redacts preview and caps TTL only for recipients with an active global burn window', async () => {
+    prisma.chatMember.findMany.mockResolvedValue([
+      seat('u-private'),
+      seat('u-plain'),
+    ]);
+    privacySettings.getSelfDestructPoliciesForUsers.mockResolvedValue(
+      new Map([
+        [
+          'u-private',
+          { sec: 300, startedAt: new Date('2026-08-06T11:00:00.000Z') },
+        ],
+        ['u-plain', { sec: 0, startedAt: null }],
+      ]),
+    );
+
+    await pushNow(msg());
+
+    expect(
+      privacySettings.getSelfDestructPoliciesForUsers,
+    ).toHaveBeenCalledWith(['u-private', 'u-plain']);
+    const byToken = new Map(
+      push.sendMessages.mock.calls[0][0].map(
+        (entry: { token: string; payload: Record<string, unknown> }) => [
+          entry.token,
+          entry.payload,
+        ],
+      ),
+    );
+    expect(byToken.get('ExponentPushToken[a]')).toBeDefined();
+    const payloads = push.sendMessages.mock.calls.flatMap(
+      ([entries]: [Array<{ payload: Record<string, unknown> }>]) =>
+        entries.map((entry) => entry.payload),
+    );
+    expect(payloads).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ body: '[阅后即焚消息]', ttl: 300 }),
+        expect.objectContaining({ body: 'hello world', ttl: 86400 }),
+      ]),
+    );
   });
 
   it('counts neither recalled messages nor muted conversations in the badge', async () => {

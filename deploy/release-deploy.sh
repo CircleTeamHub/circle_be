@@ -644,6 +644,51 @@ handle_post_migration_failure() {
   fi
 }
 
+require_downtime_for_blocking_migrations() {
+  local applied probe_script
+  [ "${RELEASE_DOWNTIME:-0}" != "1" ] || return 0
+  probe_script=$(cat <<'NODE'
+const { Client } = require('pg');
+const migration = '20260913001000_add_chat_message_deleted_at';
+
+async function main() {
+  const client = new Client({ connectionString: process.env.DATABASE_URL });
+  await client.connect();
+  try {
+    const result = await client.query(
+      `SELECT CASE
+         WHEN to_regclass('_prisma_migrations') IS NULL THEN false
+         ELSE EXISTS (
+           SELECT 1 FROM "_prisma_migrations"
+           WHERE migration_name = $1
+             AND finished_at IS NOT NULL
+             AND rolled_back_at IS NULL
+         )
+       END AS applied`,
+      [migration],
+    );
+    process.stdout.write(result.rows[0].applied ? '1' : '0');
+  } finally {
+    await client.end();
+  }
+}
+
+main().catch((error) => {
+  console.error(`blocking migration probe failed: ${error.message}`);
+  process.exit(1);
+});
+NODE
+)
+  if ! applied="$(compose run --rm --no-deps migrate node -e "$probe_script")"; then
+    echo "Could not verify whether blocking migrations are already applied; refusing zero-downtime deployment." >&2
+    return 1
+  fi
+  if [ "$applied" != "1" ]; then
+    echo "Migration 20260913001000_add_chat_message_deleted_at requires RELEASE_DOWNTIME=1 while pending." >&2
+    return 1
+  fi
+}
+
 # 异地备份的函数定义(只定义,不执行)。未配置目标存储桶时
 # ship_backup_offsite 直接返回,行为与引入它之前完全一致。
 #
@@ -659,6 +704,8 @@ else
 fi
 
 # ── 迁移前先做数据库备份(pg_dump,保留最近 7 份)────────────────
+require_downtime_for_blocking_migrations
+
 if [ -n "$(running postgres)" ]; then
   backup_dir="$HOME/circle_be_backups"
   mkdir -p "$backup_dir"

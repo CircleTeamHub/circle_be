@@ -23,6 +23,7 @@ import {
 } from './chat-group-roles';
 import { ChatSystemMessageService } from './chat-system-message.service';
 import type { ChatGroupPoliciesDto, ChatMessageDto } from './chat.types';
+import { CircleMemberLockService } from 'src/circle/circle-member-lock';
 
 /** 锁后的会话行:群策略与全员禁言都从这份快照读、往这行写。 */
 interface LockedGroupRow {
@@ -69,6 +70,7 @@ export class ChatGroupSettingsService {
     private readonly broadcast: ChatBroadcastService,
     private readonly systemMessage: ChatSystemMessageService,
     private readonly groupEvents: ChatGroupEventService,
+    private readonly circleMemberLock: CircleMemberLockService,
   ) {
     this.storagePublicObjectBases = storagePublicObjectBasesFromConfig(
       this.config,
@@ -329,6 +331,11 @@ export class ChatGroupSettingsService {
     const result = await this.prisma.$transaction(async (tx) => {
       const locked = await this.lockGroup(tx, conversationId);
       this.assertManager(await this.actorRoleInTx(tx, locked, actorId));
+      // 圈子邀请/扫码加入在同一把 circle policy lock 内重读门禁。策略写也必须
+      // 拿这把锁，否则“关闭”返回 200 后，早先读到旧值的加入事务仍可能提交。
+      if (locked.circleID) {
+        await this.circleMemberLock.lockPolicy(tx, locked.circleID);
+      }
       const current = await this.policiesOf(tx, locked);
       const changes = POLICY_KEYS.filter(
         (key) => patch[key] !== undefined && patch[key] !== current[key],

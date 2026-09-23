@@ -406,6 +406,24 @@ describe('PrivacySettingsService', () => {
     expect(update.messageSelfDestructStartedAt).toBeInstanceOf(Date);
   });
 
+  it('replaces a stale legacy boundary when global self-destruct is re-enabled', async () => {
+    const stale = new Date('2026-09-01T00:00:00.000Z');
+    prisma.userPrivacySetting.findUnique.mockResolvedValue(
+      storedRow({ messageSelfDestructStartedAt: stale }),
+    );
+    prisma.userPrivacySetting.upsert.mockResolvedValue(
+      storedRow({ messageSelfDestructSec: 3600 }),
+    );
+
+    await service.updateSettings('user-1', {
+      messageSelfDestructSec: 3600,
+    } as UpdatePrivacySettingsDto);
+
+    const { update } = prisma.userPrivacySetting.upsert.mock.calls[0][0];
+    expect(update.messageSelfDestructStartedAt).toBeInstanceOf(Date);
+    expect(update.messageSelfDestructStartedAt).not.toEqual(stale);
+  });
+
   it('keeps the original boundary when only the duration changes', async () => {
     const original = new Date('2026-09-01T00:00:00.000Z');
     prisma.userPrivacySetting.findUnique.mockResolvedValue(
