@@ -9,6 +9,7 @@ import {
 import { HttpAdapterHost } from '@nestjs/core';
 import {
   attemptDiagnostic,
+  diagnosticFailureDetails,
   logHttpFailure,
 } from '../logging/http-failure.logger';
 import { safeLogPath } from '../logging/log-sanitizer';
@@ -150,11 +151,12 @@ export class AllExceptionFilter implements ExceptionFilter {
         });
         markErrorCaptured(exception);
       },
-      () =>
+      (failure) =>
         this.logger.error(
           {
             event: 'error_aggregation_failed',
             requestId: getRequestContext()?.requestId,
+            ...diagnosticFailureDetails(failure),
           },
           'HttpError',
         ),
@@ -198,11 +200,12 @@ export class AllExceptionFilter implements ExceptionFilter {
         });
         markSecurityEventLogged(exception);
       },
-      () =>
+      (failure) =>
         this.logger.error(
           {
             event: 'security_event_log_failed',
             requestId: getRequestContext()?.requestId,
+            ...diagnosticFailureDetails(failure),
           },
           'HttpError',
         ),

@@ -87,6 +87,8 @@ describe('handled-errors markers', () => {
       expect(wasErrorCaptured(error)).toBe(true);
       expect(wasSecurityEventLogged(error)).toBe(true);
     });
+    expect(wasErrorCaptured(error)).toBe(false);
+    expect(wasSecurityEventLogged(error)).toBe(false);
   });
 
   it('classifies only missing / expired tokens as routine auth failures', () => {
