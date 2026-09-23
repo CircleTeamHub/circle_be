@@ -133,7 +133,7 @@ test('production app env access uses recoverable group-read transactions', () =>
   ).trim();
 
   assert.match(compose, /group_add:[\s\S]*APP_ENV_GID/);
-  assert.equal(runtimeCompatibility, '2');
+  assert.equal(runtimeCompatibility, '3');
   assert.ok(
     deployDocs.includes(`当前 \`compatibility=${runtimeCompatibility}\``),
     'rollback docs must name the current runtime compatibility baseline',
