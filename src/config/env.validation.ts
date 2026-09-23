@@ -326,6 +326,13 @@ export function createEnvValidationSchema(
         return helpers.message({ custom: bypass.reason });
       }
 
+      if (Boolean(value.JPUSH_APP_KEY) !== Boolean(value.JPUSH_MASTER_SECRET)) {
+        return helpers.message({
+          custom:
+            'JPUSH_APP_KEY and JPUSH_MASTER_SECRET must be configured together',
+        });
+      }
+
       const accessTtl = parseDurationMilliseconds(value.JWT_EXPIRES_IN);
       const refreshTtl = parseRefreshDurationMilliseconds(
         value.REFRESH_EXPIRES_IN ?? value.REFRESH_EXPIRES_IN_DAYS ?? '7d',
