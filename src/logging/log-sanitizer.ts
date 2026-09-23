@@ -30,10 +30,12 @@ function redactIpAddresses(value: string): string {
   return value.replace(
     IP_CANDIDATE,
     (address: string, offset: number, input: string) => {
+      const ipv4 = /^(?:\d{1,3}\.){3}\d{1,3}/.exec(address)?.[0];
+      const candidate = ipv4 ?? address;
       const preceding = input.slice(Math.max(0, offset - 16), offset);
-      return isIP(address) &&
+      return isIP(candidate) &&
         !/\b(?:version|release|build)\s*$/i.test(preceding)
-        ? '[redacted-ip]'
+        ? `[redacted-ip]${address.slice(candidate.length)}`
         : address;
     },
   );
@@ -246,6 +248,8 @@ export function sanitizeLogValue(value: unknown): unknown {
         if (
           'message' in result &&
           ('event' in result ||
+            'name' in result ||
+            'errorName' in result ||
             'stack' in result ||
             'error' in result ||
             result.level === 'error' ||
