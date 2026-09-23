@@ -50,6 +50,9 @@ COPY --from=build-stage --chown=app:app /app/dist ./dist
 COPY --from=build-stage --chown=app:app /app/prisma ./prisma
 COPY --from=build-stage --chown=app:app /app/prisma.config.ts ./
 COPY --from=build-stage --chown=app:app /app/src/generated ./src/generated
+# The release migration preflight runs from the production image too; keep the
+# bounded deletedAt backfill helper available to the release overlay.
+COPY --from=build-stage --chown=app:app /app/scripts/prepare-chat-message-deleted-at-migration.mjs ./scripts/prepare-chat-message-deleted-at-migration.mjs
 
 # Drop devDependencies, then restore just the lockfile-pinned Prisma CLI.
 # Migrations execute its local binary directly, so the final image can remove
