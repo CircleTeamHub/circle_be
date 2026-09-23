@@ -158,6 +158,10 @@ describe('createWinstonOptions', () => {
     );
     openedLoggers.push(winston.createLogger(options));
     expect(options.transports).toHaveLength(3);
+    expect(
+      (options.transports?.[1] as unknown as { options: { options: object } })
+        .options.options,
+    ).toEqual({ flags: 'a', mode: 0o644 });
     const outputs: string[] = [];
     for (const transport of options.transports as winston.transport[]) {
       jest.spyOn(transport, 'log').mockImplementation((info, callback) => {
