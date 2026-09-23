@@ -63,10 +63,8 @@ function hasRequestMarker(
   unscoped: WeakSet<object>,
   requestContext?: RequestContext,
 ): boolean {
-  return (
-    unscoped.has(error) ||
-    Boolean(requestContext && scoped.get(error)?.has(requestContext))
-  );
+  if (unscoped.delete(error)) return true;
+  return Boolean(requestContext && scoped.get(error)?.has(requestContext));
 }
 
 export function markAuthFailureReason(
