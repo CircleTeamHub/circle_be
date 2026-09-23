@@ -81,7 +81,11 @@ test('Caddy emits privacy-safe access logs only for websocket handshakes', () =>
   assert.match(apiBlock, /@chat_ws path \/chat-ws \/chat-ws\/\*/);
   assert.match(
     apiBlock,
-    /header_up X-Connection-Trace-Id ws-\{http\.request\.uuid\}/,
+    /vars @chat_ws connection_trace_id ws-\{http\.request\.uuid\}/,
+  );
+  assert.match(
+    apiBlock,
+    /header_up X-Connection-Trace-Id \{http\.vars\.connection_trace_id\}/,
   );
   assert.match(
     apiBlock,
@@ -90,8 +94,9 @@ test('Caddy emits privacy-safe access logs only for websocket handshakes', () =>
   assert.match(apiBlock, /log_name @chat_ws chat_ws/);
   assert.match(
     apiBlock,
-    /log_append @chat_ws traceId ws-\{http\.request\.uuid\}/,
+    /log_append @chat_ws traceId \{http\.vars\.connection_trace_id\}/,
   );
+  assert.equal(apiBlock.match(/\{http\.request\.uuid\}/g)?.length, 1);
   // filter 编码器要求 wrap 一个底层编码器,并把字段过滤放进 fields 块;把过滤
   // 直接写在 format filter 下会被 caddy validate 拒绝,而 release-deploy.sh 每次
   // 切流前都跑 validate —— 语法错就是发布被卡死。正文还是纯文本比对,真正的
@@ -128,7 +133,7 @@ test('production app env access uses recoverable group-read transactions', () =>
   ).trim();
 
   assert.match(compose, /group_add:[\s\S]*APP_ENV_GID/);
-  assert.equal(runtimeCompatibility, '2');
+  assert.equal(runtimeCompatibility, '3');
   assert.ok(
     deployDocs.includes(`当前 \`compatibility=${runtimeCompatibility}\``),
     'rollback docs must name the current runtime compatibility baseline',

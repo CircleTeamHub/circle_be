@@ -17,7 +17,7 @@
       "description": "Current Prometheus firing alerts grouped by name and severity. This shows rule state, not whether any notification was received.",
       "datasource": { "type": "prometheus", "uid": "prometheus" },
       "gridPos": { "h": 6, "w": 8, "x": 0, "y": 0 },
-      "fieldConfig": { "defaults": { "unit": "short", "noValue": "No firing alerts" }, "overrides": [] },
+      "fieldConfig": { "defaults": { "unit": "short", "noValue": "No firing alerts", "thresholds": { "mode": "absolute", "steps": [{ "color": "green", "value": null }, { "color": "red", "value": 1 }] } }, "overrides": [] },
       "options": { "colorMode": "value", "graphMode": "none", "reduceOptions": { "calcs": ["lastNotNull"], "values": false } },
       "targets": [{ "refId": "A", "datasource": { "type": "prometheus", "uid": "prometheus" }, "expr": "sum by (alertname, severity) (ALERTS{alertstate=\"firing\",alertname!=\"Watchdog\"})", "legendFormat": "{{severity}} · {{alertname}}", "instant": true }]
     },

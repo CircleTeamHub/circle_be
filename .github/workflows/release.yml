@@ -426,6 +426,9 @@ jobs:
             monitoring/grafana/provisioning/datasources/loki.yml
             monitoring/grafana/provisioning/datasources/loki.yml.example
             monitoring/prometheus/logs-targets.yml
+            monitoring/prometheus/prometheus.yml
+            monitoring/prometheus/prometheus.prod.yml
+            monitoring/prometheus/alerts.yml
             Dockerfile.caddy
             docker-compose.prod.yml
             docker-compose.release.yml

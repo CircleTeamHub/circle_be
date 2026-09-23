@@ -45,6 +45,9 @@ test('manual rollback keeps current trusted deploy tooling with the historical a
     'monitoring/grafana/provisioning/datasources/loki.yml',
     'monitoring/grafana/provisioning/datasources/loki.yml.example',
     'monitoring/prometheus/logs-targets.yml',
+    'monitoring/prometheus/prometheus.yml',
+    'monitoring/prometheus/prometheus.prod.yml',
+    'monitoring/prometheus/alerts.yml',
     'Dockerfile.caddy',
     'docker-compose.prod.yml',
     'docker-compose.release.yml',
@@ -304,7 +307,7 @@ test('manual rollback rejects application tags below the trusted runtime contrac
       '#!/usr/bin/env bash\nprintf "%s\\n" "$TRUSTED_RUNTIME"\n',
     );
     fs.chmodSync(git, 0o755);
-    const runGate = (target, trusted = '2') => {
+    const runGate = (target, trusted = '3') => {
       const targetFile = path.join(deploy, 'RELEASE_RUNTIME_COMPATIBILITY');
       if (target === null) fs.rmSync(targetFile, { force: true });
       else fs.writeFileSync(targetFile, `${target}\n`);
@@ -319,12 +322,13 @@ test('manual rollback rejects application tags below the trusted runtime contrac
       });
     };
 
-    assert.equal(runGate('2').status, 0);
+    assert.equal(runGate('3').status, 0);
+    assert.notEqual(runGate('2').status, 0);
     assert.notEqual(runGate('1').status, 0);
     assert.notEqual(runGate(null).status, 0);
     assert.notEqual(runGate('0').status, 0);
     assert.notEqual(runGate('invalid').status, 0);
-    assert.notEqual(runGate('2', 'invalid').status, 0);
+    assert.notEqual(runGate('3', 'invalid').status, 0);
   } finally {
     fs.rmSync(directory, { recursive: true, force: true });
   }

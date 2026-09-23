@@ -71,7 +71,7 @@ function createDailyRotateTransport(
     datePattern: 'YYYY-MM-DD-HH',
     // Keep rotated segments readable by collectors catching up after downtime.
     zippedArchive: false,
-    options: { mode: 0o644 },
+    options: { flags: 'a', mode: 0o644 },
     maxSize: '20m',
     maxFiles: `${retentionDays}d`,
     format,

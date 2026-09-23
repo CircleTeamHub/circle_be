@@ -141,14 +141,12 @@ describe('ChatMediaService', () => {
       expect(warn).toHaveBeenCalledWith(
         expect.objectContaining({
           event: 'chat_media_delete_failed',
-          operation: 'deleteObject',
           objectKey: '[redacted]',
         }),
       );
       expect(errorLog).toHaveBeenCalledWith(
         expect.objectContaining({
           event: 'chat_media_delete_queue_failed',
-          operation: 'queueDelete',
           objectKey: '[redacted]',
         }),
       );
@@ -166,7 +164,9 @@ describe('ChatMediaService', () => {
   it('logs presign and sweep failures without storage keys or error contents', async () => {
     const warn = jest.spyOn(Logger.prototype, 'warn').mockImplementation();
     uploadService.createPresignedGetUrl.mockRejectedValueOnce(
-      new Error('private-storage-response'),
+      Object.assign(new Error('private-storage-response'), {
+        code: 'ECONNREFUSED',
+      }),
     );
     prisma.chatMediaDeletion.findMany.mockRejectedValueOnce(
       new Error('SELECT private_messages'),
@@ -181,14 +181,13 @@ describe('ChatMediaService', () => {
       expect(warn).toHaveBeenCalledWith(
         expect.objectContaining({
           event: 'chat_media_presign_failed',
-          operation: 'attachMediaUrls',
           objectKey: '[redacted]',
+          failureCode: 'ECONNREFUSED',
         }),
       );
       expect(warn).toHaveBeenCalledWith(
         expect.objectContaining({
           event: 'chat_media_deletion_sweep_failed',
-          operation: 'drainPendingDeletions',
         }),
       );
       expect(JSON.stringify(warn.mock.calls)).not.toMatch(

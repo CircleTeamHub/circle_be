@@ -24,7 +24,9 @@ install -m 0644 "$SOURCE_ROOT/deploy/Caddyfile.admin" "$TARGET_ROOT/deploy/Caddy
 install -m 0755 "$SOURCE_ROOT/monitoring/sync-metrics-token.sh" "$TARGET_ROOT/monitoring/sync-metrics-token.sh"
 for file in docker-compose.logs.yml alloy/config.alloy loki/config.yml \
   grafana/provisioning/datasources/loki.yml \
-  grafana/provisioning/datasources/loki.yml.example prometheus/logs-targets.yml; do
+  grafana/provisioning/datasources/loki.yml.example prometheus/logs-targets.yml \
+  prometheus/prometheus.yml prometheus/prometheus.prod.yml \
+  prometheus/alerts.yml; do
   target="$TARGET_ROOT/monitoring/$file"
   mkdir -p "$(dirname "$target")"
   install -m 0644 "$SOURCE_ROOT/monitoring/$file" "$target"

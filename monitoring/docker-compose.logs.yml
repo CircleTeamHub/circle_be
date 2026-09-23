@@ -60,7 +60,7 @@ services:
       - ./grafana/provisioning/datasources/loki.yml.example:/etc/grafana/provisioning/datasources/loki.yml:ro
 
   prometheus:
-    networks: [default, logs]
+    networks: [default, circle-be, logs]
     volumes:
       - ./prometheus/logs-targets.yml:/etc/prometheus/log-targets/targets.yml:ro
 

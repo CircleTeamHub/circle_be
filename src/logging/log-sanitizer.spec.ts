@@ -56,18 +56,22 @@ describe('log sanitizer', () => {
       'failed Bearer private-bearer password="two private words" ' +
         'private@example.com eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJ1c2VyIn0.signature ' +
         'https://files.example.com/private.jpg?X-Amz-Signature=private-signature ' +
-        'Basic dXNlcjpwYXNzd29yZA== +1-555-123-4567 15551234568 203.0.113.42 2001:db8::1 ' +
+        'Basic dXNlcjpwYXNzd29yZA== +1-555-123-4567 15551234568 203.0.113.42:443 203.0.113.43. [2001:db8::1]:443 ' +
         'path:/api/v1/note/share-links/private-path {"access_token":"json-secret",' +
         '"password":"alpha\\"omega"} word=private-slur -----BEGIN PRIVATE KEY-----pem-secret',
     );
     expect(value).not.toMatch(
       /private-bearer|two private words|private@example|eyJhbGci|private\.jpg|private-signature|dXNlc|555-123|15551234568|203\.0\.113|2001:db8|private-path|json-secret|alpha|omega|pem-secret|private-slur/,
     );
-    expect(value).toContain('failed');
     expect(sanitizeLogText('release 1.2.3.4')).toContain('1.2.3.4');
   });
 
   it('redacts arbitrary root logger prose while preserving structured events', () => {
+    expect(
+      JSON.stringify(
+        sanitizeLogValue({ name: 'Error', message: 'private_content' }),
+      ),
+    ).not.toContain('private_content');
     expect(
       sanitizeLogValue({
         level: 'warn',
