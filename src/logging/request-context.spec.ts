@@ -32,13 +32,10 @@ describe('request context', () => {
     expect(getRequestContext()).toBeUndefined();
   });
 
-  it('reuses safe incoming request ids', () => {
+  it('reuses only UUID incoming request ids and normalizes their case', () => {
     expect(resolveRequestId('9B2A7F3C-2A9E-4F1C-8D2B-124A5CC93A10')).toBe(
-      '9B2A7F3C-2A9E-4F1C-8D2B-124A5CC93A10',
+      '9b2a7f3c-2a9e-4f1c-8d2b-124a5cc93a10',
     );
-    expect(resolveRequestId('edge:01JABC.def')).toBe('edge:01JABC.def');
-    expect(resolveRequestId('privateaccount123')).toBe('privateaccount123');
-    expect(resolveRequestId('15551234567')).toBe('15551234567');
   });
 
   it('generates ids for missing or unsafe incoming values', () => {
@@ -51,6 +48,10 @@ describe('request context', () => {
       'eyJhbGciOiJub25lIn0.eyJzdWIiOiJ1c2VyIn0.',
       'protected..iv.ciphertext.tag',
       'person@example.com',
+      'edge:01JABC.def',
+      'privateaccount123',
+      '15551234567',
+      '00000000-0000-0000-0000-000000000000',
     ])
       expect(resolveRequestId(unsafe)).toMatch(generated);
   });
