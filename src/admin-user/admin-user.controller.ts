@@ -1,4 +1,8 @@
 import {
+  AdminPermissionGuard,
+  RequireAdminPermission,
+} from 'src/admin-access/admin-permission.guard';
+import {
   Body,
   Controller,
   DefaultValuePipe,
@@ -24,9 +28,10 @@ import {
 } from './dto/admin-user.dto';
 
 @Controller('admin/users')
-@UseGuards(JwtGuard, AdminGuard)
+@UseGuards(JwtGuard, AdminGuard, AdminPermissionGuard)
 @ApiTags('Admin Users')
 @ApiBearerAuth()
+@RequireAdminPermission('USER_READ')
 export class AdminUserController {
   constructor(private readonly service: AdminUserService) {}
 
@@ -43,6 +48,7 @@ export class AdminUserController {
   }
 
   @Post(':id/sensitive-access')
+  @RequireAdminPermission('USER_SENSITIVE')
   @ApiOperation({ summary: 'Reveal one audited sensitive field' })
   reveal(
     @Param('id', ParseUUIDPipe) id: string,
@@ -60,6 +66,7 @@ export class AdminUserController {
   }
 
   @Patch(':id/status')
+  @RequireAdminPermission('USER_MODERATE')
   @ApiOperation({ summary: 'Ban, unban, or soft-delete a user' })
   updateStatus(
     @Param('id', ParseUUIDPipe) id: string,
@@ -77,6 +84,7 @@ export class AdminUserController {
   }
 
   @Get(':id/audit-logs')
+  @RequireAdminPermission('AUDIT_READ')
   @ApiOperation({ summary: 'List recent Admin activity for a user' })
   auditLogs(
     @Param('id', ParseUUIDPipe) id: string,

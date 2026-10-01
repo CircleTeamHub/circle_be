@@ -1,4 +1,8 @@
 import {
+  AdminPermissionGuard,
+  RequireAdminPermission,
+} from 'src/admin-access/admin-permission.guard';
+import {
   Body,
   Controller,
   Get,
@@ -38,8 +42,9 @@ function auditContext(req: RequestWithUser) {
 
 @ApiTags('Admin · Avatar frames')
 @ApiBearerAuth()
-@UseGuards(JwtGuard, AdminGuard)
+@UseGuards(JwtGuard, AdminGuard, AdminPermissionGuard)
 @Controller('admin/avatar-frames')
+@RequireAdminPermission('COMMERCE_MANAGE')
 export class AvatarFrameAdminController {
   constructor(
     private readonly avatarFrameAdminService: AvatarFrameAdminService,

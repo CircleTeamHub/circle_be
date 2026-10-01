@@ -1,3 +1,7 @@
+import {
+  AdminPermissionGuard,
+  RequireAdminPermission,
+} from 'src/admin-access/admin-permission.guard';
 import { Controller, Get, Query, UseGuards } from '@nestjs/common';
 import {
   ApiBearerAuth,
@@ -13,8 +17,9 @@ import { DashboardService } from './dashboard.service';
 
 @ApiTags('Admin - Dashboard')
 @ApiBearerAuth()
-@UseGuards(ThrottlerGuard, JwtGuard, AdminGuard)
+@UseGuards(ThrottlerGuard, JwtGuard, AdminGuard, AdminPermissionGuard)
 @Controller('admin/dashboard')
+@RequireAdminPermission('DASHBOARD')
 export class DashboardController {
   constructor(private readonly dashboard: DashboardService) {}
 

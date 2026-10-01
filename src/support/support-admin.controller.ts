@@ -1,4 +1,8 @@
 import {
+  AdminPermissionGuard,
+  RequireAdminPermission,
+} from 'src/admin-access/admin-permission.guard';
+import {
   Body,
   Controller,
   DefaultValuePipe,
@@ -23,8 +27,9 @@ import { SupportService } from './support.service';
 
 @ApiTags('Admin · Support')
 @ApiBearerAuth()
-@UseGuards(JwtGuard, AdminGuard)
+@UseGuards(JwtGuard, AdminGuard, AdminPermissionGuard)
 @Controller('admin/support')
+@RequireAdminPermission('SUPPORT_MANAGE')
 export class SupportAdminController {
   constructor(private readonly support: SupportService) {}
 

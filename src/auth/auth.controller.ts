@@ -104,6 +104,8 @@ export class AuthController {
   }
 
   @Post('admin/login')
+  @UseGuards(ThrottlerGuard)
+  @Throttle({ default: { limit: 10, ttl: 60_000 } })
   @ApiOperation({ summary: 'Admin web login with password' })
   @ApiBody({ type: LoginDto })
   @ApiHeader({

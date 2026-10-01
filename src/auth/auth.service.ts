@@ -163,7 +163,32 @@ export class AuthService {
           select: { id: true, status: true },
         })
       : null;
-    if (normalizedInviteCode && (!inviter || inviter.status !== 'ACTIVE')) {
+    const campaign =
+      normalizedInviteCode && !inviter
+        ? await this.prisma.campaignInvite.findUnique({
+            where: { code: normalizedInviteCode },
+            select: {
+              id: true,
+              enabled: true,
+              expiresAt: true,
+              maxUses: true,
+              usedCount: true,
+              owner: { select: { id: true, status: true, role: true } },
+            },
+          })
+        : null;
+    const campaignUsable =
+      campaign &&
+      campaign.enabled &&
+      campaign.expiresAt > new Date() &&
+      campaign.usedCount < campaign.maxUses &&
+      campaign.owner.status === 'ACTIVE' &&
+      campaign.owner.role !== 'ADMIN';
+    if (
+      normalizedInviteCode &&
+      (!inviter || inviter.status !== 'ACTIVE') &&
+      !campaignUsable
+    ) {
       throw new BadRequestException({
         message: '邀请码无效',
         errorCode: AuthErrorCode.InviteCodeInvalid,
@@ -171,12 +196,19 @@ export class AuthService {
     }
 
     const passwordHash = await argon2.hash(dto.password);
-    const user = await this.createRegisteredUser({
-      passwordHash,
-      nickname: dto.nickname,
-      email,
-      ...(inviter ? { invitedByUserId: inviter.id } : {}),
-    });
+    const user = await this.createRegisteredUser(
+      {
+        passwordHash,
+        nickname: dto.nickname,
+        email,
+        ...(inviter
+          ? { invitedByUserId: inviter.id }
+          : campaignUsable
+            ? { invitedByUserId: campaign.owner.id }
+            : {}),
+      },
+      campaignUsable ? campaign.id : undefined,
+    );
 
     logBusinessEvent(this.logger, {
       enabled: this.loggingConfig.businessLogOn,
@@ -344,6 +376,45 @@ export class AuthService {
   }
 
   async adminLogin(dto: LoginDto, sessionContext?: SessionContext) {
+    const target = await this.prisma.user.findUnique({
+      where: { email: normalizeEmail(loginIdentifier(dto)) },
+      select: { id: true, accountId: true, role: true },
+    });
+    try {
+      const login = await this.performAdminLogin(dto, sessionContext);
+      await this.prisma.adminAuditLog.create({
+        data: {
+          actorID: login.userId,
+          actorAccountId: login.accountId,
+          action: 'admin.login.success',
+          entityType: 'admin_session',
+          ip: sessionContext?.ip?.slice(0, 64),
+          userAgent: sessionContext?.userAgent?.slice(0, 256),
+        },
+      });
+      return login.tokens;
+    } catch (error) {
+      try {
+        await this.prisma.adminAuditLog.create({
+          data: {
+            actorID: target?.role === 'ADMIN' ? target.id : 'anonymous',
+            action: 'admin.login.failed',
+            entityType: 'admin_session',
+            ip: sessionContext?.ip?.slice(0, 64),
+            userAgent: sessionContext?.userAgent?.slice(0, 256),
+          },
+        });
+      } catch {
+        this.logger.warn('Admin login audit unavailable');
+      }
+      throw error;
+    }
+  }
+
+  private async performAdminLogin(
+    dto: LoginDto,
+    sessionContext?: SessionContext,
+  ) {
     const email = normalizeEmail(loginIdentifier(dto));
     const user = await this.prisma.user.findUnique({ where: { email } });
     // 管理台事件必须可追溯来源（#90）：ip/userAgent 一律进 metadata。
@@ -415,6 +486,12 @@ export class AuthService {
       throw new ForbiddenException('Invalid credentials or inactive account');
     }
 
+    const consoleAccess = await this.prisma.adminAccess.findUnique({
+      where: { userID: user.id },
+      select: { role: true },
+    });
+    if (!consoleAccess)
+      throw new ForbiddenException('管理员尚未分配权限，请联系超级管理员');
     await this.resetAdminLockCounters(user);
 
     this.prisma.user
@@ -445,7 +522,7 @@ export class AuthService {
       metadata: adminAuditContext,
     });
 
-    return tokens;
+    return { tokens, userId: user.id, accountId: user.accountId };
   }
 
   /** 密码登录共用的收尾：lastOnline、发 token、记日志。 */
@@ -1242,6 +1319,7 @@ export class AuthService {
 
   private async createRegisteredUser(
     data: Omit<Prisma.UserUncheckedCreateInput, 'accountId' | 'inviteCode'>,
+    campaignID?: string,
   ) {
     const maxAttempts = REGISTRATION_CODE_MAX_ATTEMPTS;
     for (let attempt = 0; attempt < maxAttempts; attempt += 1) {
@@ -1251,6 +1329,18 @@ export class AuthService {
       ]);
       try {
         return await this.prisma.$transaction(async (tx) => {
+          if (campaignID) {
+            const claimed = await tx.$queryRaw<Array<{ id: string }>>`
+              UPDATE "CampaignInvite" SET "usedCount" = "usedCount" + 1, "updatedAt" = CURRENT_TIMESTAMP
+              WHERE "id" = ${campaignID} AND "enabled" = true AND "expiresAt" > CURRENT_TIMESTAMP AND "usedCount" < "maxUses"
+              AND EXISTS (SELECT 1 FROM "User" WHERE "User"."id" = "CampaignInvite"."ownerUserID" AND "status" = 'ACTIVE' AND "role" <> 'ADMIN')
+              RETURNING "id"`;
+            if (claimed.length !== 1)
+              throw new BadRequestException({
+                message: '邀请码已失效或使用次数已满',
+                errorCode: AuthErrorCode.InviteCodeInvalid,
+              });
+          }
           const user = await tx.user.create({
             data: {
               ...data,
@@ -1258,6 +1348,10 @@ export class AuthService {
               inviteCode,
             },
           });
+          if (campaignID)
+            await tx.campaignInviteUse.create({
+              data: { campaignID, userID: user.id },
+            });
           if (data.invitedByUserId) {
             await tx.referral.create({
               data: buildPendingReferralData(this.referralRules, {

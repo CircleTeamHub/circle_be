@@ -90,6 +90,13 @@ enum UserRole {
   USER
 }
 
+enum AdminConsoleRole {
+  SUPER_ADMIN
+  OPERATIONS
+  MODERATOR
+  SUPPORT
+}
+
 enum Gender {
   male
   female
@@ -478,6 +485,10 @@ model User {
   supportAgentRoles                 SupportAgent[]
   qrTokensIssued                    QrToken[]                   @relation("qrTokenIssuer")
   chatDirectAutoReplyStates         ChatDirectAutoReplyState[]
+  adminAccess                       AdminAccess?
+  campaignInvites                   CampaignInvite[]
+  campaignInviteUse                 CampaignInviteUse?
+  adminOperationRequests            AdminOperationRequest[]
 
   @@index([invitedByUserId])
   @@index([selectedAvatarFrameID])
@@ -682,6 +693,77 @@ model AccountIdentifier {
   inviteOwner User?        @relation("inviteAccountIdentifier", fields: [inviteOwnerUserID], references: [id], onDelete: Restrict)
   accountUser User?        @relation("userAccountIdRegistry")
   fancyNumber FancyNumber?
+  campaignInvite CampaignInvite?
+}
+
+model AdminAccess {
+  userID    String @id
+  role      AdminConsoleRole
+  version   Int @default(1)
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+  user      User @relation(fields: [userID], references: [id], onDelete: Cascade)
+
+  @@index([role])
+}
+
+model CampaignInvite {
+  id          String @id @default(uuid())
+  code        String @unique
+  identifierValue String @unique
+  name        String
+  ownerUserID String
+  enabled     Boolean @default(true)
+  maxUses     Int
+  usedCount   Int @default(0)
+  expiresAt   DateTime
+  version     Int @default(1)
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+  owner       User @relation(fields: [ownerUserID], references: [id], onDelete: Restrict)
+  identifier  AccountIdentifier @relation(fields: [identifierValue], references: [value], onDelete: Restrict)
+  uses        CampaignInviteUse[]
+
+  @@index([ownerUserID, createdAt])
+  @@index([enabled, expiresAt])
+}
+
+model CampaignInviteUse {
+  id         String @id @default(uuid())
+  campaignID String
+  userID     String @unique
+  createdAt  DateTime @default(now())
+  campaign   CampaignInvite @relation(fields: [campaignID], references: [id], onDelete: Restrict)
+  user       User @relation(fields: [userID], references: [id], onDelete: Restrict)
+
+  @@index([campaignID, createdAt])
+}
+
+model AdminAdvertisement {
+  id         String @id @default(uuid())
+  title      String
+  imageUrl   String
+  targetUrl  String
+  placement  String
+  sortOrder  Int @default(0)
+  enabled    Boolean @default(false)
+  startsAt   DateTime
+  endsAt     DateTime
+  version    Int @default(1)
+  createdAt  DateTime @default(now())
+  updatedAt  DateTime @updatedAt
+
+  @@index([placement, enabled, startsAt, endsAt])
+}
+
+model AdminOperationRequest {
+  id        String @id
+  actorID   String
+  inputHash String
+  result    Json
+  createdAt DateTime @default(now())
+  actor     User @relation(fields: [actorID], references: [id], onDelete: Restrict)
+  @@index([actorID, createdAt])
 }
 
 model FancyNumber {

@@ -308,12 +308,46 @@ export class AdminUserService {
     }
 
     const result = await this.prisma.$transaction(async (tx) => {
+      await tx.$queryRaw`SELECT pg_advisory_xact_lock(72419930)`;
       const current = await tx.user.findUnique({
         where: { id: targetId },
-        select: { id: true, accountId: true, status: true },
+        select: {
+          id: true,
+          accountId: true,
+          status: true,
+          role: true,
+          adminAccess: true,
+        },
       });
       if (!current) {
         throw this.userNotFound();
+      }
+
+      if (current.role === 'ADMIN') {
+        const operator = await tx.user.findUnique({
+          where: { id: actor.userId },
+          select: { role: true, status: true, adminAccess: true },
+        });
+        if (
+          operator?.role !== 'ADMIN' ||
+          operator.status !== 'ACTIVE' ||
+          operator.adminAccess?.role !== 'SUPER_ADMIN'
+        )
+          throw new ForbiddenException('只有超级管理员可更改管理员账号状态');
+        if (
+          current.status === 'ACTIVE' &&
+          current.adminAccess?.role === 'SUPER_ADMIN' &&
+          dto.status !== 'ACTIVE'
+        ) {
+          const superCount = await tx.adminAccess.count({
+            where: {
+              role: 'SUPER_ADMIN',
+              user: { role: 'ADMIN', status: 'ACTIVE' },
+            },
+          });
+          if (superCount <= 1)
+            throw new BadRequestException('必须保留至少一个可用超级管理员');
+        }
       }
 
       if (

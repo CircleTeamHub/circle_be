@@ -1,3 +1,4 @@
+import { ADMIN_ROLE_PERMISSIONS } from 'src/admin-access/admin-permission.guard';
 import {
   BadRequestException,
   ConflictException,
@@ -76,11 +77,76 @@ export class GroupService {
     );
   }
 
+  /** Explicit console API; the private cores retain all circle locks and side effects. */
+  async moderateAsAdministrator(
+    actorId: string,
+    circleId: string,
+    targetUserId: string,
+    action: 'role' | 'remove',
+    role: 'ADMIN' | 'MEMBER' | undefined,
+    reason: string,
+  ) {
+    if (reason.trim().length < 2 || reason.length > 500)
+      throw new BadRequestException('Reason required');
+    if (action === 'role') {
+      if (role !== 'ADMIN' && role !== 'MEMBER')
+        throw new BadRequestException('Role required');
+      return this.updateGroupMemberRoleCore(
+        actorId,
+        circleId,
+        targetUserId,
+        { role: role as GroupMemberRoleInput },
+        reason,
+      );
+    }
+    const result = await this.removeGroupMemberCore(
+      actorId,
+      circleId,
+      targetUserId,
+      reason,
+    );
+    if (!result.handled) throw new NotFoundException('Circle group not found');
+    return result;
+  }
+
+  private async assertConsoleModerator(
+    tx: Prisma.TransactionClient,
+    actorId: string,
+  ) {
+    const actor = await tx.user.findUnique({
+      where: { id: actorId },
+      select: {
+        role: true,
+        status: true,
+        adminAccess: { select: { role: true } },
+      },
+    });
+    if (
+      actor?.role !== 'ADMIN' ||
+      actor.status !== 'ACTIVE' ||
+      !actor.adminAccess ||
+      !(ADMIN_ROLE_PERMISSIONS[actor.adminAccess.role] ?? []).includes(
+        'IM_MODERATE',
+      )
+    )
+      throw new ForbiddenException();
+  }
+
   async updateGroupMemberRole(
     actorId: string,
     groupID: string,
     targetUserID: string,
     dto: UpdateGroupMemberRoleDto,
+  ) {
+    return this.updateGroupMemberRoleCore(actorId, groupID, targetUserID, dto);
+  }
+
+  private async updateGroupMemberRoleCore(
+    actorId: string,
+    groupID: string,
+    targetUserID: string,
+    dto: UpdateGroupMemberRoleDto,
+    consoleReason?: string,
   ): Promise<GroupMemberRoleResultDto> {
     const normalizedGroupID = this.normalizeGroupID(groupID);
     const normalizedTargetUserID = normalizeUserIdAlias(targetUserID.trim());
@@ -118,12 +184,19 @@ export class GroupService {
       // 先鉴权,再取锁、再查目标。反过来的话:非群主也能让服务端为任意 userID
       // 取一遍成员锁并做一次存在性查询,错误信息的差异就成了「此人是否在群里」
       // 的探测接口,顺带还能拿锁竞争当侧信道。
-      const preflightActor = await tx.circleMember.findUnique({
-        where: {
-          userID_circleID: { userID: actorId, circleID: circle.id },
-        },
-        select: { id: true, role: true, status: true },
-      });
+      if (consoleReason) await this.assertConsoleModerator(tx, actorId);
+      const preflightActor = consoleReason
+        ? {
+            id: actorId,
+            role: CircleMemberRole.OWNER,
+            status: CircleMemberStatus.ACTIVE,
+          }
+        : await tx.circleMember.findUnique({
+            where: {
+              userID_circleID: { userID: actorId, circleID: circle.id },
+            },
+            select: { id: true, role: true, status: true },
+          });
       if (
         !preflightActor ||
         preflightActor.status !== CircleMemberStatus.ACTIVE ||
@@ -187,12 +260,18 @@ export class GroupService {
       }
 
       const [actor, target] = await Promise.all([
-        tx.circleMember.findUnique({
-          where: {
-            userID_circleID: { userID: actorId, circleID: circle.id },
-          },
-          select: { id: true, role: true, status: true },
-        }),
+        consoleReason
+          ? Promise.resolve({
+              id: actorId,
+              role: CircleMemberRole.OWNER,
+              status: CircleMemberStatus.ACTIVE,
+            })
+          : tx.circleMember.findUnique({
+              where: {
+                userID_circleID: { userID: actorId, circleID: circle.id },
+              },
+              select: { id: true, role: true, status: true },
+            }),
         tx.circleMember.findUnique({
           where: {
             userID_circleID: {
@@ -229,7 +308,19 @@ export class GroupService {
         dto.role === GroupMemberRoleInput.ADMIN
           ? CircleMemberRole.ADMIN
           : CircleMemberRole.MEMBER;
-      if (target.role === nextRole) return { changed: false, message: null };
+      if (target.role === nextRole) {
+        if (consoleReason)
+          await tx.adminAuditLog.create({
+            data: {
+              actorID: actorId,
+              action: 'IM_CIRCLE_MEMBER_ROLE_UNCHANGED',
+              entityType: 'CircleMember',
+              entityID: target.id,
+              reason: consoleReason,
+            },
+          });
+        return { changed: false, message: null };
+      }
 
       await tx.circleMember.update({
         where: { id: target.id },
@@ -240,6 +331,7 @@ export class GroupService {
         data: {
           actorID: actorId,
           action: 'GROUP_MEMBER_ROLE_UPDATED',
+          reason: consoleReason ?? null,
           entityType: 'CircleMember',
           entityID: target.id,
           metadata: {
@@ -290,16 +382,17 @@ export class GroupService {
     }
 
     if (roleResult.changed) {
-      logBusinessEvent(this.logger, {
-        enabled: this.loggingConfig.businessLogOn,
-        businessEvent: 'group_member_role_updated',
-        actorId: actorId,
-        targetId: normalizedTargetUserID,
-        result: 'success',
-        entityType: 'circle',
-        entityId: circle.id,
-        metadata: { newRole: dto.role },
-      });
+      if (!consoleReason)
+        logBusinessEvent(this.logger, {
+          enabled: this.loggingConfig.businessLogOn,
+          businessEvent: 'group_member_role_updated',
+          actorId: actorId,
+          targetId: normalizedTargetUserID,
+          result: 'success',
+          entityType: 'circle',
+          entityId: circle.id,
+          metadata: { newRole: dto.role },
+        });
     }
     return { handled: true, role: dto.role };
   }
@@ -398,6 +491,15 @@ export class GroupService {
     actorId: string,
     groupID: string,
     targetUserID: string,
+  ) {
+    return this.removeGroupMemberCore(actorId, groupID, targetUserID);
+  }
+
+  private async removeGroupMemberCore(
+    actorId: string,
+    groupID: string,
+    targetUserID: string,
+    consoleReason?: string,
   ): Promise<GroupMemberSyncResult> {
     const normalizedGroupID = this.normalizeGroupID(groupID);
     const normalizedTargetUserID = targetUserID.trim();
@@ -434,12 +536,15 @@ export class GroupService {
       //
       // 这只是前置闸:能不能动某个具体目标还要看目标的角色,那个判定必须在锁后
       // 用一致的快照做,所以下面的 assertCanManageCircleGroup 一条不少地保留。
-      const preflightActor = await tx.circleMember.findUnique({
-        where: {
-          userID_circleID: { userID: actorId, circleID: circle.id },
-        },
-        select: { role: true, status: true },
-      });
+      if (consoleReason) await this.assertConsoleModerator(tx, actorId);
+      const preflightActor = consoleReason
+        ? { role: CircleMemberRole.OWNER, status: CircleMemberStatus.ACTIVE }
+        : await tx.circleMember.findUnique({
+            where: {
+              userID_circleID: { userID: actorId, circleID: circle.id },
+            },
+            select: { role: true, status: true },
+          });
       if (
         !preflightActor ||
         preflightActor.status !== CircleMemberStatus.ACTIVE ||
@@ -466,12 +571,18 @@ export class GroupService {
         normalizedTargetUserID,
       ]);
       const [actor, target] = await Promise.all([
-        tx.circleMember.findUnique({
-          where: {
-            userID_circleID: { userID: actorId, circleID: circle.id },
-          },
-          select: { id: true, role: true, status: true },
-        }),
+        consoleReason
+          ? Promise.resolve({
+              id: actorId,
+              role: CircleMemberRole.OWNER,
+              status: CircleMemberStatus.ACTIVE,
+            })
+          : tx.circleMember.findUnique({
+              where: {
+                userID_circleID: { userID: actorId, circleID: circle.id },
+              },
+              select: { id: true, role: true, status: true },
+            }),
         tx.circleMember.findUnique({
           where: {
             userID_circleID: {
@@ -482,7 +593,26 @@ export class GroupService {
           select: { id: true, role: true, status: true },
         }),
       ]);
+      if (
+        consoleReason &&
+        (!target ||
+          target.status !== CircleMemberStatus.ACTIVE ||
+          target.role === CircleMemberRole.OWNER ||
+          normalizedTargetUserID === circle.ownerID)
+      )
+        throw new ForbiddenException('Owner or inactive member is protected');
       this.assertCanManageCircleGroup(actor, target);
+      if (consoleReason)
+        await tx.adminAuditLog.create({
+          data: {
+            actorID: actorId,
+            action: 'IM_CIRCLE_MEMBER_REMOVED',
+            entityType: 'Circle',
+            entityID: circle.id,
+            reason: consoleReason,
+            after: { targetUserID: normalizedTargetUserID },
+          },
+        });
 
       await tx.circleInvitation.updateMany({
         where: {
@@ -571,15 +701,16 @@ export class GroupService {
       }
     }
 
-    logBusinessEvent(this.logger, {
-      enabled: this.loggingConfig.businessLogOn,
-      businessEvent: 'group_member_removed',
-      actorId: actorId,
-      targetId: normalizedTargetUserID,
-      result: 'success',
-      entityType: 'group',
-      entityId: normalizedGroupID,
-    });
+    if (!consoleReason)
+      logBusinessEvent(this.logger, {
+        enabled: this.loggingConfig.businessLogOn,
+        businessEvent: 'group_member_removed',
+        actorId: actorId,
+        targetId: normalizedTargetUserID,
+        result: 'success',
+        entityType: 'group',
+        entityId: normalizedGroupID,
+      });
     return { handled: true };
   }
 

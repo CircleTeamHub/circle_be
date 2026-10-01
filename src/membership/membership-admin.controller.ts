@@ -1,4 +1,8 @@
 import {
+  AdminPermissionGuard,
+  RequireAdminPermission,
+} from 'src/admin-access/admin-permission.guard';
+import {
   Body,
   Controller,
   Param,
@@ -24,8 +28,9 @@ import { MembershipAdminService } from './membership-admin.service';
 
 @ApiTags('Admin · Memberships')
 @ApiBearerAuth()
-@UseGuards(JwtGuard, AdminGuard)
+@UseGuards(JwtGuard, AdminGuard, AdminPermissionGuard)
 @Controller('admin/memberships/users')
+@RequireAdminPermission('COMMERCE_MANAGE')
 export class MembershipAdminController {
   constructor(
     private readonly membershipAdminService: MembershipAdminService,

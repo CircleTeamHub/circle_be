@@ -1,4 +1,8 @@
 import {
+  AdminPermissionGuard,
+  RequireAdminPermission,
+} from 'src/admin-access/admin-permission.guard';
+import {
   Body,
   Controller,
   Get,
@@ -26,8 +30,9 @@ import { SupportRechargeService } from './support-recharge.service';
 
 @ApiTags('Admin · Support Recharge')
 @ApiBearerAuth()
-@UseGuards(JwtGuard, AdminGuard)
+@UseGuards(JwtGuard, AdminGuard, AdminPermissionGuard)
 @Controller('admin/support/recharge')
+@RequireAdminPermission('RECHARGE_MANAGE')
 export class SupportRechargeAdminController {
   constructor(private readonly recharge: SupportRechargeService) {}
 

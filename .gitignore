@@ -45,3 +45,4 @@ Temporary Items
 src/generated/
 .claude/
 coverage/
+.npm-cache/
