@@ -31,6 +31,8 @@ for _ in $(seq 1 60); do
   sleep 0.25
 done
 curl --fail --silent "$url/minio/health/ready" >/dev/null
+# AWS SDK loads its HTTP transport dynamically inside Jest's VM context.
+NODE_OPTIONS="${NODE_OPTIONS:-} --experimental-vm-modules" \
 MINIO_TEST_URL="$url" \
 MINIO_TEST_ACCESS_KEY="$access_key" \
 MINIO_TEST_SECRET_KEY="$secret_key" \
