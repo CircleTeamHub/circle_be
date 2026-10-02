@@ -1,4 +1,8 @@
 import {
+  AdminPermissionGuard,
+  RequireAdminPermission,
+} from 'src/admin-access/admin-permission.guard';
+import {
   Body,
   Controller,
   Get,
@@ -32,8 +36,9 @@ import { AdminCommunityService } from './admin-community.service';
 
 @ApiTags('Admin - Community')
 @ApiBearerAuth()
-@UseGuards(ThrottlerGuard, JwtGuard, AdminGuard)
+@UseGuards(ThrottlerGuard, JwtGuard, AdminGuard, AdminPermissionGuard)
 @Controller('admin/community')
+@RequireAdminPermission('COMMUNITY_MANAGE')
 export class AdminCommunityController {
   constructor(private readonly community: AdminCommunityService) {}
 

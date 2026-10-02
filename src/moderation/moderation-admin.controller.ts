@@ -1,4 +1,8 @@
 import {
+  AdminPermissionGuard,
+  RequireAdminPermission,
+} from 'src/admin-access/admin-permission.guard';
+import {
   Body,
   Controller,
   Get,
@@ -78,8 +82,9 @@ function auditContext(req: RequestWithUser) {
  */
 @ApiTags('Admin · Moderation')
 @ApiBearerAuth()
-@UseGuards(JwtGuard, AdminGuard)
+@UseGuards(JwtGuard, AdminGuard, AdminPermissionGuard)
 @Controller('admin/moderation')
+@RequireAdminPermission('MODERATION_MANAGE')
 export class ModerationAdminController {
   constructor(private readonly service: ModerationAdminService) {}
 

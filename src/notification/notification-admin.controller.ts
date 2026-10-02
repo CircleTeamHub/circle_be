@@ -1,4 +1,8 @@
 import {
+  AdminPermissionGuard,
+  RequireAdminPermission,
+} from 'src/admin-access/admin-permission.guard';
+import {
   BadRequestException,
   Body,
   Controller,
@@ -43,8 +47,9 @@ function requireIdempotencyKey(value: string | undefined): string {
 
 @ApiTags('Admin System Announcements')
 @ApiBearerAuth()
-@UseGuards(JwtGuard, AdminGuard)
+@UseGuards(JwtGuard, AdminGuard, AdminPermissionGuard)
 @Controller('admin/system-announcements')
+@RequireAdminPermission('CONTENT_MANAGE')
 export class NotificationAdminController {
   constructor(private readonly notificationService: NotificationService) {}
 

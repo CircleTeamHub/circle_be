@@ -49,6 +49,11 @@ import { MetricsModule } from './metrics/metrics.module';
 import { ReferralModule } from './referral/referral.module';
 import { SupportRechargeModule } from './support-recharge/support-recharge.module';
 import { GeoModule } from './geo/geo.module';
+import { AdminAccessModule } from './admin-access/admin-access.module';
+import { AdminOperationsModule } from './admin-operations/admin-operations.module';
+import { AdminCommerceModule } from './admin-commerce/admin-commerce.module';
+import { AdminContentModule } from './admin-content/admin-content.module';
+import { AdminImModule } from './admin-im/admin-im.module';
 
 const nodeEnv = process.env.NODE_ENV || 'development';
 const envFilePath = `.env.${nodeEnv}`;
@@ -107,6 +112,11 @@ const envFilePath = `.env.${nodeEnv}`;
     ReferralModule,
     QrModule,
     SupportRechargeModule,
+    AdminAccessModule,
+    AdminOperationsModule,
+    AdminCommerceModule,
+    AdminContentModule,
+    AdminImModule,
   ],
   controllers: [],
   providers: [Logger],

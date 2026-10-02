@@ -1,3 +1,5 @@
+import { AdminPermissionGuard } from 'src/admin-access/admin-permission.guard';
+import { PrismaService } from 'src/prisma/prisma.service';
 import {
   INestApplication,
   UnauthorizedException,
@@ -37,12 +39,30 @@ describe('AvatarFrameAdminController', () => {
     jest.clearAllMocks();
     const moduleRef = await Test.createTestingModule({
       controllers: [AvatarFrameAdminController],
-      providers: [{ provide: AvatarFrameAdminService, useValue: service }],
+      providers: [
+        { provide: AvatarFrameAdminService, useValue: service },
+        {
+          provide: PrismaService,
+          useValue: {
+            user: {
+              findUnique: jest.fn().mockResolvedValue({
+                role: 'ADMIN',
+                status: 'ACTIVE',
+                adminAccess: { role: 'OPERATIONS' },
+              }),
+            },
+          },
+        },
+      ],
     })
       .overrideGuard(JwtGuard)
       .useValue({
         canActivate: (context: any) => {
-          context.switchToHttp().getRequest().user = { userId: operatorId };
+          context.switchToHttp().getRequest().user = {
+            userId: operatorId,
+            role: 'ADMIN',
+            audience: 'ADMIN',
+          };
           return true;
         },
       })
@@ -66,7 +86,7 @@ describe('AvatarFrameAdminController', () => {
   it('requires JWT plus ADMIN-audience authorization on every route', () => {
     expect(
       Reflect.getMetadata(GUARDS_METADATA, AvatarFrameAdminController),
-    ).toEqual([JwtGuard, AdminGuard]);
+    ).toEqual([JwtGuard, AdminGuard, AdminPermissionGuard]);
   });
 
   it('lists the active grant-selector catalog', async () => {
@@ -220,7 +240,21 @@ describe('AvatarFrameAdminController', () => {
     async (_label, authorization, expectedStatus) => {
       const moduleRef = await Test.createTestingModule({
         controllers: [AvatarFrameAdminController],
-        providers: [{ provide: AvatarFrameAdminService, useValue: service }],
+        providers: [
+          { provide: AvatarFrameAdminService, useValue: service },
+          {
+            provide: PrismaService,
+            useValue: {
+              user: {
+                findUnique: jest.fn().mockResolvedValue({
+                  role: 'ADMIN',
+                  status: 'ACTIVE',
+                  adminAccess: { role: 'SUPER_ADMIN' },
+                }),
+              },
+            },
+          },
+        ],
       })
         .overrideGuard(JwtGuard)
         .useValue({

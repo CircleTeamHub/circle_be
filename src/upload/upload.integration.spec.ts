@@ -17,7 +17,8 @@ describeMinio('UploadService real MinIO integration', () => {
           MINIO_BUCKET: process.env.MINIO_TEST_BUCKET,
         })[key] ?? null,
     } as any);
-    (service as any).ready = true;
+    await service.onModuleInit();
+    expect(service.objectStoreStatus()).toBe('ok');
   });
 
   it('signs MIME and size and permits only the first write to a key', async () => {

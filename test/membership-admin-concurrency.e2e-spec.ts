@@ -87,6 +87,9 @@ describePostgres('Membership admin grant concurrency e2e', () => {
     // different JwtModule instance keyed on a secret CI does not set.
     const jwtSecret = app.get(ConfigService).get<string>('SECRET') ?? '';
     const operator = await createUser('ADMIN');
+    await prisma.adminAccess.create({
+      data: { userID: operator.id, role: 'OPERATIONS' },
+    });
     operatorId = operator.id;
     adminToken = jwt.sign(
       {

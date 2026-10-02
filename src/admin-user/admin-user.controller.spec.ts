@@ -4,6 +4,7 @@ import { UserRole, UserStatus } from 'src/generated/prisma';
 import { AdminGuard } from 'src/guards/admin.guard';
 import { JwtGuard } from 'src/guards/jwt.guard';
 import { AdminUserController } from './admin-user.controller';
+import { AdminPermissionGuard } from 'src/admin-access/admin-permission.guard';
 
 describe('AdminUserController', () => {
   const service = {
@@ -27,10 +28,11 @@ describe('AdminUserController', () => {
     jest.clearAllMocks();
   });
 
-  it('requires both JWT and Admin guards at the controller boundary', () => {
+  it('requires JWT, Admin and permission guards at the controller boundary', () => {
     expect(Reflect.getMetadata('__guards__', AdminUserController)).toEqual([
       JwtGuard,
       AdminGuard,
+      AdminPermissionGuard,
     ]);
   });
 

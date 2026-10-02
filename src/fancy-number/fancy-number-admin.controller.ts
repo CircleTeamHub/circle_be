@@ -1,4 +1,8 @@
 import {
+  AdminPermissionGuard,
+  RequireAdminPermission,
+} from 'src/admin-access/admin-permission.guard';
+import {
   Body,
   Controller,
   Get,
@@ -33,8 +37,9 @@ import { FancyNumberService } from './fancy-number.service';
 
 @ApiTags('Admin - Fancy Numbers')
 @ApiBearerAuth()
-@UseGuards(JwtGuard, AdminGuard)
+@UseGuards(JwtGuard, AdminGuard, AdminPermissionGuard)
 @Controller('admin/mall/fancy-numbers')
+@RequireAdminPermission('COMMERCE_MANAGE')
 export class FancyNumberAdminController {
   constructor(private readonly service: FancyNumberService) {}
 

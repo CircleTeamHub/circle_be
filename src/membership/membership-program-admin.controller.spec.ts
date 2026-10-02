@@ -1,3 +1,5 @@
+import { AdminPermissionGuard } from 'src/admin-access/admin-permission.guard';
+import { PrismaService } from 'src/prisma/prisma.service';
 import { INestApplication } from '@nestjs/common';
 import { GUARDS_METADATA } from '@nestjs/common/constants';
 import { Test } from '@nestjs/testing';
@@ -24,12 +26,30 @@ describe('MembershipProgramAdminController', () => {
     jest.clearAllMocks();
     const moduleRef = await Test.createTestingModule({
       controllers: [MembershipProgramAdminController],
-      providers: [{ provide: MembershipProgramService, useValue: service }],
+      providers: [
+        { provide: MembershipProgramService, useValue: service },
+        {
+          provide: PrismaService,
+          useValue: {
+            user: {
+              findUnique: jest.fn().mockResolvedValue({
+                role: 'ADMIN',
+                status: 'ACTIVE',
+                adminAccess: { role: 'OPERATIONS' },
+              }),
+            },
+          },
+        },
+      ],
     })
       .overrideGuard(JwtGuard)
       .useValue({
         canActivate: (context: any) => {
-          context.switchToHttp().getRequest().user = { userId: 'admin-1' };
+          context.switchToHttp().getRequest().user = {
+            userId: 'admin-1',
+            role: 'ADMIN',
+            audience: 'ADMIN',
+          };
           return true;
         },
       })
@@ -46,7 +66,7 @@ describe('MembershipProgramAdminController', () => {
   it('requires admin authentication and enables the program for the operator', async () => {
     expect(
       Reflect.getMetadata(GUARDS_METADATA, MembershipProgramAdminController),
-    ).toEqual([JwtGuard, AdminGuard]);
+    ).toEqual([JwtGuard, AdminGuard, AdminPermissionGuard]);
 
     await request(app.getHttpServer())
       .post('/admin/memberships/program/enable')

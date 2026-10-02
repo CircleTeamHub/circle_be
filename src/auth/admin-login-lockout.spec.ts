@@ -27,6 +27,10 @@ function buildService(user: UserRow | null) {
   // 方案的关键 —— 服务不再信任读到的快照，而是让 DB 决定是否到达锁定阈值。
   const counter = { attempts: user?.adminLoginAttempts ?? 0 };
   const prisma = {
+    adminAccess: {
+      findUnique: jest.fn().mockResolvedValue({ role: 'SUPER_ADMIN' }),
+    },
+    adminAuditLog: { create: jest.fn().mockResolvedValue({}) },
     user: {
       findUnique: jest.fn().mockResolvedValue(user),
       update: jest.fn((args: { where: unknown; data: Record<string, any> }) => {

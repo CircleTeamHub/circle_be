@@ -5,6 +5,7 @@ import {
   Logger,
   NotFoundException,
 } from '@nestjs/common';
+import { ADMIN_ROLE_PERMISSIONS } from 'src/admin-access/admin-permission.guard';
 import { ChatErrorCode } from 'src/common/app-error-codes';
 import { PrismaService } from 'src/prisma/prisma.service';
 import type { ChatMember, Prisma } from 'src/generated/prisma';
@@ -328,6 +329,149 @@ export class ChatGroupAdminService {
       });
     }
     return this.toSilenceDto(targetUserId, seat);
+  }
+
+  /** Console entry; ordinary group APIs retain their membership checks. */
+  async moderateAsAdministrator(
+    actorId: string,
+    conversationId: string,
+    targetUserId: string,
+    action: 'mute' | 'unmute' | 'remove' | 'role',
+    role: 'ADMIN' | 'MEMBER' | undefined,
+    reason: string,
+  ) {
+    this.assertNotSelf(actorId, targetUserId);
+    if (reason.trim().length < 2 || reason.length > 500)
+      throw new BadRequestException('Reason required');
+    const result = await this.prisma.$transaction(async (tx) => {
+      const actor = await tx.user.findUnique({
+        where: { id: actorId },
+        select: {
+          role: true,
+          status: true,
+          adminAccess: { select: { role: true } },
+        },
+      });
+      if (
+        actor?.role !== 'ADMIN' ||
+        actor.status !== 'ACTIVE' ||
+        !actor.adminAccess ||
+        !(ADMIN_ROLE_PERMISSIONS[actor.adminAccess.role] ?? []).includes(
+          'IM_MODERATE',
+        )
+      )
+        throw new ForbiddenException();
+      const locked = await this.lockGroup(tx, conversationId);
+      const pair = await this.resolvePair(tx, locked, actorId, targetUserId);
+      const seat = this.requireTargetSeat(pair.targetSeat, pair.targetRole);
+      if (pair.targetRole === 'OWNER')
+        throw new ForbiddenException('Owner is protected');
+      if (locked.circleID && (action === 'role' || action === 'remove'))
+        throw new BadRequestException(
+          'Circle mutation requires circle service',
+        );
+      if (action === 'role' && role !== 'ADMIN' && role !== 'MEMBER')
+        throw new BadRequestException('Role required');
+      await tx.adminAuditLog.create({
+        data: {
+          actorID: actorId,
+          action: 'IM_MEMBER_' + action.toUpperCase(),
+          entityType: 'ChatConversation',
+          entityID: conversationId,
+          reason,
+          after: { targetUserId, role: role ?? null },
+        },
+      });
+      const unchanged =
+        action === 'role'
+          ? seat.role === role
+          : action === 'mute'
+            ? seat.silencedAt !== null && seat.silencedUntil === null
+            : action === 'unmute'
+              ? seat.silencedAt === null
+              : false;
+      if (unchanged) return null;
+      await tx.chatMember.update({
+        where: { id: seat.id },
+        data:
+          action === 'role'
+            ? { role }
+            : action === 'remove'
+              ? { leftAt: new Date(), role: 'MEMBER' }
+              : action === 'mute'
+                ? { silencedAt: new Date(), silencedUntil: null }
+                : { silencedAt: null, silencedUntil: null },
+      });
+      const kind =
+        action === 'role'
+          ? 'member-role-changed'
+          : action === 'remove'
+            ? 'member-removed'
+            : action === 'mute'
+              ? 'member-silenced'
+              : 'member-unsilenced';
+      const notice =
+        await this.systemMessage.insertSystemMessageAfterLockedConversationInTx(
+          tx,
+          locked.id,
+          locked.nextHeight,
+          action === 'role'
+            ? {
+                kind: 'member-role-changed',
+                actorId,
+                targetUserId,
+                role: role!,
+              }
+            : action === 'mute'
+              ? {
+                  kind: 'member-silenced',
+                  actorId,
+                  targetUserId,
+                  durationSec: null,
+                }
+              : {
+                  kind:
+                    action === 'remove'
+                      ? 'member-removed'
+                      : 'member-unsilenced',
+                  actorId,
+                  targetUserId,
+                },
+        );
+      await this.groupEvents.recordInTx(tx, locked.id, {
+        kind,
+        actorId,
+        targetIds: [targetUserId],
+        payload: action === 'role' ? { role: role! } : {},
+      });
+      return notice;
+    });
+    if (result) {
+      if (action === 'remove') {
+        try {
+          await this.broadcast.removeUserFromConversation(
+            targetUserId,
+            conversationId,
+          );
+        } catch {
+          this.logger.warn('Admin member room detach failed');
+        }
+        try {
+          await this.systemMessage.broadcastSystemMessageExcludingUsers(
+            result,
+            [targetUserId],
+          );
+        } catch {
+          this.logger.warn('Admin member notification failed');
+        }
+      } else await this.broadcastAfterCommit(result);
+      this.broadcast.emitConversationChange(targetUserId, {
+        kind: action === 'remove' ? 'removed' : 'updated',
+        conversationId,
+        userId: targetUserId,
+      });
+    }
+    return { completed: true };
   }
 
   // ── 共同的门 ────────────────────────────────────────────────────────────

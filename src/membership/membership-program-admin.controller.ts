@@ -1,3 +1,7 @@
+import {
+  AdminPermissionGuard,
+  RequireAdminPermission,
+} from 'src/admin-access/admin-permission.guard';
 import { Controller, Post, Req, UseGuards } from '@nestjs/common';
 import {
   ApiBearerAuth,
@@ -13,8 +17,9 @@ import { MembershipProgramService } from './membership-program.service';
 
 @ApiTags('Admin · Memberships')
 @ApiBearerAuth()
-@UseGuards(JwtGuard, AdminGuard)
+@UseGuards(JwtGuard, AdminGuard, AdminPermissionGuard)
 @Controller('admin/memberships/program')
+@RequireAdminPermission('COMMERCE_MANAGE')
 export class MembershipProgramAdminController {
   constructor(private readonly membershipProgram: MembershipProgramService) {}
 

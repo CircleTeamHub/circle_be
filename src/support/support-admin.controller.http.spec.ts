@@ -1,3 +1,4 @@
+import { PrismaService } from 'src/prisma/prisma.service';
 import { INestApplication, ValidationPipe } from '@nestjs/common';
 import { Test } from '@nestjs/testing';
 import request from 'supertest';
@@ -24,18 +25,41 @@ describe('SupportAdminController HTTP pipeline', () => {
 
     const moduleRef = await Test.createTestingModule({
       controllers: [SupportAdminController],
-      providers: [{ provide: SupportService, useValue: support }],
+      providers: [
+        { provide: SupportService, useValue: support },
+        {
+          provide: PrismaService,
+          useValue: {
+            user: {
+              findUnique: jest.fn().mockResolvedValue({
+                role: 'ADMIN',
+                status: 'ACTIVE',
+                adminAccess: { role: 'SUPPORT' },
+              }),
+            },
+          },
+        },
+      ],
     })
       .overrideGuard(JwtGuard)
       .useValue({
         canActivate: (context: {
           switchToHttp(): {
-            getRequest(): { user?: { userId: string; accountId: string } };
+            getRequest(): {
+              user?: {
+                userId: string;
+                accountId: string;
+                role: string;
+                audience: string;
+              };
+            };
           };
         }) => {
           context.switchToHttp().getRequest().user = {
             userId: 'admin-1',
             accountId: 'admin-account',
+            role: 'ADMIN',
+            audience: 'ADMIN',
           };
           return true;
         },

@@ -64,6 +64,8 @@ import { ChatDirectAutoReplyProcessor } from './chat-direct-auto-reply.processor
     CircleMemberLockService,
   ],
   exports: [
+    ChatGroupAdminService,
+    ChatMediaService,
     ChatService,
     ChatBroadcastService,
     ChatCircleSyncService,

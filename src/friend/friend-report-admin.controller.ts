@@ -1,4 +1,8 @@
 import {
+  AdminPermissionGuard,
+  RequireAdminPermission,
+} from 'src/admin-access/admin-permission.guard';
+import {
   Body,
   Controller,
   Get,
@@ -29,8 +33,9 @@ import { FriendReportAdminService } from './friend-report-admin.service';
 
 @ApiTags('Admin · Friend Reports')
 @ApiBearerAuth()
-@UseGuards(JwtGuard, AdminGuard)
+@UseGuards(JwtGuard, AdminGuard, AdminPermissionGuard)
 @Controller('admin/friend-reports')
+@RequireAdminPermission('MODERATION_MANAGE')
 export class FriendReportAdminController {
   constructor(private readonly service: FriendReportAdminService) {}
 

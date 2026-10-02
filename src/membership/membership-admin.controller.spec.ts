@@ -1,3 +1,5 @@
+import { AdminPermissionGuard } from 'src/admin-access/admin-permission.guard';
+import { PrismaService } from 'src/prisma/prisma.service';
 import { INestApplication, ValidationPipe } from '@nestjs/common';
 import { GUARDS_METADATA } from '@nestjs/common/constants';
 import { Test } from '@nestjs/testing';
@@ -19,12 +21,30 @@ describe('MembershipAdminController', () => {
     jest.clearAllMocks();
     const moduleRef = await Test.createTestingModule({
       controllers: [MembershipAdminController],
-      providers: [{ provide: MembershipAdminService, useValue: service }],
+      providers: [
+        { provide: MembershipAdminService, useValue: service },
+        {
+          provide: PrismaService,
+          useValue: {
+            user: {
+              findUnique: jest.fn().mockResolvedValue({
+                role: 'ADMIN',
+                status: 'ACTIVE',
+                adminAccess: { role: 'OPERATIONS' },
+              }),
+            },
+          },
+        },
+      ],
     })
       .overrideGuard(JwtGuard)
       .useValue({
         canActivate: (context: any) => {
-          context.switchToHttp().getRequest().user = { userId: operatorId };
+          context.switchToHttp().getRequest().user = {
+            userId: operatorId,
+            role: 'ADMIN',
+            audience: 'ADMIN',
+          };
           return true;
         },
       })
@@ -48,7 +68,7 @@ describe('MembershipAdminController', () => {
   it('requires ADMIN-audience authentication and authorization', () => {
     expect(
       Reflect.getMetadata(GUARDS_METADATA, MembershipAdminController),
-    ).toEqual([JwtGuard, AdminGuard]);
+    ).toEqual([JwtGuard, AdminGuard, AdminPermissionGuard]);
   });
 
   it('takes the operator only from the authenticated request and trims note', async () => {
@@ -62,6 +82,33 @@ describe('MembershipAdminController', () => {
       idempotencyKey,
       note: 'approved case',
     });
+  });
+
+  it.each([
+    ['missing admin', null],
+    [
+      'unassigned admin',
+      { role: 'ADMIN', status: 'ACTIVE', adminAccess: null },
+    ],
+    [
+      'support role',
+      { role: 'ADMIN', status: 'ACTIVE', adminAccess: { role: 'SUPPORT' } },
+    ],
+    [
+      'banned admin',
+      { role: 'ADMIN', status: 'BANNED', adminAccess: { role: 'SUPER_ADMIN' } },
+    ],
+  ])('denies membership grants for a %s', async (_label, user) => {
+    (app.get(PrismaService).user.findUnique as jest.Mock).mockResolvedValueOnce(
+      user,
+    );
+
+    await request(app.getHttpServer())
+      .post(`/admin/memberships/users/${targetId}/grants`)
+      .send({ targetLevel: 3, idempotencyKey })
+      .expect(403);
+
+    expect(service.grant).not.toHaveBeenCalled();
   });
 
   it.each([

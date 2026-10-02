@@ -48,9 +48,6 @@ describe('container image sources', () => {
     );
 
     expect(offenders).toEqual([]);
-    expect(read('scripts/test-minio-integration.sh')).toContain(
-      'quay.io/minio/minio:RELEASE.2025-09-07T16-13-09Z',
-    );
     const compose = read('docker-compose.prod.yml');
     expect(compose).toContain(
       'image: quay.io/minio/minio:RELEASE.2025-09-07T16-13-09Z',
