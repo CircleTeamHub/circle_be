@@ -27,6 +27,8 @@ describe('AdminUserService', () => {
     listForTarget: jest.fn(),
   };
   const tx = {
+    $queryRaw: jest.fn(),
+    adminAccess: { count: jest.fn() },
     user: {
       findUnique: jest.fn(),
       updateMany: jest.fn(),
@@ -53,6 +55,7 @@ describe('AdminUserService', () => {
   beforeEach(() => {
     jest.resetAllMocks();
     prisma.$transaction.mockImplementation((callback) => callback(tx));
+    tx.$queryRaw.mockResolvedValue([]);
     sessionRevocation.revokeUserAt.mockResolvedValue(true);
     sessionRevocation.revocationExpiresAt.mockImplementation(
       (revokedAtMs: number) => new Date(revokedAtMs + 60 * 60 * 1000),
@@ -441,6 +444,109 @@ describe('AdminUserService', () => {
 
   describe('updateStatus', () => {
     const actor = { userId: 'admin-1', accountId: 'support-admin' };
+
+    it.each([
+      null,
+      { role: UserRole.USER, status: UserStatus.ACTIVE },
+      { role: UserRole.ADMIN, status: UserStatus.ACTIVE, adminAccess: null },
+      {
+        role: UserRole.ADMIN,
+        status: UserStatus.BANNED,
+        adminAccess: { role: 'SUPER_ADMIN' },
+      },
+      {
+        role: UserRole.ADMIN,
+        status: UserStatus.ACTIVE,
+        adminAccess: { role: 'SUPPORT' },
+      },
+    ])(
+      'rejects administrator moderation without an active super-admin operator (%j)',
+      async (operator) => {
+        tx.user.findUnique
+          .mockResolvedValueOnce({
+            id: 'other-admin',
+            accountId: 'other-admin-account',
+            role: UserRole.ADMIN,
+            status: UserStatus.ACTIVE,
+            adminAccess: { role: 'SUPPORT' },
+          })
+          .mockResolvedValueOnce(operator);
+
+        await expect(
+          service.updateStatus(actor, 'other-admin', {
+            status: UserStatus.BANNED,
+            reason: 'policy violation',
+          }),
+        ).rejects.toMatchObject({ status: 403 });
+        expect(tx.user.updateMany).not.toHaveBeenCalled();
+        expect(tx.refreshToken.updateMany).not.toHaveBeenCalled();
+        expect(audit.recordInTransaction).not.toHaveBeenCalled();
+      },
+    );
+
+    it.each([UserStatus.BANNED, UserStatus.DELETED])(
+      'preserves the last active super-admin when asked to change it to %s',
+      async (status) => {
+        tx.user.findUnique.mockResolvedValue({
+          id: actor.userId,
+          accountId: actor.accountId,
+          role: UserRole.ADMIN,
+          status: UserStatus.ACTIVE,
+          adminAccess: { role: 'SUPER_ADMIN' },
+        });
+        tx.adminAccess.count.mockResolvedValue(1);
+
+        await expect(
+          service.updateStatus(actor, actor.userId, {
+            status,
+            confirmationAccountId: actor.accountId,
+            reason: 'policy violation',
+          }),
+        ).rejects.toThrow('必须保留至少一个可用超级管理员');
+        expect(tx.user.updateMany).not.toHaveBeenCalled();
+        expect(audit.recordInTransaction).not.toHaveBeenCalled();
+      },
+    );
+
+    it('allows a super-admin to ban another while preserving an active super-admin', async () => {
+      tx.user.findUnique
+        .mockResolvedValueOnce({
+          id: 'other-admin',
+          accountId: 'other-admin-account',
+          role: UserRole.ADMIN,
+          status: UserStatus.ACTIVE,
+          adminAccess: { role: 'SUPER_ADMIN' },
+        })
+        .mockResolvedValueOnce({
+          role: UserRole.ADMIN,
+          status: UserStatus.ACTIVE,
+          adminAccess: { role: 'SUPER_ADMIN' },
+        });
+      tx.adminAccess.count.mockResolvedValue(2);
+      tx.user.updateMany.mockResolvedValue({ count: 1 });
+
+      await expect(
+        service.updateStatus(actor, 'other-admin', {
+          status: UserStatus.BANNED,
+          reason: 'policy violation',
+        }),
+      ).resolves.toMatchObject({
+        id: 'other-admin',
+        status: UserStatus.BANNED,
+        sessionRevocationPending: false,
+      });
+      expect(tx.adminAccess.count).toHaveBeenCalledWith({
+        where: {
+          role: 'SUPER_ADMIN',
+          user: { role: 'ADMIN', status: 'ACTIVE' },
+        },
+      });
+      expect(tx.refreshToken.updateMany).toHaveBeenCalledWith({
+        where: { userId: 'other-admin', revokedAt: null },
+        data: { revokedAt: expect.any(Date) },
+      });
+      expect(audit.recordInTransaction).toHaveBeenCalledTimes(1);
+    });
 
     it('persists access revocation in the status transaction when banning', async () => {
       prisma.$transaction.mockImplementation(async (callback) => callback(tx));
