@@ -53,6 +53,9 @@ describePostgres('Avatar-frame admin grant concurrency e2e', () => {
     const jwt = app.get(JwtService);
     const jwtSecret = app.get(ConfigService).get<string>('SECRET') ?? '';
     const operator = await createUser('ADMIN');
+    await prisma.adminAccess.create({
+      data: { userID: operator.id, role: 'OPERATIONS' },
+    });
     operatorId = operator.id;
     adminToken = jwt.sign(
       {

@@ -382,16 +382,20 @@ export class AuthService {
     });
     try {
       const login = await this.performAdminLogin(dto, sessionContext);
-      await this.prisma.adminAuditLog.create({
-        data: {
-          actorID: login.userId,
-          actorAccountId: login.accountId,
-          action: 'admin.login.success',
-          entityType: 'admin_session',
-          ip: sessionContext?.ip?.slice(0, 64),
-          userAgent: sessionContext?.userAgent?.slice(0, 256),
-        },
-      });
+      try {
+        await this.prisma.adminAuditLog.create({
+          data: {
+            actorID: login.userId,
+            actorAccountId: login.accountId,
+            action: 'admin.login.success',
+            entityType: 'admin_session',
+            ip: sessionContext?.ip?.slice(0, 64),
+            userAgent: sessionContext?.userAgent?.slice(0, 256),
+          },
+        });
+      } catch {
+        this.logger.warn('Admin login success audit unavailable');
+      }
       return login.tokens;
     } catch (error) {
       try {

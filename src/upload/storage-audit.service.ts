@@ -216,6 +216,16 @@ export class StorageAuditService {
     );
     await this.collectFrom(
       (cursor, take) =>
+        this.prisma.adminAdvertisement.findMany({
+          select: { id: true, imageUrl: true },
+          orderBy: { id: 'asc' },
+          take,
+          ...(cursor ? { cursor: { id: cursor }, skip: 1 } : {}),
+        }),
+      (row) => add(row.imageUrl),
+    );
+    await this.collectFrom(
+      (cursor, take) =>
         this.prisma.friend.findMany({
           select: {
             id: true,

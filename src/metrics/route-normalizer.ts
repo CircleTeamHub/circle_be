@@ -15,6 +15,20 @@ const NUMERIC = /^\d+$/;
 // sync with the real router when adding controllers, or new routes silently
 // fall to the id-collapse fallback.
 export const STATIC_ROUTES = new Set([
+  '/api/v1/admin/access/accounts',
+  '/api/v1/admin/access/me',
+  '/api/v1/admin/commerce/fancy-number-orders',
+  '/api/v1/admin/commerce/fancy-number-ownership',
+  '/api/v1/admin/commerce/memberships',
+  '/api/v1/admin/content/posts',
+  '/api/v1/admin/content/sensitive-words',
+  '/api/v1/admin/im/conversations',
+  '/api/v1/admin/operations/advertisements',
+  '/api/v1/admin/operations/audit-logs',
+  '/api/v1/admin/operations/campaign-invites',
+  '/api/v1/admin/operations/invite-codes',
+  '/api/v1/admin/operations/referrals',
+  '/api/v1/advertisements',
   '/api/v1/admin/memberships/program/enable',
   '/api/v1/admin/avatar-frames/assets',
   '/api/v1/admin/friend-reports',
@@ -135,6 +149,14 @@ export const STATIC_ROUTES = new Set([
   '/api/v1/user/vip-levels',
 ]);
 export const DYNAMIC_ROUTE_TEMPLATES = [
+  '/api/v1/admin/access/accounts/:id',
+  '/api/v1/admin/commerce/memberships/:userId/grants',
+  '/api/v1/admin/content/posts/:id',
+  '/api/v1/admin/im/conversations/:id/members',
+  '/api/v1/admin/im/conversations/:id/members/:userId/actions',
+  '/api/v1/admin/im/conversations/:id/messages/query',
+  '/api/v1/admin/operations/advertisements/:id',
+  '/api/v1/admin/operations/campaign-invites/:id',
   '/api/v1/admin/memberships/users/:id/grants',
   '/api/v1/admin/avatar-frames/grants/:grantId/revoke',
   '/api/v1/admin/avatar-frames/users/:userId',

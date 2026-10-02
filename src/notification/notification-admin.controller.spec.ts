@@ -1,3 +1,5 @@
+import { AdminPermissionGuard } from 'src/admin-access/admin-permission.guard';
+import { PrismaService } from 'src/prisma/prisma.service';
 import { INestApplication, ValidationPipe } from '@nestjs/common';
 import { GUARDS_METADATA } from '@nestjs/common/constants';
 import { Test } from '@nestjs/testing';
@@ -20,12 +22,30 @@ describe('NotificationAdminController', () => {
     const moduleRef = await Test.createTestingModule({
       imports: [ThrottlerModule.forRoot([{ ttl: 60_000, limit: 100 }])],
       controllers: [NotificationAdminController],
-      providers: [{ provide: NotificationService, useValue: service }],
+      providers: [
+        { provide: NotificationService, useValue: service },
+        {
+          provide: PrismaService,
+          useValue: {
+            user: {
+              findUnique: jest.fn().mockResolvedValue({
+                role: 'ADMIN',
+                status: 'ACTIVE',
+                adminAccess: { role: 'OPERATIONS' },
+              }),
+            },
+          },
+        },
+      ],
     })
       .overrideGuard(JwtGuard)
       .useValue({
         canActivate: (context: any) => {
-          context.switchToHttp().getRequest().user = { userId: 'admin-1' };
+          context.switchToHttp().getRequest().user = {
+            userId: 'admin-1',
+            role: 'ADMIN',
+            audience: 'ADMIN',
+          };
           return true;
         },
       })
@@ -49,7 +69,7 @@ describe('NotificationAdminController', () => {
   it('requires ADMIN-audience authentication and authorization', () => {
     expect(
       Reflect.getMetadata(GUARDS_METADATA, NotificationAdminController),
-    ).toEqual([JwtGuard, AdminGuard]);
+    ).toEqual([JwtGuard, AdminGuard, AdminPermissionGuard]);
   });
 
   it('publishes trimmed system announcement content from the authenticated admin', async () => {

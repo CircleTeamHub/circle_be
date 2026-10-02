@@ -25,6 +25,7 @@ describe('StorageAuditService', () => {
       circlePost: emptyRows(),
       chatMessage: emptyRows(),
       supportRechargePaymentCode: emptyRows(),
+      adminAdvertisement: emptyRows(),
     };
     for (const [model, rows] of Object.entries(options.referenced ?? {})) {
       (prisma as Record<string, { findMany: jest.Mock }>)[model].findMany = jest
@@ -121,6 +122,24 @@ describe('StorageAuditService', () => {
     });
     const result = await service.audit(now);
     expect(result).toMatchObject({ orphanCount: 1 });
+  });
+
+  it('keeps advertisement images out of the orphan list', async () => {
+    const { service } = harness({
+      objects: {
+        'posts/': [{ key: 'posts/banner.jpg', size: 20, lastModified: old }],
+      },
+      referenced: {
+        adminAdvertisement: [
+          {
+            id: 'ad-1',
+            imageUrl: 'https://api.example.com/circle/posts/banner.jpg',
+          },
+        ],
+      },
+    });
+
+    expect((await service.audit(now))?.orphanCount).toBe(0);
   });
 
   it('reports unreferenced objects without deleting anything', async () => {

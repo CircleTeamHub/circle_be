@@ -6,6 +6,7 @@ import {
   BadRequestException,
   ConflictException,
   ForbiddenException,
+  Logger,
   NotFoundException,
   ServiceUnavailableException,
   UnauthorizedException,
@@ -27,6 +28,11 @@ describe('AuthService', () => {
   const users: any[] = [];
 
   const mockPrisma = {
+    adminAccess: { findUnique: jest.fn() },
+    adminAuditLog: { create: jest.fn() },
+    campaignInvite: { findUnique: jest.fn() },
+    campaignInviteUse: { create: jest.fn() },
+    $queryRaw: jest.fn(),
     accountIdentifier: {
       findUnique: jest.fn(() => Promise.resolve(null)),
       findMany: jest.fn(() => Promise.resolve([])),
@@ -133,6 +139,13 @@ describe('AuthService', () => {
   beforeEach(async () => {
     users.length = 0;
     jest.clearAllMocks();
+    mockPrisma.adminAccess.findUnique.mockResolvedValue({
+      role: 'SUPER_ADMIN',
+    });
+    mockPrisma.adminAuditLog.create.mockResolvedValue({});
+    mockPrisma.campaignInvite.findUnique.mockResolvedValue(null);
+    mockPrisma.campaignInviteUse.create.mockResolvedValue({});
+    mockPrisma.$queryRaw.mockResolvedValue([{ id: 'campaign-1' }]);
     mockPrisma.accountIdentifier.findUnique.mockResolvedValue(null);
     mockPrisma.fancyNumberLease.findFirst.mockResolvedValue(null);
     mockFancyNumberService.ensureAccountIdChangeAllowed.mockResolvedValue();
@@ -325,6 +338,110 @@ describe('AuthService', () => {
       }),
     });
     expect(users).toHaveLength(1);
+  });
+
+  it('register attributes a usable campaign code to its owner and records its use', async () => {
+    mockPrisma.campaignInvite.findUnique.mockResolvedValue({
+      id: 'campaign-1',
+      enabled: true,
+      expiresAt: new Date(Date.now() + 60_000),
+      maxUses: 10,
+      usedCount: 0,
+      owner: { id: 'owner-1', status: 'ACTIVE', role: 'USER' },
+    });
+
+    const result = await service.register({
+      email: 'campaign@example.com',
+      password: 'password1',
+      confirmPassword: 'password1',
+      nickname: 'Campaign invitee',
+      inviteCode: ' campaign-code ',
+    } as any);
+
+    expect(result.accessToken).toBe('access-token');
+    expect(mockPrisma.campaignInvite.findUnique).toHaveBeenCalledWith(
+      expect.objectContaining({ where: { code: 'CAMPAIGN-CODE' } }),
+    );
+    expect(mockPrisma.user.create).toHaveBeenCalledWith({
+      data: expect.objectContaining({ invitedByUserId: 'owner-1' }),
+    });
+    expect(mockPrisma.campaignInviteUse.create).toHaveBeenCalledWith({
+      data: { campaignID: 'campaign-1', userID: users[0].id },
+    });
+    expect(mockPrisma.referral.create).toHaveBeenCalledWith({
+      data: expect.objectContaining({
+        inviterID: 'owner-1',
+        inviteeID: users[0].id,
+      }),
+    });
+  });
+
+  it.each([
+    ['expired', { expiresAt: new Date(0) }],
+    ['exhausted', { usedCount: 10 }],
+    ['disabled', { enabled: false }],
+    [
+      'inactive owner',
+      { owner: { id: 'owner-1', status: 'BANNED', role: 'USER' } },
+    ],
+    [
+      'admin owner',
+      { owner: { id: 'owner-1', status: 'ACTIVE', role: 'ADMIN' } },
+    ],
+  ])('register rejects a campaign with %s', async (_name, overrides) => {
+    mockPrisma.campaignInvite.findUnique.mockResolvedValue({
+      id: 'campaign-1',
+      enabled: true,
+      expiresAt: new Date(Date.now() + 60_000),
+      maxUses: 10,
+      usedCount: 0,
+      owner: { id: 'owner-1', status: 'ACTIVE', role: 'USER' },
+      ...overrides,
+    });
+
+    await expect(
+      service.register({
+        email: 'campaign@example.com',
+        password: 'password1',
+        confirmPassword: 'password1',
+        nickname: 'Campaign invitee',
+        inviteCode: 'CAMPAIGN-CODE',
+      } as any),
+    ).rejects.toMatchObject({
+      response: expect.objectContaining({
+        errorCode: AuthErrorCode.InviteCodeInvalid,
+      }),
+    });
+    expect(mockPrisma.user.create).not.toHaveBeenCalled();
+    expect(mockPrisma.campaignInviteUse.create).not.toHaveBeenCalled();
+  });
+
+  it('register rejects a campaign whose last use is claimed concurrently', async () => {
+    mockPrisma.campaignInvite.findUnique.mockResolvedValue({
+      id: 'campaign-1',
+      enabled: true,
+      expiresAt: new Date(Date.now() + 60_000),
+      maxUses: 1,
+      usedCount: 0,
+      owner: { id: 'owner-1', status: 'ACTIVE', role: 'USER' },
+    });
+    mockPrisma.$queryRaw.mockResolvedValueOnce([]);
+
+    await expect(
+      service.register({
+        email: 'campaign@example.com',
+        password: 'password1',
+        confirmPassword: 'password1',
+        nickname: 'Campaign invitee',
+        inviteCode: 'CAMPAIGN-CODE',
+      } as any),
+    ).rejects.toMatchObject({
+      response: expect.objectContaining({
+        errorCode: AuthErrorCode.InviteCodeInvalid,
+      }),
+    });
+    expect(mockPrisma.user.create).not.toHaveBeenCalled();
+    expect(mockPrisma.campaignInviteUse.create).not.toHaveBeenCalled();
   });
 
   it('register retries when account/invite-code creation loses a uniqueness race', async () => {
@@ -607,6 +724,109 @@ describe('AuthService', () => {
       // 秒数：min(admin 15m, 全局 1h) —— TTL 钳制后签名参数为秒
       expect.objectContaining({ expiresIn: 900 }),
     );
+    expect(mockPrisma.adminAccess.findUnique).toHaveBeenCalledWith({
+      where: { userID: 'uuid-1' },
+      select: { role: true },
+    });
+    expect(mockPrisma.adminAuditLog.create).toHaveBeenCalledWith({
+      data: expect.objectContaining({
+        action: 'admin.login.success',
+        actorID: 'uuid-1',
+      }),
+    });
+  });
+
+  it('adminLogin rejects an admin without assigned console access before issuing tokens', async () => {
+    users.push({
+      id: 'uuid-1',
+      accountId: 'admin',
+      email: 'admin@example.com',
+      passwordHash: await argon2.hash('password1'),
+      status: 'ACTIVE',
+      role: 'ADMIN',
+    });
+    mockPrisma.adminAccess.findUnique.mockResolvedValueOnce(null);
+
+    await expect(
+      service.adminLogin({
+        email: 'admin@example.com',
+        password: 'password1',
+      }),
+    ).rejects.toThrow(ForbiddenException);
+    expect(
+      mockRefreshTokenService.createSessionForCurrentSingleDeviceSetting,
+    ).not.toHaveBeenCalled();
+    expect(mockJwt.signAsync).not.toHaveBeenCalled();
+    expect(mockPrisma.adminAuditLog.create).toHaveBeenCalledWith({
+      data: expect.objectContaining({ action: 'admin.login.failed' }),
+    });
+  });
+
+  it('adminLogin returns issued tokens when the success audit is unavailable', async () => {
+    users.push({
+      id: 'uuid-1',
+      accountId: 'admin',
+      email: 'admin@example.com',
+      passwordHash: await argon2.hash('password1'),
+      status: 'ACTIVE',
+      role: 'ADMIN',
+    });
+    mockPrisma.adminAuditLog.create.mockRejectedValueOnce(
+      new Error('audit unavailable'),
+    );
+    const warn = jest
+      .spyOn(Logger.prototype, 'warn')
+      .mockImplementation(() => undefined);
+    try {
+      await expect(
+        service.adminLogin({
+          email: 'admin@example.com',
+          password: 'password1',
+        }),
+      ).resolves.toEqual(
+        expect.objectContaining({
+          accessToken: 'access-token',
+          refreshToken: 'refresh-token',
+        }),
+      );
+      expect(mockPrisma.adminAuditLog.create).toHaveBeenCalledTimes(1);
+      expect(mockPrisma.adminAuditLog.create).toHaveBeenCalledWith({
+        data: expect.objectContaining({ action: 'admin.login.success' }),
+      });
+      expect(warn).toHaveBeenCalledWith(
+        'Admin login success audit unavailable',
+      );
+    } finally {
+      warn.mockRestore();
+    }
+  });
+
+  it('adminLogin preserves the authentication error when the failure audit is unavailable', async () => {
+    mockPrisma.adminAuditLog.create.mockRejectedValueOnce(
+      new Error('audit unavailable'),
+    );
+    const warn = jest
+      .spyOn(Logger.prototype, 'warn')
+      .mockImplementation(() => undefined);
+    try {
+      await expect(
+        service.adminLogin({
+          email: 'missing@example.com',
+          password: 'password1',
+        }),
+      ).rejects.toThrow(ForbiddenException);
+      expect(mockPrisma.adminAuditLog.create).toHaveBeenCalledTimes(1);
+      expect(mockPrisma.adminAuditLog.create).toHaveBeenCalledWith({
+        data: expect.objectContaining({
+          action: 'admin.login.failed',
+          actorID: 'anonymous',
+        }),
+      });
+      expect(mockJwt.signAsync).not.toHaveBeenCalled();
+      expect(warn).toHaveBeenCalledWith('Admin login audit unavailable');
+    } finally {
+      warn.mockRestore();
+    }
   });
 
   it('adminLogin replaces prior admin sessions when single-device login is enabled', async () => {
