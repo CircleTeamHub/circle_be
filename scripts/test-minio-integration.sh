@@ -11,14 +11,15 @@ cleanup() {
 }
 trap cleanup EXIT INT TERM
 
-# MinIO stopped publishing to Docker Hub in 2025-10 and the minio/* repositories
-# were removed; the same tags are still published on quay.io.
+# The upstream community images and legacy binaries are no longer available.
+# Build the same release from its immutable source revision for this fixture.
+docker build --tag circle-be-minio-test:local docker/minio-test
 docker run --detach --rm \
   --name "$container" \
   --publish 127.0.0.1::9000 \
   -e MINIO_ROOT_USER="$access_key" \
   -e MINIO_ROOT_PASSWORD="$secret_key" \
-  quay.io/minio/minio:RELEASE.2025-09-07T16-13-09Z server /data >/dev/null
+  circle-be-minio-test:local server /data >/dev/null
 
 mapping="$(docker port "$container" 9000/tcp)"
 port="${mapping##*:}"
@@ -30,10 +31,6 @@ for _ in $(seq 1 60); do
   sleep 0.25
 done
 curl --fail --silent "$url/minio/health/ready" >/dev/null
-docker exec "$container" mc alias set local http://127.0.0.1:9000 \
-  "$access_key" "$secret_key" >/dev/null
-docker exec "$container" mc mb "local/$bucket" >/dev/null
-
 MINIO_TEST_URL="$url" \
 MINIO_TEST_ACCESS_KEY="$access_key" \
 MINIO_TEST_SECRET_KEY="$secret_key" \
