@@ -20,6 +20,7 @@ describe('StorageAuditService', () => {
       friend: emptyRows(),
       circle: emptyRows(),
       noteMedia: emptyRows(),
+      note: emptyRows(),
       noteDraft: emptyRows(),
       trace: emptyRows(),
       traceComment: emptyRows(),
@@ -49,6 +50,76 @@ describe('StorageAuditService', () => {
 
   const old = new Date('2020-01-01T00:00:00.000Z');
   const now = new Date('2020-02-01T00:00:00.000Z');
+
+  it('keeps published and draft card avatar snapshots referenced after avatar rotation', async () => {
+    const { service } = harness({
+      objects: {
+        'avatars/': [
+          'old-contact',
+          'old-circle',
+          'legacy-card',
+          'draft-card',
+          'unused',
+        ].map((name) => ({
+          key: `avatars/${name}.jpg`,
+          size: 1,
+          lastModified: old,
+        })),
+      },
+      referenced: {
+        user: [
+          {
+            id: 'friend',
+            avatarUrl: 'https://cdn.test/avatars/new-contact.jpg',
+          },
+        ],
+        circle: [
+          {
+            id: 'circle',
+            avatarUrl: 'https://cdn.test/avatars/new-circle.jpg',
+          },
+        ],
+        note: [
+          {
+            id: 'note',
+            sections: {
+              contacts: {
+                items: [
+                  {
+                    faceURL:
+                      'https://cdn.test/avatars/old-contact.jpg?expired=1',
+                  },
+                  null,
+                ],
+              },
+              groups: {
+                items: [
+                  { faceURL: 'https://cdn.test/avatars/old-circle.jpg' },
+                  { avatarUrl: 'https://cdn.test/avatars/legacy-card.jpg' },
+                ],
+              },
+            },
+          },
+        ],
+        noteDraft: [
+          {
+            id: 'draft',
+            mediaKeys: [],
+            sections: {
+              contacts: {
+                items: [{ faceURL: 'https://cdn.test/avatars/draft-card.jpg' }],
+              },
+            },
+          },
+        ],
+      },
+    });
+    expect(await service.audit(now)).toEqual({
+      scanned: 5,
+      orphanCount: 1,
+      orphanBytes: 1,
+    });
+  });
 
   it('audits chat/ against the keys embedded in ChatMessage.content', async () => {
     // OpenIM 时代这里守的是「绝不扫 chat/」——引用固化在 Mongo,Postgres 一条

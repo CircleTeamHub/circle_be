@@ -90,6 +90,154 @@ describeDatabase('Note draft consumption concurrency', () => {
         .send(input);
   }
 
+  it('bounds never-created discard markers without losing late-save fences or published outcomes', async () => {
+    const { http, token, prisma, user, service } = await account();
+    await service.saveNoteDraft(user.id, 'active-delete', {
+      title: 'Keep deletable',
+    });
+    await service.saveNoteDraft(user.id, 'active-publish', {
+      title: 'Keep editable',
+    });
+    const input = {
+      title: 'Durable result',
+      media: [],
+      clientDraftID: 'published-old',
+    };
+    const first = await http
+      .post('/api/v1/note')
+      .set('Authorization', `Bearer ${token}`)
+      .send(input)
+      .expect(201);
+    const old = new Date(Date.now() - 31 * 24 * 60 * 60 * 1000);
+    await prisma.noteDraft.update({
+      where: {
+        ownerID_clientDraftID: {
+          ownerID: user.id,
+          clientDraftID: 'published-old',
+        },
+      },
+      data: { consumedAt: old },
+    });
+    await prisma.noteDraft.createMany({
+      data: [
+        ...Array.from({ length: 998 }, (_, i) => ({
+          ownerID: user.id,
+          clientDraftID: `discard-${i}`,
+          consumedAt: new Date(),
+        })),
+        { ownerID: user.id, clientDraftID: 'expired-discard', consumedAt: old },
+      ],
+    });
+    const results = await Promise.all(
+      Array.from({ length: 3 }, (_, i) =>
+        http
+          .delete(`/api/v1/note/drafts/never-${i}`)
+          .set('Authorization', `Bearer ${token}`),
+      ),
+    );
+    expect(
+      results.map((result) => result.status).sort((a, b) => a - b),
+    ).toEqual([204, 204, 409]);
+    expect(
+      await prisma.noteDraft.count({
+        where: {
+          ownerID: user.id,
+          consumedAt: { not: null },
+          publishedNoteID: null,
+        },
+      }),
+    ).toBe(1000);
+    expect(
+      await prisma.noteDraft.findFirst({
+        where: { ownerID: user.id, clientDraftID: 'expired-discard' },
+      }),
+    ).toBeNull();
+    const acceptedId = `never-${results.findIndex((result) => result.status === 204)}`;
+    const marker = await prisma.noteDraft.findFirstOrThrow({
+      where: { ownerID: user.id, clientDraftID: acceptedId },
+    });
+    await http
+      .delete(`/api/v1/note/drafts/${acceptedId}`)
+      .set('Authorization', `Bearer ${token}`)
+      .expect(204);
+    expect(
+      (await prisma.noteDraft.findUniqueOrThrow({ where: { id: marker.id } }))
+        .consumedAt,
+    ).toEqual(marker.consumedAt);
+    await http
+      .put(`/api/v1/note/drafts/${acceptedId}`)
+      .set('Authorization', `Bearer ${token}`)
+      .send({ title: 'Late save' })
+      .expect(409);
+    await http
+      .put('/api/v1/note/drafts/new-over-quota')
+      .set('Authorization', `Bearer ${token}`)
+      .send({ title: 'New' })
+      .expect(409);
+    await http
+      .put('/api/v1/note/drafts/active-publish')
+      .set('Authorization', `Bearer ${token}`)
+      .send({ title: 'Updated' })
+      .expect(200);
+    await http
+      .delete('/api/v1/note/drafts/active-delete')
+      .set('Authorization', `Bearer ${token}`)
+      .expect(204);
+    expect(
+      await prisma.noteDraft.count({
+        where: {
+          ownerID: user.id,
+          consumedAt: { not: null },
+          publishedNoteID: null,
+        },
+      }),
+    ).toBe(1001);
+    await http
+      .post('/api/v1/note')
+      .set('Authorization', `Bearer ${token}`)
+      .send({
+        title: 'New published result',
+        media: [],
+        clientDraftID: 'active-publish',
+      })
+      .expect(201);
+    const replay = await http
+      .post('/api/v1/note')
+      .set('Authorization', `Bearer ${token}`)
+      .send(input)
+      .expect(201);
+    expect(body(replay).id).toBe(body(first).id);
+    await prisma.noteDraft.updateMany({
+      where: {
+        ownerID: user.id,
+        publishedNoteID: null,
+        consumedAt: { not: null },
+      },
+      data: { consumedAt: old },
+    });
+    await http
+      .put('/api/v1/note/drafts/new-after-expiry')
+      .set('Authorization', `Bearer ${token}`)
+      .send({ title: 'Capacity restored' })
+      .expect(200);
+    expect(
+      await prisma.noteDraft.count({
+        where: {
+          ownerID: user.id,
+          consumedAt: { not: null },
+          publishedNoteID: null,
+        },
+      }),
+    ).toBe(0);
+    expect(
+      (
+        await prisma.noteDraft.findFirstOrThrow({
+          where: { ownerID: user.id, clientDraftID: 'published-old' },
+        })
+      ).publishedNoteID,
+    ).toBe(body(first).id);
+  });
+
   it('consumes a create draft and rejects late saves without retaining private payloads', async () => {
     const { http, token, prisma, user } = await account();
     await http

@@ -55,6 +55,7 @@ import {
   NoteGroupDto,
   NoteMediaType,
   NoteSectionsDto,
+  NoteSectionsResponseDto,
   SaveNoteDraftDto,
   NoteShareLinkDto,
   NoteStatus,
@@ -64,6 +65,7 @@ import {
   UpdateNoteDto,
   UpdateNoteGroupDto,
   NOTE_LIST_DEFAULT_LIMIT,
+  MAX_NOTE_DRAFT_MEDIA_KEYS,
 } from './dto/note.dto';
 import { createLoggingConfig } from 'src/logging/logging.config';
 import { logBusinessEvent } from 'src/logging/business-event.logger';
@@ -260,6 +262,10 @@ const NOTE_INCLUDE = {
 } as const;
 
 const MAX_GROUPS_PER_USER = 50;
+// Discarded IDs prevent delayed autosaves for 30 days. Published outcomes never
+// expire: their replay remains safe even after the target note is deleted.
+const NOTE_DRAFT_DISCARD_RETENTION_MS = 30 * 24 * 60 * 60 * 1000;
+const MAX_NOTE_DISCARDED_DRAFTS = 1000;
 
 // Keep derived title/content in sync with the DTO's @MaxLength caps — text
 // extracted from contentJson blocks otherwise bypasses DTO validation.
@@ -474,8 +480,18 @@ export class NoteService {
   }
 
   private mapNoteDraftSummary(row: NoteDraftRow): NoteDraftSummaryDto {
-    const previewSource = row.content?.trim() || row.title.trim() || '';
     const sections = this.isRecord(row.sections) ? row.sections : {};
+    const text = this.isRecord(sections.text) ? sections.text : {};
+    const blockText = (value: unknown) =>
+      this.extractBlockText(
+        Array.isArray(value) ? (value as NoteContentBlock[]) : undefined,
+      ).join(NOTE_LINE_SEPARATOR);
+    const previewSource =
+      row.content?.trim() ||
+      (typeof text.content === 'string' ? text.content.trim() : '') ||
+      blockText(text.contentJson) ||
+      blockText(row.contentJson) ||
+      row.title.trim();
     const items = ['media', 'showcase', 'audio'].flatMap((name) => {
       const section = this.isRecord(sections[name]) ? sections[name] : {};
       return Array.isArray(section.items) ? section.items : [];
@@ -499,9 +515,7 @@ export class NoteService {
       id: row.clientDraftID,
       sourceNoteId: row.sourceNoteID ?? null,
       title: row.title,
-      contentPreview: previewSource
-        ? sliceByCodePoints(previewSource, MAX_NOTE_PREVIEW_LENGTH)
-        : null,
+      contentPreview: this.buildPreview(previewSource),
       mediaCount: row.mediaKeys.filter(
         (key) => !posterKeys.has(key) || primaryKeys.has(key),
       ).length,
@@ -726,9 +740,14 @@ export class NoteService {
         mediaKeys.push(key);
       }
     }
+    const inventoryKeys = [...new Set(mediaKeys)];
+    if (inventoryKeys.length > MAX_NOTE_DRAFT_MEDIA_KEYS)
+      throw new BadRequestException(
+        `Draft media limit is ${MAX_NOTE_DRAFT_MEDIA_KEYS} objects, including posters`,
+      );
     const ownPrefix = `notes/${ownerID}/`;
     if (
-      [...mediaKeys, ...posterKeys].some(
+      inventoryKeys.some(
         (key) =>
           key.includes('..') ||
           (!key.startsWith(ownPrefix) && !sourceMediaKeys.has(key)),
@@ -743,6 +762,7 @@ export class NoteService {
       // Share the owner's lock with publication and quota writes. A committed
       // Note retains the draft id, so even a delayed save cannot resurrect it.
       await this.membershipPolicy.lockUsers(tx, [ownerID]);
+      await this.expireDiscardedNoteDrafts(tx, ownerID);
       const published = await tx.note.findFirst({
         where: { ownerID, clientDraftID },
         select: { id: true },
@@ -755,6 +775,7 @@ export class NoteService {
       });
       if (existing?.consumedAt)
         throw new ConflictException('This draft has been consumed');
+      if (!existing) await this.requireDiscardedDraftCapacity(tx, ownerID);
       if (
         !existing &&
         (await tx.noteDraft.count({ where: { ownerID, consumedAt: null } })) >=
@@ -777,7 +798,7 @@ export class NoteService {
         contentJson: toPrismaJson(input.contentJson ?? null),
         sections: toPrismaJson(input.sections ?? null),
         groupIDs,
-        mediaKeys: [...new Set(mediaKeys)],
+        mediaKeys: inventoryKeys,
       };
       return tx.noteDraft.upsert({
         where: { ownerID_clientDraftID: { ownerID, clientDraftID } },
@@ -796,6 +817,7 @@ export class NoteService {
   ): Promise<NoteRow | null> {
     if (!clientDraftID) return null;
     this.assertClientDraftID(clientDraftID);
+    await this.expireDiscardedNoteDrafts(tx, ownerID);
     const draft = await tx.noteDraft.findUnique({
       where: { ownerID_clientDraftID: { ownerID, clientDraftID } },
       select: { consumedAt: true, sourceNoteID: true, publishedNoteID: true },
@@ -833,6 +855,11 @@ export class NoteService {
     });
     if (existing?.consumedAt && sourceNoteID !== undefined)
       throw new ConflictException('This draft has been consumed');
+    // Repeated DELETE neither renews discarded retention nor changes a durable
+    // publication result. At capacity, active drafts can still be discarded.
+    if (existing?.consumedAt) return;
+    if (!existing && sourceNoteID === undefined)
+      await this.requireDiscardedDraftCapacity(tx, ownerID);
     if (
       existing &&
       sourceNoteID !== undefined &&
@@ -869,8 +896,42 @@ export class NoteService {
     this.assertClientDraftID(clientDraftID);
     await runSerializableTransaction(this.prisma, async (tx) => {
       await this.membershipPolicy.lockUsers(tx, [ownerID]);
+      await this.expireDiscardedNoteDrafts(tx, ownerID);
       await this.consumeNoteDraft(tx, ownerID, clientDraftID);
     });
+  }
+
+  private async expireDiscardedNoteDrafts(
+    tx: Pick<Prisma.TransactionClient, 'noteDraft'>,
+    ownerID: string,
+  ): Promise<void> {
+    await tx.noteDraft.deleteMany({
+      where: {
+        ownerID,
+        publishedNoteID: null,
+        consumedAt: {
+          lt: new Date(Date.now() - NOTE_DRAFT_DISCARD_RETENTION_MS),
+        },
+      },
+    });
+  }
+
+  private async requireDiscardedDraftCapacity(
+    tx: Pick<Prisma.TransactionClient, 'noteDraft'>,
+    ownerID: string,
+  ): Promise<void> {
+    if (
+      (await tx.noteDraft.count({
+        where: {
+          ownerID,
+          publishedNoteID: null,
+          consumedAt: { not: null },
+        },
+      })) >= MAX_NOTE_DISCARDED_DRAFTS
+    )
+      throw new ConflictException(
+        'Draft discard limit reached. Discarded IDs are retained for 30 days; try again after older entries expire.',
+      );
   }
 
   /**
@@ -1775,9 +1836,8 @@ export class NoteService {
       .replace(NOTE_PREVIEW_WHITESPACE_PATTERN, ' ')
       .trim();
     if (!flattened) return null;
-    return flattened.length > MAX_NOTE_PREVIEW_LENGTH
-      ? `${flattened.slice(0, MAX_NOTE_PREVIEW_LENGTH)}...`
-      : flattened;
+    const preview = sliceByCodePoints(flattened, MAX_NOTE_PREVIEW_LENGTH);
+    return preview.length < flattened.length ? `${preview}...` : preview;
   }
 
   /**
@@ -2271,7 +2331,7 @@ export class NoteService {
             : (item.posterUrl ?? null),
         sortOrder: item.sortOrder,
       })),
-      sections,
+      sections: sections as unknown as NoteSectionsResponseDto,
     };
   }
 

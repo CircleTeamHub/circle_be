@@ -10,7 +10,7 @@ import {
 import { ApiOkResponse, DocumentBuilder, SwaggerModule } from '@nestjs/swagger';
 import { Test } from '@nestjs/testing';
 import { NoteService } from './note.service';
-import { NoteSummaryDto } from './dto/note.dto';
+import { NoteDraftDto, NoteSummaryDto } from './dto/note.dto';
 import { Prisma } from 'src/generated/prisma';
 
 describe('note review regressions', () => {
@@ -296,6 +296,197 @@ describe('note review regressions', () => {
     expect(
       (await service.saveNoteDraft('owner', 'emoji', { title })).title,
     ).toBe(title);
+  });
+
+  it('rejects an aggregate inventory over 150 keys before persistence or signing', async () => {
+    const { service, prisma, upload } = fixture();
+    const blocks = (start: number, count: number) =>
+      Array.from({ length: count }, (_, i) => ({
+        type: 'image',
+        props: { objectKey: `notes/owner/${start + i}.jpg` },
+      }));
+    await expect(
+      service.saveNoteDraft('owner', 'oversized', {
+        contentJson: blocks(0, 76),
+        sections: { text: { contentJson: blocks(76, 75) } },
+      }),
+    ).rejects.toBeInstanceOf(BadRequestException);
+    expect(prisma.noteDraft.upsert).not.toHaveBeenCalled();
+    expect(upload.createPresignedGetUrl).not.toHaveBeenCalled();
+  });
+
+  it('counts posters in the aggregate cap and deduplicates keys across rich-text representations', async () => {
+    const { service, upload } = fixture();
+    const blocks = Array.from({ length: 75 }, (_, i) => ({
+      type: 'video',
+      props: {
+        objectKey: `notes/owner/${i}.mp4`,
+        posterUrl: `https://storage.test/bucket/notes/owner/${i}.jpg`,
+      },
+    }));
+    const saved = await service.saveNoteDraft('owner', 'at-limit', {
+      contentJson: blocks,
+      sections: { text: { contentJson: blocks } },
+    });
+    expect(saved.mediaKeys).toHaveLength(150);
+    expect(upload.createPresignedGetUrl).toHaveBeenCalledTimes(150);
+    await expect(
+      service.saveNoteDraft('owner', 'over-limit', {
+        contentJson: blocks,
+        mediaKeys: ['notes/owner/extra.jpg'],
+      }),
+    ).rejects.toBeInstanceOf(BadRequestException);
+    expect(upload.createPresignedGetUrl).toHaveBeenCalledTimes(150);
+  });
+
+  it.each(['contentJson', 'sectionJson', 'sectionPlain'] as const)(
+    'lists a body preview for a draft using only %s',
+    async (representation) => {
+      const { service, prisma } = fixture();
+      const blocks = [
+        {
+          type: 'paragraph',
+          content: [
+            {
+              type: 'link',
+              href: 'https://private.test/secret',
+              content: [{ type: 'text', text: 'Visible body' }],
+            },
+          ],
+          children: [
+            {
+              type: 'paragraph',
+              content: [{ type: 'text', text: 'nested text' }],
+            },
+          ],
+        },
+      ];
+      const saved = await service.saveNoteDraft('owner', 'rich', {
+        title: 'Title',
+        ...(representation === 'contentJson'
+          ? { contentJson: blocks }
+          : {
+              sections: {
+                text:
+                  representation === 'sectionJson'
+                    ? { contentJson: blocks }
+                    : { content: 'Visible body\nnested text' },
+              },
+            }),
+      });
+      prisma.noteDraft.findMany.mockResolvedValue([
+        { ...row, ...prisma.noteDraft.upsert.mock.calls[0][0].create },
+      ]);
+      expect(saved.contentPreview).toBe('Visible body nested text');
+      expect((await service.listNoteDrafts('owner'))[0].contentPreview).toBe(
+        saved.contentPreview,
+      );
+      expect(saved.contentPreview).not.toContain('secret');
+    },
+  );
+
+  it('truncates rich-text draft previews without splitting a Unicode code point', async () => {
+    const { service } = fixture();
+    const result = await service.saveNoteDraft('owner', 'unicode-body', {
+      contentJson: [
+        {
+          type: 'paragraph',
+          content: [{ type: 'text', text: `${'a'.repeat(119)}😀tail` }],
+        },
+      ],
+    });
+    expect(result.contentPreview).toBe(`${'a'.repeat(119)}😀...`);
+  });
+
+  it('describes response section media and canonical card snapshots in OpenAPI', async () => {
+    @Controller('drafts')
+    class ProbeController {
+      @Get() @ApiOkResponse({ type: NoteDraftDto }) get() {}
+    }
+    const module = await Test.createTestingModule({
+      controllers: [ProbeController],
+    }).compile();
+    const app = module.createNestApplication();
+    try {
+      const doc = SwaggerModule.createDocument(
+        app,
+        new DocumentBuilder().setTitle('Test').setVersion('1').build(),
+      );
+      const schemas = doc.components!.schemas! as Record<string, any>;
+      for (const [section, name] of [
+        ['audio', 'NoteMediaSectionResponseDto'],
+        ['contacts', 'NoteContactSectionResponseDto'],
+        ['groups', 'NoteGroupCardSectionResponseDto'],
+      ]) {
+        expect(
+          schemas.NoteSectionsResponseDto.properties[section],
+        ).toMatchObject({ $ref: `#/components/schemas/${name}` });
+        expect(schemas[name].properties.items).toMatchObject({
+          type: 'array',
+          items: { $ref: expect.any(String) },
+        });
+      }
+      expect(schemas.NoteSectionMediaResponseDto.properties).toMatchObject({
+        objectKey: { type: 'string' },
+        durationMs: { type: 'number', nullable: true },
+      });
+      expect(schemas.NoteContactCardResponseDto.properties).toMatchObject({
+        id: { type: 'string' },
+        name: { type: 'string' },
+        faceURL: { type: 'string', nullable: true },
+      });
+      expect(
+        schemas.NoteGroupCardResponseDto.properties.circleId,
+      ).toMatchObject({ type: 'string' });
+    } finally {
+      await app.close();
+    }
+  });
+
+  it('caps absent draft deletion and new draft creation while preserving active draft updates and deletion', async () => {
+    const { service, prisma } = fixture();
+    prisma.noteDraft.count.mockResolvedValue(1000);
+    await expect(
+      service.deleteNoteDraft('owner', 'never-created'),
+    ).rejects.toThrow('Discarded IDs are retained for 30 days');
+    await expect(
+      service.saveNoteDraft('owner', 'new', {}),
+    ).rejects.toBeInstanceOf(ConflictException);
+    expect(prisma.noteDraft.upsert).not.toHaveBeenCalled();
+    prisma.noteDraft.findUnique.mockResolvedValue({
+      id: 'existing',
+      consumedAt: null,
+      sourceNoteID: null,
+    });
+    await expect(
+      service.saveNoteDraft('owner', 'existing', {}),
+    ).resolves.toBeDefined();
+    await expect(
+      service.deleteNoteDraft('owner', 'existing'),
+    ).resolves.toBeUndefined();
+  });
+
+  it('expires only owner-scoped discarded results and does not renew markers on repeated deletion', async () => {
+    const { service, prisma } = fixture();
+    prisma.noteDraft.findUnique.mockResolvedValue({
+      consumedAt: new Date(),
+      sourceNoteID: null,
+      publishedNoteID: 'published',
+    });
+    await service.deleteNoteDraft('owner', 'already-consumed');
+    expect(prisma.noteDraft.upsert).not.toHaveBeenCalled();
+    expect(prisma.noteDraft.deleteMany).toHaveBeenCalledWith({
+      where: {
+        ownerID: 'owner',
+        publishedNoteID: null,
+        consumedAt: { lt: expect.any(Date) },
+      },
+    });
+    const cutoff =
+      prisma.noteDraft.deleteMany.mock.calls[0][0].where.consumedAt.lt.getTime();
+    expect(
+      Math.abs(cutoff - (Date.now() - 30 * 24 * 60 * 60 * 1000)),
+    ).toBeLessThan(1000);
   });
 
   it('resolves nested key-only BlockNote draft media and inventories its poster', async () => {

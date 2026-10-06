@@ -37,6 +37,8 @@ export type NoteWritableStatus = (typeof NOTE_WRITABLE_STATUS)[number];
 
 export const NOTE_MEDIA_TYPE = ['IMAGE', 'VIDEO', 'AUDIO'] as const;
 export type NoteMediaType = (typeof NOTE_MEDIA_TYPE)[number];
+/** Includes all primary and poster keys from every draft representation. */
+export const MAX_NOTE_DRAFT_MEDIA_KEYS = 150;
 
 export const NOTE_EXPORT_FORMAT = ['IMAGE', 'PDF', 'IMAGES', 'VIDEOS'] as const;
 export type NoteExportFormat = (typeof NOTE_EXPORT_FORMAT)[number];
@@ -344,7 +346,8 @@ export class CreateNoteDto {
   sections?: NoteSectionsDto;
 
   @ApiPropertyOptional({
-    description: 'Stable client draft id to remove after a successful save.',
+    description:
+      'Stable ID for one publication attempt. Retry the same payload after an uncertain response; a consumed ID replays the original result. Use a new draft lifecycle for later edits.',
   })
   @IsOptional()
   @IsString()
@@ -411,10 +414,10 @@ export class SaveNoteDraftDto {
   @IsUUID()
   sourceNoteId?: string | null;
 
-  @ApiPropertyOptional({ type: [String] })
+  @ApiPropertyOptional({ type: [String], maxItems: MAX_NOTE_DRAFT_MEDIA_KEYS })
   @IsOptional()
   @IsArray()
-  @ArrayMaxSize(150)
+  @ArrayMaxSize(MAX_NOTE_DRAFT_MEDIA_KEYS)
   @IsString({ each: true })
   @MaxLength(255, { each: true })
   @Matches(/^(?!.*\.\.)[A-Za-z0-9._\/-]+$/, {
@@ -658,16 +661,71 @@ export class NoteMediaDto {
   @ApiProperty() sortOrder: number;
 }
 
+export class NoteSectionMediaResponseDto {
+  @ApiProperty({ enum: NOTE_MEDIA_TYPE }) type: NoteMediaType;
+  @ApiProperty() objectKey: string;
+  @ApiPropertyOptional() url?: string;
+  @ApiPropertyOptional({ type: String, nullable: true }) mimeType?:
+    | string
+    | null;
+  @ApiPropertyOptional({ type: Number, nullable: true }) size?: number | null;
+  @ApiPropertyOptional({ type: Number, nullable: true }) width?: number | null;
+  @ApiPropertyOptional({ type: Number, nullable: true }) height?: number | null;
+  @ApiPropertyOptional({ type: Number, nullable: true }) durationMs?:
+    | number
+    | null;
+  @ApiPropertyOptional({ type: String, nullable: true }) posterUrl?:
+    | string
+    | null;
+  @ApiProperty() sortOrder: number;
+}
+
+export class NoteMediaSectionResponseDto {
+  @ApiProperty({ type: [NoteSectionMediaResponseDto] })
+  items: NoteSectionMediaResponseDto[];
+}
+
+export class NoteContactCardResponseDto {
+  @ApiProperty() id: string;
+  @ApiProperty() name: string;
+  @ApiPropertyOptional({ type: String, nullable: true }) faceURL?:
+    | string
+    | null;
+}
+
+export class NoteGroupCardResponseDto extends NoteContactCardResponseDto {
+  @ApiPropertyOptional({
+    description:
+      'Canonical Circle primary key, including when id is a legacy OpenIM group identifier.',
+  })
+  circleId?: string;
+}
+
+export class NoteContactSectionResponseDto {
+  @ApiProperty({ type: [NoteContactCardResponseDto] })
+  items: NoteContactCardResponseDto[];
+}
+
+export class NoteGroupCardSectionResponseDto {
+  @ApiProperty({ type: [NoteGroupCardResponseDto] })
+  items: NoteGroupCardResponseDto[];
+}
+
 export class NoteSectionsResponseDto {
   @ApiProperty() text: {
     content: string | null;
     contentJson: unknown[] | null;
   };
-  @ApiProperty() media: { items: unknown[] };
-  @ApiProperty() showcase: { items: unknown[] };
-  @ApiPropertyOptional() audio?: { items: unknown[] };
-  @ApiPropertyOptional() contacts?: { items: unknown[] };
-  @ApiPropertyOptional() groups?: { items: unknown[] };
+  @ApiProperty({ type: NoteMediaSectionResponseDto })
+  media: NoteMediaSectionResponseDto;
+  @ApiProperty({ type: NoteMediaSectionResponseDto })
+  showcase: NoteMediaSectionResponseDto;
+  @ApiPropertyOptional({ type: NoteMediaSectionResponseDto })
+  audio?: NoteMediaSectionResponseDto;
+  @ApiPropertyOptional({ type: NoteContactSectionResponseDto })
+  contacts?: NoteContactSectionResponseDto;
+  @ApiPropertyOptional({ type: NoteGroupCardSectionResponseDto })
+  groups?: NoteGroupCardSectionResponseDto;
   @ApiPropertyOptional({ nullable: true }) location: {
     title?: string;
     address?: string;
