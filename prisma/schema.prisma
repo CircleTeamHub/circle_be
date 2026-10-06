@@ -495,6 +495,11 @@ model User {
   @@index([createdAt])
   @@index([lastOnline])
   @@index([status, createdAt])
+  // Substring search in the admin console uses the pg_trgm GIN indexes created
+  // by migration 20261005090300.
+  @@index([accountId(ops: raw("gin_trgm_ops"))], type: Gin, map: "User_accountId_trgm_idx")
+  @@index([nickname(ops: raw("gin_trgm_ops"))], type: Gin, map: "User_nickname_trgm_idx")
+  @@index([inviteCode(ops: raw("gin_trgm_ops"))], type: Gin, map: "User_inviteCode_trgm_idx")
 }
 
 model AvatarFrameAsset {
@@ -726,6 +731,8 @@ model CampaignInvite {
 
   @@index([ownerUserID, createdAt])
   @@index([enabled, expiresAt])
+  @@index([code(ops: raw("gin_trgm_ops"))], type: Gin, map: "CampaignInvite_code_trgm_idx")
+  @@index([name(ops: raw("gin_trgm_ops"))], type: Gin, map: "CampaignInvite_name_trgm_idx")
 }
 
 model CampaignInviteUse {
@@ -754,6 +761,7 @@ model AdminAdvertisement {
   updatedAt  DateTime @updatedAt
 
   @@index([placement, enabled, startsAt, endsAt])
+  @@index([title(ops: raw("gin_trgm_ops"))], type: Gin, map: "AdminAdvertisement_title_trgm_idx")
 }
 
 model AdminOperationRequest {
@@ -785,6 +793,7 @@ model FancyNumber {
 
   @@index([status, sortOrder, id])
   @@index([isRecommended, status, sortOrder, id], map: "FancyNumber_recommended_status_sort_idx")
+  @@index([value(ops: raw("gin_trgm_ops"))], type: Gin, map: "FancyNumber_value_trgm_idx")
 }
 
 model FancyNumberLease {
@@ -1733,6 +1742,7 @@ model AdminAuditLog {
   @@index([actorID, createdAt])
   @@index([entityType, entityID, createdAt])
   @@index([action, createdAt])
+  @@index([action(ops: raw("gin_trgm_ops"))], type: Gin, map: "AdminAuditLog_action_trgm_idx")
 }
 
 model DevicePushToken {
@@ -1816,6 +1826,9 @@ model Circle {
   /// 连接（池只有 10 个）。GET 上又没有路由级限流，只有 300 次/分钟/IP 的兜底，
   /// 这是纯读接口里最容易被一个脚本打爆的一条。CirclePost.cities 早就有同款索引。
   @@index([cities], type: Gin)
+  @@index([id(ops: raw("gin_trgm_ops"))], type: Gin, map: "Circle_id_trgm_idx")
+  @@index([name(ops: raw("gin_trgm_ops"))], type: Gin, map: "Circle_name_trgm_idx")
+  @@index([groupID(ops: raw("gin_trgm_ops"))], type: Gin, map: "Circle_groupID_trgm_idx")
 }
 
 model AdminGroupOperation {
@@ -2133,6 +2146,8 @@ model SensitiveWord {
   word      String   @unique
   createdAt DateTime @default(now())
   createdBy String?
+
+  @@index([word(ops: raw("gin_trgm_ops"))], type: Gin, map: "SensitiveWord_word_trgm_idx")
 }
 
 // ===== 自研聊天（替代 OpenIM，src/chat）=====
@@ -2233,6 +2248,9 @@ model ChatConversation {
   // ChatConversation 扫描范围。ChatMember 的 active/pinned partial index 在
   // migration 中定义，因为 Prisma schema 无法表达 NULLS LAST / WHERE 条件。
   @@index([lastMessageAt(sort: Desc), id(sort: Desc)])
+  @@index([id(ops: raw("gin_trgm_ops"))], type: Gin, map: "ChatConversation_id_trgm_idx")
+  @@index([name(ops: raw("gin_trgm_ops"))], type: Gin, map: "ChatConversation_name_trgm_idx")
+  @@index([circleID(ops: raw("gin_trgm_ops"))], type: Gin, map: "ChatConversation_circleID_trgm_idx")
   // burnDurationSec IS NOT NULL 的轮转扫描使用 migration 中的 partial index；
   // Prisma schema 无法表达 WHERE 条件。
 }
