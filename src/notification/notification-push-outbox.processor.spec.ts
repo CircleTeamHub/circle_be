@@ -1,6 +1,7 @@
 import { readFileSync } from 'fs';
 import { join } from 'path';
 import { NotificationPushOutboxProcessor } from './notification-push-outbox.processor';
+import { NotificationPushService } from './notification-push.service';
 import { Logger } from '@nestjs/common';
 import * as errorAggregation from '../logging/error-aggregation.service';
 
@@ -126,6 +127,61 @@ function buildHarness({
 }
 
 describe('NotificationPushOutboxProcessor (#88 per-token)', () => {
+  it('keeps an existing JPush delivery retryable when credentials are absent', async () => {
+    const token = {
+      token: 'jpush-device',
+      projectId: null,
+      provider: 'jpush' as const,
+      platform: 'android' as const,
+    };
+    const { prisma } = buildHarness({
+      jobs: [
+        {
+          id: 'job-1',
+          notificationID: notification.id,
+          attempts: 0,
+          payload: { title: 'T', body: 'B', data: {} },
+          notification,
+        },
+      ],
+      tokens: [token],
+      pendingDeliveries: [{ id: 'delivery-1', token: token.token }],
+      outcomes: [],
+    });
+    const devicePushToken = {
+      findMany: jest
+        .fn()
+        .mockImplementation(({ where }) =>
+          Promise.resolve(where.provider.in.includes('jpush') ? [token] : []),
+        ),
+    };
+    const push = new NotificationPushService(
+      { ...prisma, devicePushToken } as any,
+      { get: () => undefined } as any,
+    );
+    const processor = new NotificationPushOutboxProcessor(prisma as any, push);
+
+    await expect(processor.processPending()).resolves.toBe(0);
+
+    expect(prisma.notificationPushDelivery.update).toHaveBeenCalledWith({
+      where: { id: 'delivery-1' },
+      data: {
+        status: 'FAILED',
+        attempts: { increment: 1 },
+        lastError: 'JPushNotConfigured',
+      },
+    });
+    expect(prisma.notificationPushDelivery.updateMany).not.toHaveBeenCalled();
+    expect(prisma.notificationPushOutbox.updateMany).toHaveBeenCalledWith(
+      expect.objectContaining({
+        data: expect.objectContaining({
+          status: 'FAILED',
+          nextAttemptAt: expect.any(Date),
+        }),
+      }),
+    );
+  });
+
   it('logs unexpected delivery failures without leaking provider or payload text', async () => {
     const { prisma, push, processor } = buildHarness({
       jobs: [

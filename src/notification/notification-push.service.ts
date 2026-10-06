@@ -31,6 +31,21 @@ const RECEIPT_BATCH_SIZE = 300;
 // review 修复：单轮最多抽多少批 —— 300×20=6000 行/轮，远超预期峰值；
 // 有上限只是防御性兜底（雪崩恢复时不至于一轮跑穿全表）。
 const RECEIPT_MAX_BATCHES_PER_RUN = 20;
+const MAX_ACTIVE_TOKENS_PER_PROVIDER = 20;
+const MAX_PUSH_BODY_BYTES = 1024;
+
+function truncateUtf8(value: string, maxBytes: number): string {
+  if (Buffer.byteLength(value, 'utf8') <= maxBytes) return value;
+  let bytes = 0;
+  let end = 0;
+  for (const point of value) {
+    const pointBytes = Buffer.byteLength(point, 'utf8');
+    if (bytes + pointBytes > maxBytes) break;
+    bytes += pointBytes;
+    end += point.length;
+  }
+  return value.slice(0, end);
+}
 
 type ExpoPushTicket = {
   status?: string;
@@ -124,6 +139,10 @@ export class NotificationPushService {
         configuredJpushApnsProduction.trim().toLowerCase() === 'true');
   }
 
+  isJPushConfigured(): boolean {
+    return Boolean(this.jpushAppKey && this.jpushMasterSecret);
+  }
+
   /** 组装推送 payload。外置成公开方法：outbox 第一次处理时快照进 DB（#88）。 */
   composeMessage(
     userId: string,
@@ -142,7 +161,7 @@ export class NotificationPushService {
           this.fallbackBody(notification.type);
     return {
       title: notification.type === 'SYSTEM' ? '系统通知' : actor,
-      body,
+      body: truncateUtf8(body, MAX_PUSH_BODY_BYTES),
       data: {
         notificationId: notification.id,
         type: notification.type,
@@ -176,7 +195,13 @@ export class NotificationPushService {
   /** 当前活跃 token 清单（含 Expo projectId 分组信息），供 outbox 建投递行。 */
   async listActiveTokens(userId: string): Promise<PushTokenTarget[]> {
     const rows = await this.prisma.devicePushToken.findMany({
-      where: { userID: userId, disabledAt: null },
+      where: {
+        userID: userId,
+        provider: {
+          in: ['expo', 'jpush'],
+        },
+        disabledAt: null,
+      },
       select: {
         token: true,
         projectId: true,
@@ -184,9 +209,15 @@ export class NotificationPushService {
         platform: true,
       },
       orderBy: { updatedAt: 'desc' },
-      take: ACTIVE_TOKENS_PER_USER,
     });
-    return rows.map((row) => ({
+    const rowsByProvider = new Map<string, typeof rows>();
+    for (const row of rows) {
+      const providerRows = rowsByProvider.get(row.provider) ?? [];
+      if (providerRows.length >= MAX_ACTIVE_TOKENS_PER_PROVIDER) continue;
+      providerRows.push(row);
+      rowsByProvider.set(row.provider, providerRows);
+    }
+    return [...rowsByProvider.values()].flat().map((row) => ({
       token: row.token,
       projectId: row.projectId,
       provider: row.provider as 'expo' | 'jpush',
@@ -205,7 +236,13 @@ export class NotificationPushService {
     const byUser = new Map<string, PushTokenTarget[]>();
     if (userIds.length === 0) return byUser;
     const rows = await this.prisma.devicePushToken.findMany({
-      where: { userID: { in: userIds }, disabledAt: null },
+      where: {
+        userID: { in: userIds },
+        provider: {
+          in: ['expo', 'jpush'],
+        },
+        disabledAt: null,
+      },
       select: {
         userID: true,
         token: true,
@@ -215,9 +252,12 @@ export class NotificationPushService {
       },
       orderBy: { updatedAt: 'desc' },
     });
+    const countsByUserProvider = new Map<string, number>();
     for (const row of rows) {
       const tokens = byUser.get(row.userID) ?? [];
-      if (tokens.length >= ACTIVE_TOKENS_PER_USER) continue;
+      const countKey = `${row.userID}:${row.provider}`;
+      const providerCount = countsByUserProvider.get(countKey) ?? 0;
+      if (providerCount >= MAX_ACTIVE_TOKENS_PER_PROVIDER) continue;
       tokens.push({
         token: row.token,
         projectId: row.projectId,
@@ -225,6 +265,7 @@ export class NotificationPushService {
         platform: row.platform as 'ios' | 'android' | 'web',
       });
       byUser.set(row.userID, tokens);
+      countsByUserProvider.set(countKey, providerCount + 1);
     }
     return byUser;
   }
@@ -269,6 +310,12 @@ export class NotificationPushService {
     }
 
     const outcomes = new Array<TokenDeliveryOutcome>(messages.length);
+    // Start JPush while Expo batches are in flight so one provider cannot
+    // delay the other for large fan-outs.
+    const jpushMessages = messages
+      .map((message, index) => ({ ...message, index }))
+      .filter((message) => message.provider === 'jpush');
+    const jpushPromise = this.sendJPushMessages(jpushMessages);
     for (let i = 0; i < batches.length; i += EXPO_SEND_CONCURRENCY) {
       const chunk = batches.slice(i, i + EXPO_SEND_CONCURRENCY);
       const settled = await Promise.all(
@@ -281,10 +328,7 @@ export class NotificationPushService {
       });
     }
 
-    const jpushMessages = messages
-      .map((message, index) => ({ ...message, index }))
-      .filter((message) => message.provider === 'jpush');
-    const jpushOutcomes = await this.sendJPushMessages(jpushMessages);
+    const jpushOutcomes = await jpushPromise;
     jpushOutcomes.forEach(({ index, outcome }) => {
       outcomes[index] = outcome;
     });
@@ -586,7 +630,7 @@ export class NotificationPushService {
     >,
   ): Promise<Array<{ index: number; outcome: TokenDeliveryOutcome }>> {
     if (messages.length === 0) return [];
-    if (!this.jpushAppKey || !this.jpushMasterSecret) {
+    if (!this.isJPushConfigured()) {
       return messages.map(({ index, token }) => ({
         index,
         outcome: {
@@ -706,6 +750,7 @@ export class NotificationPushService {
         }));
       }
       const retryable =
+        response.status === 408 ||
         response.status === 401 ||
         response.status === 403 ||
         response.status === 429 ||

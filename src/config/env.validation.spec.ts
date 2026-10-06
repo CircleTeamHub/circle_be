@@ -99,6 +99,35 @@ describe('createEnvValidationSchema', () => {
     expect(value.CALL_ENABLE_VIDEO).toBe(true);
   });
 
+  it('rejects malformed JPush APNs environment values', () => {
+    const env = {
+      ...baseEnv,
+      DATABASE_URL: 'postgresql://user:pass@localhost:5432/db',
+      JPUSH_APNS_PRODUCTION: 'tru',
+    };
+
+    const { error } = createEnvValidationSchema(env).validate(env);
+
+    expect(error?.message).toContain('JPUSH_APNS_PRODUCTION');
+  });
+
+  it.each(['JPUSH_APP_KEY', 'JPUSH_MASTER_SECRET'])(
+    'rejects a partial JPush credential pair (%s)',
+    (key) => {
+      const env = {
+        ...baseEnv,
+        DATABASE_URL: 'postgresql://user:pass@localhost:5432/db',
+        [key]: 'configured',
+      };
+
+      const { error } = createEnvValidationSchema(env).validate(env);
+
+      expect(error?.message).toContain(
+        'JPUSH_APP_KEY and JPUSH_MASTER_SECRET must be configured together',
+      );
+    },
+  );
+
   it('normalizes backwards-compatible object storage defaults', () => {
     const env = {
       ...baseEnv,
