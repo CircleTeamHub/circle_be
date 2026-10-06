@@ -510,7 +510,7 @@ describeDatabase('Note draft consumption concurrency', () => {
     }
   });
 
-  it('keeps the canonical circleId through legacy group resolution, persistence, and GET', async () => {
+  it('roundtrips a legacy group card through GET, draft PUT/GET and published PATCH', async () => {
     const { http, token, prisma, user } = await account();
     const groupID = `legacy-${randomUUID()}`;
     const circle = await prisma.circle.create({
@@ -544,7 +544,85 @@ describeDatabase('Note draft consumption concurrency', () => {
       .set('Authorization', `Bearer ${token}`)
       .expect(200);
     expect(body(detail).sections.groups.items).toEqual([expected]);
+    const draft = await http
+      .put('/api/v1/note/drafts/group-roundtrip')
+      .set('Authorization', `Bearer ${token}`)
+      .send({
+        title: 'Group card',
+        sourceNoteId: id,
+        sections: body(detail).sections,
+      })
+      .expect(200);
+    expect(body(draft).sections.groups.items).toEqual([expected]);
+    const restored = await http
+      .get('/api/v1/note/drafts/group-roundtrip')
+      .set('Authorization', `Bearer ${token}`)
+      .expect(200);
+    const updated = await http
+      .patch(`/api/v1/note/${id}`)
+      .set('Authorization', `Bearer ${token}`)
+      .send({
+        title: 'Edited group card',
+        media: [],
+        clientDraftID: 'group-roundtrip',
+        sections: body(restored).sections,
+      })
+      .expect(200);
+    expect(body(updated).sections.groups.items).toEqual([expected]);
+    const persisted = await prisma.note.findUniqueOrThrow({ where: { id } });
+    expect((persisted.sections as any).groups.items).toEqual([expected]);
   });
+
+  it.each(['legacy', 'canonical'] as const)(
+    'ignores a forged circleId for a %s card in draft PUT, POST and PATCH',
+    async (form) => {
+      const { http, token, prisma, user } = await account();
+      const circle = await prisma.circle.create({
+        data: {
+          ownerID: user.id,
+          groupID: `legacy-${randomUUID()}`,
+          name: 'Actual circle',
+        },
+      });
+      const cardId = form === 'legacy' ? circle.groupID! : circle.id;
+      const forged = { id: cardId, name: 'Forged', circleId: randomUUID() };
+      const expected = {
+        id: cardId,
+        name: circle.name,
+        faceURL: null,
+        ...(form === 'legacy' ? { circleId: circle.id } : {}),
+      };
+      const sections = { groups: { items: [forged] } };
+      const draft = await http
+        .put('/api/v1/note/drafts/forged-group')
+        .set('Authorization', `Bearer ${token}`)
+        .send({ title: 'Draft', sections })
+        .expect(200);
+      expect(body(draft).sections.groups.items).toEqual([expected]);
+      const saved = await http
+        .post('/api/v1/note')
+        .set('Authorization', `Bearer ${token}`)
+        .send({
+          title: 'Published',
+          media: [],
+          sections,
+          clientDraftID: 'forged-group',
+        })
+        .expect(201);
+      expect(body(saved).sections.groups.items).toEqual([expected]);
+      const updated = await http
+        .patch(`/api/v1/note/${body(saved).id}`)
+        .set('Authorization', `Bearer ${token}`)
+        .send({ title: 'Changed', media: [], sections })
+        .expect(200);
+      expect(body(updated).sections.groups.items).toEqual([expected]);
+      const detail = await http
+        .get(`/api/v1/note/${body(saved).id}`)
+        .set('Authorization', `Bearer ${token}`)
+        .expect(200);
+      expect(body(detail).sections.groups.items).toEqual([expected]);
+    },
+  );
 
   it.each(['create', 'update'] as const)(
     'replays a committed %s after signing fails, including after editor draft cleanup',

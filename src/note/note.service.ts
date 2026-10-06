@@ -672,10 +672,11 @@ export class NoteService {
     await this.requireOwnedGroups(ownerID, groupIDs);
 
     let sourceMediaKeys = new Set<string>();
+    let sourceSections: unknown;
     if (input.sourceNoteId) {
       const sourceNote = await this.prisma.note.findFirst({
         where: { id: input.sourceNoteId, ownerID },
-        select: { id: true },
+        select: { id: true, sections: true },
       });
       if (!sourceNote) {
         throw new NotFoundException({
@@ -683,6 +684,7 @@ export class NoteService {
           errorCode: NoteErrorCode.NotFound,
         });
       }
+      sourceSections = sourceNote.sections;
       const sourceMedia = await this.prisma.noteMedia.findMany({
         where: { noteID: input.sourceNoteId },
         select: { objectKey: true, posterUrl: true },
@@ -696,6 +698,23 @@ export class NoteService {
         }),
       );
     }
+
+    // A returned circleId is only a readback hint. Resolve it from the card's
+    // id rather than persisting a client-supplied navigation target. Retain
+    // trusted source-note snapshots when editing after membership changes.
+    const canonicalGroups = await this.canonicalizeNoteCards(
+      ownerID,
+      { sections: { groups: input.sections?.groups } },
+      sourceSections,
+    );
+    const sections = input.sections
+      ? {
+          ...input.sections,
+          ...(input.sections.groups
+            ? { groups: canonicalGroups.sections?.groups }
+            : {}),
+        }
+      : undefined;
 
     const sectionKeys: string[] = [];
     const posterKeys: string[] = [];
@@ -796,7 +815,7 @@ export class NoteService {
             ? null
             : sliceByCodePoints(input.content, MAX_NOTE_CONTENT_LENGTH),
         contentJson: toPrismaJson(input.contentJson ?? null),
-        sections: toPrismaJson(input.sections ?? null),
+        sections: toPrismaJson(sections ?? null),
         groupIDs,
         mediaKeys: inventoryKeys,
       };
@@ -1513,11 +1532,11 @@ export class NoteService {
    * can currently address. Resolve the display fields on the server so a
    * crafted request cannot put somebody else's name or avatar in a note.
    */
-  private async canonicalizeNoteCards(
+  private async canonicalizeNoteCards<T extends { sections?: NoteSectionsDto }>(
     ownerID: string,
-    input: CreateNoteDto | UpdateNoteDto,
+    input: T,
     existingSections?: unknown,
-  ): Promise<CreateNoteDto | UpdateNoteDto> {
+  ): Promise<T> {
     const contacts = input.sections?.contacts?.items ?? [];
     const groups = input.sections?.groups?.items ?? [];
     if (!contacts.length && !groups.length) return input;
@@ -1634,6 +1653,8 @@ export class NoteService {
         (row) => row.id === id || row.groupID === id,
       );
       if (circle)
+        // Never merge the request card: even id === circle.id must drop a
+        // forged source.circleId instead of retaining it through a spread.
         groupsById.set(id, {
           id,
           ...(circle.id !== id ? { circleId: circle.id } : {}),

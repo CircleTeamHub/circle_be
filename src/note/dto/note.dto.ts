@@ -215,6 +215,15 @@ export class NoteGroupCardDto {
   @MaxLength(120)
   id: string;
 
+  @ApiPropertyOptional({
+    description:
+      'Canonical circle identifier returned on reads. Accepted for roundtrips; resolved by the server from id.',
+    format: 'uuid',
+  })
+  @IsOptional()
+  @IsUUID()
+  circleId?: string;
+
   @ApiProperty()
   @IsString()
   @IsNotEmpty()

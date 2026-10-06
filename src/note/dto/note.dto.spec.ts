@@ -13,9 +13,46 @@ import {
   NoteLocationSectionDto,
   RecycleBinQueryDto,
   ReorderNoteGroupsDto,
+  SaveNoteDraftDto,
   SetNoteRemarkDto,
   UpdateNoteGroupDto,
+  UpdateNoteDto,
 } from './note.dto';
+
+describe('group card readback validation', () => {
+  it.each([CreateNoteDto, UpdateNoteDto, SaveNoteDraftDto])(
+    '%p accepts canonical circleId in returned sections with strict whitelisting',
+    (type) => {
+      const payload = {
+        title: 'Roundtrip',
+        sections: {
+          groups: {
+            items: [
+              {
+                id: 'legacy-group',
+                circleId: 'd1c4a3c1-c6bb-42c4-a605-a4e001b49881',
+                name: 'Group',
+                faceURL: null,
+              },
+            ],
+          },
+        },
+        ...(type === SaveNoteDraftDto ? {} : { media: [] }),
+      };
+      const dto = plainToInstance<SaveNoteDraftDto, typeof payload>(
+        type,
+        payload,
+      );
+      expect(
+        validateSync(dto, { whitelist: true, forbidNonWhitelisted: true }),
+      ).toHaveLength(0);
+      dto.sections!.groups!.items[0].circleId = 'not-a-uuid';
+      expect(
+        validateSync(dto, { whitelist: true, forbidNonWhitelisted: true }),
+      ).not.toHaveLength(0);
+    },
+  );
+});
 
 describe('CreateNoteDto', () => {
   it('rejects duplicated media sort orders', () => {

@@ -209,6 +209,62 @@ describe('note review regressions', () => {
     ).toContainEqual({ groupID: { in: ['legacy-group'] } });
   });
 
+  it.each(['legacy-group', 'canonical-circle'])(
+    'recanonicalizes draft group %s instead of persisting a forged circleId',
+    async (id) => {
+      const { service, prisma } = fixture();
+      prisma.circle.findMany.mockResolvedValue([
+        {
+          id: 'canonical-circle',
+          groupID: 'legacy-group',
+          name: 'Canonical',
+          avatarUrl: null,
+        },
+      ] as any);
+      const result = await service.saveNoteDraft('owner', 'draft-1', {
+        sections: {
+          groups: {
+            items: [{ id, name: 'Forged', circleId: 'forged-circle' }],
+          },
+        },
+      });
+      const expected = {
+        id,
+        name: 'Canonical',
+        faceURL: null,
+        ...(id === 'legacy-group' ? { circleId: 'canonical-circle' } : {}),
+      };
+      expect(result.sections?.groups?.items).toEqual([expected]);
+      expect(
+        prisma.noteDraft.upsert.mock.calls[0][0].create.sections.groups.items,
+      ).toEqual([expected]);
+    },
+  );
+
+  it('retains an owned source group snapshot on draft save after membership is lost, ignoring the request circleId', async () => {
+    const { service, prisma } = fixture();
+    const group = {
+      id: 'legacy-group',
+      circleId: 'canonical-circle',
+      name: 'Saved snapshot',
+      faceURL: null,
+    };
+    prisma.note.findFirst.mockResolvedValueOnce({
+      id: 'source',
+      sections: { groups: { items: [group] } },
+    } as any);
+    const result = await service.saveNoteDraft('owner', 'draft-1', {
+      sourceNoteId: 'source',
+      sections: {
+        groups: {
+          items: [{ id: group.id, circleId: 'forged-circle', name: 'Forged' }],
+        },
+      },
+    });
+    expect(result.sections?.groups?.items).toEqual([group]);
+    expect(prisma.circle.findMany).not.toHaveBeenCalled();
+  });
+
   it('retains stored collected cards while still rejecting newly added inaccessible cards', async () => {
     const { service } = fixture();
     const stored = {
