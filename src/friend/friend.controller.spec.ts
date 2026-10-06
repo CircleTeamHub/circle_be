@@ -115,6 +115,7 @@ describe('FriendController routes', () => {
 
   it.each([
     'aabbccdd-1122-0000-0000-123456789abc',
+    'AABBCCDD-1122-0000-0000-123456789ABC',
     'aabbccdd112200000000123456789abc',
   ])(
     'accepts persisted or legacy user ID %s on the permission route',

@@ -857,7 +857,7 @@ export class NotificationService {
         `,
       );
 
-      const ids = cursorRows.map(({ id }) => id);
+      const ids = cursorRows.slice(0, pageSize).map(({ id }) => id);
       if (ids.length === 0) {
         return { items: [], nextCursor: null };
       }

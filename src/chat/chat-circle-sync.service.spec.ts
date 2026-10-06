@@ -6,6 +6,12 @@ import { createWinstonOptions } from '../logging/winston-options';
 
 describe('ChatCircleSyncService', () => {
   const prisma = {
+    chatCircleSyncRetry: {
+      findMany: jest.fn(),
+      createMany: jest.fn(),
+      updateMany: jest.fn(),
+      deleteMany: jest.fn(),
+    },
     circle: { findUnique: jest.fn() },
     user: { findMany: jest.fn() },
     circleMember: { findMany: jest.fn() },
@@ -54,6 +60,10 @@ describe('ChatCircleSyncService', () => {
 
   beforeEach(() => {
     jest.clearAllMocks();
+    prisma.chatCircleSyncRetry.findMany.mockResolvedValue([]);
+    prisma.chatCircleSyncRetry.createMany.mockResolvedValue({ count: 1 });
+    prisma.chatCircleSyncRetry.updateMany.mockResolvedValue({ count: 1 });
+    prisma.chatCircleSyncRetry.deleteMany.mockResolvedValue({ count: 0 });
     prisma.$transaction.mockImplementation(runTx as never);
     prisma.$executeRaw.mockResolvedValue(1);
     prisma.chatMember.createMany.mockResolvedValue({ count: 0 });
@@ -792,5 +802,115 @@ describe('ChatCircleSyncService', () => {
         ]),
       );
     });
+  });
+});
+
+describe('circle sync durable scan progress', () => {
+  const retry = {
+    findMany: jest.fn(),
+    createMany: jest.fn(),
+    updateMany: jest.fn(),
+    deleteMany: jest.fn(),
+  };
+  const prisma = {
+    $queryRaw: jest.fn(),
+    $transaction: jest.fn(),
+    chatCircleSyncRetry: retry,
+  };
+  const redis = {
+    tryAcquireLease: jest.fn(),
+    releaseLease: jest.fn(),
+    getJsonMany: jest.fn(),
+    setJson: jest.fn(),
+  };
+  const make = () =>
+    new ChatCircleSyncService(
+      prisma as never,
+      {} as never,
+      {} as never,
+      {} as never,
+      redis as never,
+    );
+  beforeEach(() => {
+    jest.resetAllMocks();
+    retry.findMany.mockResolvedValue([]);
+    retry.createMany.mockResolvedValue({ count: 1 });
+    retry.updateMany.mockResolvedValue({ count: 1 });
+    retry.deleteMany.mockResolvedValue({ count: 1 });
+    prisma.$transaction.mockImplementation((work) => work(prisma));
+    redis.tryAcquireLease.mockResolvedValue(undefined);
+    redis.getJsonMany.mockResolvedValue([null]);
+    redis.setJson.mockResolvedValue(false);
+  });
+  it('retains the local window and reaches the second page after Redis recovers without a key', async () => {
+    const start = Date.parse('2026-10-06T10:00:00Z');
+    const clock = jest.spyOn(Date, 'now').mockReturnValue(start);
+    const rows = Array.from({ length: 10_000 }, (_, i) => ({
+      circleID: `c-${i}`,
+      updatedAt: new Date(start - 60_000 + i),
+    }));
+    prisma.$queryRaw
+      .mockResolvedValueOnce(rows)
+      .mockResolvedValueOnce([
+        { circleID: 'after-cap', updatedAt: new Date(start - 40_000) },
+      ]);
+    const service = make();
+    const ensure = jest
+      .spyOn(service, 'ensureCircleConversation')
+      .mockImplementation(async (id) => {
+        if (id === 'c-0') throw new Error('permanent failure');
+        return 'conv';
+      });
+    try {
+      await service.reconcileRecent();
+      expect(retry.createMany).toHaveBeenCalledWith({
+        data: [{ circleID: 'c-0' }],
+        skipDuplicates: true,
+      });
+      expect(retry.createMany.mock.invocationCallOrder[0]).toBeLessThan(
+        redis.setJson.mock.invocationCallOrder[
+          redis.setJson.mock.invocationCallOrder.length - 1
+        ],
+      );
+      clock.mockReturnValue(start + 300_000);
+      redis.setJson.mockResolvedValue(true);
+      await service.reconcileRecent();
+      expect(ensure).toHaveBeenCalledWith('after-cap');
+      const values = prisma.$queryRaw.mock.calls[1][0].values;
+      expect(values).toContainEqual(new Date(start - 120_000));
+      expect(values).toContainEqual(rows[9999].updatedAt);
+      expect(values).toContain('c-9999');
+    } finally {
+      clock.mockRestore();
+    }
+  });
+  it('retries persisted failures on another service instance', async () => {
+    retry.findMany.mockResolvedValue([{ circleID: 'persisted-failure' }]);
+    prisma.$queryRaw.mockResolvedValue([]);
+    const restarted = make();
+    const ensure = jest
+      .spyOn(restarted, 'ensureCircleConversation')
+      .mockResolvedValue('conv');
+    await restarted.reconcileRecent();
+    expect(ensure).toHaveBeenCalledWith('persisted-failure');
+    expect(retry.deleteMany).toHaveBeenCalledWith({
+      where: { circleID: { in: ['persisted-failure'] } },
+    });
+  });
+  it('does not advance the page if failed IDs cannot be durably checkpointed', async () => {
+    prisma.$queryRaw.mockResolvedValue(
+      Array.from({ length: 10_000 }, (_, i) => ({
+        circleID: 'failed',
+        updatedAt: new Date(Date.now() - 30_000 + i),
+      })),
+    );
+    retry.createMany.mockRejectedValue(new Error('database unavailable'));
+    const service = make();
+    jest
+      .spyOn(service, 'ensureCircleConversation')
+      .mockRejectedValue(new Error('failed'));
+    await service.reconcileRecent();
+    expect(redis.setJson).toHaveBeenCalledTimes(1);
+    expect(redis.setJson.mock.calls[0][1].circleID).toBe('');
   });
 });

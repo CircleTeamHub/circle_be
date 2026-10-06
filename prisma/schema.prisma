@@ -2513,3 +2513,11 @@ enum QrLoginStatus {
   APPROVED
   CONSUMED
 }
+
+// Failed membership reconciliations survive process restarts independently of the scan cursor.
+model ChatCircleSyncRetry {
+  circleID      String   @id @db.VarChar(36)
+  nextAttemptAt DateTime @default(now())
+
+  @@index([nextAttemptAt, circleID])
+}

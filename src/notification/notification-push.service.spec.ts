@@ -775,6 +775,36 @@ describe('NotificationPushService (#88 per-token delivery)', () => {
       );
     });
 
+    it('continues a backlog exceeding the bounded run and reports the cap', async () => {
+      prisma.$queryRaw.mockResolvedValue([{ acquired: true }]);
+      let remaining = 21_000;
+      prisma.devicePushToken.findMany.mockImplementation(async () =>
+        Array.from({ length: Math.min(1000, remaining) }, (_, i) => ({
+          id: `token-${i}`,
+        })),
+      );
+      prisma.devicePushToken.deleteMany.mockImplementation(
+        async ({ where }) => {
+          const count = where.AND[1].id.in.length;
+          remaining -= count;
+          return { count };
+        },
+      );
+      const warn = jest
+        .spyOn((service as any).logger, 'warn')
+        .mockImplementation(() => undefined);
+      expect((await service.deleteStaleTokens()).count).toBe(20_000);
+      expect(warn).toHaveBeenCalledWith(
+        expect.objectContaining({
+          event: 'push_stale_token_cleanup_capped',
+          nextRunInMinutes: 10,
+        }),
+      );
+      expect((await service.deleteStaleTokens()).count).toBe(1000);
+      expect(remaining).toBe(0);
+      warn.mockRestore();
+    });
+
     it('is a no-op when another instance holds the lock', async () => {
       prisma.$queryRaw.mockResolvedValue([{ acquired: false }]);
 

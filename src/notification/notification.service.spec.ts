@@ -972,7 +972,7 @@ describe('NotificationService', () => {
       expect(prisma.notification.findMany).toHaveBeenCalledWith(
         expect.objectContaining({
           where: {
-            id: { in: rows.map(({ id }) => id) },
+            id: { in: rows.slice(0, 20).map(({ id }) => id) },
             toUserID: 'user-1',
             deleted: false,
             type: { in: ['SYSTEM'] },
@@ -983,6 +983,44 @@ describe('NotificationService', () => {
       expect(result.nextCursor).toBeTruthy();
       expect(decodeNotificationCursor(result.nextCursor!)).toEqual({
         createdAt: '2026-07-02T00:00:00.000Z',
+        id: 'system-19',
+      });
+    });
+
+    it('does not emit the lookahead row when a scanned page row disappears', async () => {
+      const rows = Array.from({ length: 21 }, (_, index) => ({
+        id: `system-${index}`,
+        type: 'SYSTEM',
+        content: '',
+        read: false,
+        createdAt: new Date(Date.UTC(2026, 6, 21 - index)),
+        fromUser: null,
+        fromTrace: null,
+        fromReply: null,
+        fromCircle: null,
+        fromCirclePost: null,
+        fromInvitation: null,
+        fromFriendRequest: null,
+      }));
+      prisma.$queryRaw.mockResolvedValue(
+        rows.map(({ id, createdAt }) => ({ id, createdAt })),
+      );
+      prisma.notification.findMany.mockImplementation(async ({ where }) =>
+        rows.filter(
+          (row) => row.id !== 'system-0' && where.id.in.includes(row.id),
+        ),
+      );
+      const page = await service.getProfileNotificationsByCursor(
+        'user-1',
+        encodeNotificationCursor({
+          createdAt: '2026-08-01T00:00:00.000Z',
+          id: 'cursor',
+        }),
+      );
+      expect(page.items).toHaveLength(19);
+      expect(page.items.some((item) => item.id === 'system-20')).toBe(false);
+      expect(decodeNotificationCursor(page.nextCursor!)).toEqual({
+        createdAt: rows[19].createdAt.toISOString(),
         id: 'system-19',
       });
     });

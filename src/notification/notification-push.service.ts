@@ -570,7 +570,7 @@ export class NotificationPushService {
     });
   }
 
-  @TrackedCron(CronExpression.EVERY_DAY_AT_4AM, 'push_stale_token_cleanup')
+  @TrackedCron(CronExpression.EVERY_10_MINUTES, 'push_stale_token_cleanup')
   async deleteStaleTokens(): Promise<{ count: number }> {
     const activeCutoff = new Date(Date.now() - ACTIVE_TOKEN_MAX_AGE_MS);
     const disabledCutoff = new Date(Date.now() - DISABLED_TOKEN_MAX_AGE_MS);
@@ -627,6 +627,13 @@ export class NotificationPushService {
       if (!result.acquired || result.selected === 0) break;
       count += result.deleted;
       if (result.selected < STALE_TOKEN_BATCH_SIZE) break;
+      if (batch === STALE_TOKEN_MAX_BATCHES_PER_RUN - 1) {
+        this.logger.warn({
+          event: 'push_stale_token_cleanup_capped',
+          count,
+          nextRunInMinutes: 10,
+        });
+      }
     }
 
     return { count };

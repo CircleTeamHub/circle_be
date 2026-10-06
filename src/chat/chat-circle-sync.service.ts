@@ -81,8 +81,8 @@ export class ChatCircleSyncService {
   private static readonly RECONCILE_LEASE_MS = 50_000;
 
   /**
-   * 上轮失败、需要继续重试的圈子。进程内保存:重启会丢,但重启后任一成员
-   * 变更都会把它重新带回扫描窗口,而窗口本身是从数据推导的。
+   * 即时同步失败先放进内存队列；租约持有者把对账失败持久化到重试表。
+   * 扫描游标与失败队列独立，单圈故障不会阻塞后续页面。
    */
   private readonly retryQueue = new Set<string>();
   /** Redis 不可用时的单实例兜底；Redis 可用时以共享游标为准。 */
@@ -141,8 +141,22 @@ export class ChatCircleSyncService {
           reportHandledJobFailure();
           return;
         }
-        if (await this.reconcileCircles(scan.circleIds)) {
+        // Checkpoint failures in PostgreSQL before advancing the scan. A
+        // permanently failing circle must not strand later membership pages.
+        try {
+          await this.reconcileCircles(scan.circleIds, true);
           await this.writeScanCursor(scan.nextCursor);
+        } catch (error) {
+          reportHandledJobFailure();
+          attemptDiagnostic(() =>
+            this.logger.error(
+              sanitizeLogValue({
+                event: 'chat_circle_sync_failed',
+                operation: 'reconcile_checkpoint',
+                error,
+              }),
+            ),
+          );
         }
       },
     );
@@ -156,17 +170,35 @@ export class ChatCircleSyncService {
     await this.reconcileCircles([]);
   }
 
-  private async reconcileCircles(changed: string[]): Promise<boolean> {
+  private async reconcileCircles(
+    changed: string[],
+    includeDurable = false,
+  ): Promise<void> {
+    const durable = includeDurable
+      ? await this.prisma.chatCircleSyncRetry.findMany({
+          where: { nextAttemptAt: { lte: new Date() } },
+          select: { circleID: true },
+          orderBy: [{ nextAttemptAt: 'asc' }, { circleID: 'asc' }],
+          take: ChatCircleSyncService.RETRY_QUEUE_MAX,
+        })
+      : [];
     // 上轮失败的圈子跟着重试:只靠窗口重叠的话,连续失败超过 2 分钟就永远
     // 掉出扫描范围,被踢成员的座位会一直留着(还能读能发)。
     const pending = [...this.retryQueue];
     this.retryQueue.clear();
-    let succeeded = true;
-    for (const circleID of new Set([...changed, ...pending])) {
+    const failed: string[] = [];
+    const attempted = [
+      ...new Set([
+        ...changed,
+        ...pending,
+        ...durable.map((row) => row.circleID),
+      ]),
+    ];
+    for (const circleID of attempted) {
       try {
         await this.ensureCircleConversation(circleID);
       } catch (error) {
-        succeeded = false;
+        failed.push(circleID);
         // 单圈失败不拖垮整轮;排进重试队列,直到成功为止。
         if (this.retryQueue.size < ChatCircleSyncService.RETRY_QUEUE_MAX) {
           this.retryQueue.add(circleID);
@@ -183,7 +215,27 @@ export class ChatCircleSyncService {
         );
       }
     }
-    return succeeded;
+    if (failed.length > 0) reportHandledJobFailure();
+    if (includeDurable && attempted.length > 0) {
+      const failedSet = new Set(failed);
+      await this.prisma.$transaction(async (tx) => {
+        if (failed.length > 0) {
+          await tx.chatCircleSyncRetry.createMany({
+            data: failed.map((circleID) => ({ circleID })),
+            skipDuplicates: true,
+          });
+          await tx.chatCircleSyncRetry.updateMany({
+            where: { circleID: { in: failed } },
+            data: { nextAttemptAt: new Date(Date.now() + 60_000) },
+          });
+        }
+        const succeeded = attempted.filter((id) => !failedSet.has(id));
+        if (succeeded.length > 0)
+          await tx.chatCircleSyncRetry.deleteMany({
+            where: { circleID: { in: succeeded } },
+          });
+      });
+    }
   }
 
   /**
@@ -254,7 +306,9 @@ export class ChatCircleSyncService {
       [ChatCircleSyncService.RECONCILE_CURSOR_KEY],
       { strict: true },
     );
-    const candidate = shared === null ? this.scanCursor : shared[0];
+    // A missing Redis key after an outage must not erase the in-process
+    // checkpoint whose writes could not be persisted during that outage.
+    const candidate = shared?.[0] ?? this.scanCursor;
     if (
       !candidate ||
       typeof candidate.windowSince !== 'string' ||
