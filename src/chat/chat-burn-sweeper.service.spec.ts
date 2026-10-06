@@ -19,9 +19,11 @@ describe('ChatBurnSweeperService', () => {
   // 默认:没配 Redis(单实例)—— 租约拿不到协调、照常跑,游标只在内存里。
   const redis = {
     tryAcquireLease: jest.fn(),
+    renewLease: jest.fn(),
     releaseLease: jest.fn(),
     getJsonMany: jest.fn(),
     setJson: jest.fn(),
+    setJsonIfVersionMatches: jest.fn(),
   };
   const service = new ChatBurnSweeperService(
     prisma as never,
@@ -47,9 +49,11 @@ describe('ChatBurnSweeperService', () => {
     );
     prisma.$queryRaw.mockResolvedValue([{ id: 'locked' }]);
     redis.tryAcquireLease.mockResolvedValue(undefined);
+    redis.renewLease.mockResolvedValue(true);
     redis.releaseLease.mockResolvedValue(undefined);
     redis.getJsonMany.mockResolvedValue(null);
     redis.setJson.mockResolvedValue(false);
+    redis.setJsonIfVersionMatches.mockResolvedValue(true);
     // 每批删除前都重读当前策略(防「扫描中途策略被改长/关掉」)。
     prisma.chatConversation.findUnique.mockImplementation(
       ({ where }: { where: { id: string } }) =>
@@ -165,11 +169,103 @@ describe('ChatBurnSweeperService', () => {
         }),
       );
       // 这一轮没扫满,下一轮从头开始。
-      expect(redis.setJson).toHaveBeenCalledWith(
+      expect(redis.setJsonIfVersionMatches).toHaveBeenCalledWith(
         'job-cursor:chat_burn_sweeper',
+        'job-lease:chat_burn_sweeper',
+        'lease-token',
         null,
         expect.any(Number),
       );
+    });
+
+    it('stops a pending deletion and leaves its cursor replayable when renewal fails', async () => {
+      jest.useFakeTimers();
+      redis.tryAcquireLease.mockResolvedValue('owner');
+      redis.renewLease.mockResolvedValue(false);
+      prisma.chatConversation.findMany.mockResolvedValue([
+        { id: 'conv-loss', burnDurationSec: 60 },
+      ]);
+      conversationPolicies.set('conv-loss', { burnDurationSec: 60 });
+      let finish!: (rows: unknown[]) => void;
+      let notifyStarted!: () => void;
+      const started = new Promise<void>((resolve) => {
+        notifyStarted = resolve;
+      });
+      prisma.chatMessage.findMany.mockImplementation(() => {
+        notifyStarted();
+        return new Promise((resolve) => {
+          finish = resolve;
+        });
+      });
+      const round = service.sweep();
+      try {
+        await started;
+        await jest.advanceTimersByTimeAsync(41_000);
+        finish([{ id: 'm1', type: 'text', content: {} }]);
+        await round;
+        expect(prisma.$transaction).not.toHaveBeenCalled();
+        expect(prisma.chatMessage.updateManyAndReturn).not.toHaveBeenCalled();
+        expect(redis.setJsonIfVersionMatches).not.toHaveBeenCalled();
+      } finally {
+        finish([]);
+        await round;
+        jest.useRealTimers();
+      }
+    });
+
+    it('keeps its local cursor when the atomic shared checkpoint rejects its token', async () => {
+      redis.tryAcquireLease.mockResolvedValue('owner');
+      redis.getJsonMany.mockResolvedValue(['conv-100']);
+      redis.setJsonIfVersionMatches.mockResolvedValue(false);
+      prisma.chatConversation.findMany.mockResolvedValue([]);
+      const fresh = new ChatBurnSweeperService(
+        prisma as never,
+        media as never,
+        broadcast as never,
+        redis as never,
+      );
+      await fresh.sweep();
+      expect((fresh as any).cursor).toBe('conv-100');
+      expect(redis.setJson).not.toHaveBeenCalled();
+    });
+
+    it('does not tombstone or delete media after losing the lease while waiting for a row lock', async () => {
+      jest.useFakeTimers();
+      redis.tryAcquireLease.mockResolvedValue('owner');
+      redis.renewLease.mockResolvedValue(false);
+      prisma.chatConversation.findMany.mockResolvedValue([
+        { id: 'conv-lock', burnDurationSec: 60 },
+      ]);
+      conversationPolicies.set('conv-lock', { burnDurationSec: 60 });
+      prisma.chatMessage.findMany.mockResolvedValue([
+        { id: 'm1', type: 'image', content: { key: 'chat/u1/photo.jpg' } },
+      ]);
+      let finish!: (rows: unknown[]) => void;
+      let notifyStarted!: () => void;
+      const started = new Promise<void>((resolve) => {
+        notifyStarted = resolve;
+      });
+      prisma.$queryRaw.mockImplementationOnce(() => {
+        notifyStarted();
+        return new Promise((resolve) => {
+          finish = resolve;
+        });
+      });
+      const round = service.sweep();
+      try {
+        await started;
+        await jest.advanceTimersByTimeAsync(41_000);
+        finish([{ id: 'conv-lock' }]);
+        await round;
+        expect(prisma.chatMessage.updateManyAndReturn).not.toHaveBeenCalled();
+        expect(media.queueDeletions).not.toHaveBeenCalled();
+        expect(media.deleteObjects).not.toHaveBeenCalled();
+        expect(redis.setJsonIfVersionMatches).not.toHaveBeenCalled();
+      } finally {
+        finish([]);
+        await round;
+        jest.useRealTimers();
+      }
     });
 
     // 租约过期后两个实例可能同时扫到同一批:已经烧掉的行不能再改一遍、再播一遍。

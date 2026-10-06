@@ -1938,6 +1938,8 @@ model CirclePost {
   @@index([city, createdAt(sort: Desc)])
   @@index([cities], type: Gin)
   @@index([status, expiresAt])
+  // Admin search includes DELETED posts when status is omitted.
+  @@index([content(ops: raw("gin_trgm_ops"))], type: Gin, map: "CirclePost_content_admin_trgm_idx")
   // Plaza feed keyset: status='ACTIVE' equality + ORDER BY (createdAt DESC, id
   // DESC) is served as a pure index scan (no heapsort). Status-aware, so it
   // stays efficient as ENDED/DELETED posts accumulate. Verified ~135x faster

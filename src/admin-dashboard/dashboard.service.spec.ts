@@ -16,6 +16,7 @@ describe('DashboardService', () => {
 
   beforeEach(() => {
     jest.clearAllMocks();
+    jest.spyOn(Date, 'now').mockReturnValue(now.getTime());
     service = new DashboardService(
       users as never,
       community as never,
@@ -24,6 +25,36 @@ describe('DashboardService', () => {
       system as never,
       redis as never,
     );
+  });
+  afterEach(() => jest.restoreAllMocks());
+
+  it('does not extend a shared cache hit beyond its generation TTL', async () => {
+    const generated = now.getTime();
+    const cached = {
+      range: DashboardRange.Today,
+      generatedAt: now.toISOString(),
+      sections: {},
+    };
+    redis.getJson.mockResolvedValueOnce(cached).mockResolvedValue(null);
+    users.getMetrics.mockResolvedValue({ totalUsers: 99 });
+    community.getMetrics.mockResolvedValue({});
+    commerce.getMetrics.mockResolvedValue({});
+    moderation.getMetrics.mockResolvedValue({});
+    system.getMetrics.mockResolvedValue({});
+    jest.mocked(Date.now).mockReturnValue(generated + 44_000);
+    await expect(service.getDashboard(DashboardRange.Today)).resolves.toEqual(
+      cached,
+    );
+    jest.mocked(Date.now).mockReturnValue(generated + 46_000);
+    const result = await service.getDashboard(
+      DashboardRange.Today,
+      new Date(generated + 46_000),
+    );
+    expect(result.sections.users).toEqual({
+      status: 'ok',
+      data: { totalUsers: 99 },
+    });
+    expect(users.getMetrics).toHaveBeenCalledTimes(1);
   });
 
   it('returns a cached dashboard without running section queries', async () => {

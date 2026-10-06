@@ -65,8 +65,7 @@ export class DashboardService {
         `Dashboard cache read failed: ${this.errorMessage(error)}`,
       );
     }
-    if (cached) {
-      this.remember(cacheKey, cached);
+    if (cached && this.remember(cacheKey, cached)) {
       return cached;
     }
 
@@ -130,13 +129,20 @@ export class DashboardService {
         system: this.section(results[4]),
       },
     };
-    if (results.every((result) => result.status === 'fulfilled')) {
-      this.remember(cacheKey, response);
+    if (
+      results.every((result) => result.status === 'fulfilled') &&
+      this.remember(cacheKey, response)
+    ) {
       try {
         await this.redis.setJson(
           cacheKey,
           response,
-          DASHBOARD_CACHE_TTL_SECONDS,
+          Math.ceil(
+            (Date.parse(response.generatedAt) +
+              DASHBOARD_CACHE_TTL_MS -
+              Date.now()) /
+              1000,
+          ),
         );
       } catch (error) {
         this.logger.warn(
@@ -147,11 +153,20 @@ export class DashboardService {
     return response;
   }
 
-  private remember(cacheKey: string, value: DashboardResponse): void {
+  private remember(cacheKey: string, value: DashboardResponse): boolean {
+    const generatedAt = Date.parse(value.generatedAt);
+    const expiresAt = generatedAt + DASHBOARD_CACHE_TTL_MS;
+    if (
+      !Number.isFinite(generatedAt) ||
+      generatedAt > Date.now() ||
+      expiresAt <= Date.now()
+    )
+      return false;
     this.memoryCache.set(cacheKey, {
       value,
-      expiresAt: Date.now() + DASHBOARD_CACHE_TTL_MS,
+      expiresAt,
     });
+    return true;
   }
 
   private section<T>(result: PromiseSettledResult<T>): SectionResult<T> {

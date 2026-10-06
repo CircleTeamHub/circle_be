@@ -487,6 +487,43 @@ export class RedisService implements OnModuleInit, OnModuleDestroy {
   }
 
   /**
+   * Extend only the lease identified by this token. Failure never grants the
+   * caller an uncoordinated fallback: it must stop starting new work.
+   */
+  async renewLease(
+    key: string,
+    token: string,
+    ttlMs: number,
+  ): Promise<boolean> {
+    const client = await this.getCommandClient();
+    if (!client) {
+      this.recordUnavailable('lease');
+      return false;
+    }
+    try {
+      const result = await client.eval(
+        [
+          "if redis.call('GET', KEYS[1]) == ARGV[1] then",
+          "  return redis.call('PEXPIRE', KEYS[1], ARGV[2])",
+          'end',
+          'return 0',
+        ].join('\n'),
+        1,
+        key,
+        token,
+        String(ttlMs),
+      );
+      return Number(result) === 1;
+    } catch (error) {
+      this.recordCommandFailure('lease', error);
+      this.logger.warn(
+        `Redis lease renewal failed for ${key}: ${this.formatError(error)}`,
+      );
+      return false;
+    }
+  }
+
+  /**
    * 释放自己持有的租约:比对 token 再删。过期后被别的实例拿走的租约不会被晚回来的
    * 原持有者误删。尽力而为,失败只等它自然过期。
    */

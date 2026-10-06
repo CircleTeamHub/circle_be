@@ -755,6 +755,32 @@ describe('NotificationPushService (#88 per-token delivery)', () => {
   });
 
   describe('deleteStaleTokens', () => {
+    it('skips an overlapping local sweep while the current batch holds its database lock', async () => {
+      prisma.$queryRaw.mockResolvedValue([{ acquired: true }]);
+      let finish!: (rows: unknown[]) => void;
+      let notifyStarted!: () => void;
+      const started = new Promise<void>((resolve) => {
+        notifyStarted = resolve;
+      });
+      prisma.devicePushToken.findMany.mockImplementationOnce(() => {
+        notifyStarted();
+        return new Promise((resolve) => {
+          finish = resolve;
+        });
+      });
+      const first = service.deleteStaleTokens();
+      try {
+        await started;
+        expect(await service.deleteStaleTokens()).toEqual({ count: 0 });
+        expect(prisma.$transaction).toHaveBeenCalledTimes(1);
+      } finally {
+        finish([]);
+        await first;
+      }
+      await service.deleteStaleTokens();
+      expect(prisma.$transaction).toHaveBeenCalledTimes(2);
+    });
+
     it('prunes aged tokens under an advisory lock', async () => {
       prisma.$queryRaw.mockResolvedValue([{ acquired: true }]);
       prisma.devicePushToken.findMany.mockResolvedValueOnce([

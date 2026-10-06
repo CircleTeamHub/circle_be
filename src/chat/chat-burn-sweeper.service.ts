@@ -6,7 +6,7 @@ import {
   TrackedCron,
 } from '../metrics/tracked-cron.decorator';
 import { PrismaService } from 'src/prisma/prisma.service';
-import { runWithJobLease } from 'src/redis/job-lease';
+import { JobLeaseContext, runWithJobLease } from 'src/redis/job-lease';
 import { RedisService } from 'src/redis/redis.service';
 import { ChatBroadcastService } from './chat-broadcast.service';
 import { ChatMediaService } from './chat-media.service';
@@ -33,8 +33,8 @@ const SWEEP_BATCHES_MAX = 4;
  */
 const SWEEP_CONVERSATIONS_MAX = 200;
 /**
- * 多实例时只让一个实例扫。持有者崩溃后别的实例最多等这么久;扫得比它久时可能与
- * 下一个实例短暂重叠 —— 墓碑更新带 deleted=false,重叠不会重复改、重复播。
+ * 多实例时只让一个实例扫,运行中续租。持有者崩溃后别的实例最多等这么久;
+ * 失锁后的在途批次仍用 deleted=false 避免重复改、重复播。
  */
 const SWEEP_LEASE_MS = 2 * 60_000;
 const SWEEP_JOB = 'chat_burn_sweeper';
@@ -73,7 +73,7 @@ export class ChatBurnSweeperService {
         this.redis,
         SWEEP_JOB,
         SWEEP_LEASE_MS,
-        () => this.sweepOnce(),
+        (leaseToken, lease) => this.sweepOnce(leaseToken, lease),
       );
       // 别的实例正在扫。
       if (!ran) reportJobSkipped();
@@ -82,7 +82,10 @@ export class ChatBurnSweeperService {
     }
   }
 
-  private async sweepOnce(): Promise<void> {
+  private async sweepOnce(
+    leaseToken: string | undefined,
+    lease: JobLeaseContext,
+  ): Promise<void> {
     try {
       const cursor = await this.readCursor();
       const burning = await this.prisma.chatConversation.findMany({
@@ -94,16 +97,25 @@ export class ChatBurnSweeperService {
         orderBy: { id: 'asc' },
         take: SWEEP_CONVERSATIONS_MAX,
       });
-      await this.writeCursor(
-        burning.length === SWEEP_CONVERSATIONS_MAX
-          ? burning[burning.length - 1].id
-          : null,
-      );
       for (const conversation of burning) {
+        if (!lease.isCurrent()) {
+          reportJobSkipped();
+          return;
+        }
         const seconds = conversation.burnDurationSec;
         if (!seconds || seconds <= 0) continue;
-        await this.sweepConversation(conversation.id, seconds);
+        await this.sweepConversation(conversation.id, seconds, lease);
       }
+      if (
+        !lease.isCurrent() ||
+        !(await this.writeCursor(
+          burning.length === SWEEP_CONVERSATIONS_MAX
+            ? burning[burning.length - 1].id
+            : null,
+          leaseToken,
+        ))
+      )
+        reportJobSkipped();
     } catch (error) {
       this.logger.error(
         `burn sweep failed: ${error instanceof Error ? error.message : String(error)}`,
@@ -118,19 +130,36 @@ export class ChatBurnSweeperService {
       strict: true,
     });
     if (shared === null) return this.cursor;
-    return typeof shared[0] === 'string' ? shared[0] : null;
+    this.cursor = typeof shared[0] === 'string' ? shared[0] : null;
+    return this.cursor;
   }
 
-  private async writeCursor(next: string | null): Promise<void> {
+  private async writeCursor(
+    next: string | null,
+    leaseToken?: string,
+  ): Promise<boolean> {
+    if (
+      leaseToken !== undefined &&
+      !(await this.redis.setJsonIfVersionMatches(
+        SWEEP_CURSOR_KEY,
+        `job-lease:${SWEEP_JOB}`,
+        leaseToken,
+        next,
+        SWEEP_CURSOR_TTL_SECONDS,
+      ))
+    )
+      return false;
     this.cursor = next;
-    await this.redis.setJson(SWEEP_CURSOR_KEY, next, SWEEP_CURSOR_TTL_SECONDS);
+    return true;
   }
 
   private async sweepConversation(
     conversationId: string,
     seconds: number,
+    lease: JobLeaseContext,
   ): Promise<void> {
     for (let round = 0; round < SWEEP_BATCHES_MAX; round += 1) {
+      if (!lease.isCurrent()) return;
       // 每一批都重读当前策略,而不是复用进入本轮时的那份。批与批之间可能过了
       // 好几秒,期间 POST /burn 完全可能把时长改长或关掉 —— 拿旧 cutoff 接着删,
       // 删掉的就是用户刚刚决定要留下的消息,而且不可逆。
@@ -174,12 +203,15 @@ export class ChatBurnSweeperService {
       const ownedMediaKeys = allMediaKeys.filter(
         (key) => !key.includes(`/${CHAT_NOTE_IMPORT_SEGMENT}`),
       );
+      if (!lease.isCurrent()) return;
       const burned = await this.prisma.$transaction(async (tx) => {
         // 会话行锁先拿:消息行上的触发器要更新会话计数器。先锁一批消息行再等会话行,
         // 与「先锁会话行再改消息」的编辑/回应并发就会交叉死锁。
         await tx.$queryRaw`
           SELECT "id" FROM "ChatConversation"
           WHERE "id" = ${conversationId} FOR UPDATE`;
+        // Acquiring this database lock can outlast a failed renewal.
+        if (!lease.isCurrent()) return null;
         // RETURNING 带回触发器刚分配的 revision,随焚毁通知下发。
         const tombstones = await tx.chatMessage.updateManyAndReturn({
           // deleted=false:租约过期后两个实例可能扫到同一批,已经烧掉的行不能再改
@@ -203,6 +235,7 @@ export class ChatBurnSweeperService {
         );
         return tombstones;
       });
+      if (burned === null) return;
       // 墓碑已提交才通知:事务回滚了却已经播出去,对端会删掉服务端其实还留着的消息。
       await this.announceBurned(conversationId, burned);
       if (ownedMediaKeys.length > 0) {

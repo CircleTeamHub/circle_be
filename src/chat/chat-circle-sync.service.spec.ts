@@ -45,6 +45,7 @@ describe('ChatCircleSyncService', () => {
   // 默认:没配 Redis(单实例),租约协调不可用 → 照常跑。
   const redis = {
     tryAcquireLease: jest.fn(),
+    renewLease: jest.fn(),
     releaseLease: jest.fn(),
     getJsonMany: jest.fn(),
     setJson: jest.fn(),
@@ -76,6 +77,7 @@ describe('ChatCircleSyncService', () => {
     prisma.user.findMany.mockResolvedValue([]);
     prisma.$queryRaw.mockResolvedValue([]);
     redis.tryAcquireLease.mockResolvedValue(undefined);
+    redis.renewLease.mockResolvedValue(true);
     redis.releaseLease.mockResolvedValue(undefined);
     redis.getJsonMany.mockResolvedValue(null);
     redis.setJson.mockResolvedValue(false);
@@ -827,6 +829,7 @@ describe('circle sync durable scan progress', () => {
   };
   const redis = {
     tryAcquireLease: jest.fn(),
+    renewLease: jest.fn(),
     releaseLease: jest.fn(),
     getJsonMany: jest.fn(),
     setJson: jest.fn(),
@@ -848,9 +851,115 @@ describe('circle sync durable scan progress', () => {
     retry.deleteMany.mockResolvedValue({ count: 1 });
     prisma.$transaction.mockImplementation((work) => work(prisma));
     redis.tryAcquireLease.mockResolvedValue(undefined);
+    redis.renewLease.mockResolvedValue(true);
     redis.getJsonMany.mockResolvedValue([null]);
     redis.setJson.mockResolvedValue(false);
     redis.setJsonIfVersionMatches.mockResolvedValue(true);
+  });
+  it('renews a scan lasting beyond 50 seconds and continues with its next page', async () => {
+    jest.useFakeTimers();
+    const start = Date.parse('2026-10-06T10:00:00Z');
+    jest.setSystemTime(start);
+    let checkpoint: unknown = null;
+    redis.tryAcquireLease.mockResolvedValue('owner');
+    redis.getJsonMany.mockImplementation(async () => [checkpoint]);
+    redis.setJsonIfVersionMatches.mockImplementation(
+      async (_key, _leaseKey, _owner, value) => {
+        checkpoint = value;
+        return true;
+      },
+    );
+    const rows = Array.from({ length: 10_000 }, (_, i) => ({
+      circleID: `c-${i}`,
+      updatedAt: new Date(start - 60_000 + i),
+    }));
+    prisma.$queryRaw
+      .mockResolvedValueOnce(rows)
+      .mockResolvedValueOnce([
+        { circleID: 'second-page', updatedAt: new Date(start - 40_000) },
+      ]);
+    let finish!: () => void;
+    let notifyStarted!: () => void;
+    const held = new Promise<void>((resolve) => {
+      finish = resolve;
+    });
+    const started = new Promise<void>((resolve) => {
+      notifyStarted = resolve;
+    });
+    const service = make();
+    const ensure = jest
+      .spyOn(service, 'ensureCircleConversation')
+      .mockImplementation(async (id) => {
+        if (id === 'c-0') {
+          notifyStarted();
+          await held;
+        }
+        return 'conv';
+      });
+    const round = service.reconcileRecent();
+    try {
+      await started;
+      await jest.advanceTimersByTimeAsync(60_000);
+      expect(redis.renewLease).toHaveBeenCalledWith(
+        'job-lease:chat_circle_sync',
+        'owner',
+        50_000,
+      );
+      finish();
+      await round;
+      expect(checkpoint).toEqual(
+        expect.objectContaining({ circleID: 'c-9999' }),
+      );
+      await service.reconcileRecent();
+      expect(ensure).toHaveBeenCalledWith('second-page');
+      expect(prisma.$queryRaw.mock.calls[1][0].values).toContain('c-9999');
+      expect(checkpoint).toBeNull();
+    } finally {
+      finish();
+      await round;
+      jest.useRealTimers();
+    }
+  });
+
+  it('stops subsequent circle work and keeps the replay window after renewal loses ownership', async () => {
+    jest.useFakeTimers();
+    redis.tryAcquireLease.mockResolvedValue('owner');
+    redis.renewLease.mockResolvedValue(false);
+    prisma.$queryRaw.mockResolvedValue([
+      { circleID: 'first', updatedAt: new Date(Date.now() - 30_000) },
+      { circleID: 'second', updatedAt: new Date(Date.now() - 20_000) },
+    ]);
+    let finish!: () => void;
+    let notifyStarted!: () => void;
+    const held = new Promise<void>((resolve) => {
+      finish = resolve;
+    });
+    const started = new Promise<void>((resolve) => {
+      notifyStarted = resolve;
+    });
+    const service = make();
+    const ensure = jest
+      .spyOn(service, 'ensureCircleConversation')
+      .mockImplementation(async () => {
+        notifyStarted();
+        await held;
+        return 'conv';
+      });
+    const round = service.reconcileRecent();
+    try {
+      await started;
+      await jest.advanceTimersByTimeAsync(17_000);
+      finish();
+      await round;
+      expect(ensure).toHaveBeenCalledTimes(1);
+      expect(retry.deleteMany).not.toHaveBeenCalled();
+      expect(redis.setJsonIfVersionMatches).toHaveBeenCalledTimes(1);
+      expect((service as any).scanCursor.circleID).toBe('');
+    } finally {
+      finish();
+      await round;
+      jest.useRealTimers();
+    }
   });
   it('retains the local window and reaches the second page after Redis recovers without a key', async () => {
     const start = Date.parse('2026-10-06T10:00:00Z');

@@ -2,9 +2,8 @@
 
 /**
  * Seed a disposable, tagged notification slice and measure the database hot
- * paths reviewed in this branch. The tagged rows are always removed in the
- * finally block, so the script is safe to rerun against the local development
- * database.
+ * paths reviewed in this branch. The finally block attempts to remove tagged
+ * rows and reports their marker if cleanup fails. Use an isolated database.
  *
  * Run explicitly with:
  *   PERF_DB_REVIEW=1 npm run perf:db-review
@@ -21,7 +20,7 @@ import path from 'node:path';
 
 const DEFAULT_ROWS = 25_000;
 const PAGE_SIZE = 20;
-const SAMPLE_REPETITIONS = 5;
+const SAMPLE_REPETITIONS = 100;
 
 function isTruthy(value) {
   return /^(1|true|yes)$/i.test(String(value ?? ''));
@@ -89,11 +88,18 @@ function parseRows(value) {
   return rows;
 }
 
-function percentile(values, p) {
+export function percentile(values, p) {
+  if (
+    !values.length ||
+    values.some((value) => !Number.isFinite(value)) ||
+    p <= 0 ||
+    p > 1
+  )
+    throw new Error('Percentiles require finite samples and 0 < p <= 1');
   const sorted = [...values].sort((a, b) => a - b);
-  return sorted[
-    Math.min(sorted.length - 1, Math.floor((sorted.length - 1) * p))
-  ];
+  // Nearest-rank percentile: with five observations p95 includes the maximum
+  // rather than silently dropping the tail. Normal runs collect 100 samples.
+  return sorted[Math.ceil(sorted.length * p) - 1];
 }
 
 async function timedQuery(
@@ -114,12 +120,30 @@ async function timedQuery(
   }
   return {
     repetitions,
+    percentileMethod: 'nearest-rank',
     rowCount,
     minMs: Number(Math.min(...durations).toFixed(3)),
     p50Ms: Number(percentile(durations, 0.5).toFixed(3)),
     p95Ms: Number(percentile(durations, 0.95).toFixed(3)),
     maxMs: Number(Math.max(...durations).toFixed(3)),
   };
+}
+
+export async function cleanupReview(client, idPrefix) {
+  try {
+    await client.query('DELETE FROM "Notification" WHERE "id" LIKE $1', [
+      `${idPrefix}%`,
+    ]);
+  } catch (error) {
+    // This marker is synthetic and remains usable for manual cleanup even if
+    // closing the connection also fails. Never print the connection URL.
+    console.error(
+      JSON.stringify({ event: 'perf_db_review_cleanup_failed', idPrefix }),
+    );
+    throw error;
+  } finally {
+    await client.end();
+  }
 }
 
 async function explain(client, text, values) {
@@ -272,10 +296,7 @@ async function main() {
       ),
     );
   } finally {
-    await client.query('DELETE FROM "Notification" WHERE "id" LIKE $1', [
-      `${idPrefix}%`,
-    ]);
-    await client.end();
+    await cleanupReview(client, idPrefix);
   }
 }
 

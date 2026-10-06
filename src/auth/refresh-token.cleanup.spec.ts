@@ -6,11 +6,66 @@ describe('RefreshTokenCleanup', () => {
   const deleteMany = jest.fn();
   const findMany = jest.fn();
   const prisma = { refreshToken: { findMany, deleteMany } } as never;
-  const cleanup = new RefreshTokenCleanup(prisma);
+  const redis = {
+    tryAcquireLease: jest.fn(),
+    renewLease: jest.fn(),
+    releaseLease: jest.fn(),
+  };
+  const cleanup = new RefreshTokenCleanup(prisma, redis as never);
 
   beforeEach(() => {
     jest.clearAllMocks();
     findMany.mockResolvedValue([]);
+    redis.tryAcquireLease.mockResolvedValue(undefined);
+    redis.renewLease.mockResolvedValue(true);
+  });
+
+  it('allows only one replica to scan and skips local overlap', async () => {
+    let finish!: (value: unknown[]) => void;
+    findMany.mockImplementationOnce(
+      () =>
+        new Promise((resolve) => {
+          finish = resolve;
+        }),
+    );
+    redis.tryAcquireLease
+      .mockResolvedValueOnce('owner')
+      .mockResolvedValueOnce(null);
+    const first = cleanup.sweep();
+    await Promise.resolve();
+    await cleanup.sweep();
+    const second = new RefreshTokenCleanup(prisma, redis as never);
+    await second.sweep();
+    expect(findMany).toHaveBeenCalledTimes(1);
+    finish([]);
+    await first;
+    expect(redis.releaseLease).toHaveBeenCalledWith(
+      'job-lease:refresh_token_cleanup',
+      'owner',
+    );
+  });
+
+  it('does not delete selected tokens after renewal loses ownership', async () => {
+    jest.useFakeTimers();
+    redis.tryAcquireLease.mockResolvedValue('owner');
+    redis.renewLease.mockResolvedValue(false);
+    let finish!: (value: unknown[]) => void;
+    findMany.mockImplementationOnce(
+      () =>
+        new Promise((resolve) => {
+          finish = resolve;
+        }),
+    );
+    const running = cleanup.sweep();
+    try {
+      await jest.advanceTimersByTimeAsync(21_000);
+      finish([{ id: 'old' }]);
+      await running;
+      expect(deleteMany).not.toHaveBeenCalled();
+    } finally {
+      await running;
+      jest.useRealTimers();
+    }
   });
 
   it('deletes expired tokens and tokens revoked past the retention window', async () => {

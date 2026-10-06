@@ -7,7 +7,7 @@ import {
 } from '../metrics/tracked-cron.decorator';
 import { Prisma } from 'src/generated/prisma';
 import { PrismaService } from 'src/prisma/prisma.service';
-import { runWithJobLease } from 'src/redis/job-lease';
+import { JobLeaseContext, runWithJobLease } from 'src/redis/job-lease';
 import { RedisService } from 'src/redis/redis.service';
 import { ChatBroadcastService } from './chat-broadcast.service';
 import { ChatGroupEventService } from './chat-group-event.service';
@@ -120,7 +120,7 @@ export class ChatCircleSyncService {
       this.redis,
       'chat_circle_sync',
       ChatCircleSyncService.RECONCILE_LEASE_MS,
-      async (leaseToken) => {
+      async (leaseToken, lease) => {
         let scan: {
           circleIds: string[];
           nextCursor: CircleSyncScanCursor | null;
@@ -149,7 +149,10 @@ export class ChatCircleSyncService {
         // Checkpoint failures in PostgreSQL before advancing the scan. A
         // permanently failing circle must not strand later membership pages.
         try {
-          await this.reconcileCircles(scan.circleIds, true);
+          if (!(await this.reconcileCircles(scan.circleIds, true, lease))) {
+            reportJobSkipped();
+            return;
+          }
           if (!(await this.writeScanCursor(scan.nextCursor, leaseToken)))
             reportJobSkipped();
         } catch (error) {
@@ -179,7 +182,9 @@ export class ChatCircleSyncService {
   private async reconcileCircles(
     changed: string[],
     includeDurable = false,
-  ): Promise<void> {
+    lease?: JobLeaseContext,
+  ): Promise<boolean> {
+    if (lease && !lease.isCurrent()) return false;
     const attemptStartedAt = new Date();
     const durable = includeDurable
       ? await this.prisma.chatCircleSyncRetry.findMany({
@@ -201,7 +206,18 @@ export class ChatCircleSyncService {
         ...durable.map((row) => row.circleID),
       ]),
     ];
+    let completed = true;
     for (const circleID of attempted) {
+      if (lease && !lease.isCurrent()) {
+        completed = false;
+        // Local retries outside the scan window must not disappear when a
+        // lease is lost before their turn. Durable rows remain in PostgreSQL.
+        for (const pendingID of pending) {
+          if (this.retryQueue.size < ChatCircleSyncService.RETRY_QUEUE_MAX)
+            this.retryQueue.add(pendingID);
+        }
+        break;
+      }
       try {
         await this.ensureCircleConversation(circleID);
       } catch (error) {
@@ -223,6 +239,7 @@ export class ChatCircleSyncService {
       }
     }
     if (failed.length > 0) reportHandledJobFailure();
+    if (lease && !lease.isCurrent()) completed = false;
     if (includeDurable && attempted.length > 0) {
       const failedSet = new Set(failed);
       await this.prisma.$transaction(async (tx) => {
@@ -237,7 +254,7 @@ export class ChatCircleSyncService {
           });
         }
         const succeeded = attempted.filter((id) => !failedSet.has(id));
-        if (succeeded.length > 0)
+        if (completed && succeeded.length > 0)
           await tx.chatCircleSyncRetry.deleteMany({
             // An overlapping newer run may have failed after this attempt
             // already reconciled an older membership snapshot. Its retry is
@@ -249,6 +266,7 @@ export class ChatCircleSyncService {
           });
       });
     }
+    return completed;
   }
 
   /**

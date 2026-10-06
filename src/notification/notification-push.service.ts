@@ -1,7 +1,10 @@
 import { Injectable, Logger } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { CronExpression } from '@nestjs/schedule';
-import { TrackedCron } from '../metrics/tracked-cron.decorator';
+import {
+  reportJobSkipped,
+  TrackedCron,
+} from '../metrics/tracked-cron.decorator';
 import { Prisma } from 'src/generated/prisma';
 import { PrismaService } from 'src/prisma/prisma.service';
 import type { NotificationRealtimeDto } from './notification.dto';
@@ -101,6 +104,7 @@ const DELIVERY_MAX_ATTEMPTS = 5;
 
 @Injectable()
 export class NotificationPushService {
+  private staleTokenCleanupRunning = false;
   private readonly logger = new Logger(NotificationPushService.name);
   private readonly loggingConfig = createLoggingConfig();
   // Optional. Required only when the Expo project has "Enhanced Security for
@@ -572,6 +576,19 @@ export class NotificationPushService {
 
   @TrackedCron(CronExpression.EVERY_10_MINUTES, 'push_stale_token_cleanup')
   async deleteStaleTokens(): Promise<{ count: number }> {
+    if (this.staleTokenCleanupRunning) {
+      reportJobSkipped();
+      return { count: 0 };
+    }
+    this.staleTokenCleanupRunning = true;
+    try {
+      return await this.deleteStaleTokenBatches();
+    } finally {
+      this.staleTokenCleanupRunning = false;
+    }
+  }
+
+  private async deleteStaleTokenBatches(): Promise<{ count: number }> {
     const activeCutoff = new Date(Date.now() - ACTIVE_TOKEN_MAX_AGE_MS);
     const disabledCutoff = new Date(Date.now() - DISABLED_TOKEN_MAX_AGE_MS);
     let count = 0;
@@ -624,7 +641,11 @@ export class NotificationPushService {
         },
         { timeout: 60_000 },
       );
-      if (!result.acquired || result.selected === 0) break;
+      if (!result.acquired) {
+        reportJobSkipped();
+        break;
+      }
+      if (result.selected === 0) break;
       count += result.deleted;
       if (result.selected < STALE_TOKEN_BATCH_SIZE) break;
       if (batch === STALE_TOKEN_MAX_BATCHES_PER_RUN - 1) {
