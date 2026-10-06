@@ -1,4 +1,6 @@
 import { ChatBurnSweeperService } from './chat-burn-sweeper.service';
+import { Logger } from '@nestjs/common';
+import { jobMetrics } from '../metrics/job-metrics';
 
 describe('ChatBurnSweeperService', () => {
   const prisma = {
@@ -31,6 +33,13 @@ describe('ChatBurnSweeperService', () => {
     broadcast as never,
     redis as never,
   );
+  const makeService = () =>
+    new ChatBurnSweeperService(
+      prisma as never,
+      media as never,
+      broadcast as never,
+      redis as never,
+    );
 
   beforeEach(() => {
     jest.resetAllMocks();
@@ -68,6 +77,129 @@ describe('ChatBurnSweeperService', () => {
     string,
     { burnDurationSec: number | null; burnStartedAt?: Date | null }
   >();
+
+  it('advances beyond a persistent failure, retries after restart and wrap, and burns the recovered conversation', async () => {
+    const conversations = Array.from({ length: 205 }, (_, index) => ({
+      id: `rotation-${String(index).padStart(4, '0')}`,
+      burnDurationSec: 60,
+    }));
+    const failedId = conversations[0].id;
+    const remaining = new Set(conversations.map((row) => `message-${row.id}`));
+    let broken = true;
+    let failedAttempts = 0;
+    let sharedCursor: string | null = null;
+    redis.tryAcquireLease.mockResolvedValue('owner');
+    redis.getJsonMany.mockImplementation(async () => [sharedCursor]);
+    redis.setJsonIfVersionMatches.mockImplementation(
+      async (_key, _lease, _owner, cursor) => {
+        sharedCursor = cursor;
+        return true;
+      },
+    );
+    prisma.chatConversation.findMany.mockImplementation(
+      async ({ where, take }) =>
+        conversations
+          .filter((row) => !where.id || row.id > where.id.gt)
+          .slice(0, take),
+    );
+    prisma.chatConversation.findUnique.mockResolvedValue({
+      burnDurationSec: 60,
+    });
+    prisma.chatMessage.findMany.mockImplementation(async ({ where }) => {
+      const id = where.conversationID;
+      if (id === failedId && broken) {
+        failedAttempts++;
+        throw new Error('SELECT private_chat_content secret-person');
+      }
+      const message = `message-${id}`;
+      return remaining.has(message)
+        ? [{ id: message, type: 'text', content: {} }]
+        : [];
+    });
+    prisma.chatMessage.updateManyAndReturn.mockImplementation(
+      async ({ where }) => {
+        for (const id of where.id.in) remaining.delete(id);
+        return where.id.in.map((id: string) => ({ id, revision: 1 }));
+      },
+    );
+    const log = jest.spyOn(Logger.prototype, 'error').mockImplementation();
+    const runs = jest.spyOn(jobMetrics, 'recordRun');
+    try {
+      await makeService().sweep();
+      expect(sharedCursor).toBe(conversations[199].id);
+      expect(remaining.has(`message-${conversations[199].id}`)).toBe(false);
+      expect(failedAttempts).toBe(1);
+
+      // A new process resumes the second page using the shared checkpoint.
+      await makeService().sweep();
+      expect(sharedCursor).toBeNull();
+      expect(remaining).toEqual(new Set([`message-${failedId}`]));
+
+      // Eligibility is durable in the burn policy and undeleted message rows.
+      const restarted = makeService();
+      await restarted.sweep();
+      expect(failedAttempts).toBe(2);
+      expect(sharedCursor).toBe(conversations[199].id);
+      await restarted.sweep();
+      expect(sharedCursor).toBeNull();
+      broken = false;
+      await makeService().sweep();
+      expect(remaining.size).toBe(0);
+      expect(broadcast.emitBurnedMessages).toHaveBeenCalledWith(failedId, [
+        { id: `message-${failedId}`, revision: 1 },
+      ]);
+      expect(runs.mock.calls.map((call) => call[1])).toEqual([
+        'failure',
+        'success',
+        'failure',
+        'success',
+        'success',
+      ]);
+      expect(log).toHaveBeenCalledWith(
+        expect.objectContaining({
+          event: 'chat_burn_sweep_failed',
+          operation: 'conversation',
+          conversationId: failedId,
+        }),
+      );
+      expect(JSON.stringify(log.mock.calls)).not.toMatch(
+        /SELECT|private_chat_content|secret-person/,
+      );
+    } finally {
+      log.mockRestore();
+      runs.mockRestore();
+    }
+  });
+
+  it('keeps the previous checkpoint and redacts a scan failure', async () => {
+    prisma.chatConversation.findMany.mockRejectedValue(
+      new Error('SELECT private_messages secret-person'),
+    );
+    const log = jest.spyOn(Logger.prototype, 'error').mockImplementation();
+    const runs = jest.spyOn(jobMetrics, 'recordRun');
+    try {
+      await makeService().sweep();
+      expect(log).toHaveBeenCalledWith(
+        expect.objectContaining({
+          event: 'chat_burn_sweep_failed',
+          operation: 'scan',
+        }),
+      );
+      expect(JSON.stringify(log.mock.calls)).not.toMatch(
+        /SELECT|private_messages|secret-person/,
+      );
+      expect(runs).toHaveBeenCalledWith(
+        'chat_burn_sweeper',
+        'failure',
+        expect.any(Number),
+        undefined,
+      );
+      expect(redis.setJsonIfVersionMatches).not.toHaveBeenCalled();
+    } finally {
+      log.mockRestore();
+      runs.mockRestore();
+    }
+  });
 
   // 触发器会去更新会话计数器:先锁一批消息行再等会话行,与「先锁会话行再改消息」
   // 的编辑/回应并发就会交叉死锁。所以批事务的第一条语句必须是会话行锁。
@@ -131,6 +263,79 @@ describe('ChatBurnSweeperService', () => {
   });
 
   describe('with several instances', () => {
+    it('stops subsequent conversations after a caught failure loses the lease', async () => {
+      jest.useFakeTimers();
+      redis.tryAcquireLease.mockResolvedValue('owner');
+      redis.renewLease.mockResolvedValue(false);
+      prisma.chatConversation.findMany.mockResolvedValue([
+        { id: 'lost-first', burnDurationSec: 60 },
+        { id: 'lost-second', burnDurationSec: 60 },
+      ]);
+      prisma.chatConversation.findUnique.mockResolvedValue({
+        burnDurationSec: 60,
+      });
+      let fail!: (error: Error) => void;
+      let notifyStarted!: () => void;
+      const started = new Promise<void>((resolve) => {
+        notifyStarted = resolve;
+      });
+      prisma.chatMessage.findMany.mockImplementationOnce(() => {
+        notifyStarted();
+        return new Promise((_resolve, reject) => {
+          fail = reject;
+        });
+      });
+      const log = jest.spyOn(Logger.prototype, 'error').mockImplementation();
+      const fresh = makeService();
+      const round = fresh.sweep();
+      try {
+        await started;
+        await jest.advanceTimersByTimeAsync(41_000);
+        fail(new Error('failed query'));
+        await round;
+        expect(prisma.chatConversation.findUnique).toHaveBeenCalledTimes(1);
+        expect(redis.setJsonIfVersionMatches).not.toHaveBeenCalled();
+        expect((fresh as any).cursor).toBeNull();
+      } finally {
+        fail(new Error('cleanup'));
+        await round;
+        log.mockRestore();
+        jest.useRealTimers();
+      }
+    });
+
+    it('does not advance a full page containing a failure when its checkpoint token is rejected', async () => {
+      redis.tryAcquireLease.mockResolvedValue('owner');
+      redis.getJsonMany.mockResolvedValue(['previous-page']);
+      redis.setJsonIfVersionMatches.mockResolvedValue(false);
+      const conversations = Array.from({ length: 200 }, (_, index) => ({
+        id: `z-page-${String(index).padStart(4, '0')}`,
+        burnDurationSec: 60,
+      }));
+      prisma.chatConversation.findMany.mockResolvedValue(conversations);
+      prisma.chatConversation.findUnique
+        .mockResolvedValue({ burnDurationSec: 60 })
+        .mockRejectedValueOnce(new Error('single conversation failure'));
+      prisma.chatMessage.findMany.mockResolvedValue([]);
+      const log = jest.spyOn(Logger.prototype, 'error').mockImplementation();
+      try {
+        const fresh = makeService();
+        await fresh.sweep();
+        expect(prisma.chatConversation.findUnique).toHaveBeenCalledTimes(200);
+        expect(redis.setJsonIfVersionMatches).toHaveBeenCalledWith(
+          'job-cursor:chat_burn_sweeper',
+          'job-lease:chat_burn_sweeper',
+          'owner',
+          conversations[199].id,
+          expect.any(Number),
+        );
+        expect((fresh as any).cursor).toBe('previous-page');
+        expect(redis.setJson).not.toHaveBeenCalled();
+      } finally {
+        log.mockRestore();
+      }
+    });
+
     it('skips the round while another instance holds the lease', async () => {
       redis.tryAcquireLease.mockResolvedValue(null);
 

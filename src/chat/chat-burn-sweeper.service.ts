@@ -8,6 +8,8 @@ import {
 import { PrismaService } from 'src/prisma/prisma.service';
 import { JobLeaseContext, runWithJobLease } from 'src/redis/job-lease';
 import { RedisService } from 'src/redis/redis.service';
+import { sanitizeLogValue } from 'src/logging/log-sanitizer';
+import { attemptDiagnostic } from 'src/logging/http-failure.logger';
 import { ChatBroadcastService } from './chat-broadcast.service';
 import { ChatMediaService } from './chat-media.service';
 import {
@@ -29,7 +31,8 @@ const SWEEP_BATCHES_MAX = 4;
  * 单轮扫描的会话数上限。不封顶的话,开焚毁的会话一多,每分钟一次的全表
  * findMany 会把整份结果拉进内存,后面又逐会话串行查消息 —— 一轮扫描跑过一分钟,
  * 下一轮直接被 running 挡掉,过期消息越积越久。按 id 排序 + 游标续扫,
- * 跨轮次轮转,长期覆盖不丢会话。
+ * 跨轮次轮转,长期覆盖不丢会话。单会话失败也推进本页;失败会话的焚毁策略与
+ * 未删消息仍在数据库,扫到末页后回绕重试,换实例或重启不会丢失重试资格。
  */
 const SWEEP_CONVERSATIONS_MAX = 200;
 /**
@@ -104,7 +107,11 @@ export class ChatBurnSweeperService {
         }
         const seconds = conversation.burnDurationSec;
         if (!seconds || seconds <= 0) continue;
-        await this.sweepConversation(conversation.id, seconds, lease);
+        try {
+          await this.sweepConversation(conversation.id, seconds, lease);
+        } catch (error) {
+          this.recordFailure('conversation', error, conversation.id);
+        }
       }
       if (
         !lease.isCurrent() ||
@@ -117,11 +124,26 @@ export class ChatBurnSweeperService {
       )
         reportJobSkipped();
     } catch (error) {
-      this.logger.error(
-        `burn sweep failed: ${error instanceof Error ? error.message : String(error)}`,
-      );
-      reportHandledJobFailure();
+      this.recordFailure('scan', error);
     }
+  }
+
+  private recordFailure(
+    operation: 'scan' | 'conversation',
+    error: unknown,
+    conversationId?: string,
+  ): void {
+    reportHandledJobFailure();
+    attemptDiagnostic(() =>
+      this.logger.error(
+        sanitizeLogValue({
+          event: 'chat_burn_sweep_failed',
+          operation,
+          conversationId,
+          error,
+        }),
+      ),
+    );
   }
 
   /** 共享游标;Redis 答不上来(或没配)时用本机那份。 */
