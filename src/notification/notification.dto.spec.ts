@@ -95,6 +95,18 @@ describe('push token shape validation (#98)', () => {
       );
     }
   });
+
+  it('accepts a non-whitespace JPush registration ID', () => {
+    expect(
+      validateSync(
+        plainToInstance(RegisterPushTokenDto, {
+          token: '190e35e4f7b94e5fa2c6',
+          platform: 'ios',
+          provider: 'jpush',
+        }),
+      ),
+    ).toHaveLength(0);
+  });
 });
 
 describe('UpdateCirclePushPreferenceDto', () => {
