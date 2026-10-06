@@ -36,9 +36,13 @@ const MAX_PUSH_BODY_BYTES = 1024;
 
 function truncateUtf8(value: string, maxBytes: number): string {
   if (Buffer.byteLength(value, 'utf8') <= maxBytes) return value;
-  let end = Math.min(value.length, maxBytes);
-  while (end > 0 && Buffer.byteLength(value.slice(0, end), 'utf8') > maxBytes) {
-    end -= 1;
+  let bytes = 0;
+  let end = 0;
+  for (const point of value) {
+    const pointBytes = Buffer.byteLength(point, 'utf8');
+    if (bytes + pointBytes > maxBytes) break;
+    bytes += pointBytes;
+    end += point.length;
   }
   return value.slice(0, end);
 }
@@ -194,7 +198,7 @@ export class NotificationPushService {
       where: {
         userID: userId,
         provider: {
-          in: this.isJPushConfigured() ? ['expo', 'jpush'] : ['expo'],
+          in: ['expo', 'jpush'],
         },
         disabledAt: null,
       },
@@ -235,7 +239,7 @@ export class NotificationPushService {
       where: {
         userID: { in: userIds },
         provider: {
-          in: this.isJPushConfigured() ? ['expo', 'jpush'] : ['expo'],
+          in: ['expo', 'jpush'],
         },
         disabledAt: null,
       },

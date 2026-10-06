@@ -51,6 +51,24 @@ describe('NotificationPushService (#88 per-token delivery)', () => {
   const payload = { title: 'T', body: 'B', data: { notificationId: 'n1' } };
 
   describe('composeMessage', () => {
+    it.each([1020, 1021, 1022, 1023])(
+      'truncates emoji at a %i-byte boundary without splitting code points',
+      (prefixLength) => {
+        const message = service.composeMessage('user-1', {
+          id: 'n1',
+          type: 'SYSTEM',
+          content: 'a'.repeat(prefixLength) + '😀tail',
+        } as any);
+        expect(Buffer.byteLength(message.body, 'utf8')).toBeLessThanOrEqual(
+          1024,
+        );
+        expect(message.body).toBe(
+          'a'.repeat(prefixLength) + (prefixLength === 1020 ? '😀' : ''),
+        );
+        expect(message.body).not.toMatch(/[\uD800-\uDBFF]$/u);
+      },
+    );
+
     it('builds a routable payload with actor title and data ids', () => {
       const message = service.composeMessage('user-1', {
         id: 'n1',
@@ -390,7 +408,7 @@ describe('NotificationPushService (#88 per-token delivery)', () => {
       expect(prisma.devicePushToken.findMany).toHaveBeenCalledWith({
         where: {
           userID: { in: ['u1', 'u2', 'u3'] },
-          provider: { in: ['expo'] },
+          provider: { in: ['expo', 'jpush'] },
           disabledAt: null,
         },
         select: {
