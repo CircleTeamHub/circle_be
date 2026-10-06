@@ -68,6 +68,7 @@ export class ChatCircleSyncService {
   private static readonly RECONCILE_WINDOW_MS = 2 * 60_000;
   /** 单轮扫描上限；超过后按 (updatedAt,circleID) 游标续扫。 */
   private static readonly RECONCILE_SCAN_MAX = 10_000;
+  private static readonly RECONCILE_LEASE_KEY = 'job-lease:chat_circle_sync';
   private static readonly RECONCILE_CURSOR_KEY = 'job-cursor:chat_circle_sync';
   // A 10,000-row page is normally drained in one tick, but a write burst can
   // span many ticks. Keep the shared cursor long enough to finish a large
@@ -119,13 +120,13 @@ export class ChatCircleSyncService {
       this.redis,
       'chat_circle_sync',
       ChatCircleSyncService.RECONCILE_LEASE_MS,
-      async () => {
+      async (leaseToken) => {
         let scan: {
           circleIds: string[];
           nextCursor: CircleSyncScanCursor | null;
         };
         try {
-          scan = await this.scanChangedCircles(since);
+          scan = await this.scanChangedCircles(since, leaseToken);
         } catch (error) {
           attemptDiagnostic(() =>
             this.logger.error(
@@ -141,11 +142,16 @@ export class ChatCircleSyncService {
           reportHandledJobFailure();
           return;
         }
+        if (!scan) {
+          reportJobSkipped();
+          return;
+        }
         // Checkpoint failures in PostgreSQL before advancing the scan. A
         // permanently failing circle must not strand later membership pages.
         try {
           await this.reconcileCircles(scan.circleIds, true);
-          await this.writeScanCursor(scan.nextCursor);
+          if (!(await this.writeScanCursor(scan.nextCursor, leaseToken)))
+            reportJobSkipped();
         } catch (error) {
           reportHandledJobFailure();
           attemptDiagnostic(() =>
@@ -174,9 +180,10 @@ export class ChatCircleSyncService {
     changed: string[],
     includeDurable = false,
   ): Promise<void> {
+    const attemptStartedAt = new Date();
     const durable = includeDurable
       ? await this.prisma.chatCircleSyncRetry.findMany({
-          where: { nextAttemptAt: { lte: new Date() } },
+          where: { nextAttemptAt: { lte: attemptStartedAt } },
           select: { circleID: true },
           orderBy: [{ nextAttemptAt: 'asc' }, { circleID: 'asc' }],
           take: ChatCircleSyncService.RETRY_QUEUE_MAX,
@@ -232,7 +239,13 @@ export class ChatCircleSyncService {
         const succeeded = attempted.filter((id) => !failedSet.has(id));
         if (succeeded.length > 0)
           await tx.chatCircleSyncRetry.deleteMany({
-            where: { circleID: { in: succeeded } },
+            // An overlapping newer run may have failed after this attempt
+            // already reconciled an older membership snapshot. Its retry is
+            // scheduled in the future and must survive this late success.
+            where: {
+              circleID: { in: succeeded },
+              nextAttemptAt: { lte: attemptStartedAt },
+            },
           });
       });
     }
@@ -244,17 +257,25 @@ export class ChatCircleSyncService {
    */
   private async scanChangedCircles(
     since: Date,
-  ): Promise<{ circleIds: string[]; nextCursor: CircleSyncScanCursor | null }> {
+    leaseToken?: string,
+  ): Promise<{
+    circleIds: string[];
+    nextCursor: CircleSyncScanCursor | null;
+  } | null> {
     const cursor = await this.readScanCursor(since);
     const scanSince = cursor ? new Date(cursor.windowSince) : since;
     // Persist the starting window before work begins. A restart must replay
     // this page even if its rows have left the moving two-minute window.
     if (!cursor) {
-      await this.writeScanCursor({
-        windowSince: scanSince.toISOString(),
-        updatedAt: scanSince.toISOString(),
-        circleID: '',
-      });
+      const written = await this.writeScanCursor(
+        {
+          windowSince: scanSince.toISOString(),
+          updatedAt: scanSince.toISOString(),
+          circleID: '',
+        },
+        leaseToken,
+      );
+      if (!written) return null;
     }
     const rows = cursor
       ? await this.prisma.$queryRaw<CircleSyncScanRow[]>(Prisma.sql`
@@ -336,13 +357,25 @@ export class ChatCircleSyncService {
 
   private async writeScanCursor(
     cursor: CircleSyncScanCursor | null,
-  ): Promise<void> {
+    leaseToken?: string,
+  ): Promise<boolean> {
+    // A slow run can outlive its lease and finish after another holder has
+    // saved a newer page/window. Fence SET (including a null clear) atomically
+    // with the lease token, and never retain rejected progress locally.
+    if (leaseToken !== undefined) {
+      const written = await this.redis.setJsonIfVersionMatches(
+        ChatCircleSyncService.RECONCILE_CURSOR_KEY,
+        ChatCircleSyncService.RECONCILE_LEASE_KEY,
+        leaseToken,
+        cursor,
+        ChatCircleSyncService.RECONCILE_CURSOR_TTL_SECONDS,
+      );
+      if (!written) return false;
+    }
+    // Without a lease, keep only the local outage fallback. Redis may recover
+    // mid-run, but that does not grant ownership of another worker's cursor.
     this.scanCursor = cursor;
-    await this.redis.setJson(
-      ChatCircleSyncService.RECONCILE_CURSOR_KEY,
-      cursor,
-      ChatCircleSyncService.RECONCILE_CURSOR_TTL_SECONDS,
-    );
+    return true;
   }
 
   /**

@@ -11,19 +11,20 @@ import type { RedisService } from './redis.service';
  *   也不能让协调层故障把焚毁、成员对账整个停掉 —— 所以用它的任务必须幂等。
  *
  * ttlMs 是持有者崩溃时别的实例最多要等多久;任务跑得比它久时租约会先过期,
- * 可能与下一个实例短暂重叠(同样靠幂等兜住)。
+ * 可能与下一个实例短暂重叠(同样靠幂等兜住)。共享水位等非幂等写入需要
+ * 使用传给 run 的 token 原子校验所有权；undefined 表示本轮没有共享租约。
  */
 export async function runWithJobLease(
   redis: RedisService,
   job: string,
   ttlMs: number,
-  run: () => Promise<void>,
+  run: (leaseToken: string | undefined) => Promise<void>,
 ): Promise<boolean> {
   const key = `job-lease:${job}`;
   const lease = await redis.tryAcquireLease(key, ttlMs);
   if (lease === null) return false;
   try {
-    await run();
+    await run(lease);
   } finally {
     if (typeof lease === 'string') await redis.releaseLease(key, lease);
   }

@@ -48,6 +48,7 @@ describe('ChatCircleSyncService', () => {
     releaseLease: jest.fn(),
     getJsonMany: jest.fn(),
     setJson: jest.fn(),
+    setJsonIfVersionMatches: jest.fn(),
   };
   const service = new ChatCircleSyncService(
     prisma as never,
@@ -78,6 +79,7 @@ describe('ChatCircleSyncService', () => {
     redis.releaseLease.mockResolvedValue(undefined);
     redis.getJsonMany.mockResolvedValue(null);
     redis.setJson.mockResolvedValue(false);
+    redis.setJsonIfVersionMatches.mockResolvedValue(true);
   });
 
   describe('failure log privacy', () => {
@@ -668,6 +670,7 @@ describe('ChatCircleSyncService', () => {
     });
 
     it('commits a capped scan cursor only after its circles reconcile', async () => {
+      redis.tryAcquireLease.mockResolvedValue('lease-token');
       const since = new Date(Date.now() - 2 * 60_000);
       const rows = Array.from({ length: 10_000 }, (_, i) => ({
         circleID: `c-${i % 3}`,
@@ -677,8 +680,8 @@ describe('ChatCircleSyncService', () => {
       const ensure = jest
         .spyOn(service, 'ensureCircleConversation')
         .mockImplementation(async () => {
-          const checkpoints = redis.setJson.mock.calls.map(
-            ([, cursor]) => cursor,
+          const checkpoints = redis.setJsonIfVersionMatches.mock.calls.map(
+            ([, , , cursor]) => cursor,
           );
           expect(
             checkpoints.every(
@@ -690,8 +693,10 @@ describe('ChatCircleSyncService', () => {
         });
       try {
         await service.reconcileRecent();
-        expect(redis.setJson).toHaveBeenLastCalledWith(
+        expect(redis.setJsonIfVersionMatches).toHaveBeenLastCalledWith(
           'job-cursor:chat_circle_sync',
+          'job-lease:chat_circle_sync',
+          'lease-token',
           expect.objectContaining({
             updatedAt: rows[9999].updatedAt.toISOString(),
             circleID: 'c-0',
@@ -709,10 +714,13 @@ describe('ChatCircleSyncService', () => {
         .spyOn(Date, 'now')
         .mockReturnValue(Date.parse('2026-10-06T10:00:00Z'));
       redis.getJsonMany.mockImplementation(async () => [checkpoint]);
-      redis.setJson.mockImplementation(async (_key, value) => {
-        checkpoint = value;
-        return true;
-      });
+      redis.tryAcquireLease.mockResolvedValue('lease-token');
+      redis.setJsonIfVersionMatches.mockImplementation(
+        async (_key, _leaseKey, _token, value) => {
+          checkpoint = value;
+          return true;
+        },
+      );
       const first = new ChatCircleSyncService(
         prisma as never,
         broadcast as never,
@@ -727,7 +735,7 @@ describe('ChatCircleSyncService', () => {
           updatedAt: new Date(since.getTime() + 1000),
         },
       ]);
-      await (first as any).scanChangedCircles(since);
+      await (first as any).scanChangedCircles(since, 'lease-token');
       expect(checkpoint).toEqual({
         windowSince: since.toISOString(),
         updatedAt: since.toISOString(),
@@ -822,6 +830,7 @@ describe('circle sync durable scan progress', () => {
     releaseLease: jest.fn(),
     getJsonMany: jest.fn(),
     setJson: jest.fn(),
+    setJsonIfVersionMatches: jest.fn(),
   };
   const make = () =>
     new ChatCircleSyncService(
@@ -841,6 +850,7 @@ describe('circle sync durable scan progress', () => {
     redis.tryAcquireLease.mockResolvedValue(undefined);
     redis.getJsonMany.mockResolvedValue([null]);
     redis.setJson.mockResolvedValue(false);
+    redis.setJsonIfVersionMatches.mockResolvedValue(true);
   });
   it('retains the local window and reaches the second page after Redis recovers without a key', async () => {
     const start = Date.parse('2026-10-06T10:00:00Z');
@@ -867,13 +877,10 @@ describe('circle sync durable scan progress', () => {
         data: [{ circleID: 'c-0' }],
         skipDuplicates: true,
       });
-      expect(retry.createMany.mock.invocationCallOrder[0]).toBeLessThan(
-        redis.setJson.mock.invocationCallOrder[
-          redis.setJson.mock.invocationCallOrder.length - 1
-        ],
-      );
+      expect(redis.setJson).not.toHaveBeenCalled();
+      expect(redis.setJsonIfVersionMatches).not.toHaveBeenCalled();
       clock.mockReturnValue(start + 300_000);
-      redis.setJson.mockResolvedValue(true);
+      redis.tryAcquireLease.mockResolvedValue('recovered-lease');
       await service.reconcileRecent();
       expect(ensure).toHaveBeenCalledWith('after-cap');
       const values = prisma.$queryRaw.mock.calls[1][0].values;
@@ -894,10 +901,14 @@ describe('circle sync durable scan progress', () => {
     await restarted.reconcileRecent();
     expect(ensure).toHaveBeenCalledWith('persisted-failure');
     expect(retry.deleteMany).toHaveBeenCalledWith({
-      where: { circleID: { in: ['persisted-failure'] } },
+      where: {
+        circleID: { in: ['persisted-failure'] },
+        nextAttemptAt: { lte: expect.any(Date) },
+      },
     });
   });
   it('does not advance the page if failed IDs cannot be durably checkpointed', async () => {
+    redis.tryAcquireLease.mockResolvedValue('lease-token');
     prisma.$queryRaw.mockResolvedValue(
       Array.from({ length: 10_000 }, (_, i) => ({
         circleID: 'failed',
@@ -910,7 +921,201 @@ describe('circle sync durable scan progress', () => {
       .spyOn(service, 'ensureCircleConversation')
       .mockRejectedValue(new Error('failed'));
     await service.reconcileRecent();
-    expect(redis.setJson).toHaveBeenCalledTimes(1);
-    expect(redis.setJson.mock.calls[0][1].circleID).toBe('');
+    expect(redis.setJsonIfVersionMatches).toHaveBeenCalledTimes(1);
+    expect(redis.setJsonIfVersionMatches.mock.calls[0][3].circleID).toBe('');
+  });
+
+  it('stops before scanning when its initial checkpoint loses the lease', async () => {
+    redis.tryAcquireLease.mockResolvedValue('expired-lease');
+    redis.setJsonIfVersionMatches.mockResolvedValue(false);
+    const service = make();
+
+    await service.reconcileRecent();
+
+    expect(prisma.$queryRaw).not.toHaveBeenCalled();
+    expect(retry.findMany).not.toHaveBeenCalled();
+    expect((service as any).scanCursor).toBeNull();
+    expect(redis.setJson).not.toHaveBeenCalled();
+  });
+
+  it('keeps a newer durable failure when an older attempt finishes successfully', async () => {
+    jest.useFakeTimers();
+    const start = Date.parse('2026-10-06T10:00:00Z');
+    jest.setSystemTime(start);
+    const pending = new Map<string, Date>();
+    retry.findMany.mockImplementation(async ({ where }) =>
+      [...pending]
+        .filter(([, due]) => due <= where.nextAttemptAt.lte)
+        .map(([circleID]) => ({ circleID })),
+    );
+    retry.createMany.mockImplementation(async ({ data }) => {
+      for (const { circleID } of data) {
+        if (!pending.has(circleID)) pending.set(circleID, new Date());
+      }
+      return { count: data.length };
+    });
+    retry.updateMany.mockImplementation(async ({ where, data }) => {
+      for (const circleID of where.circleID.in)
+        pending.set(circleID, data.nextAttemptAt);
+      return { count: where.circleID.in.length };
+    });
+    retry.deleteMany.mockImplementation(async ({ where }) => {
+      for (const circleID of where.circleID.in) {
+        const due = pending.get(circleID);
+        if (due && (!where.nextAttemptAt || due <= where.nextAttemptAt.lte))
+          pending.delete(circleID);
+      }
+      return { count: 1 };
+    });
+    let finishOlder!: () => void;
+    let olderStarted!: () => void;
+    const held = new Promise<void>((resolve) => {
+      finishOlder = resolve;
+    });
+    const started = new Promise<void>((resolve) => {
+      olderStarted = resolve;
+    });
+    const older = make();
+    jest
+      .spyOn(older, 'ensureCircleConversation')
+      .mockImplementation(async () => {
+        olderStarted();
+        await held;
+        return 'conv';
+      });
+    const newer = make();
+    jest
+      .spyOn(newer, 'ensureCircleConversation')
+      .mockRejectedValue(new Error('newer membership failed'));
+    let olderRun: Promise<void> | undefined;
+    try {
+      olderRun = (older as any).reconcileCircles(['changed-circle'], true);
+      await started;
+      jest.setSystemTime(start + 60_000);
+      await (newer as any).reconcileCircles(['changed-circle'], true);
+      const newerDue = new Date(start + 120_000);
+      expect(pending.get('changed-circle')).toEqual(newerDue);
+
+      jest.setSystemTime(start + 260_000);
+      finishOlder();
+      await olderRun;
+      expect(pending.get('changed-circle')).toEqual(newerDue);
+
+      const restarted = make();
+      const ensure = jest
+        .spyOn(restarted, 'ensureCircleConversation')
+        .mockResolvedValue('conv');
+      await (restarted as any).reconcileCircles([], true);
+      expect(ensure).toHaveBeenCalledWith('changed-circle');
+      expect(pending.size).toBe(0);
+    } finally {
+      finishOlder();
+      await olderRun;
+      jest.useRealTimers();
+    }
+  });
+
+  it('rejects an expired run clearing a newer recovery window and replays it after restart', async () => {
+    const start = Date.parse('2026-10-06T10:00:00Z');
+    const clock = jest.spyOn(Date, 'now').mockReturnValue(start);
+    let checkpoint: unknown = null;
+    let lease: { owner: string; expires: number } | null = null;
+    let tokenNumber = 0;
+    const rows = [
+      { circleID: 'old-circle', updatedAt: new Date(start - 30_000) },
+    ];
+    const deferred = () => {
+      let resolve!: () => void;
+      const promise = new Promise<void>((done) => {
+        resolve = done;
+      });
+      return { promise, resolve };
+    };
+    const holdA = deferred();
+    const startedA = deferred();
+    const holdC = deferred();
+    const startedC = deferred();
+    redis.tryAcquireLease.mockImplementation(async (_key, ttl) => {
+      if (lease && lease.expires > Date.now()) return null;
+      lease = { owner: String(++tokenNumber), expires: Date.now() + ttl };
+      return lease.owner;
+    });
+    redis.releaseLease.mockImplementation(async (_key, owner) => {
+      if (lease?.owner === owner) lease = null;
+    });
+    redis.getJsonMany.mockImplementation(async () => [checkpoint]);
+    redis.setJsonIfVersionMatches.mockImplementation(
+      async (_key, _leaseKey, owner, value) => {
+        if (lease?.owner !== owner || lease.expires <= Date.now()) return false;
+        checkpoint = value;
+        return true;
+      },
+    );
+    prisma.$queryRaw.mockImplementation(async (query) => {
+      const [since, after, afterId] = query.values;
+      return rows.filter(
+        (row) =>
+          row.updatedAt > since &&
+          (!after ||
+            row.updatedAt > after ||
+            (+row.updatedAt === +after && row.circleID > afterId)),
+      );
+    });
+    const a = make();
+    jest.spyOn(a, 'ensureCircleConversation').mockImplementation(async () => {
+      startedA.resolve();
+      await holdA.promise;
+      return 'conv';
+    });
+    const b = make();
+    jest.spyOn(b, 'ensureCircleConversation').mockResolvedValue('conv');
+    const c = make();
+    jest.spyOn(c, 'ensureCircleConversation').mockImplementation(async () => {
+      startedC.resolve();
+      await holdC.promise;
+      return 'conv';
+    });
+    let pendingA: Promise<void> | undefined;
+    let pendingC: Promise<void> | undefined;
+    try {
+      pendingA = a.reconcileRecent();
+      await startedA.promise;
+      const initialA = checkpoint;
+      clock.mockReturnValue(start + 60_000);
+      await b.reconcileRecent();
+      expect(checkpoint).toBeNull();
+
+      rows.push({
+        circleID: 'new-circle',
+        updatedAt: new Date(start + 90_000),
+      });
+      clock.mockReturnValue(start + 120_000);
+      pendingC = c.reconcileRecent();
+      await startedC.promise;
+      const recoveryWindow = checkpoint;
+
+      clock.mockReturnValue(start + 260_000);
+      holdA.resolve();
+      await pendingA;
+      expect(checkpoint).toEqual(recoveryWindow);
+      expect((a as any).scanCursor).toEqual(initialA);
+
+      // C stops before reconciliation/checkpointing; a fresh instance must
+      // still replay the saved window although the changed row has aged out.
+      clock.mockReturnValue(start + 300_000);
+      const restarted = make();
+      const ensure = jest
+        .spyOn(restarted, 'ensureCircleConversation')
+        .mockResolvedValue('conv');
+      await restarted.reconcileRecent();
+      expect(ensure).toHaveBeenCalledWith('new-circle');
+      expect(checkpoint).toBeNull();
+      expect(redis.setJson).not.toHaveBeenCalled();
+    } finally {
+      holdA.resolve();
+      holdC.resolve();
+      await Promise.all([pendingA, pendingC]);
+      clock.mockRestore();
+    }
   });
 });

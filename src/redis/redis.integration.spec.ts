@@ -106,6 +106,35 @@ describeRedis('RedisService real Redis integration', () => {
     await expect(received).resolves.toEqual({ channel, message: 'hello' });
   });
 
+  it('fences checkpoint advances and null clears with the current unexpired lease token', async () => {
+    const cursorKey = `${prefix}:circle-cursor`;
+    const leaseKey = `${prefix}:circle-lease`;
+    const first = await service.tryAcquireLease(leaseKey, 100);
+    expect(typeof first).toBe('string');
+    const write = (token: string, cursor: unknown) =>
+      service.setJsonIfVersionMatches(cursorKey, leaseKey, token, cursor, 30);
+    const firstWindow = { window: 'first', circleID: '' };
+    expect(await write(first!, firstWindow)).toBe(true);
+
+    await new Promise((resolve) => setTimeout(resolve, 110));
+    expect(await write(first!, null)).toBe(false);
+    await expect(service.getJson(cursorKey)).resolves.toEqual(firstWindow);
+
+    const current = await service.tryAcquireLease(leaseKey, 5_000);
+    expect(typeof current).toBe('string');
+    const recoveryWindow = { window: 'newer', circleID: '' };
+    expect(await write(current!, recoveryWindow)).toBe(true);
+    expect(await write(first!, { window: 'first', circleID: 'last' })).toBe(
+      false,
+    );
+    expect(await write(first!, null)).toBe(false);
+    await service.releaseLease(leaseKey, first!);
+    await expect(service.getJson(cursorKey)).resolves.toEqual(recoveryWindow);
+    expect(await write(current!, null)).toBe(true);
+    await expect(service.getJson(cursorKey)).resolves.toBeNull();
+    await service.releaseLease(leaseKey, current!);
+  });
+
   it('shares rate-limit counts through rate-limit-redis', async () => {
     const first = service.createRateLimitStore(`${prefix}:limiter`)!;
     const second = service.createRateLimitStore(`${prefix}:limiter`)!;
