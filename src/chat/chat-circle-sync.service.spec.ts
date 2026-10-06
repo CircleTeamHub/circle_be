@@ -657,50 +657,100 @@ describe('ChatCircleSyncService', () => {
       ensure.mockRestore();
     });
 
-    it('continues a capped row scan from the shared cursor', async () => {
+    it('commits a capped scan cursor only after its circles reconcile', async () => {
       const since = new Date(Date.now() - 2 * 60_000);
-      const firstBatch = Array.from({ length: 10_000 }, (_, i) => ({
+      const rows = Array.from({ length: 10_000 }, (_, i) => ({
         circleID: `c-${i % 3}`,
         updatedAt: new Date(since.getTime() + i + 1),
       }));
-      const nextBatch = [
-        {
-          circleID: 'c-next',
-          updatedAt: new Date(since.getTime() + 20_000),
-        },
-      ];
-      prisma.$queryRaw
-        .mockResolvedValueOnce(firstBatch)
-        .mockResolvedValueOnce(nextBatch);
-      const scan = (
-        service as unknown as {
-          scanChangedCircles: (value: Date) => Promise<string[]>;
-        }
-      ).scanChangedCircles;
+      prisma.$queryRaw.mockResolvedValueOnce(rows);
+      const ensure = jest
+        .spyOn(service, 'ensureCircleConversation')
+        .mockImplementation(async () => {
+          const checkpoints = redis.setJson.mock.calls.map(
+            ([, cursor]) => cursor,
+          );
+          expect(
+            checkpoints.every(
+              (cursor) =>
+                cursor?.updatedAt !== rows[9999].updatedAt.toISOString(),
+            ),
+          ).toBe(true);
+          return 'conv';
+        });
+      try {
+        await service.reconcileRecent();
+        expect(redis.setJson).toHaveBeenLastCalledWith(
+          'job-cursor:chat_circle_sync',
+          expect.objectContaining({
+            updatedAt: rows[9999].updatedAt.toISOString(),
+            circleID: 'c-0',
+          }),
+          24 * 60 * 60,
+        );
+      } finally {
+        ensure.mockRestore();
+      }
+    });
 
-      await expect(scan.call(service, since)).resolves.toEqual([
-        'c-0',
-        'c-1',
-        'c-2',
+    it('replays an unreconciled page after restart even when the live window has advanced', async () => {
+      let checkpoint: unknown = null;
+      const clock = jest
+        .spyOn(Date, 'now')
+        .mockReturnValue(Date.parse('2026-10-06T10:00:00Z'));
+      redis.getJsonMany.mockImplementation(async () => [checkpoint]);
+      redis.setJson.mockImplementation(async (_key, value) => {
+        checkpoint = value;
+        return true;
+      });
+      const first = new ChatCircleSyncService(
+        prisma as never,
+        broadcast as never,
+        systemMessage as never,
+        groupEvents as never,
+        redis as never,
+      );
+      const since = new Date(Date.now() - 120_000);
+      prisma.$queryRaw.mockResolvedValueOnce([
+        {
+          circleID: 'unprocessed',
+          updatedAt: new Date(since.getTime() + 1000),
+        },
       ]);
-      expect(redis.setJson).toHaveBeenNthCalledWith(
-        1,
-        'job-cursor:chat_circle_sync',
+      await (first as any).scanChangedCircles(since);
+      expect(checkpoint).toEqual({
+        windowSince: since.toISOString(),
+        updatedAt: since.toISOString(),
+        circleID: '',
+      });
+      clock.mockReturnValue(Date.parse('2026-10-06T10:05:00Z'));
+      const restarted = new ChatCircleSyncService(
+        prisma as never,
+        broadcast as never,
+        systemMessage as never,
+        groupEvents as never,
+        redis as never,
+      );
+      const ensure = jest
+        .spyOn(restarted, 'ensureCircleConversation')
+        .mockResolvedValue('conv');
+      prisma.$queryRaw.mockResolvedValueOnce([
         {
-          windowSince: since.toISOString(),
-          updatedAt: firstBatch[firstBatch.length - 1].updatedAt.toISOString(),
-          circleID: 'c-0',
+          circleID: 'unprocessed',
+          updatedAt: new Date(since.getTime() + 1000),
         },
-        24 * 60 * 60,
-      );
-
-      await expect(scan.call(service, since)).resolves.toEqual(['c-next']);
-      expect(redis.setJson).toHaveBeenNthCalledWith(
-        2,
-        'job-cursor:chat_circle_sync',
-        null,
-        24 * 60 * 60,
-      );
+      ]);
+      try {
+        await restarted.reconcileRecent();
+        expect(ensure).toHaveBeenCalledWith('unprocessed');
+        expect(
+          (prisma.$queryRaw.mock.calls[1][0] as any).values,
+        ).toContainEqual(since);
+        expect(checkpoint).toBeNull();
+      } finally {
+        clock.mockRestore();
+        ensure.mockRestore();
+      }
     });
 
     it('keeps the original scan window when the next tick moves since forward', async () => {
@@ -721,11 +771,16 @@ describe('ChatCircleSyncService', () => {
 
       const scan = (
         service as unknown as {
-          scanChangedCircles: (value: Date) => Promise<string[]>;
+          scanChangedCircles: (
+            value: Date,
+          ) => Promise<{ circleIds: string[]; nextCursor: unknown }>;
         }
       ).scanChangedCircles;
 
-      await expect(scan.call(service, nextSince)).resolves.toEqual(['c-next']);
+      await expect(scan.call(service, nextSince)).resolves.toEqual({
+        circleIds: ['c-next'],
+        nextCursor: null,
+      });
       const query = prisma.$queryRaw.mock.calls[0][0] as {
         values?: unknown[];
       };

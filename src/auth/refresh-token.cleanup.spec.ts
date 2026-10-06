@@ -61,6 +61,37 @@ describe('RefreshTokenCleanup', () => {
     report.mockRestore();
   });
 
+  it('drains a backlog across bounded frequent sweeps and reports a capped run', async () => {
+    let remaining = 21_000;
+    findMany.mockImplementation(() =>
+      Promise.resolve(
+        Array.from({ length: Math.min(remaining, 1000) }, (_, index) => ({
+          id: `t-${index}`,
+        })),
+      ),
+    );
+    deleteMany.mockImplementation(({ where }) => {
+      const count = where.AND[1].id.in.length;
+      remaining -= count;
+      return Promise.resolve({ count });
+    });
+    const warn = jest.spyOn(Logger.prototype, 'warn').mockImplementation();
+    try {
+      await cleanup.sweep(new Date());
+      expect(remaining).toBe(1000);
+      expect(warn).toHaveBeenCalledWith(
+        expect.objectContaining({
+          event: 'refresh_token_cleanup_capped',
+          nextRunInMinutes: 10,
+        }),
+      );
+      await cleanup.sweep(new Date());
+      expect(remaining).toBe(0);
+    } finally {
+      warn.mockRestore();
+    }
+  });
+
   it('logs a fixed prune failure without private database error text', async () => {
     const log = jest.spyOn(Logger.prototype, 'error').mockImplementation();
     const error = new Error('SELECT private_messages private-value');

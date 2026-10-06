@@ -1073,7 +1073,11 @@ describe('FriendService', () => {
       select: { id: true, userID: true },
     });
     expect(prisma.friend.updateMany).toHaveBeenCalledWith({
-      where: { id: 'friendship-1', state: FriendState.ACCEPTED },
+      where: {
+        userID: 'user-1',
+        friendID: 'user-2',
+        state: FriendState.ACCEPTED,
+      },
       data: { permissionA: 'CHAT_ONLY' },
     });
   });
@@ -1089,7 +1093,11 @@ describe('FriendService', () => {
     await service.setFriendPermission('user-2', 'user-1', 'FULL' as any);
 
     expect(prisma.friend.updateMany).toHaveBeenCalledWith({
-      where: { id: 'friendship-1', state: FriendState.ACCEPTED },
+      where: {
+        userID: 'user-1',
+        friendID: 'user-2',
+        state: FriendState.ACCEPTED,
+      },
       data: { permissionB: 'FULL' },
     });
   });
@@ -1121,9 +1129,64 @@ describe('FriendService', () => {
       },
     });
     expect(prisma.friend.updateMany).toHaveBeenCalledWith({
-      where: { id: 'friendship-1', state: FriendState.ACCEPTED },
+      where: {
+        userID: 'user-1',
+        friendID: 'user-2',
+        state: FriendState.ACCEPTED,
+      },
       data: { permissionA: 'CHAT_ONLY' },
     });
+  });
+
+  it('updates caller-owned grants on every historical accepted duplicate', async () => {
+    const rows = [
+      {
+        id: 'f1',
+        userID: 'user-1',
+        friendID: 'user-2',
+        state: FriendState.ACCEPTED,
+        permissionA: 'CHAT_ONLY',
+        permissionB: 'CHAT_ONLY',
+      },
+      {
+        id: 'f2',
+        userID: 'user-1',
+        friendID: 'user-2',
+        state: FriendState.ACCEPTED,
+        permissionA: 'CHAT_ONLY',
+        permissionB: 'CHAT_ONLY',
+      },
+      {
+        id: 'f3',
+        userID: 'user-2',
+        friendID: 'user-1',
+        state: FriendState.ACCEPTED,
+        permissionA: 'CHAT_ONLY',
+        permissionB: 'CHAT_ONLY',
+      },
+    ];
+    prisma.friend.findFirst.mockResolvedValue(rows[0]);
+    prisma.friend.updateMany.mockImplementation(({ where, data }) => {
+      const matches = rows.filter(
+        (row) =>
+          row.userID === where.userID &&
+          row.friendID === where.friendID &&
+          row.state === where.state,
+      );
+      matches.forEach((row) => Object.assign(row, data));
+      return Promise.resolve({ count: matches.length });
+    });
+    await service.setFriendPermission('user-1', 'user-2', 'FULL' as any);
+    expect(
+      rows.map((row) =>
+        row.userID === 'user-1' ? row.permissionA : row.permissionB,
+      ),
+    ).toEqual(['FULL', 'FULL', 'FULL']);
+    expect(
+      rows.map((row) =>
+        row.userID === 'user-1' ? row.permissionB : row.permissionA,
+      ),
+    ).toEqual(['CHAT_ONLY', 'CHAT_ONLY', 'CHAT_ONLY']);
   });
 
   it('stores sender-owned pending metadata when sending a request', async () => {

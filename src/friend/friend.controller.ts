@@ -26,6 +26,7 @@ import { FriendState } from 'src/generated/prisma';
 import { JwtGuard } from 'src/guards/jwt.guard';
 import type { RequestWithUser } from 'src/auth/types';
 import { ClampPagePipe } from 'src/common/pagination';
+import { ParseUserIdPipe } from 'src/user/parse-user-id.pipe';
 import {
   AssignTagDto,
   BlockUserDto,
@@ -63,7 +64,7 @@ export class FriendController {
   @ApiOperation({ summary: 'Get editable settings for a friend' })
   @ApiOkResponse({ type: FriendSettingsDto })
   getFriendSettings(
-    @Param('friendUserId', ParseUUIDPipe) friendUserId: string,
+    @Param('friendUserId', ParseUserIdPipe) friendUserId: string,
     @Req() req: RequestWithUser,
   ): Promise<FriendSettingsDto> {
     return this.friendService.getFriendSettings(req.user.userId, friendUserId);
@@ -74,7 +75,7 @@ export class FriendController {
   @ApiOperation({ summary: 'Set the moments permission for a friend' })
   @ApiNoContentResponse()
   setFriendPermission(
-    @Param('friendUserId', ParseUUIDPipe) friendUserId: string,
+    @Param('friendUserId', ParseUserIdPipe) friendUserId: string,
     @Body() dto: SetFriendPermissionDto,
     @Req() req: RequestWithUser,
   ): Promise<void> {

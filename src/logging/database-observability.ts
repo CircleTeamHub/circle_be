@@ -44,6 +44,10 @@ export function observeDatabaseAdapter(
     const state = warningStates.get(key);
     if (!state || now - state.lastEmittedAt >= warningIntervalMs) {
       const suppressedCount = state?.suppressedCount ?? 0;
+      if (!state && warningStates.size >= 1024) {
+        const oldestKey = warningStates.keys().next().value;
+        if (oldestKey !== undefined) warningStates.delete(oldestKey);
+      }
       warningStates.set(key, { lastEmittedAt: now, suppressedCount: 0 });
       return suppressedCount;
     }
@@ -66,13 +70,18 @@ export function observeDatabaseAdapter(
     } finally {
       try {
         const durationMs = elapsedMs() - startedAt;
+        const fingerprint =
+          durationMs >= config.slowDbOperationMs
+            ? queryFingerprint(query)
+            : undefined;
         const suppressedCount =
           durationMs >= config.slowDbOperationMs
-            ? shouldEmitWarning(`${operation}:${result}`)
+            ? shouldEmitWarning(
+                `${operation}:${result}:${fingerprint ?? 'unknown'}`,
+              )
             : null;
         if (suppressedCount !== null) {
           const requestContext = getRequestContext();
-          const fingerprint = queryFingerprint(query);
           logger.warn(
             {
               event: 'database_operation_slow',

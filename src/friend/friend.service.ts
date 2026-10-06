@@ -1005,15 +1005,27 @@ export class FriendService {
       });
     }
 
-    const field = friendship.userID === userId ? 'permissionA' : 'permissionB';
-    // Re-check the state in the write predicate. The friendship can be
-    // blocked or removed after the read above; updating by id alone would
-    // let a stale request mutate a no-longer-accepted friendship.
-    const updated = await this.prisma.friend.updateMany({
-      where: { id: friendship.id, state: FriendState.ACCEPTED },
-      data: { [field]: permission },
-    });
-    if (updated.count === 0) {
+    // Historical duplicates can exist in either orientation. Update every
+    // accepted grant atomically, including the state predicate in each write.
+    const updated = await this.prisma.$transaction([
+      this.prisma.friend.updateMany({
+        where: {
+          userID: userId,
+          friendID: friendUserId,
+          state: FriendState.ACCEPTED,
+        },
+        data: { permissionA: permission },
+      }),
+      this.prisma.friend.updateMany({
+        where: {
+          userID: friendUserId,
+          friendID: userId,
+          state: FriendState.ACCEPTED,
+        },
+        data: { permissionB: permission },
+      }),
+    ]);
+    if (updated.every((result) => result.count === 0)) {
       throw new NotFoundException({
         message: 'Friendship not found',
         errorCode: FriendErrorCode.FriendshipNotFound,

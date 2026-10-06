@@ -192,6 +192,48 @@ describe('database operation timing', () => {
     });
   });
 
+  it('tracks slow-query suppression independently for distinct fingerprints', async () => {
+    const { factory } = fixture();
+    let elapsed = 0;
+    let warningClock = 0;
+    const observed = observeDatabaseAdapter(
+      factory as unknown as PrismaPg,
+      logger,
+      config,
+      () => {
+        elapsed += 1500;
+        return elapsed;
+      },
+      () => warningClock,
+    );
+    const connection = await observed.connect();
+    const first = {
+      sql: 'SELECT id FROM table_a WHERE id = $1',
+      args: ['a'],
+      argTypes: [],
+    };
+    const second = { ...first, sql: 'SELECT id FROM table_b WHERE id = $1' };
+    await connection.queryRaw(first);
+    await connection.queryRaw(second);
+    await connection.queryRaw(first);
+    warningClock = 60_001;
+    await connection.queryRaw(first);
+    await connection.queryRaw(second);
+    const events = (logger.warn as jest.Mock).mock.calls.map(
+      ([event]) => event,
+    );
+    expect(events).toHaveLength(4);
+    expect(events[0].queryFingerprint).not.toBe(events[1].queryFingerprint);
+    expect(events[2]).toMatchObject({
+      queryFingerprint: events[0].queryFingerprint,
+      suppressedCount: 1,
+    });
+    expect(events[3]).toMatchObject({
+      queryFingerprint: events[1].queryFingerprint,
+      suppressedCount: 0,
+    });
+  });
+
   it('retains transaction methods and options while timing their queries', async () => {
     const { factory, adapter, transaction, rows } = fixture();
     const originalQuery = transaction.queryRaw;

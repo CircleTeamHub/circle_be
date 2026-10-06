@@ -18,7 +18,7 @@ import { sanitizeLogValue } from 'src/logging/log-sanitizer';
  *   useful for reuse-detection forensics (the reuse check only matters within a
  *   token's own validity window).
  *
- * Runs daily off-peak in bounded batches. Notification / FriendActivity
+ * Runs every ten minutes in bounded batches. Notification / FriendActivity
  * retention is intentionally left out — pruning user-visible history is a
  * product decision, not housekeeping.
  */
@@ -31,7 +31,7 @@ export class RefreshTokenCleanup {
 
   constructor(private readonly prisma: PrismaService) {}
 
-  @TrackedCron(CronExpression.EVERY_DAY_AT_4AM, 'refresh_token_cleanup')
+  @TrackedCron(CronExpression.EVERY_10_MINUTES, 'refresh_token_cleanup')
   async sweep(now: Date = new Date()): Promise<void> {
     const revokedCutoff = new Date(
       now.getTime() -
@@ -41,6 +41,7 @@ export class RefreshTokenCleanup {
       OR: [{ expiredAt: { lt: now } }, { revokedAt: { lt: revokedCutoff } }],
     } satisfies Prisma.RefreshTokenWhereInput;
     let count = 0;
+    let capped = false;
     try {
       for (
         let batch = 0;
@@ -64,9 +65,17 @@ export class RefreshTokenCleanup {
         });
         count += deleted.count;
         if (candidates.length < RefreshTokenCleanup.BATCH_SIZE) break;
+        capped = batch === RefreshTokenCleanup.MAX_BATCHES_PER_RUN - 1;
       }
       if (count > 0) {
         this.logger.log(`Pruned ${count} expired/revoked refresh tokens`);
+      }
+      if (capped) {
+        this.logger.warn({
+          event: 'refresh_token_cleanup_capped',
+          deletedCount: count,
+          nextRunInMinutes: 10,
+        });
       }
     } catch (err) {
       reportOperationalError(err, {

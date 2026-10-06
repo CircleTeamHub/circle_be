@@ -213,7 +213,7 @@ export class NotificationPushService {
     const byUser = new Map<string, PushTokenTarget[]>();
     if (userIds.length === 0) return byUser;
     const uniqueUserIds = [...new Set(userIds)];
-    const providers = this.isJPushConfigured() ? ['expo', 'jpush'] : ['expo'];
+    const providers = ['expo', 'jpush'];
     // Cap per user/provider in SQL. Legacy rows can exceed the registration
     // limit, and pulling every one for a large group fan-out wastes DB and JS
     // memory before the same cap is applied below.

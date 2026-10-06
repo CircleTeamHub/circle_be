@@ -120,9 +120,12 @@ export class ChatCircleSyncService {
       'chat_circle_sync',
       ChatCircleSyncService.RECONCILE_LEASE_MS,
       async () => {
-        let changed: string[];
+        let scan: {
+          circleIds: string[];
+          nextCursor: CircleSyncScanCursor | null;
+        };
         try {
-          changed = await this.scanChangedCircles(since);
+          scan = await this.scanChangedCircles(since);
         } catch (error) {
           attemptDiagnostic(() =>
             this.logger.error(
@@ -138,7 +141,9 @@ export class ChatCircleSyncService {
           reportHandledJobFailure();
           return;
         }
-        await this.reconcileCircles(changed);
+        if (await this.reconcileCircles(scan.circleIds)) {
+          await this.writeScanCursor(scan.nextCursor);
+        }
       },
     );
     if (leased) return;
@@ -151,15 +156,17 @@ export class ChatCircleSyncService {
     await this.reconcileCircles([]);
   }
 
-  private async reconcileCircles(changed: string[]): Promise<void> {
+  private async reconcileCircles(changed: string[]): Promise<boolean> {
     // 上轮失败的圈子跟着重试:只靠窗口重叠的话,连续失败超过 2 分钟就永远
     // 掉出扫描范围,被踢成员的座位会一直留着(还能读能发)。
     const pending = [...this.retryQueue];
     this.retryQueue.clear();
+    let succeeded = true;
     for (const circleID of new Set([...changed, ...pending])) {
       try {
         await this.ensureCircleConversation(circleID);
       } catch (error) {
+        succeeded = false;
         // 单圈失败不拖垮整轮;排进重试队列,直到成功为止。
         if (this.retryQueue.size < ChatCircleSyncService.RETRY_QUEUE_MAX) {
           this.retryQueue.add(circleID);
@@ -176,15 +183,27 @@ export class ChatCircleSyncService {
         );
       }
     }
+    return succeeded;
   }
 
   /**
    * 窗口内发生过成员变更的圈子。按 (updatedAt,circleID) 逐批轮转，超过
    * 单轮上限时把水位写入 Redis，下一轮从上次位置继续，避免每分钟重复扫批首部。
    */
-  private async scanChangedCircles(since: Date): Promise<string[]> {
+  private async scanChangedCircles(
+    since: Date,
+  ): Promise<{ circleIds: string[]; nextCursor: CircleSyncScanCursor | null }> {
     const cursor = await this.readScanCursor(since);
     const scanSince = cursor ? new Date(cursor.windowSince) : since;
+    // Persist the starting window before work begins. A restart must replay
+    // this page even if its rows have left the moving two-minute window.
+    if (!cursor) {
+      await this.writeScanCursor({
+        windowSince: scanSince.toISOString(),
+        updatedAt: scanSince.toISOString(),
+        circleID: '',
+      });
+    }
     const rows = cursor
       ? await this.prisma.$queryRaw<CircleSyncScanRow[]>(Prisma.sql`
           SELECT "circleID", "updatedAt"
@@ -203,24 +222,24 @@ export class ChatCircleSyncService {
         `);
 
     const last = rows[rows.length - 1];
+    let nextCursor: CircleSyncScanCursor | null = null;
     if (rows.length >= ChatCircleSyncService.RECONCILE_SCAN_MAX && last) {
       const updatedAt = this.parseScanTimestamp(last.updatedAt);
       if (updatedAt) {
-        await this.writeScanCursor({
+        nextCursor = {
           windowSince: scanSince.toISOString(),
           updatedAt: updatedAt.toISOString(),
           circleID: last.circleID,
-        });
-      } else {
-        await this.writeScanCursor(null);
+        };
       }
       this.logger.warn(
         `reconcile scan hit the ${ChatCircleSyncService.RECONCILE_SCAN_MAX}-row cap; remainder continues from the saved cursor`,
       );
-    } else {
-      await this.writeScanCursor(null);
     }
-    return [...new Set(rows.map((row) => row.circleID))];
+    return {
+      circleIds: [...new Set(rows.map((row) => row.circleID))],
+      nextCursor,
+    };
   }
 
   private parseScanTimestamp(value: unknown): Date | null {

@@ -112,4 +112,22 @@ describe('FriendController routes', () => {
       'CHAT_ONLY',
     );
   });
+
+  it.each([
+    'aabbccdd-1122-0000-0000-123456789abc',
+    'aabbccdd112200000000123456789abc',
+  ])(
+    'accepts persisted or legacy user ID %s on the permission route',
+    async (id) => {
+      await request(app.getHttpServer())
+        .patch(`/friend/${id}/permission`)
+        .send({ permission: 'FULL' })
+        .expect(204);
+      expect(friendService.setFriendPermission).toHaveBeenCalledWith(
+        'user-1',
+        'aabbccdd-1122-0000-0000-123456789abc',
+        'FULL',
+      );
+    },
+  );
 });

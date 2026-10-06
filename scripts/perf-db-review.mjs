@@ -52,15 +52,13 @@ function isLocalDatabaseUrl(databaseUrl) {
   if (!databaseUrl) return false;
   try {
     const parsed = new URL(databaseUrl);
-    return new Set(['localhost', '127.0.0.1', '::1', 'postgres', 'db']).has(
-      parsed.hostname,
-    );
+    return new Set(['localhost', '127.0.0.1', '[::1]']).has(parsed.hostname);
   } catch {
     return false;
   }
 }
 
-function assertAllowed(env, databaseUrl) {
+export function assertAllowed(env, databaseUrl) {
   if (!isTruthy(env.PERF_DB_REVIEW)) {
     throw new Error(
       'Refusing to run the database review. Set PERF_DB_REVIEW=1 for an explicit disposable-data run.',
