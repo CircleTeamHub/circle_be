@@ -266,6 +266,7 @@ const MAX_GROUPS_PER_USER = 50;
 // expire: their replay remains safe even after the target note is deleted.
 const NOTE_DRAFT_DISCARD_RETENTION_MS = 30 * 24 * 60 * 60 * 1000;
 const MAX_NOTE_DISCARDED_DRAFTS = 1000;
+export const MAX_NOTE_EDIT_PUBLICATION_OUTCOMES = 10_000;
 
 // Keep derived title/content in sync with the DTO's @MaxLength caps — text
 // extracted from contentJson blocks otherwise bypasses DTO validation.
@@ -699,19 +700,27 @@ export class NoteService {
       );
     }
 
-    // A returned circleId is only a readback hint. Resolve it from the card's
-    // id rather than persisting a client-supplied navigation target. Retain
-    // trusted source-note snapshots when editing after membership changes.
-    const canonicalGroups = await this.canonicalizeNoteCards(
+    // Resolve cards from their ids rather than persisting client-selected
+    // profile fields or navigation targets. Retain trusted source-note
+    // snapshots when editing after friendship or membership changes.
+    const canonicalCards = await this.canonicalizeNoteCards(
       ownerID,
-      { sections: { groups: input.sections?.groups } },
+      {
+        sections: {
+          groups: input.sections?.groups,
+          contacts: input.sections?.contacts,
+        },
+      },
       sourceSections,
     );
     const sections = input.sections
       ? {
           ...input.sections,
           ...(input.sections.groups
-            ? { groups: canonicalGroups.sections?.groups }
+            ? { groups: canonicalCards.sections?.groups }
+            : {}),
+          ...(input.sections.contacts
+            ? { contacts: canonicalCards.sections?.contacts }
             : {}),
         }
       : undefined;
@@ -953,10 +962,40 @@ export class NoteService {
       );
   }
 
+  private async assertNoteEditOutcomeCapacity(
+    tx: Pick<Prisma.TransactionClient, 'noteDraft'>,
+    ownerID: string,
+    noteId: string,
+  ): Promise<void> {
+    // Called under the owner lock, after replay. The sourceNoteID index keeps
+    // this count local to the note; create outcomes have no sourceNoteID.
+    const current = await tx.noteDraft.count({
+      where: {
+        ownerID,
+        sourceNoteID: noteId,
+        publishedNoteID: { not: null },
+      },
+    });
+    if (current >= MAX_NOTE_EDIT_PUBLICATION_OUTCOMES)
+      throw new ForbiddenException({
+        message:
+          'This note has reached its saved edit result limit. Keep your draft and save these edits as a new note.',
+        errorCode: NoteErrorCode.PublicationQuotaReached,
+        quota: 'notePublicationEdits',
+        limit: MAX_NOTE_EDIT_PUBLICATION_OUTCOMES,
+        current,
+        details: {
+          quota: 'notePublicationEdits',
+          limit: MAX_NOTE_EDIT_PUBLICATION_OUTCOMES,
+          current,
+        },
+      });
+  }
+
   /**
    * Active storage is one owned, non-deleted Note row. Group memberships do
-   * not add slots, and DELETED rows release capacity because the API has no
-   * restore path (all writable-note lookups exclude DELETED).
+   * not add slots, and DELETED rows release capacity. Restoring a note must
+   * pass this same gate; ordinary writable-note lookups exclude DELETED.
    */
   private async assertNoteStorageAvailable(
     tx: Prisma.TransactionClient,
@@ -3695,13 +3734,6 @@ export class NoteService {
         noteId,
       );
       if (replay) return replay;
-      if (canonicalInput.clientDraftID)
-        await this.consumeNoteDraft(
-          tx,
-          ownerID,
-          canonicalInput.clientDraftID,
-          noteId,
-        );
       // Re-verify ownership inside the transaction to prevent TOCTOU races
       // where a concurrent delete could cause this update to un-delete the note.
       const existing = await tx.note.findFirst({
@@ -3713,6 +3745,16 @@ export class NoteService {
           message: 'Note not found',
           errorCode: NoteErrorCode.NotFound,
         });
+      }
+
+      if (canonicalInput.clientDraftID) {
+        await this.assertNoteEditOutcomeCapacity(tx, ownerID, noteId);
+        await this.consumeNoteDraft(
+          tx,
+          ownerID,
+          canonicalInput.clientDraftID,
+          noteId,
+        );
       }
 
       await tx.noteMedia.deleteMany({

@@ -4,7 +4,10 @@ import { ConfigService } from '@nestjs/config';
 import { JwtService } from '@nestjs/jwt';
 import request from 'supertest';
 import { PrismaService } from 'src/prisma/prisma.service';
-import { NoteService } from 'src/note/note.service';
+import {
+  MAX_NOTE_EDIT_PUBLICATION_OUTCOMES,
+  NoteService,
+} from 'src/note/note.service';
 import { UploadService } from 'src/upload/upload.service';
 import { getE2eApp } from './e2e-context';
 
@@ -696,6 +699,230 @@ describeDatabase('Note draft consumption concurrency', () => {
       expect(await prisma.note.count({ where: { ownerID: user.id } })).toBe(1);
     },
   );
+
+  it('serializes the last keyed edit outcome slot, retains old replays, and keeps the cap across delete/restore', async () => {
+    const { http, token, prisma, user, service } = await account();
+    const creation = {
+      title: 'Original',
+      media: [],
+      clientDraftID: 'quota-create',
+    };
+    const created = await http
+      .post('/api/v1/note')
+      .set('Authorization', `Bearer ${token}`)
+      .send(creation)
+      .expect(201);
+    const id = body(created).id;
+    await prisma.noteDraft.createMany({
+      data: Array.from(
+        { length: MAX_NOTE_EDIT_PUBLICATION_OUTCOMES - 1 },
+        (_, index) => ({
+          ownerID: user.id,
+          clientDraftID: `quota-history-${index}`,
+          sourceNoteID: id,
+          publishedNoteID: id,
+          consumedAt: new Date(Date.now() - 60 * 24 * 60 * 60 * 1000),
+        }),
+      ),
+    });
+    const edits = ['last-slot-a', 'last-slot-b'].map((clientDraftID) => ({
+      title: clientDraftID,
+      media: [],
+      clientDraftID,
+    }));
+    for (const edit of edits)
+      await service.saveNoteDraft(user.id, edit.clientDraftID, {
+        sourceNoteId: id,
+        title: edit.title,
+      });
+    const responses = await Promise.all(
+      edits.map((edit) =>
+        http
+          .patch(`/api/v1/note/${id}`)
+          .set('Authorization', `Bearer ${token}`)
+          .send(edit),
+      ),
+    );
+    expect(
+      responses.map((response) => response.status).sort((a, b) => a - b),
+    ).toEqual([200, 403]);
+    const winner = responses.findIndex((response) => response.status === 200);
+    const loser = 1 - winner;
+    expect(responses[loser].body).toMatchObject({
+      errorCode: 'NOTE_PUBLICATION_QUOTA_REACHED',
+      data: {
+        limit: MAX_NOTE_EDIT_PUBLICATION_OUTCOMES,
+        current: MAX_NOTE_EDIT_PUBLICATION_OUTCOMES,
+      },
+    });
+    const count = () =>
+      prisma.noteDraft.count({
+        where: {
+          ownerID: user.id,
+          sourceNoteID: id,
+          publishedNoteID: { not: null },
+        },
+      });
+    expect(await count()).toBe(MAX_NOTE_EDIT_PUBLICATION_OUTCOMES);
+    const retained = await prisma.noteDraft.findUniqueOrThrow({
+      where: {
+        ownerID_clientDraftID: {
+          ownerID: user.id,
+          clientDraftID: edits[loser].clientDraftID,
+        },
+      },
+    });
+    expect(retained.consumedAt).toBeNull();
+    expect(retained.title).toBe(edits[loser].title);
+    await http
+      .delete(`/api/v1/note/drafts/${edits[winner].clientDraftID}`)
+      .set('Authorization', `Bearer ${token}`)
+      .expect(204);
+    const replay = await http
+      .patch(`/api/v1/note/${id}`)
+      .set('Authorization', `Bearer ${token}`)
+      .send({
+        title: 'Must not roll back',
+        media: [],
+        clientDraftID: 'quota-history-0',
+      })
+      .expect(200);
+    expect(body(replay).title).toBe(edits[winner].title);
+    await http
+      .post('/api/v1/note')
+      .set('Authorization', `Bearer ${token}`)
+      .send(creation)
+      .expect(201);
+    expect(await count()).toBe(MAX_NOTE_EDIT_PUBLICATION_OUTCOMES);
+    expect(await prisma.note.count({ where: { ownerID: user.id } })).toBe(1);
+    await http
+      .delete(`/api/v1/note/${id}`)
+      .set('Authorization', `Bearer ${token}`)
+      .expect(204);
+    await http
+      .patch(`/api/v1/note/${id}`)
+      .set('Authorization', `Bearer ${token}`)
+      .send(edits[winner])
+      .expect(404);
+    await http
+      .post(`/api/v1/note/${id}/restore`)
+      .set('Authorization', `Bearer ${token}`)
+      .expect(201);
+    await http
+      .patch(`/api/v1/note/${id}`)
+      .set('Authorization', `Bearer ${token}`)
+      .send(edits[loser])
+      .expect(403);
+    expect(await count()).toBe(MAX_NOTE_EDIT_PUBLICATION_OUTCOMES);
+    expect((await prisma.note.findUniqueOrThrow({ where: { id } })).title).toBe(
+      edits[winner].title,
+    );
+    await http
+      .post('/api/v1/note')
+      .set('Authorization', `Bearer ${token}`)
+      .send({ title: retained.title, media: [], clientDraftID: 'save-as-new' })
+      .expect(201);
+    expect(await prisma.note.count({ where: { ownerID: user.id } })).toBe(2);
+  });
+
+  it('roundtrips a contacts-only partial draft, canonicalizes friends, and retains only owned source snapshots after friendship loss', async () => {
+    const owner = await account();
+    const friend = await account();
+    const stranger = await account();
+    const { http, token, prisma, user } = owner;
+    const relation = await prisma.friend.create({
+      data: { userID: user.id, friendID: friend.user.id, state: 'ACCEPTED' },
+    });
+    const forged = {
+      id: friend.user.id,
+      name: 'Forged profile',
+      faceURL: 'https://storage.test/bucket/private/forged.jpg',
+    };
+    const expected = {
+      id: friend.user.id,
+      name: friend.user.nickname,
+      faceURL: null,
+    };
+    const draft = await http
+      .put('/api/v1/note/drafts/contact-only')
+      .set('Authorization', `Bearer ${token}`)
+      .send({
+        title: 'Contact only',
+        sections: { contacts: { items: [forged] } },
+      })
+      .expect(200);
+    expect(body(draft).sections).toEqual({ contacts: { items: [expected] } });
+    const restored = await http
+      .get('/api/v1/note/drafts/contact-only')
+      .set('Authorization', `Bearer ${token}`)
+      .expect(200);
+    await http
+      .put('/api/v1/note/drafts/contact-only')
+      .set('Authorization', `Bearer ${token}`)
+      .send({ title: 'Contact only', sections: body(restored).sections })
+      .expect(200);
+    const stored = await prisma.noteDraft.findUniqueOrThrow({
+      where: {
+        ownerID_clientDraftID: {
+          ownerID: user.id,
+          clientDraftID: 'contact-only',
+        },
+      },
+    });
+    expect(stored.sections).toEqual({ contacts: { items: [expected] } });
+    await http
+      .put('/api/v1/note/drafts/stranger')
+      .set('Authorization', `Bearer ${token}`)
+      .send({
+        sections: {
+          contacts: {
+            items: [
+              {
+                id: stranger.user.id,
+                name: 'Forged stranger',
+                faceURL: forged.faceURL,
+              },
+            ],
+          },
+        },
+      })
+      .expect(403);
+    expect(
+      await prisma.noteDraft.count({
+        where: { ownerID: user.id, clientDraftID: 'stranger' },
+      }),
+    ).toBe(0);
+    const published = await http
+      .post('/api/v1/note')
+      .set('Authorization', `Bearer ${token}`)
+      .send({ title: 'Snapshot', media: [], sections: body(restored).sections })
+      .expect(201);
+    const id = body(published).id;
+    await prisma.friend.delete({ where: { id: relation.id } });
+    const retained = await http
+      .put('/api/v1/note/drafts/lost-friend')
+      .set('Authorization', `Bearer ${token}`)
+      .send({ sourceNoteId: id, sections: { contacts: { items: [forged] } } })
+      .expect(200);
+    expect(body(retained).sections).toEqual({
+      contacts: { items: [expected] },
+    });
+    await http
+      .put('/api/v1/note/drafts/new-stranger')
+      .set('Authorization', `Bearer ${token}`)
+      .send({
+        sourceNoteId: id,
+        sections: {
+          contacts: { items: [{ id: stranger.user.id, name: 'New stranger' }] },
+        },
+      })
+      .expect(403);
+    await stranger.http
+      .put('/api/v1/note/drafts/stolen-source')
+      .set('Authorization', `Bearer ${stranger.token}`)
+      .send({ sourceNoteId: id, sections: { contacts: { items: [forged] } } })
+      .expect(404);
+  });
 
   it.each(['create', 'update'] as const)(
     'serializes simultaneous %s publications of the same draft',

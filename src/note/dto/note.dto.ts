@@ -743,6 +743,37 @@ export class NoteSectionsResponseDto {
   } | null;
 }
 
+export class NoteDraftTextSectionResponseDto {
+  @ApiPropertyOptional({ type: String, nullable: true }) content?:
+    | string
+    | null;
+  @ApiPropertyOptional({ type: [Object], nullable: true }) contentJson?:
+    | Record<string, unknown>[]
+    | null;
+}
+
+/** Drafts preserve omitted sections and fields rather than filling published defaults. */
+export class NoteDraftSectionsResponseDto {
+  @ApiPropertyOptional({ type: NoteDraftTextSectionResponseDto })
+  text?: NoteDraftTextSectionResponseDto;
+  @ApiPropertyOptional({ type: NoteMediaSectionResponseDto })
+  media?: NoteMediaSectionResponseDto;
+  @ApiPropertyOptional({ type: NoteMediaSectionResponseDto })
+  showcase?: NoteMediaSectionResponseDto;
+  @ApiPropertyOptional({ type: NoteMediaSectionResponseDto })
+  audio?: NoteMediaSectionResponseDto;
+  @ApiPropertyOptional({ type: NoteContactSectionResponseDto })
+  contacts?: NoteContactSectionResponseDto;
+  @ApiPropertyOptional({ type: NoteGroupCardSectionResponseDto })
+  groups?: NoteGroupCardSectionResponseDto;
+  @ApiPropertyOptional({ nullable: true }) location?: {
+    title?: string;
+    address?: string;
+    latitude?: number;
+    longitude?: number;
+  } | null;
+}
+
 export class NoteSummaryDto {
   @ApiProperty() id: string;
   @ApiProperty() ownerId: string;
@@ -796,8 +827,8 @@ export class NoteDraftDto extends NoteDraftSummaryDto {
   @ApiPropertyOptional({ type: [Object], nullable: true }) contentJson:
     | Record<string, unknown>[]
     | null;
-  @ApiPropertyOptional({ type: NoteSectionsResponseDto, nullable: true })
-  sections: NoteSectionsResponseDto | null;
+  @ApiPropertyOptional({ type: NoteDraftSectionsResponseDto, nullable: true })
+  sections: NoteDraftSectionsResponseDto | null;
   @ApiProperty({ type: [String] }) groupIds: string[];
   @ApiProperty({ type: [String] }) mediaKeys: string[];
 }

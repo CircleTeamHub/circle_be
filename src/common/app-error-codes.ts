@@ -253,6 +253,7 @@ export const FriendErrorCode = {
 // 上限类原文含数字,前端用固定文案。
 export const NoteErrorCode = {
   StorageQuotaReached: 'NOTE_STORAGE_QUOTA_REACHED',
+  PublicationQuotaReached: 'NOTE_PUBLICATION_QUOTA_REACHED',
   GroupExists: 'NOTE_GROUP_EXISTS',
   GroupLimit: 'NOTE_GROUP_LIMIT',
   ExportNoMedia: 'NOTE_EXPORT_NO_MEDIA',

@@ -9,8 +9,11 @@ import {
 } from '@nestjs/common';
 import { ApiOkResponse, DocumentBuilder, SwaggerModule } from '@nestjs/swagger';
 import { Test } from '@nestjs/testing';
-import { NoteService } from './note.service';
-import { NoteDraftDto, NoteSummaryDto } from './dto/note.dto';
+import {
+  MAX_NOTE_EDIT_PUBLICATION_OUTCOMES,
+  NoteService,
+} from './note.service';
+import { NoteDetailDto, NoteDraftDto, NoteSummaryDto } from './dto/note.dto';
 import { Prisma } from 'src/generated/prisma';
 
 describe('note review regressions', () => {
@@ -300,6 +303,105 @@ describe('note review regressions', () => {
     ).rejects.toBeInstanceOf(ForbiddenException);
   });
 
+  it('rejects a non-friend draft contact before persisting its forged name and storage reference', async () => {
+    const { service, prisma } = fixture();
+    await expect(
+      service.saveNoteDraft('owner', 'draft-1', {
+        sections: {
+          contacts: {
+            items: [
+              {
+                id: 'stranger',
+                name: 'Forged',
+                faceURL: 'https://storage.test/bucket/private/avatar.jpg',
+              },
+            ],
+          },
+        },
+      }),
+    ).rejects.toBeInstanceOf(ForbiddenException);
+    expect(prisma.noteDraft.upsert).not.toHaveBeenCalled();
+  });
+
+  it('resolves an accepted friend draft card from the server profile', async () => {
+    const { service, prisma } = fixture();
+    prisma.friend.findMany.mockResolvedValue([
+      {
+        userID: 'owner',
+        friend: {
+          id: 'friend',
+          nickname: 'Actual name',
+          avatarUrl: 'https://storage.test/bucket/avatars/friend.jpg',
+        },
+      },
+    ] as any);
+    const result = await service.saveNoteDraft('owner', 'draft-1', {
+      sections: {
+        contacts: {
+          items: [
+            {
+              id: 'friend',
+              name: 'Forged',
+              faceURL: 'https://storage.test/bucket/private/forged.jpg',
+            },
+          ],
+        },
+      },
+    });
+    const contacts = {
+      items: [
+        {
+          id: 'friend',
+          name: 'Actual name',
+          faceURL: 'https://storage.test/bucket/avatars/friend.jpg',
+        },
+      ],
+    };
+    expect(result.sections).toEqual({ contacts });
+    expect(prisma.noteDraft.upsert.mock.calls[0][0].create.sections).toEqual({
+      contacts,
+    });
+  });
+
+  it('grandfathers an owned source contact snapshot after friendship is lost but rejects a new stranger', async () => {
+    const { service, prisma } = fixture();
+    const card = { id: 'former-friend', name: 'Saved name', faceURL: null };
+    prisma.note.findFirst.mockResolvedValueOnce({
+      id: 'source',
+      sections: { contacts: { items: [card] } },
+    } as any);
+    const input = {
+      sourceNoteId: 'source',
+      sections: {
+        contacts: {
+          items: [
+            {
+              ...card,
+              name: 'Forged',
+              faceURL: 'https://storage.test/bucket/private/forged.jpg',
+            },
+          ],
+        },
+      },
+    };
+    expect(
+      (await service.saveNoteDraft('owner', 'draft-1', input)).sections,
+    ).toEqual({ contacts: { items: [card] } });
+    expect(prisma.friend.findMany).not.toHaveBeenCalled();
+    prisma.note.findFirst.mockResolvedValueOnce({
+      id: 'source',
+      sections: { contacts: { items: [card] } },
+    } as any);
+    await expect(
+      service.saveNoteDraft('owner', 'draft-2', {
+        ...input,
+        sections: {
+          contacts: { items: [{ id: 'stranger', name: 'New stranger' }] },
+        },
+      }),
+    ).rejects.toBeInstanceOf(ForbiddenException);
+  });
+
   it('returns the NoteMedia audio total even when the explicit section is empty', () => {
     const { service } = fixture();
     const summary = (service as any).mapSummary(
@@ -458,6 +560,7 @@ describe('note review regressions', () => {
     @Controller('drafts')
     class ProbeController {
       @Get() @ApiOkResponse({ type: NoteDraftDto }) get() {}
+      @Get('published') @ApiOkResponse({ type: NoteDetailDto }) published() {}
     }
     const module = await Test.createTestingModule({
       controllers: [ProbeController],
@@ -469,6 +572,21 @@ describe('note review regressions', () => {
         new DocumentBuilder().setTitle('Test').setVersion('1').build(),
       );
       const schemas = doc.components!.schemas! as Record<string, any>;
+      expect(schemas.NoteDraftDto.properties.sections).toMatchObject({
+        nullable: true,
+        allOf: [{ $ref: '#/components/schemas/NoteDraftSectionsResponseDto' }],
+      });
+      expect(schemas.NoteDraftSectionsResponseDto.required ?? []).toEqual([]);
+      expect(schemas.NoteDraftTextSectionResponseDto.required ?? []).toEqual(
+        [],
+      );
+      expect(schemas.NoteDraftTextSectionResponseDto.properties).toMatchObject({
+        content: { type: 'string', nullable: true },
+        contentJson: { type: 'array', nullable: true },
+      });
+      expect(schemas.NoteSectionsResponseDto.required).toEqual(
+        expect.arrayContaining(['text', 'media', 'showcase']),
+      );
       for (const [section, name] of [
         ['audio', 'NoteMediaSectionResponseDto'],
         ['contacts', 'NoteContactSectionResponseDto'],
@@ -476,6 +594,9 @@ describe('note review regressions', () => {
       ]) {
         expect(
           schemas.NoteSectionsResponseDto.properties[section],
+        ).toMatchObject({ $ref: `#/components/schemas/${name}` });
+        expect(
+          schemas.NoteDraftSectionsResponseDto.properties[section],
         ).toMatchObject({ $ref: `#/components/schemas/${name}` });
         expect(schemas[name].properties.items).toMatchObject({
           type: 'array',
@@ -921,6 +1042,74 @@ describe('note review regressions', () => {
       (await service.getNote('owner', 'note-1')).sections.groups.items,
     ).toEqual([expected]);
   });
+
+  it('rejects a new keyed edit at the outcome cap before consuming its draft or changing the note', async () => {
+    const { service, prisma, draft } = publicationFixture('note-1');
+    prisma.noteDraft.count.mockResolvedValue(
+      MAX_NOTE_EDIT_PUBLICATION_OUTCOMES,
+    );
+    await expect(
+      service.updateNote('owner', 'note-1', {
+        title: 'Must remain a draft',
+        media: [],
+        clientDraftID: 'draft-1',
+      }),
+    ).rejects.toMatchObject({
+      response: {
+        errorCode: 'NOTE_PUBLICATION_QUOTA_REACHED',
+        limit: MAX_NOTE_EDIT_PUBLICATION_OUTCOMES,
+        current: MAX_NOTE_EDIT_PUBLICATION_OUTCOMES,
+      },
+      status: 403,
+    });
+    expect(prisma.noteDraft.count).toHaveBeenCalledWith({
+      where: {
+        ownerID: 'owner',
+        sourceNoteID: 'note-1',
+        publishedNoteID: { not: null },
+      },
+    });
+    expect(draft().consumedAt).toBeNull();
+    expect(prisma.noteDraft.upsert).not.toHaveBeenCalled();
+    expect((prisma.note as any).update).not.toHaveBeenCalled();
+    expect(prisma.noteMedia.deleteMany).not.toHaveBeenCalled();
+  });
+
+  it('permits a committed edit replay and editor cleanup at capacity without another quota check', async () => {
+    const { service, prisma, draft } = publicationFixture('note-1');
+    const input = { title: 'Committed', media: [], clientDraftID: 'draft-1' };
+    await service.updateNote('owner', 'note-1', input);
+    prisma.noteDraft.count
+      .mockClear()
+      .mockResolvedValue(MAX_NOTE_EDIT_PUBLICATION_OUTCOMES);
+    await service.deleteNoteDraft('owner', 'draft-1');
+    expect((await service.updateNote('owner', 'note-1', input)).id).toBe(
+      'note-1',
+    );
+    expect(prisma.noteDraft.count).not.toHaveBeenCalled();
+    expect(draft().publishedNoteID).toBe('note-1');
+    expect((prisma.note as any).update).toHaveBeenCalledTimes(1);
+  });
+
+  it.each(['create', 'unkeyed edit'] as const)(
+    'does not apply a per-note PATCH outcome cap to %s',
+    async (action) => {
+      const { service, prisma } = publicationFixture(
+        action === 'create' ? null : 'note-1',
+      );
+      prisma.noteDraft.count.mockResolvedValue(
+        MAX_NOTE_EDIT_PUBLICATION_OUTCOMES,
+      );
+      const input = {
+        title: 'Allowed',
+        media: [],
+        ...(action === 'create' ? { clientDraftID: 'draft-1' } : {}),
+      };
+      if (action === 'create') await service.createNote('owner', input);
+      else await service.updateNote('owner', 'note-1', input);
+      expect(prisma.noteDraft.count).not.toHaveBeenCalled();
+    },
+  );
 
   it.each(['create', 'update'] as const)(
     'replays %s once after a post-commit signing failure and editor draft deletion',
