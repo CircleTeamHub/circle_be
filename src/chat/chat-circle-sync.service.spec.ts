@@ -3,6 +3,7 @@ import { LoggerService } from '@nestjs/common';
 import { WinstonModule } from 'nest-winston';
 import * as winston from 'winston';
 import { createWinstonOptions } from '../logging/winston-options';
+import { RedisService } from '../redis/redis.service';
 
 describe('ChatCircleSyncService', () => {
   const prisma = {
@@ -766,7 +767,7 @@ describe('ChatCircleSyncService', () => {
         expect(
           (prisma.$queryRaw.mock.calls[1][0] as any).values,
         ).toContainEqual(since);
-        expect(checkpoint).toBeNull();
+        expect(checkpoint).toEqual({ completed: true });
       } finally {
         clock.mockRestore();
         ensure.mockRestore();
@@ -856,6 +857,186 @@ describe('circle sync durable scan progress', () => {
     redis.setJson.mockResolvedValue(false);
     redis.setJsonIfVersionMatches.mockResolvedValue(true);
   });
+  it('starts a fresh window when another replica completes its retained local checkpoint', async () => {
+    const start = Date.parse('2026-10-06T10:00:00Z');
+    const clock = jest.spyOn(Date, 'now').mockReturnValue(start);
+    let checkpoint: unknown = null;
+    let owner: string | null = null;
+    let leaseNumber = 0;
+    redis.tryAcquireLease.mockImplementation(async () => {
+      if (owner !== null) return null;
+      owner = `lease-${++leaseNumber}`;
+      return owner;
+    });
+    redis.releaseLease.mockImplementation(async (_key, token) => {
+      if (token === owner) owner = null;
+    });
+    redis.getJsonMany.mockImplementation(async () => [checkpoint]);
+    redis.setJsonIfVersionMatches.mockImplementation(
+      async (_key, _leaseKey, token, value) => {
+        if (token !== owner) return false;
+        checkpoint = value;
+        return true;
+      },
+    );
+    const rows = Array.from({ length: 10_001 }, (_, index) => ({
+      circleID: `old-${String(index).padStart(5, '0')}`,
+      updatedAt: new Date(start - 60_000 + index),
+    }));
+    prisma.$queryRaw.mockImplementation(async (query) => {
+      const [since] = query.values;
+      const [after, afterId] =
+        query.values.length === 4 ? query.values.slice(1, 3) : [];
+      return rows
+        .filter(
+          (row) =>
+            row.updatedAt > since &&
+            (!after ||
+              row.updatedAt > after ||
+              (+row.updatedAt === +after && row.circleID > afterId)),
+        )
+        .slice(0, 10_000);
+    });
+    const a = make();
+    const b = make();
+    const ensureA = jest
+      .spyOn(a, 'ensureCircleConversation')
+      .mockResolvedValue('conv');
+    const ensureB = jest
+      .spyOn(b, 'ensureCircleConversation')
+      .mockResolvedValue('conv');
+    try {
+      await a.reconcileRecent();
+      const aCheckpoint = (a as any).scanCursor;
+      expect(aCheckpoint.circleID).toBe(rows[9999].circleID);
+      clock.mockReturnValue(start + 60_000);
+      await b.reconcileRecent();
+      expect(ensureB).toHaveBeenCalledWith(rows[10000].circleID);
+      expect(checkpoint).toEqual({ completed: true });
+      expect((a as any).scanCursor).toEqual(aCheckpoint);
+
+      const newer = {
+        circleID: 'new-change',
+        updatedAt: new Date(start + 170_000),
+      };
+      rows.push(newer);
+      clock.mockReturnValue(start + 180_000);
+      ensureA.mockClear();
+      await a.reconcileRecent();
+      expect(ensureA).toHaveBeenCalledTimes(1);
+      expect(ensureA).toHaveBeenCalledWith(newer.circleID);
+      expect(prisma.$queryRaw.mock.calls[2][0].values).toEqual([
+        new Date(start + 60_000),
+        10_000,
+      ]);
+      expect((a as any).scanCursor).toBeNull();
+    } finally {
+      clock.mockRestore();
+      ensureA.mockRestore();
+      ensureB.mockRestore();
+    }
+  });
+
+  it.each(['outage', 'miss', 'legacy null', 'legacy cursor', 'completed'])(
+    'handles the actual Redis JSON decoding of %s',
+    async (mode) => {
+      const local = {
+        windowSince: '2026-10-06T09:55:00.000Z',
+        updatedAt: '2026-10-06T09:55:10.000Z',
+        circleID: 'local',
+      };
+      const legacy = {
+        windowSince: '2026-10-06T09:56:00.000Z',
+        updatedAt: '2026-10-06T09:56:10.000Z',
+        circleID: 'shared',
+      };
+      const transport = { mget: jest.fn() };
+      if (mode === 'outage')
+        transport.mget.mockRejectedValue(new Error('timeout'));
+      else
+        transport.mget.mockResolvedValue([
+          mode === 'miss'
+            ? null
+            : JSON.stringify(
+                mode === 'legacy null'
+                  ? null
+                  : mode === 'completed'
+                    ? { completed: true }
+                    : legacy,
+              ),
+        ]);
+      const reader = new RedisService();
+      jest
+        .spyOn(reader as any, 'getCommandClient')
+        .mockResolvedValue(transport);
+      jest.spyOn((reader as any).logger, 'warn').mockImplementation();
+      const service = new ChatCircleSyncService(
+        prisma as never,
+        {} as never,
+        {} as never,
+        {} as never,
+        reader,
+      );
+      (service as any).scanCursor = local;
+      const expected =
+        mode === 'completed' ? null : mode === 'legacy cursor' ? legacy : local;
+      const result = await (service as any).readScanCursor(
+        new Date('2026-10-06T10:00:00Z'),
+      );
+      expect(result).toEqual(expected);
+      expect((service as any).scanCursor).toEqual(expected);
+      // Once completion is observed, a following outage cannot resurrect local state.
+      if (mode === 'completed') {
+        transport.mget.mockRejectedValue(new Error('outage after completion'));
+        expect(
+          await (service as any).readScanCursor(
+            new Date('2026-10-06T10:00:00Z'),
+          ),
+        ).toBeNull();
+      }
+    },
+  );
+
+  it.each([false, true])(
+    'retains shared and local state when a fenced %s completion write is rejected',
+    async (completion) => {
+      const previous = {
+        windowSince: '2026-10-06T09:55:00.000Z',
+        updatedAt: '2026-10-06T09:55:10.000Z',
+        circleID: 'previous',
+      };
+      const next = completion
+        ? null
+        : {
+            ...previous,
+            circleID: 'next',
+            updatedAt: '2026-10-06T09:55:20.000Z',
+          };
+      let checkpoint: unknown = previous;
+      redis.setJsonIfVersionMatches.mockImplementation(
+        async (_key, _lease, token, value) => {
+          if (token !== 'current') return false;
+          checkpoint = value;
+          return true;
+        },
+      );
+      const service = make();
+      (service as any).scanCursor = previous;
+      expect(await (service as any).writeScanCursor(next, 'expired')).toBe(
+        false,
+      );
+      expect(checkpoint).toEqual(previous);
+      expect((service as any).scanCursor).toEqual(previous);
+      expect(redis.setJsonIfVersionMatches).toHaveBeenCalledWith(
+        'job-cursor:chat_circle_sync',
+        'job-lease:chat_circle_sync',
+        'expired',
+        completion ? { completed: true } : next,
+        expect.any(Number),
+      );
+      expect(redis.setJson).not.toHaveBeenCalled();
+    },
+  );
   it('renews a scan lasting beyond 50 seconds and continues with its next page', async () => {
     jest.useFakeTimers();
     const start = Date.parse('2026-10-06T10:00:00Z');
@@ -913,7 +1094,7 @@ describe('circle sync durable scan progress', () => {
       await service.reconcileRecent();
       expect(ensure).toHaveBeenCalledWith('second-page');
       expect(prisma.$queryRaw.mock.calls[1][0].values).toContain('c-9999');
-      expect(checkpoint).toBeNull();
+      expect(checkpoint).toEqual({ completed: true });
     } finally {
       finish();
       await round;
@@ -1192,7 +1373,7 @@ describe('circle sync durable scan progress', () => {
       const initialA = checkpoint;
       clock.mockReturnValue(start + 60_000);
       await b.reconcileRecent();
-      expect(checkpoint).toBeNull();
+      expect(checkpoint).toEqual({ completed: true });
 
       rows.push({
         circleID: 'new-circle',
@@ -1218,7 +1399,7 @@ describe('circle sync durable scan progress', () => {
         .mockResolvedValue('conv');
       await restarted.reconcileRecent();
       expect(ensure).toHaveBeenCalledWith('new-circle');
-      expect(checkpoint).toBeNull();
+      expect(checkpoint).toEqual({ completed: true });
       expect(redis.setJson).not.toHaveBeenCalled();
     } finally {
       holdA.resolve();

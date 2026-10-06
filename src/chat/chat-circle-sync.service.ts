@@ -341,15 +341,28 @@ export class ChatCircleSyncService {
   private async readScanCursor(
     since: Date,
   ): Promise<CircleSyncScanCursor | null> {
-    const shared = await this.redis.getJsonMany<CircleSyncScanCursor>(
+    const shared = await this.redis.getJsonMany<unknown>(
       [ChatCircleSyncService.RECONCILE_CURSOR_KEY],
       { strict: true },
     );
-    // A missing Redis key after an outage must not erase the in-process
-    // checkpoint whose writes could not be persisted during that outage.
+    // Missing keys and legacy JSON null both decode as [null]. Retain local
+    // outage progress in that ambiguous case; new completions are explicit.
     const candidate = shared?.[0] ?? this.scanCursor;
     if (
+      candidate &&
+      typeof candidate === 'object' &&
+      'completed' in candidate &&
+      candidate.completed === true
+    ) {
+      this.scanCursor = null;
+      return null;
+    }
+    if (
       !candidate ||
+      typeof candidate !== 'object' ||
+      !('windowSince' in candidate) ||
+      !('circleID' in candidate) ||
+      !('updatedAt' in candidate) ||
       typeof candidate.windowSince !== 'string' ||
       typeof candidate.circleID !== 'string' ||
       typeof candidate.updatedAt !== 'string'
@@ -366,11 +379,12 @@ export class ChatCircleSyncService {
     ) {
       return null;
     }
-    return {
+    this.scanCursor = {
       windowSince: windowSince.toISOString(),
       updatedAt: updatedAt.toISOString(),
       circleID: candidate.circleID,
     };
+    return this.scanCursor;
   }
 
   private async writeScanCursor(
@@ -378,14 +392,14 @@ export class ChatCircleSyncService {
     leaseToken?: string,
   ): Promise<boolean> {
     // A slow run can outlive its lease and finish after another holder has
-    // saved a newer page/window. Fence SET (including a null clear) atomically
+    // saved a newer page/window. Fence SET (including completion) atomically
     // with the lease token, and never retain rejected progress locally.
     if (leaseToken !== undefined) {
       const written = await this.redis.setJsonIfVersionMatches(
         ChatCircleSyncService.RECONCILE_CURSOR_KEY,
         ChatCircleSyncService.RECONCILE_LEASE_KEY,
         leaseToken,
-        cursor,
+        cursor ?? { completed: true },
         ChatCircleSyncService.RECONCILE_CURSOR_TTL_SECONDS,
       );
       if (!written) return false;
