@@ -216,6 +216,18 @@ export function createWriteMethodLimiterMount(
   };
 }
 
+/** Autosaves use an authenticated account budget in NoteController. */
+export function createNoteWriteLimiterMount(
+  limiter: (req: any, res: any, next: any) => unknown,
+) {
+  const writes = createWriteMethodLimiterMount(limiter);
+  return (req: any, res: any, next: any) => {
+    if (req.method === 'PUT' && /^\/drafts\/[^/]+\/?$/.test(req.path))
+      return next();
+    return writes(req, res, next);
+  };
+}
+
 /**
  * Account lookup limiter. Without this, any authenticated user can probe the
  * /user/search/account endpoint to enumerate accountIds at the global 300/min
@@ -484,7 +496,7 @@ export const setupApp = (app: INestApplication): ErrorAggregationProvider => {
   // 路径一起删了（卡片改由 CoinService 结算后服务端签发），前缀挂载不会再
   // 误把回执算进 20/15min 配额里。
   app.use('/api/v1/coin/gift', coinGiftLimiter);
-  app.use('/api/v1/note', createWriteMethodLimiterMount(noteWriteLimiter));
+  app.use('/api/v1/note', createNoteWriteLimiterMount(noteWriteLimiter));
   app.use('/api/v1/circle', (req: any, res: any, next: any) => {
     // 写方法与 note 挂载同一集合(POST/PATCH/PUT/DELETE):PATCH /circle/:id 编辑圈子、
     // 改群名/群公告此前只算读配额。

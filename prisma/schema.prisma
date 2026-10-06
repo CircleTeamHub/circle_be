@@ -1105,6 +1105,9 @@ model NoteDraft {
   mediaKeys     String[] @default([])
   createdAt     DateTime @default(now())
   updatedAt     DateTime @updatedAt
+  consumedAt    DateTime?
+  // Durable write outcome; retained even if the published note is deleted.
+  publishedNoteID String?
 
   owner      User  @relation(fields: [ownerID], references: [id], onDelete: Cascade)
   sourceNote Note? @relation(fields: [sourceNoteID], references: [id], onDelete: SetNull)
@@ -1112,6 +1115,7 @@ model NoteDraft {
   @@unique([ownerID, clientDraftID])
   @@index([ownerID, updatedAt])
   @@index([sourceNoteID])
+  @@index([ownerID, consumedAt, updatedAt])
 }
 
 model NoteShareLink {

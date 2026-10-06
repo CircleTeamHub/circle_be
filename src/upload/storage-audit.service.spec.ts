@@ -20,6 +20,7 @@ describe('StorageAuditService', () => {
       friend: emptyRows(),
       circle: emptyRows(),
       noteMedia: emptyRows(),
+      noteDraft: emptyRows(),
       trace: emptyRows(),
       traceComment: emptyRows(),
       circlePost: emptyRows(),
@@ -85,6 +86,26 @@ describe('StorageAuditService', () => {
     expect(
       scannedPrefixes.some((p: string) => p.startsWith('note-exports')),
     ).toBe(false);
+  });
+
+  it('counts a draft-only video poster in its reference inventory', async () => {
+    const { service } = harness({
+      objects: {
+        'notes/': [
+          { key: 'notes/u1/poster.jpg', size: 100, lastModified: old },
+        ],
+      },
+      referenced: {
+        noteDraft: [
+          {
+            id: 'draft-1',
+            mediaKeys: ['notes/u1/video.mp4', 'notes/u1/poster.jpg'],
+          },
+        ],
+      },
+    });
+    const result = await service.audit(now);
+    expect(result).toMatchObject({ orphanCount: 0 });
   });
 
   it('keeps configured recharge payment codes out of the orphan list', async () => {

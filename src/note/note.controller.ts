@@ -25,6 +25,7 @@ import {
 import { Throttle, ThrottlerGuard } from '@nestjs/throttler';
 import type { Response } from 'express';
 import { JwtGuard } from 'src/guards/jwt.guard';
+import { UserThrottlerGuard } from 'src/guards/user-throttler.guard';
 import type { RequestWithUser } from 'src/auth/types';
 import {
   CollectNoteDto,
@@ -310,6 +311,8 @@ export class NoteController {
   }
 
   @Put('drafts/:draftId')
+  @UseGuards(UserThrottlerGuard)
+  @Throttle({ default: { limit: 120, ttl: 60_000 } })
   @ApiOperation({ summary: 'Create or update one of my note drafts' })
   @ApiOkResponse({ type: NoteDraftDto })
   saveDraft(

@@ -4,11 +4,14 @@ import {
   BadRequestException,
   ConflictException,
   ForbiddenException,
+  NotFoundException,
+  ServiceUnavailableException,
 } from '@nestjs/common';
 import { ApiOkResponse, DocumentBuilder, SwaggerModule } from '@nestjs/swagger';
 import { Test } from '@nestjs/testing';
 import { NoteService } from './note.service';
 import { NoteSummaryDto } from './dto/note.dto';
+import { Prisma } from 'src/generated/prisma';
 
 describe('note review regressions', () => {
   const row = {
@@ -29,6 +32,7 @@ describe('note review regressions', () => {
     const prisma = {
       noteDraft: {
         findMany: jest.fn().mockResolvedValue([]),
+        findFirst: jest.fn().mockResolvedValue(null),
         findUnique: jest.fn().mockResolvedValue(null),
         count: jest.fn().mockResolvedValue(0),
         upsert: jest
@@ -37,9 +41,14 @@ describe('note review regressions', () => {
             Promise.resolve({ ...row, ...create }),
           ),
         deleteMany: jest.fn(),
+        update: jest.fn(),
       },
       note: { findFirst: jest.fn().mockResolvedValue(null) },
-      noteMedia: { findMany: jest.fn().mockResolvedValue([]) },
+      noteMedia: {
+        findMany: jest.fn().mockResolvedValue([]),
+        createMany: jest.fn().mockResolvedValue({ count: 1 }),
+        deleteMany: jest.fn().mockResolvedValue({ count: 0 }),
+      },
       friend: { findMany: jest.fn().mockResolvedValue([]) },
       circle: { findMany: jest.fn().mockResolvedValue([]) },
       user: { findUnique: jest.fn() },
@@ -59,7 +68,9 @@ describe('note review regressions', () => {
     };
     const config = {
       get: (key: string) =>
-        key === 'MINIO_PUBLIC_URL' ? 'https://storage.test/bucket' : undefined,
+        key === 'OBJECT_STORAGE_DELIVERY_URL'
+          ? 'https://storage.test/bucket'
+          : undefined,
     };
     const service = new NoteService(
       prisma as any,
@@ -149,7 +160,7 @@ describe('note review regressions', () => {
     const { service, prisma } = fixture();
     await service.listNoteDrafts('owner', 2, 20);
     expect(prisma.noteDraft.findMany).toHaveBeenCalledWith({
-      where: { ownerID: 'owner' },
+      where: { ownerID: 'owner', consumedAt: null },
       orderBy: [{ updatedAt: 'desc' }, { id: 'desc' }],
       skip: 20,
       take: 20,
@@ -278,4 +289,551 @@ describe('note review regressions', () => {
       await app.close();
     }
   });
+
+  it('preserves a draft title at the 120 Unicode code-point limit', async () => {
+    const { service } = fixture();
+    const title = '😀'.repeat(120);
+    expect(
+      (await service.saveNoteDraft('owner', 'emoji', { title })).title,
+    ).toBe(title);
+  });
+
+  it('resolves nested key-only BlockNote draft media and inventories its poster', async () => {
+    const { service, prisma } = fixture();
+    const result = await service.saveNoteDraft('owner', 'block-media', {
+      contentJson: [
+        {
+          type: 'paragraph',
+          children: [
+            {
+              type: 'video',
+              props: {
+                objectKey: 'notes/owner/video.mp4',
+                posterUrl: 'https://storage.test/bucket/notes/owner/poster.jpg',
+              },
+            },
+          ],
+        },
+      ],
+    });
+    const props = (result.contentJson![0] as any).children[0].props;
+    expect(props.url).toBe(
+      'https://signed.test/notes/owner/video.mp4?signature=test',
+    );
+    expect(props.posterUrl).toBe(
+      'https://signed.test/notes/owner/poster.jpg?signature=test',
+    );
+    expect(result.mediaKeys).toEqual([
+      'notes/owner/video.mp4',
+      'notes/owner/poster.jpg',
+    ]);
+    expect(prisma.noteDraft.upsert.mock.calls[0][0].create.mediaKeys).toEqual(
+      result.mediaKeys,
+    );
+    expect(result.mediaCount).toBe(1);
+  });
+
+  it('rejects foreign media keys inside contentJson', async () => {
+    const { service, upload } = fixture();
+    await expect(
+      service.saveNoteDraft('owner', 'foreign-block', {
+        contentJson: [
+          { type: 'image', props: { objectKey: 'notes/another/private.jpg' } },
+        ],
+      }),
+    ).rejects.toBeInstanceOf(BadRequestException);
+    expect(upload.createPresignedGetUrl).not.toHaveBeenCalled();
+  });
+
+  it('never signs a legacy nested poster outside the validated draft inventory', async () => {
+    const { service, prisma, upload } = fixture();
+    const ownKey = 'notes/owner/video.mp4';
+    const foreignKey = 'notes/another/private.jpg';
+    prisma.noteDraft.findFirst.mockResolvedValue({
+      ...row,
+      mediaKeys: [ownKey],
+      contentJson: [
+        {
+          type: 'paragraph',
+          children: [
+            {
+              type: 'video',
+              props: {
+                objectKey: ownKey,
+                posterUrl: `https://storage.test/bucket/${foreignKey}`,
+              },
+            },
+          ],
+        },
+      ],
+    });
+    const result = await service.getNoteDraft('owner', 'draft-1');
+    expect((result.contentJson![0] as any).children[0].props.url).toBe(
+      `https://signed.test/${ownKey}?signature=test`,
+    );
+    expect(upload.createPresignedGetUrl.mock.calls.map(([key]) => key)).toEqual(
+      [ownKey],
+    );
+  });
+
+  it('replaces omitted draft JSON with database null instead of retaining untracked media', async () => {
+    const { service, prisma, upload } = fixture();
+    let stored: any;
+    const persisted = (data: Record<string, unknown>) =>
+      Object.fromEntries(
+        Object.entries(data)
+          .filter(([, value]) => value !== undefined)
+          .map(([key, value]) => [key, value === Prisma.DbNull ? null : value]),
+      );
+    prisma.noteDraft.findUnique.mockImplementation(async () => stored ?? null);
+    prisma.noteDraft.upsert.mockImplementation(async ({ create, update }) => {
+      stored = stored
+        ? { ...stored, ...persisted(update) }
+        : { ...row, ...persisted(create) };
+      return stored;
+    });
+    const image = {
+      type: 'IMAGE' as const,
+      objectKey: 'notes/owner/image.jpg',
+      url: 'https://storage.test/bucket/notes/owner/image.jpg',
+      sortOrder: 0,
+    };
+    await service.saveNoteDraft('owner', 'draft-1', {
+      title: 'Image draft',
+      contentJson: [{ type: 'image', props: image }],
+      sections: { media: { items: [image] } },
+    });
+    upload.createPresignedGetUrl.mockClear();
+    const result = await service.saveNoteDraft('owner', 'draft-1', {
+      title: 'Title only',
+    });
+    expect(prisma.noteDraft.upsert.mock.calls[1][0].update).toMatchObject({
+      contentJson: Prisma.DbNull,
+      sections: Prisma.DbNull,
+      mediaKeys: [],
+    });
+    expect(result.contentJson).toBeNull();
+    expect(result.sections).toBeNull();
+    expect(result.mediaCount).toBe(0);
+    expect(result.mediaKeys).toEqual([]);
+    expect(upload.createPresignedGetUrl).not.toHaveBeenCalled();
+  });
+
+  function publishedMediaRow(blocks: unknown[], media: unknown[]) {
+    return {
+      id: 'note-1',
+      ownerID: 'owner',
+      title: 'Nested media',
+      content: 'Text',
+      contentJson: blocks,
+      sections: { text: { content: 'Text', contentJson: blocks } },
+      status: 'ACTIVE',
+      available: true,
+      pinned: false,
+      imageCount: 1,
+      videoCount: 1,
+      audioCount: 0,
+      mediaCount: media.length,
+      createdAt: new Date(),
+      updatedAt: new Date(),
+      coverMedia: null,
+      groupMemberships: [],
+      media,
+    };
+  }
+
+  it.each([
+    ['image', true],
+    ['image', false],
+    ['video', true],
+    ['video', false],
+  ] as const)(
+    'refreshes authorized published nested %s props (expired URL: %s)',
+    async (type, expired) => {
+      const { service, prisma, upload } = fixture();
+      const objectKey = `notes/owner/nested.${type === 'image' ? 'jpg' : 'mp4'}`;
+      const url = `https://storage.test/bucket/${objectKey}`;
+      const blocks = [
+        {
+          type: 'paragraph',
+          children: [
+            {
+              type,
+              props: {
+                objectKey,
+                ...(expired ? { url: `${url}?signature=expired` } : {}),
+              },
+            },
+          ],
+        },
+      ];
+      prisma.note.findFirst.mockResolvedValue(
+        publishedMediaRow(blocks, [
+          {
+            id: 'media-1',
+            type: type === 'image' ? 'IMAGE' : 'VIDEO',
+            objectKey,
+            url,
+            sortOrder: 0,
+          },
+        ]),
+      );
+      const result = await service.getNote('owner', 'note-1');
+      const signed = `https://signed.test/${objectKey}?signature=test`;
+      expect((result.contentJson![0] as any).children[0].props.url).toBe(
+        signed,
+      );
+      expect(
+        (result.sections.text.contentJson![0] as any).children[0].props.url,
+      ).toBe(signed);
+      expect(result.media[0].url).toBe(signed);
+      expect(
+        upload.createPresignedGetUrl.mock.calls.map(([key]) => key),
+      ).toEqual([objectKey]);
+    },
+  );
+
+  it('does not sign foreign published inline keys absent from the NoteMedia inventory', async () => {
+    const { service, prisma, upload } = fixture();
+    const objectKey = 'notes/owner/valid.jpg';
+    const foreignKey = 'notes/another/private.jpg';
+    const blocks = [
+      {
+        type: 'paragraph',
+        children: [
+          {
+            type: 'image',
+            props: { objectKey: foreignKey },
+          },
+        ],
+      },
+    ];
+    prisma.note.findFirst.mockResolvedValue(
+      publishedMediaRow(blocks, [
+        {
+          id: 'media-1',
+          type: 'IMAGE',
+          objectKey,
+          url: `https://storage.test/bucket/${objectKey}`,
+          sortOrder: 0,
+        },
+      ]),
+    );
+    const result = await service.getNote('owner', 'note-1');
+    expect(upload.createPresignedGetUrl.mock.calls.map(([key]) => key)).toEqual(
+      [objectKey],
+    );
+    expect(
+      (result.sections.text.contentJson![0] as any).children[0].props.url,
+    ).toBeFalsy();
+  });
+
+  it.each([
+    ['audio', 'IMAGE'],
+    ['showcase', 'AUDIO'],
+    ['media', 'AUDIO'],
+  ])('rejects %s sections containing %s', (section, type) => {
+    const { service } = fixture();
+    const item = {
+      type,
+      objectKey: 'notes/owner/media',
+      url: 'https://storage.test/bucket/notes/owner/media',
+    };
+    expect(() =>
+      (service as any).deriveNoteContent({
+        title: 'Types',
+        media: [item],
+        sections: { [section]: { items: [item] } },
+      }),
+    ).toThrow(BadRequestException);
+  });
+
+  it('returns no cover for an audio-only note', () => {
+    const { service } = fixture();
+    const note = {
+      id: 'audio',
+      ownerID: 'owner',
+      title: 'Audio',
+      media: [{ type: 'AUDIO', url: 'https://storage.test/audio.m4a' }],
+      sections: {},
+    };
+    expect((service as any).mapSummary(note, 'owner').cover).toBeNull();
+  });
+
+  it.each([false, true])(
+    'looks up legacy OpenIM contact IDs canonically while preserving the advertised ID (self: %s)',
+    async (self) => {
+      const { service, prisma } = fixture();
+      const id = 'aabbccdd-1122-0000-0000-123456789abc';
+      const alias = id.replace(/-/g, '').toUpperCase();
+      const person = {
+        id,
+        nickname: 'Friend',
+        accountId: 'friend',
+        avatarUrl: null,
+      };
+      if (self) prisma.user.findUnique.mockResolvedValue(person);
+      else
+        prisma.friend.findMany.mockResolvedValue([
+          { userID: 'owner', friendID: id, friend: person },
+        ] as any);
+      const result = await (service as any).canonicalizeNoteCards(
+        self ? id : 'owner',
+        {
+          sections: { contacts: { items: [{ id: alias, name: 'Untrusted' }] } },
+        },
+      );
+      expect(result.sections.contacts.items).toEqual([
+        { id: alias, name: 'Friend', faceURL: null },
+      ]);
+      if (!self)
+        expect(
+          prisma.friend.findMany.mock.calls[0][0].where.OR[0].friendID.in,
+        ).toEqual([id]);
+    },
+  );
+
+  function publicationFixture(sourceNoteID: string | null) {
+    const value = fixture();
+    const { prisma, service } = value;
+    let draft: any = { ...row, sourceNoteID, consumedAt: null };
+    prisma.noteDraft.findUnique.mockImplementation(async () => draft);
+    prisma.noteDraft.upsert.mockImplementation(async ({ update }) => {
+      draft = { ...draft, ...update };
+      return draft;
+    });
+    prisma.noteDraft.update.mockImplementation(async ({ data }) => {
+      draft = { ...draft, ...data };
+      return draft;
+    });
+    const note = {
+      id: 'note-1',
+      ownerID: 'owner',
+      status: 'ACTIVE',
+      title: 'Updated',
+      sections: {},
+      media: [],
+      groupMemberships: [],
+    };
+    prisma.note.findFirst.mockImplementation(async ({ where }) =>
+      where.id ? (note as any) : null,
+    );
+    Object.assign(prisma.note, {
+      create: jest.fn().mockResolvedValue(note),
+      update: jest.fn().mockResolvedValue(note),
+    });
+    Object.assign(prisma.noteMedia, {
+      deleteMany: jest.fn().mockResolvedValue({ count: 0 }),
+      createMany: jest.fn().mockResolvedValue({ count: 1 }),
+    });
+    Object.assign(prisma, {
+      noteGroupMembership: {
+        deleteMany: jest.fn().mockResolvedValue({ count: 0 }),
+      },
+    });
+    jest
+      .spyOn(service as any, 'assertNoteStorageAvailable')
+      .mockResolvedValue(undefined);
+    return { ...value, note, draft: () => draft };
+  }
+
+  it('persists and reads the canonical circleId after resolving a legacy groupID', async () => {
+    const { service, prisma, note } = publicationFixture(null);
+    prisma.circle.findMany.mockResolvedValue([
+      {
+        id: 'canonical-circle',
+        groupID: 'legacy-group',
+        name: 'Real group',
+        avatarUrl: null,
+      },
+    ]);
+    (prisma.note as any).create.mockImplementation(async ({ data }) =>
+      Object.assign(note, data),
+    );
+    (prisma.note as any).update.mockImplementation(async ({ data }) =>
+      Object.assign(note, data),
+    );
+    const result = await service.createNote('owner', {
+      title: 'Group note',
+      media: [],
+      sections: {
+        groups: { items: [{ id: 'legacy-group', name: 'Untrusted' }] },
+      },
+    });
+    const expected = {
+      id: 'legacy-group',
+      circleId: 'canonical-circle',
+      name: 'Real group',
+      faceURL: null,
+    };
+    expect(
+      (prisma.note as any).create.mock.calls[0][0].data.sections.groups.items,
+    ).toEqual([expected]);
+    expect(result.sections.groups.items).toEqual([expected]);
+    expect(
+      (await service.getNote('owner', 'note-1')).sections.groups.items,
+    ).toEqual([expected]);
+  });
+
+  it.each(['create', 'update'] as const)(
+    'replays %s once after a post-commit signing failure and editor draft deletion',
+    async (action) => {
+      const { service, prisma, upload, note, draft } = publicationFixture(
+        action === 'update' ? 'note-1' : null,
+      );
+      const media = {
+        id: 'media-1',
+        type: 'IMAGE' as const,
+        objectKey: 'notes/owner/image.jpg',
+        url: 'https://storage.test/bucket/notes/owner/image.jpg',
+        sortOrder: 0,
+      };
+      (note.media as unknown[]).push(media);
+      const input = {
+        title: 'Saved',
+        media: [media],
+        clientDraftID: 'draft-1',
+      };
+      const save = () =>
+        action === 'create'
+          ? service.createNote('owner', input)
+          : service.updateNote('owner', 'note-1', input);
+      upload.createPresignedGetUrl.mockRejectedValueOnce(
+        new Error('Signing unavailable'),
+      );
+      await expect(save()).rejects.toBeInstanceOf(ServiceUnavailableException);
+      expect(draft()).toMatchObject({
+        consumedAt: expect.any(Date),
+        publishedNoteID: 'note-1',
+      });
+      expect((await save()).id).toBe('note-1');
+      await service.deleteNoteDraft('owner', 'draft-1');
+      expect(draft().publishedNoteID).toBe('note-1');
+      expect((await save()).id).toBe('note-1');
+      expect((prisma.note as any).create).toHaveBeenCalledTimes(
+        action === 'create' ? 1 : 0,
+      );
+      expect((prisma.note as any).update).toHaveBeenCalledTimes(1);
+      expect(prisma.noteDraft.update).toHaveBeenCalledTimes(1);
+      expect(prisma.noteMedia.createMany).toHaveBeenCalledTimes(1);
+    },
+  );
+
+  it('rejects publication after a draft was discarded', async () => {
+    const { service, prisma } = publicationFixture(null);
+    await service.deleteNoteDraft('owner', 'draft-1');
+    await expect(
+      service.createNote('owner', {
+        title: 'Late publish',
+        media: [],
+        clientDraftID: 'draft-1',
+      }),
+    ).rejects.toBeInstanceOf(ConflictException);
+    expect((prisma.note as any).create).not.toHaveBeenCalled();
+  });
+
+  it('rejects a consumed edit draft replay for a different source note', async () => {
+    const { service, prisma } = publicationFixture('note-1');
+    await service.updateNote('owner', 'note-1', {
+      title: 'Saved',
+      media: [],
+      clientDraftID: 'draft-1',
+    });
+    await expect(
+      service.updateNote('owner', 'other-note', {
+        title: 'Wrong replay',
+        media: [],
+        clientDraftID: 'draft-1',
+      }),
+    ).rejects.toBeInstanceOf(ConflictException);
+    expect((prisma.note as any).update).toHaveBeenCalledTimes(1);
+  });
+
+  it("does not replay another owner's published note through an edit request", async () => {
+    const { service, prisma, draft } = publicationFixture('note-1');
+    await service.updateNote('owner', 'note-1', {
+      title: 'Saved',
+      media: [],
+      clientDraftID: 'draft-1',
+    });
+    prisma.noteDraft.findUnique.mockImplementation(async ({ where }) =>
+      where.ownerID_clientDraftID.ownerID === 'owner' ? draft() : null,
+    );
+    prisma.note.findFirst.mockImplementation(async ({ where }) =>
+      where.ownerID === 'owner' ? ({ id: 'note-1' } as any) : null,
+    );
+    await expect(
+      service.updateNote('another-owner', 'note-1', {
+        title: 'Wrong owner',
+        media: [],
+        clientDraftID: 'draft-1',
+      }),
+    ).rejects.toBeInstanceOf(NotFoundException);
+    expect((prisma.note as any).update).toHaveBeenCalledTimes(1);
+  });
+
+  it('rejects replay when the published note is deleted without erasing its durable outcome', async () => {
+    const { service, prisma, draft } = publicationFixture(null);
+    const input = { title: 'Saved', media: [], clientDraftID: 'draft-1' };
+    await service.createNote('owner', input);
+    prisma.note.findFirst.mockResolvedValue(null);
+    await expect(service.createNote('owner', input)).rejects.toBeInstanceOf(
+      NotFoundException,
+    );
+    expect(draft().publishedNoteID).toBe('note-1');
+    expect((prisma.note as any).create).toHaveBeenCalledTimes(1);
+  });
+
+  it.each(['delete', 'update'] as const)(
+    'rejects an autosave whose validation resumes after %s consumes the draft',
+    async (action) => {
+      const { service, prisma, draft } = publicationFixture(
+        action === 'update' ? 'note-1' : null,
+      );
+      let resume!: () => void;
+      const validation = new Promise<void>((resolve) => {
+        resume = resolve;
+      });
+      jest
+        .spyOn(service as any, 'requireOwnedGroups')
+        .mockReturnValueOnce(validation);
+      const autosave = service.saveNoteDraft('owner', 'draft-1', {
+        sourceNoteId: action === 'update' ? 'note-1' : undefined,
+        title: 'Late write',
+      });
+      if (action === 'update')
+        await service.updateNote('owner', 'note-1', {
+          title: 'Saved',
+          media: [],
+          clientDraftID: 'draft-1',
+        });
+      else await service.deleteNoteDraft('owner', 'draft-1');
+      resume();
+      await expect(autosave).rejects.toBeInstanceOf(ConflictException);
+      expect(draft().consumedAt).toBeInstanceOf(Date);
+      expect(draft().title).toBe('');
+      expect(draft().mediaKeys).toEqual([]);
+      expect(prisma.noteDraft.upsert).toHaveBeenCalledTimes(1);
+    },
+  );
+
+  it.each([
+    ['create', 'note-1'],
+    ['update', null],
+    ['update', 'other-note'],
+  ] as const)(
+    'rejects %s with a draft for %s before changing either note',
+    async (action, source) => {
+      const { service, prisma } = publicationFixture(source);
+      const input = { title: 'Saved', media: [], clientDraftID: 'draft-1' };
+      await expect(
+        action === 'create'
+          ? service.createNote('owner', input)
+          : service.updateNote('owner', 'note-1', input),
+      ).rejects.toBeInstanceOf(BadRequestException);
+      expect(prisma.noteDraft.upsert).not.toHaveBeenCalled();
+      expect((prisma.note as any).create).not.toHaveBeenCalled();
+      expect((prisma.note as any).update).not.toHaveBeenCalled();
+    },
+  );
 });

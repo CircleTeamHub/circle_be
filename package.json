@@ -61,7 +61,7 @@
     "express-rate-limit": "^8.5.2",
     "helmet": "^8.1.0",
     "ioredis": "^5.11.1",
-    "joi": "^18.2.8",
+    "joi": "^18.2.9",
     "livekit-server-sdk": "^2.15.4",
     "module-alias": "^2.2.2",
     "nest-winston": "^1.10.2",
@@ -155,17 +155,19 @@
   "overrides": {
     "@hono/node-server": "^1.19.13",
     "find-my-way": "^9.7.0",
-    "multer": "^2.3.0",
+    "multer": "^2.4.0",
     "picomatch": "^4.0.4",
-    "fast-uri": "^3.1.6",
-    "ip-address": "^10.3.1",
+    "fast-uri": "^3.1.8",
+    "ip-address": "^10.7.3",
     "brace-expansion@1": "1.1.18",
     "brace-expansion@2": "2.1.4",
     "brace-expansion@5": "5.0.9",
     "js-yaml": "^4.3.2",
     "deepmerge-ts": "8.0.1",
     "qs": "^6.16.0",
-    "mysql2": "^3.24.3"
+    "mysql2": "^3.24.3",
+    "proxy-addr": "^2.0.8",
+    "moment": "^2.31.0"
   }
 }
 
