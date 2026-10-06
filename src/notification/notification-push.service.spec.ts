@@ -52,6 +52,24 @@ describe('NotificationPushService (#88 per-token delivery)', () => {
   const payload = { title: 'T', body: 'B', data: { notificationId: 'n1' } };
 
   describe('composeMessage', () => {
+    it.each([1020, 1021, 1022, 1023])(
+      'truncates emoji at a %i-byte boundary without splitting code points',
+      (prefixLength) => {
+        const message = service.composeMessage('user-1', {
+          id: 'n1',
+          type: 'SYSTEM',
+          content: 'a'.repeat(prefixLength) + '😀tail',
+        } as any);
+        expect(Buffer.byteLength(message.body, 'utf8')).toBeLessThanOrEqual(
+          1024,
+        );
+        expect(message.body).toBe(
+          'a'.repeat(prefixLength) + (prefixLength === 1020 ? '😀' : ''),
+        );
+        expect(message.body).not.toMatch(/[\uD800-\uDBFF]$/u);
+      },
+    );
+
     it('builds a routable payload with actor title and data ids', () => {
       const message = service.composeMessage('user-1', {
         id: 'n1',
@@ -376,6 +394,13 @@ describe('NotificationPushService (#88 per-token delivery)', () => {
           provider: 'expo',
           platform: 'ios',
         })),
+        ...Array.from({ length: 22 }, (_, i) => ({
+          userID: 'u1',
+          token: `u1-jpush-${i}`,
+          projectId: null,
+          provider: 'jpush',
+          platform: 'android',
+        })),
         {
           userID: 'u2',
           token: 'u2-0',
@@ -385,13 +410,31 @@ describe('NotificationPushService (#88 per-token delivery)', () => {
         },
       ]);
 
-      const byUser = await service.listActiveTokensForUsers(['u1', 'u2', 'u3']);
+      const byUser = await service.listActiveTokensForUsers([
+        'u1',
+        'u2',
+        'u3',
+        'u1',
+      ]);
 
       expect(prisma.$queryRaw).toHaveBeenCalledTimes(1);
-      const query = prisma.$queryRaw.mock.calls[0][0] as { sql: string };
+      expect(prisma.devicePushToken.findMany).not.toHaveBeenCalled();
+      const query = prisma.$queryRaw.mock.calls[0][0] as {
+        sql: string;
+        values: unknown[];
+      };
       expect(query.sql).toContain('ROW_NUMBER() OVER');
+      expect(query.sql).toContain('PARTITION BY "userID", provider');
+      expect(query.sql).toContain('provider IN');
+      expect(query.sql).toContain('"disabledAt" IS NULL');
       expect(query.sql).toContain('token_rank <=');
-      expect(byUser.get('u1')).toHaveLength(20);
+      expect(query.values).toEqual(['u1', 'u2', 'u3', 'expo', 'jpush', 20]);
+      expect(byUser.get('u1')).toHaveLength(40);
+      for (const provider of ['expo', 'jpush']) {
+        expect(
+          byUser.get('u1')?.filter((token) => token.provider === provider),
+        ).toHaveLength(20);
+      }
       expect(byUser.get('u1')?.[0]).toEqual({
         token: 'u1-0',
         projectId: null,

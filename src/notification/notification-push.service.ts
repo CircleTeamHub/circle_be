@@ -20,8 +20,7 @@ const JPUSH_BATCH_SIZE = 1000;
 // 一次扇出里同时在途的 Expo 请求数:3000 人的群是 30 批,串行发太慢,全并发又会
 // 撞 Expo 的速率限制。
 const EXPO_SEND_CONCURRENCY = 4;
-// 每个用户最多推几台设备(按最近注册的算)。
-const ACTIVE_TOKENS_PER_USER = 20;
+// 每个用户、每个 provider 最多推几台设备(按最近注册的算)。
 const MAX_ACTIVE_TOKENS_PER_PROVIDER = 20;
 const EXPO_MAX_ATTEMPTS = 3;
 // Hard cap on the Expo call. Node's global fetch (undici) applies no response
@@ -38,6 +37,20 @@ const RECEIPT_BATCH_SIZE = 300;
 // review 修复：单轮最多抽多少批 —— 300×20=6000 行/轮，远超预期峰值；
 // 有上限只是防御性兜底（雪崩恢复时不至于一轮跑穿全表）。
 const RECEIPT_MAX_BATCHES_PER_RUN = 20;
+const MAX_PUSH_BODY_BYTES = 1024;
+
+function truncateUtf8(value: string, maxBytes: number): string {
+  if (Buffer.byteLength(value, 'utf8') <= maxBytes) return value;
+  let bytes = 0;
+  let end = 0;
+  for (const point of value) {
+    const pointBytes = Buffer.byteLength(point, 'utf8');
+    if (bytes + pointBytes > maxBytes) break;
+    bytes += pointBytes;
+    end += point.length;
+  }
+  return value.slice(0, end);
+}
 
 type ExpoPushTicket = {
   status?: string;
@@ -154,7 +167,7 @@ export class NotificationPushService {
           this.fallbackBody(notification.type);
     return {
       title: notification.type === 'SYSTEM' ? '系统通知' : actor,
-      body,
+      body: truncateUtf8(body, MAX_PUSH_BODY_BYTES),
       data: {
         notificationId: notification.id,
         type: notification.type,
@@ -188,7 +201,13 @@ export class NotificationPushService {
   /** 当前活跃 token 清单（含 Expo projectId 分组信息），供 outbox 建投递行。 */
   async listActiveTokens(userId: string): Promise<PushTokenTarget[]> {
     const rows = await this.prisma.devicePushToken.findMany({
-      where: { userID: userId, disabledAt: null },
+      where: {
+        userID: userId,
+        provider: {
+          in: ['expo', 'jpush'],
+        },
+        disabledAt: null,
+      },
       select: {
         token: true,
         projectId: true,
@@ -196,9 +215,15 @@ export class NotificationPushService {
         platform: true,
       },
       orderBy: { updatedAt: 'desc' },
-      take: ACTIVE_TOKENS_PER_USER,
     });
-    return rows.map((row) => ({
+    const rowsByProvider = new Map<string, typeof rows>();
+    for (const row of rows) {
+      const providerRows = rowsByProvider.get(row.provider) ?? [];
+      if (providerRows.length >= MAX_ACTIVE_TOKENS_PER_PROVIDER) continue;
+      providerRows.push(row);
+      rowsByProvider.set(row.provider, providerRows);
+    }
+    return [...rowsByProvider.values()].flat().map((row) => ({
       token: row.token,
       projectId: row.projectId,
       provider: row.provider as 'expo' | 'jpush',
@@ -207,7 +232,7 @@ export class NotificationPushService {
   }
 
   /**
-   * 多个用户的活跃 token 一次查回(每人最近的 ACTIVE_TOKENS_PER_USER 个)。聊天大群
+   * 多个用户的活跃 token 一次查回(每人每 provider 最近的 20 个)。聊天大群
    * 扇出用:原来每个收件人一次查询,3000 人的群一条消息就是 3000 次往返。
    * 没有活跃 token 的用户不出现在结果里。
    */
@@ -311,6 +336,12 @@ export class NotificationPushService {
     }
 
     const outcomes = new Array<TokenDeliveryOutcome>(messages.length);
+    // Start JPush while Expo batches are in flight so one provider cannot
+    // delay the other for large fan-outs.
+    const jpushMessages = messages
+      .map((message, index) => ({ ...message, index }))
+      .filter((message) => message.provider === 'jpush');
+    const jpushPromise = this.sendJPushMessages(jpushMessages);
     for (let i = 0; i < batches.length; i += EXPO_SEND_CONCURRENCY) {
       const chunk = batches.slice(i, i + EXPO_SEND_CONCURRENCY);
       const settled = await Promise.all(
@@ -323,10 +354,7 @@ export class NotificationPushService {
       });
     }
 
-    const jpushMessages = messages
-      .map((message, index) => ({ ...message, index }))
-      .filter((message) => message.provider === 'jpush');
-    const jpushOutcomes = await this.sendJPushMessages(jpushMessages);
+    const jpushOutcomes = await jpushPromise;
     jpushOutcomes.forEach(({ index, outcome }) => {
       outcomes[index] = outcome;
     });
@@ -684,7 +712,7 @@ export class NotificationPushService {
     >,
   ): Promise<Array<{ index: number; outcome: TokenDeliveryOutcome }>> {
     if (messages.length === 0) return [];
-    if (!this.jpushAppKey || !this.jpushMasterSecret) {
+    if (!this.isJPushConfigured()) {
       return messages.map(({ index, token }) => ({
         index,
         outcome: {
@@ -804,6 +832,7 @@ export class NotificationPushService {
         }));
       }
       const retryable =
+        response.status === 408 ||
         response.status === 401 ||
         response.status === 403 ||
         response.status === 429 ||

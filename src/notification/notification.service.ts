@@ -7,6 +7,7 @@ import {
   Injectable,
   Logger,
   Optional,
+  ServiceUnavailableException,
 } from '@nestjs/common';
 import { createHash } from 'crypto';
 import { NotificationType, Prisma, UserStatus } from 'src/generated/prisma';
@@ -148,6 +149,12 @@ export class NotificationService {
     userId: string,
     dto: RegisterPushTokenDto,
   ): Promise<void> {
+    if (
+      dto.provider === 'jpush' &&
+      this.pushService?.isJPushConfigured?.() === false
+    ) {
+      throw new ServiceUnavailableException('JPush is not configured');
+    }
     const revocationSecretHash = dto.revocationSecret
       ? this.hashRevocationSecret(dto.revocationSecret)
       : undefined;
