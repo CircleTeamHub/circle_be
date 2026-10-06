@@ -390,6 +390,7 @@ describe('NotificationPushService (#88 per-token delivery)', () => {
       expect(prisma.devicePushToken.findMany).toHaveBeenCalledWith({
         where: {
           userID: { in: ['u1', 'u2', 'u3'] },
+          provider: { in: ['expo'] },
           disabledAt: null,
         },
         select: {
