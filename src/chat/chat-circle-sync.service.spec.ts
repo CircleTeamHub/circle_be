@@ -40,6 +40,8 @@ describe('ChatCircleSyncService', () => {
   const redis = {
     tryAcquireLease: jest.fn(),
     releaseLease: jest.fn(),
+    getJsonMany: jest.fn(),
+    setJson: jest.fn(),
   };
   const service = new ChatCircleSyncService(
     prisma as never,
@@ -64,6 +66,8 @@ describe('ChatCircleSyncService', () => {
     prisma.$queryRaw.mockResolvedValue([]);
     redis.tryAcquireLease.mockResolvedValue(undefined);
     redis.releaseLease.mockResolvedValue(undefined);
+    redis.getJsonMany.mockResolvedValue(null);
+    redis.setJson.mockResolvedValue(false);
   });
 
   describe('failure log privacy', () => {
@@ -639,7 +643,7 @@ describe('ChatCircleSyncService', () => {
       );
     });
 
-    it('scans without a row cap that could silently drop circles', async () => {
+    it('processes every changed circle below the row cap', async () => {
       const many = Array.from({ length: 500 }, (_, i) => ({
         circleID: `c-${i}`,
       }));
@@ -649,9 +653,89 @@ describe('ChatCircleSyncService', () => {
         .mockResolvedValue('conv');
 
       await service.reconcileRecent();
-      // 旧实现 take:200 会把后 300 个圈子直接丢掉且再也选不中。
       expect(ensure).toHaveBeenCalledTimes(500);
       ensure.mockRestore();
+    });
+
+    it('continues a capped row scan from the shared cursor', async () => {
+      const since = new Date(Date.now() - 2 * 60_000);
+      const firstBatch = Array.from({ length: 10_000 }, (_, i) => ({
+        circleID: `c-${i % 3}`,
+        updatedAt: new Date(since.getTime() + i + 1),
+      }));
+      const nextBatch = [
+        {
+          circleID: 'c-next',
+          updatedAt: new Date(since.getTime() + 20_000),
+        },
+      ];
+      prisma.$queryRaw
+        .mockResolvedValueOnce(firstBatch)
+        .mockResolvedValueOnce(nextBatch);
+      const scan = (
+        service as unknown as {
+          scanChangedCircles: (value: Date) => Promise<string[]>;
+        }
+      ).scanChangedCircles;
+
+      await expect(scan.call(service, since)).resolves.toEqual([
+        'c-0',
+        'c-1',
+        'c-2',
+      ]);
+      expect(redis.setJson).toHaveBeenNthCalledWith(
+        1,
+        'job-cursor:chat_circle_sync',
+        {
+          windowSince: since.toISOString(),
+          updatedAt: firstBatch[firstBatch.length - 1].updatedAt.toISOString(),
+          circleID: 'c-0',
+        },
+        24 * 60 * 60,
+      );
+
+      await expect(scan.call(service, since)).resolves.toEqual(['c-next']);
+      expect(redis.setJson).toHaveBeenNthCalledWith(
+        2,
+        'job-cursor:chat_circle_sync',
+        null,
+        24 * 60 * 60,
+      );
+    });
+
+    it('keeps the original scan window when the next tick moves since forward', async () => {
+      const firstSince = new Date(Date.now() - 2 * 60_000);
+      const cursor = {
+        windowSince: firstSince.toISOString(),
+        updatedAt: new Date(firstSince.getTime() + 30_000).toISOString(),
+        circleID: 'c-0',
+      };
+      const nextSince = new Date(firstSince.getTime() + 60_000);
+      redis.getJsonMany.mockResolvedValue([cursor]);
+      prisma.$queryRaw.mockResolvedValueOnce([
+        {
+          circleID: 'c-next',
+          updatedAt: new Date(firstSince.getTime() + 31_000),
+        },
+      ]);
+
+      const scan = (
+        service as unknown as {
+          scanChangedCircles: (value: Date) => Promise<string[]>;
+        }
+      ).scanChangedCircles;
+
+      await expect(scan.call(service, nextSince)).resolves.toEqual(['c-next']);
+      const query = prisma.$queryRaw.mock.calls[0][0] as {
+        values?: unknown[];
+      };
+      expect(query.values).toEqual(
+        expect.arrayContaining([
+          firstSince,
+          new Date(firstSince.getTime() + 30_000),
+          'c-0',
+        ]),
+      );
     });
   });
 });

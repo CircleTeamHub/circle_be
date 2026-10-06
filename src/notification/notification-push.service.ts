@@ -2,6 +2,7 @@ import { Injectable, Logger } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { CronExpression } from '@nestjs/schedule';
 import { TrackedCron } from '../metrics/tracked-cron.decorator';
+import { Prisma } from 'src/generated/prisma';
 import { PrismaService } from 'src/prisma/prisma.service';
 import type { NotificationRealtimeDto } from './notification.dto';
 import { createLoggingConfig } from 'src/logging/logging.config';
@@ -18,12 +19,15 @@ const JPUSH_BATCH_SIZE = 1000;
 const EXPO_SEND_CONCURRENCY = 4;
 // 每个用户最多推几台设备(按最近注册的算)。
 const ACTIVE_TOKENS_PER_USER = 20;
+const MAX_ACTIVE_TOKENS_PER_PROVIDER = 20;
 const EXPO_MAX_ATTEMPTS = 3;
 // Hard cap on the Expo call. Node's global fetch (undici) applies no response
 // timeout by default — a hung Expo endpoint would stall the outbox sweep.
 const EXPO_PUSH_TIMEOUT_MS = 8_000;
 const ACTIVE_TOKEN_MAX_AGE_MS = 180 * 24 * 60 * 60 * 1000;
 const DISABLED_TOKEN_MAX_AGE_MS = 30 * 24 * 60 * 60 * 1000;
+const STALE_TOKEN_BATCH_SIZE = 1000;
+const STALE_TOKEN_MAX_BATCHES_PER_RUN = 20;
 // Expo 建议发送后稍等再取回执；回执在 Expo 侧保留约 24h。
 const RECEIPT_MIN_AGE_MS = 15 * 60 * 1000;
 const RECEIPT_MAX_AGE_MS = 24 * 60 * 60 * 1000;
@@ -124,6 +128,10 @@ export class NotificationPushService {
         configuredJpushApnsProduction.trim().toLowerCase() === 'true');
   }
 
+  isJPushConfigured(): boolean {
+    return Boolean(this.jpushAppKey && this.jpushMasterSecret);
+  }
+
   /** 组装推送 payload。外置成公开方法：outbox 第一次处理时快照进 DB（#88）。 */
   composeMessage(
     userId: string,
@@ -204,20 +212,49 @@ export class NotificationPushService {
   ): Promise<Map<string, PushTokenTarget[]>> {
     const byUser = new Map<string, PushTokenTarget[]>();
     if (userIds.length === 0) return byUser;
-    const rows = await this.prisma.devicePushToken.findMany({
-      where: { userID: { in: userIds }, disabledAt: null },
-      select: {
-        userID: true,
-        token: true,
-        projectId: true,
-        provider: true,
-        platform: true,
-      },
-      orderBy: { updatedAt: 'desc' },
-    });
+    const uniqueUserIds = [...new Set(userIds)];
+    const providers = this.isJPushConfigured() ? ['expo', 'jpush'] : ['expo'];
+    // Cap per user/provider in SQL. Legacy rows can exceed the registration
+    // limit, and pulling every one for a large group fan-out wastes DB and JS
+    // memory before the same cap is applied below.
+    const rows = await this.prisma.$queryRaw<
+      Array<{
+        userID: string;
+        token: string;
+        projectId: string | null;
+        provider: string;
+        platform: string;
+      }>
+    >(Prisma.sql`
+      WITH ranked AS (
+        SELECT
+          "userID",
+          token,
+          "projectId",
+          provider,
+          platform,
+          ROW_NUMBER() OVER (
+            PARTITION BY "userID", provider
+            ORDER BY "updatedAt" DESC, id DESC
+          ) AS token_rank
+        FROM "DevicePushToken"
+        WHERE "userID" IN (${Prisma.join(uniqueUserIds)})
+          AND provider IN (${Prisma.join(providers)})
+          AND "disabledAt" IS NULL
+      )
+      SELECT "userID", token, "projectId", provider, platform
+      FROM ranked
+      WHERE token_rank <= ${MAX_ACTIVE_TOKENS_PER_PROVIDER}
+      ORDER BY "userID", provider, token_rank
+    `);
+    const countsByUserProvider = new Map<string, number>();
     for (const row of rows) {
       const tokens = byUser.get(row.userID) ?? [];
-      if (tokens.length >= ACTIVE_TOKENS_PER_USER) continue;
+      const countKey = `${row.userID}:${row.provider}`;
+      const providerCount = countsByUserProvider.get(countKey) ?? 0;
+      // Keep a defensive application-side cap for malformed/legacy query
+      // results while the SQL window remains the primary memory bound.
+      if (providerCount >= MAX_ACTIVE_TOKENS_PER_PROVIDER) continue;
       tokens.push({
         token: row.token,
         projectId: row.projectId,
@@ -225,6 +262,7 @@ export class NotificationPushService {
         platform: row.platform as 'ios' | 'android' | 'web',
       });
       byUser.set(row.userID, tokens);
+      countsByUserProvider.set(countKey, providerCount + 1);
     }
     return byUser;
   }
@@ -534,32 +572,64 @@ export class NotificationPushService {
 
   @TrackedCron(CronExpression.EVERY_DAY_AT_4AM, 'push_stale_token_cleanup')
   async deleteStaleTokens(): Promise<{ count: number }> {
-    return this.prisma.$transaction(
-      async (tx) => {
-        const [lock] = await tx.$queryRaw<Array<{ acquired: boolean }>>`
-        SELECT pg_try_advisory_xact_lock(hashtext('notification-token-cleanup')) AS acquired
-      `;
-        if (!lock?.acquired) return { count: 0 };
+    const activeCutoff = new Date(Date.now() - ACTIVE_TOKEN_MAX_AGE_MS);
+    const disabledCutoff = new Date(Date.now() - DISABLED_TOKEN_MAX_AGE_MS);
+    let count = 0;
 
-        return tx.devicePushToken.deleteMany({
-          where: {
-            OR: [
-              {
-                updatedAt: {
-                  lt: new Date(Date.now() - ACTIVE_TOKEN_MAX_AGE_MS),
+    for (let batch = 0; batch < STALE_TOKEN_MAX_BATCHES_PER_RUN; batch += 1) {
+      const result = await this.prisma.$transaction(
+        async (tx) => {
+          const [lock] = await tx.$queryRaw<Array<{ acquired: boolean }>>`
+          SELECT pg_try_advisory_xact_lock(hashtext('notification-token-cleanup')) AS acquired
+        `;
+          if (!lock?.acquired) {
+            return { acquired: false, selected: 0, deleted: 0 };
+          }
+
+          const candidates = await tx.devicePushToken.findMany({
+            where: {
+              OR: [
+                { updatedAt: { lt: activeCutoff } },
+                { disabledAt: { lt: disabledCutoff } },
+              ],
+            },
+            select: { id: true },
+            orderBy: { id: 'asc' },
+            take: STALE_TOKEN_BATCH_SIZE,
+          });
+          if (candidates.length === 0) {
+            return { acquired: true, selected: 0, deleted: 0 };
+          }
+
+          // Recheck the age predicate inside the delete in case a token was
+          // refreshed while a previous batch was committing.
+          const deleted = await tx.devicePushToken.deleteMany({
+            where: {
+              AND: [
+                {
+                  OR: [
+                    { updatedAt: { lt: activeCutoff } },
+                    { disabledAt: { lt: disabledCutoff } },
+                  ],
                 },
-              },
-              {
-                disabledAt: {
-                  lt: new Date(Date.now() - DISABLED_TOKEN_MAX_AGE_MS),
-                },
-              },
-            ],
-          },
-        });
-      },
-      { timeout: 60_000 },
-    );
+                { id: { in: candidates.map(({ id }) => id) } },
+              ],
+            },
+          });
+          return {
+            acquired: true,
+            selected: candidates.length,
+            deleted: deleted.count,
+          };
+        },
+        { timeout: 60_000 },
+      );
+      if (!result.acquired || result.selected === 0) break;
+      count += result.deleted;
+      if (result.selected < STALE_TOKEN_BATCH_SIZE) break;
+    }
+
+    return { count };
   }
 
   private fallbackBody(type: string): string {

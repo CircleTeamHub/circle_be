@@ -30,6 +30,17 @@ const DISABLED_ADMIN_STATES = new Set<string>([
   'DISMISSED',
 ]);
 
+type CircleSyncScanCursor = {
+  windowSince: string;
+  updatedAt: string;
+  circleID: string;
+};
+
+type CircleSyncScanRow = {
+  circleID: string;
+  updatedAt: Date;
+};
+
 function safePrismaCode(error: unknown): string | undefined {
   const code =
     error && typeof error === 'object'
@@ -55,8 +66,13 @@ export class ChatCircleSyncService {
 
   /** 对账扫描窗口:2 个周期重叠,防止边界上的变更漏扫。 */
   private static readonly RECONCILE_WINDOW_MS = 2 * 60_000;
-  /** 单轮扫描上限,纯粹是失控查询的兜底(正常量级远低于此)。 */
+  /** 单轮扫描上限；超过后按 (updatedAt,circleID) 游标续扫。 */
   private static readonly RECONCILE_SCAN_MAX = 10_000;
+  private static readonly RECONCILE_CURSOR_KEY = 'job-cursor:chat_circle_sync';
+  // A 10,000-row page is normally drained in one tick, but a write burst can
+  // span many ticks. Keep the shared cursor long enough to finish a large
+  // backlog instead of expiring back to the moving two-minute window.
+  private static readonly RECONCILE_CURSOR_TTL_SECONDS = 24 * 60 * 60;
   private static readonly RETRY_QUEUE_MAX = 1000;
   /**
    * 多实例时只让一个实例扫窗口。要短于扫描周期:持有者崩溃后租约若残留超过
@@ -66,9 +82,11 @@ export class ChatCircleSyncService {
 
   /**
    * 上轮失败、需要继续重试的圈子。进程内保存:重启会丢,但重启后任一成员
-   * 变更都会把它重新带回扫描窗口,而窗口本身是从数据推导的(无需持久游标)。
+   * 变更都会把它重新带回扫描窗口,而窗口本身是从数据推导的。
    */
   private readonly retryQueue = new Set<string>();
+  /** Redis 不可用时的单实例兜底；Redis 可用时以共享游标为准。 */
+  private scanCursor: CircleSyncScanCursor | null = null;
 
   constructor(
     private readonly prisma: PrismaService,
@@ -96,7 +114,7 @@ export class ChatCircleSyncService {
     const since = new Date(
       Date.now() - ChatCircleSyncService.RECONCILE_WINDOW_MS,
     );
-    // 窗口扫描是全表按 updatedAt 找变更,各实例扫的是同一份数据:只让租约持有者扫。
+    // 窗口扫描按 updatedAt 找变更,各实例扫的是同一份数据:只让租约持有者扫。
     const leased = await runWithJobLease(
       this.redis,
       'chat_circle_sync',
@@ -161,27 +179,97 @@ export class ChatCircleSyncService {
   }
 
   /**
-   * 窗口内发生过成员变更的全部圈子(游标翻页跑完)。
-   * 原来只取首批 200 且不翻页:一分钟内变更超过 200 个圈子时,多出来的
-   * 会被静默丢掉且再也不会被选中 —— 那些圈子里被移除的成员会无限期保留座位。
+   * 窗口内发生过成员变更的圈子。按 (updatedAt,circleID) 逐批轮转，超过
+   * 单轮上限时把水位写入 Redis，下一轮从上次位置继续，避免每分钟重复扫批首部。
    */
   private async scanChangedCircles(since: Date): Promise<string[]> {
-    // 一次 SELECT DISTINCT 取回窗口内全部圈子 id(只有 UUID,量级很小),
-    // 不再靠 take:200 截断 —— circleID 在 CircleMember 上不唯一,做不了游标翻页,
-    // 而截断就意味着多出来的圈子这一轮直接消失。上限只是失控兜底。
-    const rows = await this.prisma.$queryRaw<Array<{ circleID: string }>>`
-      SELECT DISTINCT "circleID"
-      FROM "CircleMember"
-      WHERE "updatedAt" > ${since}
-      LIMIT ${ChatCircleSyncService.RECONCILE_SCAN_MAX}
-    `;
-    if (rows.length >= ChatCircleSyncService.RECONCILE_SCAN_MAX) {
-      // 触顶只可能是异常量级的写入洪峰:记一条,剩余部分下个周期继续。
+    const cursor = await this.readScanCursor(since);
+    const scanSince = cursor ? new Date(cursor.windowSince) : since;
+    const rows = cursor
+      ? await this.prisma.$queryRaw<CircleSyncScanRow[]>(Prisma.sql`
+          SELECT "circleID", "updatedAt"
+          FROM "CircleMember"
+          WHERE "updatedAt" > ${scanSince}
+            AND ("updatedAt", "circleID") > (${new Date(cursor.updatedAt)}, ${cursor.circleID})
+          ORDER BY "updatedAt" ASC, "circleID" ASC
+          LIMIT ${ChatCircleSyncService.RECONCILE_SCAN_MAX}
+        `)
+      : await this.prisma.$queryRaw<CircleSyncScanRow[]>(Prisma.sql`
+          SELECT "circleID", "updatedAt"
+          FROM "CircleMember"
+          WHERE "updatedAt" > ${scanSince}
+          ORDER BY "updatedAt" ASC, "circleID" ASC
+          LIMIT ${ChatCircleSyncService.RECONCILE_SCAN_MAX}
+        `);
+
+    const last = rows[rows.length - 1];
+    if (rows.length >= ChatCircleSyncService.RECONCILE_SCAN_MAX && last) {
+      const updatedAt = this.parseScanTimestamp(last.updatedAt);
+      if (updatedAt) {
+        await this.writeScanCursor({
+          windowSince: scanSince.toISOString(),
+          updatedAt: updatedAt.toISOString(),
+          circleID: last.circleID,
+        });
+      } else {
+        await this.writeScanCursor(null);
+      }
       this.logger.warn(
-        `reconcile scan hit the ${ChatCircleSyncService.RECONCILE_SCAN_MAX}-circle cap; remainder deferred to the next tick`,
+        `reconcile scan hit the ${ChatCircleSyncService.RECONCILE_SCAN_MAX}-row cap; remainder continues from the saved cursor`,
       );
+    } else {
+      await this.writeScanCursor(null);
     }
-    return rows.map((row) => row.circleID);
+    return [...new Set(rows.map((row) => row.circleID))];
+  }
+
+  private parseScanTimestamp(value: unknown): Date | null {
+    const date = value instanceof Date ? value : new Date(String(value ?? ''));
+    return Number.isNaN(date.getTime()) ? null : date;
+  }
+
+  private async readScanCursor(
+    since: Date,
+  ): Promise<CircleSyncScanCursor | null> {
+    const shared = await this.redis.getJsonMany<CircleSyncScanCursor>(
+      [ChatCircleSyncService.RECONCILE_CURSOR_KEY],
+      { strict: true },
+    );
+    const candidate = shared === null ? this.scanCursor : shared[0];
+    if (
+      !candidate ||
+      typeof candidate.windowSince !== 'string' ||
+      typeof candidate.circleID !== 'string' ||
+      typeof candidate.updatedAt !== 'string'
+    ) {
+      return null;
+    }
+    const windowSince = this.parseScanTimestamp(candidate.windowSince);
+    const updatedAt = this.parseScanTimestamp(candidate.updatedAt);
+    if (
+      !windowSince ||
+      !updatedAt ||
+      windowSince > since ||
+      updatedAt < windowSince
+    ) {
+      return null;
+    }
+    return {
+      windowSince: windowSince.toISOString(),
+      updatedAt: updatedAt.toISOString(),
+      circleID: candidate.circleID,
+    };
+  }
+
+  private async writeScanCursor(
+    cursor: CircleSyncScanCursor | null,
+  ): Promise<void> {
+    this.scanCursor = cursor;
+    await this.redis.setJson(
+      ChatCircleSyncService.RECONCILE_CURSOR_KEY,
+      cursor,
+      ChatCircleSyncService.RECONCILE_CURSOR_TTL_SECONDS,
+    );
   }
 
   /**

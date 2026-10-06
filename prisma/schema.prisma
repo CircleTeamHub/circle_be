@@ -870,6 +870,8 @@ model RefreshToken {
   @@index([userId])
   @@index([userId, familyId])
   @@index([userId, audience, createdAt])
+  @@index([expiredAt])
+  @@index([revokedAt])
 }
 
 // ─── Social ───────────────────────────────────────────────────────────────────
@@ -1104,7 +1106,6 @@ model NoteShareLink {
   owner User @relation(fields: [ownerID], references: [id], onDelete: Cascade)
 
   @@index([ownerID, createdAt])
-  @@index([token])
   @@index([expiresAt])
 }
 
@@ -1127,7 +1128,6 @@ model NoteMedia {
   coverForNote Note? @relation("noteCoverMedia")
 
   @@unique([noteID, sortOrder])
-  @@index([noteID, sortOrder])
 }
 
 model NoteGroup {
@@ -1642,6 +1642,8 @@ model Notification {
   // review 修复：保留期清理按裸 createdAt 截断分批删除
   @@index([createdAt])
   @@index([fromFriendRequestID])
+  // deleted/read 的热点列表与徽标查询使用 migration 中的 partial indexes；
+  // Prisma schema 无法表达 WHERE 条件。
 }
 
 model SystemAnnouncement {
@@ -1750,6 +1752,10 @@ model DevicePushToken {
 
   @@index([userID])
   @@index([provider, platform])
+  @@index([updatedAt])
+  @@index([disabledAt])
+  // disabledAt IS NULL 的用户/供应商/最近更新时间查询使用 migration 中的
+  // partial index；Prisma schema 无法表达 WHERE 条件。
 }
 
 // ─── Circle Plaza ────────────────────────────────────────────────────────────
@@ -1873,6 +1879,8 @@ model CircleMember {
   @@unique([userID, circleID])
   @@index([circleID])
   @@index([status, createdAt])
+  @@index([updatedAt, circleID])
+  @@index([circleID, status, userID])
 }
 
 model CirclePost {
@@ -1913,6 +1921,7 @@ model CirclePost {
 
   @@index([circleID, createdAt(sort: Desc)])
   @@index([authorID])
+  @@index([createdAt])
   @@index([city, createdAt(sort: Desc)])
   @@index([cities], type: Gin)
   @@index([status, expiresAt])
@@ -2219,6 +2228,13 @@ model ChatConversation {
   messages ChatMessage[]
   directAutoReplyStates ChatDirectAutoReplyState[]
   groupEvents ChatGroupEvent[]
+
+  // 会话列表按成员置顶后再按末条消息时间排序；该索引减少关联排序前的
+  // ChatConversation 扫描范围。ChatMember 的 active/pinned partial index 在
+  // migration 中定义，因为 Prisma schema 无法表达 NULLS LAST / WHERE 条件。
+  @@index([lastMessageAt(sort: Desc), id(sort: Desc)])
+  // burnDurationSec IS NOT NULL 的轮转扫描使用 migration 中的 partial index；
+  // Prisma schema 无法表达 WHERE 条件。
 }
 
 /// 会话成员。成员行的存在即成员资格（发送/收取的授权来源）；
@@ -2265,6 +2281,8 @@ model ChatMember {
   // 尾部的 userID / muted 不参与过滤，只为让两条查询走 index-only scan。
   // 详见 migrations/20260906010000_add_chat_member_fanout_index。
   @@index([conversationID, leftAt, clearedBeforeHeight, userID, muted], map: "ChatMember_fanout_idx")
+  // leftAt IS NULL AND hiddenAt IS NULL 的会话列表使用 migration 中的 partial
+  // index；Prisma schema 无法表达 WHERE 条件。
 }
 
 /// 聊天消息。height 在发送事务内于 pg_advisory_xact_lock 下分配，
@@ -2334,6 +2352,8 @@ model ChatMessage {
   @@unique([conversationID, senderID, clientMessageId])
   // 按日期查聊天记录（chat-history 模块 Phase 2 将从 OpenIM 迁到此索引）。
   @@index([conversationID, createdAt])
+  // deleted = false 的阅后即焚扫描使用 migration 中的 partial index；
+  // Prisma schema 无法表达 WHERE 条件。
   /// 旧重连追平（GET /chat/messages/mutations）按变更时刻扫的三条索引。接口已被
   /// 增量同步取代，但蓝绿发布的回滚目标（旧二进制）还在用它们：按 expand/contract
   /// 留到下一个版本再删。

@@ -1,4 +1,4 @@
-import { ForbiddenException } from '@nestjs/common';
+import { BadRequestException, ForbiddenException } from '@nestjs/common';
 import { Test, TestingModule } from '@nestjs/testing';
 import { createHash } from 'crypto';
 import { PrismaService } from 'src/prisma/prisma.service';
@@ -10,6 +10,10 @@ import {
   DISCOVER_NOTIFICATION_TYPES,
   MOMENT_NOTIFICATION_TYPES,
 } from './notification.constants';
+import {
+  decodeNotificationCursor,
+  encodeNotificationCursor,
+} from './notification.dto';
 import { NotificationPushService } from './notification-push.service';
 import { AdminAuditService } from 'src/moderation/admin-audit.service';
 
@@ -867,7 +871,7 @@ describe('NotificationService', () => {
           },
           skip: 0,
           take: 20,
-          orderBy: { createdAt: 'desc' },
+          orderBy: [{ createdAt: 'desc' }, { id: 'desc' }],
         }),
       );
       expect(result[0]).toEqual({
@@ -921,7 +925,7 @@ describe('NotificationService', () => {
           },
           skip: 20,
           take: 20,
-          orderBy: { createdAt: 'desc' },
+          orderBy: [{ createdAt: 'desc' }, { id: 'desc' }],
         }),
       );
       expect(result[0]).toEqual(
@@ -930,6 +934,110 @@ describe('NotificationService', () => {
           type: 'SYSTEM',
           content: '积分已到账 10',
         }),
+      );
+    });
+
+    it('uses keyset pagination and returns an opaque next cursor', async () => {
+      const rows = Array.from({ length: 21 }, (_, index) => ({
+        id: `system-${index}`,
+        type: 'SYSTEM',
+        content: `system ${index}`,
+        read: false,
+        createdAt: new Date(Date.UTC(2026, 6, 21 - index)),
+        fromUser: null,
+        fromTrace: null,
+        fromReply: null,
+        fromCircle: null,
+        fromCirclePost: null,
+        fromInvitation: null,
+        fromFriendRequest: null,
+      }));
+      prisma.$queryRaw.mockResolvedValue(
+        rows.map(({ id, createdAt }) => ({ id, createdAt })),
+      );
+      prisma.notification.findMany.mockResolvedValue(rows);
+      const cursor = encodeNotificationCursor({
+        createdAt: '2026-08-01T00:00:00.000Z',
+        id: 'after-system-0',
+      });
+
+      const result = await service.getProfileNotificationsByCursor(
+        'user-1',
+        cursor,
+      );
+
+      expect(prisma.$queryRaw).toHaveBeenCalledTimes(1);
+      const cursorQuery = prisma.$queryRaw.mock.calls[0][0] as { sql: string };
+      expect(cursorQuery.sql).toContain('(n."createdAt", n."id") <');
+      expect(prisma.notification.findMany).toHaveBeenCalledWith(
+        expect.objectContaining({
+          where: {
+            id: { in: rows.map(({ id }) => id) },
+            toUserID: 'user-1',
+            deleted: false,
+            type: { in: ['SYSTEM'] },
+          },
+        }),
+      );
+      expect(result.items).toHaveLength(20);
+      expect(result.nextCursor).toBeTruthy();
+      expect(decodeNotificationCursor(result.nextCursor!)).toEqual({
+        createdAt: '2026-07-02T00:00:00.000Z',
+        id: 'system-19',
+      });
+    });
+
+    it('advances past rows deleted during cursor hydration', async () => {
+      const scanned = Array.from({ length: 21 }, (_, index) => ({
+        id: `system-${index}`,
+        createdAt: new Date(Date.UTC(2026, 6, 21 - index)),
+      }));
+      prisma.$queryRaw.mockResolvedValue(scanned);
+      prisma.notification.findMany.mockResolvedValue([]);
+
+      const result = await service.getProfileNotificationsByCursor(
+        'user-1',
+        encodeNotificationCursor({
+          createdAt: '2026-08-01T00:00:00.000Z',
+          id: 'after-system-0',
+        }),
+      );
+
+      expect(result).toEqual({
+        items: [],
+        nextCursor: encodeNotificationCursor({
+          createdAt: scanned[19].createdAt.toISOString(),
+          id: scanned[19].id,
+        }),
+      });
+    });
+
+    it('rejects malformed notification cursors before querying', async () => {
+      await expect(
+        service.getProfileNotificationsByCursor('user-1', 'not-a-cursor'),
+      ).rejects.toBeInstanceOf(BadRequestException);
+      expect(prisma.notification.findMany).not.toHaveBeenCalled();
+    });
+
+    it('starts cursor pagination with a bounded first-page query', async () => {
+      prisma.notification.findMany.mockResolvedValue([]);
+
+      await expect(service.getNotificationsByCursor('user-1')).resolves.toEqual(
+        { items: [], nextCursor: null },
+      );
+
+      expect(prisma.notification.findMany).toHaveBeenCalledWith(
+        expect.objectContaining({
+          where: expect.objectContaining({
+            toUserID: 'user-1',
+            deleted: false,
+          }),
+          orderBy: [{ createdAt: 'desc' }, { id: 'desc' }],
+          take: 21,
+        }),
+      );
+      expect(prisma.notification.findMany.mock.calls[0][0]).not.toHaveProperty(
+        'skip',
       );
     });
 

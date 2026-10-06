@@ -38,6 +38,7 @@ describe('NotificationPushService (#88 per-token delivery)', () => {
   beforeEach(() => {
     jest.clearAllMocks();
     for (const key of Object.keys(configValues)) delete configValues[key];
+    prisma.devicePushToken.findMany.mockResolvedValue([]);
     service = new NotificationPushService(
       prisma as unknown as PrismaService,
       config as any,
@@ -366,8 +367,8 @@ describe('NotificationPushService (#88 per-token delivery)', () => {
   });
 
   describe('listActiveTokensForUsers', () => {
-    it('loads every recipient token in one query and keeps the 20 newest per user', async () => {
-      prisma.devicePushToken.findMany.mockResolvedValue([
+    it('caps recipient tokens per user/provider inside the database query', async () => {
+      prisma.$queryRaw.mockResolvedValue([
         ...Array.from({ length: 22 }, (_, i) => ({
           userID: 'u1',
           token: `u1-${i}`,
@@ -386,21 +387,10 @@ describe('NotificationPushService (#88 per-token delivery)', () => {
 
       const byUser = await service.listActiveTokensForUsers(['u1', 'u2', 'u3']);
 
-      expect(prisma.devicePushToken.findMany).toHaveBeenCalledTimes(1);
-      expect(prisma.devicePushToken.findMany).toHaveBeenCalledWith({
-        where: {
-          userID: { in: ['u1', 'u2', 'u3'] },
-          disabledAt: null,
-        },
-        select: {
-          userID: true,
-          token: true,
-          projectId: true,
-          provider: true,
-          platform: true,
-        },
-        orderBy: { updatedAt: 'desc' },
-      });
+      expect(prisma.$queryRaw).toHaveBeenCalledTimes(1);
+      const query = prisma.$queryRaw.mock.calls[0][0] as { sql: string };
+      expect(query.sql).toContain('ROW_NUMBER() OVER');
+      expect(query.sql).toContain('token_rank <=');
       expect(byUser.get('u1')).toHaveLength(20);
       expect(byUser.get('u1')?.[0]).toEqual({
         token: 'u1-0',
@@ -423,7 +413,7 @@ describe('NotificationPushService (#88 per-token delivery)', () => {
       await expect(service.listActiveTokensForUsers([])).resolves.toEqual(
         new Map(),
       );
-      expect(prisma.devicePushToken.findMany).not.toHaveBeenCalled();
+      expect(prisma.$queryRaw).not.toHaveBeenCalled();
     });
   });
 
@@ -767,11 +757,22 @@ describe('NotificationPushService (#88 per-token delivery)', () => {
   describe('deleteStaleTokens', () => {
     it('prunes aged tokens under an advisory lock', async () => {
       prisma.$queryRaw.mockResolvedValue([{ acquired: true }]);
+      prisma.devicePushToken.findMany.mockResolvedValueOnce([
+        { id: 'token-1' },
+        { id: 'token-2' },
+      ]);
       prisma.devicePushToken.deleteMany.mockResolvedValue({ count: 2 });
 
       const result = await service.deleteStaleTokens();
 
       expect(result.count).toBe(2);
+      expect(prisma.devicePushToken.findMany).toHaveBeenCalledWith(
+        expect.objectContaining({
+          select: { id: true },
+          orderBy: { id: 'asc' },
+          take: 1000,
+        }),
+      );
     });
 
     it('is a no-op when another instance holds the lock', async () => {

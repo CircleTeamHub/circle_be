@@ -126,4 +126,27 @@ describe('DashboardService', () => {
       },
     });
   });
+
+  it('coalesces concurrent cache misses for the same range', async () => {
+    redis.getJson.mockResolvedValue(null);
+    let releaseUsers!: (value: { totalUsers: number }) => void;
+    const usersGate = new Promise<{ totalUsers: number }>((resolve) => {
+      releaseUsers = resolve;
+    });
+    users.getMetrics.mockReturnValue(usersGate);
+    community.getMetrics.mockResolvedValue({ totalCircles: 3 });
+    commerce.getMetrics.mockResolvedValue({ pointSpend: 100 });
+    moderation.getMetrics.mockResolvedValue({ pendingTotal: 2 });
+    system.getMetrics.mockResolvedValue({ services: { api: 'healthy' } });
+    redis.setJson.mockResolvedValue(true);
+
+    const first = service.getDashboard(DashboardRange.Today, now);
+    const second = service.getDashboard(DashboardRange.Today, now);
+    await Promise.resolve();
+    await Promise.resolve();
+
+    expect(users.getMetrics).toHaveBeenCalledTimes(1);
+    releaseUsers({ totalUsers: 10 });
+    await expect(Promise.all([first, second])).resolves.toHaveLength(2);
+  });
 });

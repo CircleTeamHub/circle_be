@@ -74,7 +74,7 @@ describe('database operation timing', () => {
     expect(originalQuery).toHaveBeenCalledTimes(1);
     expect(originalQuery).toHaveBeenCalledWith(secretQuery);
     expect(logger.warn).toHaveBeenCalledWith(
-      {
+      expect.objectContaining({
         event: 'database_operation_slow',
         scope: 'driver_adapter',
         operation: 'queryRaw',
@@ -84,7 +84,8 @@ describe('database operation timing', () => {
         suppressedCount: 0,
         requestId: 'request-1',
         traceId: 'trace-1',
-      },
+        queryFingerprint: expect.stringMatching(/^[a-f0-9]{16}$/),
+      }),
       'Performance',
     );
     const output = JSON.stringify((logger.warn as jest.Mock).mock.calls);

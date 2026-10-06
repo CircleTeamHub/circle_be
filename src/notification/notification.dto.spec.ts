@@ -161,4 +161,46 @@ describe('notification page bound', () => {
       expect(errorsFor(Dto, String(MAX_PAGE + 1))).toEqual(['page']);
     }
   });
+
+  it('accepts a bounded cursor and rejects an oversized cursor', () => {
+    expect(
+      validateSync(
+        plainToInstance(NotificationPageQueryDto, { cursor: 'cursor' }),
+      ),
+    ).toHaveLength(0);
+    expect(
+      validateSync(
+        plainToInstance(NotificationListQueryDto, {
+          cursor: 'c'.repeat(257),
+        }),
+      )
+        .map((error) => error.property)
+        .sort(),
+    ).toEqual(['cursor']);
+  });
+
+  it('accepts explicit cursor mode booleans and rejects other values', () => {
+    for (const value of ['true', 'false']) {
+      expect(
+        validateSync(
+          plainToInstance(
+            NotificationPageQueryDto,
+            { cursorMode: value },
+            { enableImplicitConversion: true },
+          ),
+        ),
+      ).toHaveLength(0);
+    }
+    expect(
+      validateSync(
+        plainToInstance(
+          NotificationPageQueryDto,
+          { cursorMode: '1' },
+          { enableImplicitConversion: true },
+        ),
+      )
+        .map((error) => error.property)
+        .sort(),
+    ).toEqual(['cursorMode']);
+  });
 });

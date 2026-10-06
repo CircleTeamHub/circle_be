@@ -1,4 +1,5 @@
 import {
+  BadRequestException,
   ConflictException,
   ForbiddenException,
   HttpException,
@@ -23,6 +24,8 @@ import {
 import {
   mapNotificationRealtimeDto,
   NOTIFICATION_REALTIME_INCLUDE,
+  decodeNotificationCursor,
+  encodeNotificationCursor,
   type NotificationRealtimeRow,
   type RegisterPushTokenDto,
   type NotificationRealtimeDto,
@@ -38,6 +41,12 @@ const SYSTEM_ANNOUNCEMENT_BROADCAST_BATCH_SIZE = 50;
 // 20 内都装得下，超限按 lastSeen 逐出最旧的；收紧到 10 只会更快逐出仍然
 // 活跃的次要设备，没有对应的安全收益（token 本身不可伪造投递身份）。
 const MAX_PUSH_TOKENS_PER_USER = 20;
+const NOTIFICATION_PAGE_SIZE = 20;
+
+type NotificationListPage = {
+  items: NotificationRealtimeDto[];
+  nextCursor: string | null;
+};
 
 type SystemAnnouncementAuditContext = {
   ip?: string | null;
@@ -756,37 +765,163 @@ export class NotificationService {
     page = 1,
     domain?: NotificationDomain,
   ) {
-    const take = 20;
+    const take = NOTIFICATION_PAGE_SIZE;
     const skip = (Math.max(1, page) - 1) * take;
-    const rows = await this.prisma.notification.findMany({
-      where: {
-        toUserID: userId,
-        deleted: false,
-        type: { in: [...notificationTypesForDomain(domain)] },
-      },
-      orderBy: { createdAt: 'desc' },
-      skip,
-      take,
-      include: NOTIFICATION_REALTIME_INCLUDE,
-    });
-    return rows.map(mapNotificationRealtimeDto);
+    return (
+      await this.listNotificationPage({
+        userId,
+        typeFilter: notificationTypesForDomain(domain),
+        skip,
+        take,
+      })
+    ).items;
   }
 
   async getProfileNotifications(userId: string, page = 1) {
-    const take = 20;
+    const take = NOTIFICATION_PAGE_SIZE;
     const skip = (Math.max(1, page) - 1) * take;
+    return (
+      await this.listNotificationPage({
+        userId,
+        typeFilter: PROFILE_NOTIFICATION_TYPES,
+        skip,
+        take,
+      })
+    ).items;
+  }
+
+  /**
+   * Cursor mode for clients that need to keep paging through a large inbox.
+   * The legacy page methods above remain array-shaped and continue to use the
+   * old contract; cursor callers receive an envelope with the next opaque
+   * cursor so they never pay a growing OFFSET cost.
+   */
+  async getNotificationsByCursor(
+    userId: string,
+    cursor?: string,
+    domain?: NotificationDomain,
+  ): Promise<NotificationListPage> {
+    return this.listNotificationPage({
+      userId,
+      typeFilter: notificationTypesForDomain(domain),
+      keyset: true,
+      cursor: cursor ? this.parseNotificationCursor(cursor) : undefined,
+    });
+  }
+
+  async getProfileNotificationsByCursor(
+    userId: string,
+    cursor?: string,
+  ): Promise<NotificationListPage> {
+    return this.listNotificationPage({
+      userId,
+      typeFilter: PROFILE_NOTIFICATION_TYPES,
+      keyset: true,
+      cursor: cursor ? this.parseNotificationCursor(cursor) : undefined,
+    });
+  }
+
+  private parseNotificationCursor(cursor: string) {
+    const parsed = decodeNotificationCursor(cursor);
+    if (!parsed) {
+      throw new BadRequestException('Invalid notification cursor');
+    }
+    return parsed;
+  }
+
+  private async listNotificationPage(input: {
+    userId: string;
+    typeFilter: readonly NotificationType[];
+    skip?: number;
+    take?: number;
+    keyset?: boolean;
+    cursor?: { createdAt: string; id: string };
+  }): Promise<NotificationListPage> {
+    const pageSize = input.take ?? NOTIFICATION_PAGE_SIZE;
+    const useCursor = input.keyset === true || Boolean(input.cursor);
+
+    if (input.cursor) {
+      const cursorDate = new Date(input.cursor.createdAt);
+      const cursorRows = await this.prisma.$queryRaw<
+        Array<{ id: string; createdAt: Date }>
+      >(
+        Prisma.sql`
+          SELECT n."id", n."createdAt"
+          FROM "Notification" n
+          WHERE n."toUserID" = ${input.userId}
+            AND n."deleted" = false
+            AND n."type" IN (${Prisma.join([...input.typeFilter])})
+            AND (n."createdAt", n."id") < (${cursorDate}, ${input.cursor.id})
+          ORDER BY n."createdAt" DESC, n."id" DESC
+          LIMIT ${pageSize + 1}
+        `,
+      );
+
+      const ids = cursorRows.map(({ id }) => id);
+      if (ids.length === 0) {
+        return { items: [], nextCursor: null };
+      }
+
+      // Hydrate the same relation graph as the legacy query, then restore the
+      // keyset order because an IN predicate does not guarantee row order.
+      const hydratedRows = await this.prisma.notification.findMany({
+        where: {
+          id: { in: ids },
+          toUserID: input.userId,
+          deleted: false,
+          type: { in: [...input.typeFilter] },
+        },
+        include: NOTIFICATION_REALTIME_INCLUDE,
+      });
+      const byId = new Map(hydratedRows.map((row) => [row.id, row]));
+      const orderedRows = ids
+        .map((id) => byId.get(id))
+        .filter((row): row is NotificationRealtimeRow => row !== undefined);
+      const hasMore = cursorRows.length > pageSize;
+      const pageRows = orderedRows.slice(0, pageSize);
+      const items = pageRows.map(mapNotificationRealtimeDto);
+      // A concurrent delete can make hydration return fewer rows than the ID
+      // scan. Advance from the last scanned key, rather than only the last
+      // hydrated row, so an empty hydrated page cannot strand later rows.
+      const last = hasMore ? (cursorRows[pageSize - 1] ?? null) : null;
+
+      return {
+        items,
+        nextCursor: last
+          ? encodeNotificationCursor({
+              createdAt: last.createdAt.toISOString(),
+              id: last.id,
+            })
+          : null,
+      };
+    }
+
+    const where: Prisma.NotificationWhereInput = {
+      toUserID: input.userId,
+      deleted: false,
+      type: { in: [...input.typeFilter] },
+    };
     const rows = await this.prisma.notification.findMany({
-      where: {
-        toUserID: userId,
-        deleted: false,
-        type: { in: [...PROFILE_NOTIFICATION_TYPES] },
-      },
-      orderBy: { createdAt: 'desc' },
-      skip,
-      take,
+      where,
+      orderBy: [{ createdAt: 'desc' }, { id: 'desc' }],
+      ...(useCursor ? {} : { skip: input.skip ?? 0 }),
+      take: useCursor ? pageSize + 1 : pageSize,
       include: NOTIFICATION_REALTIME_INCLUDE,
     });
-    return rows.map(mapNotificationRealtimeDto);
+    const hasMore = Boolean(useCursor && rows.length > pageSize);
+    const items = (hasMore ? rows.slice(0, pageSize) : rows).map(
+      mapNotificationRealtimeDto,
+    );
+    const last = hasMore ? rows[pageSize - 1] : null;
+    return {
+      items,
+      nextCursor: last
+        ? encodeNotificationCursor({
+            createdAt: last.createdAt.toISOString(),
+            id: last.id,
+          })
+        : null,
+    };
   }
 
   async getNotificationOpenOwnership(

@@ -22,6 +22,7 @@ describe('FriendController routes', () => {
   let app: INestApplication;
   const friendService = {
     listBlocked: jest.fn().mockResolvedValue([]),
+    setFriendPermission: jest.fn().mockResolvedValue(undefined),
   };
 
   beforeEach(async () => {
@@ -97,5 +98,18 @@ describe('FriendController routes', () => {
     await request(app.getHttpServer()).get('/friend/blocked').expect(200);
 
     expect(friendService.listBlocked).toHaveBeenCalledWith('user-1', 1);
+  });
+
+  it('PATCH /friend/:friendUserId/permission delegates the current user and body', async () => {
+    await request(app.getHttpServer())
+      .patch(`/friend/${FRIEND_ID}/permission`)
+      .send({ permission: 'CHAT_ONLY' })
+      .expect(204);
+
+    expect(friendService.setFriendPermission).toHaveBeenCalledWith(
+      'user-1',
+      FRIEND_ID,
+      'CHAT_ONLY',
+    );
   });
 });
