@@ -4,6 +4,54 @@
 
 ## 上线前检查
 
+- [ ] **帖子完整 trigram 索引迁移及中断恢复**
+
+  `20261007010000_cover_all_admin_post_search` 先并发建立完整 GIN，后续
+  `20261007010100_drop_redundant_partial_post_search` 才删除旧 partial GIN。
+  新建语句故意不使用 `IF NOT EXISTS`：同名索引可能是中断构建留下的 invalid
+  索引，必须阻止部署继续删除仍可用的旧索引。正常已完成的 Prisma 迁移不会重跑。
+
+  如果部署失败，先停止该次发布，用实际发布数据库运行 `npx prisma migrate status`。
+  确认下面的构建进度查询没有返回仍在运行的任务，再核验索引状态与定义
+  （下面以 `public` schema 为例；其他 schema 必须替换）：
+
+  ```sql
+  SELECT pid, phase FROM pg_stat_progress_create_index
+  WHERE relid = 'public."CirclePost"'::regclass;
+
+  SELECT n.nspname, c.relname, i.indisvalid, i.indisready,
+         pg_get_indexdef(i.indexrelid) AS definition,
+         pg_get_expr(i.indpred, i.indrelid) AS predicate
+  FROM pg_index i
+  JOIN pg_class c ON c.oid = i.indexrelid
+  JOIN pg_namespace n ON n.oid = c.relnamespace
+  WHERE n.nspname = 'public'
+    AND c.relname IN ('CirclePost_content_admin_trgm_idx', 'CirclePost_content_trgm_idx');
+  ```
+
+  - 完整索引 `indisvalid=false` 或 `indisready=false`：确认旧 partial 索引仍有效，
+    在事务外单独执行 `DROP INDEX CONCURRENTLY public."CirclePost_content_admin_trgm_idx";`。
+    然后执行 `npx prisma migrate resolve --rolled-back 20261007010000_cover_all_admin_post_search`
+    和 `npx prisma migrate deploy`，重新建立完整索引后再移除旧索引。
+  - 完整索引已有效，但 Prisma 未记录该次构建完成：重试仍会因同名索引失败，这是预期。
+    必须人工确认 `indisvalid=true`、`indisready=true`、目标表为 `CirclePost`、完整
+    `GIN (content gin_trgm_ops)` 且 `predicate` 为 NULL。确认该失败迁移的全部语句
+    已完成后，执行 `npx prisma migrate resolve --applied 20261007010000_cover_all_admin_post_search`
+    和 `npx prisma migrate deploy`。不要把 invalid 或定义不符的索引标记为 applied。
+  - 完整索引不存在：确认没有仍在运行的构建，再对该失败迁移执行上述 `--rolled-back`
+    和 deploy。恢复后复查索引有效性、默认无 status 搜索的 `EXPLAIN`、migration status
+    和 schema drift，并保留日志。
+
+  **证据：**
+
+  ```text
+  发布数据库/schema：
+  迁移与索引状态：
+  中断原因与恢复命令：
+  查询计划/drift 结果：
+  时间：
+  ```
+
 - [ ] **真实账号鉴权接口冒烟**
 
   使用真实登录态验证通知接口的完整流程：

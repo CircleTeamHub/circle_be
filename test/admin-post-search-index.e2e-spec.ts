@@ -18,6 +18,38 @@ const describePostgres = databaseUrl ? describe : describe.skip;
 describePostgres('admin post search corrective migrations', () => {
   const schema = `post_search_test_${randomUUID().replace(/-/g, '')}`;
   let client: Client;
+  let partialSql: string;
+  const createFullSql = readFileSync(
+    join(
+      __dirname,
+      '../prisma/migrations/20261007010000_cover_all_admin_post_search/migration.sql',
+    ),
+    'utf8',
+  );
+  const dropPartialSql = readFileSync(
+    join(
+      __dirname,
+      '../prisma/migrations/20261007010100_drop_redundant_partial_post_search/migration.sql',
+    ),
+    'utf8',
+  );
+  const applyCorrections = async () => {
+    await client.query(createFullSql);
+    await client.query(dropPartialSql);
+  };
+  const indexState = async (name: string) => {
+    const result = await client.query<{
+      indisvalid: boolean;
+      indisready: boolean;
+    }>(
+      `SELECT i.indisvalid, i.indisready
+       FROM pg_index i JOIN pg_class c ON c.oid = i.indexrelid
+       JOIN pg_namespace n ON n.oid = c.relnamespace
+       WHERE n.nspname = $1 AND c.relname = $2`,
+      [schema, name],
+    );
+    return result.rows[0];
+  };
   const explain = async (status = '') => {
     const result = await client.query(`EXPLAIN (FORMAT JSON)
       SELECT "id", "content" FROM "CirclePost"
@@ -53,8 +85,18 @@ describePostgres('admin post search corrective migrations', () => {
         oldMigration,
       )?.[0];
     expect(partial).toBeDefined();
-    await client.query(partial!);
+    partialSql = partial!;
     await client.query('ANALYZE "CirclePost"');
+  });
+
+  beforeEach(async () => {
+    await client.query(
+      `DROP INDEX IF EXISTS "${schema}"."CirclePost_content_admin_trgm_idx"`,
+    );
+    await client.query(
+      `DROP INDEX IF EXISTS "${schema}"."CirclePost_content_trgm_idx"`,
+    );
+    await client.query(partialSql);
   });
 
   afterAll(async () => {
@@ -70,23 +112,7 @@ describePostgres('admin post search corrective migrations', () => {
 
   it('indexes default admin search including deleted posts without changing results', async () => {
     expect(await explain()).not.toContain('CirclePost_content_trgm_idx');
-    const corrections = [
-      readFileSync(
-        join(
-          __dirname,
-          '../prisma/migrations/20261007010000_cover_all_admin_post_search/migration.sql',
-        ),
-        'utf8',
-      ),
-      readFileSync(
-        join(
-          __dirname,
-          '../prisma/migrations/20261007010100_drop_redundant_partial_post_search/migration.sql',
-        ),
-        'utf8',
-      ),
-    ];
-    for (const sql of corrections) await client.query(sql);
+    await applyCorrections();
     await client.query('ANALYZE "CirclePost"');
     expect(await explain()).toContain('CirclePost_content_admin_trgm_idx');
     expect(await explain(`AND "status" = 'VISIBLE'`)).toContain(
@@ -110,5 +136,98 @@ describePostgres('admin post search corrective migrations', () => {
     expect(indexes.rows.map((row) => row.indexname)).not.toContain(
       'CirclePost_content_trgm_idx',
     );
+  });
+
+  it('blocks an interrupted concurrent build retry until its invalid artifact is removed', async () => {
+    const blocker = new Client({ connectionString: databaseUrl! });
+    const builder = new Client({ connectionString: databaseUrl! });
+    let builderPid: number | undefined;
+    let building: Promise<unknown> | undefined;
+    try {
+      await blocker.connect();
+      await builder.connect();
+      await blocker.query('BEGIN');
+      await blocker.query(
+        `UPDATE "${schema}"."CirclePost" SET "content" = "content" WHERE "id" = '1'`,
+      );
+      await builder.query(`SET search_path TO "${schema}", public`);
+      await builder.query("SET statement_timeout TO '10s'");
+      const pid = await builder.query<{ pid: number }>(
+        'SELECT pg_backend_pid() AS pid',
+      );
+      builderPid = pid.rows[0].pid;
+      building = builder.query(createFullSql).catch((error: unknown) => error);
+      let waiting = false;
+      for (let attempt = 0; attempt < 100; attempt++) {
+        const progress = await client.query<{ phase: string }>(
+          'SELECT phase FROM pg_stat_progress_create_index WHERE pid = $1',
+          [builderPid],
+        );
+        if (progress.rows[0]?.phase === 'waiting for writers before build') {
+          waiting = true;
+          break;
+        }
+        await new Promise((resolve) => setTimeout(resolve, 50));
+      }
+      expect(waiting).toBe(true);
+      await client.query('SELECT pg_cancel_backend($1)', [builderPid]);
+      expect(await building).toMatchObject({ code: '57014' });
+    } finally {
+      try {
+        if (builderPid !== undefined)
+          await client.query('SELECT pg_cancel_backend($1)', [builderPid]);
+        await building;
+        await blocker.query('ROLLBACK');
+      } finally {
+        await Promise.all([blocker.end(), builder.end()]);
+      }
+    }
+
+    expect(await indexState('CirclePost_content_admin_trgm_idx')).toEqual({
+      indisvalid: false,
+      indisready: false,
+    });
+    await expect(applyCorrections()).rejects.toMatchObject({ code: '42P07' });
+    expect(await indexState('CirclePost_content_trgm_idx')).toEqual({
+      indisvalid: true,
+      indisready: true,
+    });
+    expect(await indexState('CirclePost_content_admin_trgm_idx')).toEqual({
+      indisvalid: false,
+      indisready: false,
+    });
+
+    // Operator recovery: remove the failed artifact, then rerun deployment.
+    await client.query(
+      `DROP INDEX CONCURRENTLY "${schema}"."CirclePost_content_admin_trgm_idx"`,
+    );
+    await applyCorrections();
+    expect(await indexState('CirclePost_content_admin_trgm_idx')).toEqual({
+      indisvalid: true,
+      indisready: true,
+    });
+    expect(await indexState('CirclePost_content_trgm_idx')).toBeUndefined();
+    expect(await explain()).toContain('CirclePost_content_admin_trgm_idx');
+  });
+
+  it('also blocks a valid existing index so an operator must verify and resolve the migration', async () => {
+    await client.query(createFullSql);
+    expect(await indexState('CirclePost_content_admin_trgm_idx')).toEqual({
+      indisvalid: true,
+      indisready: true,
+    });
+    await expect(applyCorrections()).rejects.toMatchObject({ code: '42P07' });
+    expect(await indexState('CirclePost_content_trgm_idx')).toEqual({
+      indisvalid: true,
+      indisready: true,
+    });
+    // After verifying the completed full index, migrate resolve --applied
+    // permits deploy to continue with only the next migration.
+    await client.query(dropPartialSql);
+    expect(await indexState('CirclePost_content_trgm_idx')).toBeUndefined();
+    expect(await indexState('CirclePost_content_admin_trgm_idx')).toEqual({
+      indisvalid: true,
+      indisready: true,
+    });
   });
 });
