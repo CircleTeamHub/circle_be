@@ -35,7 +35,7 @@ export type NoteStatus = (typeof NOTE_STATUS)[number];
 export const NOTE_WRITABLE_STATUS = ['ACTIVE', 'UNLISTED'] as const;
 export type NoteWritableStatus = (typeof NOTE_WRITABLE_STATUS)[number];
 
-export const NOTE_MEDIA_TYPE = ['IMAGE', 'VIDEO'] as const;
+export const NOTE_MEDIA_TYPE = ['IMAGE', 'VIDEO', 'AUDIO'] as const;
 export type NoteMediaType = (typeof NOTE_MEDIA_TYPE)[number];
 
 export const NOTE_EXPORT_FORMAT = ['IMAGE', 'PDF', 'IMAGES', 'VIDEOS'] as const;
@@ -184,6 +184,66 @@ export class NoteLocationSectionDto {
   longitude?: number;
 }
 
+/** A contact card is an immutable snapshot embedded in the note. */
+export class NoteContactCardDto {
+  @ApiProperty({ description: 'OpenIM/user identifier; UUID is not required.' })
+  @IsString()
+  @IsNotEmpty()
+  @MaxLength(120)
+  id: string;
+
+  @ApiProperty()
+  @IsString()
+  @IsNotEmpty()
+  @MaxLength(120)
+  name: string;
+
+  @ApiPropertyOptional()
+  @IsOptional()
+  @IsUrl({ require_tld: false })
+  @MaxLength(500)
+  faceURL?: string;
+}
+
+/** A group card is also a snapshot; it must not turn a note read into a roster read. */
+export class NoteGroupCardDto {
+  @ApiProperty({ description: 'OpenIM group identifier.' })
+  @IsString()
+  @IsNotEmpty()
+  @MaxLength(120)
+  id: string;
+
+  @ApiProperty()
+  @IsString()
+  @IsNotEmpty()
+  @MaxLength(120)
+  name: string;
+
+  @ApiPropertyOptional()
+  @IsOptional()
+  @IsUrl({ require_tld: false })
+  @MaxLength(500)
+  faceURL?: string;
+}
+
+export class NoteContactSectionDto {
+  @ApiProperty({ type: [NoteContactCardDto] })
+  @IsArray()
+  @ArrayMaxSize(50)
+  @ValidateNested({ each: true })
+  @Type(() => NoteContactCardDto)
+  items: NoteContactCardDto[];
+}
+
+export class NoteGroupCardSectionDto {
+  @ApiProperty({ type: [NoteGroupCardDto] })
+  @IsArray()
+  @ArrayMaxSize(50)
+  @ValidateNested({ each: true })
+  @Type(() => NoteGroupCardDto)
+  items: NoteGroupCardDto[];
+}
+
 export class NoteSectionsDto {
   @ApiPropertyOptional({ type: NoteTextSectionDto })
   @IsOptional()
@@ -202,6 +262,27 @@ export class NoteSectionsDto {
   @ValidateNested()
   @Type(() => NoteMediaSectionDto)
   showcase?: NoteMediaSectionDto;
+
+  @ApiPropertyOptional({
+    type: NoteMediaSectionDto,
+    description: 'Audio recordings.',
+  })
+  @IsOptional()
+  @ValidateNested()
+  @Type(() => NoteMediaSectionDto)
+  audio?: NoteMediaSectionDto;
+
+  @ApiPropertyOptional({ type: NoteContactSectionDto })
+  @IsOptional()
+  @ValidateNested()
+  @Type(() => NoteContactSectionDto)
+  contacts?: NoteContactSectionDto;
+
+  @ApiPropertyOptional({ type: NoteGroupCardSectionDto })
+  @IsOptional()
+  @ValidateNested()
+  @Type(() => NoteGroupCardSectionDto)
+  groups?: NoteGroupCardSectionDto;
 
   @ApiPropertyOptional({ type: NoteLocationSectionDto, nullable: true })
   @IsOptional()
@@ -261,9 +342,69 @@ export class CreateNoteDto {
   @ValidateNested()
   @Type(() => NoteSectionsDto)
   sections?: NoteSectionsDto;
+
+  @ApiPropertyOptional({
+    description: 'Stable client draft id to remove after a successful save.',
+  })
+  @IsOptional()
+  @IsString()
+  @MaxLength(180)
+  @Matches(/^[A-Za-z0-9._:-]+$/)
+  clientDraftID?: string;
 }
 
 export class UpdateNoteDto extends CreateNoteDto {}
+
+export class SaveNoteDraftDto {
+  @ApiPropertyOptional()
+  @IsOptional()
+  @IsString()
+  @Trim()
+  @MaxLength(120)
+  title?: string;
+
+  @ApiPropertyOptional()
+  @IsOptional()
+  @IsString()
+  @MaxLength(20000)
+  content?: string;
+
+  @ApiPropertyOptional({ type: [Object] })
+  @IsOptional()
+  @IsArray()
+  @ArrayMaxSize(500)
+  contentJson?: Record<string, unknown>[];
+
+  @ApiPropertyOptional({ type: NoteSectionsDto })
+  @IsOptional()
+  @ValidateNested()
+  @Type(() => NoteSectionsDto)
+  sections?: NoteSectionsDto;
+
+  @ApiPropertyOptional({ type: [String] })
+  @IsOptional()
+  @IsArray()
+  @IsUUID(undefined, { each: true })
+  @ArrayMaxSize(50)
+  groupIds?: string[];
+
+  @ApiPropertyOptional({ nullable: true })
+  @IsOptional()
+  @IsUUID()
+  sourceNoteId?: string | null;
+
+  @ApiPropertyOptional({ type: [String] })
+  @IsOptional()
+  @IsArray()
+  @ArrayMaxSize(150)
+  @IsString({ each: true })
+  @MaxLength(255, { each: true })
+  @Matches(/^(?!.*\.\.)[A-Za-z0-9._\/-]+$/, {
+    each: true,
+    message: 'mediaKeys contains invalid characters',
+  })
+  mediaKeys?: string[];
+}
 
 // 单独更新一条 note 的 group 归属。前端"批量调分组成员"流程要避免对每个 note 做
 // fetch-detail-then-replace-all 的 N+1（参考 review #59）；这个 DTO 让前端只发 groupIds 一项。
@@ -506,6 +647,9 @@ export class NoteSectionsResponseDto {
   };
   @ApiProperty() media: { items: unknown[] };
   @ApiProperty() showcase: { items: unknown[] };
+  @ApiPropertyOptional() audio?: { items: unknown[] };
+  @ApiPropertyOptional() contacts?: { items: unknown[] };
+  @ApiPropertyOptional() groups?: { items: unknown[] };
   @ApiPropertyOptional({ nullable: true }) location: {
     title?: string;
     address?: string;
@@ -536,6 +680,7 @@ export class NoteSummaryDto {
   } | null;
   @ApiProperty() imageCount: number;
   @ApiProperty() videoCount: number;
+  @ApiProperty() audioCount: number;
   @ApiProperty() mediaCount: number;
   @ApiProperty() hasText: boolean;
   @ApiProperty() showcaseCount: number;
@@ -547,6 +692,27 @@ export class NoteSummaryDto {
   collectedFrom: Record<string, unknown> | null;
   @ApiProperty() createdAt: Date;
   @ApiProperty() updatedAt: Date;
+}
+
+export class NoteDraftSummaryDto {
+  @ApiProperty({ description: 'Stable client draft id.' }) id: string;
+  @ApiPropertyOptional({ nullable: true }) sourceNoteId: string | null;
+  @ApiProperty() title: string;
+  @ApiPropertyOptional() contentPreview: string | null;
+  @ApiProperty() mediaCount: number;
+  @ApiProperty() createdAt: Date;
+  @ApiProperty() updatedAt: Date;
+}
+
+export class NoteDraftDto extends NoteDraftSummaryDto {
+  @ApiPropertyOptional() content: string | null;
+  @ApiPropertyOptional({ type: [Object], nullable: true }) contentJson:
+    | Record<string, unknown>[]
+    | null;
+  @ApiPropertyOptional({ type: NoteSectionsResponseDto, nullable: true })
+  sections: NoteSectionsResponseDto | null;
+  @ApiProperty({ type: [String] }) groupIds: string[];
+  @ApiProperty({ type: [String] }) mediaKeys: string[];
 }
 
 export class NoteDetailDto extends NoteSummaryDto {

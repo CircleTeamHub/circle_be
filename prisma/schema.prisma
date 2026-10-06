@@ -138,6 +138,7 @@ enum NoteStatus {
 enum NoteMediaType {
   IMAGE
   VIDEO
+  AUDIO
 }
 
 enum CirclePostStatus {
@@ -450,6 +451,7 @@ model User {
   creditEvents                      CreditEvent[]               @relation("creditEventUser")
   creditEventsAuthored              CreditEvent[]               @relation("creditEventActor")
   notes                             Note[]
+  noteDrafts                        NoteDraft[]
   noteShareLinks                    NoteShareLink[]
   noteGroups                        NoteGroup[]
   circles                           Circle[]
@@ -1063,6 +1065,7 @@ model Note {
   mediaCount          Int        @default(0)
   imageCount          Int        @default(0)
   videoCount          Int        @default(0)
+  audioCount          Int        @default(0)
   // 仅笔记主人可见的私人备注 —— 不随分享/访客视图外发（序列化时按 viewer 判空）。
   remark              String?
   // 从聊天收藏他人笔记时的来源快照（会话类型、群/发送者名片、消息定位信息）。
@@ -1077,6 +1080,7 @@ model Note {
   media            NoteMedia[]           @relation("noteMediaItems")
   coverMedia       NoteMedia?            @relation("noteCoverMedia", fields: [coverMediaID], references: [id], onDelete: SetNull)
   groupMemberships NoteGroupMembership[]
+  drafts           NoteDraft[]
   // Active collect idempotency is enforced by a raw partial unique index in
   // migration 20260702010000_add_note_collected_from. Prisma cannot model the
   // `WHERE collectedFromNoteID IS NOT NULL AND status <> 'DELETED'` predicate.
@@ -1084,6 +1088,28 @@ model Note {
   @@index([ownerID, status, updatedAt])
   @@index([ownerID, pinned, updatedAt])
   @@index([groupID])
+}
+
+model NoteDraft {
+  id            String   @id @default(uuid())
+  ownerID       String
+  clientDraftID String
+  sourceNoteID  String?
+  title         String   @default("")
+  content       String?
+  contentJson   Json?
+  sections      Json?
+  groupIDs      String[] @default([])
+  mediaKeys     String[] @default([])
+  createdAt     DateTime @default(now())
+  updatedAt     DateTime @updatedAt
+
+  owner      User  @relation(fields: [ownerID], references: [id], onDelete: Cascade)
+  sourceNote Note? @relation(fields: [sourceNoteID], references: [id], onDelete: SetNull)
+
+  @@unique([ownerID, clientDraftID])
+  @@index([ownerID, updatedAt])
+  @@index([sourceNoteID])
 }
 
 model NoteShareLink {

@@ -457,9 +457,13 @@ export class UploadService implements OnModuleInit {
 
     // 语音/文件只对 chat 目录开放。DTO 的白名单是全局的,只放宽它等于让头像、
     // 封面、圈子帖目录也能收 pdf/zip —— 目录收口必须在这里再做一次。
-    if (CHAT_ONLY_UPLOAD_TYPES.includes(contentType) && folder !== 'chat') {
+    const isAudio = contentType.startsWith('audio/');
+    if (
+      CHAT_ONLY_UPLOAD_TYPES.includes(contentType) &&
+      (isAudio ? !['chat', 'notes'].includes(folder) : folder !== 'chat')
+    ) {
       throw new BadRequestException({
-        message: `${contentType} uploads are only allowed in chat`,
+        message: `${contentType} uploads are only allowed in chat or notes`,
         errorCode: UploadErrorCode.InvalidContentType,
       });
     }

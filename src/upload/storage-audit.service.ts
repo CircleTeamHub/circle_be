@@ -284,6 +284,23 @@ export class StorageAuditService {
         add(row.posterUrl);
       },
     );
+    // 草稿中的媒体只保存 object key，还没有 NoteMedia 行；纳入引用盘点，避免
+    // 用户离开编辑器后草稿仍可恢复，却被审计误报成孤儿对象。
+    // Older test doubles and rolling deployments may not expose the new model
+    // yet. Skipping this source is safe: the audit remains report-only, while
+    // a real Prisma client always has noteDraft after the migration is applied.
+    if (this.prisma.noteDraft) {
+      await this.collectFrom(
+        (cursor, take) =>
+          this.prisma.noteDraft.findMany({
+            select: { id: true, mediaKeys: true },
+            orderBy: { id: 'asc' },
+            take,
+            ...(cursor ? { cursor: { id: cursor }, skip: 1 } : {}),
+          }),
+        (row) => row.mediaKeys.forEach(add),
+      );
+    }
     // 下面三张刻意逐张写死,不走动态表名:storage-audit.service.spec.ts 用
     // `this.prisma.<table>.findMany` 的字面量守「十张表一个都不能漏」——
     // 漏一处就是那批对象被误报成孤儿,而这份账是用来授权删除的。

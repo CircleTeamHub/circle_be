@@ -35,6 +35,7 @@ import {
 } from 'src/avatar-frame/avatar-frame.service';
 import { createLoggingConfig } from 'src/logging/logging.config';
 import { logBusinessEvent } from 'src/logging/business-event.logger';
+import { buildImageMedia } from 'src/media/image-media';
 
 const TRACE_FEED_LIKE_PREVIEW_LIMIT = 20;
 const TRACE_FEED_COMMENT_PREVIEW_LIMIT = 20;
@@ -79,6 +80,7 @@ export class TraceService {
   private readonly logger = new Logger(TraceService.name);
   private readonly loggingConfig = createLoggingConfig();
   private readonly storagePublicObjectBases: readonly string[];
+  private readonly imageTransformTemplate: string | undefined;
 
   constructor(
     private readonly prisma: PrismaService,
@@ -90,6 +92,9 @@ export class TraceService {
   ) {
     this.storagePublicObjectBases = storagePublicObjectBasesFromConfig(
       this.config,
+    );
+    this.imageTransformTemplate = this.config.get<string>(
+      'MEDIA_IMAGE_TRANSFORM_URL',
     );
   }
 
@@ -395,6 +400,7 @@ export class TraceService {
       id: trace.id,
       content: trace.content,
       images: trace.images,
+      media: buildImageMedia(trace.images, this.imageTransformTemplate),
       visibility: trace.visibility,
       author: {
         id: trace.from.id,
@@ -807,6 +813,7 @@ export class TraceService {
       id: comment.id,
       content: comment.content,
       images: comment.images,
+      media: buildImageMedia(comment.images, this.imageTransformTemplate),
       user: { id: comment.user.id, nickname: comment.user.nickname },
       replyTo: comment.replyTo
         ? {
@@ -1140,6 +1147,7 @@ export class TraceService {
           id: c.id,
           content: c.content,
           images: c.images ?? [],
+          media: buildImageMedia(c.images ?? [], this.imageTransformTemplate),
           user: { id: c.user.id, nickname: c.user.nickname },
           // `id` MUST be the parent COMMENT id — the client threads replies by
           // looking it up in a comment-id map. Using c.replyTo.user.id here made
@@ -1160,6 +1168,7 @@ export class TraceService {
       id: trace.id,
       content: trace.content,
       images: trace.images,
+      media: buildImageMedia(trace.images, this.imageTransformTemplate),
       visibility: trace.visibility,
       author: {
         id: trace.from.id,

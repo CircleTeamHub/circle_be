@@ -51,6 +51,7 @@ import {
 } from 'src/avatar-frame/avatar-frame.service';
 import { createLoggingConfig } from 'src/logging/logging.config';
 import { logBusinessEvent } from 'src/logging/business-event.logger';
+import { buildImageMedia } from 'src/media/image-media';
 
 // The relations every DTO mapping needs, narrowed to the columns it reads.
 // `include: { author: true }` pulled the whole User row (passwordHash, email,
@@ -109,6 +110,7 @@ export class CirclePlazaService {
   private readonly logger = new Logger(CirclePlazaService.name);
   private readonly loggingConfig = createLoggingConfig();
   private readonly storagePublicObjectBases: readonly string[];
+  private readonly imageTransformTemplate: string | undefined;
 
   constructor(
     private readonly prisma: PrismaService,
@@ -121,6 +123,9 @@ export class CirclePlazaService {
   ) {
     this.storagePublicObjectBases = storagePublicObjectBasesFromConfig(
       this.config,
+    );
+    this.imageTransformTemplate = this.config.get<string>(
+      'MEDIA_IMAGE_TRANSFORM_URL',
     );
   }
 
@@ -1704,6 +1709,7 @@ export class CirclePlazaService {
       id: post.id,
       content: post.content,
       images: post.images,
+      media: buildImageMedia(post.images, this.imageTransformTemplate),
       tags: post.tags,
       city: post.city,
       cities: post.cities ?? (post.city ? [post.city] : []),
