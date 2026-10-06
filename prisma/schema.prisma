@@ -1053,6 +1053,7 @@ model CreditEvent {
 model Note {
   id                  String     @id @default(uuid())
   ownerID             String
+  clientDraftID       String?
   groupID             String?
   title               String
   content             String?
@@ -1085,6 +1086,7 @@ model Note {
   // migration 20260702010000_add_note_collected_from. Prisma cannot model the
   // `WHERE collectedFromNoteID IS NOT NULL AND status <> 'DELETED'` predicate.
 
+  @@unique([ownerID, clientDraftID])
   @@index([ownerID, status, updatedAt])
   @@index([ownerID, pinned, updatedAt])
   @@index([groupID])

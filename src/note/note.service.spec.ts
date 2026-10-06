@@ -100,6 +100,7 @@ describe('NoteService', () => {
 
   beforeEach(async () => {
     jest.clearAllMocks();
+    prisma.note.findFirst.mockReset();
     programEnabled = true;
     prisma.user.findUnique.mockResolvedValue({
       vipLevel: 0,
@@ -2175,11 +2176,13 @@ describe('NoteService', () => {
 
   it('updates a note by replacing media and recalculating counts', async () => {
     prisma.note.count.mockResolvedValue(51);
-    prisma.note.findFirst.mockResolvedValueOnce({
-      id: 'note-1',
-      ownerID: 'user-1',
-      groupID: null,
-    });
+    prisma.note.findFirst
+      .mockResolvedValueOnce({ sections: null })
+      .mockResolvedValueOnce({
+        id: 'note-1',
+        ownerID: 'user-1',
+        groupID: null,
+      });
     prisma.note.update.mockResolvedValueOnce({
       id: 'note-1',
       title: '更新后的笔记',
@@ -3082,7 +3085,9 @@ describe('NoteService', () => {
         if (operation === 'create') {
           prisma.note.create.mockResolvedValueOnce({ id: row.id });
         } else {
-          prisma.note.findFirst.mockResolvedValueOnce(row);
+          prisma.note.findFirst
+            .mockResolvedValueOnce(row)
+            .mockResolvedValueOnce(row);
         }
         prisma.note.update.mockImplementationOnce(async ({ data }) => ({
           ...row,
@@ -4030,11 +4035,13 @@ describe('NoteService', () => {
     prisma.noteMedia.findMany.mockResolvedValueOnce([
       { objectKey: 'notes/user-2/a.jpg' },
     ]);
-    prisma.note.findFirst.mockResolvedValueOnce({
-      id: 'note-copy',
-      ownerID: 'user-1',
-      status: 'ACTIVE',
-    });
+    prisma.note.findFirst
+      .mockResolvedValueOnce({ sections: null })
+      .mockResolvedValueOnce({
+        id: 'note-copy',
+        ownerID: 'user-1',
+        status: 'ACTIVE',
+      });
     prisma.note.update.mockResolvedValueOnce({
       ...otherUsersNote,
       id: 'note-copy',
@@ -4063,6 +4070,7 @@ describe('NoteService', () => {
   });
 
   it('updateNote still rejects foreign media keys that are not on the note', async () => {
+    prisma.note.findFirst.mockResolvedValueOnce({ sections: null });
     prisma.noteMedia.findMany.mockResolvedValueOnce([]);
 
     await expect(

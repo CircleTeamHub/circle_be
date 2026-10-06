@@ -36,6 +36,7 @@ import {
   CreateNoteShareLinkDto,
   ListNoteShareLinksQueryDto,
   ListNotesQueryDto,
+  ListNoteDraftsQueryDto,
   NoteChatMediaImportDto,
   RecycleBinQueryDto,
   NoteDetailDto,
@@ -287,8 +288,15 @@ export class NoteController {
   @Get('drafts')
   @ApiOperation({ summary: 'List my note drafts' })
   @ApiOkResponse({ type: [NoteDraftSummaryDto] })
-  listDrafts(@Req() req: RequestWithUser): Promise<NoteDraftSummaryDto[]> {
-    return this.noteService.listNoteDrafts(req.user.userId);
+  listDrafts(
+    @Query() query: ListNoteDraftsQueryDto,
+    @Req() req: RequestWithUser,
+  ): Promise<NoteDraftSummaryDto[]> {
+    return this.noteService.listNoteDrafts(
+      req.user.userId,
+      query.page ?? 1,
+      query.limit ?? 100,
+    );
   }
 
   @Get('drafts/:draftId')

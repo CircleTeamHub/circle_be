@@ -355,6 +355,24 @@ export class CreateNoteDto {
 
 export class UpdateNoteDto extends CreateNoteDto {}
 
+export class ListNoteDraftsQueryDto {
+  @ApiPropertyOptional({ default: 1 })
+  @IsOptional()
+  @Type(() => Number)
+  @IsInt()
+  @Min(1)
+  @Max(MAX_PAGE)
+  page = 1;
+
+  @ApiPropertyOptional({ default: 100, maximum: 100 })
+  @IsOptional()
+  @Type(() => Number)
+  @IsInt()
+  @Min(1)
+  @Max(100)
+  limit = 100;
+}
+
 export class SaveNoteDraftDto {
   @ApiPropertyOptional()
   @IsOptional()
@@ -684,6 +702,8 @@ export class NoteSummaryDto {
   @ApiProperty() mediaCount: number;
   @ApiProperty() hasText: boolean;
   @ApiProperty() showcaseCount: number;
+  @ApiProperty() contactCount: number;
+  @ApiProperty() groupCardCount: number;
   @ApiProperty() hasLocation: boolean;
   @ApiPropertyOptional({
     nullable: true,
