@@ -301,6 +301,7 @@ const NOTE_MEDIA_URL_WINDOW_MS = 60 * 60 * 1000; // 1h
 const NOTE_MEDIA_URL_TTL_SECONDS = 2 * 60 * 60; // 2h
 /** 单请求内 S3 CopyObject 的并发上限（转发笔记媒体进聊天时）。 */
 const NOTE_CHAT_MEDIA_COPY_CONCURRENCY = 5;
+const MAX_NOTE_MEDIA_ITEMS = 50;
 const MAX_EXPORT_MEDIA_ITEMS = 50;
 const MAX_EXPORT_SINGLE_MEDIA_BYTES = 8 * 1024 * 1024;
 const MAX_EXPORT_TOTAL_MEDIA_BYTES = 16 * 1024 * 1024;
@@ -1109,18 +1110,25 @@ export class NoteService {
 
   private getExportSectionMedia(sections: NoteSections) {
     const seen = new Set<string>();
-    return [...sections.media.items, ...sections.showcase.items].filter(
-      (item: any) => {
-        if (item.type !== 'IMAGE' && item.type !== 'VIDEO') return false;
-        const key =
-          typeof item.objectKey === 'string'
-            ? `${item.objectKey}:${item.url ?? ''}`
-            : `url:${item.url ?? ''}`;
-        if (seen.has(key)) return false;
-        seen.add(key);
-        return true;
-      },
-    );
+    return [
+      ...sections.media.items,
+      ...sections.showcase.items,
+      ...(sections.audio?.items ?? []),
+    ].filter((item: any) => {
+      if (
+        item.type !== 'IMAGE' &&
+        item.type !== 'VIDEO' &&
+        item.type !== 'AUDIO'
+      )
+        return false;
+      const key =
+        typeof item.objectKey === 'string'
+          ? `${item.objectKey}:${item.url ?? ''}`
+          : `url:${item.url ?? ''}`;
+      if (seen.has(key)) return false;
+      seen.add(key);
+      return true;
+    });
   }
 
   /**
@@ -1146,7 +1154,10 @@ export class NoteService {
       ...(sections.text.content ?? '').split(NOTE_LINE_SEPARATOR),
       '',
       ...exportMedia.map((item: any, index) => {
-        const type = item.type === 'VIDEO' ? '视频' : '图片';
+        const type =
+          ({ IMAGE: '图片', VIDEO: '视频', AUDIO: '音频' } as const)[
+            item.type as 'IMAGE' | 'VIDEO' | 'AUDIO'
+          ] ?? '媒体';
         return `${type} ${index + 1}: ${item.url ?? ''}`;
       }),
       ...(sections.location
@@ -1239,7 +1250,10 @@ export class NoteService {
     let embeddedImages = 0;
     for (const [index, rawItem] of sectionMedia.entries()) {
       const item = rawItem as any;
-      const type = item.type === 'VIDEO' ? 'Video' : 'Image';
+      const type =
+        ({ IMAGE: 'Image', VIDEO: 'Video', AUDIO: 'Audio' } as const)[
+          item.type as 'IMAGE' | 'VIDEO' | 'AUDIO'
+        ] ?? 'Media';
       doc.fontSize(12).text(`${type} ${index + 1}`, { continued: false });
       doc
         .fontSize(9)
@@ -2057,6 +2071,11 @@ export class NoteService {
         sectionMediaCombined.length > 0
           ? sectionMediaCombined
           : this.deriveMediaFromBlocks(blocks);
+    }
+    if (derivedMedia.length > MAX_NOTE_MEDIA_ITEMS) {
+      throw new BadRequestException(
+        `Note media limit is ${MAX_NOTE_MEDIA_ITEMS} items across all sections`,
+      );
     }
 
     // 客户端 edit 时会回传读到的签名 url；写入前 strip 掉 query，只存持久 base url
