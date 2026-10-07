@@ -9,6 +9,7 @@ import {
   ParseUUIDPipe,
   Patch,
   Post,
+  Put,
   Query,
   Req,
   Res,
@@ -24,6 +25,7 @@ import {
 import { Throttle, ThrottlerGuard } from '@nestjs/throttler';
 import type { Response } from 'express';
 import { JwtGuard } from 'src/guards/jwt.guard';
+import { UserThrottlerGuard } from 'src/guards/user-throttler.guard';
 import type { RequestWithUser } from 'src/auth/types';
 import {
   CollectNoteDto,
@@ -35,9 +37,12 @@ import {
   CreateNoteShareLinkDto,
   ListNoteShareLinksQueryDto,
   ListNotesQueryDto,
+  ListNoteDraftsQueryDto,
   NoteChatMediaImportDto,
   RecycleBinQueryDto,
   NoteDetailDto,
+  NoteDraftDto,
+  NoteDraftSummaryDto,
   NoteExportResultDto,
   NoteGroupDto,
   NoteShareLinkDto,
@@ -47,6 +52,7 @@ import {
   SetNoteRemarkDto,
   SetNoteStatusDto,
   SetPinnedDto,
+  SaveNoteDraftDto,
   UpdateNoteDto,
   UpdateNoteGroupDto,
   UpdateNoteGroupIdsDto,
@@ -278,6 +284,54 @@ export class NoteController {
   @ApiOkResponse({ type: [NoteGroupDto] })
   listGroups(@Req() req: RequestWithUser): Promise<NoteGroupDto[]> {
     return this.noteService.listGroups(req.user.userId);
+  }
+
+  @Get('drafts')
+  @ApiOperation({ summary: 'List my note drafts' })
+  @ApiOkResponse({ type: [NoteDraftSummaryDto] })
+  listDrafts(
+    @Query() query: ListNoteDraftsQueryDto,
+    @Req() req: RequestWithUser,
+  ): Promise<NoteDraftSummaryDto[]> {
+    return this.noteService.listNoteDrafts(
+      req.user.userId,
+      query.page ?? 1,
+      query.limit ?? 100,
+    );
+  }
+
+  @Get('drafts/:draftId')
+  @ApiOperation({ summary: 'Get one of my note drafts' })
+  @ApiOkResponse({ type: NoteDraftDto })
+  getDraft(
+    @Param('draftId') draftId: string,
+    @Req() req: RequestWithUser,
+  ): Promise<NoteDraftDto> {
+    return this.noteService.getNoteDraft(req.user.userId, draftId);
+  }
+
+  @Put('drafts/:draftId')
+  @UseGuards(UserThrottlerGuard)
+  @Throttle({ default: { limit: 120, ttl: 60_000 } })
+  @ApiOperation({ summary: 'Create or update one of my note drafts' })
+  @ApiOkResponse({ type: NoteDraftDto })
+  saveDraft(
+    @Param('draftId') draftId: string,
+    @Body() dto: SaveNoteDraftDto,
+    @Req() req: RequestWithUser,
+  ): Promise<NoteDraftDto> {
+    return this.noteService.saveNoteDraft(req.user.userId, draftId, dto);
+  }
+
+  @Delete('drafts/:draftId')
+  @HttpCode(HttpStatus.NO_CONTENT)
+  @ApiOperation({ summary: 'Delete one of my note drafts' })
+  @ApiNoContentResponse()
+  deleteDraft(
+    @Param('draftId') draftId: string,
+    @Req() req: RequestWithUser,
+  ): Promise<void> {
+    return this.noteService.deleteNoteDraft(req.user.userId, draftId);
   }
 
   @Get(':id')

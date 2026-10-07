@@ -173,6 +173,23 @@ export class StorageAuditService {
       const key = this.toObjectKey(value);
       if (key) keys.add(key);
     };
+    const addCardAvatars = (sections: unknown) => {
+      if (!sections || typeof sections !== 'object' || Array.isArray(sections))
+        return;
+      for (const name of ['contacts', 'groups']) {
+        const section = (sections as Record<string, unknown>)[name];
+        if (!section || typeof section !== 'object' || Array.isArray(section))
+          continue;
+        const items = (section as Record<string, unknown>).items;
+        if (!Array.isArray(items)) continue;
+        for (const item of items) {
+          if (!item || typeof item !== 'object' || Array.isArray(item))
+            continue;
+          add(item.faceURL);
+          add(item.avatarUrl);
+        }
+      }
+    };
 
     // 这份清单是从 schema 里逐个 String 字段筛出来的（名字含 url/avatar/cover/
     // image/photo 的全部 14 个），不是凭印象列的。少一处 = 那批对象被误报成孤儿。
@@ -284,6 +301,39 @@ export class StorageAuditService {
         add(row.posterUrl);
       },
     );
+    // Cards freeze avatars independently of the current User/Circle columns.
+    // Retain durable row references, including DELETED rows, consistently with
+    // the existing NoteMedia scan.
+    await this.collectFrom(
+      (cursor, take) =>
+        this.prisma.note.findMany({
+          select: { id: true, sections: true },
+          orderBy: { id: 'asc' },
+          take,
+          ...(cursor ? { cursor: { id: cursor }, skip: 1 } : {}),
+        }),
+      (row) => addCardAvatars(row.sections),
+    );
+    // 草稿中的媒体只保存 object key，还没有 NoteMedia 行；纳入引用盘点，避免
+    // 用户离开编辑器后草稿仍可恢复，却被审计误报成孤儿对象。
+    // Older test doubles and rolling deployments may not expose the new model
+    // yet. Skipping this source is safe: the audit remains report-only, while
+    // a real Prisma client always has noteDraft after the migration is applied.
+    if (this.prisma.noteDraft) {
+      await this.collectFrom(
+        (cursor, take) =>
+          this.prisma.noteDraft.findMany({
+            select: { id: true, mediaKeys: true, sections: true },
+            orderBy: { id: 'asc' },
+            take,
+            ...(cursor ? { cursor: { id: cursor }, skip: 1 } : {}),
+          }),
+        (row) => {
+          row.mediaKeys.forEach(add);
+          addCardAvatars(row.sections);
+        },
+      );
+    }
     // 下面三张刻意逐张写死,不走动态表名:storage-audit.service.spec.ts 用
     // `this.prisma.<table>.findMany` 的字面量守「十张表一个都不能漏」——
     // 漏一处就是那批对象被误报成孤儿,而这份账是用来授权删除的。

@@ -11,6 +11,7 @@ import {
 import { ConfigService } from '@nestjs/config';
 import { MembershipErrorCode, NoteErrorCode } from 'src/common/app-error-codes';
 import { createHash, randomBytes, randomUUID } from 'crypto';
+import { normalizeUserIdAlias } from 'src/user/user-id-alias';
 import { existsSync } from 'fs';
 import PDFDocument from 'pdfkit';
 import { Prisma } from 'src/generated/prisma';
@@ -48,10 +49,14 @@ import {
   NoteChatMediaSection,
   NoteCollectSourceDto,
   NoteDetailDto,
+  NoteDraftDto,
+  NoteDraftSummaryDto,
   NoteExportResultDto,
   NoteGroupDto,
   NoteMediaType,
   NoteSectionsDto,
+  NoteSectionsResponseDto,
+  SaveNoteDraftDto,
   NoteShareLinkDto,
   NoteStatus,
   NoteSummaryDto,
@@ -60,6 +65,7 @@ import {
   UpdateNoteDto,
   UpdateNoteGroupDto,
   NOTE_LIST_DEFAULT_LIMIT,
+  MAX_NOTE_DRAFT_MEDIA_KEYS,
 } from './dto/note.dto';
 import { createLoggingConfig } from 'src/logging/logging.config';
 import { logBusinessEvent } from 'src/logging/business-event.logger';
@@ -142,6 +148,21 @@ type NoteMediaRow = {
   sortOrder: number;
 };
 
+type NoteDraftRow = {
+  id: string;
+  ownerID: string;
+  clientDraftID: string;
+  sourceNoteID: string | null;
+  title: string;
+  content: string | null;
+  contentJson: unknown;
+  sections: unknown;
+  groupIDs: string[];
+  mediaKeys: string[];
+  createdAt: Date;
+  updatedAt: Date;
+};
+
 type NoteRow = {
   id: string;
   ownerID: string;
@@ -155,6 +176,7 @@ type NoteRow = {
   remark?: string | null;
   imageCount: number;
   videoCount: number;
+  audioCount: number;
   mediaCount: number;
   collectedFrom?: unknown;
   collectedFromNoteID?: string | null;
@@ -183,7 +205,23 @@ type NoteSections = {
   showcase: {
     items: Array<Record<string, unknown>>;
   };
+  audio: {
+    items: Array<Record<string, unknown>>;
+  };
+  contacts: {
+    items: Array<Record<string, unknown>>;
+  };
+  groups: {
+    items: Array<Record<string, unknown>>;
+  };
   location: NoteLocationSection | null;
+};
+
+type NoteCardSnapshot = {
+  id: string;
+  name: string;
+  faceURL: string | null;
+  circleId?: string;
 };
 
 type NoteGroupRow = {
@@ -224,6 +262,11 @@ const NOTE_INCLUDE = {
 } as const;
 
 const MAX_GROUPS_PER_USER = 50;
+// Discarded IDs prevent delayed autosaves for 30 days. Published outcomes never
+// expire: their replay remains safe even after the target note is deleted.
+const NOTE_DRAFT_DISCARD_RETENTION_MS = 30 * 24 * 60 * 60 * 1000;
+const MAX_NOTE_DISCARDED_DRAFTS = 1000;
+export const MAX_NOTE_EDIT_PUBLICATION_OUTCOMES = 10_000;
 
 // Keep derived title/content in sync with the DTO's @MaxLength caps — text
 // extracted from contentJson blocks otherwise bypasses DTO validation.
@@ -431,10 +474,528 @@ export class NoteService {
     );
   }
 
+  private assertClientDraftID(clientDraftID: string): void {
+    if (!/^[A-Za-z0-9._:-]{1,180}$/.test(clientDraftID)) {
+      throw new BadRequestException('Invalid draft id');
+    }
+  }
+
+  private mapNoteDraftSummary(row: NoteDraftRow): NoteDraftSummaryDto {
+    const sections = this.isRecord(row.sections) ? row.sections : {};
+    const text = this.isRecord(sections.text) ? sections.text : {};
+    const blockText = (value: unknown) =>
+      this.extractBlockText(
+        Array.isArray(value) ? (value as NoteContentBlock[]) : undefined,
+      ).join(NOTE_LINE_SEPARATOR);
+    const previewSource =
+      row.content?.trim() ||
+      (typeof text.content === 'string' ? text.content.trim() : '') ||
+      blockText(text.contentJson) ||
+      blockText(row.contentJson) ||
+      row.title.trim();
+    const items = ['media', 'showcase', 'audio'].flatMap((name) => {
+      const section = this.isRecord(sections[name]) ? sections[name] : {};
+      return Array.isArray(section.items) ? section.items : [];
+    });
+    const media = [
+      ...items.filter((item) => this.isRecord(item)),
+      ...this.draftBlockMedia(row.contentJson),
+      ...this.draftBlockMedia(
+        this.isRecord(sections.text) ? sections.text.contentJson : undefined,
+      ),
+    ];
+    const primaryKeys = new Set(media.map((item) => item.objectKey));
+    const posterKeys = new Set(
+      media
+        .map((item) =>
+          this.uploadService?.objectKeyFromPublicUrl(item.posterUrl),
+        )
+        .filter(Boolean),
+    );
+    return {
+      id: row.clientDraftID,
+      sourceNoteId: row.sourceNoteID ?? null,
+      title: row.title,
+      contentPreview: this.buildPreview(previewSource),
+      mediaCount: row.mediaKeys.filter(
+        (key) => !posterKeys.has(key) || primaryKeys.has(key),
+      ).length,
+      createdAt: row.createdAt,
+      updatedAt: row.updatedAt,
+    };
+  }
+
+  private mapNoteDraft(row: NoteDraftRow): NoteDraftDto {
+    return {
+      ...this.mapNoteDraftSummary(row),
+      content: row.content ?? null,
+      contentJson: Array.isArray(row.contentJson)
+        ? (row.contentJson as Record<string, unknown>[])
+        : null,
+      sections:
+        row.sections && typeof row.sections === 'object'
+          ? (row.sections as NoteDraftDto['sections'])
+          : null,
+      groupIds: row.groupIDs,
+      mediaKeys: row.mediaKeys,
+    };
+  }
+
+  private draftBlockMedia(blocks: unknown): CreateNoteDto['media'] {
+    return this.deriveMediaFromBlocks(
+      Array.isArray(blocks) ? (blocks as NoteContentBlock[]) : undefined,
+    );
+  }
+
+  private async mapNoteDraftResolved(row: NoteDraftRow): Promise<NoteDraftDto> {
+    const result = this.mapNoteDraft(row);
+    const targets: Array<{ url: string; objectKey: string }> = [];
+    // Only the validated inventory may be signed, including nested BlockNote media.
+    const keys = new Set(row.mediaKeys);
+    const prepareItem = (item: unknown) => {
+      if (
+        !this.isRecord(item) ||
+        typeof item.objectKey !== 'string' ||
+        !keys.has(item.objectKey)
+      )
+        return item;
+      const url = this.resolveMediaUrl({ objectKey: item.objectKey });
+      targets.push({ url, objectKey: item.objectKey });
+      const posterKey = this.uploadService?.objectKeyFromPublicUrl(
+        item.posterUrl,
+      );
+      const posterUrl =
+        typeof item.posterUrl === 'string'
+          ? item.posterUrl.split('?')[0]
+          : undefined;
+      if (posterKey && posterUrl && keys.has(posterKey))
+        targets.push({ url: posterUrl, objectKey: posterKey });
+      return { ...item, url, ...(posterUrl ? { posterUrl } : {}) };
+    };
+    const mapBlocks = (
+      blocks: unknown,
+      mapItem: (item: unknown) => unknown,
+      depth = 0,
+    ): unknown => {
+      if (!Array.isArray(blocks) || depth > MAX_NOTE_BLOCK_DEPTH) return blocks;
+      return blocks.map((block) => {
+        if (!this.isRecord(block)) return block;
+        return {
+          ...block,
+          ...(block.type === 'image' || block.type === 'video'
+            ? { props: mapItem(block.props) }
+            : {}),
+          ...(Array.isArray(block.children)
+            ? { children: mapBlocks(block.children, mapItem, depth + 1) }
+            : {}),
+        };
+      });
+    };
+    const sections = this.isRecord(row.sections) ? row.sections : {};
+    const mappedSections: Record<string, any> = { ...sections };
+    for (const section of ['media', 'showcase', 'audio'] as const) {
+      const stored = this.isRecord(sections[section]) ? sections[section] : {};
+      if (Array.isArray(stored.items))
+        mappedSections[section] = {
+          ...stored,
+          items: stored.items.map(prepareItem),
+        };
+    }
+    let contentJson = mapBlocks(result.contentJson, prepareItem);
+    if (this.isRecord(sections.text))
+      mappedSections.text = {
+        ...sections.text,
+        contentJson: mapBlocks(sections.text.contentJson, prepareItem),
+      };
+    if (!targets.length) return result;
+    const presigned = await this.presignNoteMedia(targets);
+    const signItem = (item: unknown) =>
+      this.applyPresignedToItems([item], presigned)[0];
+    contentJson = mapBlocks(contentJson, signItem);
+    if (mappedSections.text)
+      mappedSections.text.contentJson = mapBlocks(
+        mappedSections.text.contentJson,
+        signItem,
+      );
+    for (const section of ['media', 'showcase', 'audio'] as const) {
+      const stored = mappedSections[section];
+      if (Array.isArray(stored?.items))
+        mappedSections[section] = {
+          ...stored,
+          items: this.applyPresignedToItems(stored.items, presigned),
+        };
+    }
+    return {
+      ...result,
+      contentJson: contentJson as NoteDraftDto['contentJson'],
+      sections: mappedSections as NoteDraftDto['sections'],
+    };
+  }
+
+  async listNoteDrafts(
+    ownerID: string,
+    page = 1,
+    limit = 100,
+  ): Promise<NoteDraftSummaryDto[]> {
+    const rows = await this.prisma.noteDraft.findMany({
+      where: { ownerID, consumedAt: null },
+      orderBy: [{ updatedAt: 'desc' }, { id: 'desc' }],
+      skip: (page - 1) * limit,
+      take: limit,
+    });
+    return rows.map((row) => this.mapNoteDraftSummary(row as NoteDraftRow));
+  }
+
+  async getNoteDraft(
+    ownerID: string,
+    clientDraftID: string,
+  ): Promise<NoteDraftDto> {
+    this.assertClientDraftID(clientDraftID);
+    const row = await this.prisma.noteDraft.findFirst({
+      where: { ownerID, clientDraftID, consumedAt: null },
+    });
+    if (!row) {
+      throw new NotFoundException({
+        message: 'Note draft not found',
+        errorCode: NoteErrorCode.NotFound,
+      });
+    }
+    return this.mapNoteDraftResolved(row as NoteDraftRow);
+  }
+
+  async saveNoteDraft(
+    ownerID: string,
+    clientDraftID: string,
+    input: SaveNoteDraftDto,
+  ): Promise<NoteDraftDto> {
+    this.assertClientDraftID(clientDraftID);
+    const groupIDs = [...new Set(input.groupIds ?? [])];
+    await this.requireOwnedGroups(ownerID, groupIDs);
+
+    let sourceMediaKeys = new Set<string>();
+    let sourceSections: unknown;
+    if (input.sourceNoteId) {
+      const sourceNote = await this.prisma.note.findFirst({
+        where: { id: input.sourceNoteId, ownerID },
+        select: { id: true, sections: true },
+      });
+      if (!sourceNote) {
+        throw new NotFoundException({
+          message: 'Source note not found',
+          errorCode: NoteErrorCode.NotFound,
+        });
+      }
+      sourceSections = sourceNote.sections;
+      const sourceMedia = await this.prisma.noteMedia.findMany({
+        where: { noteID: input.sourceNoteId },
+        select: { objectKey: true, posterUrl: true },
+      });
+      sourceMediaKeys = new Set(
+        sourceMedia.flatMap((item) => {
+          const posterKey = this.uploadService?.objectKeyFromPublicUrl(
+            item.posterUrl,
+          );
+          return [item.objectKey, ...(posterKey ? [posterKey] : [])];
+        }),
+      );
+    }
+
+    // Resolve cards from their ids rather than persisting client-selected
+    // profile fields or navigation targets. Retain trusted source-note
+    // snapshots when editing after friendship or membership changes.
+    const canonicalCards = await this.canonicalizeNoteCards(
+      ownerID,
+      {
+        sections: {
+          groups: input.sections?.groups,
+          contacts: input.sections?.contacts,
+        },
+      },
+      sourceSections,
+    );
+    const sections = input.sections
+      ? {
+          ...input.sections,
+          ...(input.sections.groups
+            ? { groups: canonicalCards.sections?.groups }
+            : {}),
+          ...(input.sections.contacts
+            ? { contacts: canonicalCards.sections?.contacts }
+            : {}),
+        }
+      : undefined;
+
+    const sectionKeys: string[] = [];
+    const posterKeys: string[] = [];
+    for (const section of ['media', 'showcase', 'audio'] as const) {
+      for (const item of input.sections?.[section]?.items ?? []) {
+        if ((section === 'audio') !== (item.type === 'AUDIO'))
+          throw new BadRequestException(
+            `${section} section has an incompatible media type`,
+          );
+        sectionKeys.push(item.objectKey);
+        if (item.posterUrl) {
+          assertUrlsFromStorage(
+            [item.posterUrl],
+            this.storagePublicObjectBases,
+            'draft poster url',
+          );
+          const key = this.uploadService?.objectKeyFromPublicUrl(
+            item.posterUrl,
+          );
+          if (!key) throw new BadRequestException('Invalid draft poster URL');
+          posterKeys.push(key);
+        }
+      }
+    }
+    const mediaKeys = [
+      ...new Set([...(input.mediaKeys ?? []), ...sectionKeys, ...posterKeys]),
+    ];
+    const blockMedia = [
+      ...this.draftBlockMedia(input.contentJson),
+      ...this.draftBlockMedia(input.sections?.text?.contentJson),
+    ];
+    for (const item of blockMedia) {
+      mediaKeys.push(item.objectKey);
+      if (item.posterUrl) {
+        assertUrlsFromStorage(
+          [item.posterUrl],
+          this.storagePublicObjectBases,
+          'draft poster url',
+        );
+        const key = this.uploadService?.objectKeyFromPublicUrl(item.posterUrl);
+        if (!key) throw new BadRequestException('Invalid draft poster URL');
+        mediaKeys.push(key);
+      }
+    }
+    const inventoryKeys = [...new Set(mediaKeys)];
+    if (inventoryKeys.length > MAX_NOTE_DRAFT_MEDIA_KEYS)
+      throw new BadRequestException(
+        `Draft media limit is ${MAX_NOTE_DRAFT_MEDIA_KEYS} objects, including posters`,
+      );
+    const ownPrefix = `notes/${ownerID}/`;
+    if (
+      inventoryKeys.some(
+        (key) =>
+          key.includes('..') ||
+          (!key.startsWith(ownPrefix) && !sourceMediaKeys.has(key)),
+      )
+    ) {
+      throw new BadRequestException(
+        'Draft media does not belong to the current user',
+      );
+    }
+
+    const row = await runSerializableTransaction(this.prisma, async (tx) => {
+      // Share the owner's lock with publication and quota writes. A committed
+      // Note retains the draft id, so even a delayed save cannot resurrect it.
+      await this.membershipPolicy.lockUsers(tx, [ownerID]);
+      await this.expireDiscardedNoteDrafts(tx, ownerID);
+      const published = await tx.note.findFirst({
+        where: { ownerID, clientDraftID },
+        select: { id: true },
+      });
+      if (published)
+        throw new ConflictException('This draft has already been published');
+      const existing = await tx.noteDraft.findUnique({
+        where: { ownerID_clientDraftID: { ownerID, clientDraftID } },
+        select: { id: true, consumedAt: true },
+      });
+      if (existing?.consumedAt)
+        throw new ConflictException('This draft has been consumed');
+      if (!existing) await this.requireDiscardedDraftCapacity(tx, ownerID);
+      if (
+        !existing &&
+        (await tx.noteDraft.count({ where: { ownerID, consumedAt: null } })) >=
+          100
+      ) {
+        throw new ConflictException(
+          'Draft limit reached. Delete an existing draft before creating another.',
+        );
+      }
+      const data = {
+        sourceNoteID: input.sourceNoteId ?? null,
+        title: sliceByCodePoints(
+          (input.title ?? '').trim(),
+          MAX_NOTE_TITLE_LENGTH,
+        ),
+        content:
+          input.content == null
+            ? null
+            : sliceByCodePoints(input.content, MAX_NOTE_CONTENT_LENGTH),
+        contentJson: toPrismaJson(input.contentJson ?? null),
+        sections: toPrismaJson(sections ?? null),
+        groupIDs,
+        mediaKeys: inventoryKeys,
+      };
+      return tx.noteDraft.upsert({
+        where: { ownerID_clientDraftID: { ownerID, clientDraftID } },
+        create: { ownerID, clientDraftID, ...data },
+        update: data,
+      });
+    });
+    return this.mapNoteDraftResolved(row as NoteDraftRow);
+  }
+
+  private async publishedDraftNote(
+    tx: Pick<Prisma.TransactionClient, 'noteDraft' | 'note'>,
+    ownerID: string,
+    clientDraftID: string | undefined,
+    sourceNoteID: string | null,
+  ): Promise<NoteRow | null> {
+    if (!clientDraftID) return null;
+    this.assertClientDraftID(clientDraftID);
+    await this.expireDiscardedNoteDrafts(tx, ownerID);
+    const draft = await tx.noteDraft.findUnique({
+      where: { ownerID_clientDraftID: { ownerID, clientDraftID } },
+      select: { consumedAt: true, sourceNoteID: true, publishedNoteID: true },
+    });
+    if (!draft?.consumedAt) return null;
+    if (
+      !draft.publishedNoteID ||
+      draft.sourceNoteID !== sourceNoteID ||
+      (sourceNoteID !== null && draft.publishedNoteID !== sourceNoteID)
+    ) {
+      throw new ConflictException('This draft has been consumed');
+    }
+    const note = await tx.note.findFirst({
+      where: { id: draft.publishedNoteID, ownerID, status: { not: 'DELETED' } },
+      include: NOTE_INCLUDE,
+    });
+    if (!note)
+      throw new NotFoundException({
+        message: 'Note not found',
+        errorCode: NoteErrorCode.NotFound,
+      });
+    return note;
+  }
+
+  private async consumeNoteDraft(
+    tx: Prisma.TransactionClient,
+    ownerID: string,
+    clientDraftID: string,
+    sourceNoteID?: string | null,
+  ): Promise<void> {
+    this.assertClientDraftID(clientDraftID);
+    const existing = await tx.noteDraft.findUnique({
+      where: { ownerID_clientDraftID: { ownerID, clientDraftID } },
+      select: { sourceNoteID: true, consumedAt: true },
+    });
+    if (existing?.consumedAt && sourceNoteID !== undefined)
+      throw new ConflictException('This draft has been consumed');
+    // Repeated DELETE neither renews discarded retention nor changes a durable
+    // publication result. At capacity, active drafts can still be discarded.
+    if (existing?.consumedAt) return;
+    if (!existing && sourceNoteID === undefined)
+      await this.requireDiscardedDraftCapacity(tx, ownerID);
+    if (
+      existing &&
+      sourceNoteID !== undefined &&
+      existing.sourceNoteID !== sourceNoteID
+    ) {
+      throw new BadRequestException(
+        'Draft does not belong to the note being saved',
+      );
+    }
+    // Keep only a tombstone. The owner's lock serializes upserts, and this
+    // durable marker rejects autosaves that acquire the lock after consumption.
+    const data = {
+      consumedAt: new Date(),
+      title: '',
+      content: null,
+      contentJson: Prisma.DbNull,
+      sections: Prisma.DbNull,
+      groupIDs: [],
+      mediaKeys: [],
+    };
+    await tx.noteDraft.upsert({
+      where: { ownerID_clientDraftID: { ownerID, clientDraftID } },
+      create: {
+        ownerID,
+        clientDraftID,
+        sourceNoteID: sourceNoteID ?? null,
+        ...data,
+      },
+      update: data,
+    });
+  }
+
+  async deleteNoteDraft(ownerID: string, clientDraftID: string): Promise<void> {
+    this.assertClientDraftID(clientDraftID);
+    await runSerializableTransaction(this.prisma, async (tx) => {
+      await this.membershipPolicy.lockUsers(tx, [ownerID]);
+      await this.expireDiscardedNoteDrafts(tx, ownerID);
+      await this.consumeNoteDraft(tx, ownerID, clientDraftID);
+    });
+  }
+
+  private async expireDiscardedNoteDrafts(
+    tx: Pick<Prisma.TransactionClient, 'noteDraft'>,
+    ownerID: string,
+  ): Promise<void> {
+    await tx.noteDraft.deleteMany({
+      where: {
+        ownerID,
+        publishedNoteID: null,
+        consumedAt: {
+          lt: new Date(Date.now() - NOTE_DRAFT_DISCARD_RETENTION_MS),
+        },
+      },
+    });
+  }
+
+  private async requireDiscardedDraftCapacity(
+    tx: Pick<Prisma.TransactionClient, 'noteDraft'>,
+    ownerID: string,
+  ): Promise<void> {
+    if (
+      (await tx.noteDraft.count({
+        where: {
+          ownerID,
+          publishedNoteID: null,
+          consumedAt: { not: null },
+        },
+      })) >= MAX_NOTE_DISCARDED_DRAFTS
+    )
+      throw new ConflictException(
+        'Draft discard limit reached. Discarded IDs are retained for 30 days; try again after older entries expire.',
+      );
+  }
+
+  private async assertNoteEditOutcomeCapacity(
+    tx: Pick<Prisma.TransactionClient, 'noteDraft'>,
+    ownerID: string,
+    noteId: string,
+  ): Promise<void> {
+    // Called under the owner lock, after replay. The sourceNoteID index keeps
+    // this count local to the note; create outcomes have no sourceNoteID.
+    const current = await tx.noteDraft.count({
+      where: {
+        ownerID,
+        sourceNoteID: noteId,
+        publishedNoteID: { not: null },
+      },
+    });
+    if (current >= MAX_NOTE_EDIT_PUBLICATION_OUTCOMES)
+      throw new ForbiddenException({
+        message:
+          'This note has reached its saved edit result limit. Keep your draft and save these edits as a new note.',
+        errorCode: NoteErrorCode.PublicationQuotaReached,
+        quota: 'notePublicationEdits',
+        limit: MAX_NOTE_EDIT_PUBLICATION_OUTCOMES,
+        current,
+        details: {
+          quota: 'notePublicationEdits',
+          limit: MAX_NOTE_EDIT_PUBLICATION_OUTCOMES,
+          current,
+        },
+      });
+  }
+
   /**
    * Active storage is one owned, non-deleted Note row. Group memberships do
-   * not add slots, and DELETED rows release capacity because the API has no
-   * restore path (all writable-note lookups exclude DELETED).
+   * not add slots, and DELETED rows release capacity. Restoring a note must
+   * pass this same gate; ordinary writable-note lookups exclude DELETED.
    */
   private async assertNoteStorageAvailable(
     tx: Prisma.TransactionClient,
@@ -550,6 +1111,7 @@ export class NoteService {
     const seen = new Set<string>();
     return [...sections.media.items, ...sections.showcase.items].filter(
       (item: any) => {
+        if (item.type !== 'IMAGE' && item.type !== 'VIDEO') return false;
         const key =
           typeof item.objectKey === 'string'
             ? `${item.objectKey}:${item.url ?? ''}`
@@ -962,10 +1524,12 @@ export class NoteService {
   private buildMediaStats(media: CreateNoteDto['media']) {
     const imageCount = media.filter((item) => item.type === 'IMAGE').length;
     const videoCount = media.filter((item) => item.type === 'VIDEO').length;
+    const audioCount = media.filter((item) => item.type === 'AUDIO').length;
 
     return {
       imageCount,
       videoCount,
+      audioCount,
       mediaCount: media.length,
     };
   }
@@ -1002,6 +1566,161 @@ export class NoteService {
     return Object.keys(normalized).length > 0 ? normalized : null;
   }
 
+  /**
+   * Cards are snapshots, but the client may only attach people and circles it
+   * can currently address. Resolve the display fields on the server so a
+   * crafted request cannot put somebody else's name or avatar in a note.
+   */
+  private async canonicalizeNoteCards<T extends { sections?: NoteSectionsDto }>(
+    ownerID: string,
+    input: T,
+    existingSections?: unknown,
+  ): Promise<T> {
+    const contacts = input.sections?.contacts?.items ?? [];
+    const groups = input.sections?.groups?.items ?? [];
+    if (!contacts.length && !groups.length) return input;
+
+    const stored = this.isRecord(existingSections) ? existingSections : {};
+    const existingCards = (section: string) => {
+      const value = this.isRecord(stored[section]) ? stored[section] : {};
+      return new Map<string, NoteCardSnapshot>(
+        (Array.isArray(value.items) ? value.items : [])
+          .filter(
+            (item) =>
+              this.isRecord(item) &&
+              typeof item.id === 'string' &&
+              typeof item.name === 'string',
+          )
+          .map((item) => [
+            item.id,
+            {
+              id: item.id,
+              name: item.name,
+              faceURL: item.faceURL ?? null,
+              ...(section === 'groups' && typeof item.circleId === 'string'
+                ? { circleId: item.circleId }
+                : {}),
+            },
+          ]),
+      );
+    };
+    const contactsById = existingCards('contacts');
+    const groupsById = existingCards('groups');
+    const contactIds = [...new Set(contacts.map((item) => item.id))].filter(
+      (id) => !contactsById.has(id),
+    );
+    const canonicalContactIds = [
+      ...new Set(contactIds.map(normalizeUserIdAlias)),
+    ];
+    const groupIds = [...new Set(groups.map((item) => item.id))].filter(
+      (id) => !groupsById.has(id),
+    );
+    const [friendRows, circleRows] = await Promise.all([
+      contactIds.length
+        ? this.prisma.friend.findMany({
+            where: {
+              state: 'ACCEPTED',
+              OR: [
+                { userID: ownerID, friendID: { in: canonicalContactIds } },
+                { userID: { in: canonicalContactIds }, friendID: ownerID },
+              ],
+            },
+            include: { user: true, friend: true },
+          })
+        : Promise.resolve([]),
+      groupIds.length
+        ? this.prisma.circle.findMany({
+            where: {
+              deleted: false,
+              AND: [
+                {
+                  OR: [{ id: { in: groupIds } }, { groupID: { in: groupIds } }],
+                },
+                {
+                  OR: [
+                    { ownerID },
+                    {
+                      members: { some: { userID: ownerID, status: 'ACTIVE' } },
+                    },
+                  ],
+                },
+              ],
+            },
+            select: { id: true, groupID: true, name: true, avatarUrl: true },
+          })
+        : Promise.resolve([]),
+    ]);
+
+    for (const row of friendRows) {
+      const person = row.userID === ownerID ? row.friend : row.user;
+      for (const id of contactIds.filter(
+        (id) => normalizeUserIdAlias(id) === person.id,
+      )) {
+        contactsById.set(id, {
+          id,
+          name: person.nickname || person.accountId,
+          faceURL: person.avatarUrl ?? null,
+        });
+      }
+    }
+    // A user may add their own card without needing a friendship row.
+    if (canonicalContactIds.includes(ownerID)) {
+      const self = await this.prisma.user.findUnique({
+        where: { id: ownerID },
+        select: { id: true, nickname: true, accountId: true, avatarUrl: true },
+      });
+      if (self) {
+        for (const id of contactIds.filter(
+          (id) => normalizeUserIdAlias(id) === self.id,
+        )) {
+          contactsById.set(id, {
+            id,
+            name: self.nickname || self.accountId,
+            faceURL: self.avatarUrl ?? null,
+          });
+        }
+      }
+    }
+    if (contacts.some((item) => !contactsById.has(item.id))) {
+      throw new ForbiddenException(
+        'Contact card target is not an accepted friend',
+      );
+    }
+
+    for (const id of groupIds) {
+      const circle = circleRows.find(
+        (row) => row.id === id || row.groupID === id,
+      );
+      if (circle)
+        // Never merge the request card: even id === circle.id must drop a
+        // forged source.circleId instead of retaining it through a spread.
+        groupsById.set(id, {
+          id,
+          ...(circle.id !== id ? { circleId: circle.id } : {}),
+          name: circle.name,
+          faceURL: circle.avatarUrl ?? null,
+        });
+    }
+    if (groups.some((item) => !groupsById.has(item.id))) {
+      throw new ForbiddenException(
+        'Group card target is not an accessible group',
+      );
+    }
+
+    return {
+      ...input,
+      sections: {
+        ...input.sections,
+        contacts: contacts.length
+          ? { items: contacts.map((item) => contactsById.get(item.id)!) }
+          : input.sections?.contacts,
+        groups: groups.length
+          ? { items: groups.map((item) => groupsById.get(item.id)!) }
+          : input.sections?.groups,
+      },
+    };
+  }
+
   private mapMediaItemForSection(
     item: Record<string, any>,
     presignedUrls?: Map<string, string>,
@@ -1035,7 +1754,7 @@ export class NoteService {
   }
 
   private resolveSectionMediaItems(
-    sectionName: 'media' | 'showcase',
+    sectionName: 'media' | 'showcase' | 'audio',
     requestedItems: CreateNoteDto['media'] | undefined,
     fallbackItems: CreateNoteDto['media'],
     validatedMedia: CreateNoteDto['media'],
@@ -1066,6 +1785,11 @@ export class NoteService {
           `${sectionName} section media must reference note media`,
         );
       }
+      if ((sectionName === 'audio') !== (resolved.type === 'AUDIO')) {
+        throw new BadRequestException(
+          `${sectionName} section has an incompatible media type`,
+        );
+      }
       return resolved;
     });
   }
@@ -1089,10 +1813,16 @@ export class NoteService {
     const hasExplicitShowcase = this.hasSectionMediaItems(
       sectionInput?.showcase?.items,
     );
+    const hasExplicitAudio = this.hasSectionMediaItems(
+      sectionInput?.audio?.items,
+    );
+    const ordinaryFallback = derived.media.filter(
+      (item) => item.type !== 'AUDIO',
+    );
     const mediaItems = this.resolveSectionMediaItems(
       'media',
       sectionInput?.media?.items,
-      hasExplicitShowcase ? [] : derived.media,
+      hasExplicitShowcase ? [] : ordinaryFallback,
       derived.media,
     );
     const showcaseItems = this.resolveSectionMediaItems(
@@ -1100,7 +1830,15 @@ export class NoteService {
       sectionInput?.showcase?.items,
       hasExplicitMedia
         ? []
-        : derived.media.filter((item) => item.type === 'IMAGE'),
+        : ordinaryFallback.filter((item) => item.type === 'IMAGE'),
+      derived.media,
+    );
+    const audioItems = this.resolveSectionMediaItems(
+      'audio',
+      sectionInput?.audio?.items,
+      hasExplicitAudio
+        ? []
+        : derived.media.filter((item) => item.type === 'AUDIO'),
       derived.media,
     );
 
@@ -1115,8 +1853,36 @@ export class NoteService {
       showcase: {
         items: showcaseItems,
       },
+      ...(sectionInput?.audio || audioItems.length > 0
+        ? { audio: { items: audioItems } }
+        : {}),
+      ...(sectionInput?.contacts
+        ? {
+            contacts: {
+              items: (sectionInput.contacts.items ?? []).map((item) => ({
+                id: item.id,
+                name: item.name,
+                faceURL: item.faceURL ?? null,
+              })),
+            },
+          }
+        : {}),
+      ...(sectionInput?.groups
+        ? {
+            groups: {
+              items: (sectionInput.groups.items ?? []).map((item) => ({
+                id: item.id,
+                ...((item as unknown as NoteCardSnapshot).circleId
+                  ? { circleId: (item as unknown as NoteCardSnapshot).circleId }
+                  : {}),
+                name: item.name,
+                faceURL: item.faceURL ?? null,
+              })),
+            },
+          }
+        : {}),
       location: this.normalizeLocation(sectionInput?.location),
-    };
+    } as NoteSections;
   }
 
   /**
@@ -1130,9 +1896,8 @@ export class NoteService {
       .replace(NOTE_PREVIEW_WHITESPACE_PATTERN, ' ')
       .trim();
     if (!flattened) return null;
-    return flattened.length > MAX_NOTE_PREVIEW_LENGTH
-      ? `${flattened.slice(0, MAX_NOTE_PREVIEW_LENGTH)}...`
-      : flattened;
+    const preview = sliceByCodePoints(flattened, MAX_NOTE_PREVIEW_LENGTH);
+    return preview.length < flattened.length ? `${preview}...` : preview;
   }
 
   /**
@@ -1276,9 +2041,11 @@ export class NoteService {
       blocks.length > 0 ? this.extractBlockText(blocks) : [];
     const sectionMedia = input.sections?.media?.items ?? [];
     const sectionShowcase = input.sections?.showcase?.items ?? [];
+    const sectionAudio = input.sections?.audio?.items ?? [];
     const sectionMediaCombined = this.dedupeMedia([
       ...sectionMedia,
       ...sectionShowcase,
+      ...sectionAudio,
     ]);
 
     // Prefer explicitly provided media — the client sends full metadata including
@@ -1332,6 +2099,63 @@ export class NoteService {
     return Boolean(value && typeof value === 'object' && !Array.isArray(value));
   }
 
+  private resolvePublishedBlocks(
+    blocks: unknown,
+    note: NoteRow,
+    presignedUrls?: Map<string, string>,
+  ): Record<string, unknown>[] | null {
+    if (!Array.isArray(blocks)) return null;
+    const authorized = new Map(
+      (note.media ?? []).map((item) => [item.objectKey, item]),
+    );
+    const visit = (
+      items: unknown[],
+      depth: number,
+    ): Record<string, unknown>[] => {
+      if (depth > MAX_NOTE_BLOCK_DEPTH) return [];
+      return items.flatMap((block) => {
+        if (!this.isRecord(block)) return [];
+        let props = block.props;
+        if (
+          (block.type === 'image' || block.type === 'video') &&
+          this.isRecord(props)
+        ) {
+          const key =
+            typeof props.objectKey === 'string'
+              ? props.objectKey
+              : this.uploadService?.objectKeyFromPublicUrl(props.url);
+          const media = key ? authorized.get(key) : undefined;
+          if (media) {
+            props = {
+              ...props,
+              objectKey: media.objectKey,
+              url: presignedUrls?.get(media.url) ?? media.url.split('?')[0],
+              posterUrl:
+                media.posterUrl &&
+                !this.isForeignPosterKey(media.objectKey, media.posterUrl)
+                  ? (presignedUrls?.get(media.posterUrl) ??
+                    media.posterUrl.split('?')[0])
+                  : null,
+            };
+          } else if (key) {
+            // Arbitrary legacy JSON must not open another private signing path.
+            props = { ...props, url: '', posterUrl: null };
+          }
+        }
+        return [
+          {
+            ...block,
+            ...(props !== undefined ? { props } : {}),
+            ...(Array.isArray(block.children)
+              ? { children: visit(block.children, depth + 1) }
+              : {}),
+          },
+        ];
+      });
+    };
+    return visit(blocks, 0);
+  }
+
   private buildSectionsFromRow(
     note: NoteRow,
     presignedUrls?: Map<string, string>,
@@ -1342,11 +2166,17 @@ export class NoteService {
     const storedShowcase = this.isRecord(stored.showcase)
       ? stored.showcase
       : {};
+    const storedAudio = this.isRecord(stored.audio) ? stored.audio : {};
+    const storedContacts = this.isRecord(stored.contacts)
+      ? stored.contacts
+      : {};
+    const storedGroups = this.isRecord(stored.groups) ? stored.groups : {};
     const storedLocation = this.isRecord(stored.location)
       ? stored.location
       : null;
     const hasExplicitMedia = Array.isArray(storedMedia.items);
     const hasExplicitShowcase = Array.isArray(storedShowcase.items);
+    const hasExplicitAudio = Array.isArray(storedAudio.items);
     const mediaItems = hasExplicitMedia
       ? // 坑：已存的 sections JSON items 是原样返回的，其冻结 url 也必须重签。
         this.applyPresignedToItems(storedMedia.items, presignedUrls)
@@ -1364,12 +2194,20 @@ export class NoteService {
             .map((item) =>
               this.mapMediaItemForSection(item as any, presignedUrls),
             );
+    const audioItems = hasExplicitAudio
+      ? this.applyPresignedToItems(storedAudio.items, presignedUrls)
+      : (note.media ?? [])
+          .filter((item) => item.type === 'AUDIO')
+          .map((item) =>
+            this.mapMediaItemForSection(item as any, presignedUrls),
+          );
     let contentJson: unknown[] | null = null;
     if (Array.isArray(storedText.contentJson)) {
       contentJson = storedText.contentJson;
     } else if (Array.isArray(note.contentJson)) {
       contentJson = note.contentJson;
     }
+    contentJson = this.resolvePublishedBlocks(contentJson, note, presignedUrls);
     const content =
       typeof storedText.content === 'string'
         ? storedText.content
@@ -1386,6 +2224,23 @@ export class NoteService {
       showcase: {
         items: showcaseItems,
       },
+      ...(hasExplicitAudio || audioItems.length > 0
+        ? { audio: { items: audioItems } }
+        : {}),
+      ...(Array.isArray(storedContacts.items)
+        ? {
+            contacts: {
+              items: storedContacts.items.filter((item) => this.isRecord(item)),
+            },
+          }
+        : {}),
+      ...(Array.isArray(storedGroups.items)
+        ? {
+            groups: {
+              items: storedGroups.items.filter((item) => this.isRecord(item)),
+            },
+          }
+        : {}),
       location: storedLocation
         ? {
             ...(typeof storedLocation.title === 'string'
@@ -1402,7 +2257,7 @@ export class NoteService {
               : {}),
           }
         : null,
-    };
+    } as NoteSections;
   }
 
   private getSectionAvailability(sections: NoteSections) {
@@ -1411,6 +2266,8 @@ export class NoteService {
         Boolean(sections.text.content?.trim()) ||
         Boolean(sections.text.contentJson?.length),
       showcaseCount: sections.showcase.items.length,
+      contactCount: sections.contacts?.items.length ?? 0,
+      groupCardCount: sections.groups?.items.length ?? 0,
       hasLocation: Boolean(sections.location),
     };
   }
@@ -1456,8 +2313,10 @@ export class NoteService {
           name: membership.group.name,
         }))
       : [];
-    const fallbackCoverMedia = note.media?.[0] ?? null;
-    const coverMedia = note.coverMedia ?? fallbackCoverMedia;
+    const fallbackCoverMedia =
+      note.media?.find((item) => item.type === 'IMAGE') ?? null;
+    const coverMedia =
+      note.coverMedia?.type === 'IMAGE' ? note.coverMedia : fallbackCoverMedia;
     const sections = this.buildSectionsFromRow(note, presignedUrls);
     const availability = this.getSectionAvailability(sections);
 
@@ -1485,6 +2344,7 @@ export class NoteService {
         : null,
       imageCount: note.imageCount,
       videoCount: note.videoCount,
+      audioCount: note.audioCount ?? 0,
       mediaCount: note.mediaCount,
       ...availability,
       // 来源名片是收藏者的私人定位标记：available=true 的笔记任何人都能打开，
@@ -1507,7 +2367,11 @@ export class NoteService {
     return {
       ...this.mapSummary(note, viewerID, presignedUrls),
       content: note.content ?? null,
-      contentJson: Array.isArray(note.contentJson) ? note.contentJson : null,
+      contentJson: this.resolvePublishedBlocks(
+        note.contentJson,
+        note,
+        presignedUrls,
+      ),
       media: (note.media ?? []).map((item) => ({
         id: item.id,
         type: item.type,
@@ -1527,7 +2391,7 @@ export class NoteService {
             : (item.posterUrl ?? null),
         sortOrder: item.sortOrder,
       })),
-      sections,
+      sections: sections as unknown as NoteSectionsResponseDto,
     };
   }
 
@@ -1559,7 +2423,7 @@ export class NoteService {
       addPoster(m.posterUrl, m.objectKey);
     }
     const stored = this.isRecord(note.sections) ? note.sections : {};
-    for (const section of ['media', 'showcase'] as const) {
+    for (const section of ['media', 'showcase', 'audio'] as const) {
       const s = this.isRecord(stored[section]) ? stored[section] : {};
       if (Array.isArray(s.items)) {
         for (const item of s.items) {
@@ -1666,10 +2530,19 @@ export class NoteService {
     ownerID: string,
     input: CreateNoteDto,
   ): Promise<NoteDetailDto> {
+    // A response/signing failure after commit must be safe to retry with the same ID.
+    const replay = await this.publishedDraftNote(
+      this.prisma,
+      ownerID,
+      input.clientDraftID,
+      null,
+    );
+    if (replay) return this.mapDetailResolved(replay, ownerID);
     const uniqueGroupIds = [...new Set(input.groupIds ?? [])];
     await this.requireOwnedGroups(ownerID, uniqueGroupIds);
 
-    const derived = this.deriveNoteContent(input);
+    const canonicalInput = await this.canonicalizeNoteCards(ownerID, input);
+    const derived = this.deriveNoteContent(canonicalInput);
     this.assertMediaOwnership(ownerID, derived.media);
     this.assertMediaUrlsAreSafe(derived.media);
 
@@ -1691,19 +2564,34 @@ export class NoteService {
       this.prisma,
       async (tx) => {
         await this.membershipPolicy.lockUsers(tx, [ownerID]);
+        const replay = await this.publishedDraftNote(
+          tx,
+          ownerID,
+          canonicalInput.clientDraftID,
+          null,
+        );
+        if (replay) return replay;
+        if (canonicalInput.clientDraftID)
+          await this.consumeNoteDraft(
+            tx,
+            ownerID,
+            canonicalInput.clientDraftID,
+            null,
+          );
         await this.assertNoteStorageAvailable(tx, ownerID);
 
         const note = await tx.note.create({
           data: {
             ownerID,
+            clientDraftID: canonicalInput.clientDraftID ?? null,
             title: derived.title,
             content: derived.content,
             contentJson: toPrismaJson(derived.contentJson),
             sections: toPrismaJson(derived.sections),
             groupID: null,
-            status: input.status ?? 'ACTIVE',
+            status: canonicalInput.status ?? 'ACTIVE',
             available: true,
-            pinned: input.pinned ?? false,
+            pinned: canonicalInput.pinned ?? false,
             ...counts,
           },
         });
@@ -1736,13 +2624,25 @@ export class NoteService {
           });
         }
 
-        return tx.note.update({
+        const saved = await tx.note.update({
           where: { id: note.id },
           data: {
             coverMediaID,
           },
           include: NOTE_INCLUDE,
         });
+        if (canonicalInput.clientDraftID) {
+          await tx.noteDraft.update({
+            where: {
+              ownerID_clientDraftID: {
+                ownerID,
+                clientDraftID: canonicalInput.clientDraftID,
+              },
+            },
+            data: { publishedNoteID: saved.id },
+          });
+        }
+        return saved;
       },
     );
 
@@ -2459,6 +3359,7 @@ export class NoteService {
       ...sections,
       media: rewriteSection(sections.media),
       showcase: rewriteSection(sections.showcase),
+      audio: rewriteSection(sections.audio),
     };
   }
 
@@ -2585,6 +3486,7 @@ export class NoteService {
               pinned: false,
               imageCount: source.imageCount,
               videoCount: source.videoCount,
+              audioCount: source.audioCount ?? 0,
               mediaCount: source.mediaCount,
               collectedFrom: toPrismaJson(collectedFrom),
               collectedFromNoteID: source.id,
@@ -2771,10 +3673,32 @@ export class NoteService {
     noteId: string,
     input: UpdateNoteDto,
   ): Promise<NoteDetailDto> {
+    const replay = await this.publishedDraftNote(
+      this.prisma,
+      ownerID,
+      input.clientDraftID,
+      noteId,
+    );
+    if (replay) return this.mapDetailResolved(replay, ownerID);
     const uniqueGroupIds = [...new Set(input.groupIds ?? [])];
     await this.requireOwnedGroups(ownerID, uniqueGroupIds);
 
-    const derived = this.deriveNoteContent(input);
+    const existingNote = await this.prisma.note.findFirst({
+      where: { id: noteId, ownerID, status: { not: 'DELETED' } },
+      select: { sections: true },
+    });
+    if (!existingNote) {
+      throw new NotFoundException({
+        message: 'Note not found',
+        errorCode: NoteErrorCode.NotFound,
+      });
+    }
+    const canonicalInput = await this.canonicalizeNoteCards(
+      ownerID,
+      input,
+      existingNote.sections,
+    );
+    const derived = this.deriveNoteContent(canonicalInput);
     // 收藏复制的笔记媒体沿用原作者的 objectKey；这些 key 是服务端 collectNote
     // 时合法落到本笔记上的，编辑时允许原样保留（新增媒体仍必须归属自己）。
     const existingMedia = await this.prisma.noteMedia.findMany({
@@ -2802,6 +3726,14 @@ export class NoteService {
     const counts = this.buildMediaStats(media);
 
     const updated = await this.prisma.$transaction(async (tx) => {
+      await this.membershipPolicy.lockUsers(tx, [ownerID]);
+      const replay = await this.publishedDraftNote(
+        tx,
+        ownerID,
+        canonicalInput.clientDraftID,
+        noteId,
+      );
+      if (replay) return replay;
       // Re-verify ownership inside the transaction to prevent TOCTOU races
       // where a concurrent delete could cause this update to un-delete the note.
       const existing = await tx.note.findFirst({
@@ -2813,6 +3745,16 @@ export class NoteService {
           message: 'Note not found',
           errorCode: NoteErrorCode.NotFound,
         });
+      }
+
+      if (canonicalInput.clientDraftID) {
+        await this.assertNoteEditOutcomeCapacity(tx, ownerID, noteId);
+        await this.consumeNoteDraft(
+          tx,
+          ownerID,
+          canonicalInput.clientDraftID,
+          noteId,
+        );
       }
 
       await tx.noteMedia.deleteMany({
@@ -2851,7 +3793,7 @@ export class NoteService {
         });
       }
 
-      return tx.note.update({
+      const saved = await tx.note.update({
         where: { id: noteId },
         data: {
           title: derived.title,
@@ -2861,13 +3803,25 @@ export class NoteService {
           groupID: null,
           // Preserve the existing status when the caller omits it — omitting
           // status on a PATCH must not silently promote an UNLISTED note to ACTIVE.
-          status: input.status ?? existing.status,
-          pinned: input.pinned ?? false,
+          status: canonicalInput.status ?? existing.status,
+          pinned: canonicalInput.pinned ?? false,
           coverMediaID,
           ...counts,
         },
         include: NOTE_INCLUDE,
       });
+      if (canonicalInput.clientDraftID) {
+        await tx.noteDraft.update({
+          where: {
+            ownerID_clientDraftID: {
+              ownerID,
+              clientDraftID: canonicalInput.clientDraftID,
+            },
+          },
+          data: { publishedNoteID: saved.id },
+        });
+      }
+      return saved;
     });
 
     return this.mapDetailResolved(updated, ownerID);

@@ -37,6 +37,12 @@ describe('NoteService', () => {
     user: {
       findUnique: jest.fn(),
     },
+    friend: {
+      findMany: jest.fn(),
+    },
+    circle: {
+      findMany: jest.fn(),
+    },
     note: {
       count: jest.fn(),
       create: jest.fn(),
@@ -94,6 +100,7 @@ describe('NoteService', () => {
 
   beforeEach(async () => {
     jest.clearAllMocks();
+    prisma.note.findFirst.mockReset();
     programEnabled = true;
     prisma.user.findUnique.mockResolvedValue({
       vipLevel: 0,
@@ -749,6 +756,168 @@ describe('NoteService', () => {
       showcaseCount: 1,
       hasLocation: true,
     });
+  });
+
+  it('canonicalizes audio and accessible contact/group cards before persisting', async () => {
+    prisma.friend.findMany.mockResolvedValueOnce([
+      {
+        userID: 'user-1',
+        friendID: 'friend-1',
+        user: {
+          id: 'user-1',
+          nickname: 'Owner',
+          accountId: 'owner',
+          avatarUrl: null,
+        },
+        friend: {
+          id: 'friend-1',
+          nickname: 'Canonical friend',
+          accountId: 'friend',
+          avatarUrl: 'https://cdn.example.com/friend.png',
+        },
+      },
+    ]);
+    prisma.circle.findMany.mockResolvedValueOnce([
+      { id: 'circle-1', name: 'Canonical circle', avatarUrl: null },
+    ]);
+    prisma.note.create.mockResolvedValueOnce({ id: 'audio-card-note' });
+    prisma.note.update.mockResolvedValueOnce({
+      id: 'audio-card-note',
+      ownerID: 'user-1',
+      title: 'Audio cards',
+      content: null,
+      contentJson: null,
+      sections: {
+        audio: {
+          items: [
+            {
+              type: 'AUDIO',
+              objectKey: 'notes/user-1/audio.m4a',
+              url: 'https://cdn.example.com/audio.m4a',
+              sortOrder: 0,
+            },
+          ],
+        },
+        contacts: {
+          items: [
+            {
+              id: 'friend-1',
+              name: 'Canonical friend',
+              faceURL: 'https://cdn.example.com/friend.png',
+            },
+          ],
+        },
+        groups: {
+          items: [{ id: 'circle-1', name: 'Canonical circle', faceURL: null }],
+        },
+      },
+      status: 'ACTIVE',
+      available: true,
+      pinned: false,
+      imageCount: 0,
+      videoCount: 0,
+      audioCount: 1,
+      mediaCount: 1,
+      createdAt: new Date('2026-04-09T00:00:00.000Z'),
+      updatedAt: new Date('2026-04-09T00:00:00.000Z'),
+      groupMemberships: [],
+      coverMedia: null,
+      media: [
+        {
+          id: 'audio-1',
+          type: 'AUDIO',
+          objectKey: 'notes/user-1/audio.m4a',
+          url: 'https://cdn.example.com/audio.m4a',
+          mimeType: 'audio/mp4',
+          size: 1024,
+          width: null,
+          height: null,
+          durationMs: 4200,
+          posterUrl: null,
+          sortOrder: 0,
+        },
+      ],
+    });
+
+    await service.createNote('user-1', {
+      title: 'Audio cards',
+      media: [
+        {
+          type: 'AUDIO',
+          objectKey: 'notes/user-1/audio.m4a',
+          url: 'https://cdn.example.com/audio.m4a',
+          mimeType: 'audio/mp4',
+          durationMs: 4200,
+          sortOrder: 0,
+        },
+      ],
+      sections: {
+        audio: {
+          items: [
+            {
+              type: 'AUDIO',
+              objectKey: 'notes/user-1/audio.m4a',
+              url: 'https://cdn.example.com/audio.m4a',
+              durationMs: 4200,
+              sortOrder: 0,
+            },
+          ],
+        },
+        contacts: {
+          items: [
+            {
+              id: 'friend-1',
+              name: 'Spoofed name',
+              faceURL: 'https://evil.example/avatar',
+            },
+          ],
+        },
+        groups: {
+          items: [{ id: 'circle-1', name: 'Spoofed group', faceURL: null }],
+        },
+      },
+    } as any);
+
+    expect(prisma.note.create).toHaveBeenCalledWith(
+      expect.objectContaining({
+        data: expect.objectContaining({
+          audioCount: 1,
+          sections: expect.objectContaining({
+            audio: expect.objectContaining({
+              items: [expect.objectContaining({ type: 'AUDIO' })],
+            }),
+            contacts: {
+              items: [
+                {
+                  id: 'friend-1',
+                  name: 'Canonical friend',
+                  faceURL: 'https://cdn.example.com/friend.png',
+                },
+              ],
+            },
+            groups: {
+              items: [
+                { id: 'circle-1', name: 'Canonical circle', faceURL: null },
+              ],
+            },
+          }),
+        }),
+      }),
+    );
+  });
+
+  it('rejects contact cards for users who are not accepted friends', async () => {
+    prisma.friend.findMany.mockResolvedValueOnce([]);
+    await expect(
+      service.createNote('user-1', {
+        title: 'Invalid card',
+        media: [],
+        sections: {
+          contacts: { items: [{ id: 'stranger', name: 'Stranger' }] },
+        },
+      } as any),
+    ).rejects.toThrow('Contact card target is not an accepted friend');
+    expect(prisma.note.create).not.toHaveBeenCalled();
   });
 
   it('strips signed-url query before persisting note media (edit round-trip)', async () => {
@@ -2007,11 +2176,13 @@ describe('NoteService', () => {
 
   it('updates a note by replacing media and recalculating counts', async () => {
     prisma.note.count.mockResolvedValue(51);
-    prisma.note.findFirst.mockResolvedValueOnce({
-      id: 'note-1',
-      ownerID: 'user-1',
-      groupID: null,
-    });
+    prisma.note.findFirst
+      .mockResolvedValueOnce({ sections: null })
+      .mockResolvedValueOnce({
+        id: 'note-1',
+        ownerID: 'user-1',
+        groupID: null,
+      });
     prisma.note.update.mockResolvedValueOnce({
       id: 'note-1',
       title: '更新后的笔记',
@@ -2914,7 +3085,9 @@ describe('NoteService', () => {
         if (operation === 'create') {
           prisma.note.create.mockResolvedValueOnce({ id: row.id });
         } else {
-          prisma.note.findFirst.mockResolvedValueOnce(row);
+          prisma.note.findFirst
+            .mockResolvedValueOnce(row)
+            .mockResolvedValueOnce(row);
         }
         prisma.note.update.mockImplementationOnce(async ({ data }) => ({
           ...row,
@@ -3862,11 +4035,13 @@ describe('NoteService', () => {
     prisma.noteMedia.findMany.mockResolvedValueOnce([
       { objectKey: 'notes/user-2/a.jpg' },
     ]);
-    prisma.note.findFirst.mockResolvedValueOnce({
-      id: 'note-copy',
-      ownerID: 'user-1',
-      status: 'ACTIVE',
-    });
+    prisma.note.findFirst
+      .mockResolvedValueOnce({ sections: null })
+      .mockResolvedValueOnce({
+        id: 'note-copy',
+        ownerID: 'user-1',
+        status: 'ACTIVE',
+      });
     prisma.note.update.mockResolvedValueOnce({
       ...otherUsersNote,
       id: 'note-copy',
@@ -3895,6 +4070,7 @@ describe('NoteService', () => {
   });
 
   it('updateNote still rejects foreign media keys that are not on the note', async () => {
+    prisma.note.findFirst.mockResolvedValueOnce({ sections: null });
     prisma.noteMedia.findMany.mockResolvedValueOnce([]);
 
     await expect(

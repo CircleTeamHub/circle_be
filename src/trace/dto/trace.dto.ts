@@ -18,6 +18,7 @@ import {
 import { ApiProperty, ApiPropertyOptional } from '@nestjs/swagger';
 import { AvatarFrameAppearanceDto } from 'src/user/dto/public-user.dto';
 import { MAX_PAGE } from 'src/common/pagination';
+import { ImageMediaVariantDto } from 'src/media/image-media.dto';
 import { USER_ID_OR_ALIAS_PATTERN } from 'src/user/user-id-alias';
 
 const TRACE_VISIBILITY = ['FRIENDS_ONLY', 'PRIVATE'] as const;
@@ -150,6 +151,8 @@ export class TraceCommentDto {
   id: string;
   content: string;
   images: string[];
+  @ApiPropertyOptional({ type: [ImageMediaVariantDto] })
+  media?: ImageMediaVariantDto[];
   user: { id: string; nickname: string };
   replyTo: { id: string; nickname: string } | null;
   ignoredMentionCount = 0;
@@ -160,6 +163,8 @@ export class TraceDto {
   id: string;
   content: string;
   images: string[];
+  @ApiPropertyOptional({ type: [ImageMediaVariantDto] })
+  media?: ImageMediaVariantDto[];
   visibility: string;
 
   @ApiProperty({ type: TraceAuthorDto })

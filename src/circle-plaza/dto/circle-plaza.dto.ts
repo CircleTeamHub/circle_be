@@ -21,6 +21,7 @@ import {
   PublicMembershipAppearanceDto,
 } from 'src/user/dto/public-user.dto';
 import { MAX_PAGE } from 'src/common/pagination';
+import { ImageMediaVariantDto } from 'src/media/image-media.dto';
 
 // ── Request DTOs ─────────────────────────────────────────────────────────────
 
@@ -338,6 +339,8 @@ export class PlazaPostDto {
   id: string;
   content: string;
   images: string[];
+  @ApiPropertyOptional({ type: [ImageMediaVariantDto] })
+  media?: ImageMediaVariantDto[];
   tags: string[];
   city: string | null;
   cities: string[];
