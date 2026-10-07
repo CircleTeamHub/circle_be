@@ -32,6 +32,7 @@
     "prisma:studio": "prisma studio",
     "seed:admin": "node scripts/seed-admin-user.js",
     "seed:fancy-numbers": "node scripts/seed-fancy-numbers.js",
+    "perf:db-review": "node scripts/perf-db-review.mjs",
     "sentry:smoke": "cross-env NODE_ENV=development ts-node scripts/sentry-smoke.ts"
   },
   "dependencies": {

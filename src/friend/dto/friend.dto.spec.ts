@@ -1,7 +1,11 @@
 import 'reflect-metadata';
 import { plainToInstance } from 'class-transformer';
 import { validateSync } from 'class-validator';
-import { ReportFriendDto, SendFriendRequestDto } from './friend.dto';
+import {
+  ReportFriendDto,
+  SendFriendRequestDto,
+  SetFriendPermissionDto,
+} from './friend.dto';
 
 describe('SendFriendRequestDto', () => {
   it('rejects oversized request messages', () => {
@@ -28,5 +32,25 @@ describe('ReportFriendDto', () => {
 
     expect(errors.some((error) => error.property === 'description')).toBe(true);
     expect(errors.some((error) => error.property === 'evidence')).toBe(true);
+  });
+});
+
+describe('SetFriendPermissionDto', () => {
+  it('accepts FULL and CHAT_ONLY and rejects unknown values', () => {
+    expect(
+      validateSync(
+        plainToInstance(SetFriendPermissionDto, { permission: 'FULL' }),
+      ),
+    ).toHaveLength(0);
+    expect(
+      validateSync(
+        plainToInstance(SetFriendPermissionDto, { permission: 'CHAT_ONLY' }),
+      ),
+    ).toHaveLength(0);
+    expect(
+      validateSync(
+        plainToInstance(SetFriendPermissionDto, { permission: 'PRIVATE' }),
+      ).some((error) => error.property === 'permission'),
+    ).toBe(true);
   });
 });

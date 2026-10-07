@@ -1052,6 +1052,143 @@ describe('FriendService', () => {
     });
   });
 
+  it('updates the permission slot owned by the current user', async () => {
+    prisma.friend.findFirst.mockResolvedValue({
+      id: 'friendship-1',
+      userID: 'user-1',
+      friendID: 'user-2',
+      state: FriendState.ACCEPTED,
+    });
+
+    await service.setFriendPermission('user-1', 'user-2', 'CHAT_ONLY' as any);
+
+    expect(prisma.friend.findFirst).toHaveBeenCalledWith({
+      where: {
+        OR: [
+          { userID: 'user-1', friendID: 'user-2' },
+          { userID: 'user-2', friendID: 'user-1' },
+        ],
+        state: FriendState.ACCEPTED,
+      },
+      select: { id: true, userID: true },
+    });
+    expect(prisma.friend.updateMany).toHaveBeenCalledWith({
+      where: {
+        userID: 'user-1',
+        friendID: 'user-2',
+        state: FriendState.ACCEPTED,
+      },
+      data: { permissionA: 'CHAT_ONLY' },
+    });
+  });
+
+  it('updates permissionB when the current user is stored as friendID', async () => {
+    prisma.friend.findFirst.mockResolvedValue({
+      id: 'friendship-1',
+      userID: 'user-1',
+      friendID: 'user-2',
+      state: FriendState.ACCEPTED,
+    });
+
+    await service.setFriendPermission('user-2', 'user-1', 'FULL' as any);
+
+    expect(prisma.friend.updateMany).toHaveBeenCalledWith({
+      where: {
+        userID: 'user-1',
+        friendID: 'user-2',
+        state: FriendState.ACCEPTED,
+      },
+      data: { permissionB: 'FULL' },
+    });
+  });
+
+  it('rejects permission updates for non-friends', async () => {
+    prisma.friend.findFirst.mockResolvedValue(null);
+
+    await expect(
+      service.setFriendPermission('user-1', 'user-2', 'CHAT_ONLY' as any),
+    ).rejects.toThrow(NotFoundException);
+
+    expect(prisma.friend.updateMany).not.toHaveBeenCalled();
+  });
+
+  it('does not mutate a friendship that changes state after the read', async () => {
+    prisma.friend.findFirst.mockResolvedValue({
+      id: 'friendship-1',
+      userID: 'user-1',
+      friendID: 'user-2',
+      state: FriendState.ACCEPTED,
+    });
+    prisma.friend.updateMany.mockResolvedValue({ count: 0 });
+
+    await expect(
+      service.setFriendPermission('user-1', 'user-2', 'CHAT_ONLY' as any),
+    ).rejects.toMatchObject({
+      response: {
+        errorCode: FriendErrorCode.FriendshipNotFound,
+      },
+    });
+    expect(prisma.friend.updateMany).toHaveBeenCalledWith({
+      where: {
+        userID: 'user-1',
+        friendID: 'user-2',
+        state: FriendState.ACCEPTED,
+      },
+      data: { permissionA: 'CHAT_ONLY' },
+    });
+  });
+
+  it('updates caller-owned grants on every historical accepted duplicate', async () => {
+    const rows = [
+      {
+        id: 'f1',
+        userID: 'user-1',
+        friendID: 'user-2',
+        state: FriendState.ACCEPTED,
+        permissionA: 'CHAT_ONLY',
+        permissionB: 'CHAT_ONLY',
+      },
+      {
+        id: 'f2',
+        userID: 'user-1',
+        friendID: 'user-2',
+        state: FriendState.ACCEPTED,
+        permissionA: 'CHAT_ONLY',
+        permissionB: 'CHAT_ONLY',
+      },
+      {
+        id: 'f3',
+        userID: 'user-2',
+        friendID: 'user-1',
+        state: FriendState.ACCEPTED,
+        permissionA: 'CHAT_ONLY',
+        permissionB: 'CHAT_ONLY',
+      },
+    ];
+    prisma.friend.findFirst.mockResolvedValue(rows[0]);
+    prisma.friend.updateMany.mockImplementation(({ where, data }) => {
+      const matches = rows.filter(
+        (row) =>
+          row.userID === where.userID &&
+          row.friendID === where.friendID &&
+          row.state === where.state,
+      );
+      matches.forEach((row) => Object.assign(row, data));
+      return Promise.resolve({ count: matches.length });
+    });
+    await service.setFriendPermission('user-1', 'user-2', 'FULL' as any);
+    expect(
+      rows.map((row) =>
+        row.userID === 'user-1' ? row.permissionA : row.permissionB,
+      ),
+    ).toEqual(['FULL', 'FULL', 'FULL']);
+    expect(
+      rows.map((row) =>
+        row.userID === 'user-1' ? row.permissionB : row.permissionA,
+      ),
+    ).toEqual(['CHAT_ONLY', 'CHAT_ONLY', 'CHAT_ONLY']);
+  });
+
   it('stores sender-owned pending metadata when sending a request', async () => {
     prisma.user.findUnique.mockResolvedValue({
       id: 'user-2',

@@ -74,7 +74,7 @@ describe('database operation timing', () => {
     expect(originalQuery).toHaveBeenCalledTimes(1);
     expect(originalQuery).toHaveBeenCalledWith(secretQuery);
     expect(logger.warn).toHaveBeenCalledWith(
-      {
+      expect.objectContaining({
         event: 'database_operation_slow',
         scope: 'driver_adapter',
         operation: 'queryRaw',
@@ -84,7 +84,8 @@ describe('database operation timing', () => {
         suppressedCount: 0,
         requestId: 'request-1',
         traceId: 'trace-1',
-      },
+        queryFingerprint: expect.stringMatching(/^[a-f0-9]{16}$/),
+      }),
       'Performance',
     );
     const output = JSON.stringify((logger.warn as jest.Mock).mock.calls);
@@ -188,6 +189,48 @@ describe('database operation timing', () => {
       operation: 'executeRaw',
       result: 'failure',
       suppressedCount: 4,
+    });
+  });
+
+  it('tracks slow-query suppression independently for distinct fingerprints', async () => {
+    const { factory } = fixture();
+    let elapsed = 0;
+    let warningClock = 0;
+    const observed = observeDatabaseAdapter(
+      factory as unknown as PrismaPg,
+      logger,
+      config,
+      () => {
+        elapsed += 1500;
+        return elapsed;
+      },
+      () => warningClock,
+    );
+    const connection = await observed.connect();
+    const first = {
+      sql: 'SELECT id FROM table_a WHERE id = $1',
+      args: ['a'],
+      argTypes: [],
+    };
+    const second = { ...first, sql: 'SELECT id FROM table_b WHERE id = $1' };
+    await connection.queryRaw(first);
+    await connection.queryRaw(second);
+    await connection.queryRaw(first);
+    warningClock = 60_001;
+    await connection.queryRaw(first);
+    await connection.queryRaw(second);
+    const events = (logger.warn as jest.Mock).mock.calls.map(
+      ([event]) => event,
+    );
+    expect(events).toHaveLength(4);
+    expect(events[0].queryFingerprint).not.toBe(events[1].queryFingerprint);
+    expect(events[2]).toMatchObject({
+      queryFingerprint: events[0].queryFingerprint,
+      suppressedCount: 1,
+    });
+    expect(events[3]).toMatchObject({
+      queryFingerprint: events[1].queryFingerprint,
+      suppressedCount: 0,
     });
   });
 

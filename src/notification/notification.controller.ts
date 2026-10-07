@@ -64,9 +64,16 @@ export class NotificationController {
   @Get('list')
   @ApiOperation({
     summary:
-      'Paginated interactive notification list, optionally scoped to one bell domain',
+      'Paginated interactive notification list; cursor mode avoids deep OFFSET',
   })
   list(@Query() query: NotificationListQueryDto, @Req() req: RequestWithUser) {
+    if (query.cursorMode || query.cursor) {
+      return this.notificationService.getNotificationsByCursor(
+        req.user.userId,
+        query.cursor,
+        query.domain,
+      );
+    }
     return this.notificationService.getNotifications(
       req.user.userId,
       query.page,
@@ -76,12 +83,18 @@ export class NotificationController {
 
   @Get('profile/list')
   @ApiOperation({
-    summary: 'Paginated profile-domain system notification list',
+    summary: 'Paginated profile notifications; cursor mode avoids deep OFFSET',
   })
   profileList(
     @Query() query: NotificationPageQueryDto,
     @Req() req: RequestWithUser,
   ) {
+    if (query.cursorMode || query.cursor) {
+      return this.notificationService.getProfileNotificationsByCursor(
+        req.user.userId,
+        query.cursor,
+      );
+    }
     return this.notificationService.getProfileNotifications(
       req.user.userId,
       query.page,

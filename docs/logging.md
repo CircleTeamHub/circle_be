@@ -136,8 +136,9 @@ Database and job diagnostics:
   threshold, success/failure and available request/job correlation.
   This can include pool waiting and transaction control statements sent through
   these methods; it is **not** PostgreSQL execution time or whole-model latency.
-  Initial adapter connection/startTransaction setup is not timed. SQL, parameters,
-  results and exception messages are never inspected.
+  Initial adapter connection/startTransaction setup is not timed. The adapter SQL
+  text is reduced to a short one-way `queryFingerprint` for grouping slow-query
+  events; SQL text, parameters, results and exception messages are never logged.
 - `job_run`: every tracked cron execution gets an isolated UUID `runId`, job,
   outcome and monotonic duration. Success/skipped summaries are debug; handled
   failures warn, thrown failures error. Existing heartbeat/failure metrics remain

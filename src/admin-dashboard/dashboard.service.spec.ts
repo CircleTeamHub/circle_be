@@ -16,6 +16,7 @@ describe('DashboardService', () => {
 
   beforeEach(() => {
     jest.clearAllMocks();
+    jest.spyOn(Date, 'now').mockReturnValue(now.getTime());
     service = new DashboardService(
       users as never,
       community as never,
@@ -24,6 +25,36 @@ describe('DashboardService', () => {
       system as never,
       redis as never,
     );
+  });
+  afterEach(() => jest.restoreAllMocks());
+
+  it('does not extend a shared cache hit beyond its generation TTL', async () => {
+    const generated = now.getTime();
+    const cached = {
+      range: DashboardRange.Today,
+      generatedAt: now.toISOString(),
+      sections: {},
+    };
+    redis.getJson.mockResolvedValueOnce(cached).mockResolvedValue(null);
+    users.getMetrics.mockResolvedValue({ totalUsers: 99 });
+    community.getMetrics.mockResolvedValue({});
+    commerce.getMetrics.mockResolvedValue({});
+    moderation.getMetrics.mockResolvedValue({});
+    system.getMetrics.mockResolvedValue({});
+    jest.mocked(Date.now).mockReturnValue(generated + 44_000);
+    await expect(service.getDashboard(DashboardRange.Today)).resolves.toEqual(
+      cached,
+    );
+    jest.mocked(Date.now).mockReturnValue(generated + 46_000);
+    const result = await service.getDashboard(
+      DashboardRange.Today,
+      new Date(generated + 46_000),
+    );
+    expect(result.sections.users).toEqual({
+      status: 'ok',
+      data: { totalUsers: 99 },
+    });
+    expect(users.getMetrics).toHaveBeenCalledTimes(1);
   });
 
   it('returns a cached dashboard without running section queries', async () => {
@@ -125,5 +156,28 @@ describe('DashboardService', () => {
         users: { status: 'ok', data: { totalUsers: 10 } },
       },
     });
+  });
+
+  it('coalesces concurrent cache misses for the same range', async () => {
+    redis.getJson.mockResolvedValue(null);
+    let releaseUsers!: (value: { totalUsers: number }) => void;
+    const usersGate = new Promise<{ totalUsers: number }>((resolve) => {
+      releaseUsers = resolve;
+    });
+    users.getMetrics.mockReturnValue(usersGate);
+    community.getMetrics.mockResolvedValue({ totalCircles: 3 });
+    commerce.getMetrics.mockResolvedValue({ pointSpend: 100 });
+    moderation.getMetrics.mockResolvedValue({ pendingTotal: 2 });
+    system.getMetrics.mockResolvedValue({ services: { api: 'healthy' } });
+    redis.setJson.mockResolvedValue(true);
+
+    const first = service.getDashboard(DashboardRange.Today, now);
+    const second = service.getDashboard(DashboardRange.Today, now);
+    await Promise.resolve();
+    await Promise.resolve();
+
+    expect(users.getMetrics).toHaveBeenCalledTimes(1);
+    releaseUsers({ totalUsers: 10 });
+    await expect(Promise.all([first, second])).resolves.toHaveLength(2);
   });
 });

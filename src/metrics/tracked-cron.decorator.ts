@@ -17,6 +17,7 @@ import { runWithOperationContext } from '../logging/operation-context';
 const INTERVAL_SECONDS: ReadonlyMap<string, number> = new Map([
   [CronExpression.EVERY_MINUTE, 60],
   [CronExpression.EVERY_5_MINUTES, 5 * 60],
+  [CronExpression.EVERY_10_MINUTES, 10 * 60],
   [CronExpression.EVERY_30_MINUTES, 30 * 60],
   [CronExpression.EVERY_HOUR, 60 * 60],
   [CronExpression.EVERY_DAY_AT_4AM, 24 * 60 * 60],

@@ -1,6 +1,10 @@
 import { plainToInstance } from 'class-transformer';
 import { validateSync } from 'class-validator';
-import { CreateTraceCommentDto, CreateTraceDto } from './trace.dto';
+import {
+  CreateTraceCommentDto,
+  CreateTraceDto,
+  TraceFeedQueryDto,
+} from './trace.dto';
 
 describe('CreateTraceCommentDto', () => {
   const uuid = (suffix: string) =>
@@ -93,5 +97,38 @@ describe('CreateTraceDto images', () => {
       (error) => error.property === 'images',
     );
     expect(target?.constraints).toHaveProperty('arrayUnique');
+  });
+});
+
+describe('TraceFeedQueryDto authorId', () => {
+  it('accepts persisted user IDs that are UUID-shaped but not RFC UUIDs', () => {
+    const dto = plainToInstance(TraceFeedQueryDto, {
+      authorId: '1bb0505f-98af-bb5d-9c38-d31d38fd412a',
+    });
+
+    expect(validateSync(dto)).toHaveLength(0);
+  });
+
+  it('accepts the legacy 32-hex user id alias', () => {
+    const dto = plainToInstance(TraceFeedQueryDto, {
+      authorId: '1bb0505f98afbb5d9c38d31d38fd412a',
+    });
+
+    expect(validateSync(dto)).toHaveLength(0);
+  });
+
+  it('rejects an empty or oversized author ID', () => {
+    const empty = plainToInstance(TraceFeedQueryDto, { authorId: '' });
+    const oversized = plainToInstance(TraceFeedQueryDto, {
+      authorId: 'a'.repeat(129),
+    });
+
+    expect(validateSync(empty).map((error) => error.property)).toContain(
+      'authorId',
+    );
+    expect(
+      validateSync(oversized).find((error) => error.property === 'authorId')
+        ?.constraints,
+    ).toHaveProperty('maxLength');
   });
 });
