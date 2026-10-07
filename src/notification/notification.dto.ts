@@ -31,6 +31,29 @@ export class NotificationPageQueryDto {
   @ApiPropertyOptional({ minimum: 1, maximum: MAX_PAGE, default: 1 })
   @IsOptional()
   page = 1;
+
+  // Cursor mode is opt-in so existing clients can keep consuming the array
+  // response from the page-based endpoint while new clients avoid deep OFFSET.
+  @ApiPropertyOptional({ maxLength: 256 })
+  @IsString()
+  @MaxLength(256)
+  @IsOptional()
+  cursor?: string;
+
+  // A first cursor page has no token yet. This explicit switch keeps the
+  // legacy array response unchanged while letting new clients request the
+  // cursor envelope before they have a cursor to send back.
+  @ApiPropertyOptional({ type: Boolean, default: false })
+  @Transform(({ obj }: { obj: Record<string, unknown> }) => {
+    const value = obj.cursorMode;
+    if (value === undefined) return undefined;
+    if (value === true || value === 'true') return true;
+    if (value === false || value === 'false') return false;
+    return value;
+  })
+  @IsBoolean()
+  @IsOptional()
+  cursorMode?: boolean;
 }
 
 export class NotificationListQueryDto extends NotificationPageQueryDto {
@@ -169,6 +192,42 @@ export type NotificationRealtimeDto = {
   fromInvitation: { id: string; status: string } | null;
   requestId?: string | null;
 };
+
+export type NotificationCursor = {
+  createdAt: string;
+  id: string;
+};
+
+export function encodeNotificationCursor(cursor: NotificationCursor): string {
+  return Buffer.from(JSON.stringify(cursor), 'utf8').toString('base64url');
+}
+
+export function decodeNotificationCursor(
+  value: string,
+): NotificationCursor | null {
+  try {
+    const parsed: unknown = JSON.parse(
+      Buffer.from(value, 'base64url').toString('utf8'),
+    );
+    if (!parsed || typeof parsed !== 'object') return null;
+    const cursor = parsed as Record<string, unknown>;
+    if (
+      typeof cursor.id !== 'string' ||
+      cursor.id.length === 0 ||
+      cursor.id.length > 128 ||
+      typeof cursor.createdAt !== 'string' ||
+      Number.isNaN(Date.parse(cursor.createdAt))
+    ) {
+      return null;
+    }
+    return {
+      id: cursor.id,
+      createdAt: new Date(cursor.createdAt).toISOString(),
+    };
+  } catch {
+    return null;
+  }
+}
 
 export const NOTIFICATION_REALTIME_INCLUDE = {
   fromUser: { select: { id: true, nickname: true, avatarUrl: true } },

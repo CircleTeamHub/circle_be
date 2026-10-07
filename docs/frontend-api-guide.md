@@ -14,15 +14,16 @@
 3. [User 接口](#user-接口)
 4. [Upload 接口](#upload-接口)
 5. [Friend 接口](#friend-接口)
-6. [Coin 接口](#coin-接口)
-7. [Note 接口](#note-接口)
-8. [Circle 接口](#circle-接口)
-9. [Circle Plaza 接口](#circle-plaza-接口)
-10. [Circle Invitation 接口](#circle-invitation-接口)
-11. [Group 接口](#group-接口)
-12. [Collections 接口](#collections-接口)
-13. [错误处理](#错误处理)
-14. [前端集成建议](#前端集成建议)
+6. [Notification 接口](#notification-接口)
+7. [Coin 接口](#coin-接口)
+8. [Note 接口](#note-接口)
+9. [Circle 接口](#circle-接口)
+10. [Circle Plaza 接口](#circle-plaza-接口)
+11. [Circle Invitation 接口](#circle-invitation-接口)
+12. [Group 接口](#group-接口)
+13. [Collections 接口](#collections-接口)
+14. [错误处理](#错误处理)
+15. [前端集成建议](#前端集成建议)
 
 ---
 
@@ -546,6 +547,28 @@ PATCH /friend/:friendUserId/remark
 
 ---
 
+### 设置好友朋友圈权限
+
+```
+PATCH /friend/:friendUserId/permission
+```
+
+**Request Body：**
+```json
+{
+  "permission": "CHAT_ONLY"
+}
+```
+
+| 值 | 含义 |
+|---|---|
+| `FULL` | 好友可以查看你的朋友圈 |
+| `CHAT_ONLY` | 好友可以聊天，但不能查看你的朋友圈 |
+
+**Response 204：** 无内容
+
+---
+
 ### 查询与某用户的关系状态
 
 ```
@@ -857,6 +880,49 @@ GET /friend/blocked
   → GET /friend/status/:B_userId
   ← { status: "ACCEPTED", requestId: "friend_uuid" }
 ```
+
+---
+
+## Notification 接口
+
+> 所有接口均需 `Authorization: Bearer <accessToken>`
+> Base path: `/notification`
+
+### 互动通知游标分页
+
+```
+GET /notification/list?cursorMode=true&domain=circle
+GET /notification/list?cursorMode=true&domain=circle&cursor=<nextCursor>
+```
+
+`domain` 可选：`moments`（朋友圈）或 `circle`（圈子）；省略时返回全部互动通知。
+首个请求省略 `cursor`，之后把响应里的 `nextCursor` 原样带回。响应固定为：
+
+```json
+{
+  "items": [
+    {
+      "id": "uuid",
+      "type": "TRACE_LIKE",
+      "content": "有人赞了你的动态",
+      "read": false,
+      "createdAt": "2026-10-05T12:00:00.000Z"
+    }
+  ],
+  "nextCursor": "eyJjcmVhdGVkQXQiOiIyMDI2..."
+}
+```
+
+`nextCursor` 为 `null` 表示没有下一页。客户端不要自行拼接或解析游标。未带 `cursorMode=true` 时仍返回旧的数组响应，供旧客户端和实时恢复逻辑兼容。
+
+### 系统通知游标分页
+
+```
+GET /notification/profile/list?cursorMode=true
+GET /notification/profile/list?cursorMode=true&cursor=<nextCursor>
+```
+
+响应结构与互动通知相同，`items` 只包含当前账号的系统/资料通知。
 
 ---
 

@@ -2,6 +2,7 @@ import type { Options } from 'express-rate-limit';
 import Redis from 'ioredis';
 import { redisMetrics } from './redis.metrics';
 import { RedisService } from './redis.service';
+import { runWithJobLease } from './job-lease';
 
 const redisUrl = process.env.REDIS_TEST_URL;
 const describeRedis = redisUrl ? describe : describe.skip;
@@ -106,6 +107,35 @@ describeRedis('RedisService real Redis integration', () => {
     await expect(received).resolves.toEqual({ channel, message: 'hello' });
   });
 
+  it('fences checkpoint advances and null clears with the current unexpired lease token', async () => {
+    const cursorKey = `${prefix}:circle-cursor`;
+    const leaseKey = `${prefix}:circle-lease`;
+    const first = await service.tryAcquireLease(leaseKey, 100);
+    expect(typeof first).toBe('string');
+    const write = (token: string, cursor: unknown) =>
+      service.setJsonIfVersionMatches(cursorKey, leaseKey, token, cursor, 30);
+    const firstWindow = { window: 'first', circleID: '' };
+    expect(await write(first!, firstWindow)).toBe(true);
+
+    await new Promise((resolve) => setTimeout(resolve, 110));
+    expect(await write(first!, null)).toBe(false);
+    await expect(service.getJson(cursorKey)).resolves.toEqual(firstWindow);
+
+    const current = await service.tryAcquireLease(leaseKey, 5_000);
+    expect(typeof current).toBe('string');
+    const recoveryWindow = { window: 'newer', circleID: '' };
+    expect(await write(current!, recoveryWindow)).toBe(true);
+    expect(await write(first!, { window: 'first', circleID: 'last' })).toBe(
+      false,
+    );
+    expect(await write(first!, null)).toBe(false);
+    await service.releaseLease(leaseKey, first!);
+    await expect(service.getJson(cursorKey)).resolves.toEqual(recoveryWindow);
+    expect(await write(current!, null)).toBe(true);
+    await expect(service.getJson(cursorKey)).resolves.toBeNull();
+    await service.releaseLease(leaseKey, current!);
+  });
+
   it('shares rate-limit counts through rate-limit-redis', async () => {
     const first = service.createRateLimitStore(`${prefix}:limiter`)!;
     const second = service.createRateLimitStore(`${prefix}:limiter`)!;
@@ -121,6 +151,55 @@ describeRedis('RedisService real Redis integration', () => {
     expect(secondResult.totalHits).toBe(2);
     await first.shutdown?.();
     await second.shutdown?.();
+  });
+
+  it('extends only the current lease without reviving an expired owner', async () => {
+    const key = `${prefix}:renewing-lease`;
+    const owner = await service.tryAcquireLease(key, 300);
+    expect(typeof owner).toBe('string');
+    await new Promise((resolve) => setTimeout(resolve, 150));
+    expect(await service.renewLease(key, owner!, 600)).toBe(true);
+    await new Promise((resolve) => setTimeout(resolve, 200));
+    expect(await service.tryAcquireLease(key, 500)).toBeNull();
+    const remaining = await admin.pttl(key);
+    expect(await service.renewLease(key, 'different-owner', 10_000)).toBe(
+      false,
+    );
+    expect(await admin.pttl(key)).toBeLessThanOrEqual(remaining);
+    await admin.pexpire(key, 1);
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    expect(await service.renewLease(key, owner!, 500)).toBe(false);
+    const replacement = await service.tryAcquireLease(key, 500);
+    expect(typeof replacement).toBe('string');
+    expect(await service.renewLease(key, owner!, 10_000)).toBe(false);
+    await service.releaseLease(key, owner!);
+    expect(await admin.get(key)).toBe(replacement);
+    await service.releaseLease(key, replacement!);
+  });
+
+  it('renews a running job past its original TTL and fences its final checkpoint', async () => {
+    const job = `${prefix}:long-job`;
+    const cursor = `${prefix}:long-job-cursor`;
+    await expect(
+      runWithJobLease(service, job, 300, async (owner, lease) => {
+        await new Promise((resolve) => setTimeout(resolve, 700));
+        expect(lease.isCurrent()).toBe(true);
+        expect(
+          await service.tryAcquireLease(`job-lease:${job}`, 300),
+        ).toBeNull();
+        expect(
+          await service.setJsonIfVersionMatches(
+            cursor,
+            `job-lease:${job}`,
+            owner!,
+            'finished',
+            30,
+          ),
+        ).toBe(true);
+      }),
+    ).resolves.toBe(true);
+    expect(await admin.exists(`job-lease:${job}`)).toBe(0);
+    expect(await service.getJson(cursor)).toBe('finished');
   });
 
   it('times out blocked commands and records the bounded failure reason', async () => {

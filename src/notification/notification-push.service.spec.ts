@@ -38,6 +38,7 @@ describe('NotificationPushService (#88 per-token delivery)', () => {
   beforeEach(() => {
     jest.clearAllMocks();
     for (const key of Object.keys(configValues)) delete configValues[key];
+    prisma.devicePushToken.findMany.mockResolvedValue([]);
     service = new NotificationPushService(
       prisma as unknown as PrismaService,
       config as any,
@@ -384,14 +385,21 @@ describe('NotificationPushService (#88 per-token delivery)', () => {
   });
 
   describe('listActiveTokensForUsers', () => {
-    it('loads every recipient token in one query and keeps the 20 newest per user', async () => {
-      prisma.devicePushToken.findMany.mockResolvedValue([
+    it('caps recipient tokens per user/provider inside the database query', async () => {
+      prisma.$queryRaw.mockResolvedValue([
         ...Array.from({ length: 22 }, (_, i) => ({
           userID: 'u1',
           token: `u1-${i}`,
           projectId: null,
           provider: 'expo',
           platform: 'ios',
+        })),
+        ...Array.from({ length: 22 }, (_, i) => ({
+          userID: 'u1',
+          token: `u1-jpush-${i}`,
+          projectId: null,
+          provider: 'jpush',
+          platform: 'android',
         })),
         {
           userID: 'u2',
@@ -402,25 +410,31 @@ describe('NotificationPushService (#88 per-token delivery)', () => {
         },
       ]);
 
-      const byUser = await service.listActiveTokensForUsers(['u1', 'u2', 'u3']);
+      const byUser = await service.listActiveTokensForUsers([
+        'u1',
+        'u2',
+        'u3',
+        'u1',
+      ]);
 
-      expect(prisma.devicePushToken.findMany).toHaveBeenCalledTimes(1);
-      expect(prisma.devicePushToken.findMany).toHaveBeenCalledWith({
-        where: {
-          userID: { in: ['u1', 'u2', 'u3'] },
-          provider: { in: ['expo', 'jpush'] },
-          disabledAt: null,
-        },
-        select: {
-          userID: true,
-          token: true,
-          projectId: true,
-          provider: true,
-          platform: true,
-        },
-        orderBy: { updatedAt: 'desc' },
-      });
-      expect(byUser.get('u1')).toHaveLength(20);
+      expect(prisma.$queryRaw).toHaveBeenCalledTimes(1);
+      expect(prisma.devicePushToken.findMany).not.toHaveBeenCalled();
+      const query = prisma.$queryRaw.mock.calls[0][0] as {
+        sql: string;
+        values: unknown[];
+      };
+      expect(query.sql).toContain('ROW_NUMBER() OVER');
+      expect(query.sql).toContain('PARTITION BY "userID", provider');
+      expect(query.sql).toContain('provider IN');
+      expect(query.sql).toContain('"disabledAt" IS NULL');
+      expect(query.sql).toContain('token_rank <=');
+      expect(query.values).toEqual(['u1', 'u2', 'u3', 'expo', 'jpush', 20]);
+      expect(byUser.get('u1')).toHaveLength(40);
+      for (const provider of ['expo', 'jpush']) {
+        expect(
+          byUser.get('u1')?.filter((token) => token.provider === provider),
+        ).toHaveLength(20);
+      }
       expect(byUser.get('u1')?.[0]).toEqual({
         token: 'u1-0',
         projectId: null,
@@ -442,7 +456,7 @@ describe('NotificationPushService (#88 per-token delivery)', () => {
       await expect(service.listActiveTokensForUsers([])).resolves.toEqual(
         new Map(),
       );
-      expect(prisma.devicePushToken.findMany).not.toHaveBeenCalled();
+      expect(prisma.$queryRaw).not.toHaveBeenCalled();
     });
   });
 
@@ -784,13 +798,80 @@ describe('NotificationPushService (#88 per-token delivery)', () => {
   });
 
   describe('deleteStaleTokens', () => {
+    it('skips an overlapping local sweep while the current batch holds its database lock', async () => {
+      prisma.$queryRaw.mockResolvedValue([{ acquired: true }]);
+      let finish!: (rows: unknown[]) => void;
+      let notifyStarted!: () => void;
+      const started = new Promise<void>((resolve) => {
+        notifyStarted = resolve;
+      });
+      prisma.devicePushToken.findMany.mockImplementationOnce(() => {
+        notifyStarted();
+        return new Promise((resolve) => {
+          finish = resolve;
+        });
+      });
+      const first = service.deleteStaleTokens();
+      try {
+        await started;
+        expect(await service.deleteStaleTokens()).toEqual({ count: 0 });
+        expect(prisma.$transaction).toHaveBeenCalledTimes(1);
+      } finally {
+        finish([]);
+        await first;
+      }
+      await service.deleteStaleTokens();
+      expect(prisma.$transaction).toHaveBeenCalledTimes(2);
+    });
+
     it('prunes aged tokens under an advisory lock', async () => {
       prisma.$queryRaw.mockResolvedValue([{ acquired: true }]);
+      prisma.devicePushToken.findMany.mockResolvedValueOnce([
+        { id: 'token-1' },
+        { id: 'token-2' },
+      ]);
       prisma.devicePushToken.deleteMany.mockResolvedValue({ count: 2 });
 
       const result = await service.deleteStaleTokens();
 
       expect(result.count).toBe(2);
+      expect(prisma.devicePushToken.findMany).toHaveBeenCalledWith(
+        expect.objectContaining({
+          select: { id: true },
+          orderBy: { id: 'asc' },
+          take: 1000,
+        }),
+      );
+    });
+
+    it('continues a backlog exceeding the bounded run and reports the cap', async () => {
+      prisma.$queryRaw.mockResolvedValue([{ acquired: true }]);
+      let remaining = 21_000;
+      prisma.devicePushToken.findMany.mockImplementation(async () =>
+        Array.from({ length: Math.min(1000, remaining) }, (_, i) => ({
+          id: `token-${i}`,
+        })),
+      );
+      prisma.devicePushToken.deleteMany.mockImplementation(
+        async ({ where }) => {
+          const count = where.AND[1].id.in.length;
+          remaining -= count;
+          return { count };
+        },
+      );
+      const warn = jest
+        .spyOn((service as any).logger, 'warn')
+        .mockImplementation(() => undefined);
+      expect((await service.deleteStaleTokens()).count).toBe(20_000);
+      expect(warn).toHaveBeenCalledWith(
+        expect.objectContaining({
+          event: 'push_stale_token_cleanup_capped',
+          nextRunInMinutes: 10,
+        }),
+      );
+      expect((await service.deleteStaleTokens()).count).toBe(1000);
+      expect(remaining).toBe(0);
+      warn.mockRestore();
     });
 
     it('is a no-op when another instance holds the lock', async () => {

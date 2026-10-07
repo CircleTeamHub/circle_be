@@ -1,18 +1,29 @@
 import type { LoggerService } from '@nestjs/common';
 import type { PrismaPg } from '@prisma/adapter-pg';
+import { createHash } from 'crypto';
+import type { SqlQuery } from '@prisma/driver-adapter-utils';
 import { getRequestContext } from './request-context';
 import { getOperationContext } from './operation-context';
 
 type Adapter = Awaited<ReturnType<PrismaPg['connect']>>;
 type Queryable = Pick<Adapter, 'queryRaw' | 'executeRaw'>;
 
+function queryFingerprint(query: SqlQuery): string | undefined {
+  if (typeof query.sql !== 'string' || query.sql.trim().length === 0) {
+    return undefined;
+  }
+  const normalized = query.sql.replace(/\s+/g, ' ').trim();
+  return createHash('sha256').update(normalized).digest('hex').slice(0, 16);
+}
+
 /**
  * Time the public driver-adapter query boundary, including transaction queries.
  * This is a driver round trip (and pool wait for non-transaction queries), not
  * PostgreSQL execution time or an entire Prisma/model operation. The adapter
- * cannot expose a model name without inspecting SQL, so operation names are
- * deliberately limited to queryRaw/executeRaw. SQL, args, results and errors
- * are never inspected. PrismaPromise and transaction lifecycle remain intact.
+ * cannot expose a model name without retaining SQL, so operation names are
+ * deliberately limited to queryRaw/executeRaw. SQL is only normalized into a
+ * one-way fingerprint for grouping; args, results and error messages are never
+ * logged. PrismaPromise and transaction lifecycle remain intact.
  */
 export function observeDatabaseAdapter(
   factory: PrismaPg,
@@ -33,6 +44,10 @@ export function observeDatabaseAdapter(
     const state = warningStates.get(key);
     if (!state || now - state.lastEmittedAt >= warningIntervalMs) {
       const suppressedCount = state?.suppressedCount ?? 0;
+      if (!state && warningStates.size >= 1024) {
+        const oldestKey = warningStates.keys().next().value;
+        if (oldestKey !== undefined) warningStates.delete(oldestKey);
+      }
       warningStates.set(key, { lastEmittedAt: now, suppressedCount: 0 });
       return suppressedCount;
     }
@@ -42,6 +57,7 @@ export function observeDatabaseAdapter(
 
   async function timed<T>(
     operation: 'queryRaw' | 'executeRaw',
+    query: SqlQuery,
     run: () => Promise<T>,
   ): Promise<T> {
     const startedAt = elapsedMs();
@@ -54,9 +70,15 @@ export function observeDatabaseAdapter(
     } finally {
       try {
         const durationMs = elapsedMs() - startedAt;
+        const fingerprint =
+          durationMs >= config.slowDbOperationMs
+            ? queryFingerprint(query)
+            : undefined;
         const suppressedCount =
           durationMs >= config.slowDbOperationMs
-            ? shouldEmitWarning(`${operation}:${result}`)
+            ? shouldEmitWarning(
+                `${operation}:${result}:${fingerprint ?? 'unknown'}`,
+              )
             : null;
         if (suppressedCount !== null) {
           const requestContext = getRequestContext();
@@ -71,6 +93,7 @@ export function observeDatabaseAdapter(
               suppressedCount,
               requestId: requestContext?.requestId,
               traceId: requestContext?.traceId,
+              ...(fingerprint ? { queryFingerprint: fingerprint } : {}),
               ...getOperationContext(),
             },
             'Performance',
@@ -85,9 +108,10 @@ export function observeDatabaseAdapter(
   function observeQueries(queryable: Queryable): void {
     const queryRaw = queryable.queryRaw.bind(queryable);
     const executeRaw = queryable.executeRaw.bind(queryable);
-    queryable.queryRaw = (query) => timed('queryRaw', () => queryRaw(query));
+    queryable.queryRaw = (query) =>
+      timed('queryRaw', query, () => queryRaw(query));
     queryable.executeRaw = (query) =>
-      timed('executeRaw', () => executeRaw(query));
+      timed('executeRaw', query, () => executeRaw(query));
   }
 
   const connect = factory.connect.bind(factory);

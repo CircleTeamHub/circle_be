@@ -1,4 +1,6 @@
 import { ChatBurnSweeperService } from './chat-burn-sweeper.service';
+import { Logger } from '@nestjs/common';
+import { jobMetrics } from '../metrics/job-metrics';
 
 describe('ChatBurnSweeperService', () => {
   const prisma = {
@@ -19,9 +21,11 @@ describe('ChatBurnSweeperService', () => {
   // 默认:没配 Redis(单实例)—— 租约拿不到协调、照常跑,游标只在内存里。
   const redis = {
     tryAcquireLease: jest.fn(),
+    renewLease: jest.fn(),
     releaseLease: jest.fn(),
     getJsonMany: jest.fn(),
     setJson: jest.fn(),
+    setJsonIfVersionMatches: jest.fn(),
   };
   const service = new ChatBurnSweeperService(
     prisma as never,
@@ -29,6 +33,13 @@ describe('ChatBurnSweeperService', () => {
     broadcast as never,
     redis as never,
   );
+  const makeService = () =>
+    new ChatBurnSweeperService(
+      prisma as never,
+      media as never,
+      broadcast as never,
+      redis as never,
+    );
 
   beforeEach(() => {
     jest.resetAllMocks();
@@ -47,9 +58,11 @@ describe('ChatBurnSweeperService', () => {
     );
     prisma.$queryRaw.mockResolvedValue([{ id: 'locked' }]);
     redis.tryAcquireLease.mockResolvedValue(undefined);
+    redis.renewLease.mockResolvedValue(true);
     redis.releaseLease.mockResolvedValue(undefined);
     redis.getJsonMany.mockResolvedValue(null);
     redis.setJson.mockResolvedValue(false);
+    redis.setJsonIfVersionMatches.mockResolvedValue(true);
     // 每批删除前都重读当前策略(防「扫描中途策略被改长/关掉」)。
     prisma.chatConversation.findUnique.mockImplementation(
       ({ where }: { where: { id: string } }) =>
@@ -64,6 +77,129 @@ describe('ChatBurnSweeperService', () => {
     string,
     { burnDurationSec: number | null; burnStartedAt?: Date | null }
   >();
+
+  it('advances beyond a persistent failure, retries after restart and wrap, and burns the recovered conversation', async () => {
+    const conversations = Array.from({ length: 205 }, (_, index) => ({
+      id: `rotation-${String(index).padStart(4, '0')}`,
+      burnDurationSec: 60,
+    }));
+    const failedId = conversations[0].id;
+    const remaining = new Set(conversations.map((row) => `message-${row.id}`));
+    let broken = true;
+    let failedAttempts = 0;
+    let sharedCursor: string | null = null;
+    redis.tryAcquireLease.mockResolvedValue('owner');
+    redis.getJsonMany.mockImplementation(async () => [sharedCursor]);
+    redis.setJsonIfVersionMatches.mockImplementation(
+      async (_key, _lease, _owner, cursor) => {
+        sharedCursor = cursor;
+        return true;
+      },
+    );
+    prisma.chatConversation.findMany.mockImplementation(
+      async ({ where, take }) =>
+        conversations
+          .filter((row) => !where.id || row.id > where.id.gt)
+          .slice(0, take),
+    );
+    prisma.chatConversation.findUnique.mockResolvedValue({
+      burnDurationSec: 60,
+    });
+    prisma.chatMessage.findMany.mockImplementation(async ({ where }) => {
+      const id = where.conversationID;
+      if (id === failedId && broken) {
+        failedAttempts++;
+        throw new Error('SELECT private_chat_content secret-person');
+      }
+      const message = `message-${id}`;
+      return remaining.has(message)
+        ? [{ id: message, type: 'text', content: {} }]
+        : [];
+    });
+    prisma.chatMessage.updateManyAndReturn.mockImplementation(
+      async ({ where }) => {
+        for (const id of where.id.in) remaining.delete(id);
+        return where.id.in.map((id: string) => ({ id, revision: 1 }));
+      },
+    );
+    const log = jest.spyOn(Logger.prototype, 'error').mockImplementation();
+    const runs = jest.spyOn(jobMetrics, 'recordRun');
+    try {
+      await makeService().sweep();
+      expect(sharedCursor).toBe(conversations[199].id);
+      expect(remaining.has(`message-${conversations[199].id}`)).toBe(false);
+      expect(failedAttempts).toBe(1);
+
+      // A new process resumes the second page using the shared checkpoint.
+      await makeService().sweep();
+      expect(sharedCursor).toBeNull();
+      expect(remaining).toEqual(new Set([`message-${failedId}`]));
+
+      // Eligibility is durable in the burn policy and undeleted message rows.
+      const restarted = makeService();
+      await restarted.sweep();
+      expect(failedAttempts).toBe(2);
+      expect(sharedCursor).toBe(conversations[199].id);
+      await restarted.sweep();
+      expect(sharedCursor).toBeNull();
+      broken = false;
+      await makeService().sweep();
+      expect(remaining.size).toBe(0);
+      expect(broadcast.emitBurnedMessages).toHaveBeenCalledWith(failedId, [
+        { id: `message-${failedId}`, revision: 1 },
+      ]);
+      expect(runs.mock.calls.map((call) => call[1])).toEqual([
+        'failure',
+        'success',
+        'failure',
+        'success',
+        'success',
+      ]);
+      expect(log).toHaveBeenCalledWith(
+        expect.objectContaining({
+          event: 'chat_burn_sweep_failed',
+          operation: 'conversation',
+          conversationId: failedId,
+        }),
+      );
+      expect(JSON.stringify(log.mock.calls)).not.toMatch(
+        /SELECT|private_chat_content|secret-person/,
+      );
+    } finally {
+      log.mockRestore();
+      runs.mockRestore();
+    }
+  });
+
+  it('keeps the previous checkpoint and redacts a scan failure', async () => {
+    prisma.chatConversation.findMany.mockRejectedValue(
+      new Error('SELECT private_messages secret-person'),
+    );
+    const log = jest.spyOn(Logger.prototype, 'error').mockImplementation();
+    const runs = jest.spyOn(jobMetrics, 'recordRun');
+    try {
+      await makeService().sweep();
+      expect(log).toHaveBeenCalledWith(
+        expect.objectContaining({
+          event: 'chat_burn_sweep_failed',
+          operation: 'scan',
+        }),
+      );
+      expect(JSON.stringify(log.mock.calls)).not.toMatch(
+        /SELECT|private_messages|secret-person/,
+      );
+      expect(runs).toHaveBeenCalledWith(
+        'chat_burn_sweeper',
+        'failure',
+        expect.any(Number),
+        undefined,
+      );
+      expect(redis.setJsonIfVersionMatches).not.toHaveBeenCalled();
+    } finally {
+      log.mockRestore();
+      runs.mockRestore();
+    }
+  });
 
   // 触发器会去更新会话计数器:先锁一批消息行再等会话行,与「先锁会话行再改消息」
   // 的编辑/回应并发就会交叉死锁。所以批事务的第一条语句必须是会话行锁。
@@ -127,6 +263,79 @@ describe('ChatBurnSweeperService', () => {
   });
 
   describe('with several instances', () => {
+    it('stops subsequent conversations after a caught failure loses the lease', async () => {
+      jest.useFakeTimers();
+      redis.tryAcquireLease.mockResolvedValue('owner');
+      redis.renewLease.mockResolvedValue(false);
+      prisma.chatConversation.findMany.mockResolvedValue([
+        { id: 'lost-first', burnDurationSec: 60 },
+        { id: 'lost-second', burnDurationSec: 60 },
+      ]);
+      prisma.chatConversation.findUnique.mockResolvedValue({
+        burnDurationSec: 60,
+      });
+      let fail!: (error: Error) => void;
+      let notifyStarted!: () => void;
+      const started = new Promise<void>((resolve) => {
+        notifyStarted = resolve;
+      });
+      prisma.chatMessage.findMany.mockImplementationOnce(() => {
+        notifyStarted();
+        return new Promise((_resolve, reject) => {
+          fail = reject;
+        });
+      });
+      const log = jest.spyOn(Logger.prototype, 'error').mockImplementation();
+      const fresh = makeService();
+      const round = fresh.sweep();
+      try {
+        await started;
+        await jest.advanceTimersByTimeAsync(41_000);
+        fail(new Error('failed query'));
+        await round;
+        expect(prisma.chatConversation.findUnique).toHaveBeenCalledTimes(1);
+        expect(redis.setJsonIfVersionMatches).not.toHaveBeenCalled();
+        expect((fresh as any).cursor).toBeNull();
+      } finally {
+        fail(new Error('cleanup'));
+        await round;
+        log.mockRestore();
+        jest.useRealTimers();
+      }
+    });
+
+    it('does not advance a full page containing a failure when its checkpoint token is rejected', async () => {
+      redis.tryAcquireLease.mockResolvedValue('owner');
+      redis.getJsonMany.mockResolvedValue(['previous-page']);
+      redis.setJsonIfVersionMatches.mockResolvedValue(false);
+      const conversations = Array.from({ length: 200 }, (_, index) => ({
+        id: `z-page-${String(index).padStart(4, '0')}`,
+        burnDurationSec: 60,
+      }));
+      prisma.chatConversation.findMany.mockResolvedValue(conversations);
+      prisma.chatConversation.findUnique
+        .mockResolvedValue({ burnDurationSec: 60 })
+        .mockRejectedValueOnce(new Error('single conversation failure'));
+      prisma.chatMessage.findMany.mockResolvedValue([]);
+      const log = jest.spyOn(Logger.prototype, 'error').mockImplementation();
+      try {
+        const fresh = makeService();
+        await fresh.sweep();
+        expect(prisma.chatConversation.findUnique).toHaveBeenCalledTimes(200);
+        expect(redis.setJsonIfVersionMatches).toHaveBeenCalledWith(
+          'job-cursor:chat_burn_sweeper',
+          'job-lease:chat_burn_sweeper',
+          'owner',
+          conversations[199].id,
+          expect.any(Number),
+        );
+        expect((fresh as any).cursor).toBe('previous-page');
+        expect(redis.setJson).not.toHaveBeenCalled();
+      } finally {
+        log.mockRestore();
+      }
+    });
+
     it('skips the round while another instance holds the lease', async () => {
       redis.tryAcquireLease.mockResolvedValue(null);
 
@@ -165,11 +374,103 @@ describe('ChatBurnSweeperService', () => {
         }),
       );
       // 这一轮没扫满,下一轮从头开始。
-      expect(redis.setJson).toHaveBeenCalledWith(
+      expect(redis.setJsonIfVersionMatches).toHaveBeenCalledWith(
         'job-cursor:chat_burn_sweeper',
+        'job-lease:chat_burn_sweeper',
+        'lease-token',
         null,
         expect.any(Number),
       );
+    });
+
+    it('stops a pending deletion and leaves its cursor replayable when renewal fails', async () => {
+      jest.useFakeTimers();
+      redis.tryAcquireLease.mockResolvedValue('owner');
+      redis.renewLease.mockResolvedValue(false);
+      prisma.chatConversation.findMany.mockResolvedValue([
+        { id: 'conv-loss', burnDurationSec: 60 },
+      ]);
+      conversationPolicies.set('conv-loss', { burnDurationSec: 60 });
+      let finish!: (rows: unknown[]) => void;
+      let notifyStarted!: () => void;
+      const started = new Promise<void>((resolve) => {
+        notifyStarted = resolve;
+      });
+      prisma.chatMessage.findMany.mockImplementation(() => {
+        notifyStarted();
+        return new Promise((resolve) => {
+          finish = resolve;
+        });
+      });
+      const round = service.sweep();
+      try {
+        await started;
+        await jest.advanceTimersByTimeAsync(41_000);
+        finish([{ id: 'm1', type: 'text', content: {} }]);
+        await round;
+        expect(prisma.$transaction).not.toHaveBeenCalled();
+        expect(prisma.chatMessage.updateManyAndReturn).not.toHaveBeenCalled();
+        expect(redis.setJsonIfVersionMatches).not.toHaveBeenCalled();
+      } finally {
+        finish([]);
+        await round;
+        jest.useRealTimers();
+      }
+    });
+
+    it('keeps its local cursor when the atomic shared checkpoint rejects its token', async () => {
+      redis.tryAcquireLease.mockResolvedValue('owner');
+      redis.getJsonMany.mockResolvedValue(['conv-100']);
+      redis.setJsonIfVersionMatches.mockResolvedValue(false);
+      prisma.chatConversation.findMany.mockResolvedValue([]);
+      const fresh = new ChatBurnSweeperService(
+        prisma as never,
+        media as never,
+        broadcast as never,
+        redis as never,
+      );
+      await fresh.sweep();
+      expect((fresh as any).cursor).toBe('conv-100');
+      expect(redis.setJson).not.toHaveBeenCalled();
+    });
+
+    it('does not tombstone or delete media after losing the lease while waiting for a row lock', async () => {
+      jest.useFakeTimers();
+      redis.tryAcquireLease.mockResolvedValue('owner');
+      redis.renewLease.mockResolvedValue(false);
+      prisma.chatConversation.findMany.mockResolvedValue([
+        { id: 'conv-lock', burnDurationSec: 60 },
+      ]);
+      conversationPolicies.set('conv-lock', { burnDurationSec: 60 });
+      prisma.chatMessage.findMany.mockResolvedValue([
+        { id: 'm1', type: 'image', content: { key: 'chat/u1/photo.jpg' } },
+      ]);
+      let finish!: (rows: unknown[]) => void;
+      let notifyStarted!: () => void;
+      const started = new Promise<void>((resolve) => {
+        notifyStarted = resolve;
+      });
+      prisma.$queryRaw.mockImplementationOnce(() => {
+        notifyStarted();
+        return new Promise((resolve) => {
+          finish = resolve;
+        });
+      });
+      const round = service.sweep();
+      try {
+        await started;
+        await jest.advanceTimersByTimeAsync(41_000);
+        finish([{ id: 'conv-lock' }]);
+        await round;
+        expect(prisma.chatMessage.updateManyAndReturn).not.toHaveBeenCalled();
+        expect(media.queueDeletions).not.toHaveBeenCalled();
+        expect(media.deleteObjects).not.toHaveBeenCalled();
+        expect(redis.setJsonIfVersionMatches).not.toHaveBeenCalled();
+      } finally {
+        finish([]);
+        await round;
+        jest.useRealTimers();
+      }
     });
 
     // 租约过期后两个实例可能同时扫到同一批:已经烧掉的行不能再改一遍、再播一遍。

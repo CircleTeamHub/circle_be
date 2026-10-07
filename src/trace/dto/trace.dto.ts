@@ -12,12 +12,14 @@ import {
   IsUUID,
   Max,
   MaxLength,
+  Matches,
   Min,
 } from 'class-validator';
 import { ApiProperty, ApiPropertyOptional } from '@nestjs/swagger';
 import { AvatarFrameAppearanceDto } from 'src/user/dto/public-user.dto';
 import { MAX_PAGE } from 'src/common/pagination';
 import { ImageMediaVariantDto } from 'src/media/image-media.dto';
+import { USER_ID_OR_ALIAS_PATTERN } from 'src/user/user-id-alias';
 
 const TRACE_VISIBILITY = ['FRIENDS_ONLY', 'PRIVATE'] as const;
 
@@ -95,7 +97,12 @@ export class TraceFeedQueryDto {
   limit?: number;
 
   @ApiPropertyOptional({ description: '只看某个用户的朋友圈' })
-  @IsUUID()
+  @IsString()
+  @IsNotEmpty()
+  @MaxLength(128)
+  // Keep legacy UUID-shaped ids and the documented 32-hex alias compatible,
+  // while rejecting arbitrary strings before they reach the visibility query.
+  @Matches(USER_ID_OR_ALIAS_PATTERN)
   @IsOptional()
   authorId?: string;
 

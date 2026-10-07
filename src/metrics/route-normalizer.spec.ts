@@ -192,6 +192,10 @@ describe('normalizeRoute', () => {
       '/api/v1/friend/requests/request-alpha/messages',
       '/api/v1/friend/requests/:requestId/messages',
     ],
+    [
+      '/api/v1/friend/friend-alpha/permission',
+      '/api/v1/friend/:friendUserId/permission',
+    ],
   ])('recognizes the controller route %s', (path, expected) => {
     expect(normalizeRoute(path)).toBe(expected);
     expect(createRouteCardinalityLimiter(0)(expected)).toBe(expected);

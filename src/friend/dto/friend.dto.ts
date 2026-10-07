@@ -205,6 +205,17 @@ export class FriendSettingsDto {
   @ApiProperty({ enum: FRIEND_PERMISSIONS }) permission: FriendPermission;
 }
 
+export class SetFriendPermissionDto {
+  @ApiProperty({
+    enum: FRIEND_PERMISSIONS,
+    example: 'CHAT_ONLY',
+    description:
+      "Whether the selected friend may view the current user's moments",
+  })
+  @IsEnum(FRIEND_PERMISSIONS)
+  permission: FriendPermission;
+}
+
 export class FriendStatusDto {
   @ApiProperty({
     enum: ['NONE', 'PENDING_SENT', 'PENDING_RECEIVED', 'ACCEPTED', 'BLOCKED'],

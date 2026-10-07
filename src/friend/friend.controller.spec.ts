@@ -22,6 +22,7 @@ describe('FriendController routes', () => {
   let app: INestApplication;
   const friendService = {
     listBlocked: jest.fn().mockResolvedValue([]),
+    setFriendPermission: jest.fn().mockResolvedValue(undefined),
   };
 
   beforeEach(async () => {
@@ -98,4 +99,36 @@ describe('FriendController routes', () => {
 
     expect(friendService.listBlocked).toHaveBeenCalledWith('user-1', 1);
   });
+
+  it('PATCH /friend/:friendUserId/permission delegates the current user and body', async () => {
+    await request(app.getHttpServer())
+      .patch(`/friend/${FRIEND_ID}/permission`)
+      .send({ permission: 'CHAT_ONLY' })
+      .expect(204);
+
+    expect(friendService.setFriendPermission).toHaveBeenCalledWith(
+      'user-1',
+      FRIEND_ID,
+      'CHAT_ONLY',
+    );
+  });
+
+  it.each([
+    'aabbccdd-1122-0000-0000-123456789abc',
+    'AABBCCDD-1122-0000-0000-123456789ABC',
+    'aabbccdd112200000000123456789abc',
+  ])(
+    'accepts persisted or legacy user ID %s on the permission route',
+    async (id) => {
+      await request(app.getHttpServer())
+        .patch(`/friend/${id}/permission`)
+        .send({ permission: 'FULL' })
+        .expect(204);
+      expect(friendService.setFriendPermission).toHaveBeenCalledWith(
+        'user-1',
+        'aabbccdd-1122-0000-0000-123456789abc',
+        'FULL',
+      );
+    },
+  );
 });

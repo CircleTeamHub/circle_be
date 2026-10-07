@@ -231,6 +231,7 @@ export const DYNAMIC_ROUTE_TEMPLATES = [
   '/api/v1/conversation-groups/:id',
   '/api/v1/conversation-groups/:id/members',
   '/api/v1/friend/:friendUserId',
+  '/api/v1/friend/:friendUserId/permission',
   '/api/v1/friend/:friendUserId/remark',
   '/api/v1/friend/:friendUserId/report',
   '/api/v1/friend/:friendUserId/settings',

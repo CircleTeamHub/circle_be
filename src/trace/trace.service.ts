@@ -36,6 +36,7 @@ import {
 import { createLoggingConfig } from 'src/logging/logging.config';
 import { logBusinessEvent } from 'src/logging/business-event.logger';
 import { buildImageMedia } from 'src/media/image-media';
+import { normalizeUserIdAlias } from 'src/user/user-id-alias';
 
 const TRACE_FEED_LIKE_PREVIEW_LIMIT = 20;
 const TRACE_FEED_COMMENT_PREVIEW_LIMIT = 20;
@@ -122,6 +123,9 @@ export class TraceService {
     const useKeyset = cursor !== null;
     const skip = useKeyset ? 0 : (page - 1) * limit;
 
+    const authorId = query.authorId
+      ? normalizeUserIdAlias(query.authorId)
+      : undefined;
     const friendIds = await this.getAcceptedFriendIds(userId);
     const friendIdSet = new Set(friendIds);
     const visibleUserIds = await this.filterMomentVisibleAuthorIds(
@@ -132,7 +136,7 @@ export class TraceService {
 
     // 单用户相册：authorId 收窄到某个作者。作者必须对 viewer 可见
     // （本人或已接受好友且未被隐私屏蔽），否则返回空——不泄露存在性。
-    if (query.authorId && !visibleUserIds.includes(query.authorId)) {
+    if (authorId && !visibleUserIds.includes(authorId)) {
       return {
         items: [],
         total: useKeyset ? null : 0,
@@ -145,7 +149,7 @@ export class TraceService {
 
     const whereBase = {
       deleted: false,
-      fromID: query.authorId ? query.authorId : { in: visibleUserIds },
+      fromID: authorId ? authorId : { in: visibleUserIds },
       // PRIVATE is excluded for everyone but the author. PUBLIC isn't creatable
       // via CreateTraceDto (FRIENDS_ONLY | PRIVATE only) but is honored here on
       // purpose, so legacy / other-origin PUBLIC rows still surface — do not
@@ -240,7 +244,7 @@ export class TraceService {
     // Feed query dimensions — helps diagnose "I can't see X's moments" reports
     // (scope size vs. result count) without logging any content.
     this.logger.debug(
-      `trace feed: viewer=${userId} authorId=${query.authorId ?? '-'} ` +
+      `trace feed: viewer=${userId} authorId=${authorId ?? '-'} ` +
         `mode=${useKeyset ? 'keyset' : 'offset'} ` +
         `visibleAuthors=${visibleUserIds.length} page=${page} ` +
         `returned=${traces.length} total=${total ?? '-'}`,

@@ -73,6 +73,86 @@ describe('NotificationController', () => {
     );
   });
 
+  it('routes cursor notification requests to keyset pagination', async () => {
+    const notificationService = {
+      getNotificationsByCursor: jest.fn().mockResolvedValue({
+        items: [],
+        nextCursor: null,
+      }),
+    };
+    const controller = new NotificationController(notificationService as any);
+
+    await controller.list(
+      { cursor: 'opaque', domain: 'moments' } as any,
+      { user: { userId: 'user-1' } } as any,
+    );
+
+    expect(notificationService.getNotificationsByCursor).toHaveBeenCalledWith(
+      'user-1',
+      'opaque',
+      'moments',
+    );
+  });
+
+  it('starts cursor notification pagination without requiring a token', async () => {
+    const notificationService = {
+      getNotificationsByCursor: jest.fn().mockResolvedValue({
+        items: [],
+        nextCursor: null,
+      }),
+    };
+    const controller = new NotificationController(notificationService as any);
+
+    await controller.list(
+      { cursorMode: true } as any,
+      { user: { userId: 'user-1' } } as any,
+    );
+
+    expect(notificationService.getNotificationsByCursor).toHaveBeenCalledWith(
+      'user-1',
+      undefined,
+      undefined,
+    );
+  });
+
+  it('routes profile cursor requests to keyset pagination', async () => {
+    const notificationService = {
+      getProfileNotificationsByCursor: jest.fn().mockResolvedValue({
+        items: [],
+        nextCursor: null,
+      }),
+    };
+    const controller = new NotificationController(notificationService as any);
+
+    await controller.profileList(
+      { cursor: 'opaque' } as any,
+      { user: { userId: 'user-1' } } as any,
+    );
+
+    expect(
+      notificationService.getProfileNotificationsByCursor,
+    ).toHaveBeenCalledWith('user-1', 'opaque');
+  });
+
+  it('starts profile cursor pagination without requiring a token', async () => {
+    const notificationService = {
+      getProfileNotificationsByCursor: jest.fn().mockResolvedValue({
+        items: [],
+        nextCursor: null,
+      }),
+    };
+    const controller = new NotificationController(notificationService as any);
+
+    await controller.profileList(
+      { cursorMode: true } as any,
+      { user: { userId: 'user-1' } } as any,
+    );
+
+    expect(
+      notificationService.getProfileNotificationsByCursor,
+    ).toHaveBeenCalledWith('user-1', undefined);
+  });
+
   it('forwards the bell domain to mark-all-read so one bell cannot clear the other', async () => {
     const notificationService = {
       markAllNotificationsRead: jest.fn().mockResolvedValue({ count: 1 }),

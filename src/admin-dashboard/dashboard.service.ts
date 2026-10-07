@@ -29,9 +29,19 @@ type DashboardResponse = {
   };
 };
 
+const DASHBOARD_CACHE_TTL_SECONDS = 45;
+const DASHBOARD_CACHE_TTL_MS = DASHBOARD_CACHE_TTL_SECONDS * 1000;
+
 @Injectable()
 export class DashboardService {
   private readonly logger = new Logger(DashboardService.name);
+  /** Redis is the shared cache; this tiny local cache keeps an outage from
+   * turning every dashboard request into five parallel count queries. */
+  private readonly memoryCache = new Map<
+    string,
+    { expiresAt: number; value: DashboardResponse }
+  >();
+  private readonly inFlight = new Map<string, Promise<DashboardResponse>>();
 
   constructor(
     private readonly users: DashboardUserMetrics,
@@ -55,8 +65,33 @@ export class DashboardService {
         `Dashboard cache read failed: ${this.errorMessage(error)}`,
       );
     }
-    if (cached) return cached;
+    if (cached && this.remember(cacheKey, cached)) {
+      return cached;
+    }
 
+    const local = this.memoryCache.get(cacheKey);
+    if (local && local.expiresAt > Date.now()) return local.value;
+    if (local) this.memoryCache.delete(cacheKey);
+
+    const running = this.inFlight.get(cacheKey);
+    if (running) return running;
+
+    const refresh = this.refreshDashboard(range, now, cacheKey);
+    this.inFlight.set(cacheKey, refresh);
+    try {
+      return await refresh;
+    } finally {
+      if (this.inFlight.get(cacheKey) === refresh) {
+        this.inFlight.delete(cacheKey);
+      }
+    }
+  }
+
+  private async refreshDashboard(
+    range: DashboardRange,
+    now: Date,
+    cacheKey: string,
+  ): Promise<DashboardResponse> {
     const period = resolveDashboardPeriod(range, now);
     const results = await Promise.allSettled([
       this.users.getMetrics(period),
@@ -94,9 +129,21 @@ export class DashboardService {
         system: this.section(results[4]),
       },
     };
-    if (results.every((result) => result.status === 'fulfilled')) {
+    if (
+      results.every((result) => result.status === 'fulfilled') &&
+      this.remember(cacheKey, response)
+    ) {
       try {
-        await this.redis.setJson(cacheKey, response, 45);
+        await this.redis.setJson(
+          cacheKey,
+          response,
+          Math.ceil(
+            (Date.parse(response.generatedAt) +
+              DASHBOARD_CACHE_TTL_MS -
+              Date.now()) /
+              1000,
+          ),
+        );
       } catch (error) {
         this.logger.warn(
           `Dashboard cache write failed: ${this.errorMessage(error)}`,
@@ -104,6 +151,22 @@ export class DashboardService {
       }
     }
     return response;
+  }
+
+  private remember(cacheKey: string, value: DashboardResponse): boolean {
+    const generatedAt = Date.parse(value.generatedAt);
+    const expiresAt = generatedAt + DASHBOARD_CACHE_TTL_MS;
+    if (
+      !Number.isFinite(generatedAt) ||
+      generatedAt > Date.now() ||
+      expiresAt <= Date.now()
+    )
+      return false;
+    this.memoryCache.set(cacheKey, {
+      value,
+      expiresAt,
+    });
+    return true;
   }
 
   private section<T>(result: PromiseSettledResult<T>): SectionResult<T> {

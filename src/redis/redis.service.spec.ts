@@ -89,6 +89,33 @@ describe('RedisService', () => {
       );
     });
 
+    it('renews only an existing lease with the same owner and fails closed on Redis errors', async () => {
+      process.env.REDIS_URL = 'redis://localhost:6379';
+      const service = new RedisService();
+      const client = {
+        eval: jest
+          .fn()
+          .mockResolvedValueOnce(1)
+          .mockResolvedValueOnce(0)
+          .mockRejectedValueOnce(new Error('down')),
+      };
+      jest.spyOn(service as any, 'getCommandClient').mockResolvedValue(client);
+      jest.spyOn((service as any).logger, 'warn').mockImplementation(() => {});
+      await expect(
+        service.renewLease('job-lease:x', 'owner', 5000),
+      ).resolves.toBe(true);
+      await expect(
+        service.renewLease('job-lease:x', 'owner', 5000),
+      ).resolves.toBe(false);
+      await expect(
+        service.renewLease('job-lease:x', 'owner', 5000),
+      ).resolves.toBe(false);
+      const [script, ...args] = client.eval.mock.calls[0];
+      expect(script).toContain("redis.call('GET', KEYS[1]) == ARGV[1]");
+      expect(script).toContain("redis.call('PEXPIRE', KEYS[1], ARGV[2])");
+      expect(args).toEqual([1, 'job-lease:x', 'owner', '5000']);
+    });
+
     // 租约过期后被别的实例拿走了,晚回来的持有者不能把人家的删掉。
     it('releases only a lease it still holds', async () => {
       process.env.REDIS_URL = 'redis://localhost:6379';

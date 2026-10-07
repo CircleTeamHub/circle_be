@@ -976,6 +976,63 @@ export class FriendService {
     };
   }
 
+  /**
+   * Set the moments permission this user grants to one of their friends.
+   * The shared friendship row stores each side's grant separately:
+   *   permissionA = userID's grant to friendID
+   *   permissionB = friendID's grant to userID
+   */
+  async setFriendPermission(
+    userId: string,
+    friendUserId: string,
+    permission: FriendPermission,
+  ): Promise<void> {
+    const friendship = await this.prisma.friend.findFirst({
+      where: {
+        OR: [
+          { userID: userId, friendID: friendUserId },
+          { userID: friendUserId, friendID: userId },
+        ],
+        state: FriendState.ACCEPTED,
+      },
+      select: { id: true, userID: true },
+    });
+
+    if (!friendship) {
+      throw new NotFoundException({
+        message: 'Friendship not found',
+        errorCode: FriendErrorCode.FriendshipNotFound,
+      });
+    }
+
+    // Historical duplicates can exist in either orientation. Update every
+    // accepted grant atomically, including the state predicate in each write.
+    const updated = await this.prisma.$transaction([
+      this.prisma.friend.updateMany({
+        where: {
+          userID: userId,
+          friendID: friendUserId,
+          state: FriendState.ACCEPTED,
+        },
+        data: { permissionA: permission },
+      }),
+      this.prisma.friend.updateMany({
+        where: {
+          userID: friendUserId,
+          friendID: userId,
+          state: FriendState.ACCEPTED,
+        },
+        data: { permissionB: permission },
+      }),
+    ]);
+    if (updated.every((result) => result.count === 0)) {
+      throw new NotFoundException({
+        message: 'Friendship not found',
+        errorCode: FriendErrorCode.FriendshipNotFound,
+      });
+    }
+  }
+
   async listActivities(userId: string): Promise<FriendActivityDto[]> {
     await this.backfillLegacyActivitiesForViewer(userId);
 
