@@ -72,6 +72,38 @@ export function createEnvValidationSchema(
         }
         return value;
       });
+  const imageTransformUrlSchema = (schemes: string[]) =>
+    Joi.string().custom((value, helpers) => {
+      if (!value.includes('{url}') || !value.includes('{width}')) {
+        return helpers.message({
+          custom:
+            'MEDIA_IMAGE_TRANSFORM_URL must include {url} and {width} placeholders',
+        });
+      }
+      try {
+        const candidate = value
+          .split('{url}')
+          .join(encodeURIComponent('https://storage.example.com/image.jpg'))
+          .split('{width}')
+          .join('480');
+        const url = new URL(candidate);
+        if (!schemes.includes(url.protocol.slice(0, -1))) {
+          return helpers.message({
+            custom: `MEDIA_IMAGE_TRANSFORM_URL must use ${schemes.join(' or ')}`,
+          });
+        }
+        if (url.username || url.password) {
+          return helpers.message({
+            custom: 'MEDIA_IMAGE_TRANSFORM_URL must not include credentials',
+          });
+        }
+        return value;
+      } catch {
+        return helpers.message({
+          custom: 'MEDIA_IMAGE_TRANSFORM_URL must be a valid URL template',
+        });
+      }
+    });
   const productionRedisUrlSchema = redisUrlSchema.custom((value, helpers) => {
     const url = new URL(value);
     const queryPasswords = url.searchParams.getAll('password');
@@ -290,6 +322,11 @@ export function createEnvValidationSchema(
       is: 'production',
       then: objectDeliveryUrlSchema(['https']).optional(),
       otherwise: objectDeliveryUrlSchema(['http', 'https']).optional(),
+    }),
+    MEDIA_IMAGE_TRANSFORM_URL: Joi.when('NODE_ENV', {
+      is: 'production',
+      then: imageTransformUrlSchema(['https']).optional(),
+      otherwise: imageTransformUrlSchema(['http', 'https']).optional(),
     }),
     // Comma-separated list of allowed CORS origins. Required in production.
     ALLOWED_ORIGINS: Joi.when('NODE_ENV', {

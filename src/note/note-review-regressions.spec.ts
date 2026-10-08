@@ -420,6 +420,46 @@ describe('note review regressions', () => {
     expect(summary.audioCount).toBe(2);
   });
 
+  it('rejects more than 50 aggregate published media across sections', () => {
+    const { service } = fixture();
+    const items = (type: 'IMAGE' | 'AUDIO', start: number, count: number) =>
+      Array.from({ length: count }, (_, index) => ({
+        type,
+        objectKey: `notes/owner/${start + index}.${type === 'AUDIO' ? 'm4a' : 'jpg'}`,
+        sortOrder: start + index,
+      }));
+
+    expect(() =>
+      (service as any).deriveNoteContent({
+        title: 'Too many media items',
+        media: [],
+        sections: {
+          media: { items: items('IMAGE', 0, 50) },
+          audio: { items: items('AUDIO', 50, 1) },
+        },
+      }),
+    ).toThrow(BadRequestException);
+  });
+
+  it('includes audio references in whole-note PDF and image exports', () => {
+    const { service } = fixture();
+    const audio = {
+      type: 'AUDIO',
+      objectKey: 'notes/owner/voice.m4a',
+      url: 'https://storage.test/bucket/notes/owner/voice.m4a',
+      sortOrder: 0,
+    };
+
+    expect(
+      (service as any).getExportSectionMedia({
+        text: { content: null, contentJson: null },
+        media: { items: [] },
+        showcase: { items: [] },
+        audio: { items: [audio] },
+      }),
+    ).toEqual([audio]);
+  });
+
   it('publishes contact and group counts in the OpenAPI response schema', async () => {
     @Controller('notes')
     class ProbeController {

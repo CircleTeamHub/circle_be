@@ -220,6 +220,20 @@ describe('createEnvValidationSchema', () => {
   });
 
   it.each([
+    'http://img.example.com/resize?url={url}&width={width}',
+    'https://user:secret@img.example.com/resize?url={url}&width={width}',
+  ])('rejects an unsafe production image transform URL: %s', (template) => {
+    const env = {
+      ...productionBypassEnv,
+      MEDIA_IMAGE_TRANSFORM_URL: template,
+    };
+
+    const { error } = createEnvValidationSchema(env).validate(env);
+
+    expect(error?.message).toContain('MEDIA_IMAGE_TRANSFORM_URL');
+  });
+
+  it.each([
     'http://media.example.com/circle',
     'ftp://media.example.com/circle',
     'https://user:password@media.example.com/circle',

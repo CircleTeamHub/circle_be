@@ -41,25 +41,33 @@ const password = process.env.ADMIN_SEED_PASSWORD || 'Admin1234!';
 
 async function main() {
   const passwordHash = await argon2.hash(password);
-  const user = await prisma.user.upsert({
-    where: { accountId },
-    update: {
-      inviteCode,
-      passwordHash,
-      nickname: 'Local Admin',
-      email,
-      role: 'ADMIN',
-      status: 'ACTIVE',
-    },
-    create: {
-      accountId,
-      inviteCode,
-      email,
-      passwordHash,
-      nickname: 'Local Admin',
-      role: 'ADMIN',
-      status: 'ACTIVE',
-    },
+  const user = await prisma.$transaction(async (tx) => {
+    const seededUser = await tx.user.upsert({
+      where: { accountId },
+      update: {
+        inviteCode,
+        passwordHash,
+        nickname: 'Local Admin',
+        email,
+        role: 'ADMIN',
+        status: 'ACTIVE',
+      },
+      create: {
+        accountId,
+        inviteCode,
+        email,
+        passwordHash,
+        nickname: 'Local Admin',
+        role: 'ADMIN',
+        status: 'ACTIVE',
+      },
+    });
+    await tx.adminAccess.upsert({
+      where: { userID: seededUser.id },
+      update: { role: 'SUPER_ADMIN' },
+      create: { userID: seededUser.id, role: 'SUPER_ADMIN' },
+    });
+    return seededUser;
   });
 
   console.log('Admin seed ready:', {
