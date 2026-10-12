@@ -30,6 +30,8 @@ import type { RequestWithUser } from 'src/auth/types';
 import {
   CollectNoteDto,
   CollectNoteResultDto,
+  NoteSourceStateDto,
+  NoteSourceStatesQueryDto,
   CopyNoteChatMediaDto,
   CreateNoteDto,
   CreateNoteExportDto,
@@ -51,6 +53,8 @@ import {
   SetNoteAvailableDto,
   SetNoteRemarkDto,
   SetNoteStatusDto,
+  SetNoteSourceConversationDto,
+  SetNoteWorkStatusDto,
   SetPinnedDto,
   SaveNoteDraftDto,
   UpdateNoteDto,
@@ -120,6 +124,21 @@ export class NoteController {
     return this.noteService.collectNote(req.user.userId, dto);
   }
 
+  @Post('source-states')
+  @UseGuards(UserThrottlerGuard)
+  @Throttle({ default: { limit: 60, ttl: 60_000 } })
+  @ApiOperation({
+    summary:
+      'Live source status for note cards (root of the collect chain), batched',
+  })
+  @ApiOkResponse({ type: [NoteSourceStateDto] })
+  getSourceStates(
+    @Body() dto: NoteSourceStatesQueryDto,
+    @Req() req: RequestWithUser,
+  ): Promise<NoteSourceStateDto[]> {
+    return this.noteService.getSourceStates(req.user.userId, dto.noteIds);
+  }
+
   @Patch(':id')
   @ApiOperation({ summary: 'Update note' })
   @ApiOkResponse({ type: NoteDetailDto })
@@ -179,6 +198,40 @@ export class NoteController {
     @Req() req: RequestWithUser,
   ) {
     return this.noteService.setAvailable(req.user.userId, id, dto.available);
+  }
+
+  @Patch(':id/work-status')
+  @ApiOperation({ summary: 'Set optional note work status' })
+  @ApiOkResponse({ schema: { example: { id: 'uuid', workStatus: 'WORKING' } } })
+  setWorkStatus(
+    @Param('id', ParseUUIDPipe) id: string,
+    @Body() dto: SetNoteWorkStatusDto,
+    @Req() req: RequestWithUser,
+  ) {
+    return this.noteService.setWorkStatus(
+      req.user.userId,
+      id,
+      dto.workStatus ?? null,
+    );
+  }
+
+  @Patch(':id/source-group')
+  @ApiOperation({
+    summary: 'Bind an owned note to a source group conversation',
+  })
+  @ApiOkResponse({
+    schema: { example: { id: 'uuid', sourceConversationID: 'uuid' } },
+  })
+  setSourceConversation(
+    @Param('id', ParseUUIDPipe) id: string,
+    @Body() dto: SetNoteSourceConversationDto,
+    @Req() req: RequestWithUser,
+  ) {
+    return this.noteService.setSourceConversation(
+      req.user.userId,
+      id,
+      dto.conversationID ?? null,
+    );
   }
 
   @Patch(':id/status')

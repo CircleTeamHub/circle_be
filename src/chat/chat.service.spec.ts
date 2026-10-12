@@ -44,6 +44,7 @@ describe('ChatService', () => {
       updateMany: jest.fn(),
       updateManyAndReturn: jest.fn(),
     },
+    note: { findFirst: jest.fn(), findUnique: jest.fn() },
     user: { findUnique: jest.fn(), findMany: jest.fn(), updateMany: jest.fn() },
     tempChat: { findUnique: jest.fn(), findMany: jest.fn() },
     tempChatGuest: { findMany: jest.fn() },
@@ -225,6 +226,7 @@ describe('ChatService', () => {
     prisma.friend.findFirst.mockResolvedValue(null);
     // 搜索/焚毁读路径:默认没有会话开焚毁。
     prisma.chatConversation.findMany.mockResolvedValue([]);
+    prisma.note.findFirst.mockResolvedValue(null);
     systemMessage.insertSystemMessageInTx.mockResolvedValue({
       id: 'sys-1',
       conversationId: 'conv-1',
@@ -384,6 +386,272 @@ describe('ChatService', () => {
         data: expect.objectContaining({
           nextHeight: 4,
           lastMessageAt: expect.any(Date),
+        }),
+      }),
+    );
+  });
+
+  it('stamps the current sender personal card on every note-card share', async () => {
+    prisma.chatMember.findUnique.mockResolvedValue(membership());
+    prisma.chatMessage.findUnique.mockResolvedValue(null);
+    prisma.$queryRaw.mockResolvedValue([{ nextHeight: 3 }]);
+    prisma.chatMessage.create.mockResolvedValue({
+      ...createdRow,
+      type: 'note-card',
+      content: {
+        noteId: 'note-1',
+        personalCardSnapshot: {
+          id: 'u1',
+          name: '当前中间人',
+          faceURL: 'https://cdn.example.com/agent.jpg',
+        },
+      },
+    });
+    prisma.chatConversation.update.mockResolvedValue({});
+    prisma.user.findUnique.mockResolvedValue({
+      id: 'u1',
+      nickname: '当前中间人',
+      avatarUrl: 'https://cdn.example.com/agent.jpg',
+    });
+    prisma.note.findFirst.mockResolvedValueOnce({
+      sections: {
+        groups: {
+          items: [
+            {
+              id: 'canonical-group',
+              name: '老板真实群',
+              faceURL: 'https://cdn.example.com/canonical.jpg',
+            },
+          ],
+        },
+      },
+      collectedFromNoteID: null,
+      sourceConversationID: null,
+    });
+
+    await service.sendMessage(
+      'u1',
+      sendPayload({
+        type: 'note-card',
+        content: {
+          noteId: 'note-1',
+          // A forwarded card may contain the previous sender's snapshot. The
+          // service must replace it with the new sender, not trust the client.
+          personalCardSnapshot: {
+            id: 'boss',
+            name: '老板',
+            faceURL: null,
+          },
+          sourceGroupCardSnapshot: {
+            id: 'forged-group',
+            name: '伪造群',
+            faceURL: 'https://cdn.example.com/forged.jpg',
+          },
+        },
+      }),
+    );
+
+    expect(prisma.chatMessage.create).toHaveBeenCalledWith(
+      expect.objectContaining({
+        data: expect.objectContaining({
+          type: 'note-card',
+          content: {
+            noteId: 'note-1',
+            personalCardSnapshot: {
+              id: 'u1',
+              name: '当前中间人',
+              faceURL: 'https://cdn.example.com/agent.jpg',
+            },
+            sourceGroupCardSnapshot: {
+              id: 'canonical-group',
+              name: '老板真实群',
+              faceURL: 'https://cdn.example.com/canonical.jpg',
+            },
+          },
+        }),
+      }),
+    );
+  });
+
+  it('drops an unverified group snapshot instead of trusting a forged card', async () => {
+    prisma.chatMember.findUnique.mockResolvedValue(membership());
+    prisma.chatMessage.findUnique.mockResolvedValue(null);
+    prisma.$queryRaw.mockResolvedValue([{ nextHeight: 3 }]);
+    prisma.chatMessage.create.mockResolvedValue(createdRow);
+    prisma.chatConversation.update.mockResolvedValue({});
+    prisma.user.findUnique.mockResolvedValue({
+      id: 'u1',
+      nickname: '当前中间人',
+      avatarUrl: null,
+    });
+    prisma.note.findFirst.mockResolvedValueOnce({
+      sections: { groups: { items: [] } },
+      collectedFromNoteID: null,
+      sourceConversationID: null,
+    });
+
+    await service.sendMessage(
+      'u1',
+      sendPayload({
+        type: 'note-card',
+        content: {
+          noteId: 'note-1',
+          sourceGroupCardSnapshot: {
+            id: 'forged-group',
+            name: '伪造群',
+            faceURL: null,
+          },
+        },
+      }),
+    );
+
+    expect(prisma.chatMessage.create).toHaveBeenCalledWith(
+      expect.objectContaining({
+        data: expect.objectContaining({
+          content: {
+            noteId: 'note-1',
+            personalCardSnapshot: {
+              id: 'u1',
+              name: '当前中间人',
+              faceURL: null,
+            },
+          },
+        }),
+      }),
+    );
+  });
+
+  it('stamps note-card work status from the live root of the collect chain', async () => {
+    prisma.chatMember.findUnique.mockResolvedValue(membership());
+    prisma.chatMessage.findUnique.mockResolvedValue(null);
+    prisma.$queryRaw.mockResolvedValue([{ nextHeight: 3 }]);
+    prisma.chatMessage.create.mockResolvedValue(createdRow);
+    prisma.chatConversation.update.mockResolvedValue({});
+    prisma.user.findUnique.mockResolvedValue(null);
+    prisma.note.findFirst
+      // group snapshot walk: copy has no stored group and no parent
+      .mockResolvedValueOnce({
+        sections: null,
+        collectedFromNoteID: null,
+        sourceConversationID: null,
+      })
+      // source state walk starts at the sender's readable copy
+      .mockResolvedValueOnce({
+        id: 'copy-1',
+        status: 'ACTIVE',
+        available: true,
+        workStatus: 'WORKING',
+        collectedFromNoteID: 'boss-note',
+      });
+    prisma.note.findUnique.mockResolvedValueOnce({
+      id: 'boss-note',
+      status: 'ACTIVE',
+      available: true,
+      workStatus: 'CLOSED',
+      collectedFromNoteID: null,
+    });
+
+    await service.sendMessage(
+      'u1',
+      sendPayload({
+        type: 'note-card',
+        content: {
+          noteId: 'copy-1',
+          // A stale or crafted card claims the venue is open.
+          workStatus: 'WORKING',
+          publicationStatus: 'ACTIVE',
+        },
+      }),
+    );
+
+    expect(prisma.chatMessage.create).toHaveBeenCalledWith(
+      expect.objectContaining({
+        data: expect.objectContaining({
+          content: {
+            noteId: 'copy-1',
+            sourceNoteId: 'boss-note',
+            workStatus: 'CLOSED',
+            publicationStatus: 'ACTIVE',
+          },
+        }),
+      }),
+    );
+  });
+
+  it('drops client-supplied card status when the sender cannot read the note', async () => {
+    prisma.chatMember.findUnique.mockResolvedValue(membership());
+    prisma.chatMessage.findUnique.mockResolvedValue(null);
+    prisma.$queryRaw.mockResolvedValue([{ nextHeight: 3 }]);
+    prisma.chatMessage.create.mockResolvedValue(createdRow);
+    prisma.chatConversation.update.mockResolvedValue({});
+    prisma.user.findUnique.mockResolvedValue(null);
+    prisma.note.findFirst
+      .mockResolvedValueOnce(null) // group snapshot: not readable
+      .mockResolvedValueOnce(null); // source state: not readable
+
+    await service.sendMessage(
+      'u1',
+      sendPayload({
+        type: 'note-card',
+        content: {
+          noteId: 'hidden-note',
+          sourceNoteId: 'forged-root',
+          workStatus: 'WORKING',
+          publicationStatus: 'ACTIVE',
+        },
+      }),
+    );
+
+    expect(prisma.chatMessage.create).toHaveBeenCalledWith(
+      expect.objectContaining({
+        data: expect.objectContaining({
+          content: { noteId: 'hidden-note' },
+        }),
+      }),
+    );
+  });
+
+  it('does not fail a note-card send when the sender profile is unavailable', async () => {
+    prisma.chatMember.findUnique.mockResolvedValue(membership());
+    prisma.chatMessage.findUnique.mockResolvedValue(null);
+    prisma.$queryRaw.mockResolvedValue([{ nextHeight: 3 }]);
+    prisma.chatMessage.create.mockResolvedValue(createdRow);
+    prisma.chatConversation.update.mockResolvedValue({});
+    prisma.user.findUnique.mockResolvedValue(null);
+
+    await expect(
+      service.sendMessage(
+        'u1',
+        sendPayload({ type: 'note-card', content: { noteId: 'note-1' } }),
+      ),
+    ).resolves.toMatchObject({ reused: false });
+    expect(prisma.chatMessage.create).toHaveBeenCalledWith(
+      expect.objectContaining({
+        data: expect.objectContaining({
+          content: { noteId: 'note-1' },
+        }),
+      }),
+    );
+  });
+
+  it('keeps sending a note-card when the profile snapshot lookup fails', async () => {
+    prisma.chatMember.findUnique.mockResolvedValue(membership());
+    prisma.chatMessage.findUnique.mockResolvedValue(null);
+    prisma.$queryRaw.mockResolvedValue([{ nextHeight: 3 }]);
+    prisma.chatMessage.create.mockResolvedValue(createdRow);
+    prisma.chatConversation.update.mockResolvedValue({});
+    prisma.user.findUnique.mockRejectedValue(new Error('profile store down'));
+
+    await expect(
+      service.sendMessage(
+        'u1',
+        sendPayload({ type: 'note-card', content: { noteId: 'note-1' } }),
+      ),
+    ).resolves.toMatchObject({ reused: false });
+    expect(prisma.chatMessage.create).toHaveBeenCalledWith(
+      expect.objectContaining({
+        data: expect.objectContaining({
+          content: { noteId: 'note-1' },
         }),
       }),
     );

@@ -35,6 +35,9 @@ export type NoteStatus = (typeof NOTE_STATUS)[number];
 export const NOTE_WRITABLE_STATUS = ['ACTIVE', 'UNLISTED'] as const;
 export type NoteWritableStatus = (typeof NOTE_WRITABLE_STATUS)[number];
 
+export const NOTE_WORK_STATUS = ['WORKING', 'CLOSED'] as const;
+export type NoteWorkStatus = (typeof NOTE_WORK_STATUS)[number];
+
 export const NOTE_MEDIA_TYPE = ['IMAGE', 'VIDEO', 'AUDIO'] as const;
 export type NoteMediaType = (typeof NOTE_MEDIA_TYPE)[number];
 /** Includes all primary and poster keys from every draft representation. */
@@ -478,6 +481,20 @@ export class SetNoteStatusDto {
   status: NoteWritableStatus;
 }
 
+export class SetNoteWorkStatusDto {
+  @ApiPropertyOptional({ enum: NOTE_WORK_STATUS, nullable: true })
+  @IsOptional()
+  @IsEnum(NOTE_WORK_STATUS)
+  workStatus?: NoteWorkStatus | null;
+}
+
+export class SetNoteSourceConversationDto {
+  @ApiPropertyOptional({ format: 'uuid', nullable: true })
+  @IsOptional()
+  @IsUUID()
+  conversationID?: string | null;
+}
+
 /**
  * GET /note 与 GET /note/recycle-bin 的默认页大小，同时是 limit 的上限。
  *
@@ -782,6 +799,10 @@ export class NoteSummaryDto {
   @ApiPropertyOptional() contentPreview: string | null;
   @ApiProperty({ enum: NOTE_STATUS }) status: NoteStatus;
   @ApiProperty() available: boolean;
+  @ApiPropertyOptional({ enum: NOTE_WORK_STATUS, nullable: true })
+  workStatus: NoteWorkStatus | null;
+  @ApiPropertyOptional({ format: 'uuid', nullable: true })
+  sourceConversationID: string | null;
   @ApiProperty() pinned: boolean;
   @ApiPropertyOptional({
     nullable: true,
@@ -926,6 +947,37 @@ export class CollectNoteDto {
   @ValidateNested()
   @Type(() => NoteCollectSourceDto)
   source: NoteCollectSourceDto;
+
+  @ApiPropertyOptional({ format: 'uuid', nullable: true })
+  @IsOptional()
+  @IsUUID()
+  targetNoteGroupId?: string | null;
+
+  @ApiPropertyOptional({ maxLength: 120 })
+  @IsOptional()
+  @IsString()
+  @Trim()
+  @IsNotEmpty()
+  @MaxLength(120)
+  title?: string;
+}
+
+export class NoteSourceStatesQueryDto {
+  @ApiProperty({ type: [String], maxItems: 100 })
+  @IsArray()
+  @ArrayNotEmpty()
+  @ArrayMaxSize(100)
+  @IsUUID('all', { each: true })
+  noteIds: string[];
+}
+
+export class NoteSourceStateDto {
+  @ApiProperty() noteId: string;
+  @ApiProperty({ enum: ['WORKING', 'CLOSED', 'UNSET'] })
+  workStatus: 'WORKING' | 'CLOSED' | 'UNSET';
+  /** UNLISTED also covers notes the viewer cannot read (no existence oracle). */
+  @ApiProperty({ enum: ['ACTIVE', 'UNLISTED', 'DELETED'] })
+  publicationStatus: 'ACTIVE' | 'UNLISTED' | 'DELETED';
 }
 
 export class CollectNoteResultDto {

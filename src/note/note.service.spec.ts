@@ -1817,10 +1817,8 @@ describe('NoteService', () => {
     });
   });
 
-  // 导出漏在 presign-on-read 改造之外：createLongImageSvg / createPdf 调
-  // buildSectionsFromRow 时不传 presigned map，嵌进导出文件的是原始 URL。
-  // 桶策略把 notes/* 收归私有后，这些链接对任何人都是 403 —— 而长图导出**只有**
-  // URL、PDF 第 5 张往后也只有 URL，等于导出件里全是死链。
+  // 长图和 PDF 都必须走 presign-on-read；长图会把可下载的图片字节嵌进 SVG，
+  // 不能把私有原始 URL 写进长期导出件。
   it('presigns media urls embedded in the long-image (SVG) export', async () => {
     prisma.note.findFirst.mockResolvedValueOnce({
       id: 'note-svg-presign',
@@ -1854,6 +1852,9 @@ describe('NoteService', () => {
       size: 512,
       expiresAt: new Date('2026-06-29T12:15:00.000Z'),
     });
+    uploadService.downloadObjectBuffer.mockResolvedValueOnce(
+      Buffer.from('embedded-image'),
+    );
 
     await service.createNoteExport('user-1', 'note-svg-presign', {
       format: 'IMAGE',
@@ -1863,8 +1864,10 @@ describe('NoteService', () => {
     const body = (
       uploadService.uploadBuffer.mock.calls[0][0].body as Buffer
     ).toString();
-    expect(body).toContain('https://signed.example.com/notes/user-1/1.png');
-    // 原始直链不该再出现在导出件里 —— 它对收件人是 403。
+    expect(body).toContain('data:image/png;base64,ZW1iZWRkZWQtaW1hZ2U=');
+    // 长图现在把图片字节嵌入 SVG，不把带权限的签名 URL 写进长期文件。
+    expect(body).not.toContain('https://signed.example.com/notes/user-1/1.png');
+    // 原始直链也不该出现在导出件里 —— 它对收件人是 403。
     expect(body).not.toContain(
       'https://cdn.example.com/circle/notes/user-1/1.png',
     );
@@ -1924,6 +1927,9 @@ describe('NoteService', () => {
         'base64',
       ),
     );
+    uploadService.downloadObjectBuffer.mockResolvedValueOnce(
+      Buffer.from('embedded-showcase-image'),
+    );
     uploadService.uploadBuffer
       .mockResolvedValueOnce({
         url: 'https://cdn.example.com/pdf.pdf',
@@ -1953,6 +1959,9 @@ describe('NoteService', () => {
       'https://signed.example.com/notes/user-1/show.png',
     );
     expect(svgBody.toString()).toContain(
+      'data:image/png;base64,ZW1iZWRkZWQtc2hvd2Nhc2UtaW1hZ2U=',
+    );
+    expect(svgBody.toString()).not.toContain(
       'https://signed.example.com/notes/user-1/show.png',
     );
     expect(svgBody.toString()).not.toContain(
@@ -2398,6 +2407,85 @@ describe('NoteService', () => {
       id: 'note-1',
       available: false,
     });
+  });
+
+  it('broadcasts source status changes to the source owner and collected-copy owners', async () => {
+    const realtime = {
+      safeBroadcastAll: jest.fn(async (fns: Array<() => unknown>) => {
+        await Promise.all(fns.map((fn) => fn()));
+      }),
+      broadcastNoteSourceStatusChanged: jest.fn(),
+    };
+    (prisma as any).chatMessage = {
+      findMany: jest.fn().mockResolvedValue([{ conversationID: 'chat-1' }]),
+    };
+    (prisma as any).chatMember = {
+      findMany: jest.fn().mockResolvedValue([{ userID: 'chat-recipient' }]),
+    };
+    const configured = new NoteService(
+      prisma as any,
+      {
+        get: jest.fn(() => null),
+      } as any,
+      new MembershipPolicyService(prisma as any),
+      uploadService as any,
+      realtime as any,
+    );
+    prisma.note.findFirst.mockResolvedValueOnce({
+      id: 'source-note',
+      ownerID: 'boss',
+      status: 'ACTIVE',
+      collectedFromNoteID: null,
+    });
+    prisma.note.update.mockResolvedValueOnce({
+      id: 'source-note',
+      available: false,
+    });
+    prisma.note.findMany
+      .mockResolvedValueOnce([
+        {
+          id: 'source-note',
+          ownerID: 'boss',
+          status: 'ACTIVE',
+          available: false,
+          workStatus: 'CLOSED',
+          collectedFromNoteID: null,
+        },
+      ])
+      .mockResolvedValueOnce([{ id: 'copy-note', ownerID: 'agent' }])
+      .mockResolvedValueOnce([]);
+
+    await configured.setAvailable('boss', 'source-note', false);
+
+    expect(realtime.broadcastNoteSourceStatusChanged).toHaveBeenCalledWith(
+      'boss',
+      expect.objectContaining({
+        sourceNoteId: 'source-note',
+        workStatus: 'CLOSED',
+        status: 'ACTIVE',
+        available: false,
+      }),
+    );
+    expect(realtime.broadcastNoteSourceStatusChanged).toHaveBeenCalledWith(
+      'agent',
+      expect.objectContaining({ sourceNoteId: 'source-note' }),
+    );
+    expect(realtime.broadcastNoteSourceStatusChanged).toHaveBeenCalledWith(
+      'chat-recipient',
+      expect.objectContaining({ sourceNoteId: 'source-note' }),
+    );
+    expect((prisma as any).chatMessage.findMany).toHaveBeenCalledWith(
+      expect.objectContaining({
+        where: expect.objectContaining({
+          OR: expect.arrayContaining([
+            { content: { path: ['sourceNoteId'], equals: 'source-note' } },
+            { content: { path: ['noteId'], equals: 'source-note' } },
+          ]),
+        }),
+      }),
+    );
+    delete (prisma as any).chatMessage;
+    delete (prisma as any).chatMember;
   });
 
   it('updates note status for the owner only', async () => {
@@ -3729,6 +3817,120 @@ describe('NoteService', () => {
     );
   });
 
+  it('collectNote seeds the previous sender card and preserves the origin group card', async () => {
+    prisma.note.findFirst
+      .mockResolvedValueOnce({
+        ...otherUsersNote,
+        sections: {
+          contacts: { items: [{ id: 'boss', name: '老板' }] },
+          groups: { items: [] },
+        },
+      })
+      .mockResolvedValueOnce(null);
+    prisma.note.create.mockResolvedValueOnce({ id: 'note-copy' });
+    prisma.noteMedia.createMany.mockResolvedValueOnce({ count: 2 });
+    prisma.note.update.mockImplementationOnce(async (args: any) => ({
+      ...otherUsersNote,
+      id: 'note-copy',
+      ownerID: 'user-1',
+      sections: args.data.sections,
+      collectedFrom: { kind: 'chat' },
+      collectedFromNoteID: 'note-src',
+    }));
+
+    await service.collectNote('user-1', {
+      noteId: 'note-src',
+      source: collectSource,
+    });
+
+    const sections = prisma.note.create.mock.calls[0][0].data.sections;
+    expect(sections.contacts.items).toEqual([
+      {
+        id: 'user-2',
+        name: '小王',
+        faceURL: 'https://cdn.example.com/w.jpg',
+      },
+    ]);
+    expect(sections.groups.items).toEqual([
+      {
+        id: 'g-1',
+        name: '产品讨论群',
+        faceURL: 'https://cdn.example.com/g.jpg',
+      },
+    ]);
+  });
+
+  it('collectNote carries a customized personal card to the next hop', async () => {
+    prisma.note.findFirst
+      .mockResolvedValueOnce({
+        ...otherUsersNote,
+        collectedFromNoteID: 'prior-note',
+        sections: {
+          contacts: {
+            items: [
+              {
+                id: 'custom-agent',
+                name: '代理小王',
+                faceURL: 'https://cdn.example.com/custom.jpg',
+              },
+            ],
+          },
+          groups: {
+            items: [{ id: 'origin-group', name: '老板群', faceURL: null }],
+          },
+        },
+      })
+      .mockResolvedValueOnce(null);
+    prisma.note.create.mockResolvedValueOnce({ id: 'note-copy' });
+    prisma.noteMedia.createMany.mockResolvedValueOnce({ count: 2 });
+    prisma.note.update.mockImplementationOnce(async (args: any) => ({
+      ...otherUsersNote,
+      id: 'note-copy',
+      ownerID: 'user-1',
+      sections: args.data.sections,
+      collectedFrom: { kind: 'chat' },
+      collectedFromNoteID: 'note-src',
+    }));
+
+    await service.collectNote('user-1', {
+      noteId: 'note-src',
+      source: collectSource,
+    });
+
+    const sections = prisma.note.create.mock.calls[0][0].data.sections;
+    expect(sections.contacts.items).toEqual([
+      {
+        id: 'custom-agent',
+        name: '代理小王',
+        faceURL: 'https://cdn.example.com/custom.jpg',
+      },
+    ]);
+    expect(sections.groups.items).toEqual([
+      { id: 'origin-group', name: '老板群', faceURL: null },
+    ]);
+  });
+
+  it('collectNote leaves an existing personal card on idempotent refresh for manual edits', async () => {
+    prisma.note.findFirst
+      .mockResolvedValueOnce(otherUsersNote)
+      .mockResolvedValueOnce({ id: 'note-copy' });
+    prisma.note.update.mockResolvedValueOnce({
+      ...otherUsersNote,
+      id: 'note-copy',
+      ownerID: 'user-1',
+      collectedFrom: { kind: 'chat' },
+      collectedFromNoteID: 'note-src',
+    });
+
+    await service.collectNote('user-1', {
+      noteId: 'note-src',
+      source: collectSource,
+    });
+
+    const updateArg = prisma.note.update.mock.calls[0][0];
+    expect(updateArg.data).not.toHaveProperty('sections');
+  });
+
   it('collectNote rewrites structured section media IDs to the copied media rows', async () => {
     prisma.note.findFirst
       .mockResolvedValueOnce({
@@ -3914,6 +4116,179 @@ describe('NoteService', () => {
       }),
     );
     expect(prisma.note.create).not.toHaveBeenCalled();
+  });
+
+  describe('collected copies follow the live source lifecycle', () => {
+    const rootState = (over: Record<string, unknown> = {}) => ({
+      id: 'boss-note',
+      status: 'ACTIVE',
+      available: true,
+      workStatus: null,
+      collectedFromNoteID: null,
+      ...over,
+    });
+    const relayCopy = {
+      ...otherUsersNote,
+      id: 'relay-copy',
+      ownerID: 'relay-user',
+      status: 'ACTIVE',
+      available: true,
+      collectedFromNoteID: 'boss-note',
+    };
+
+    it.each([
+      ['UNLISTED', { status: 'UNLISTED' }],
+      ['DELETED', { status: 'DELETED' }],
+      ['unavailable', { available: false }],
+    ])(
+      'collectNote rejects re-collecting a copy whose source is %s',
+      async (_label, rootOver) => {
+        prisma.note.findFirst.mockResolvedValueOnce(relayCopy);
+        prisma.note.findMany.mockResolvedValueOnce([rootState(rootOver)]);
+
+        await expect(
+          service.collectNote('user-1', {
+            noteId: 'relay-copy',
+            source: collectSource,
+          }),
+        ).rejects.toBeInstanceOf(NotFoundException);
+        expect(prisma.note.create).not.toHaveBeenCalled();
+        expect(prisma.note.update).not.toHaveBeenCalled();
+      },
+    );
+
+    it('collectNote still allows a CLOSED source and copies its work status', async () => {
+      prisma.note.findFirst
+        .mockResolvedValueOnce(relayCopy)
+        .mockResolvedValueOnce(null);
+      prisma.note.findMany.mockResolvedValue([
+        rootState({ workStatus: 'CLOSED' }),
+      ]);
+      prisma.note.create.mockResolvedValueOnce({ id: 'note-copy' });
+      prisma.noteMedia.createMany.mockResolvedValueOnce({ count: 2 });
+      prisma.note.update.mockImplementationOnce(async () => ({
+        ...relayCopy,
+        id: 'note-copy',
+        ownerID: 'user-1',
+        collectedFrom: { kind: 'chat' },
+        collectedFromNoteID: 'relay-copy',
+      }));
+
+      await service.collectNote('user-1', {
+        noteId: 'relay-copy',
+        source: collectSource,
+      });
+
+      expect(prisma.note.create).toHaveBeenCalledWith(
+        expect.objectContaining({
+          data: expect.objectContaining({ workStatus: 'CLOSED' }),
+        }),
+      );
+      prisma.note.findMany.mockReset();
+    });
+
+    it('getNote hides a copy from non-owners once its source is unlisted', async () => {
+      prisma.note.findFirst.mockResolvedValueOnce(relayCopy);
+      prisma.note.findMany.mockResolvedValueOnce([
+        rootState({ status: 'UNLISTED' }),
+      ]);
+
+      await expect(
+        service.getNote('user-1', 'relay-copy'),
+      ).rejects.toBeInstanceOf(NotFoundException);
+    });
+
+    it('getNote keeps the copy readable for its own owner with the source state overlaid', async () => {
+      prisma.note.findFirst.mockResolvedValueOnce(relayCopy);
+      prisma.note.findMany.mockResolvedValue([
+        rootState({ status: 'UNLISTED' }),
+      ]);
+
+      const detail = await service.getNote('relay-user', 'relay-copy');
+
+      expect(detail.id).toBe('relay-copy');
+      expect(detail.status).toBe('UNLISTED');
+      prisma.note.findMany.mockReset();
+    });
+
+    it('getSharedNoteForGuest hides a copy whose source was deleted', async () => {
+      prisma.note.findFirst.mockResolvedValueOnce(relayCopy);
+      prisma.note.findMany.mockResolvedValueOnce([
+        rootState({ status: 'DELETED' }),
+      ]);
+
+      await expect(
+        service.getSharedNoteForGuest('relay-copy'),
+      ).rejects.toBeInstanceOf(NotFoundException);
+    });
+
+    it('getSourceStates reports root state per requested id and hides unreadable ones', async () => {
+      prisma.note.findMany
+        .mockResolvedValueOnce([
+          { ...relayCopy, id: 'relay-copy' },
+          {
+            ...otherUsersNote,
+            id: 'plain-note',
+            ownerID: 'someone',
+            status: 'ACTIVE',
+            available: true,
+            workStatus: 'WORKING',
+            collectedFromNoteID: null,
+          },
+        ])
+        .mockResolvedValueOnce([
+          rootState({ status: 'UNLISTED', workStatus: 'CLOSED' }),
+        ]);
+
+      const states = await service.getSourceStates('user-1', [
+        'relay-copy',
+        'plain-note',
+        'hidden-note',
+        'plain-note',
+      ]);
+
+      expect(prisma.note.findMany).toHaveBeenNthCalledWith(
+        1,
+        expect.objectContaining({
+          where: {
+            id: { in: ['relay-copy', 'plain-note', 'hidden-note'] },
+            status: { not: 'DELETED' },
+            OR: [{ ownerID: 'user-1' }, { available: true, status: 'ACTIVE' }],
+          },
+        }),
+      );
+      expect(states).toEqual([
+        // Non-owner of an unlisted root: no work status leak.
+        {
+          noteId: 'relay-copy',
+          workStatus: 'UNSET',
+          publicationStatus: 'UNLISTED',
+        },
+        {
+          noteId: 'plain-note',
+          workStatus: 'WORKING',
+          publicationStatus: 'ACTIVE',
+        },
+        {
+          noteId: 'hidden-note',
+          workStatus: 'UNSET',
+          publicationStatus: 'UNLISTED',
+        },
+      ]);
+    });
+
+    it('createNoteExport refuses to export a copy whose source was unlisted', async () => {
+      prisma.note.findFirst.mockResolvedValueOnce(relayCopy);
+      prisma.note.findMany.mockResolvedValueOnce([
+        rootState({ status: 'UNLISTED' }),
+      ]);
+
+      await expect(
+        service.createNoteExport('user-1', 'relay-copy', {
+          format: 'TEXT',
+        } as never),
+      ).rejects.toBeInstanceOf(NotFoundException);
+    });
   });
 
   /** 收藏写入成功路径的最小 mock：只关心写进 collectedFrom 的内容。 */
@@ -4141,6 +4516,31 @@ describe('NoteService', () => {
         return error;
       }
     };
+
+    it('drops collected copies whose source has been unlisted since the link was made', async () => {
+      prisma.noteShareLink.findUnique.mockResolvedValueOnce({
+        ...shareLinkRow,
+        noteIDs: ['note-1', 'copy-1'],
+      });
+      prisma.note.findMany
+        .mockResolvedValueOnce([
+          sharedNoteRow,
+          { ...sharedNoteRow, id: 'copy-1', collectedFromNoteID: 'boss-note' },
+        ])
+        .mockResolvedValueOnce([
+          {
+            id: 'boss-note',
+            status: 'UNLISTED',
+            available: true,
+            workStatus: null,
+            collectedFromNoteID: null,
+          },
+        ]);
+
+      const result = await service.resolveShareLink('tok-abc');
+
+      expect(result.notes.map((note) => note.id)).toEqual(['note-1']);
+    });
 
     it('resolves a valid token to the notes in the link snapshot', async () => {
       prisma.noteShareLink.findUnique.mockResolvedValueOnce({

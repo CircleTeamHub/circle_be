@@ -239,6 +239,28 @@ describe('RealtimeService', () => {
     });
   });
 
+  it('broadcastNoteSourceStatusChanged emits a refetch-only source status event', () => {
+    const broadcast = jest.spyOn(service, 'broadcast').mockImplementation();
+
+    service.broadcastNoteSourceStatusChanged('collector-1', {
+      sourceNoteId: 'source-note-1',
+      workStatus: 'CLOSED',
+      status: 'ACTIVE',
+      available: true,
+    });
+
+    expect(broadcast).toHaveBeenCalledWith('collector-1', {
+      type: 'note.source.status.changed',
+      payload: {
+        sourceNoteId: 'source-note-1',
+        workStatus: 'CLOSED',
+        status: 'ACTIVE',
+        available: true,
+        changedAt: expect.any(String),
+      },
+    });
+  });
+
   it('broadcastCallInvite emits a token-free incoming call payload', () => {
     const broadcast = jest.spyOn(service, 'broadcast').mockImplementation();
 
