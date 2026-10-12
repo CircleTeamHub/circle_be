@@ -99,7 +99,8 @@ type BNTableContent = {
   columnWidths?: (number | undefined)[];
   rows: {
     cells: (
-      BNInlineContent[] | { type: 'tableCell'; content: BNInlineContent[] }
+      | BNInlineContent[]
+      | { type: 'tableCell'; content: BNInlineContent[] }
     )[];
   }[];
 };
