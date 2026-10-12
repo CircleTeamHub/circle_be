@@ -38,6 +38,7 @@ import {
 import {
   CollectNoteDto,
   CollectNoteResultDto,
+  NoteSourceStateDto,
   CreateNoteExportDto,
   CreateNoteDto,
   CreateNoteGroupDto,
@@ -2662,6 +2663,36 @@ export class NoteService {
     });
   }
 
+  /**
+   * Non-owner gate for collected copies. A copy keeps its own row (stored as
+   * ACTIVE/available), so the row-level `readableByViewer` filter alone would
+   * let anyone keep reading, exporting, forwarding or re-collecting it after
+   * the boss unlisted or deleted the source. The live root state decides:
+   * outside the owner, a copy is only reachable while its root is ACTIVE and
+   * available. CLOSED is a work-status reminder, not a distribution block.
+   * Returns the note with the root state overlaid.
+   */
+  private async requireDistributableForViewer(
+    note: NoteRow,
+    viewerID: string | null,
+  ): Promise<NoteRow> {
+    const [effective] = await this.overlayCollectedSourceState([note]);
+    if (viewerID !== null && note.ownerID === viewerID) return effective;
+    if (!this.isDistributable(effective)) {
+      throw new NotFoundException({
+        message: 'Note not found',
+        errorCode: NoteErrorCode.NotFound,
+      });
+    }
+    return effective;
+  }
+
+  /** Root-overlaid state check shared by single reads and share-link lists. */
+  private isDistributable(effective: NoteRow): boolean {
+    if (!effective.collectedFromNoteID) return true;
+    return effective.status === 'ACTIVE' && effective.available;
+  }
+
   private assertExportMediaWithinLimits(media: NoteMediaRow[]) {
     if (media.length > MAX_EXPORT_MEDIA_ITEMS) {
       throw new BadRequestException({
@@ -3283,9 +3314,19 @@ export class NoteService {
       take: SHARE_LINK_MAX_NOTES,
     });
 
+    // 链接的过滤条件只看每一行自己存的状态；副本还要按来源实时状态过一遍，
+    // 来源下架/删除后副本不能再经分享链接外流。
+    const effectiveNotes = await this.overlayCollectedSourceState(notes);
+    const distributableNotes = notes.filter((_note, index) =>
+      this.isDistributable(effectiveNotes[index]),
+    );
+
     return {
       title: link.title,
-      notes: await this.mapSummaryListResolved(notes, SHARE_LINK_GUEST_VIEWER),
+      notes: await this.mapSummaryListResolved(
+        distributableNotes,
+        SHARE_LINK_GUEST_VIEWER,
+      ),
       expiresAt: link.expiresAt,
     };
   }
@@ -3481,6 +3522,7 @@ export class NoteService {
       });
     }
 
+    await this.requireDistributableForViewer(note, ownerID);
     return this.mapDetailResolved(note, ownerID);
   }
 
@@ -3521,6 +3563,7 @@ export class NoteService {
         errorCode: NoteErrorCode.NotFound,
       });
     }
+    await this.requireDistributableForViewer(note, viewerID);
 
     const rowByKey = new Map<string, NoteMediaRow>();
     for (const row of note.media ?? []) rowByKey.set(row.objectKey, row);
@@ -3704,6 +3747,8 @@ export class NoteService {
         errorCode: NoteErrorCode.NotFound,
       });
     }
+    // 访客没有主人身份：副本的来源被下架/删除后同样不可读。
+    await this.requireDistributableForViewer(note, null);
 
     // 固定访客 viewer：不可编辑，也不会带出主人私有的 collectedFrom 定位信息。
     return this.mapDetailResolved(note, SHARE_LINK_GUEST_VIEWER);
@@ -4021,6 +4066,56 @@ export class NoteService {
    * 幂等：自己的笔记不复制直接返回；同一原笔记重复收藏只刷新来源快照。
    * 并发重复收藏由数据库唯一索引兜底，冲突后重读已有副本。
    */
+  /**
+   * Batched live status for chat note cards. Each id resolves through the
+   * collect chain to its root, so a card for any hop reports the boss's
+   * current state. Ids the viewer cannot read come back as UNLISTED/UNSET,
+   * which is indistinguishable from a missing note.
+   */
+  async getSourceStates(
+    viewerID: string,
+    noteIds: string[],
+  ): Promise<NoteSourceStateDto[]> {
+    const ids = [...new Set(noteIds)];
+    const rows = (await this.prisma.note.findMany({
+      where: {
+        id: { in: ids },
+        status: { not: 'DELETED' },
+        ...this.readableByViewer(viewerID),
+      },
+      select: {
+        id: true,
+        ownerID: true,
+        status: true,
+        available: true,
+        workStatus: true,
+        collectedFromNoteID: true,
+      },
+    })) as unknown as NoteRow[];
+    const effective = await this.overlayCollectedSourceState(rows);
+    const byId = new Map(effective.map((note) => [note.id, note]));
+
+    return ids.map((noteId) => {
+      const note = byId.get(noteId);
+      if (!note) {
+        return { noteId, workStatus: 'UNSET', publicationStatus: 'UNLISTED' };
+      }
+      const publicationStatus: NoteSourceStateDto['publicationStatus'] =
+        note.status === 'DELETED'
+          ? 'DELETED'
+          : note.status === 'ACTIVE' && note.available
+            ? 'ACTIVE'
+            : 'UNLISTED';
+      const revealWorkStatus =
+        publicationStatus === 'ACTIVE' || note.ownerID === viewerID;
+      return {
+        noteId,
+        workStatus: revealWorkStatus ? (note.workStatus ?? 'UNSET') : 'UNSET',
+        publicationStatus,
+      };
+    });
+  }
+
   async collectNote(
     userID: string,
     dto: CollectNoteDto,
@@ -4041,7 +4136,10 @@ export class NoteService {
       });
     }
 
-    const [effectiveSource] = await this.overlayCollectedSourceState([source]);
+    const effectiveSource = await this.requireDistributableForViewer(
+      source,
+      userID,
+    );
 
     // 自己的笔记本来就在"我的笔记"里 —— 不复制、不打来源标（来源名片只对
     // 收藏他人笔记有意义）。
@@ -4236,6 +4334,7 @@ export class NoteService {
         errorCode: NoteErrorCode.NotFound,
       });
     }
+    await this.requireDistributableForViewer(note, viewerID);
 
     const basename = sanitizeFilenamePart(note.title);
     if (input.format === 'IMAGE' || input.format === 'PDF') {

@@ -123,6 +123,7 @@ export const STATIC_ROUTES = new Set([
   '/api/v1/note/group/order',
   '/api/v1/note/recycle-bin',
   '/api/v1/note/share-links',
+  '/api/v1/note/source-states',
   '/api/v1/notification/circle-push-preference',
   '/api/v1/notification/list',
   '/api/v1/notification/profile/list',

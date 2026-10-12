@@ -30,6 +30,8 @@ import type { RequestWithUser } from 'src/auth/types';
 import {
   CollectNoteDto,
   CollectNoteResultDto,
+  NoteSourceStateDto,
+  NoteSourceStatesQueryDto,
   CopyNoteChatMediaDto,
   CreateNoteDto,
   CreateNoteExportDto,
@@ -120,6 +122,21 @@ export class NoteController {
     @Req() req: RequestWithUser,
   ): Promise<CollectNoteResultDto> {
     return this.noteService.collectNote(req.user.userId, dto);
+  }
+
+  @Post('source-states')
+  @UseGuards(UserThrottlerGuard)
+  @Throttle({ default: { limit: 60, ttl: 60_000 } })
+  @ApiOperation({
+    summary:
+      'Live source status for note cards (root of the collect chain), batched',
+  })
+  @ApiOkResponse({ type: [NoteSourceStateDto] })
+  getSourceStates(
+    @Body() dto: NoteSourceStatesQueryDto,
+    @Req() req: RequestWithUser,
+  ): Promise<NoteSourceStateDto[]> {
+    return this.noteService.getSourceStates(req.user.userId, dto.noteIds);
   }
 
   @Patch(':id')

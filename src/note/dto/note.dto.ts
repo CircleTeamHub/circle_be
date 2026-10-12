@@ -962,6 +962,24 @@ export class CollectNoteDto {
   title?: string;
 }
 
+export class NoteSourceStatesQueryDto {
+  @ApiProperty({ type: [String], maxItems: 100 })
+  @IsArray()
+  @ArrayNotEmpty()
+  @ArrayMaxSize(100)
+  @IsUUID('all', { each: true })
+  noteIds: string[];
+}
+
+export class NoteSourceStateDto {
+  @ApiProperty() noteId: string;
+  @ApiProperty({ enum: ['WORKING', 'CLOSED', 'UNSET'] })
+  workStatus: 'WORKING' | 'CLOSED' | 'UNSET';
+  /** UNLISTED also covers notes the viewer cannot read (no existence oracle). */
+  @ApiProperty({ enum: ['ACTIVE', 'UNLISTED', 'DELETED'] })
+  publicationStatus: 'ACTIVE' | 'UNLISTED' | 'DELETED';
+}
+
 export class CollectNoteResultDto {
   @ApiProperty({ type: NoteDetailDto }) note: NoteDetailDto;
   /** true = 笔记本来就是自己的，或此前已收藏过（幂等，不产生新副本） */

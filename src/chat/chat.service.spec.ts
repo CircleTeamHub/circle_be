@@ -44,7 +44,7 @@ describe('ChatService', () => {
       updateMany: jest.fn(),
       updateManyAndReturn: jest.fn(),
     },
-    note: { findFirst: jest.fn() },
+    note: { findFirst: jest.fn(), findUnique: jest.fn() },
     user: { findUnique: jest.fn(), findMany: jest.fn(), updateMany: jest.fn() },
     tempChat: { findUnique: jest.fn(), findMany: jest.fn() },
     tempChatGuest: { findMany: jest.fn() },
@@ -516,6 +516,96 @@ describe('ChatService', () => {
               faceURL: null,
             },
           },
+        }),
+      }),
+    );
+  });
+
+  it('stamps note-card work status from the live root of the collect chain', async () => {
+    prisma.chatMember.findUnique.mockResolvedValue(membership());
+    prisma.chatMessage.findUnique.mockResolvedValue(null);
+    prisma.$queryRaw.mockResolvedValue([{ nextHeight: 3 }]);
+    prisma.chatMessage.create.mockResolvedValue(createdRow);
+    prisma.chatConversation.update.mockResolvedValue({});
+    prisma.user.findUnique.mockResolvedValue(null);
+    prisma.note.findFirst
+      // group snapshot walk: copy has no stored group and no parent
+      .mockResolvedValueOnce({
+        sections: null,
+        collectedFromNoteID: null,
+        sourceConversationID: null,
+      })
+      // source state walk starts at the sender's readable copy
+      .mockResolvedValueOnce({
+        id: 'copy-1',
+        status: 'ACTIVE',
+        available: true,
+        workStatus: 'WORKING',
+        collectedFromNoteID: 'boss-note',
+      });
+    prisma.note.findUnique.mockResolvedValueOnce({
+      id: 'boss-note',
+      status: 'ACTIVE',
+      available: true,
+      workStatus: 'CLOSED',
+      collectedFromNoteID: null,
+    });
+
+    await service.sendMessage(
+      'u1',
+      sendPayload({
+        type: 'note-card',
+        content: {
+          noteId: 'copy-1',
+          // A stale or crafted card claims the venue is open.
+          workStatus: 'WORKING',
+          publicationStatus: 'ACTIVE',
+        },
+      }),
+    );
+
+    expect(prisma.chatMessage.create).toHaveBeenCalledWith(
+      expect.objectContaining({
+        data: expect.objectContaining({
+          content: {
+            noteId: 'copy-1',
+            sourceNoteId: 'boss-note',
+            workStatus: 'CLOSED',
+            publicationStatus: 'ACTIVE',
+          },
+        }),
+      }),
+    );
+  });
+
+  it('drops client-supplied card status when the sender cannot read the note', async () => {
+    prisma.chatMember.findUnique.mockResolvedValue(membership());
+    prisma.chatMessage.findUnique.mockResolvedValue(null);
+    prisma.$queryRaw.mockResolvedValue([{ nextHeight: 3 }]);
+    prisma.chatMessage.create.mockResolvedValue(createdRow);
+    prisma.chatConversation.update.mockResolvedValue({});
+    prisma.user.findUnique.mockResolvedValue(null);
+    prisma.note.findFirst
+      .mockResolvedValueOnce(null) // group snapshot: not readable
+      .mockResolvedValueOnce(null); // source state: not readable
+
+    await service.sendMessage(
+      'u1',
+      sendPayload({
+        type: 'note-card',
+        content: {
+          noteId: 'hidden-note',
+          sourceNoteId: 'forged-root',
+          workStatus: 'WORKING',
+          publicationStatus: 'ACTIVE',
+        },
+      }),
+    );
+
+    expect(prisma.chatMessage.create).toHaveBeenCalledWith(
+      expect.objectContaining({
+        data: expect.objectContaining({
+          content: { noteId: 'hidden-note' },
         }),
       }),
     );

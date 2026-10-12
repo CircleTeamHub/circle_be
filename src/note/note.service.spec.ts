@@ -4118,6 +4118,179 @@ describe('NoteService', () => {
     expect(prisma.note.create).not.toHaveBeenCalled();
   });
 
+  describe('collected copies follow the live source lifecycle', () => {
+    const rootState = (over: Record<string, unknown> = {}) => ({
+      id: 'boss-note',
+      status: 'ACTIVE',
+      available: true,
+      workStatus: null,
+      collectedFromNoteID: null,
+      ...over,
+    });
+    const relayCopy = {
+      ...otherUsersNote,
+      id: 'relay-copy',
+      ownerID: 'relay-user',
+      status: 'ACTIVE',
+      available: true,
+      collectedFromNoteID: 'boss-note',
+    };
+
+    it.each([
+      ['UNLISTED', { status: 'UNLISTED' }],
+      ['DELETED', { status: 'DELETED' }],
+      ['unavailable', { available: false }],
+    ])(
+      'collectNote rejects re-collecting a copy whose source is %s',
+      async (_label, rootOver) => {
+        prisma.note.findFirst.mockResolvedValueOnce(relayCopy);
+        prisma.note.findMany.mockResolvedValueOnce([rootState(rootOver)]);
+
+        await expect(
+          service.collectNote('user-1', {
+            noteId: 'relay-copy',
+            source: collectSource,
+          }),
+        ).rejects.toBeInstanceOf(NotFoundException);
+        expect(prisma.note.create).not.toHaveBeenCalled();
+        expect(prisma.note.update).not.toHaveBeenCalled();
+      },
+    );
+
+    it('collectNote still allows a CLOSED source and copies its work status', async () => {
+      prisma.note.findFirst
+        .mockResolvedValueOnce(relayCopy)
+        .mockResolvedValueOnce(null);
+      prisma.note.findMany.mockResolvedValue([
+        rootState({ workStatus: 'CLOSED' }),
+      ]);
+      prisma.note.create.mockResolvedValueOnce({ id: 'note-copy' });
+      prisma.noteMedia.createMany.mockResolvedValueOnce({ count: 2 });
+      prisma.note.update.mockImplementationOnce(async () => ({
+        ...relayCopy,
+        id: 'note-copy',
+        ownerID: 'user-1',
+        collectedFrom: { kind: 'chat' },
+        collectedFromNoteID: 'relay-copy',
+      }));
+
+      await service.collectNote('user-1', {
+        noteId: 'relay-copy',
+        source: collectSource,
+      });
+
+      expect(prisma.note.create).toHaveBeenCalledWith(
+        expect.objectContaining({
+          data: expect.objectContaining({ workStatus: 'CLOSED' }),
+        }),
+      );
+      prisma.note.findMany.mockReset();
+    });
+
+    it('getNote hides a copy from non-owners once its source is unlisted', async () => {
+      prisma.note.findFirst.mockResolvedValueOnce(relayCopy);
+      prisma.note.findMany.mockResolvedValueOnce([
+        rootState({ status: 'UNLISTED' }),
+      ]);
+
+      await expect(
+        service.getNote('user-1', 'relay-copy'),
+      ).rejects.toBeInstanceOf(NotFoundException);
+    });
+
+    it('getNote keeps the copy readable for its own owner with the source state overlaid', async () => {
+      prisma.note.findFirst.mockResolvedValueOnce(relayCopy);
+      prisma.note.findMany.mockResolvedValue([
+        rootState({ status: 'UNLISTED' }),
+      ]);
+
+      const detail = await service.getNote('relay-user', 'relay-copy');
+
+      expect(detail.id).toBe('relay-copy');
+      expect(detail.status).toBe('UNLISTED');
+      prisma.note.findMany.mockReset();
+    });
+
+    it('getSharedNoteForGuest hides a copy whose source was deleted', async () => {
+      prisma.note.findFirst.mockResolvedValueOnce(relayCopy);
+      prisma.note.findMany.mockResolvedValueOnce([
+        rootState({ status: 'DELETED' }),
+      ]);
+
+      await expect(
+        service.getSharedNoteForGuest('relay-copy'),
+      ).rejects.toBeInstanceOf(NotFoundException);
+    });
+
+    it('getSourceStates reports root state per requested id and hides unreadable ones', async () => {
+      prisma.note.findMany
+        .mockResolvedValueOnce([
+          { ...relayCopy, id: 'relay-copy' },
+          {
+            ...otherUsersNote,
+            id: 'plain-note',
+            ownerID: 'someone',
+            status: 'ACTIVE',
+            available: true,
+            workStatus: 'WORKING',
+            collectedFromNoteID: null,
+          },
+        ])
+        .mockResolvedValueOnce([
+          rootState({ status: 'UNLISTED', workStatus: 'CLOSED' }),
+        ]);
+
+      const states = await service.getSourceStates('user-1', [
+        'relay-copy',
+        'plain-note',
+        'hidden-note',
+        'plain-note',
+      ]);
+
+      expect(prisma.note.findMany).toHaveBeenNthCalledWith(
+        1,
+        expect.objectContaining({
+          where: {
+            id: { in: ['relay-copy', 'plain-note', 'hidden-note'] },
+            status: { not: 'DELETED' },
+            OR: [{ ownerID: 'user-1' }, { available: true, status: 'ACTIVE' }],
+          },
+        }),
+      );
+      expect(states).toEqual([
+        // Non-owner of an unlisted root: no work status leak.
+        {
+          noteId: 'relay-copy',
+          workStatus: 'UNSET',
+          publicationStatus: 'UNLISTED',
+        },
+        {
+          noteId: 'plain-note',
+          workStatus: 'WORKING',
+          publicationStatus: 'ACTIVE',
+        },
+        {
+          noteId: 'hidden-note',
+          workStatus: 'UNSET',
+          publicationStatus: 'UNLISTED',
+        },
+      ]);
+    });
+
+    it('createNoteExport refuses to export a copy whose source was unlisted', async () => {
+      prisma.note.findFirst.mockResolvedValueOnce(relayCopy);
+      prisma.note.findMany.mockResolvedValueOnce([
+        rootState({ status: 'UNLISTED' }),
+      ]);
+
+      await expect(
+        service.createNoteExport('user-1', 'relay-copy', {
+          format: 'TEXT',
+        } as never),
+      ).rejects.toBeInstanceOf(NotFoundException);
+    });
+  });
+
   /** 收藏写入成功路径的最小 mock：只关心写进 collectedFrom 的内容。 */
   const mockCollectWrites = () => {
     prisma.note.findFirst
@@ -4343,6 +4516,31 @@ describe('NoteService', () => {
         return error;
       }
     };
+
+    it('drops collected copies whose source has been unlisted since the link was made', async () => {
+      prisma.noteShareLink.findUnique.mockResolvedValueOnce({
+        ...shareLinkRow,
+        noteIDs: ['note-1', 'copy-1'],
+      });
+      prisma.note.findMany
+        .mockResolvedValueOnce([
+          sharedNoteRow,
+          { ...sharedNoteRow, id: 'copy-1', collectedFromNoteID: 'boss-note' },
+        ])
+        .mockResolvedValueOnce([
+          {
+            id: 'boss-note',
+            status: 'UNLISTED',
+            available: true,
+            workStatus: null,
+            collectedFromNoteID: null,
+          },
+        ]);
+
+      const result = await service.resolveShareLink('tok-abc');
+
+      expect(result.notes.map((note) => note.id)).toEqual(['note-1']);
+    });
 
     it('resolves a valid token to the notes in the link snapshot', async () => {
       prisma.noteShareLink.findUnique.mockResolvedValueOnce({

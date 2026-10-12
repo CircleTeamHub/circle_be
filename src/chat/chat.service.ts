@@ -144,6 +144,13 @@ type NoteCardPersonalSnapshot = {
   faceURL: string | null;
 };
 
+type NoteCardSourceState = {
+  /** Root of the collect chain; realtime status events are keyed by it. */
+  sourceNoteId: string;
+  workStatus: 'WORKING' | 'CLOSED' | 'UNSET';
+  publicationStatus: 'ACTIVE' | 'UNLISTED' | 'DELETED';
+};
+
 type NoteCardGroupSnapshot = {
   id: string;
   name: string;
@@ -457,10 +464,38 @@ export class ChatService {
         );
       }
     }
-    const { [NOTE_CARD_GROUP_SNAPSHOT_KEY]: _untrustedGroup, ...baseContent } =
-      content;
+    // Work / publication status on the card is a promise to the recipient, so
+    // it is derived from the live root of the collect chain, never from the
+    // replayed client content. Unresolvable notes drop the fields and the
+    // client falls back to "unset".
+    let sourceState: NoteCardSourceState | null = null;
+    if (noteId) {
+      try {
+        sourceState = await this.resolveNoteCardSourceState(
+          senderUserId,
+          noteId,
+        );
+      } catch (error) {
+        this.logger.warn(
+          sanitizeLogValue({
+            event: 'chat_note_card_source_state_failed',
+            operation: 'snapshotNoteCardContent',
+            noteId,
+            error,
+          }),
+        );
+      }
+    }
+    const {
+      [NOTE_CARD_GROUP_SNAPSHOT_KEY]: _untrustedGroup,
+      sourceNoteId: _untrustedSourceNoteId,
+      workStatus: _untrustedWorkStatus,
+      publicationStatus: _untrustedPublicationStatus,
+      ...baseContent
+    } = content;
     return {
       ...baseContent,
+      ...(sourceState ?? {}),
       ...(user
         ? {
             [NOTE_CARD_PERSONAL_SNAPSHOT_KEY]: {
@@ -473,6 +508,59 @@ export class ChatService {
       ...(groupSnapshot
         ? { [NOTE_CARD_GROUP_SNAPSHOT_KEY]: groupSnapshot }
         : {}),
+    };
+  }
+
+  /**
+   * Walk the collect chain from a note the sender may read up to its root and
+   * report the root's live state in the chat-card vocabulary.
+   */
+  private async resolveNoteCardSourceState(
+    viewerID: string,
+    noteId: string,
+  ): Promise<NoteCardSourceState | null> {
+    const select = {
+      id: true,
+      status: true,
+      available: true,
+      workStatus: true,
+      collectedFromNoteID: true,
+    } as const;
+    let current = await this.prisma.note.findFirst({
+      where: {
+        id: noteId,
+        status: { not: 'DELETED' },
+        OR: [{ ownerID: viewerID }, { available: true, status: 'ACTIVE' }],
+      },
+      select,
+    });
+    if (!current) return null;
+    const seen = new Set<string>([current.id]);
+    for (
+      let depth = 0;
+      depth < 8 &&
+      current.collectedFromNoteID &&
+      !seen.has(current.collectedFromNoteID);
+      depth += 1
+    ) {
+      const parent = await this.prisma.note.findUnique({
+        where: { id: current.collectedFromNoteID },
+        select,
+      });
+      if (!parent) break;
+      seen.add(parent.id);
+      current = parent;
+    }
+    const publicationStatus: NoteCardSourceState['publicationStatus'] =
+      current.status === 'DELETED'
+        ? 'DELETED'
+        : current.status === 'ACTIVE' && current.available
+          ? 'ACTIVE'
+          : 'UNLISTED';
+    return {
+      sourceNoteId: current.id,
+      workStatus: current.workStatus ?? 'UNSET',
+      publicationStatus,
     };
   }
 
