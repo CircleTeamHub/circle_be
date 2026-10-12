@@ -132,6 +132,29 @@ interface SendResult {
 type ChatBurnPolicyInput = ChatBurnPolicy | number | null;
 
 /**
+ * A note-card message carries the effective cards that were visible when it
+ * was sent.  They live inside the message content so a later profile/group
+ * change cannot rewrite an already shared order.  The personal card is
+ * replaced by the server for every new send; the source group card is carried
+ * forward verbatim when present.
+ */
+type NoteCardPersonalSnapshot = {
+  id: string;
+  name: string;
+  faceURL: string | null;
+};
+
+type NoteCardGroupSnapshot = {
+  id: string;
+  name: string;
+  faceURL: string | null;
+  circleId?: string;
+};
+
+const NOTE_CARD_PERSONAL_SNAPSHOT_KEY = 'personalCardSnapshot';
+const NOTE_CARD_GROUP_SNAPSHOT_KEY = 'sourceGroupCardSnapshot';
+
+/**
  * 读路径拿到的消息行。
  *
  * contentHistory(每次编辑压一版旧正文的审计数组)不在里面:它从不出现在
@@ -371,6 +394,198 @@ export class ChatService {
   }
 
   /**
+   * Freeze the card state at the moment a note-card is shared.
+   *
+   * The client may forward a note-card by replaying its content.  Trusting the
+   * replayed personal card would make the first intermediary's card stick
+   * forever, while deriving it only in the UI lets a crafted client impersonate
+   * somebody else.  The server therefore stamps the current sender's canonical
+   * profile on every new message.  The source group card is a separate
+   * immutable snapshot: if a previous hop supplied it, keep that value and do
+   * not replace it with the relay group.
+   */
+  private async snapshotNoteCardContent(
+    senderUserId: string,
+    content: Record<string, unknown>,
+  ): Promise<Record<string, unknown>> {
+    let user: {
+      id: string;
+      nickname: string;
+      avatarUrl: string | null;
+    } | null = null;
+    try {
+      user = await this.prisma.user.findUnique({
+        where: { id: senderUserId },
+        select: { id: true, nickname: true, avatarUrl: true },
+      });
+    } catch (error) {
+      // A profile read is enrichment, not a reason to lose a chat message.
+      // Keep sending; the next explicit forward can stamp a snapshot once the
+      // profile service is available again.
+      this.logger.warn(
+        sanitizeLogValue({
+          event: 'chat_note_card_snapshot_failed',
+          operation: 'snapshotNoteCardContent',
+          senderUserId,
+          error,
+        }),
+      );
+    }
+    const noteId =
+      typeof content.noteId === 'string' && content.noteId.trim()
+        ? content.noteId.trim()
+        : null;
+    // Only resolve card provenance for a note the sender is allowed to read.
+    // This keeps a guessed note id from turning a send into a private group
+    // metadata oracle.  If the note cannot be authorized, omit the group
+    // snapshot rather than trusting a client-provided replacement.
+    let groupSnapshot: NoteCardGroupSnapshot | null = null;
+    if (noteId) {
+      try {
+        groupSnapshot = await this.resolveNoteCardGroupSnapshot(
+          senderUserId,
+          noteId,
+        );
+      } catch (error) {
+        this.logger.warn(
+          sanitizeLogValue({
+            event: 'chat_note_card_group_snapshot_failed',
+            operation: 'snapshotNoteCardContent',
+            noteId,
+            error,
+          }),
+        );
+      }
+    }
+    const { [NOTE_CARD_GROUP_SNAPSHOT_KEY]: _untrustedGroup, ...baseContent } =
+      content;
+    return {
+      ...baseContent,
+      ...(user
+        ? {
+            [NOTE_CARD_PERSONAL_SNAPSHOT_KEY]: {
+              id: user.id,
+              name: user.nickname,
+              faceURL: user.avatarUrl ?? null,
+            } satisfies NoteCardPersonalSnapshot,
+          }
+        : {}),
+      ...(groupSnapshot
+        ? { [NOTE_CARD_GROUP_SNAPSHOT_KEY]: groupSnapshot }
+        : {}),
+    };
+  }
+
+  private normalizeNoteCardGroupSnapshot(
+    value: unknown,
+  ): NoteCardGroupSnapshot | null {
+    if (!value || typeof value !== 'object' || Array.isArray(value))
+      return null;
+    const candidate = value as Record<string, unknown>;
+    if (
+      typeof candidate.id !== 'string' ||
+      candidate.id.trim().length === 0 ||
+      typeof candidate.name !== 'string' ||
+      candidate.name.trim().length === 0
+    ) {
+      return null;
+    }
+    const snapshot: NoteCardGroupSnapshot = {
+      id: candidate.id.trim(),
+      name: candidate.name.trim(),
+      faceURL: typeof candidate.faceURL === 'string' ? candidate.faceURL : null,
+    };
+    if (typeof candidate.circleId === 'string' && candidate.circleId.trim()) {
+      snapshot.circleId = candidate.circleId.trim();
+    }
+    return snapshot;
+  }
+
+  /** Resolve the immutable source group from the authorized note chain. */
+  private async resolveNoteCardGroupSnapshot(
+    viewerID: string,
+    noteId: string,
+  ): Promise<NoteCardGroupSnapshot | null> {
+    let currentID: string | null = noteId;
+    const seen = new Set<string>();
+    for (
+      let depth = 0;
+      depth < 8 && currentID && !seen.has(currentID);
+      depth += 1
+    ) {
+      seen.add(currentID);
+      const note = await this.prisma.note.findFirst({
+        where: {
+          id: currentID,
+          status: { not: 'DELETED' },
+          OR: [{ ownerID: viewerID }, { available: true, status: 'ACTIVE' }],
+        },
+        select: {
+          sections: true,
+          collectedFromNoteID: true,
+          sourceConversationID: true,
+        },
+      });
+      if (!note) return null;
+
+      const storedGroup = this.firstNoteGroupSnapshot(note.sections);
+      if (storedGroup) return storedGroup;
+      if (!note.collectedFromNoteID && note.sourceConversationID) {
+        return this.resolveManagedGroupSnapshot(note.sourceConversationID);
+      }
+      currentID = note.collectedFromNoteID ?? null;
+    }
+    return null;
+  }
+
+  private firstNoteGroupSnapshot(
+    sections: unknown,
+  ): NoteCardGroupSnapshot | null {
+    if (!sections || typeof sections !== 'object' || Array.isArray(sections)) {
+      return null;
+    }
+    const groups = (sections as Record<string, unknown>).groups;
+    if (!groups || typeof groups !== 'object' || Array.isArray(groups)) {
+      return null;
+    }
+    const items = (groups as Record<string, unknown>).items;
+    if (!Array.isArray(items)) return null;
+    return this.normalizeNoteCardGroupSnapshot(items[0]);
+  }
+
+  private async resolveManagedGroupSnapshot(
+    sourceConversationID: string,
+  ): Promise<NoteCardGroupSnapshot | null> {
+    const chatConversation = (this.prisma as any).chatConversation;
+    if (!chatConversation?.findUnique) return null;
+    const conversation = await chatConversation.findUnique({
+      where: { id: sourceConversationID },
+      select: { type: true, circleID: true, name: true, avatarUrl: true },
+    });
+    if (!conversation || conversation.type !== 'GROUP') return null;
+    if (conversation.circleID) {
+      const circle = (this.prisma as any).circle;
+      if (!circle?.findUnique) return null;
+      const row = await circle.findUnique({
+        where: { id: conversation.circleID },
+        select: { id: true, name: true, avatarUrl: true },
+      });
+      return row
+        ? this.normalizeNoteCardGroupSnapshot({
+            id: row.id,
+            name: row.name,
+            faceURL: row.avatarUrl ?? null,
+          })
+        : null;
+    }
+    return this.normalizeNoteCardGroupSnapshot({
+      id: sourceConversationID,
+      name: conversation.name,
+      faceURL: conversation.avatarUrl ?? null,
+    });
+  }
+
+  /**
    * 发送消息(squady sendMsg 的移植):
    * 事务内 pg_advisory_xact_lock 串行化本会话 → clientMessageId 幂等查重 →
    * height = max+1 → 落库 → 更新会话 lastMessageAt。
@@ -442,6 +657,15 @@ export class ChatService {
             : {}),
         };
         this.validateSendPayload(senderUserId, effectivePayload);
+      }
+      if (effectivePayload.type === 'note-card') {
+        effectivePayload = {
+          ...effectivePayload,
+          content: await this.snapshotNoteCardContent(
+            senderUserId,
+            effectivePayload.content,
+          ),
+        };
       }
       // G-09 真引用的归属校验。replyToId 之前只校验「是个字符串」,于是任何人都能
       // 拿一条**别的会话**里的消息 UUID 当引用发出去 —— attachReplyTo 照单全收,

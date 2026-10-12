@@ -239,6 +239,28 @@ describe('RealtimeService', () => {
     });
   });
 
+  it('broadcastNoteSourceStatusChanged emits a refetch-only source status event', () => {
+    const broadcast = jest.spyOn(service, 'broadcast').mockImplementation();
+
+    service.broadcastNoteSourceStatusChanged('collector-1', {
+      sourceNoteId: 'source-note-1',
+      workStatus: 'CLOSED',
+      status: 'ACTIVE',
+      available: true,
+    });
+
+    expect(broadcast).toHaveBeenCalledWith('collector-1', {
+      type: 'note.source.status.changed',
+      payload: {
+        sourceNoteId: 'source-note-1',
+        workStatus: 'CLOSED',
+        status: 'ACTIVE',
+        available: true,
+        changedAt: expect.any(String),
+      },
+    });
+  });
+
   it('broadcastCallInvite emits a token-free incoming call payload', () => {
     const broadcast = jest.spyOn(service, 'broadcast').mockImplementation();
 
@@ -514,8 +536,7 @@ describe('RealtimeService', () => {
 
   it('delivers Redis realtime events from other instances to local sockets', async () => {
     let handler:
-      | ((channel: string, message: string) => void | Promise<void>)
-      | undefined;
+      ((channel: string, message: string) => void | Promise<void>) | undefined;
     redis.subscribePattern.mockImplementation(
       async (pattern: string, callback) => {
         // The service subscribes more than one channel; keep the realtime-event
@@ -561,8 +582,7 @@ describe('RealtimeService', () => {
 
   it('does not redeliver an instance own cross-instance echo (origin guard)', async () => {
     let handler:
-      | ((channel: string, message: string) => void | Promise<void>)
-      | undefined;
+      ((channel: string, message: string) => void | Promise<void>) | undefined;
     redis.subscribePattern.mockImplementation(
       async (pattern: string, callback) => {
         // The service subscribes more than one channel; keep the realtime-event
@@ -597,8 +617,7 @@ describe('RealtimeService', () => {
 
   it('counts cross-instance messages for users not connected locally', async () => {
     let handler:
-      | ((channel: string, message: string) => void | Promise<void>)
-      | undefined;
+      ((channel: string, message: string) => void | Promise<void>) | undefined;
     redis.subscribePattern.mockImplementation(
       async (pattern: string, callback) => {
         // The service subscribes more than one channel; keep the realtime-event
@@ -626,8 +645,7 @@ describe('RealtimeService', () => {
 
   it('drops cross-instance messages with an unknown event type', async () => {
     let handler:
-      | ((channel: string, message: string) => void | Promise<void>)
-      | undefined;
+      ((channel: string, message: string) => void | Promise<void>) | undefined;
     redis.subscribePattern.mockImplementation(
       async (pattern: string, callback) => {
         // The service subscribes more than one channel; keep the realtime-event

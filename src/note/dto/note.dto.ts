@@ -35,6 +35,9 @@ export type NoteStatus = (typeof NOTE_STATUS)[number];
 export const NOTE_WRITABLE_STATUS = ['ACTIVE', 'UNLISTED'] as const;
 export type NoteWritableStatus = (typeof NOTE_WRITABLE_STATUS)[number];
 
+export const NOTE_WORK_STATUS = ['WORKING', 'CLOSED'] as const;
+export type NoteWorkStatus = (typeof NOTE_WORK_STATUS)[number];
+
 export const NOTE_MEDIA_TYPE = ['IMAGE', 'VIDEO', 'AUDIO'] as const;
 export type NoteMediaType = (typeof NOTE_MEDIA_TYPE)[number];
 /** Includes all primary and poster keys from every draft representation. */
@@ -478,6 +481,20 @@ export class SetNoteStatusDto {
   status: NoteWritableStatus;
 }
 
+export class SetNoteWorkStatusDto {
+  @ApiPropertyOptional({ enum: NOTE_WORK_STATUS, nullable: true })
+  @IsOptional()
+  @IsEnum(NOTE_WORK_STATUS)
+  workStatus?: NoteWorkStatus | null;
+}
+
+export class SetNoteSourceConversationDto {
+  @ApiPropertyOptional({ format: 'uuid', nullable: true })
+  @IsOptional()
+  @IsUUID()
+  conversationID?: string | null;
+}
+
 /**
  * GET /note 与 GET /note/recycle-bin 的默认页大小，同时是 limit 的上限。
  *
@@ -675,17 +692,14 @@ export class NoteSectionMediaResponseDto {
   @ApiProperty() objectKey: string;
   @ApiPropertyOptional() url?: string;
   @ApiPropertyOptional({ type: String, nullable: true }) mimeType?:
-    | string
-    | null;
+    string | null;
   @ApiPropertyOptional({ type: Number, nullable: true }) size?: number | null;
   @ApiPropertyOptional({ type: Number, nullable: true }) width?: number | null;
   @ApiPropertyOptional({ type: Number, nullable: true }) height?: number | null;
   @ApiPropertyOptional({ type: Number, nullable: true }) durationMs?:
-    | number
-    | null;
+    number | null;
   @ApiPropertyOptional({ type: String, nullable: true }) posterUrl?:
-    | string
-    | null;
+    string | null;
   @ApiProperty() sortOrder: number;
 }
 
@@ -698,8 +712,7 @@ export class NoteContactCardResponseDto {
   @ApiProperty() id: string;
   @ApiProperty() name: string;
   @ApiPropertyOptional({ type: String, nullable: true }) faceURL?:
-    | string
-    | null;
+    string | null;
 }
 
 export class NoteGroupCardResponseDto extends NoteContactCardResponseDto {
@@ -745,11 +758,9 @@ export class NoteSectionsResponseDto {
 
 export class NoteDraftTextSectionResponseDto {
   @ApiPropertyOptional({ type: String, nullable: true }) content?:
-    | string
-    | null;
+    string | null;
   @ApiPropertyOptional({ type: [Object], nullable: true }) contentJson?:
-    | Record<string, unknown>[]
-    | null;
+    Record<string, unknown>[] | null;
 }
 
 /** Drafts preserve omitted sections and fields rather than filling published defaults. */
@@ -782,6 +793,10 @@ export class NoteSummaryDto {
   @ApiPropertyOptional() contentPreview: string | null;
   @ApiProperty({ enum: NOTE_STATUS }) status: NoteStatus;
   @ApiProperty() available: boolean;
+  @ApiPropertyOptional({ enum: NOTE_WORK_STATUS, nullable: true })
+  workStatus: NoteWorkStatus | null;
+  @ApiPropertyOptional({ format: 'uuid', nullable: true })
+  sourceConversationID: string | null;
   @ApiProperty() pinned: boolean;
   @ApiPropertyOptional({
     nullable: true,
@@ -825,8 +840,7 @@ export class NoteDraftSummaryDto {
 export class NoteDraftDto extends NoteDraftSummaryDto {
   @ApiPropertyOptional() content: string | null;
   @ApiPropertyOptional({ type: [Object], nullable: true }) contentJson:
-    | Record<string, unknown>[]
-    | null;
+    Record<string, unknown>[] | null;
   @ApiPropertyOptional({ type: NoteDraftSectionsResponseDto, nullable: true })
   sections: NoteDraftSectionsResponseDto | null;
   @ApiProperty({ type: [String] }) groupIds: string[];
@@ -836,8 +850,7 @@ export class NoteDraftDto extends NoteDraftSummaryDto {
 export class NoteDetailDto extends NoteSummaryDto {
   @ApiPropertyOptional() content: string | null;
   @ApiPropertyOptional({ type: [Object] }) contentJson?:
-    | Record<string, unknown>[]
-    | null;
+    Record<string, unknown>[] | null;
   @ApiProperty({ type: [NoteMediaDto] }) media: NoteMediaDto[];
   @ApiProperty({ type: NoteSectionsResponseDto })
   sections: NoteSectionsResponseDto;
@@ -926,6 +939,19 @@ export class CollectNoteDto {
   @ValidateNested()
   @Type(() => NoteCollectSourceDto)
   source: NoteCollectSourceDto;
+
+  @ApiPropertyOptional({ format: 'uuid', nullable: true })
+  @IsOptional()
+  @IsUUID()
+  targetNoteGroupId?: string | null;
+
+  @ApiPropertyOptional({ maxLength: 120 })
+  @IsOptional()
+  @IsString()
+  @Trim()
+  @IsNotEmpty()
+  @MaxLength(120)
+  title?: string;
 }
 
 export class CollectNoteResultDto {

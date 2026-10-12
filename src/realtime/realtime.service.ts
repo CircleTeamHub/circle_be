@@ -123,11 +123,23 @@ type CachedUserProfileSummaryPayload = UserProfileSummaryPayload & {
   membershipExpiresAt?: string | null;
 };
 
+export type NoteSourceStatusPayload = {
+  sourceNoteId: string;
+  workStatus: 'WORKING' | 'CLOSED' | null;
+  status: 'ACTIVE' | 'UNLISTED' | 'DELETED';
+  available: boolean;
+  changedAt: string;
+};
+
 type RealtimeEvent =
   | { type: 'badge.snapshot'; payload: BadgeSnapshot }
   | {
       type: 'moments.feed.updated';
       payload: { authorId: string; changedAt: string };
+    }
+  | {
+      type: 'note.source.status.changed';
+      payload: NoteSourceStatusPayload;
     }
   | { type: 'call.invite'; payload: CallInvitePayload }
   | { type: 'call.participant.joined'; payload: CallParticipantPayload }
@@ -223,6 +235,7 @@ export class RealtimeService implements OnModuleInit, OnModuleDestroy {
   private static readonly REALTIME_EVENT_TYPES: ReadonlySet<string> = new Set([
     'badge.snapshot',
     'moments.feed.updated',
+    'note.source.status.changed',
     'call.invite',
     'call.participant.joined',
     'call.participant.left',
@@ -696,6 +709,25 @@ export class RealtimeService implements OnModuleInit, OnModuleDestroy {
       type: 'moments.feed.updated',
       payload: {
         authorId: payload.authorId,
+        changedAt: new Date().toISOString(),
+      },
+    });
+  }
+
+  /**
+   * Pokes the owner and collectors of a source note after its availability,
+   * work status, or publication status changes. The payload is deliberately
+   * small; clients refetch their own note projections so private groups/cards
+   * never cross the realtime boundary.
+   */
+  broadcastNoteSourceStatusChanged(
+    userId: string,
+    payload: Omit<NoteSourceStatusPayload, 'changedAt'>,
+  ) {
+    this.broadcast(userId, {
+      type: 'note.source.status.changed',
+      payload: {
+        ...payload,
         changedAt: new Date().toISOString(),
       },
     });

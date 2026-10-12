@@ -51,6 +51,8 @@ import {
   SetNoteAvailableDto,
   SetNoteRemarkDto,
   SetNoteStatusDto,
+  SetNoteSourceConversationDto,
+  SetNoteWorkStatusDto,
   SetPinnedDto,
   SaveNoteDraftDto,
   UpdateNoteDto,
@@ -179,6 +181,40 @@ export class NoteController {
     @Req() req: RequestWithUser,
   ) {
     return this.noteService.setAvailable(req.user.userId, id, dto.available);
+  }
+
+  @Patch(':id/work-status')
+  @ApiOperation({ summary: 'Set optional note work status' })
+  @ApiOkResponse({ schema: { example: { id: 'uuid', workStatus: 'WORKING' } } })
+  setWorkStatus(
+    @Param('id', ParseUUIDPipe) id: string,
+    @Body() dto: SetNoteWorkStatusDto,
+    @Req() req: RequestWithUser,
+  ) {
+    return this.noteService.setWorkStatus(
+      req.user.userId,
+      id,
+      dto.workStatus ?? null,
+    );
+  }
+
+  @Patch(':id/source-group')
+  @ApiOperation({
+    summary: 'Bind an owned note to a source group conversation',
+  })
+  @ApiOkResponse({
+    schema: { example: { id: 'uuid', sourceConversationID: 'uuid' } },
+  })
+  setSourceConversation(
+    @Param('id', ParseUUIDPipe) id: string,
+    @Body() dto: SetNoteSourceConversationDto,
+    @Req() req: RequestWithUser,
+  ) {
+    return this.noteService.setSourceConversation(
+      req.user.userId,
+      id,
+      dto.conversationID ?? null,
+    );
   }
 
   @Patch(':id/status')

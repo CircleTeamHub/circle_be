@@ -17,6 +17,7 @@ import PDFDocument from 'pdfkit';
 import { Prisma } from 'src/generated/prisma';
 import { PrismaService } from 'src/prisma/prisma.service';
 import { MembershipPolicyService } from 'src/membership/membership-policy.service';
+import { RealtimeService } from 'src/realtime/realtime.service';
 import { UploadService } from 'src/upload/upload.service';
 import {
   CHAT_MEDIA_DELETE_CLAIM_REASON,
@@ -47,6 +48,7 @@ import {
   NoteChatMediaImportDto,
   NoteChatMediaItemDto,
   NoteChatMediaSection,
+  NoteCollectPeerDto,
   NoteCollectSourceDto,
   NoteDetailDto,
   NoteDraftDto,
@@ -61,6 +63,7 @@ import {
   NoteStatus,
   NoteSummaryDto,
   NoteWritableStatus,
+  NoteWorkStatus,
   SharedNoteListDto,
   UpdateNoteDto,
   UpdateNoteGroupDto,
@@ -96,8 +99,7 @@ type BNTableContent = {
   columnWidths?: (number | undefined)[];
   rows: {
     cells: (
-      | BNInlineContent[]
-      | { type: 'tableCell'; content: BNInlineContent[] }
+      BNInlineContent[] | { type: 'tableCell'; content: BNInlineContent[] }
     )[];
   }[];
 };
@@ -172,6 +174,8 @@ type NoteRow = {
   sections: unknown;
   status: NoteStatus;
   available: boolean;
+  workStatus: NoteWorkStatus | null;
+  sourceConversationID?: string | null;
   pinned: boolean;
   remark?: string | null;
   imageCount: number;
@@ -469,6 +473,7 @@ export class NoteService {
     private readonly config: ConfigService,
     private readonly membershipPolicy: MembershipPolicyService,
     @Optional() private readonly uploadService?: UploadService,
+    @Optional() private readonly realtime?: RealtimeService,
   ) {
     this.storagePublicObjectBases = storagePublicObjectBasesFromConfig(
       this.config,
@@ -1104,6 +1109,186 @@ export class NoteService {
     return note;
   }
 
+  /** 群设置里的来源关联和开工/打烊状态只属于老板的来源笔记。 */
+  private async requireOwnedSourceNote(ownerID: string, noteId: string) {
+    const note = await this.requireOwnedNote(ownerID, noteId);
+    if (note.collectedFromNoteID) {
+      throw new ForbiddenException(
+        'Only a source note can be managed from its group',
+      );
+    }
+    return note;
+  }
+
+  /**
+   * Notify everyone who can have a local copy of a source note. Copies keep
+   * their own rows, so the event is a refetch signal rather than a mutable
+   * broadcast of note contents. The bounded walk follows the same chain limit
+   * used by overlayCollectedSourceState and includes the source owner.
+   */
+  private async broadcastSourceStatusChanged(noteID: string): Promise<void> {
+    if (!this.realtime) return;
+
+    try {
+      type SourceRow = {
+        id: string;
+        ownerID: string;
+        status: NoteStatus;
+        available: boolean;
+        workStatus: NoteWorkStatus | null;
+        collectedFromNoteID: string | null;
+      };
+
+      const rows = new Map<string, SourceRow>();
+      const visited = new Set<string>();
+      let frontier = [noteID];
+      for (let depth = 0; depth < 8 && frontier.length > 0; depth += 1) {
+        const ids = frontier.filter((id) => !visited.has(id));
+        if (ids.length === 0) break;
+        ids.forEach((id) => visited.add(id));
+
+        const batch = (await this.prisma.note.findMany({
+          where: { id: { in: ids } },
+          select: {
+            id: true,
+            ownerID: true,
+            status: true,
+            available: true,
+            workStatus: true,
+            collectedFromNoteID: true,
+          },
+        })) as SourceRow[];
+        batch.forEach((row) => rows.set(row.id, row));
+        frontier = batch
+          .map((row) => row.collectedFromNoteID)
+          .filter((id): id is string => Boolean(id));
+      }
+
+      const requested = rows.get(noteID);
+      if (!requested) return;
+
+      let source = requested;
+      const seen = new Set<string>();
+      while (source.collectedFromNoteID && !seen.has(source.id)) {
+        seen.add(source.id);
+        const parent = rows.get(source.collectedFromNoteID);
+        if (!parent) break;
+        source = parent;
+      }
+
+      const recipientIDs = new Set<string>([source.ownerID]);
+      const relatedNoteIDs = new Set<string>([source.id]);
+      frontier = [source.id];
+      const descendantsSeen = new Set<string>();
+      for (let depth = 0; depth < 8 && frontier.length > 0; depth += 1) {
+        const ids = frontier.filter((id) => !descendantsSeen.has(id));
+        if (ids.length === 0) break;
+        ids.forEach((id) => descendantsSeen.add(id));
+        const copies = (await this.prisma.note.findMany({
+          where: { collectedFromNoteID: { in: ids } },
+          select: { id: true, ownerID: true },
+        })) as Array<{ id: string; ownerID: string }>;
+        copies.forEach((copy) => {
+          recipientIDs.add(copy.ownerID);
+          relatedNoteIDs.add(copy.id);
+        });
+        frontier = copies.map((copy) => copy.id);
+      }
+
+      // Chat cards are pointers, so a recipient may have seen the source note
+      // without collecting it. Include active members of conversations that
+      // still contain a live card; the payload has no private note content.
+      const chatMessage = (this.prisma as any).chatMessage;
+      const chatMember = (this.prisma as any).chatMember;
+      if (chatMessage?.findMany && chatMember?.findMany) {
+        try {
+          const messages: Array<{ conversationID?: unknown }> = [];
+          const relatedIDs = [...relatedNoteIDs];
+          for (let start = 0; start < relatedIDs.length; start += 100) {
+            const chunk = relatedIDs.slice(start, start + 100);
+            const pointerFilters = chunk.flatMap((id) => [
+              { content: { path: ['sourceNoteId'], equals: id } },
+              // Older cards predate sourceNoteId and use noteId as the source
+              // pointer. Keep their recipients live as well.
+              { content: { path: ['noteId'], equals: id } },
+            ]);
+            const batch = await chatMessage.findMany({
+              where: {
+                type: 'note-card',
+                deleted: false,
+                revokedAt: null,
+                OR: pointerFilters,
+              },
+              select: { conversationID: true },
+              distinct: ['conversationID'],
+            });
+            messages.push(...(batch as Array<{ conversationID?: unknown }>));
+          }
+          const conversationIDs = [
+            ...new Set(
+              (messages as Array<{ conversationID?: unknown }>)
+                .map((message) => message.conversationID)
+                .filter(
+                  (id): id is string => typeof id === 'string' && id.length > 0,
+                ),
+            ),
+          ];
+          if (conversationIDs.length > 0) {
+            const members = await chatMember.findMany({
+              where: { conversationID: { in: conversationIDs }, leftAt: null },
+              select: { userID: true },
+            });
+            (members as Array<{ userID?: unknown }>).forEach((member) => {
+              if (
+                typeof member.userID === 'string' &&
+                member.userID.length > 0
+              ) {
+                recipientIDs.add(member.userID);
+              }
+            });
+          }
+        } catch (error) {
+          this.logger.warn(
+            `Note chat recipient lookup failed: ${error instanceof Error ? error.message : String(error)}`,
+          );
+        }
+      }
+
+      await this.realtime.safeBroadcastAll(
+        [...recipientIDs].map(
+          (userID) => () =>
+            this.realtime!.broadcastNoteSourceStatusChanged(userID, {
+              sourceNoteId: source.id,
+              workStatus: source.workStatus,
+              status: source.status,
+              available: source.available,
+            }),
+        ),
+      );
+    } catch (error) {
+      // Status writes have already committed. Realtime delivery is best effort
+      // and a failed lookup must never turn a successful PATCH into a 500.
+      this.logger.warn(
+        `Note status realtime update failed: ${error instanceof Error ? error.message : String(error)}`,
+      );
+    }
+  }
+
+  /** 保留来源群名片快照，避免收录副本或已绑定来源笔记被客户端改成别的群。 */
+  private preserveManagedGroupCard(
+    nextSections: unknown,
+    sourceSections: unknown,
+  ): unknown {
+    const next = this.isRecord(nextSections) ? { ...nextSections } : {};
+    const source = this.isRecord(sourceSections) ? sourceSections : {};
+    if (this.isRecord(source.groups)) {
+      next.groups = source.groups;
+    } else {
+      delete next.groups;
+    }
+    return next;
+  }
+
   private createShareToken(): string {
     return randomBytes(18).toString('base64url');
   }
@@ -1132,34 +1317,26 @@ export class NoteService {
   }
 
   /**
-   * 长图导出是**纯文字** SVG：不嵌图片字节，`图片 N: <url>` 里的 URL 是对媒体的
-   * 唯一引用。桶策略把 notes/* 收归私有后，原始直链对收件人是 403，所以这里必须
-   * 和其它读取路径一样发短时签名 URL（presignedUrls）。
-   *
-   * 已知限制：签名 URL ~2h 过期，而导出件是用户长期留存的。链接终会失效 ——
-   * 但「导出后即刻可用」好过「一出生就是死链」。彻底解法是把媒体打包进导出件，
-   * 属于更大的改动，不在本次范围。
+   * 长图导出使用 SVG 容器：正文按文本排版，图片媒体嵌成 data URI，避免把
+   * 带权限的短时 URL 写进长期文件。视频不能被 SVG 携带，仍只保留一个媒体标签。
+   * presignedUrls 仍用于 buildSectionsFromRow，确保无法嵌入的历史媒体不会回退到
+   * 私有原始直链。
    */
-  private createLongImageSvg(
+  private async createLongImageSvg(
     note: NoteRow,
     presignedUrls?: Map<string, string>,
   ) {
     const sections = this.buildSectionsFromRow(note, presignedUrls);
     const exportMedia = this.getExportSectionMedia(sections);
-    const lines = [
+    const mediaByKey = new Map(
+      (note.media ?? []).map((item) => [item.objectKey, item]),
+    );
+    const textLines = [
       note.title,
       '',
       // 一个换行一个 <text>：SVG 默认 xml:space 会把 <text> 里的换行整个**吞掉**
       // （不是换成空格），整段塞一个 <text> 会让表格行和后面的段落首尾粘在一起。
       ...(sections.text.content ?? '').split(NOTE_LINE_SEPARATOR),
-      '',
-      ...exportMedia.map((item: any, index) => {
-        const type =
-          ({ IMAGE: '图片', VIDEO: '视频', AUDIO: '音频' } as const)[
-            item.type as 'IMAGE' | 'VIDEO' | 'AUDIO'
-          ] ?? '媒体';
-        return `${type} ${index + 1}: ${item.url ?? ''}`;
-      }),
       ...(sections.location
         ? [
             '',
@@ -1168,15 +1345,111 @@ export class NoteService {
           ]
         : []),
     ].filter((line) => line != null);
-    const height = Math.max(320, 120 + lines.length * 34);
-    const text = lines
+
+    const safeImageMime = (item: any, media: NoteMediaRow | undefined) => {
+      const mime = media?.mimeType ?? item.mimeType;
+      if (
+        typeof mime === 'string' &&
+        /^(image\/(?:jpeg|jpg|png|gif|webp|avif))$/i.test(mime)
+      ) {
+        return mime.toLowerCase() === 'image/jpg' ? 'image/jpeg' : mime;
+      }
+      const source = String(
+        media?.objectKey ?? item.objectKey ?? item.url ?? '',
+      )
+        .split('?')[0]
+        .split('#')[0]
+        .toLowerCase();
+      const extension = source.slice(source.lastIndexOf('.') + 1);
+      const byExtension: Record<string, string> = {
+        jpg: 'image/jpeg',
+        jpeg: 'image/jpeg',
+        png: 'image/png',
+        gif: 'image/gif',
+        webp: 'image/webp',
+        avif: 'image/avif',
+      };
+      return byExtension[extension] ?? null;
+    };
+
+    const text = textLines
       .map(
         (line, index) =>
           `<text x="40" y="${60 + index * 34}" font-size="${index === 0 ? 28 : 18}" fill="#111827">${escapeXml(String(line))}</text>`,
       )
       .join('');
+    let cursor = 60 + textLines.length * 34;
+    let embeddedBytes = 0;
+    const mediaMarkup: string[] = [];
+    for (const [index, item] of exportMedia.entries()) {
+      const objectKey =
+        typeof item.objectKey === 'string' ? item.objectKey : undefined;
+      const media = objectKey ? mediaByKey.get(objectKey) : undefined;
+      const label =
+        item.type === 'VIDEO' ? `视频 ${index + 1}` : `图片 ${index + 1}`;
+      cursor += 18;
+      mediaMarkup.push(
+        `<text x="40" y="${cursor}" font-size="18" fill="#111827">${escapeXml(label)}</text>`,
+      );
+      cursor += 18;
+
+      const mime = safeImageMime(item, media);
+      const canEmbed =
+        item.type === 'IMAGE' &&
+        mime &&
+        media?.objectKey &&
+        embeddedBytes < MAX_EXPORT_TOTAL_MEDIA_BYTES &&
+        (media.size == null || media.size <= MAX_EXPORT_SINGLE_MEDIA_BYTES);
+      if (!canEmbed || !this.uploadService) {
+        cursor += 22;
+        continue;
+      }
+
+      try {
+        const image = await this.uploadService.downloadObjectBuffer(
+          media.objectKey,
+          MAX_EXPORT_SINGLE_MEDIA_BYTES,
+        );
+        if (
+          !Buffer.isBuffer(image) ||
+          image.byteLength === 0 ||
+          embeddedBytes + image.byteLength > MAX_EXPORT_TOTAL_MEDIA_BYTES
+        ) {
+          cursor += 22;
+          continue;
+        }
+        embeddedBytes += image.byteLength;
+        const width = 820;
+        const sourceWidth = Number(item.width ?? media.width ?? width);
+        const sourceHeight = Number(
+          item.height ?? media.height ?? width * 0.75,
+        );
+        const ratio =
+          Number.isFinite(sourceWidth) &&
+          Number.isFinite(sourceHeight) &&
+          sourceWidth > 0 &&
+          sourceHeight > 0
+            ? sourceHeight / sourceWidth
+            : 0.75;
+        const imageHeight = Math.min(
+          900,
+          Math.max(160, Math.round(width * ratio)),
+        );
+        const dataUri = `data:${mime};base64,${image.toString('base64')}`;
+        mediaMarkup.push(
+          `<image x="40" y="${cursor}" width="${width}" height="${imageHeight}" preserveAspectRatio="xMidYMid meet" href="${dataUri}" />`,
+        );
+        cursor += imageHeight + 24;
+      } catch {
+        // Keep the export usable when one stale/deleted media object cannot be
+        // embedded; the remaining note content should still be exported.
+        cursor += 22;
+      }
+    }
+
+    const height = Math.max(320, cursor + 40);
     return Buffer.from(
-      `<svg xmlns="http://www.w3.org/2000/svg" width="900" height="${height}" viewBox="0 0 900 ${height}"><rect width="900" height="${height}" fill="#ffffff"/>${text}</svg>`,
+      `<svg xmlns="http://www.w3.org/2000/svg" width="900" height="${height}" viewBox="0 0 900 ${height}"><rect width="900" height="${height}" fill="#ffffff"/>${text}${mediaMarkup.join('')}</svg>`,
     );
   }
 
@@ -2291,6 +2564,103 @@ export class NoteService {
     };
   }
 
+  /** Contact/group blocks are editor-only metadata and must not cross a read projection. */
+  private stripPrivateCardBlocks(value: unknown): unknown {
+    if (Array.isArray(value)) {
+      return value
+        .map((item) => this.stripPrivateCardBlocks(item))
+        .filter((item) => item !== null);
+    }
+    if (!value || typeof value !== 'object') return value;
+    const record = value as Record<string, unknown>;
+    if (record.type === 'contact' || record.type === 'group') return null;
+    return Object.fromEntries(
+      Object.entries(record).map(([key, item]) => [
+        key,
+        this.stripPrivateCardBlocks(item),
+      ]),
+    );
+  }
+
+  /**
+   * A collected copy is a local editing surface, but its availability badge
+   * must follow the boss's source note. Resolve the short collect chain in one
+   * bounded set of queries so an intermediary cannot keep showing an old
+   * WORKING snapshot after the source was closed or unlisted.
+   */
+  private async overlayCollectedSourceState(
+    notes: NoteRow[],
+  ): Promise<NoteRow[]> {
+    const initialIDs = [
+      ...new Set(
+        notes
+          .map((note) => note.collectedFromNoteID)
+          .filter(
+            (id): id is string => typeof id === 'string' && id.length > 0,
+          ),
+      ),
+    ];
+    if (initialIDs.length === 0) return notes;
+
+    type SourceState = {
+      id: string;
+      status: NoteStatus;
+      available: boolean;
+      workStatus: NoteWorkStatus | null;
+      collectedFromNoteID: string | null;
+    };
+    const states = new Map<string, SourceState>();
+    const queried = new Set<string>();
+    let frontier = initialIDs;
+    for (let depth = 0; depth < 8 && frontier.length > 0; depth += 1) {
+      const ids = frontier.filter((id) => !queried.has(id));
+      if (ids.length === 0) break;
+      ids.forEach((id) => queried.add(id));
+      const rows =
+        (await this.prisma.note.findMany({
+          where: { id: { in: ids } },
+          select: {
+            id: true,
+            status: true,
+            available: true,
+            workStatus: true,
+            collectedFromNoteID: true,
+          },
+        })) ?? [];
+      frontier = rows
+        .map((row) => row.collectedFromNoteID)
+        .filter(
+          (id): id is string => typeof id === 'string' && !queried.has(id),
+        );
+      rows.forEach((row) => states.set(row.id, row));
+    }
+
+    const rootState = (id: string): SourceState | null => {
+      let current = states.get(id) ?? null;
+      const seen = new Set<string>();
+      while (current?.collectedFromNoteID && !seen.has(current.id)) {
+        seen.add(current.id);
+        const parent = states.get(current.collectedFromNoteID);
+        if (!parent) break;
+        current = parent;
+      }
+      return current;
+    };
+
+    return notes.map((note) => {
+      if (!note.collectedFromNoteID) return note;
+      const source = rootState(note.collectedFromNoteID);
+      return source
+        ? {
+            ...note,
+            status: source.status,
+            available: source.available,
+            workStatus: source.workStatus,
+          }
+        : note;
+    });
+  }
+
   private assertExportMediaWithinLimits(media: NoteMediaRow[]) {
     if (media.length > MAX_EXPORT_MEDIA_ITEMS) {
       throw new BadRequestException({
@@ -2337,7 +2707,14 @@ export class NoteService {
     const coverMedia =
       note.coverMedia?.type === 'IMAGE' ? note.coverMedia : fallbackCoverMedia;
     const sections = this.buildSectionsFromRow(note, presignedUrls);
-    const availability = this.getSectionAvailability(sections);
+    const visibleSections = isOwner
+      ? sections
+      : ({
+          ...sections,
+          contacts: { items: [] },
+          groups: { items: [] },
+        } as NoteSections);
+    const availability = this.getSectionAvailability(visibleSections);
 
     return {
       id: note.id,
@@ -2347,6 +2724,10 @@ export class NoteService {
       contentPreview: this.buildPreview(note.content),
       status: note.status,
       available: note.available,
+      workStatus: note.workStatus ?? null,
+      sourceConversationID: isOwner
+        ? (note.sourceConversationID ?? null)
+        : null,
       pinned: isOwner ? note.pinned : false,
       // 备注与来源名片同属笔记主人的私人标注，绝不随分享/访客视图外发。
       remark: isOwner ? (note.remark ?? null) : null,
@@ -2383,14 +2764,27 @@ export class NoteService {
     presignedUrls?: Map<string, string>,
   ): NoteDetailDto {
     const sections = this.buildSectionsFromRow(note, presignedUrls);
+    const visibleSections =
+      note.ownerID === viewerID
+        ? sections
+        : ({
+            ...sections,
+            contacts: { items: [] },
+            groups: { items: [] },
+          } as NoteSections);
+    const publishedBlocks = this.resolvePublishedBlocks(
+      note.contentJson,
+      note,
+      presignedUrls,
+    );
     return {
       ...this.mapSummary(note, viewerID, presignedUrls),
       content: note.content ?? null,
-      contentJson: this.resolvePublishedBlocks(
-        note.contentJson,
-        note,
-        presignedUrls,
-      ),
+      contentJson: (note.ownerID === viewerID
+        ? publishedBlocks
+        : this.stripPrivateCardBlocks(
+            publishedBlocks,
+          )) as NoteDetailDto['contentJson'],
       media: (note.media ?? []).map((item) => ({
         id: item.id,
         type: item.type,
@@ -2410,7 +2804,7 @@ export class NoteService {
             : (item.posterUrl ?? null),
         sortOrder: item.sortOrder,
       })),
-      sections: sections as unknown as NoteSectionsResponseDto,
+      sections: visibleSections as unknown as NoteSectionsResponseDto,
     };
   }
 
@@ -2520,20 +2914,24 @@ export class NoteService {
     note: NoteRow,
     viewerID: string,
   ): Promise<NoteDetailDto> {
+    const [effectiveNote] = await this.overlayCollectedSourceState([note]);
     const presigned = await this.presignNoteMedia(
-      this.collectNoteMediaTargets(note),
+      this.collectNoteMediaTargets(effectiveNote),
     );
-    return this.mapDetail(note, viewerID, presigned);
+    return this.mapDetail(effectiveNote, viewerID, presigned);
   }
 
   private async mapSummaryListResolved(
     notes: NoteRow[],
     viewerID: string,
   ): Promise<NoteSummaryDto[]> {
+    const effectiveNotes = await this.overlayCollectedSourceState(notes);
     const presigned = await this.presignNoteMedia(
-      notes.flatMap((note) => this.collectNoteMediaTargets(note)),
+      effectiveNotes.flatMap((note) => this.collectNoteMediaTargets(note)),
     );
-    return notes.map((note) => this.mapSummary(note, viewerID, presigned));
+    return effectiveNotes.map((note) =>
+      this.mapSummary(note, viewerID, presigned),
+    );
   }
 
   private mapGroup(group: NoteGroupRow): NoteGroupDto {
@@ -3322,6 +3720,70 @@ export class NoteService {
     return isUrlFromStorage(url, this.storagePublicObjectBases) ? url : null;
   }
 
+  /**
+   * Prefer the server-stamped cards from the exact chat message that triggered
+   * collection. The request still carries a legacy fallback for old messages,
+   * but a client cannot replace a newer immutable relay snapshot by editing the
+   * collect request body.
+   */
+  private async resolveCollectedFromMessageSnapshot(
+    source: NoteCollectSourceDto,
+  ): Promise<NoteCollectSourceDto> {
+    const chatMessage = (this.prisma as any).chatMessage;
+    if (!chatMessage?.findFirst || !source.clientMsgID) return source;
+
+    const row = await chatMessage.findFirst({
+      where: {
+        id: source.clientMsgID,
+        conversationID: source.conversationID,
+        type: 'note-card',
+        deleted: false,
+        revokedAt: null,
+      },
+      select: { senderID: true, content: true },
+    });
+    if (
+      !row ||
+      !row.content ||
+      typeof row.content !== 'object' ||
+      Array.isArray(row.content)
+    ) {
+      return source;
+    }
+
+    const content = row.content as Record<string, unknown>;
+    const normalizePeer = (
+      value: unknown,
+      expectedID?: string | null,
+    ): NoteCollectPeerDto | null => {
+      if (!value || typeof value !== 'object' || Array.isArray(value))
+        return null;
+      const card = value as Record<string, unknown>;
+      const id = typeof card.id === 'string' ? card.id.trim() : '';
+      const name = typeof card.name === 'string' ? card.name.trim() : '';
+      if (!id || !name || (expectedID && id !== expectedID)) return null;
+      return {
+        id,
+        name,
+        faceURL:
+          this.storageFaceUrlOrNull(
+            typeof card.faceURL === 'string' ? card.faceURL : undefined,
+          ) ?? undefined,
+      };
+    };
+
+    const sender = normalizePeer(
+      content.personalCardSnapshot,
+      typeof row.senderID === 'string' ? row.senderID : null,
+    );
+    const group = normalizePeer(content.sourceGroupCardSnapshot);
+    return {
+      ...source,
+      ...(sender ? { sender } : {}),
+      ...(group ? { group } : {}),
+    };
+  }
+
   private buildCollectedFrom(
     source: NoteCollectSourceDto,
     note: Pick<NoteRow, 'id' | 'ownerID'>,
@@ -3346,6 +3808,109 @@ export class NoteService {
       sourceNoteId: note.id,
       sourceOwnerId: note.ownerID,
       collectedAt: new Date().toISOString(),
+    };
+  }
+
+  /**
+   * A collected note carries the previous sender's personal card as its default
+   * editable contact card. The chat/group card is an origin snapshot: preserve
+   * one that already exists and seed it only on the first collection from a
+   * group, so later hops cannot replace the boss group's card with the relay
+   * group. These cards stay in the owner's private note sections; read
+   * projections strip them for chat/detail viewers.
+   */
+  /** Resolve the immutable source group when the boss associated the note with
+   * a managed group. If the association is absent (legacy notes), the chat
+   * collect context remains the only available fallback. */
+  private async resolveOriginGroupCard(
+    note: Pick<NoteRow, 'sourceConversationID'>,
+    fallback: NoteCollectSourceDto['group'],
+  ): Promise<NoteCollectSourceDto['group'] | null | undefined> {
+    if (!note.sourceConversationID) return fallback;
+    const chatConversation = (this.prisma as any).chatConversation;
+    if (!chatConversation?.findUnique) return null;
+    const conversation = await chatConversation.findUnique({
+      where: { id: note.sourceConversationID },
+      select: { type: true, circleID: true, name: true, avatarUrl: true },
+    });
+    if (!conversation || conversation.type !== 'GROUP') return null;
+    if (conversation.circleID) {
+      const circle = (this.prisma as any).circle;
+      if (!circle?.findUnique) return null;
+      const row = await circle.findUnique({
+        where: { id: conversation.circleID },
+        select: { id: true, name: true, avatarUrl: true },
+      });
+      return row
+        ? { id: row.id, name: row.name, faceURL: row.avatarUrl ?? undefined }
+        : null;
+    }
+    if (typeof conversation.name !== 'string' || !conversation.name.trim()) {
+      return null;
+    }
+    return {
+      id: note.sourceConversationID,
+      name: conversation.name.trim(),
+      faceURL: conversation.avatarUrl ?? undefined,
+    };
+  }
+
+  private applyCollectSourceCards(
+    sections: unknown,
+    source: NoteCollectSourceDto,
+    originGroup?: NoteCollectSourceDto['group'] | null,
+    inheritedPersonalCard?: Record<string, unknown> | null,
+  ): unknown {
+    const stored = this.isRecord(sections) ? sections : {};
+    const inheritedId =
+      inheritedPersonalCard && typeof inheritedPersonalCard.id === 'string'
+        ? inheritedPersonalCard.id.trim()
+        : '';
+    const inheritedName =
+      inheritedPersonalCard && typeof inheritedPersonalCard.name === 'string'
+        ? inheritedPersonalCard.name.trim()
+        : '';
+    const sender =
+      inheritedId && inheritedName
+        ? {
+            id: inheritedId,
+            name: inheritedName,
+            faceURL: this.storageFaceUrlOrNull(
+              typeof inheritedPersonalCard?.faceURL === 'string'
+                ? inheritedPersonalCard.faceURL
+                : undefined,
+            ),
+          }
+        : {
+            id: source.sender.id,
+            name: source.sender.name,
+            faceURL: this.storageFaceUrlOrNull(source.sender.faceURL),
+          };
+    const storedGroups = this.isRecord(stored.groups) ? stored.groups : null;
+    const groupItems =
+      storedGroups && Array.isArray(storedGroups.items)
+        ? storedGroups.items.filter((item) => this.isRecord(item))
+        : [];
+    const groupSource = originGroup === undefined ? source.group : originGroup;
+    const seededGroup = groupSource
+      ? {
+          id: groupSource.id,
+          name: groupSource.name,
+          faceURL: this.storageFaceUrlOrNull(groupSource.faceURL),
+        }
+      : null;
+
+    return {
+      ...stored,
+      // Every new hop starts with the person who shared this message. The
+      // owner may edit this card afterwards; an idempotent refresh leaves it
+      // untouched (see refreshCollectedNote below).
+      contacts: { items: [sender] },
+      ...(groupItems.length > 0
+        ? { groups: storedGroups }
+        : seededGroup
+          ? { groups: { items: [seededGroup] } }
+          : {}),
     };
   }
 
@@ -3387,6 +3952,7 @@ export class NoteService {
     userID: string,
     sourceNoteID: string,
     collectedFrom: Record<string, unknown>,
+    options?: { title?: string; targetNoteGroupId?: string | null },
   ): Promise<NoteRow | null> {
     const existing = await tx.note.findFirst({
       where: {
@@ -3398,13 +3964,47 @@ export class NoteService {
     });
     if (!existing) return null;
 
+    if (
+      options &&
+      Object.prototype.hasOwnProperty.call(options, 'targetNoteGroupId')
+    ) {
+      if (options.targetNoteGroupId) {
+        const group = await tx.noteGroup.findFirst({
+          where: {
+            id: options.targetNoteGroupId,
+            ownerID: userID,
+            deletedAt: null,
+          },
+          select: { id: true },
+        });
+        if (!group) {
+          throw new NotFoundException({
+            message: 'Note group not found',
+            errorCode: NoteErrorCode.GroupNotFound,
+          });
+        }
+        await tx.noteGroupMembership.upsert({
+          where: { noteID_groupID: { noteID: existing.id, groupID: group.id } },
+          create: { noteID: existing.id, groupID: group.id },
+          update: {},
+        });
+      } else {
+        await tx.noteGroupMembership.deleteMany({
+          where: { noteID: existing.id },
+        });
+      }
+    }
+
     return tx.note.update({
       where: {
         id: existing.id,
         ownerID: userID,
         status: { not: 'DELETED' },
       },
-      data: { collectedFrom: toPrismaJson(collectedFrom) },
+      data: {
+        collectedFrom: toPrismaJson(collectedFrom),
+        ...(options?.title ? { title: options.title } : {}),
+      },
       include: NOTE_INCLUDE,
     });
   }
@@ -3437,6 +4037,8 @@ export class NoteService {
       });
     }
 
+    const [effectiveSource] = await this.overlayCollectedSourceState([source]);
+
     // 自己的笔记本来就在"我的笔记"里 —— 不复制、不打来源标（来源名片只对
     // 收藏他人笔记有意义）。
     if (source.ownerID === userID) {
@@ -3446,7 +4048,13 @@ export class NoteService {
       };
     }
 
-    const collectedFrom = this.buildCollectedFrom(dto.source, source);
+    const effectiveCollectSource =
+      await this.resolveCollectedFromMessageSnapshot(dto.source);
+    const collectedFrom = this.buildCollectedFrom(
+      effectiveCollectSource,
+      source,
+    );
+    const collectedTitle = dto.title?.trim() || source.title;
 
     const media = (source.media ?? []).map((item) => ({
       id: randomUUID(),
@@ -3469,9 +4077,28 @@ export class NoteService {
       media.find((item) => item.type === 'IMAGE')?.id ??
       null;
 
-    const copiedSections = this.rewriteCollectedSectionMediaIds(
-      source.sections,
-      media,
+    const originGroup = await this.resolveOriginGroupCard(
+      source,
+      effectiveCollectSource.group,
+    );
+    const rawSourceSections: unknown = source.sections;
+    const storedSourceSections = this.isRecord(rawSourceSections)
+      ? rawSourceSections
+      : null;
+    const storedSourceContacts =
+      storedSourceSections && this.isRecord(storedSourceSections.contacts)
+        ? storedSourceSections.contacts
+        : null;
+    const sourceContacts = storedSourceContacts?.items;
+    const inheritedPersonalCard =
+      source.collectedFromNoteID && Array.isArray(sourceContacts)
+        ? (sourceContacts.find((item) => this.isRecord(item)) ?? null)
+        : null;
+    const copiedSections = this.applyCollectSourceCards(
+      this.rewriteCollectedSectionMediaIds(source.sections, media),
+      effectiveCollectSource,
+      originGroup,
+      inheritedPersonalCard,
     );
 
     try {
@@ -3485,6 +4112,7 @@ export class NoteService {
             userID,
             dto.noteId,
             collectedFrom,
+            { title: collectedTitle, targetNoteGroupId: dto.targetNoteGroupId },
           );
           if (refreshed) {
             return { note: refreshed, alreadyCollected: true };
@@ -3495,13 +4123,14 @@ export class NoteService {
           const note = await tx.note.create({
             data: {
               ownerID: userID,
-              title: source.title,
+              title: collectedTitle,
               content: source.content,
               contentJson: toPrismaJson(source.contentJson),
               sections: toPrismaJson(copiedSections),
               groupID: null,
               status: 'ACTIVE',
               available: true,
+              workStatus: effectiveSource.workStatus ?? null,
               pinned: false,
               imageCount: source.imageCount,
               videoCount: source.videoCount,
@@ -3511,6 +4140,26 @@ export class NoteService {
               collectedFromNoteID: source.id,
             },
           });
+
+          if (dto.targetNoteGroupId) {
+            const group = await tx.noteGroup.findFirst({
+              where: {
+                id: dto.targetNoteGroupId,
+                ownerID: userID,
+                deletedAt: null,
+              },
+              select: { id: true },
+            });
+            if (!group) {
+              throw new NotFoundException({
+                message: 'Note group not found',
+                errorCode: NoteErrorCode.GroupNotFound,
+              });
+            }
+            await tx.noteGroupMembership.create({
+              data: { noteID: note.id, groupID: group.id },
+            });
+          }
 
           if (media.length > 0) {
             await tx.noteMedia.createMany({
@@ -3545,6 +4194,10 @@ export class NoteService {
               userID,
               dto.noteId,
               collectedFrom,
+              {
+                title: collectedTitle,
+                targetNoteGroupId: dto.targetNoteGroupId,
+              },
             );
           },
         );
@@ -3597,7 +4250,7 @@ export class NoteService {
             noteID: note.id,
             filename: `${basename}.svg`,
             mimeType: 'image/svg+xml',
-            body: this.createLongImageSvg(note, presignedUrls),
+            body: await this.createLongImageSvg(note, presignedUrls),
             contentFingerprint,
           })
         : this.uploadExportArtifact({
@@ -3704,7 +4357,11 @@ export class NoteService {
 
     const existingNote = await this.prisma.note.findFirst({
       where: { id: noteId, ownerID, status: { not: 'DELETED' } },
-      select: { sections: true },
+      select: {
+        sections: true,
+        collectedFromNoteID: true,
+        sourceConversationID: true,
+      },
     });
     if (!existingNote) {
       throw new NotFoundException({
@@ -3757,7 +4414,13 @@ export class NoteService {
       // where a concurrent delete could cause this update to un-delete the note.
       const existing = await tx.note.findFirst({
         where: { id: noteId, ownerID, status: { not: 'DELETED' } },
-        select: { id: true, status: true },
+        select: {
+          id: true,
+          status: true,
+          sections: true,
+          collectedFromNoteID: true,
+          sourceConversationID: true,
+        },
       });
       if (!existing) {
         throw new NotFoundException({
@@ -3818,7 +4481,14 @@ export class NoteService {
           title: derived.title,
           content: derived.content,
           contentJson: toPrismaJson(derived.contentJson),
-          sections: toPrismaJson(derived.sections),
+          sections: toPrismaJson(
+            existing.collectedFromNoteID || existing.sourceConversationID
+              ? this.preserveManagedGroupCard(
+                  derived.sections,
+                  existing.sections,
+                )
+              : derived.sections,
+          ),
           groupID: null,
           // Preserve the existing status when the caller omits it — omitting
           // status on a PATCH must not silently promote an UNLISTED note to ACTIVE.
@@ -3935,7 +4605,7 @@ export class NoteService {
   async setAvailable(ownerID: string, noteId: string, available: boolean) {
     await this.requireOwnedNote(ownerID, noteId);
     // Include ownerID + status guard in the write to close the TOCTOU window.
-    return this.prisma.note.update({
+    const result = await this.prisma.note.update({
       where: { id: noteId, ownerID, status: { not: 'DELETED' } },
       data: { available },
       select: {
@@ -3943,12 +4613,94 @@ export class NoteService {
         available: true,
       },
     });
+    await this.broadcastSourceStatusChanged(noteId);
+    return result;
+  }
+
+  async setWorkStatus(
+    ownerID: string,
+    noteId: string,
+    workStatus: NoteWorkStatus | null,
+  ) {
+    await this.requireOwnedSourceNote(ownerID, noteId);
+    const result = await this.prisma.note.update({
+      where: { id: noteId, ownerID, status: { not: 'DELETED' } },
+      data: { workStatus },
+      select: { id: true, workStatus: true },
+    });
+    await this.broadcastSourceStatusChanged(noteId);
+    return result;
+  }
+
+  async setSourceConversation(
+    ownerID: string,
+    noteId: string,
+    conversationID: string | null,
+  ) {
+    const note = await this.requireOwnedSourceNote(ownerID, noteId);
+    if (conversationID) {
+      const conversation = await this.prisma.chatConversation.findUnique({
+        where: { id: conversationID },
+        select: { type: true, ownerID: true, circleID: true },
+      });
+      if (!conversation || conversation.type !== 'GROUP') {
+        throw new NotFoundException({
+          message: 'Source group not found',
+          errorCode: NoteErrorCode.NotFound,
+        });
+      }
+      let isOwner = conversation.ownerID === ownerID;
+      if (!isOwner && conversation.circleID) {
+        const circle = await this.prisma.circle.findUnique({
+          where: { id: conversation.circleID },
+          select: { ownerID: true, deleted: true },
+        });
+        isOwner = Boolean(
+          circle && !circle.deleted && circle.ownerID === ownerID,
+        );
+      }
+      if (!isOwner) {
+        throw new ForbiddenException(
+          'Only the group owner can bind source notes',
+        );
+      }
+    }
+    const sourceGroupCard = conversationID
+      ? await this.resolveOriginGroupCard(
+          { sourceConversationID: conversationID },
+          undefined,
+        )
+      : null;
+    const nextSections: Record<string, unknown> = this.isRecord(note.sections)
+      ? { ...note.sections }
+      : {};
+    if (sourceGroupCard) {
+      nextSections.groups = {
+        items: [
+          {
+            id: sourceGroupCard.id,
+            name: sourceGroupCard.name,
+            faceURL: sourceGroupCard.faceURL ?? null,
+          },
+        ],
+      };
+    } else {
+      delete nextSections.groups;
+    }
+    return this.prisma.note.update({
+      where: { id: noteId, ownerID, status: { not: 'DELETED' } },
+      data: {
+        sourceConversationID: conversationID,
+        sections: toPrismaJson(nextSections),
+      },
+      select: { id: true, sourceConversationID: true },
+    });
   }
 
   async setStatus(ownerID: string, noteId: string, status: NoteWritableStatus) {
     await this.requireOwnedNote(ownerID, noteId);
     // Include ownerID + status guard in the write to close the TOCTOU window.
-    return this.prisma.note.update({
+    const result = await this.prisma.note.update({
       where: { id: noteId, ownerID, status: { not: 'DELETED' } },
       data: { status },
       select: {
@@ -3956,6 +4708,8 @@ export class NoteService {
         status: true,
       },
     });
+    await this.broadcastSourceStatusChanged(noteId);
+    return result;
   }
 
   /** FE#92 回收站：已软删笔记列表（新删在前）。 */
@@ -4040,6 +4794,7 @@ export class NoteService {
         errorCode: NoteErrorCode.NotFound,
       });
     }
+    await this.broadcastSourceStatusChanged(noteId);
   }
 
   async deleteNote(ownerID: string, noteId: string): Promise<void> {
@@ -4051,6 +4806,7 @@ export class NoteService {
       data: { status: 'DELETED' },
       select: { id: true },
     });
+    await this.broadcastSourceStatusChanged(noteId);
   }
 
   async listGroups(ownerID: string): Promise<NoteGroupDto[]> {

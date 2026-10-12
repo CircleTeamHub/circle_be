@@ -135,6 +135,11 @@ enum NoteStatus {
   DELETED
 }
 
+enum NoteWorkStatus {
+  WORKING
+  CLOSED
+}
+
 enum NoteMediaType {
   IMAGE
   VIDEO
@@ -1070,8 +1075,11 @@ model Note {
   content             String?
   contentJson         Json?
   sections            Json?
-  status              NoteStatus @default(ACTIVE)
-  available           Boolean    @default(true)
+  status              NoteStatus     @default(ACTIVE)
+  available           Boolean        @default(true)
+  workStatus          NoteWorkStatus?
+  /// 老板在群设置中绑定的来源聊天会话；收藏副本不继承此字段。
+  sourceConversationID String?
   pinned              Boolean    @default(false)
   coverMediaID        String?    @unique
   mediaCount          Int        @default(0)
@@ -1101,6 +1109,7 @@ model Note {
   @@index([ownerID, status, updatedAt])
   @@index([ownerID, pinned, updatedAt])
   @@index([groupID])
+  @@index([sourceConversationID])
 }
 
 model NoteDraft {
