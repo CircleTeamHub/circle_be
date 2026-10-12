@@ -3733,6 +3733,9 @@ export class NoteService {
     const chatMessage = (this.prisma as any).chatMessage;
     if (!chatMessage?.findFirst || !source.clientMsgID) return source;
 
+    // Despite its OpenIM-era name, clientMsgID carries the server message UUID
+    // (ChatMessageDto.id). Do not switch this to clientMessageId: the `d` key is
+    // only delivered to the author, so collectors never know it.
     const row = await chatMessage.findFirst({
       where: {
         id: source.clientMsgID,
