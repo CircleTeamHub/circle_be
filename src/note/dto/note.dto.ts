@@ -145,6 +145,9 @@ export class NoteTextSectionDto {
   @IsOptional()
   @IsArray()
   @ArrayMaxSize(500)
+  // 全局管道开了 enableImplicitConversion：不声明元素类型时，class-transformer
+  // 按反射到的 Array 把每个正文块对象「转换」成空数组，富文本结构整段丢失。
+  @Type(() => Object)
   contentJson?: Record<string, unknown>[];
 }
 
@@ -324,6 +327,9 @@ export class CreateNoteDto {
   @IsOptional()
   @IsArray()
   @ArrayMaxSize(500)
+  // 全局管道开了 enableImplicitConversion：不声明元素类型时，class-transformer
+  // 按反射到的 Array 把每个正文块对象「转换」成空数组，富文本结构整段丢失。
+  @Type(() => Object)
   contentJson?: Record<string, unknown>[];
 
   @ApiPropertyOptional({ type: [String] })
@@ -406,6 +412,9 @@ export class SaveNoteDraftDto {
   @IsOptional()
   @IsArray()
   @ArrayMaxSize(500)
+  // 全局管道开了 enableImplicitConversion：不声明元素类型时，class-transformer
+  // 按反射到的 Array 把每个正文块对象「转换」成空数组，富文本结构整段丢失。
+  @Type(() => Object)
   contentJson?: Record<string, unknown>[];
 
   @ApiPropertyOptional({ type: NoteSectionsDto })
