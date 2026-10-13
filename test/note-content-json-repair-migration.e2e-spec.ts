@@ -2,7 +2,6 @@ import { randomUUID } from 'node:crypto';
 import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { Client } from 'pg';
-import { NOTE_CONTENT_JSON_REPAIR_STATEMENTS } from '../src/note/note-content-json-repair';
 
 function allowlistedTestDatabaseUrl(): string | null {
   const databaseUrl =
@@ -143,34 +142,5 @@ describePostgres('note contentJson repair migration', () => {
     const before = await snapshot('Note');
     await client.query(migrationSql);
     expect(await snapshot('Note')).toEqual(before);
-  });
-
-  // 迁移跑完到切流之间，旧版本还会写出被清空的形状；新版本的定时任务
-  // 用同一组语句把它们收回来，且不碰正常行。
-  it('repairs rows wiped by an old writer after the migration with the runtime statements', async () => {
-    await client.query(
-      `UPDATE "Note" SET "contentJson" = $1::jsonb, "sections" = $2::jsonb WHERE "id" = 'wiped'`,
-      [
-        JSON.stringify([[], []]),
-        JSON.stringify({ text: { content: '你好', contentJson: [[]] } }),
-      ],
-    );
-    const before = await snapshot('Note');
-    for (const statement of NOTE_CONTENT_JSON_REPAIR_STATEMENTS) {
-      await client.query(statement.sql);
-    }
-    const after = await snapshot('Note');
-    expect(after.get('wiped')).toEqual({
-      id: 'wiped',
-      contentJson: null,
-      sections: { text: { content: '你好' } },
-    });
-    for (const id of [...before.keys()].filter((id) => id !== 'wiped')) {
-      expect(after.get(id)).toEqual(before.get(id));
-    }
-    for (const statement of NOTE_CONTENT_JSON_REPAIR_STATEMENTS) {
-      await client.query(statement.sql);
-    }
-    expect(await snapshot('Note')).toEqual(after);
   });
 });

@@ -7,17 +7,11 @@ import { NoteController } from './note.controller';
 import { NoteService } from './note.service';
 import { NoteShareLinkCleanup } from './note-share-link.cleanup';
 import { NoteRecycleBinCleanup } from './note-recycle-bin.cleanup';
-import { NoteContentJsonRepair } from './note-content-json-repair';
 
 @Module({
   imports: [UploadModule, MembershipPolicyModule, RealtimeModule],
   controllers: [NoteController, NoteShareLinkPublicController],
-  providers: [
-    NoteService,
-    NoteShareLinkCleanup,
-    NoteRecycleBinCleanup,
-    NoteContentJsonRepair,
-  ],
+  providers: [NoteService, NoteShareLinkCleanup, NoteRecycleBinCleanup],
   exports: [NoteService],
 })
 export class NoteModule {}
