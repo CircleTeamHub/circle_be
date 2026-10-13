@@ -1,4 +1,5 @@
 import { Test, TestingModule } from '@nestjs/testing';
+import * as notePurge from './note-purge';
 import {
   BadRequestException,
   ConflictException,
@@ -49,6 +50,11 @@ describe('NoteService', () => {
       findFirst: jest.fn(),
       findUnique: jest.fn(),
       findMany: jest.fn(),
+    },
+    // 绑定独立群要求本人座位仍在；收藏时按收藏者视角重算独立群名片。
+    chatMember: {
+      findUnique: jest.fn().mockResolvedValue({ leftAt: null, remark: null }),
+      findMany: jest.fn().mockResolvedValue([]),
     },
     note: {
       count: jest.fn(),
@@ -108,6 +114,22 @@ describe('NoteService', () => {
 
   beforeEach(async () => {
     jest.clearAllMocks();
+    // 收录链查来源（where.id.in）默认查到上架中的原笔记：现在「查过却查不到」
+    // 等于原笔记已被永久删除（副本跟着不可分发），老用例没桩来源时不能被误判。
+    // 关心来源状态的用例自己覆盖。
+    prisma.note.findMany.mockReset();
+    prisma.note.findMany.mockImplementation(async (args?: any) => {
+      const ids: unknown = args?.where?.id?.in;
+      return Array.isArray(ids)
+        ? ids.map((id) => ({
+            id,
+            status: 'ACTIVE',
+            available: true,
+            workStatus: null,
+            collectedFromNoteID: null,
+          }))
+        : [];
+    });
     // 群名片即绑定：默认 user-1 是 circle-1 那个圈子群的群主，老用例里挂圈子群名片照常可绑。
     prisma.chatConversation.findFirst.mockReset();
     prisma.chatConversation.findFirst.mockResolvedValue({
@@ -127,10 +149,15 @@ describe('NoteService', () => {
     // 其他原生查询维持默认空结果。
     prisma.$queryRaw.mockReset();
     prisma.$queryRaw.mockImplementation(
-      async (strings: TemplateStringsArray) =>
-        strings.join('?').includes('FROM "ChatConversation"')
-          ? [await prisma.chatConversation.findUnique()]
-          : [],
+      async (strings: TemplateStringsArray) => {
+        const sql = strings.join('?');
+        // 编辑笔记在事务内锁读笔记行（FOR UPDATE），沿用 findFirst 桩的调用顺序。
+        if (sql.includes('FROM "Note"')) {
+          const note = await prisma.note.findFirst();
+          return note ? [note] : [];
+        }
+        return [];
+      },
     );
     prisma.circle.findFirst.mockReset();
     prisma.circle.findFirst.mockResolvedValue(null);
@@ -4548,6 +4575,67 @@ describe('NoteService', () => {
     expect(detail.canEdit).toBe(false);
   });
 
+  // Codex P1：回收站「立即删除」/30 天清理会把原笔记整行删掉，副本不能因此
+  // 「找不到来源」就退回自己的 ACTIVE 状态重新可读、可分享、可再收藏。
+  describe('copies of a permanently deleted source', () => {
+    const copyOf = (sourceID: string) => ({
+      ...otherUsersNote,
+      id: 'note-copy',
+      ownerID: 'user-1',
+      status: 'ACTIVE',
+      available: true,
+      collectedFrom: { kind: 'chat', conversationType: 'private' },
+      collectedFromNoteID: sourceID,
+    });
+
+    it('blocks other viewers once the root row is gone', async () => {
+      prisma.note.findFirst.mockResolvedValueOnce(copyOf('purged-root'));
+      prisma.note.findMany.mockImplementation(async () => []);
+
+      await expect(service.getNote('user-9', 'note-copy')).rejects.toThrow(
+        NotFoundException,
+      );
+    });
+
+    it('blocks other viewers when a purged note sits in the middle of the chain', async () => {
+      prisma.note.findFirst.mockResolvedValueOnce(copyOf('relay'));
+      // 中转副本还在，但它指向的根已经被硬删。
+      prisma.note.findMany.mockImplementation(async (args: any) =>
+        args.where.id.in.includes('relay')
+          ? [
+              {
+                id: 'relay',
+                status: 'ACTIVE',
+                available: true,
+                workStatus: null,
+                collectedFromNoteID: 'purged-root',
+              },
+            ]
+          : [],
+      );
+
+      await expect(service.getNote('user-9', 'note-copy')).rejects.toThrow(
+        NotFoundException,
+      );
+    });
+
+    it('still lets the copy owner open their own copy', async () => {
+      prisma.note.findFirst.mockResolvedValueOnce(copyOf('purged-root'));
+      prisma.note.findMany.mockImplementation(async () => []);
+
+      const detail = await service.getNote('user-1', 'note-copy');
+      expect(detail.status).toBe('DELETED');
+    });
+
+    it('reports the purged source as deleted to the owner list', async () => {
+      prisma.note.findMany.mockImplementation(async () => []);
+      const [effective] = await (service as any).overlayCollectedSourceState([
+        copyOf('purged-root'),
+      ]);
+      expect(effective).toMatchObject({ status: 'DELETED', available: false });
+    });
+  });
+
   // ── updateNote：收藏副本上的原作者媒体 key 豁免 ────────────────────────────
 
   it('updateNote keeps grandfathered foreign media keys already on the note', async () => {
@@ -5832,20 +5920,23 @@ describe('NoteService', () => {
     });
   });
 
+  // 真正的删除（收录链改指向、唯一索引避让、只认回收站）在真库 e2e
+  // test/note-purge-chain.e2e-spec.ts 里验证；这里只守接口口径。
   describe('purgeNote (recycle bin delete now)', () => {
-    it('hard-deletes only the owner note that is already in the recycle bin', async () => {
-      prisma.note.deleteMany.mockResolvedValueOnce({ count: 1 });
+    it('purges through the shared recycle-bin delete with an owner guard', async () => {
+      const purge = jest
+        .spyOn(notePurge, 'purgeDeletedNote')
+        .mockResolvedValueOnce(true);
 
       await service.purgeNote('user-1', 'note-1');
 
-      // 与 30 天到期清理同一语义：只删行（媒体/分组随外键级联），只认 DELETED。
-      expect(prisma.note.deleteMany).toHaveBeenCalledWith({
-        where: { id: 'note-1', ownerID: 'user-1', status: 'DELETED' },
+      expect(purge).toHaveBeenCalledWith(prisma, 'note-1', {
+        ownerID: 'user-1',
       });
     });
 
     it('404s for a note that is not in my recycle bin (active, foreign or missing)', async () => {
-      prisma.note.deleteMany.mockResolvedValueOnce({ count: 0 });
+      jest.spyOn(notePurge, 'purgeDeletedNote').mockResolvedValueOnce(false);
 
       await expect(service.purgeNote('user-1', 'note-1')).rejects.toThrow(
         NotFoundException,

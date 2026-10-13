@@ -241,7 +241,7 @@ export class GroupService {
       //
       // 只是重读一遍不够。事务是 SERIALIZABLE,但 SSI 要形成 dangerous structure
       // 才会中止,单独一条 rw 依赖(我读 Circle、别人写 Circle)并不必然触发。
-      // FOR UPDATE 拿真实行锁才有确定语义:停用先提交 → 这里报 40001(P2034),
+      // FOR UPDATE 拿真实行锁才有确定语义:停用先提交 → 这里报 40001(原生查询被 Prisma 包成 P2010,isRetryableTransactionError 识别),
       // runSerializableTransaction 重试后读到 deleted=true 正常拒绝;本事务先
       // 拿到锁 → 停用阻塞到提交后生效,此时角色变更确实发生在停用之前,放行是对的。
       //

@@ -9,8 +9,8 @@
 -- 顶层 contentJson 置 NULL，sections.text.contentJson 整个键删掉。客户端遇到没有块
 -- 时会回退显示 / 编辑 content。只匹配被清空的形状，可重复执行；不碰 updatedAt。
 --
--- jsonb_array_length 对非数组会直接报错，而 Postgres 不保证 AND 的求值顺序，
--- 所以类型判断必须放在 CASE 里。
+-- jsonb_array_length 对非数组会直接报错，而 Postgres 不保证 AND / OR 的求值顺序，
+-- 所以外层值和每个块元素的类型判断都必须放在 CASE 里（正常笔记的块是对象）。
 
 UPDATE "Note"
 SET "contentJson" = NULL
@@ -19,7 +19,10 @@ WHERE CASE
     jsonb_array_length("contentJson") > 0
     AND NOT EXISTS (
       SELECT 1 FROM jsonb_array_elements("contentJson") AS block
-      WHERE jsonb_typeof(block) <> 'array' OR jsonb_array_length(block) <> 0
+      WHERE CASE
+        WHEN jsonb_typeof(block) = 'array' THEN jsonb_array_length(block) <> 0
+        ELSE true
+      END
     )
   ELSE false
 END;
@@ -31,7 +34,10 @@ WHERE CASE
     jsonb_array_length("sections" -> 'text' -> 'contentJson') > 0
     AND NOT EXISTS (
       SELECT 1 FROM jsonb_array_elements("sections" -> 'text' -> 'contentJson') AS block
-      WHERE jsonb_typeof(block) <> 'array' OR jsonb_array_length(block) <> 0
+      WHERE CASE
+        WHEN jsonb_typeof(block) = 'array' THEN jsonb_array_length(block) <> 0
+        ELSE true
+      END
     )
   ELSE false
 END;
@@ -43,7 +49,10 @@ WHERE CASE
     jsonb_array_length("contentJson") > 0
     AND NOT EXISTS (
       SELECT 1 FROM jsonb_array_elements("contentJson") AS block
-      WHERE jsonb_typeof(block) <> 'array' OR jsonb_array_length(block) <> 0
+      WHERE CASE
+        WHEN jsonb_typeof(block) = 'array' THEN jsonb_array_length(block) <> 0
+        ELSE true
+      END
     )
   ELSE false
 END;
@@ -55,7 +64,10 @@ WHERE CASE
     jsonb_array_length("sections" -> 'text' -> 'contentJson') > 0
     AND NOT EXISTS (
       SELECT 1 FROM jsonb_array_elements("sections" -> 'text' -> 'contentJson') AS block
-      WHERE jsonb_typeof(block) <> 'array' OR jsonb_array_length(block) <> 0
+      WHERE CASE
+        WHEN jsonb_typeof(block) = 'array' THEN jsonb_array_length(block) <> 0
+        ELSE true
+      END
     )
   ELSE false
 END;

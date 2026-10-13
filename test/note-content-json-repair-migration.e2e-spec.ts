@@ -76,6 +76,13 @@ describePostgres('note contentJson repair migration', () => {
       sections: { text: { contentJson: { not: 'an array' } }, media: 3 },
     },
     { id: 'nulls', contentJson: null, sections: null },
+    // 块元素是对象/字符串/数字/null/布尔：jsonb_array_length 碰到它们会报错，
+    // 迁移必须用 CASE 先判类型，不能依赖 OR 短路（Postgres 不保证求值顺序）。
+    {
+      id: 'scalar-blocks',
+      contentJson: [[], 'text', 3, null, true],
+      sections: { text: { contentJson: [block, 'x', 0, false, null] } },
+    },
   ];
 
   async function snapshot(table: string): Promise<Map<string, Row>> {

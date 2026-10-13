@@ -214,6 +214,9 @@ export class NoteContactCardDto {
 }
 
 /** A group card is also a snapshot; it must not turn a note read into a roster read. */
+/** 群名片名称上限（按码点计，与 class-validator 的 MaxLength 同一口径）。 */
+export const NOTE_GROUP_CARD_NAME_MAX = 120;
+
 export class NoteGroupCardDto {
   @ApiProperty({ description: 'OpenIM group identifier.' })
   @IsString()
@@ -242,7 +245,7 @@ export class NoteGroupCardDto {
   @ApiProperty()
   @IsString()
   @IsNotEmpty()
-  @MaxLength(120)
+  @MaxLength(NOTE_GROUP_CARD_NAME_MAX)
   name: string;
 
   @ApiPropertyOptional()
