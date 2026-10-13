@@ -89,6 +89,8 @@ export function buildNestFactoryOptions() {
         'Content-Type',
         'X-Request-Id',
         'X-Device-Name',
+        // 陌生设备登录验证的设备标识；网页端不放行就永远被当成陌生设备。
+        'X-Device-Id',
         'Idempotency-Key',
       ],
       // GET /note and /note/recycle-bin signal truncation through this header
