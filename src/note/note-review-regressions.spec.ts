@@ -63,16 +63,31 @@ describe('note review regressions', () => {
         findFirst: jest.fn().mockResolvedValue(null),
         findUnique: jest.fn().mockResolvedValue(null),
       },
-      user: { findUnique: jest.fn() },
+      // 绑定独立群要求本人座位仍在：默认在群里，个别用例覆盖成已退群。
+      chatMember: {
+        findUnique: jest.fn().mockResolvedValue({ leftAt: null, remark: null }),
+        findMany: jest.fn().mockResolvedValue([]),
+      },
+      user: {
+        findUnique: jest.fn(),
+        findMany: jest.fn().mockResolvedValue([]),
+      },
       $transaction: jest.fn(),
       // 事务内复核群主走 FOR SHARE 原生查询；默认与 findUnique 桩读到同一行。
       $queryRaw: jest.fn(),
     };
     prisma.$transaction.mockImplementation(async (run) => run(prisma));
-    prisma.$queryRaw.mockImplementation(async () => {
-      const conversation = await prisma.chatConversation.findUnique();
-      return conversation ? [conversation] : [];
-    });
+    prisma.$queryRaw.mockImplementation(
+      async (strings: TemplateStringsArray) => {
+        // 事务内的座位复核与会话复核各读各的桩，口径与事务外一致。
+        if (strings.join('').includes('"ChatMember"')) {
+          const seat = await prisma.chatMember.findUnique();
+          return seat ? [seat] : [];
+        }
+        const conversation = await prisma.chatConversation.findUnique();
+        return conversation ? [conversation] : [];
+      },
+    );
     const policy = { lockUsers: jest.fn().mockResolvedValue(undefined) };
     const upload = {
       createPresignedGetUrl: jest.fn().mockImplementation(async (key) => ({
@@ -751,6 +766,10 @@ describe('note review regressions', () => {
         schemas.NoteGroupCardResponseDto.properties.conversationID,
       ).toMatchObject({ type: 'string' });
       expect(schemas.NoteCardPeerDto.properties.conversationID).toMatchObject({
+        type: 'string',
+        nullable: true,
+      });
+      expect(schemas.NoteCardPeerDto.properties.circleId).toMatchObject({
         type: 'string',
         nullable: true,
       });
@@ -1519,6 +1538,93 @@ describe('note review regressions', () => {
         expect((prisma.note as any).update).not.toHaveBeenCalled();
       },
     );
+
+    // Codex P2：解散独立群只置 leftAt、不动 ownerID。事务外检查之后群被解散，
+    // 事务内锁住会话再读本人座位，必须拒绝。
+    it.each(['create', 'update'])(
+      'rejects binding a standalone group dissolved after the early check (%s)',
+      async (mode) => {
+        const { service, prisma, note } = publicationFixture(null);
+        Object.assign(note, {
+          sourceConversationID: null,
+          collectedFromNoteID: null,
+          sections: {},
+        });
+        standaloneOwnedBy(prisma, 'owner');
+        prisma.$queryRaw.mockImplementation(
+          async (strings: TemplateStringsArray) =>
+            strings.join('').includes('"ChatMember"')
+              ? [{ leftAt: new Date() }]
+              : [{ type: 'GROUP', ownerID: 'owner', circleID: null }],
+        );
+        const input = {
+          title: 'Dissolved',
+          media: [],
+          sections: { groups: { items: [{ id: 'conv-s', name: 'x' }] } },
+        };
+        await expect(
+          mode === 'create'
+            ? service.createNote('owner', input)
+            : service.updateNote('owner', 'note-1', input),
+        ).rejects.toBeInstanceOf(ForbiddenException);
+        const memberLock = prisma.$queryRaw.mock.calls.find(([strings]) =>
+          strings.join('?').includes('"ChatMember"'),
+        );
+        expect(memberLock?.[0].join('?')).toContain('FOR SHARE');
+        expect((prisma.note as any).create).not.toHaveBeenCalled();
+        expect((prisma.note as any).update).not.toHaveBeenCalled();
+      },
+    );
+
+    // Codex P2：「笔记管理」绑定接口只带 conversationID，没有客户端展示名。
+    // 无名独立群要由服务端给出名字，不能绑上了却把群名片删掉。
+    function unnamedStandalone(prisma: any) {
+      prisma.chatConversation.findUnique.mockResolvedValue({
+        type: 'GROUP',
+        ownerID: 'owner',
+        circleID: null,
+        name: null,
+        avatarUrl: null,
+      });
+      prisma.chatMember.findMany.mockResolvedValue([
+        { userID: 'u1' },
+        { userID: 'u2' },
+      ]);
+      prisma.user.findMany.mockResolvedValue([
+        { id: 'u2', nickname: '小红', accountId: 'b' },
+        { id: 'u1', nickname: '', accountId: 'xiaoming' },
+      ]);
+    }
+
+    it('binds an unnamed standalone group from group settings with a member-derived name', async () => {
+      const { service, prisma } = publicationFixture(null);
+      unnamedStandalone(prisma);
+      await service.setSourceConversation('owner', 'note-1', 'conv-u');
+      const data = (prisma.note as any).update.mock.calls.at(-1)[0].data;
+      expect(data.sourceConversationID).toBe('conv-u');
+      // 按入群先后取成员昵称，没昵称用账号。
+      expect(data.sections.groups.items).toEqual([
+        {
+          id: 'conv-u',
+          name: 'xiaoming、小红',
+          faceURL: null,
+          conversationID: 'conv-u',
+        },
+      ]);
+    });
+
+    it('prefers my own group remark as the name of an unnamed standalone group', async () => {
+      const { service, prisma } = publicationFixture(null);
+      unnamedStandalone(prisma);
+      prisma.chatMember.findUnique.mockResolvedValue({
+        leftAt: null,
+        remark: ' 我的小群 ',
+      });
+      await service.setSourceConversation('owner', 'note-1', 'conv-u');
+      const data = (prisma.note as any).update.mock.calls.at(-1)[0].data;
+      expect(data.sections.groups.items[0].name).toBe('我的小群');
+      expect(prisma.chatMember.findMany).not.toHaveBeenCalled();
+    });
 
     // 前端 P1：独立群名片要带服务端可信的 conversationID，圈子群不带，请求里伪造的不收。
     it('never keeps a request conversationID: circle cards drop it, standalone cards get the server value', async () => {

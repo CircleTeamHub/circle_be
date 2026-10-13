@@ -823,6 +823,9 @@ export class NoteCardPeerDto {
   /** 仅群名片：独立群的会话 id；圈子群为 null。联系人名片不输出。 */
   @ApiPropertyOptional({ nullable: true, type: String })
   conversationID?: string | null;
+  /** 仅群名片：规范圈子 UUID。旧版卡片 id 是 OpenIM groupID 时靠它路由；其余为 null。 */
+  @ApiPropertyOptional({ nullable: true, type: String })
+  circleId?: string | null;
 }
 
 export class NoteCardPreviewDto {

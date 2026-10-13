@@ -1265,8 +1265,10 @@ describe('NoteService', () => {
         contacts: { items: [contact(1), contact(2), contact(3), contact(4)] },
         groups: {
           items: [
+            // 旧版圈子卡片：id 是 OpenIM groupID，规范圈子 UUID 存在 circleId。
             {
               id: 'chat-group-1',
+              circleId: 'circle-uuid-1',
               name: '玫瑰刺群',
               avatarUrl: 'https://cdn.example.com/g1.jpg',
             },
@@ -1317,12 +1319,14 @@ describe('NoteService', () => {
             name: '玫瑰刺群',
             faceURL: 'https://cdn.example.com/g1.jpg',
             conversationID: null,
+            circleId: 'circle-uuid-1',
           },
           {
             id: 'conv-standalone',
             name: '独立群',
             faceURL: null,
             conversationID: 'conv-standalone',
+            circleId: null,
           },
         ],
       });

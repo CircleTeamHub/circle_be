@@ -302,6 +302,8 @@ const MAX_NOTE_BLOCK_DEPTH = 10;
 const NOTE_LINE_SEPARATOR = '\n';
 /** 列表卡片每类名片（个人/群）最多带几个摘要。 */
 const NOTE_CARD_PREVIEW_LIMIT = 3;
+/** 无名独立群的兜底名取几位成员昵称。 */
+const UNNAMED_GROUP_LABEL_MEMBERS = 3;
 /** 表格同一行内的列分隔符。 */
 const NOTE_TABLE_CELL_SEPARATOR = '\t';
 /**
@@ -2634,11 +2636,17 @@ export class NoteService {
         id,
         name,
         faceURL: face,
+        // 群名片带路由所需的两种 id：独立群的会话 id；旧版圈子卡片的 id 是 OpenIM
+        // groupID，规范圈子 UUID 单独存在 circleId（canonicalizeNoteCards 写入）。
         ...(groups
           ? {
               conversationID:
                 typeof item.conversationID === 'string' && item.conversationID
                   ? item.conversationID
+                  : null,
+              circleId:
+                typeof item.circleId === 'string' && item.circleId
+                  ? item.circleId
                   : null,
             }
           : {}),
@@ -4881,6 +4889,43 @@ export class NoteService {
   }
 
   /**
+   * 没有群名的独立群在「笔记管理」绑定时没有客户端展示名可用：先用本人的群备注
+   * （只有自己看得见，与客户端会话列表同一优先级），否则取最早入群的三位成员
+   * 昵称拼成名字。只在会话本身没名字时才会被用到。
+   */
+  private async unnamedGroupLabel(
+    viewerID: string,
+    conversationID: string,
+  ): Promise<string | undefined> {
+    const own = await this.prisma.chatMember.findUnique({
+      where: { conversationID_userID: { conversationID, userID: viewerID } },
+      select: { remark: true },
+    });
+    const remark = own?.remark?.trim();
+    if (remark) return remark;
+    const seats = await this.prisma.chatMember.findMany({
+      where: { conversationID, leftAt: null },
+      orderBy: { joinedAt: 'asc' },
+      take: UNNAMED_GROUP_LABEL_MEMBERS,
+      select: { userID: true },
+    });
+    if (!seats.length) return undefined;
+    const users = await this.prisma.user.findMany({
+      where: { id: { in: seats.map((seat) => seat.userID) } },
+      select: { id: true, nickname: true, accountId: true },
+    });
+    const byId = new Map(users.map((user) => [user.id, user]));
+    const label = seats
+      .map((seat) => {
+        const user = byId.get(seat.userID);
+        return user ? user.nickname?.trim() || user.accountId : '';
+      })
+      .filter(Boolean)
+      .join('、');
+    return label || undefined;
+  }
+
+  /**
    * 只有群主能把笔记绑到群上：独立群看会话群主，圈子群看圈主。
    *
    * 传 tx 时是写笔记那个事务里的复核：对会话行加 FOR SHARE，与
@@ -4929,12 +4974,32 @@ export class NoteService {
         'Only the group owner can bind source notes',
       );
     }
+    // 解散独立群只把所有座位置 leftAt、不动 ownerID：光看群主会把笔记绑到
+    // 已解散的群上。还要本人座位仍在。事务内同样加 FOR SHARE：解散先提交时
+    // 这里报序列化冲突（P2034）由 runSerializableTransaction 重试，重试后读到
+    // leftAt 正常拒绝；锁顺序与解散一致（先会话、后座位），不会死锁。
+    if (!conversation.circleID) {
+      const seat = tx
+        ? (
+            await tx.$queryRaw<Array<{ leftAt: Date | null }>>`
+              SELECT "leftAt" FROM "ChatMember"
+              WHERE "conversationID" = ${conversationID}
+                AND "userID" = ${ownerID} FOR SHARE`
+          )[0]
+        : await this.prisma.chatMember.findUnique({
+            where: {
+              conversationID_userID: { conversationID, userID: ownerID },
+            },
+            select: { leftAt: true },
+          });
+      if (!seat || seat.leftAt) {
+        throw new ForbiddenException(
+          'Only the group owner can bind source notes',
+        );
+      }
+    }
   }
 
-  /**
-   * 群名片的 id 有两种口径：圈子群是圈子 id（老数据也可能是 groupID），
-   * 独立群是会话 id。绑定要落到会话上，这里统一换算成会话 id。
-   */
   /**
    * 圈子群聊会话是懒创建的（第一次有人打开群聊才建）。圈主给还没建会话的
    * 圈子加群名片时，与他打开群聊一样先把会话建出来再绑定，否则会被误判成
@@ -4954,6 +5019,10 @@ export class NoteService {
     return this.circleSync.ensureCircleConversation(circle.id);
   }
 
+  /**
+   * 群名片的 id 有两种口径：圈子群是圈子 id（老数据也可能是 groupID），
+   * 独立群是会话 id。绑定要落到会话上，这里统一换算成会话 id。
+   */
   private async findGroupConversationIdForCard(
     cardId: string,
   ): Promise<string | null> {
@@ -5069,8 +5138,17 @@ export class NoteService {
       ? await this.resolveOriginGroupCard(
           { sourceConversationID: conversationID },
           undefined,
+          await this.unnamedGroupLabel(ownerID, conversationID),
         )
       : null;
+    // 绑定与群名片一一对应：绑上了却拿不到名片（群已不可用）就整单拒绝，
+    // 不能留下「有绑定、没名片」的半截状态。
+    if (conversationID && !sourceGroupCard) {
+      throw new NotFoundException({
+        message: 'Source group not found',
+        errorCode: NoteErrorCode.NotFound,
+      });
+    }
     const nextSections: Record<string, unknown> = this.isRecord(note.sections)
       ? { ...note.sections }
       : {};
