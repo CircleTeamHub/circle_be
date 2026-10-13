@@ -219,6 +219,20 @@ type RealtimeEvent =
   | {
       type: 'user.profile.summary.changed';
       payload: UserProfileSummaryPayload;
+    }
+  | {
+      // 陌生设备登录验证：受信任设备据此弹「是否是你本人」。
+      type: 'auth.login.challenge.created';
+      payload: { challengeId: string; changedAt: string };
+    }
+  | {
+      // 某台受信任设备已处理（或新设备已通过），其他设备收起弹窗。
+      type: 'auth.login.challenge.resolved';
+      payload: {
+        challengeId: string;
+        status: 'APPROVED' | 'REJECTED' | 'CONSUMED';
+        changedAt: string;
+      };
     };
 
 @Injectable()

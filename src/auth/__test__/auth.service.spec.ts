@@ -1,5 +1,6 @@
 import { Test, TestingModule } from '@nestjs/testing';
 import { AuthService } from '../auth.service';
+import { DeviceTrustService } from '../device-trust.service';
 import { JwtService } from '@nestjs/jwt';
 import { ConfigService } from '@nestjs/config';
 import {
@@ -88,6 +89,14 @@ describe('AuthService', () => {
     $transaction: jest.fn(async (operation: any) => operation(mockPrisma)),
   };
 
+  const mockDeviceTrust = {
+    evaluateLogin: jest.fn(() => Promise.resolve({ kind: 'trusted' })),
+    trustOnRefresh: jest.fn(() => Promise.resolve()),
+    revokeDevice: jest.fn(() => Promise.resolve()),
+    revokeOtherDevices: jest.fn(() => Promise.resolve()),
+    consumeWithCode: jest.fn(),
+    completeVerifiedLogin: jest.fn(() => Promise.resolve()),
+  };
   const mockRefreshTokenService = {
     create: jest.fn(() =>
       Promise.resolve({ token: 'refresh-token', sessionId: 'session-1' }),
@@ -109,6 +118,9 @@ describe('AuthService', () => {
     listActiveSessions: jest.fn(() => Promise.resolve([])),
     revokeSession: jest.fn(() => Promise.resolve()),
     revokeOtherSessions: jest.fn(() => Promise.resolve()),
+    findSessionDeviceKey: jest.fn((_userId: string, sessionId: string) =>
+      Promise.resolve(`device-key-of-${sessionId}`),
+    ),
     revokeAll: jest.fn(() => Promise.resolve()),
     replaceForSingleDevice: jest.fn(() =>
       Promise.resolve({ token: 'refresh-token', sessionId: 'session-1' }),
@@ -226,6 +238,7 @@ describe('AuthService', () => {
         { provide: ConfigService, useValue: { get: () => undefined } },
         { provide: FancyNumberService, useValue: mockFancyNumberService },
         { provide: AvatarFrameService, useValue: mockAvatarFrameService },
+        { provide: DeviceTrustService, useValue: mockDeviceTrust },
       ],
     }).compile();
 
@@ -243,7 +256,9 @@ describe('AuthService', () => {
       password: 'password1',
       nickname: 'Test User',
     } as any);
-    expect(result.accessToken).toBe('access-token');
+    expect((result as { accessToken: string }).accessToken).toBe(
+      'access-token',
+    );
     expect(result.refreshToken).toBe('refresh-token');
     expect(users[0].accountId).toMatch(/^\d{6}$/);
     expect(users[0].inviteCode).toMatch(/^[A-Z0-9]{6}$/);
@@ -358,7 +373,9 @@ describe('AuthService', () => {
       inviteCode: ' campaign-code ',
     } as any);
 
-    expect(result.accessToken).toBe('access-token');
+    expect((result as { accessToken: string }).accessToken).toBe(
+      'access-token',
+    );
     expect(mockPrisma.campaignInvite.findUnique).toHaveBeenCalledWith(
       expect.objectContaining({ where: { code: 'CAMPAIGN-CODE' } }),
     );
@@ -460,7 +477,9 @@ describe('AuthService', () => {
       nickname: 'Race',
     } as any);
 
-    expect(result.accessToken).toBe('access-token');
+    expect((result as { accessToken: string }).accessToken).toBe(
+      'access-token',
+    );
     expect(mockPrisma.user.create).toHaveBeenCalledTimes(2);
     expect(users).toHaveLength(1);
   });
@@ -487,7 +506,9 @@ describe('AuthService', () => {
     } as any);
 
     expect(rejectedAccountId).toMatch(/^\d{6}$/);
-    expect(result.accessToken).toBe('access-token');
+    expect((result as { accessToken: string }).accessToken).toBe(
+      'access-token',
+    );
     expect(mockPrisma.user.create).toHaveBeenCalledTimes(2);
     expect(users).toHaveLength(1);
     expect(users[0].accountId).not.toBe(rejectedAccountId);
@@ -510,7 +531,9 @@ describe('AuthService', () => {
     } as any);
 
     expect(rejectedInviteCode).toMatch(/^[A-Z0-9]{6}$/);
-    expect(result.accessToken).toBe('access-token');
+    expect((result as { accessToken: string }).accessToken).toBe(
+      'access-token',
+    );
     expect(mockPrisma.user.create).toHaveBeenCalledTimes(2);
   });
 
@@ -581,7 +604,9 @@ describe('AuthService', () => {
       email: 'a@example.com',
       password: 'password1',
     } as any);
-    expect(result.accessToken).toBe('access-token');
+    expect((result as { accessToken: string }).accessToken).toBe(
+      'access-token',
+    );
   });
 
   it('login by user ID returns tokens with correct password', async () => {
@@ -598,7 +623,9 @@ describe('AuthService', () => {
       identifier: ' user_123 ',
       password: 'password1',
     } as any);
-    expect(result.accessToken).toBe('access-token');
+    expect((result as { accessToken: string }).accessToken).toBe(
+      'access-token',
+    );
   });
 
   it('login throws ForbiddenException for unknown email', async () => {
@@ -703,7 +730,9 @@ describe('AuthService', () => {
       password: 'password1',
     } as any);
 
-    expect(result.accessToken).toBe('access-token');
+    expect((result as { accessToken: string }).accessToken).toBe(
+      'access-token',
+    );
     expect(
       mockRefreshTokenService.createSessionForCurrentSingleDeviceSetting,
     ).toHaveBeenCalledWith('uuid-1', undefined, 'ADMIN');
@@ -902,6 +931,11 @@ describe('AuthService', () => {
       'uuid-1',
       'session-2',
     );
+    // 移除设备 = 撤销信任，下次登录要重新经受信任设备批准。
+    expect(mockDeviceTrust.revokeDevice).toHaveBeenCalledWith(
+      'uuid-1',
+      'device-key-of-session-2',
+    );
   });
 
   it('revokes other sessions while keeping the current session', async () => {
@@ -911,6 +945,124 @@ describe('AuthService', () => {
       'uuid-1',
       'session-1',
     );
+    expect(mockDeviceTrust.revokeOtherDevices).toHaveBeenCalledWith(
+      'uuid-1',
+      'device-key-of-session-1',
+    );
+  });
+
+  it('keeps device trust when the current session has no bound device', async () => {
+    mockRefreshTokenService.findSessionDeviceKey.mockResolvedValueOnce(
+      null as never,
+    );
+    await service.logoutOtherSessions('uuid-1', 'session-1');
+
+    expect(mockDeviceTrust.revokeOtherDevices).not.toHaveBeenCalled();
+  });
+
+  it('does not issue tokens when the device needs verification', async () => {
+    const passwordHash = await argon2.hash('password1');
+    users.push({
+      id: 'uuid-new-device',
+      accountId: 'newdev1',
+      email: 'newdev@example.com',
+      passwordHash,
+      status: 'ACTIVE',
+      role: 'USER',
+    });
+    const expiresAt = new Date(Date.now() + 300_000);
+    mockDeviceTrust.evaluateLogin.mockResolvedValueOnce({
+      kind: 'challenge',
+      challenge: { id: 'challenge-1', expiresAt, securityCodeAvailable: false },
+    } as never);
+
+    const result = await service.login(
+      { identifier: 'newdev@example.com', password: 'password1' } as any,
+      { deviceKey: 'unknown-device' },
+    );
+
+    expect(result).toEqual({
+      deviceVerificationRequired: true,
+      challenge: { id: 'challenge-1', expiresAt, securityCodeAvailable: false },
+    });
+    expect(mockRefreshTokenService.createAppSession).not.toHaveBeenCalled();
+    expect(mockJwt.signAsync).not.toHaveBeenCalled();
+  });
+
+  it('never evaluates device trust when the password is wrong', async () => {
+    const passwordHash = await argon2.hash('password1');
+    users.push({
+      id: 'uuid-wrong-pw',
+      accountId: 'wrongpw1',
+      email: 'wrongpw@example.com',
+      passwordHash,
+      status: 'ACTIVE',
+      role: 'USER',
+    });
+    await expect(
+      service.login({
+        identifier: 'wrongpw@example.com',
+        password: 'password2',
+      } as any),
+    ).rejects.toThrow(ForbiddenException);
+    // 错密码不能触发受信任设备弹窗，否则谁都能拿别人的账号名刷弹窗。
+    expect(mockDeviceTrust.evaluateLogin).not.toHaveBeenCalled();
+  });
+
+  it('issues tokens and trusts the device after a correct challenge code', async () => {
+    users.push({
+      id: 'uuid-1',
+      accountId: 'AAA111',
+      email: 'a@example.com',
+      passwordHash: 'x',
+      status: 'ACTIVE',
+      role: 'USER',
+      singleDeviceLoginEnabled: false,
+    });
+    mockDeviceTrust.consumeWithCode.mockResolvedValueOnce({
+      userId: 'uuid-1',
+      deviceKey: 'new-device',
+    } as never);
+
+    const result = await service.verifyLoginChallengeCode(
+      'challenge-1',
+      '123456',
+      { deviceKey: 'new-device', deviceName: 'Pixel 9' },
+    );
+
+    expect(result.accessToken).toBe('access-token');
+    expect(mockDeviceTrust.completeVerifiedLogin).toHaveBeenCalledWith(
+      'uuid-1',
+      'challenge-1',
+      'new-device',
+      { deviceKey: 'new-device', deviceName: 'Pixel 9' },
+    );
+    expect(mockRefreshTokenService.createAppSession).toHaveBeenCalledWith(
+      'uuid-1',
+      expect.objectContaining({ deviceKey: 'new-device' }),
+    );
+  });
+
+  it('refuses a verified challenge for a user banned meanwhile', async () => {
+    users.push({
+      id: 'uuid-banned',
+      accountId: 'banned1',
+      email: 'banned@example.com',
+      passwordHash: 'x',
+      status: 'BANNED',
+      role: 'USER',
+    });
+    mockDeviceTrust.consumeWithCode.mockResolvedValueOnce({
+      userId: 'uuid-banned',
+      deviceKey: 'new-device',
+    } as never);
+
+    await expect(
+      service.verifyLoginChallengeCode('challenge-1', '123456', {
+        deviceKey: 'new-device',
+      }),
+    ).rejects.toThrow(ForbiddenException);
+    expect(mockDeviceTrust.completeVerifiedLogin).not.toHaveBeenCalled();
   });
 
   it('reads and updates the account-level single-device login setting', async () => {
@@ -949,7 +1101,9 @@ describe('AuthService', () => {
     const beforeRefresh = Date.now();
     const result = await service.refresh('refresh-token');
 
-    expect(result.accessToken).toBe('access-token');
+    expect((result as { accessToken: string }).accessToken).toBe(
+      'access-token',
+    );
     expect(result.refreshToken).toBe('new-refresh-token');
     expect(mockRefreshTokenService.rotate).toHaveBeenCalledWith(
       'refresh-token',

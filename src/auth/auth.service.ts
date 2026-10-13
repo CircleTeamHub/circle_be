@@ -37,6 +37,7 @@ import {
   SessionContext,
 } from './refresh-token.service';
 import { accessTokenTtlSeconds } from './session-revocation.service';
+import { DeviceTrustService, LoginChallengeView } from './device-trust.service';
 import { ConfigService } from '@nestjs/config';
 import { createLoggingConfig } from 'src/logging/logging.config';
 import { logBusinessEvent } from 'src/logging/business-event.logger';
@@ -134,6 +135,7 @@ export class AuthService {
     private configService: ConfigService,
     private fancyNumberService: FancyNumberService,
     private avatarFrames: AvatarFrameService,
+    private deviceTrust: DeviceTrustService,
   ) {
     this.referralRules = readReferralRules(configService);
   }
@@ -219,7 +221,19 @@ export class AuthService {
       entityId: user.id,
     });
 
-    return this.issueTokens(user.id, user.accountId, user.role, sessionContext);
+    const tokens = await this.issueTokens(
+      user.id,
+      user.accountId,
+      user.role,
+      sessionContext,
+    );
+    // 注册设备就是这个账号的首台受信任设备。
+    await this.deviceTrust.trustOnRefresh(
+      user.id,
+      sessionContext?.deviceKey ?? null,
+      sessionContext ?? {},
+    );
+    return tokens;
   }
 
   async login(dto: LoginDto, sessionContext?: SessionContext) {
@@ -317,7 +331,123 @@ export class AuthService {
         errorCode: AuthErrorCode.InvalidCredentials,
       });
     }
+
+    // 密码对了也不等于能进：陌生设备必须先经受信任设备批准（只发验证单号，不发 token）。
+    const decision = await this.deviceTrust.evaluateLogin(
+      user,
+      sessionContext ?? {},
+    );
+    if (decision.kind === 'challenge') {
+      logBusinessEvent(this.logger, {
+        enabled: this.loggingConfig.businessLogOn,
+        businessEvent: 'auth_login_device_verification_required',
+        actorId: user.id,
+        result: 'success',
+        entityType: 'login_challenge',
+        entityId: decision.challenge.id,
+      });
+      return this.deviceVerificationResponse(decision.challenge);
+    }
     return this.finishLogin(user, sessionContext);
+  }
+
+  private deviceVerificationResponse(challenge: LoginChallengeView) {
+    return {
+      deviceVerificationRequired: true as const,
+      challenge: {
+        id: challenge.id,
+        expiresAt: challenge.expiresAt,
+        securityCodeAvailable: challenge.securityCodeAvailable,
+      },
+    };
+  }
+
+  /** 新设备：受信任设备批准后输入验证码，通过即记为受信任并发 token。 */
+  async verifyLoginChallengeCode(
+    challengeId: string,
+    code: string,
+    sessionContext: SessionContext,
+  ) {
+    const { userId, deviceKey } = await this.deviceTrust.consumeWithCode(
+      challengeId,
+      sessionContext.deviceKey ?? null,
+      code,
+    );
+    return this.finishChallengeLogin(
+      userId,
+      challengeId,
+      deviceKey,
+      sessionContext,
+    );
+  }
+
+  /** 新设备：受信任设备不在身边时，改用登录安全码通过验证。 */
+  async verifyLoginChallengeSecurityCode(
+    challengeId: string,
+    securityCode: string,
+    sessionContext: SessionContext,
+  ) {
+    const challenge = await this.deviceTrust.loadForSecurityCode(
+      challengeId,
+      sessionContext.deviceKey ?? null,
+    );
+    assertValidSecurityCode(securityCode);
+    const user = await this.prisma.user.findUnique({
+      where: { id: challenge.userId },
+      select: { loginSecurityCodeHash: true },
+    });
+    if (!user?.loginSecurityCodeHash) {
+      throw new ForbiddenException({
+        message: '未设置登录安全码，请在受信任设备上确认登录',
+        errorCode: AuthErrorCode.SecurityCodeNotSet,
+      });
+    }
+    // 复用安全码自身的错误计数与锁定。
+    const { ok } = await this.verifyLoginSecurityCode(
+      challenge.userId,
+      securityCode,
+    );
+    if (!ok) {
+      throw new ForbiddenException({
+        message: '安全码错误',
+        errorCode: AuthErrorCode.SecurityCodeInvalid,
+      });
+    }
+    await this.deviceTrust.consumeAfterSecurityCode(challenge.id);
+    return this.finishChallengeLogin(
+      challenge.userId,
+      challenge.id,
+      challenge.deviceKey,
+      sessionContext,
+    );
+  }
+
+  private async finishChallengeLogin(
+    userId: string,
+    challengeId: string,
+    deviceKey: string,
+    sessionContext: SessionContext,
+  ) {
+    const user = await this.prisma.user.findUnique({ where: { id: userId } });
+    // 验证期间账号被封 / 升成管理员：与 login() 同一套拒绝口径。
+    if (!user || user.status !== 'ACTIVE' || user.role === 'ADMIN') {
+      throw new ForbiddenException({
+        message: '邮箱、用户ID或密码错误',
+        errorCode: AuthErrorCode.InvalidCredentials,
+      });
+    }
+    await this.deviceTrust.completeVerifiedLogin(
+      userId,
+      challengeId,
+      deviceKey,
+      sessionContext,
+    );
+    return this.finishLogin(user, { ...sessionContext, deviceKey });
+  }
+
+  async resendLoginChallenge(challengeId: string, deviceKey: string | null) {
+    const challenge = await this.deviceTrust.resend(challengeId, deviceKey);
+    return this.deviceVerificationResponse(challenge);
   }
 
   /** ADMIN 账号当前是否处于登录锁定期。锁死期间不做密码比对。 */
@@ -574,6 +704,7 @@ export class AuthService {
       token: newRefreshToken,
       userId,
       sessionId,
+      deviceKey,
     } = await this.refreshTokenService.rotate(
       refreshToken,
       sessionContext,
@@ -635,6 +766,13 @@ export class AuthService {
       'APP',
     );
     await this.refreshTokenService.assertSessionActive(user.id, sessionId);
+    // 持有有效会话的设备就是本人设备：功能上线前已登录的设备靠这条补记信任，
+    // 免得一升级所有人都变成「陌生设备」。只认会话绑定的设备，不认请求头里新报的。
+    await this.deviceTrust.trustOnRefresh(
+      user.id,
+      deviceKey,
+      sessionContext ?? {},
+    );
     return { accessToken, refreshToken: newRefreshToken };
   }
 
@@ -728,7 +866,13 @@ export class AuthService {
   }
 
   async logoutSession(userId: string, sessionId: string): Promise<void> {
+    // 在设备管理里移除 = 撤销信任：这台设备再登录要重新经受信任设备批准。
+    const deviceKey = await this.refreshTokenService.findSessionDeviceKey(
+      userId,
+      sessionId,
+    );
     await this.refreshTokenService.revokeSession(userId, sessionId);
+    await this.deviceTrust.revokeDevice(userId, deviceKey);
     logBusinessEvent(this.logger, {
       enabled: this.loggingConfig.businessLogOn,
       businessEvent: 'auth_session_logout',
@@ -743,10 +887,21 @@ export class AuthService {
     userId: string,
     currentSessionId?: string,
   ): Promise<void> {
+    const currentDeviceKey = currentSessionId
+      ? await this.refreshTokenService.findSessionDeviceKey(
+          userId,
+          currentSessionId,
+        )
+      : null;
     await this.refreshTokenService.revokeOtherSessions(
       userId,
       currentSessionId,
     );
+    // 「退出其他设备」通常是怀疑被盗号：其他设备的信任一并撤销。当前会话还没
+    // 绑定设备（旧客户端）时不撤，免得把用户自己也变成陌生设备。
+    if (currentDeviceKey) {
+      await this.deviceTrust.revokeOtherDevices(userId, currentDeviceKey);
+    }
     logBusinessEvent(this.logger, {
       enabled: this.loggingConfig.businessLogOn,
       businessEvent: 'auth_other_sessions_logout',

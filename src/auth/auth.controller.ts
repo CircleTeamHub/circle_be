@@ -42,6 +42,9 @@ import {
   SetLoginSecurityCodeDto,
 } from './dto/login-security-code.dto';
 import { SingleDeviceLoginDto } from './dto/single-device-login.dto';
+import { LoginChallengeCodeDto } from './dto/login-challenge.dto';
+import { DeviceTrustService, hashDeviceId } from './device-trust.service';
+import { RefreshTokenService } from './refresh-token.service';
 import { SelfUserDto } from 'src/user/dto/public-user.dto';
 import { Serialize } from 'src/decorators/serialize.decorator';
 import { SessionContext } from './refresh-token.service';
@@ -63,13 +66,33 @@ function getSessionContext(req?: Request): SessionContext {
     deviceName: getHeaderValue(req.headers['x-device-name']),
     ip: requestIp.getClientIp(req) ?? req.ip ?? null,
     userAgent: getHeaderValue(req.headers['user-agent']),
+    // 客户端安全存储里的随机设备 ID，只以哈希形式进入服务端。
+    deviceKey: hashDeviceId(getHeaderValue(req.headers['x-device-id'])),
   };
 }
 
 @Controller('auth')
 @ApiTags('Auth')
 export class AuthController {
-  constructor(private authService: AuthService) {}
+  constructor(
+    private authService: AuthService,
+    private deviceTrust: DeviceTrustService,
+    private refreshTokens: RefreshTokenService,
+  ) {}
+
+  /**
+   * 批准方的设备：优先认会话绑定的设备（不可伪造），会话还没绑定时（旧客户端
+   * 签发、尚未续签过）才回落请求头。
+   */
+  private async approverDeviceKey(req: RequestWithUser) {
+    const bound = req.user.sessionId
+      ? await this.refreshTokens.findSessionDeviceKey(
+          req.user.userId,
+          req.user.sessionId,
+        )
+      : null;
+    return bound ?? hashDeviceId(getHeaderValue(req.headers['x-device-id']));
+  }
 
   @Post('register')
   @ApiOperation({ summary: 'Register a new user' })
@@ -101,6 +124,123 @@ export class AuthController {
   })
   login(@Body() dto: LoginDto, @Req() req?: Request) {
     return this.authService.login(dto, getSessionContext(req));
+  }
+
+  @Post('login-challenges/:challengeId/verify')
+  @UseGuards(ThrottlerGuard)
+  @Throttle({ default: { limit: 10, ttl: 60_000 } })
+  @ApiOperation({
+    summary: 'New device: submit the code shown on a trusted device',
+  })
+  @ApiHeader({ name: 'x-device-id', required: true })
+  @ApiBody({ type: LoginChallengeCodeDto })
+  @ApiCreatedResponse({ type: AuthTokensDto })
+  verifyLoginChallenge(
+    @Param('challengeId', ParseUUIDPipe) challengeId: string,
+    @Body() dto: LoginChallengeCodeDto,
+    @Req() req: Request,
+  ) {
+    return this.authService.verifyLoginChallengeCode(
+      challengeId,
+      dto.code,
+      getSessionContext(req),
+    );
+  }
+
+  @Post('login-challenges/:challengeId/security-code')
+  @UseGuards(ThrottlerGuard)
+  @Throttle({ default: { limit: 10, ttl: 60_000 } })
+  @ApiOperation({
+    summary: 'New device: pass verification with the login security code',
+  })
+  @ApiHeader({ name: 'x-device-id', required: true })
+  @ApiBody({ type: LoginSecurityCodeDto })
+  @ApiCreatedResponse({ type: AuthTokensDto })
+  verifyLoginChallengeSecurityCode(
+    @Param('challengeId', ParseUUIDPipe) challengeId: string,
+    @Body() dto: LoginSecurityCodeDto,
+    @Req() req: Request,
+  ) {
+    return this.authService.verifyLoginChallengeSecurityCode(
+      challengeId,
+      dto.securityCode,
+      getSessionContext(req),
+    );
+  }
+
+  @Post('login-challenges/:challengeId/resend')
+  @UseGuards(ThrottlerGuard)
+  @Throttle({ default: { limit: 10, ttl: 60_000 } })
+  @ApiOperation({ summary: 'New device: start a new verification request' })
+  @ApiHeader({ name: 'x-device-id', required: true })
+  resendLoginChallenge(
+    @Param('challengeId', ParseUUIDPipe) challengeId: string,
+    @Req() req: Request,
+  ) {
+    return this.authService.resendLoginChallenge(
+      challengeId,
+      getSessionContext(req).deviceKey ?? null,
+    );
+  }
+
+  @Get('login-challenges/:challengeId/status')
+  @UseGuards(ThrottlerGuard)
+  @Throttle({ default: { limit: 60, ttl: 60_000 } })
+  @ApiOperation({ summary: 'New device: poll verification status' })
+  @ApiHeader({ name: 'x-device-id', required: true })
+  loginChallengeStatus(
+    @Param('challengeId', ParseUUIDPipe) challengeId: string,
+    @Req() req: Request,
+  ) {
+    return this.deviceTrust.status(
+      challengeId,
+      getSessionContext(req).deviceKey ?? null,
+    );
+  }
+
+  @Get('login-challenges')
+  @UseGuards(JwtGuard)
+  @ApiBearerAuth()
+  @ApiOperation({
+    summary: 'Trusted device: pending login requests from unknown devices',
+  })
+  async pendingLoginChallenges(@Req() req: RequestWithUser) {
+    return this.deviceTrust.listPending(
+      req.user.userId,
+      await this.approverDeviceKey(req),
+    );
+  }
+
+  @Post('login-challenges/:challengeId/approve')
+  @UseGuards(JwtGuard)
+  @ApiBearerAuth()
+  @ApiOperation({
+    summary: 'Trusted device: approve and get a one-time code (60s)',
+  })
+  async approveLoginChallenge(
+    @Param('challengeId', ParseUUIDPipe) challengeId: string,
+    @Req() req: RequestWithUser,
+  ) {
+    return this.deviceTrust.approve(
+      req.user.userId,
+      await this.approverDeviceKey(req),
+      challengeId,
+    );
+  }
+
+  @Post('login-challenges/:challengeId/reject')
+  @UseGuards(JwtGuard)
+  @ApiBearerAuth()
+  @ApiOperation({ summary: 'Trusted device: reject the login request' })
+  async rejectLoginChallenge(
+    @Param('challengeId', ParseUUIDPipe) challengeId: string,
+    @Req() req: RequestWithUser,
+  ) {
+    await this.deviceTrust.reject(
+      req.user.userId,
+      await this.approverDeviceKey(req),
+      challengeId,
+    );
   }
 
   @Post('admin/login')

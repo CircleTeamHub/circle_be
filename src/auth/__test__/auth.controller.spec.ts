@@ -4,6 +4,8 @@ import { ParseUUIDPipe } from '@nestjs/common';
 import { ROUTE_ARGS_METADATA } from '@nestjs/common/constants';
 import { AuthController } from '../auth.controller';
 import { AuthService } from '../auth.service';
+import { DeviceTrustService } from '../device-trust.service';
+import { RefreshTokenService } from '../refresh-token.service';
 import { RegisterDto } from '../dto/register.dto';
 import { LoginDto } from '../dto/login.dto';
 import { RefreshTokenDto } from '../dto/refresh-token.dto';
@@ -104,7 +106,14 @@ describe('AuthController', () => {
       // 找回密码路由挂 ThrottlerGuard，需要模块选项在位（本 spec 直呼 handler）。
       imports: [ThrottlerModule.forRoot([{ ttl: 60_000, limit: 100 }])],
       controllers: [AuthController],
-      providers: [{ provide: AuthService, useValue: mockAuthService }],
+      providers: [
+        { provide: AuthService, useValue: mockAuthService },
+        { provide: DeviceTrustService, useValue: {} },
+        {
+          provide: RefreshTokenService,
+          useValue: { findSessionDeviceKey: jest.fn() },
+        },
+      ],
     }).compile();
 
     controller = module.get<AuthController>(AuthController);

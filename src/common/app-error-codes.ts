@@ -23,6 +23,16 @@ export const AuthErrorCode = {
   AccountIdInvalid: 'AUTH_ACCOUNT_ID_INVALID',
   CodeRateLimited: 'AUTH_CODE_RATE_LIMITED',
   UserNotFound: 'AUTH_USER_NOT_FOUND',
+  // 陌生设备登录验证（受信任设备批准 + 一次性验证码）。
+  DeviceIdRequired: 'AUTH_DEVICE_ID_REQUIRED',
+  DeviceNotTrusted: 'AUTH_DEVICE_NOT_TRUSTED',
+  DeviceVerificationRateLimited: 'AUTH_DEVICE_VERIFICATION_RATE_LIMITED',
+  DeviceCodeInvalid: 'AUTH_DEVICE_CODE_INVALID',
+  LoginChallengeInvalid: 'AUTH_LOGIN_CHALLENGE_INVALID',
+  LoginChallengeExpired: 'AUTH_LOGIN_CHALLENGE_EXPIRED',
+  LoginChallengeRejected: 'AUTH_LOGIN_CHALLENGE_REJECTED',
+  LoginChallengeLocked: 'AUTH_LOGIN_CHALLENGE_LOCKED',
+  SecurityCodeNotSet: 'AUTH_SECURITY_CODE_NOT_SET',
 } as const;
 
 export const CoinErrorCode = {
