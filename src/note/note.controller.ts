@@ -275,6 +275,19 @@ export class NoteController {
     return this.noteService.restoreNote(req.user.userId, id);
   }
 
+  @Delete(':id/permanent')
+  @HttpCode(HttpStatus.NO_CONTENT)
+  @ApiOperation({
+    summary: 'Permanently delete a note that is already in the recycle bin',
+  })
+  @ApiNoContentResponse()
+  purge(
+    @Param('id', ParseUUIDPipe) id: string,
+    @Req() req: RequestWithUser,
+  ): Promise<void> {
+    return this.noteService.purgeNote(req.user.userId, id);
+  }
+
   @Delete(':id')
   @HttpCode(HttpStatus.NO_CONTENT)
   @ApiOperation({ summary: 'Soft delete note' })

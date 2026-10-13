@@ -63,6 +63,7 @@ import {
   NoteShareLinkDto,
   NoteStatus,
   NoteSummaryDto,
+  NoteCardPeerDto,
   NoteWritableStatus,
   NoteWorkStatus,
   SharedNoteListDto,
@@ -291,6 +292,8 @@ const MAX_NOTE_BLOCK_DEPTH = 10;
  * 段落粘到最后一行末尾，导出时被当成多出来的一格。
  */
 const NOTE_LINE_SEPARATOR = '\n';
+/** 列表卡片每类名片（个人/群）最多带几个摘要。 */
+const NOTE_CARD_PREVIEW_LIMIT = 3;
 /** 表格同一行内的列分隔符。 */
 const NOTE_TABLE_CELL_SEPARATOR = '\t';
 /**
@@ -2583,6 +2586,30 @@ export class NoteService {
     } as NoteSections;
   }
 
+  /**
+   * 列表卡片只需要名片的 id / 名称 / 头像，最多 NOTE_CARD_PREVIEW_LIMIT 个；
+   * 缺 id 或名称的历史坏数据直接跳过（点了跳不动，不如不显示）。
+   */
+  private toCardPeers(
+    items: Array<Record<string, unknown>> | undefined,
+  ): NoteCardPeerDto[] {
+    const peers: NoteCardPeerDto[] = [];
+    for (const item of items ?? []) {
+      if (peers.length >= NOTE_CARD_PREVIEW_LIMIT) break;
+      const id = typeof item.id === 'string' ? item.id.trim() : '';
+      const name = typeof item.name === 'string' ? item.name.trim() : '';
+      if (!id || !name) continue;
+      const face =
+        typeof item.faceURL === 'string' && item.faceURL
+          ? item.faceURL
+          : typeof item.avatarUrl === 'string' && item.avatarUrl
+            ? item.avatarUrl
+            : null;
+      peers.push({ id, name, faceURL: face });
+    }
+    return peers;
+  }
+
   private getSectionAvailability(sections: NoteSections) {
     return {
       hasText:
@@ -2776,6 +2803,10 @@ export class NoteService {
           groups: { items: [] },
         } as NoteSections);
     const availability = this.getSectionAvailability(visibleSections);
+    const cardPreview = {
+      contacts: this.toCardPeers(visibleSections.contacts?.items),
+      groups: this.toCardPeers(visibleSections.groups?.items),
+    };
 
     return {
       id: note.id,
@@ -2808,6 +2839,7 @@ export class NoteService {
       audioCount: note.audioCount ?? 0,
       mediaCount: note.mediaCount,
       ...availability,
+      cardPreview,
       // 来源名片是收藏者的私人定位标记：available=true 的笔记任何人都能打开，
       // 但「从哪个群/谁那里收藏的」不能跟着泄漏 —— 只回给笔记主人本人。
       collectedFrom:
@@ -5042,6 +5074,24 @@ export class NoteService {
       });
     }
     await this.broadcastSourceStatusChanged(noteId);
+  }
+
+  /**
+   * 回收站「立即删除」：不等 30 天，直接硬删。与 NoteRecycleBinCleanup 到期清理
+   * 同一语义 —— 只删 Postgres 行（NoteMedia / NoteGroupMembership 随外键级联），
+   * MinIO 对象留给 StorageAudit（收藏副本可能共享同一 objectKey）。
+   * 只认自己回收站里的笔记（status=DELETED），正常/下架笔记必须先删进回收站。
+   */
+  async purgeNote(ownerID: string, noteId: string): Promise<void> {
+    const removed = await this.prisma.note.deleteMany({
+      where: { id: noteId, ownerID, status: 'DELETED' },
+    });
+    if (removed.count === 0) {
+      throw new NotFoundException({
+        message: 'Note not found',
+        errorCode: NoteErrorCode.NotFound,
+      });
+    }
   }
 
   async deleteNote(ownerID: string, noteId: string): Promise<void> {

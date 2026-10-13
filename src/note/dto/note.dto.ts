@@ -800,6 +800,18 @@ export class NoteDraftSectionsResponseDto {
   } | null;
 }
 
+/** 列表卡片上展示的名片摘要：只取展示所需的 id / 名称 / 头像。 */
+export class NoteCardPeerDto {
+  @ApiProperty() id: string;
+  @ApiProperty() name: string;
+  @ApiPropertyOptional({ nullable: true, type: String }) faceURL: string | null;
+}
+
+export class NoteCardPreviewDto {
+  @ApiProperty({ type: [NoteCardPeerDto] }) contacts: NoteCardPeerDto[];
+  @ApiProperty({ type: [NoteCardPeerDto] }) groups: NoteCardPeerDto[];
+}
+
 export class NoteSummaryDto {
   @ApiProperty() id: string;
   @ApiProperty() ownerId: string;
@@ -833,6 +845,12 @@ export class NoteSummaryDto {
   @ApiProperty() contactCount: number;
   @ApiProperty() groupCardCount: number;
   @ApiProperty() hasLocation: boolean;
+  @ApiProperty({
+    type: NoteCardPreviewDto,
+    description:
+      '笔记里添加的个人名片/群名片摘要（每类最多 3 个，总数见 contactCount/groupCardCount）；仅笔记主人可见，他人恒为空数组',
+  })
+  cardPreview: NoteCardPreviewDto;
   @ApiPropertyOptional({
     nullable: true,
     description: '聊天收藏来源快照；自建笔记为 null',

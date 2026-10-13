@@ -59,6 +59,7 @@ describe('NoteService', () => {
       findUniqueOrThrow: jest.fn(),
       update: jest.fn(),
       updateMany: jest.fn(),
+      deleteMany: jest.fn(),
     },
     noteGroup: {
       count: jest.fn(),
@@ -1230,6 +1231,90 @@ describe('NoteService', () => {
 
     expect(result.sections.media.items).toEqual([]);
     expect(result.sections.showcase.items).toHaveLength(1);
+  });
+
+  describe('summary card preview', () => {
+    const contact = (n: number) => ({
+      id: `user-${n}`,
+      name: `联系人${n}`,
+      faceURL: `https://cdn.example.com/u${n}.jpg`,
+    });
+    const noteWithCards = (ownerID: string) => ({
+      id: 'note-cards',
+      ownerID,
+      title: '带名片的笔记',
+      content: '正文',
+      contentJson: null,
+      status: 'ACTIVE',
+      available: true,
+      pinned: false,
+      imageCount: 0,
+      videoCount: 0,
+      mediaCount: 0,
+      collectedFrom: null,
+      sections: {
+        contacts: { items: [contact(1), contact(2), contact(3), contact(4)] },
+        groups: {
+          items: [
+            {
+              id: 'chat-group-1',
+              name: '玫瑰刺群',
+              avatarUrl: 'https://cdn.example.com/g1.jpg',
+            },
+            { id: '', name: '缺 id 的坏数据' },
+          ],
+        },
+      },
+      groupMemberships: [],
+      media: [],
+      coverMedia: null,
+      createdAt: new Date(),
+      updatedAt: new Date(),
+    });
+
+    it('returns at most three card peers per kind to the owner, with total counts', async () => {
+      prisma.note.findMany.mockResolvedValueOnce([noteWithCards('user-1')]);
+
+      const [item] = (await service.listNotes('user-1', {})).items;
+
+      expect(item.cardPreview).toEqual({
+        contacts: [
+          {
+            id: 'user-1',
+            name: '联系人1',
+            faceURL: 'https://cdn.example.com/u1.jpg',
+          },
+          {
+            id: 'user-2',
+            name: '联系人2',
+            faceURL: 'https://cdn.example.com/u2.jpg',
+          },
+          {
+            id: 'user-3',
+            name: '联系人3',
+            faceURL: 'https://cdn.example.com/u3.jpg',
+          },
+        ],
+        groups: [
+          {
+            id: 'chat-group-1',
+            name: '玫瑰刺群',
+            faceURL: 'https://cdn.example.com/g1.jpg',
+          },
+        ],
+      });
+      expect(item.contactCount).toBe(4);
+    });
+
+    it('never exposes card peers to a non-owner viewer', async () => {
+      prisma.note.findFirst.mockResolvedValueOnce(noteWithCards('user-1'));
+
+      const result = await service.getNote('user-2', 'note-cards');
+
+      expect(result.cardPreview).toEqual({ contacts: [], groups: [] });
+      expect(result.contactCount).toBe(0);
+      expect(result.groupCardCount).toBe(0);
+    });
   });
 
   it('lists only the owner notes with summary fields', async () => {
@@ -5717,6 +5802,27 @@ describe('NoteService', () => {
 
       expect(own.remark).toBe('重要客户');
       expect(foreign.remark).toBeNull();
+    });
+  });
+
+  describe('purgeNote (recycle bin delete now)', () => {
+    it('hard-deletes only the owner note that is already in the recycle bin', async () => {
+      prisma.note.deleteMany.mockResolvedValueOnce({ count: 1 });
+
+      await service.purgeNote('user-1', 'note-1');
+
+      // 与 30 天到期清理同一语义：只删行（媒体/分组随外键级联），只认 DELETED。
+      expect(prisma.note.deleteMany).toHaveBeenCalledWith({
+        where: { id: 'note-1', ownerID: 'user-1', status: 'DELETED' },
+      });
+    });
+
+    it('404s for a note that is not in my recycle bin (active, foreign or missing)', async () => {
+      prisma.note.deleteMany.mockResolvedValueOnce({ count: 0 });
+
+      await expect(service.purgeNote('user-1', 'note-1')).rejects.toThrow(
+        NotFoundException,
+      );
     });
   });
 

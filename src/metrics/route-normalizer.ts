@@ -261,6 +261,7 @@ export const DYNAMIC_ROUTE_TEMPLATES = [
   '/api/v1/note/:id/chat-media',
   '/api/v1/note/:id/exports',
   '/api/v1/note/:id/groups',
+  '/api/v1/note/:id/permanent',
   '/api/v1/note/:id/pin',
   '/api/v1/note/:id/remark',
   '/api/v1/note/:id/restore',
