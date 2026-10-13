@@ -42,6 +42,13 @@ describe('NoteService', () => {
     },
     circle: {
       findMany: jest.fn(),
+      findFirst: jest.fn(),
+      findUnique: jest.fn(),
+    },
+    chatConversation: {
+      findFirst: jest.fn(),
+      findUnique: jest.fn(),
+      findMany: jest.fn(),
     },
     note: {
       count: jest.fn(),
@@ -100,6 +107,31 @@ describe('NoteService', () => {
 
   beforeEach(async () => {
     jest.clearAllMocks();
+    // 群名片即绑定：默认 user-1 是 circle-1 那个圈子群的群主，老用例里挂圈子群名片照常可绑。
+    prisma.chatConversation.findFirst.mockReset();
+    prisma.chatConversation.findFirst.mockResolvedValue({
+      id: 'conv-circle-1',
+    });
+    prisma.chatConversation.findUnique.mockReset();
+    prisma.chatConversation.findUnique.mockResolvedValue({
+      type: 'GROUP',
+      ownerID: null,
+      circleID: 'circle-1',
+      name: null,
+      avatarUrl: null,
+    });
+    prisma.chatConversation.findMany.mockReset();
+    prisma.chatConversation.findMany.mockResolvedValue([]);
+    prisma.circle.findFirst.mockReset();
+    prisma.circle.findFirst.mockResolvedValue(null);
+    prisma.circle.findUnique.mockReset();
+    prisma.circle.findUnique.mockResolvedValue({
+      id: 'circle-1',
+      name: 'Canonical circle',
+      avatarUrl: null,
+      ownerID: 'user-1',
+      deleted: false,
+    });
     prisma.note.findFirst.mockReset();
     programEnabled = true;
     prisma.user.findUnique.mockResolvedValue({

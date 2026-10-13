@@ -53,7 +53,16 @@ describe('note review regressions', () => {
         deleteMany: jest.fn().mockResolvedValue({ count: 0 }),
       },
       friend: { findMany: jest.fn().mockResolvedValue([]) },
-      circle: { findMany: jest.fn().mockResolvedValue([]) },
+      circle: {
+        findMany: jest.fn().mockResolvedValue([]),
+        findFirst: jest.fn().mockResolvedValue(null),
+        findUnique: jest.fn().mockResolvedValue(null),
+      },
+      chatConversation: {
+        findMany: jest.fn().mockResolvedValue([]),
+        findFirst: jest.fn().mockResolvedValue(null),
+        findUnique: jest.fn().mockResolvedValue(null),
+      },
       user: { findUnique: jest.fn() },
       $transaction: jest.fn(),
     };
@@ -210,6 +219,67 @@ describe('note review regressions', () => {
     expect(
       prisma.circle.findMany.mock.calls[0][0].where.AND[0].OR,
     ).toContainEqual({ groupID: { in: ['legacy-group'] } });
+  });
+
+  // 群名片挂的是群聊而不只是圈子：独立群聊（circleID 为空的 GROUP 会话）也要能存。
+  it('accepts a standalone group chat card when the owner is still a member', async () => {
+    const { service, prisma } = fixture();
+    prisma.chatConversation.findMany.mockResolvedValue([
+      { id: 'conv-standalone', name: ' 独立群 ', avatarUrl: null },
+    ] as any);
+    const result = await (service as any).canonicalizeNoteCards('owner', {
+      sections: {
+        groups: { items: [{ id: 'conv-standalone', name: 'client name' }] },
+      },
+    });
+    expect(result.sections.groups.items).toEqual([
+      { id: 'conv-standalone', name: '独立群', faceURL: null },
+    ]);
+    expect(prisma.chatConversation.findMany.mock.calls[0][0].where).toEqual({
+      id: { in: ['conv-standalone'] },
+      type: 'GROUP',
+      circleID: null,
+      members: { some: { userID: 'owner', leftAt: null } },
+    });
+  });
+
+  it('keeps the client display name for an unnamed standalone group chat', async () => {
+    const { service, prisma } = fixture();
+    prisma.chatConversation.findMany.mockResolvedValue([
+      { id: 'conv-unnamed', name: null, avatarUrl: null },
+    ] as any);
+    const result = await (service as any).canonicalizeNoteCards('owner', {
+      sections: {
+        groups: { items: [{ id: 'conv-unnamed', name: '小明、小红' }] },
+      },
+    });
+    expect(result.sections.groups.items).toEqual([
+      { id: 'conv-unnamed', name: '小明、小红', faceURL: null },
+    ]);
+  });
+
+  it('rejects a group chat card the owner is not (or no longer) a member of', async () => {
+    const { service, prisma } = fixture();
+    // 查询本身带着 members.leftAt = null 的条件，退群/非成员时查不到任何行。
+    prisma.chatConversation.findMany.mockResolvedValue([]);
+    await expect(
+      (service as any).canonicalizeNoteCards('owner', {
+        sections: {
+          groups: { items: [{ id: 'conv-left', name: 'Left group' }] },
+        },
+      }),
+    ).rejects.toBeInstanceOf(ForbiddenException);
+  });
+
+  it('does not look up standalone chats for ids that already resolved to a circle', async () => {
+    const { service, prisma } = fixture();
+    prisma.circle.findMany.mockResolvedValue([
+      { id: 'circle-1', groupID: null, name: 'Circle', avatarUrl: null },
+    ] as any);
+    await (service as any).canonicalizeNoteCards('owner', {
+      sections: { groups: { items: [{ id: 'circle-1', name: 'Circle' }] } },
+    });
+    expect(prisma.chatConversation.findMany).not.toHaveBeenCalled();
   });
 
   it.each(['legacy-group', 'canonical-circle'])(
@@ -1055,6 +1125,27 @@ describe('note review regressions', () => {
         avatarUrl: null,
       },
     ]);
+    // 群名片即绑定：legacy groupID → 圈子 → 圈子群会话，owner 是圈主。
+    prisma.chatConversation.findFirst
+      .mockResolvedValueOnce(null)
+      .mockResolvedValueOnce({ id: 'conv-1' } as any);
+    prisma.circle.findFirst.mockResolvedValue({
+      id: 'canonical-circle',
+    } as any);
+    prisma.chatConversation.findUnique.mockResolvedValue({
+      type: 'GROUP',
+      ownerID: null,
+      circleID: 'canonical-circle',
+      name: null,
+      avatarUrl: null,
+    } as any);
+    prisma.circle.findUnique.mockResolvedValue({
+      id: 'canonical-circle',
+      name: 'Real group',
+      avatarUrl: null,
+      ownerID: 'owner',
+      deleted: false,
+    } as any);
     (prisma.note as any).create.mockImplementation(async ({ data }) =>
       Object.assign(note, data),
     );
@@ -1077,10 +1168,122 @@ describe('note review regressions', () => {
     expect(
       (prisma.note as any).create.mock.calls[0][0].data.sections.groups.items,
     ).toEqual([expected]);
+    expect(
+      (prisma.note as any).create.mock.calls[0][0].data.sourceConversationID,
+    ).toBe('conv-1');
     expect(result.sections.groups.items).toEqual([expected]);
     expect(
       (await service.getNote('owner', 'note-1')).sections.groups.items,
     ).toEqual([expected]);
+  });
+
+  describe('group card is the group binding (笔记管理)', () => {
+    function standaloneOwnedBy(prisma: any, ownerID: string) {
+      prisma.chatConversation.findFirst.mockResolvedValue({ id: 'conv-s' });
+      prisma.chatConversation.findUnique.mockResolvedValue({
+        type: 'GROUP',
+        ownerID,
+        circleID: null,
+        name: '独立群',
+        avatarUrl: null,
+      });
+      prisma.chatConversation.findMany.mockResolvedValue([
+        { id: 'conv-s', name: '独立群', avatarUrl: null },
+      ]);
+    }
+
+    it('binds the note to the standalone group its owner picked', async () => {
+      const { service, prisma } = publicationFixture(null);
+      standaloneOwnedBy(prisma, 'owner');
+      await service.createNote('owner', {
+        title: 'Bound',
+        media: [],
+        sections: { groups: { items: [{ id: 'conv-s', name: 'x' }] } },
+      });
+      const data = (prisma.note as any).create.mock.calls[0][0].data;
+      expect(data.sourceConversationID).toBe('conv-s');
+      expect(data.sections.groups.items).toEqual([
+        { id: 'conv-s', name: '独立群', faceURL: null },
+      ]);
+    });
+
+    it('rejects a group card for a group the author does not own', async () => {
+      const { service, prisma } = publicationFixture(null);
+      standaloneOwnedBy(prisma, 'someone-else');
+      await expect(
+        service.createNote('owner', {
+          title: 'Not mine',
+          media: [],
+          sections: { groups: { items: [{ id: 'conv-s', name: 'x' }] } },
+        }),
+      ).rejects.toBeInstanceOf(ForbiddenException);
+      expect((prisma.note as any).create).not.toHaveBeenCalled();
+    });
+
+    it('clearing the group card on a source note unbinds it', async () => {
+      const { service, prisma, note } = publicationFixture(null);
+      Object.assign(note, {
+        sourceConversationID: 'conv-s',
+        collectedFromNoteID: null,
+        sections: {
+          groups: { items: [{ id: 'conv-s', name: '独立群', faceURL: null }] },
+        },
+      });
+      await service.updateNote('owner', 'note-1', {
+        title: 'Unbind',
+        media: [],
+        sections: { groups: { items: [] } },
+      });
+      const data = (prisma.note as any).update.mock.calls.at(-1)[0].data;
+      expect(data.sourceConversationID).toBeNull();
+      expect(data.sections.groups).toEqual({ items: [] });
+    });
+
+    it('keeps an unchanged binding without re-checking ownership', async () => {
+      const { service, prisma, note } = publicationFixture(null);
+      Object.assign(note, {
+        sourceConversationID: 'conv-s',
+        collectedFromNoteID: null,
+        sections: {
+          groups: { items: [{ id: 'conv-s', name: '独立群', faceURL: null }] },
+        },
+      });
+      // 群主已转让：只改正文、群名片没换，保存不能被拦下。
+      standaloneOwnedBy(prisma, 'new-owner');
+      await service.updateNote('owner', 'note-1', {
+        title: 'Text only',
+        media: [],
+        sections: { groups: { items: [{ id: 'conv-s', name: '独立群' }] } },
+      });
+      const data = (prisma.note as any).update.mock.calls.at(-1)[0].data;
+      expect(data).not.toHaveProperty('sourceConversationID');
+      expect(data.sections.groups.items).toEqual([
+        { id: 'conv-s', name: '独立群', faceURL: null },
+      ]);
+    });
+
+    it("leaves a collected copy's source group card fixed and unbound", async () => {
+      const { service, prisma, note } = publicationFixture(null);
+      Object.assign(note, {
+        sourceConversationID: null,
+        collectedFromNoteID: 'origin-note',
+        sections: {
+          groups: { items: [{ id: 'conv-s', name: '来源群', faceURL: null }] },
+        },
+      });
+      // 读收藏副本详情会沿收藏链查原笔记；本用例只看写入。
+      (prisma.note as any).findMany = jest.fn().mockResolvedValue([]);
+      await service.updateNote('owner', 'note-1', {
+        title: 'Copy',
+        media: [],
+        sections: { groups: { items: [] } },
+      });
+      const data = (prisma.note as any).update.mock.calls.at(-1)[0].data;
+      expect(data).not.toHaveProperty('sourceConversationID');
+      expect(data.sections.groups.items).toEqual([
+        { id: 'conv-s', name: '来源群', faceURL: null },
+      ]);
+    });
   });
 
   it('rejects a new keyed edit at the outcome cap before consuming its draft or changing the note', async () => {
