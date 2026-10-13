@@ -65,8 +65,14 @@ describe('note review regressions', () => {
       },
       user: { findUnique: jest.fn() },
       $transaction: jest.fn(),
+      // 事务内复核群主走 FOR SHARE 原生查询；默认与 findUnique 桩读到同一行。
+      $queryRaw: jest.fn(),
     };
     prisma.$transaction.mockImplementation(async (run) => run(prisma));
+    prisma.$queryRaw.mockImplementation(async () => {
+      const conversation = await prisma.chatConversation.findUnique();
+      return conversation ? [conversation] : [];
+    });
     const policy = { lockUsers: jest.fn().mockResolvedValue(undefined) };
     const upload = {
       createPresignedGetUrl: jest.fn().mockImplementation(async (key) => ({
@@ -233,7 +239,12 @@ describe('note review regressions', () => {
       },
     });
     expect(result.sections.groups.items).toEqual([
-      { id: 'conv-standalone', name: '独立群', faceURL: null },
+      {
+        id: 'conv-standalone',
+        name: '独立群',
+        faceURL: null,
+        conversationID: 'conv-standalone',
+      },
     ]);
     expect(prisma.chatConversation.findMany.mock.calls[0][0].where).toEqual({
       id: { in: ['conv-standalone'] },
@@ -254,7 +265,12 @@ describe('note review regressions', () => {
       },
     });
     expect(result.sections.groups.items).toEqual([
-      { id: 'conv-unnamed', name: '小明、小红', faceURL: null },
+      {
+        id: 'conv-unnamed',
+        name: '小明、小红',
+        faceURL: null,
+        conversationID: 'conv-unnamed',
+      },
     ]);
   });
 
@@ -725,6 +741,13 @@ describe('note review regressions', () => {
       expect(
         schemas.NoteGroupCardResponseDto.properties.circleId,
       ).toMatchObject({ type: 'string' });
+      expect(
+        schemas.NoteGroupCardResponseDto.properties.conversationID,
+      ).toMatchObject({ type: 'string' });
+      expect(schemas.NoteCardPeerDto.properties.conversationID).toMatchObject({
+        type: 'string',
+        nullable: true,
+      });
     } finally {
       await app.close();
     }
@@ -1203,7 +1226,12 @@ describe('note review regressions', () => {
       const data = (prisma.note as any).create.mock.calls[0][0].data;
       expect(data.sourceConversationID).toBe('conv-s');
       expect(data.sections.groups.items).toEqual([
-        { id: 'conv-s', name: '独立群', faceURL: null },
+        {
+          id: 'conv-s',
+          name: '独立群',
+          faceURL: null,
+          conversationID: 'conv-s',
+        },
       ]);
     });
 
@@ -1259,6 +1287,298 @@ describe('note review regressions', () => {
       expect(data).not.toHaveProperty('sourceConversationID');
       expect(data.sections.groups.items).toEqual([
         { id: 'conv-s', name: '独立群', faceURL: null },
+      ]);
+    });
+
+    // Codex P1：以前群成员也能加群名片，旧笔记有名片而没有绑定。原样带回来
+    // 保存不是新绑定，不能要求群主权限，绑定也要保持为空。
+    it('saves a legacy unbound group card unchanged for a non-owner member', async () => {
+      const { service, prisma, note } = publicationFixture(null);
+      Object.assign(note, {
+        sourceConversationID: null,
+        collectedFromNoteID: null,
+        sections: {
+          groups: { items: [{ id: 'conv-s', name: '独立群', faceURL: null }] },
+        },
+      });
+      standaloneOwnedBy(prisma, 'someone-else');
+      await service.updateNote('owner', 'note-1', {
+        title: 'Text only',
+        media: [],
+        sections: { groups: { items: [{ id: 'conv-s', name: '独立群' }] } },
+      });
+      const data = (prisma.note as any).update.mock.calls.at(-1)[0].data;
+      expect(data).not.toHaveProperty('sourceConversationID');
+      expect(data.sections.groups.items).toEqual([
+        { id: 'conv-s', name: '独立群', faceURL: null },
+      ]);
+      expect(prisma.$queryRaw).not.toHaveBeenCalled();
+    });
+
+    it('still requires group ownership when a legacy unbound note switches to another group card', async () => {
+      const { service, prisma, note } = publicationFixture(null);
+      Object.assign(note, {
+        sourceConversationID: null,
+        collectedFromNoteID: null,
+        sections: {
+          groups: { items: [{ id: 'conv-old', name: '旧群', faceURL: null }] },
+        },
+      });
+      standaloneOwnedBy(prisma, 'someone-else');
+      await expect(
+        service.updateNote('owner', 'note-1', {
+          title: 'Switch',
+          media: [],
+          sections: { groups: { items: [{ id: 'conv-s', name: 'x' }] } },
+        }),
+      ).rejects.toBeInstanceOf(ForbiddenException);
+      expect((prisma.note as any).update).not.toHaveBeenCalled();
+    });
+
+    it('treats an already-bound card as changed when it is not the single stored card', async () => {
+      const { service, prisma, note } = publicationFixture(null);
+      Object.assign(note, {
+        sourceConversationID: 'conv-old',
+        collectedFromNoteID: null,
+        sections: {
+          groups: { items: [{ id: 'conv-old', name: '旧群', faceURL: null }] },
+        },
+      });
+      standaloneOwnedBy(prisma, 'someone-else');
+      await expect(
+        service.updateNote('owner', 'note-1', {
+          title: 'Switch',
+          media: [],
+          sections: { groups: { items: [{ id: 'conv-s', name: 'x' }] } },
+        }),
+      ).rejects.toBeInstanceOf(ForbiddenException);
+    });
+
+    // Codex P2：独立群可以没有群名，绑定时沿用提交的名字（本人在群里才算数）。
+    function unnamedStandaloneOwnedBy(prisma: any, member: boolean) {
+      prisma.chatConversation.findFirst.mockResolvedValue({ id: 'conv-u' });
+      prisma.chatConversation.findUnique.mockResolvedValue({
+        type: 'GROUP',
+        ownerID: 'owner',
+        circleID: null,
+        name: null,
+        avatarUrl: null,
+      });
+      prisma.chatConversation.findMany.mockResolvedValue(
+        member ? [{ id: 'conv-u', name: null, avatarUrl: null }] : [],
+      );
+    }
+
+    it('binds an unnamed standalone group on create using the submitted name', async () => {
+      const { service, prisma } = publicationFixture(null);
+      unnamedStandaloneOwnedBy(prisma, true);
+      await service.createNote('owner', {
+        title: 'Unnamed',
+        media: [],
+        sections: {
+          groups: { items: [{ id: 'conv-u', name: ' 小明、小红 ' }] },
+        },
+      });
+      const data = (prisma.note as any).create.mock.calls[0][0].data;
+      expect(data.sourceConversationID).toBe('conv-u');
+      expect(data.sections.groups.items).toEqual([
+        {
+          id: 'conv-u',
+          name: '小明、小红',
+          faceURL: null,
+          conversationID: 'conv-u',
+        },
+      ]);
+    });
+
+    it('binds an unnamed standalone group on update using the submitted name', async () => {
+      const { service, prisma, note } = publicationFixture(null);
+      Object.assign(note, {
+        sourceConversationID: null,
+        collectedFromNoteID: null,
+        sections: {},
+      });
+      unnamedStandaloneOwnedBy(prisma, true);
+      await service.updateNote('owner', 'note-1', {
+        title: 'Unnamed',
+        media: [],
+        sections: { groups: { items: [{ id: 'conv-u', name: '小明、小红' }] } },
+      });
+      const data = (prisma.note as any).update.mock.calls.at(-1)[0].data;
+      expect(data.sourceConversationID).toBe('conv-u');
+      expect(data.sections.groups.items).toEqual([
+        {
+          id: 'conv-u',
+          name: '小明、小红',
+          faceURL: null,
+          conversationID: 'conv-u',
+        },
+      ]);
+    });
+
+    it('rejects an unnamed standalone group the author has left, even as its recorded owner', async () => {
+      const { service, prisma } = publicationFixture(null);
+      unnamedStandaloneOwnedBy(prisma, false);
+      await expect(
+        service.createNote('owner', {
+          title: 'Left',
+          media: [],
+          sections: { groups: { items: [{ id: 'conv-u', name: '小明' }] } },
+        }),
+      ).rejects.toBeInstanceOf(ForbiddenException);
+      expect((prisma.note as any).create).not.toHaveBeenCalled();
+    });
+
+    // Codex P2：事务外预检之后群主被转让，以写入事务内锁后读到的为准。
+    it.each(['create', 'update'])(
+      'revalidates group ownership inside the %s transaction',
+      async (mode) => {
+        const { service, prisma, note } = publicationFixture(null);
+        Object.assign(note, {
+          sourceConversationID: null,
+          collectedFromNoteID: null,
+          sections: {},
+        });
+        standaloneOwnedBy(prisma, 'owner');
+        prisma.$queryRaw.mockResolvedValue([
+          { type: 'GROUP', ownerID: 'new-owner', circleID: null },
+        ]);
+        const input = {
+          title: 'Raced',
+          media: [],
+          sections: { groups: { items: [{ id: 'conv-s', name: 'x' }] } },
+        };
+        await expect(
+          mode === 'create'
+            ? service.createNote('owner', input)
+            : service.updateNote('owner', 'note-1', input),
+        ).rejects.toBeInstanceOf(ForbiddenException);
+        const [strings, conversationID] = prisma.$queryRaw.mock.calls[0];
+        expect(strings.join('?')).toContain('FOR SHARE');
+        expect(conversationID).toBe('conv-s');
+        expect((prisma.note as any).create).not.toHaveBeenCalled();
+        expect((prisma.note as any).update).not.toHaveBeenCalled();
+      },
+    );
+
+    // 前端 P1：独立群名片要带服务端可信的 conversationID，圈子群不带，请求里伪造的不收。
+    it('never keeps a request conversationID: circle cards drop it, standalone cards get the server value', async () => {
+      const { service, prisma } = fixture();
+      prisma.circle.findMany.mockResolvedValue([
+        { id: 'circle-1', groupID: null, name: 'Circle', avatarUrl: null },
+      ] as any);
+      prisma.chatConversation.findMany.mockResolvedValue([
+        { id: 'conv-s', name: '独立群', avatarUrl: null },
+      ] as any);
+      const result = await (service as any).canonicalizeNoteCards('owner', {
+        sections: {
+          groups: {
+            items: [
+              { id: 'circle-1', name: 'Circle', conversationID: 'forged' },
+              { id: 'conv-s', name: '独立群', conversationID: 'forged' },
+            ],
+          },
+        },
+      });
+      expect(result.sections.groups.items).toEqual([
+        { id: 'circle-1', name: 'Circle', faceURL: null },
+        {
+          id: 'conv-s',
+          name: '独立群',
+          faceURL: null,
+          conversationID: 'conv-s',
+        },
+      ]);
+    });
+
+    it('keeps the stored conversationID of an unchanged card instead of the request one', async () => {
+      const { service } = fixture();
+      const result = await (service as any).canonicalizeNoteCards(
+        'owner',
+        {
+          sections: {
+            groups: {
+              items: [
+                { id: 'conv-s', name: 'x', conversationID: 'forged' },
+                { id: 'circle-1', name: 'y', conversationID: 'forged' },
+              ],
+            },
+          },
+        },
+        {
+          groups: {
+            items: [
+              {
+                id: 'conv-s',
+                name: '独立群',
+                faceURL: null,
+                conversationID: 'conv-s',
+              },
+              { id: 'circle-1', name: 'Circle', faceURL: null },
+            ],
+          },
+        },
+      );
+      expect(result.sections.groups.items).toEqual([
+        {
+          id: 'conv-s',
+          name: '独立群',
+          faceURL: null,
+          conversationID: 'conv-s',
+        },
+        { id: 'circle-1', name: 'Circle', faceURL: null },
+      ]);
+    });
+
+    it('tags a collected standalone origin group card with its conversationID', async () => {
+      const { service, prisma } = fixture();
+      // 绑定过的源笔记：按绑定的会话解析。
+      prisma.chatConversation.findUnique.mockResolvedValue({
+        type: 'GROUP',
+        circleID: null,
+        name: '独立群',
+        avatarUrl: null,
+      });
+      const bound = await (service as any).resolveOriginGroupCard(
+        { sourceConversationID: 'conv-s' },
+        undefined,
+      );
+      expect(bound).toMatchObject({ id: 'conv-s', conversationID: 'conv-s' });
+      // 没绑定的旧笔记：聊天里带来的群 id 核实是独立群才补。
+      const fallback = await (service as any).resolveOriginGroupCard(
+        { sourceConversationID: null },
+        { id: 'conv-s', name: '聊天里的群' },
+      );
+      expect(fallback).toEqual({
+        id: 'conv-s',
+        name: '聊天里的群',
+        conversationID: 'conv-s',
+      });
+      prisma.chatConversation.findUnique.mockResolvedValue({
+        type: 'GROUP',
+        circleID: 'circle-1',
+      });
+      const circleFallback = await (service as any).resolveOriginGroupCard(
+        { sourceConversationID: null },
+        { id: 'circle-1', name: '圈子群', conversationID: 'forged' },
+      );
+      expect(circleFallback).toEqual({ id: 'circle-1', name: '圈子群' });
+
+      const sections = (service as any).applyCollectSourceCards(
+        {},
+        {
+          sender: { id: 'u2', name: '小王' },
+          group: { id: 'conv-s', name: 'x' },
+        },
+        fallback,
+      );
+      expect(sections.groups.items).toEqual([
+        {
+          id: 'conv-s',
+          name: '聊天里的群',
+          faceURL: null,
+          conversationID: 'conv-s',
+        },
       ]);
     });
 

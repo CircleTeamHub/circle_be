@@ -220,6 +220,16 @@ fail closed,不会连接服务器。必须从 Actions 手动运行 Release,同�
 `deploy/SCHEMA_COMPATIBILITY` 抬到 `4`:迁移后旧二进制不再是合法回滚目标,
 launcher 会拒绝任何兼容级别低于 4 的 tag。
 
+**笔记正文 contentJson 修复(`20261013000000_repair_wiped_note_content_json`)迁移之外还有一个
+临时定时任务。** 迁移只修存量:默认蓝绿模式下迁移先跑、新色健康后才切流,这段窗口里
+(以及新色没起来、旧色继续服务的整段时间里)旧版本未修复的 DTO 还会把正文块写成
+`[[], ...]`,迁移不会再跑第二次。所以新版本带了 `note_content_json_repair`
+(`src/note/note-content-json-repair.ts`,每小时)重跑同一组幂等 UPDATE —— 只按行内数据
+判断、不碰 `updatedAt`,SQL 与迁移文件由单测逐条比对防漂移。修到行时打 WARN 日志
+`repaired N wiped note contentJson field(s)`。**删除时机**:本版本成功切流、旧色已停,
+且之后至少跑过一轮(日志里不再出现修复计数),即可在下一个版本连同其单测一起删掉;
+迁移文件本身保留。
+
 ### 一次性配置(GitHub 仓库 Settings → Secrets and variables → Actions)
 
 | 类型 | 名称 | 值 |

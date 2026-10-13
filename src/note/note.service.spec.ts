@@ -123,6 +123,15 @@ describe('NoteService', () => {
     });
     prisma.chatConversation.findMany.mockReset();
     prisma.chatConversation.findMany.mockResolvedValue([]);
+    // 写笔记事务内复核群主（FOR SHARE 读会话）与 findUnique 桩读到同一行；
+    // 其他原生查询维持默认空结果。
+    prisma.$queryRaw.mockReset();
+    prisma.$queryRaw.mockImplementation(
+      async (strings: TemplateStringsArray) =>
+        strings.join('?').includes('FROM "ChatConversation"')
+          ? [await prisma.chatConversation.findUnique()]
+          : [],
+    );
     prisma.circle.findFirst.mockReset();
     prisma.circle.findFirst.mockResolvedValue(null);
     prisma.circle.findUnique.mockReset();
@@ -1262,6 +1271,13 @@ describe('NoteService', () => {
               avatarUrl: 'https://cdn.example.com/g1.jpg',
             },
             { id: '', name: '缺 id 的坏数据' },
+            // 独立群名片：服务端存的 conversationID 原样进摘要。
+            {
+              id: 'conv-standalone',
+              name: '独立群',
+              faceURL: null,
+              conversationID: 'conv-standalone',
+            },
           ],
         },
       },
@@ -1300,6 +1316,13 @@ describe('NoteService', () => {
             id: 'chat-group-1',
             name: '玫瑰刺群',
             faceURL: 'https://cdn.example.com/g1.jpg',
+            conversationID: null,
+          },
+          {
+            id: 'conv-standalone',
+            name: '独立群',
+            faceURL: null,
+            conversationID: 'conv-standalone',
           },
         ],
       });

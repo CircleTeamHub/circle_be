@@ -229,6 +229,13 @@ type NoteCardSnapshot = {
   name: string;
   faceURL: string | null;
   circleId?: string;
+  /** 独立群名片的会话 id：服务端按会话解析出来才写，客户端据此路由到群聊。 */
+  conversationID?: string;
+};
+
+/** 来源群名片：独立群额外带服务端核实过的会话 id。 */
+type OriginGroupCard = NonNullable<NoteCollectSourceDto['group']> & {
+  conversationID?: string;
 };
 
 type NoteGroupRow = {
@@ -1892,6 +1899,10 @@ export class NoteService {
               ...(section === 'groups' && typeof item.circleId === 'string'
                 ? { circleId: item.circleId }
                 : {}),
+              ...(section === 'groups' &&
+              typeof item.conversationID === 'string'
+                ? { conversationID: item.conversationID }
+                : {}),
             },
           ]),
       );
@@ -2019,6 +2030,9 @@ export class NoteService {
           id: conversation.id,
           name,
           faceURL: conversation.avatarUrl ?? null,
+          // 卡片 id 本身就是会话 id；显式标出来，客户端才分得清这是独立群
+          // 而不是圈子 id（圈子群名片永远不带这个字段）。
+          conversationID: conversation.id,
         });
       }
     }
@@ -2195,6 +2209,12 @@ export class NoteService {
                 id: item.id,
                 ...((item as unknown as NoteCardSnapshot).circleId
                   ? { circleId: (item as unknown as NoteCardSnapshot).circleId }
+                  : {}),
+                ...((item as unknown as NoteCardSnapshot).conversationID
+                  ? {
+                      conversationID: (item as unknown as NoteCardSnapshot)
+                        .conversationID,
+                    }
                   : {}),
                 name: item.name,
                 faceURL: item.faceURL ?? null,
@@ -2589,9 +2609,12 @@ export class NoteService {
   /**
    * 列表卡片只需要名片的 id / 名称 / 头像，最多 NOTE_CARD_PREVIEW_LIMIT 个；
    * 缺 id 或名称的历史坏数据直接跳过（点了跳不动，不如不显示）。
+   * 群名片额外带 conversationID（独立群才有，否则 null），客户端靠它区分
+   * 「打开群聊」还是「打开圈子」；只读库里存的，与详情同一口径。
    */
   private toCardPeers(
     items: Array<Record<string, unknown>> | undefined,
+    groups = false,
   ): NoteCardPeerDto[] {
     const peers: NoteCardPeerDto[] = [];
     for (const item of items ?? []) {
@@ -2605,7 +2628,19 @@ export class NoteService {
           : typeof item.avatarUrl === 'string' && item.avatarUrl
             ? item.avatarUrl
             : null;
-      peers.push({ id, name, faceURL: face });
+      peers.push({
+        id,
+        name,
+        faceURL: face,
+        ...(groups
+          ? {
+              conversationID:
+                typeof item.conversationID === 'string' && item.conversationID
+                  ? item.conversationID
+                  : null,
+            }
+          : {}),
+      });
     }
     return peers;
   }
@@ -2805,7 +2840,7 @@ export class NoteService {
     const availability = this.getSectionAvailability(visibleSections);
     const cardPreview = {
       contacts: this.toCardPeers(visibleSections.contacts?.items),
-      groups: this.toCardPeers(visibleSections.groups?.items),
+      groups: this.toCardPeers(visibleSections.groups?.items, true),
     };
 
     return {
@@ -3093,6 +3128,9 @@ export class NoteService {
             null,
           );
         await this.assertNoteStorageAvailable(tx, ownerID);
+        if (binding?.conversationID) {
+          await this.assertCanBindGroup(ownerID, binding.conversationID, tx);
+        }
 
         const note = await tx.note.create({
           data: {
@@ -3940,9 +3978,29 @@ export class NoteService {
   private async resolveOriginGroupCard(
     note: Pick<NoteRow, 'sourceConversationID'>,
     fallback: NoteCollectSourceDto['group'],
-  ): Promise<NoteCollectSourceDto['group'] | null | undefined> {
-    if (!note.sourceConversationID) return fallback;
+    unnamedGroupName?: string,
+  ): Promise<OriginGroupCard | null | undefined> {
     const chatConversation = (this.prisma as any).chatConversation;
+    if (!note.sourceConversationID) {
+      if (!fallback) return fallback;
+      // 旧笔记没有绑定，只能用聊天里带来的群。它若确实是独立群（按 id 查到
+      // circleID 为空的 GROUP 会话），补上服务端核实过的 conversationID；
+      // 请求里的字段一律不收。
+      const card = {
+        id: fallback.id,
+        name: fallback.name,
+        ...(fallback.faceURL ? { faceURL: fallback.faceURL } : {}),
+      };
+      const row = chatConversation?.findUnique
+        ? await chatConversation.findUnique({
+            where: { id: fallback.id },
+            select: { type: true, circleID: true },
+          })
+        : null;
+      return row?.type === 'GROUP' && row.circleID === null
+        ? { ...card, conversationID: fallback.id }
+        : card;
+    }
     if (!chatConversation?.findUnique) return null;
     const conversation = await chatConversation.findUnique({
       where: { id: note.sourceConversationID },
@@ -3960,20 +4018,24 @@ export class NoteService {
         ? { id: row.id, name: row.name, faceURL: row.avatarUrl ?? undefined }
         : null;
     }
-    if (typeof conversation.name !== 'string' || !conversation.name.trim()) {
-      return null;
-    }
+    // 独立群可以没有群名：调用方核实过本人在群里时，会把客户端展示的名字
+    // 作为兜底传进来（与 canonicalizeNoteCards 同一口径）；收藏路径不传。
+    const name =
+      (typeof conversation.name === 'string' ? conversation.name.trim() : '') ||
+      unnamedGroupName?.trim();
+    if (!name) return null;
     return {
       id: note.sourceConversationID,
-      name: conversation.name.trim(),
+      name,
       faceURL: conversation.avatarUrl ?? undefined,
+      conversationID: note.sourceConversationID,
     };
   }
 
   private applyCollectSourceCards(
     sections: unknown,
     source: NoteCollectSourceDto,
-    originGroup?: NoteCollectSourceDto['group'] | null,
+    originGroup?: OriginGroupCard | null,
     inheritedPersonalCard?: Record<string, unknown> | null,
   ): unknown {
     const stored = this.isRecord(sections) ? sections : {};
@@ -4012,6 +4074,11 @@ export class NoteService {
           id: groupSource.id,
           name: groupSource.name,
           faceURL: this.storageFaceUrlOrNull(groupSource.faceURL),
+          // 只有 resolveOriginGroupCard 核实过的独立群才带；source.group
+          // 是请求体，原样回落时不会有这个字段。
+          ...(originGroup?.conversationID
+            ? { conversationID: originGroup.conversationID }
+            : {}),
         }
       : null;
 
@@ -4602,6 +4669,10 @@ export class NoteService {
         });
       }
 
+      if (binding?.conversationID) {
+        await this.assertCanBindGroup(ownerID, binding.conversationID, tx);
+      }
+
       if (canonicalInput.clientDraftID) {
         await this.assertNoteEditOutcomeCapacity(tx, ownerID, noteId);
         await this.consumeNoteDraft(
@@ -4807,12 +4878,34 @@ export class NoteService {
     return result;
   }
 
-  /** 只有群主能把笔记绑到群上：独立群看会话群主，圈子群看圈主。 */
-  private async assertCanBindGroup(ownerID: string, conversationID: string) {
-    const conversation = await this.prisma.chatConversation.findUnique({
-      where: { id: conversationID },
-      select: { type: true, ownerID: true, circleID: true },
-    });
+  /**
+   * 只有群主能把笔记绑到群上：独立群看会话群主，圈子群看圈主。
+   *
+   * 传 tx 时是写笔记那个事务里的复核：对会话行加 FOR SHARE，与
+   * ChatGroupSettingsService.transferOwnership 锁会话的 FOR UPDATE 互斥，
+   * 读到的就是锁后最新的群主。事务外那次只是早失败，以事务内为准。
+   */
+  private async assertCanBindGroup(
+    ownerID: string,
+    conversationID: string,
+    tx?: Prisma.TransactionClient,
+  ) {
+    const conversation = tx
+      ? (
+          await tx.$queryRaw<
+            Array<{
+              type: string;
+              ownerID: string | null;
+              circleID: string | null;
+            }>
+          >`
+            SELECT "type", "ownerID", "circleID" FROM "ChatConversation"
+            WHERE "id" = ${conversationID} FOR SHARE`
+        )[0]
+      : await this.prisma.chatConversation.findUnique({
+          where: { id: conversationID },
+          select: { type: true, ownerID: true, circleID: true },
+        });
     if (!conversation || conversation.type !== 'GROUP') {
       throw new NotFoundException({
         message: 'Source group not found',
@@ -4821,7 +4914,7 @@ export class NoteService {
     }
     let isOwner = conversation.ownerID === ownerID;
     if (!isOwner && conversation.circleID) {
-      const circle = await this.prisma.circle.findUnique({
+      const circle = await (tx ?? this.prisma).circle.findUnique({
         where: { id: conversation.circleID },
         select: { ownerID: true, deleted: true },
       });
@@ -4864,6 +4957,10 @@ export class NoteService {
    * 群名片就是群设置里的「笔记管理」绑定：源笔记发布/更新时，提交的群名片
    * 决定 sourceConversationID。返回 undefined 表示这次不动绑定——没带群名片段、
    * 旧版多张群名片，或群名片没换（换了群主后只改正文也不该被拦下）。
+   *
+   * 「没换」只看库里已存的名片，与有没有绑定无关：以前群成员也能加群名片，
+   * 这类旧笔记有名片而 sourceConversationID 为空，原样带回来保存不能被当成
+   * 新绑定去要求群主权限；绑定照旧保持为空。
    */
   private async resolveGroupCardBinding(
     ownerID: string,
@@ -4877,19 +4974,19 @@ export class NoteService {
     const items = section.items ?? [];
     if (items.length === 0) return { conversationID: null, card: null };
     if (items.length > 1) return undefined;
-    if (existing?.sourceConversationID) {
+    if (existing) {
       const stored = this.isRecord(existing.sections)
         ? existing.sections.groups
         : undefined;
-      const storedItems =
-        this.isRecord(stored) && Array.isArray(stored.items)
-          ? stored.items
-          : [];
-      const storedId =
-        storedItems.length === 1 && this.isRecord(storedItems[0])
-          ? storedItems[0].id
-          : undefined;
-      if (storedId === items[0].id) return undefined;
+      const storedIds = (
+        this.isRecord(stored) && Array.isArray(stored.items) ? stored.items : []
+      ).map((item) => (this.isRecord(item) ? item.id : undefined));
+      // 已绑定：库里恰好就是这一张才算没换（绑定与名片一一对应）。
+      // 未绑定的旧笔记可能存着多张，删到只剩其中一张也不是新绑定。
+      const unchanged = existing.sourceConversationID
+        ? storedIds.length === 1 && storedIds[0] === items[0].id
+        : storedIds.includes(items[0].id);
+      if (unchanged) return undefined;
     }
     const conversationID = await this.findGroupConversationIdForCard(
       items[0].id,
@@ -4900,9 +4997,12 @@ export class NoteService {
       );
     }
     await this.assertCanBindGroup(ownerID, conversationID);
+    // 没有群名的独立群沿用提交的名字；本人是否还在群里由随后的
+    // canonicalizeNoteCards 按 leftAt 为空把关，不在就整单 403。
     const card = await this.resolveOriginGroupCard(
       { sourceConversationID: conversationID },
       undefined,
+      items[0].name,
     );
     if (!card) {
       throw new ForbiddenException(
@@ -4960,19 +5060,28 @@ export class NoteService {
             id: sourceGroupCard.id,
             name: sourceGroupCard.name,
             faceURL: sourceGroupCard.faceURL ?? null,
+            ...(sourceGroupCard.conversationID
+              ? { conversationID: sourceGroupCard.conversationID }
+              : {}),
           },
         ],
       };
     } else {
       delete nextSections.groups;
     }
-    return this.prisma.note.update({
-      where: { id: noteId, ownerID, status: { not: 'DELETED' } },
-      data: {
-        sourceConversationID: conversationID,
-        sections: toPrismaJson(nextSections),
-      },
-      select: { id: true, sourceConversationID: true },
+    return this.prisma.$transaction(async (tx) => {
+      // 与 createNote / updateNote 同一口径：群主以写入事务内锁后读到的为准。
+      if (conversationID) {
+        await this.assertCanBindGroup(ownerID, conversationID, tx);
+      }
+      return tx.note.update({
+        where: { id: noteId, ownerID, status: { not: 'DELETED' } },
+        data: {
+          sourceConversationID: conversationID,
+          sections: toPrismaJson(nextSections),
+        },
+        select: { id: true, sourceConversationID: true },
+      });
     });
   }
 

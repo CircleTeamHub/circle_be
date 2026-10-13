@@ -230,6 +230,15 @@ export class NoteGroupCardDto {
   @IsUUID()
   circleId?: string;
 
+  @ApiPropertyOptional({
+    description:
+      'Standalone group conversation identifier returned on reads. Accepted for roundtrips; the stored value is always resolved by the server.',
+  })
+  @IsOptional()
+  @IsString()
+  @MaxLength(120)
+  conversationID?: string;
+
   @ApiProperty()
   @IsString()
   @IsNotEmpty()
@@ -734,6 +743,12 @@ export class NoteGroupCardResponseDto extends NoteContactCardResponseDto {
       'Canonical Circle primary key, including when id is a legacy OpenIM group identifier.',
   })
   circleId?: string;
+
+  @ApiPropertyOptional({
+    description:
+      'Present only on standalone group cards: the group conversation id (equal to id). Circle group cards never carry it.',
+  })
+  conversationID?: string;
 }
 
 export class NoteContactSectionResponseDto {
@@ -805,6 +820,9 @@ export class NoteCardPeerDto {
   @ApiProperty() id: string;
   @ApiProperty() name: string;
   @ApiPropertyOptional({ nullable: true, type: String }) faceURL: string | null;
+  /** 仅群名片：独立群的会话 id；圈子群为 null。联系人名片不输出。 */
+  @ApiPropertyOptional({ nullable: true, type: String })
+  conversationID?: string | null;
 }
 
 export class NoteCardPreviewDto {
