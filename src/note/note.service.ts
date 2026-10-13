@@ -18,6 +18,7 @@ import { Prisma } from 'src/generated/prisma';
 import { PrismaService } from 'src/prisma/prisma.service';
 import { MembershipPolicyService } from 'src/membership/membership-policy.service';
 import { RealtimeService } from 'src/realtime/realtime.service';
+import { ChatCircleSyncService } from 'src/chat/chat-circle-sync.service';
 import { UploadService } from 'src/upload/upload.service';
 import {
   CHAT_MEDIA_DELETE_CLAIM_REASON,
@@ -486,6 +487,7 @@ export class NoteService {
     private readonly membershipPolicy: MembershipPolicyService,
     @Optional() private readonly uploadService?: UploadService,
     @Optional() private readonly realtime?: RealtimeService,
+    @Optional() private readonly circleSync?: ChatCircleSyncService,
   ) {
     this.storagePublicObjectBases = storagePublicObjectBasesFromConfig(
       this.config,
@@ -4933,6 +4935,25 @@ export class NoteService {
    * 群名片的 id 有两种口径：圈子群是圈子 id（老数据也可能是 groupID），
    * 独立群是会话 id。绑定要落到会话上，这里统一换算成会话 id。
    */
+  /**
+   * 圈子群聊会话是懒创建的（第一次有人打开群聊才建）。圈主给还没建会话的
+   * 圈子加群名片时，与他打开群聊一样先把会话建出来再绑定，否则会被误判成
+   * 「不可访问的群」。只替圈主建：非圈主本来就不能绑，也不该因为随手提交
+   * 一个圈子 id 就触发建会话的副作用。解散/停用的圈子 ensure 返回 null。
+   */
+  private async ensureOwnedCircleConversation(
+    ownerID: string,
+    cardId: string,
+  ): Promise<string | null> {
+    if (!this.circleSync) return null;
+    const circle = await this.prisma.circle.findFirst({
+      where: { deleted: false, OR: [{ id: cardId }, { groupID: cardId }] },
+      select: { id: true, ownerID: true },
+    });
+    if (!circle || circle.ownerID !== ownerID) return null;
+    return this.circleSync.ensureCircleConversation(circle.id);
+  }
+
   private async findGroupConversationIdForCard(
     cardId: string,
   ): Promise<string | null> {
@@ -4988,9 +5009,9 @@ export class NoteService {
         : storedIds.includes(items[0].id);
       if (unchanged) return undefined;
     }
-    const conversationID = await this.findGroupConversationIdForCard(
-      items[0].id,
-    );
+    const conversationID =
+      (await this.findGroupConversationIdForCard(items[0].id)) ??
+      (await this.ensureOwnedCircleConversation(ownerID, items[0].id));
     if (!conversationID) {
       throw new ForbiddenException(
         'Group card target is not an accessible group',

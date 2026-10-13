@@ -90,13 +90,19 @@ describe('note review regressions', () => {
           ? 'https://storage.test/bucket'
           : undefined,
     };
+    // 圈子群聊会话懒创建：圈主绑群名片时由它补建，默认返回 null（建不出来）。
+    const circleSync = {
+      ensureCircleConversation: jest.fn().mockResolvedValue(null),
+    };
     const service = new NoteService(
       prisma as any,
       config as any,
       policy as any,
       upload as any,
+      undefined,
+      circleSync as any,
     );
-    return { service, prisma, policy, upload };
+    return { service, prisma, policy, upload, circleSync };
   }
 
   it.each(['media', 'showcase', 'audio'])(
@@ -1233,6 +1239,59 @@ describe('note review regressions', () => {
           conversationID: 'conv-s',
         },
       ]);
+    });
+
+    it('creates the lazy circle conversation when the circle owner binds its card', async () => {
+      const { service, prisma, circleSync } = publicationFixture(null);
+      // 圈子还没有群聊会话：第一次查不到，补建后能读到圈子群的会话行。
+      prisma.circle.findFirst.mockResolvedValue({
+        id: 'circle-1',
+        ownerID: 'owner',
+      });
+      circleSync.ensureCircleConversation.mockResolvedValue('conv-c');
+      prisma.chatConversation.findUnique.mockResolvedValue({
+        type: 'GROUP',
+        ownerID: null,
+        circleID: 'circle-1',
+        name: null,
+        avatarUrl: null,
+      });
+      prisma.circle.findUnique.mockResolvedValue({
+        id: 'circle-1',
+        ownerID: 'owner',
+        name: '圈子群',
+        avatarUrl: null,
+      });
+      prisma.circle.findMany.mockResolvedValue([
+        { id: 'circle-1', groupID: null, name: '圈子群', avatarUrl: null },
+      ]);
+      await service.createNote('owner', {
+        title: 'Bound to circle',
+        media: [],
+        sections: { groups: { items: [{ id: 'circle-1', name: 'x' }] } },
+      });
+      expect(circleSync.ensureCircleConversation).toHaveBeenCalledWith(
+        'circle-1',
+      );
+      const data = (prisma.note as any).create.mock.calls[0][0].data;
+      expect(data.sourceConversationID).toBe('conv-c');
+    });
+
+    it('never creates a circle conversation for someone who does not own the circle', async () => {
+      const { service, prisma, circleSync } = publicationFixture(null);
+      prisma.circle.findFirst.mockResolvedValue({
+        id: 'circle-1',
+        ownerID: 'someone-else',
+      });
+      await expect(
+        service.createNote('owner', {
+          title: 'Not my circle',
+          media: [],
+          sections: { groups: { items: [{ id: 'circle-1', name: 'x' }] } },
+        }),
+      ).rejects.toBeInstanceOf(ForbiddenException);
+      expect(circleSync.ensureCircleConversation).not.toHaveBeenCalled();
+      expect((prisma.note as any).create).not.toHaveBeenCalled();
     });
 
     it('rejects a group card for a group the author does not own', async () => {
