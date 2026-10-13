@@ -23,8 +23,10 @@ export const LOGIN_CHALLENGE_DECISION_MS = 5 * 60 * 1000;
 export const LOGIN_CHALLENGE_CODE_TTL_MS = 60 * 1000;
 /** 单个验证请求最多输错次数，用完即作废。 */
 export const LOGIN_CHALLENGE_MAX_ATTEMPTS = 5;
-/** 同一账号在窗口内最多发起几次验证（防「弹窗轰炸」骗点同意）。 */
+/** 同一账号、同一来源 IP 在窗口内最多发起几次验证（防「弹窗轰炸」骗点同意）。 */
 export const LOGIN_CHALLENGE_RATE_LIMIT = 5;
+/** 账号级总量（所有来源 IP 合计）。 */
+export const LOGIN_CHALLENGE_ACCOUNT_RATE_LIMIT = 20;
 export const LOGIN_CHALLENGE_RATE_WINDOW_MS = 10 * 60 * 1000;
 /** 超过这个年龄的验证请求在新建时顺手清掉。 */
 const LOGIN_CHALLENGE_RETENTION_MS = 24 * 60 * 60 * 1000;
@@ -116,11 +118,7 @@ export class DeviceTrustService {
       }
     }
 
-    const trustedCount = await this.prisma.trustedDevice.count({
-      where: { userId: user.id, revokedAt: null },
-    });
-    if (trustedCount === 0) {
-      // 首台设备（新注册、或功能上线前从未在新版客户端上登录过的老账号）。
+    if (await this.isFirstDevice(user.id, now)) {
       if (deviceKey) await this.trust(user.id, deviceKey, context);
       return { kind: 'trusted' };
     }
@@ -203,9 +201,8 @@ export class DeviceTrustService {
     const rows = await this.prisma.loginChallenge.findMany({
       where: {
         userId,
-        status: {
-          in: [LoginChallengeStatus.PENDING, LoginChallengeStatus.APPROVED],
-        },
+        // 只问还没人处理过的：批准的那台设备自己握着验证码，别的设备不必再问。
+        status: LoginChallengeStatus.PENDING,
         expiresAt: { gt: new Date() },
       },
       orderBy: { createdAt: 'desc' },
@@ -217,14 +214,9 @@ export class DeviceTrustService {
         userAgent: true,
         createdAt: true,
         expiresAt: true,
-        status: true,
       },
     });
-    return rows.map((row) => ({
-      ...row,
-      status:
-        row.status === LoginChallengeStatus.APPROVED ? 'APPROVED' : 'PENDING',
-    }));
+    return rows.map((row) => ({ ...row, status: 'PENDING' as const }));
   }
 
   /**
@@ -372,6 +364,8 @@ export class DeviceTrustService {
         status: LoginChallengeStatus.APPROVED,
         codeHash: challenge.codeHash,
         codeExpiresAt: { gt: now },
+        // 并发猜码时，别的请求可能已把次数用完。
+        attempts: { lt: LOGIN_CHALLENGE_MAX_ATTEMPTS },
       },
       data: { status: LoginChallengeStatus.CONSUMED, codeHash: null },
     });
@@ -391,8 +385,23 @@ export class DeviceTrustService {
     const status = this.publicStatus(challenge, new Date());
     if (status === 'REJECTED') this.throwRejected();
     if (status === 'CONSUMED') this.throwInvalid();
+    if (challenge.attempts >= LOGIN_CHALLENGE_MAX_ATTEMPTS) this.throwLocked();
     if (status === 'EXPIRED') this.throwExpired();
     return challenge;
+  }
+
+  /**
+   * 安全码输错：与验证码共用这张验证单的次数上限（条件自增，并发也越不过去）。
+   * 安全码可能只有 4 位，不能只靠账号级的锁。
+   */
+  async registerSecurityCodeFailure(challengeId: string): Promise<void> {
+    await this.prisma.loginChallenge.updateMany({
+      where: {
+        id: challengeId,
+        attempts: { lt: LOGIN_CHALLENGE_MAX_ATTEMPTS },
+      },
+      data: { attempts: { increment: 1 } },
+    });
   }
 
   async consumeAfterSecurityCode(challengeId: string): Promise<void> {
@@ -403,6 +412,7 @@ export class DeviceTrustService {
           in: [LoginChallengeStatus.PENDING, LoginChallengeStatus.APPROVED],
         },
         expiresAt: { gt: new Date() },
+        attempts: { lt: LOGIN_CHALLENGE_MAX_ATTEMPTS },
       },
       data: { status: LoginChallengeStatus.CONSUMED, codeHash: null },
     });
@@ -426,7 +436,7 @@ export class DeviceTrustService {
     });
   }
 
-  /** 新注册 / 续签 token 的设备：持有有效会话即视为受信任（上线迁移也靠这条）。 */
+  /** 通过验证 / 首台设备：记为受信任（含恢复此前撤销的信任）。 */
   async trust(
     userId: string,
     deviceKey: string,
@@ -442,7 +452,11 @@ export class DeviceTrustService {
     });
   }
 
-  /** refresh 成功后的尽力而为补记；任何错误都不能挡住续签。 */
+  /**
+   * 注册 / 续签时的尽力而为补记（上线迁移靠这条）：只在这台设备从没有记录时新建，
+   * 绝不恢复已撤销的信任 —— 否则在设备管理里移除的设备，凭另一条没撤掉的会话续签
+   * 一次就「复活」了。任何错误都不能挡住续签。
+   */
   async trustOnRefresh(
     userId: string,
     deviceKey: string | null,
@@ -450,7 +464,26 @@ export class DeviceTrustService {
   ): Promise<void> {
     if (!deviceKey) return;
     try {
-      await this.trust(userId, deviceKey, context);
+      const now = new Date();
+      const existing = await this.prisma.trustedDevice.findUnique({
+        where: { userId_deviceKey: { userId, deviceKey } },
+        select: { revokedAt: true },
+      });
+      if (existing) {
+        if (!existing.revokedAt) {
+          await this.touch(userId, deviceKey, context, now);
+        }
+        return;
+      }
+      await this.prisma.trustedDevice.create({
+        data: {
+          userId,
+          deviceKey,
+          deviceName: truncate(context.deviceName, MAX_DEVICE_NAME_LENGTH),
+          lastIp: truncate(context.ip, MAX_IP_LENGTH),
+          lastSeenAt: now,
+        },
+      });
     } catch (error) {
       this.logger.warn(
         `trustOnRefresh failed for ${userId}: ${error instanceof Error ? error.message : error}`,
@@ -491,22 +524,56 @@ export class DeviceTrustService {
     return Boolean(row && !row.revokedAt);
   }
 
+  /**
+   * 「首台设备」= 没有任何受信任设备，并且也没有仍然有效的 APP 会话。
+   * 后半句堵住上线窗口：老账号还没有信任记录，但本人手机上的旧会话还活着 ——
+   * 这时直接放行，拿到密码的人就抢先成了受信任设备。本人设备续签一次即补记信任，
+   * 之后就能批准；全部会话都已失效的账号才按首台设备处理。
+   */
+  private async isFirstDevice(userId: string, now: Date): Promise<boolean> {
+    const trustedCount = await this.prisma.trustedDevice.count({
+      where: { userId, revokedAt: null },
+    });
+    if (trustedCount > 0) return false;
+    const liveSessions = await this.prisma.refreshToken.count({
+      where: {
+        userId,
+        audience: 'APP',
+        revokedAt: null,
+        expiredAt: { gt: now },
+      },
+    });
+    return liveSessions === 0;
+  }
+
   private async createChallenge(
     userId: string,
     deviceKey: string,
     context: SessionContext,
   ): Promise<{ id: string; expiresAt: Date }> {
     const now = new Date();
-    const recent = await this.prisma.loginChallenge.count({
-      where: {
-        userId,
-        createdAt: {
-          gt: new Date(now.getTime() - LOGIN_CHALLENGE_RATE_WINDOW_MS),
-        },
-      },
-    });
-    if (recent >= LOGIN_CHALLENGE_RATE_LIMIT) {
-      this.logSecurity('login_challenge_rate_limited', userId, { recent });
+    const windowStart = new Date(
+      now.getTime() - LOGIN_CHALLENGE_RATE_WINDOW_MS,
+    );
+    const ip = truncate(context.ip, MAX_IP_LENGTH);
+    // 按「账号 + 来源 IP」限：只知道密码的人刷满自己 IP 的额度，挡不住本人从别处
+    // 登录；账号总量再兜一道，限制弹窗 / 推送轰炸。
+    const [fromThisIp, total] = await Promise.all([
+      this.prisma.loginChallenge.count({
+        where: { userId, ip, createdAt: { gt: windowStart } },
+      }),
+      this.prisma.loginChallenge.count({
+        where: { userId, createdAt: { gt: windowStart } },
+      }),
+    ]);
+    if (
+      fromThisIp >= LOGIN_CHALLENGE_RATE_LIMIT ||
+      total >= LOGIN_CHALLENGE_ACCOUNT_RATE_LIMIT
+    ) {
+      this.logSecurity('login_challenge_rate_limited', userId, {
+        fromThisIp,
+        total,
+      });
       throw new HttpException(
         {
           message: '验证请求过于频繁，请 10 分钟后再试',

@@ -327,7 +327,7 @@ export class AuthController {
   @ApiBearerAuth()
   @ApiOkResponse({ description: 'All device sessions revoked' })
   logoutAll(@Req() req: RequestWithUser) {
-    return this.authService.logoutAll(req.user.userId);
+    return this.authService.logoutAll(req.user.userId, req.user.sessionId);
   }
 
   @Delete('sessions/:sessionId')
@@ -417,6 +417,7 @@ export class AuthController {
       req.user.userId,
       dto.oldPassword,
       dto.newPassword,
+      req.user.sessionId,
     );
   }
 

@@ -595,6 +595,19 @@ export class RefreshTokenService {
     }
   }
 
+  /** 撤销绑定到某台设备的全部会话（设备管理里移除设备时用）。 */
+  async revokeDeviceSessions(userId: string, deviceKey: string): Promise<void> {
+    const revoked = await this.prisma.refreshToken.updateManyAndReturn({
+      where: { userId, deviceKey, revokedAt: null },
+      data: {
+        revokedAt: new Date(),
+        revocationReason: RefreshTokenRevocationReason.SESSION_REVOKED,
+      },
+      select: { id: true },
+    });
+    await this.revokeAccessSessions(revoked.map(({ id }) => id));
+  }
+
   async revokeOtherSessions(
     userId: string,
     currentSessionId?: string,

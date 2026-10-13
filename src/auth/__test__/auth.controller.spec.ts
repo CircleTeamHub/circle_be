@@ -178,7 +178,7 @@ describe('AuthController', () => {
   it('logoutAll revokes all sessions for the current user', async () => {
     await controller.logoutAll({ user: { userId: 'uuid-1' } } as any);
 
-    expect(mockAuthService.logoutAll).toHaveBeenCalledWith('uuid-1');
+    expect(mockAuthService.logoutAll).toHaveBeenCalledWith('uuid-1', undefined);
   });
 
   it('logoutSession revokes a selected session for the current user', async () => {

@@ -408,6 +408,7 @@ export class AuthService {
       securityCode,
     );
     if (!ok) {
+      await this.deviceTrust.registerSecurityCodeFailure(challenge.id);
       throw new ForbiddenException({
         message: '安全码错误',
         errorCode: AuthErrorCode.SecurityCodeInvalid,
@@ -853,7 +854,9 @@ export class AuthService {
     }));
   }
 
-  async logoutAll(userId: string): Promise<void> {
+  async logoutAll(userId: string, currentSessionId?: string): Promise<void> {
+    // 「全部退出」多半是怀疑被盗号：发起这一步的设备之外，全部撤销信任。
+    await this.revokeTrustExceptSession(userId, currentSessionId);
     await this.refreshTokenService.revokeAll(userId);
     logBusinessEvent(this.logger, {
       enabled: this.loggingConfig.businessLogOn,
@@ -872,7 +875,11 @@ export class AuthService {
       sessionId,
     );
     await this.refreshTokenService.revokeSession(userId, sessionId);
-    await this.deviceTrust.revokeDevice(userId, deviceKey);
+    if (deviceKey) {
+      // 同一台设备可能有多条会话（重装、重复登录）：一起撤掉，否则剩下那条还能续签。
+      await this.refreshTokenService.revokeDeviceSessions(userId, deviceKey);
+      await this.deviceTrust.revokeDevice(userId, deviceKey);
+    }
     logBusinessEvent(this.logger, {
       enabled: this.loggingConfig.businessLogOn,
       businessEvent: 'auth_session_logout',
@@ -910,6 +917,20 @@ export class AuthService {
       entityType: 'user',
       entityId: userId,
     });
+  }
+
+  /** 撤销除当前会话所在设备外的全部信任；当前会话未绑定设备时全部撤销。 */
+  private async revokeTrustExceptSession(
+    userId: string,
+    currentSessionId?: string,
+  ): Promise<void> {
+    const keep = currentSessionId
+      ? await this.refreshTokenService.findSessionDeviceKey(
+          userId,
+          currentSessionId,
+        )
+      : null;
+    await this.deviceTrust.revokeOtherDevices(userId, keep);
   }
 
   async getSingleDeviceLoginStatus(
@@ -1094,6 +1115,9 @@ export class AuthService {
     ]);
     // access token 吊销标记（Redis）单独尽力：失败时 refresh 已死、access
     // 最多再活一个 TTL；显式 error 让运维可见，不把已提交的改密翻成假失败。
+    // 邮箱验证过的找回密码 = 设备丢失时的恢复通道：撤销全部信任。会话也已全撤，
+    // 下一次登录的设备就是「首台设备」，不必再等一台已经找不回来的设备批准。
+    await this.deviceTrust.revokeOtherDevices(user.id, null);
     try {
       await this.refreshTokenService.revokeAllAccessMarkers(user.id);
     } catch (markerError) {
@@ -1119,6 +1143,7 @@ export class AuthService {
     userId: string,
     oldPassword: string,
     newPassword: string,
+    currentSessionId?: string,
   ): Promise<void> {
     const user = await this.prisma.user.findUnique({ where: { id: userId } });
     if (!user) {
@@ -1142,6 +1167,9 @@ export class AuthService {
       data: { passwordHash },
     });
 
+    // 改密通常是怀疑密码泄露：当前设备之外全部撤销信任，否则攻击者的设备
+    // 拿到新密码后照样免批准登录。
+    await this.revokeTrustExceptSession(userId, currentSessionId);
     // Invalidate all existing sessions after password change
     await this.refreshTokenService.revokeAll(userId);
     logBusinessEvent(this.logger, {

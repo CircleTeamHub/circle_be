@@ -94,6 +94,7 @@ describe('AuthService', () => {
     trustOnRefresh: jest.fn(() => Promise.resolve()),
     revokeDevice: jest.fn(() => Promise.resolve()),
     revokeOtherDevices: jest.fn(() => Promise.resolve()),
+    registerSecurityCodeFailure: jest.fn(() => Promise.resolve()),
     consumeWithCode: jest.fn(),
     completeVerifiedLogin: jest.fn(() => Promise.resolve()),
   };
@@ -118,6 +119,7 @@ describe('AuthService', () => {
     listActiveSessions: jest.fn(() => Promise.resolve([])),
     revokeSession: jest.fn(() => Promise.resolve()),
     revokeOtherSessions: jest.fn(() => Promise.resolve()),
+    revokeDeviceSessions: jest.fn(() => Promise.resolve()),
     findSessionDeviceKey: jest.fn((_userId: string, sessionId: string) =>
       Promise.resolve(`device-key-of-${sessionId}`),
     ),
@@ -919,9 +921,13 @@ describe('AuthService', () => {
   });
 
   it('revokes all sessions for a user', async () => {
-    await service.logoutAll('uuid-1');
+    await service.logoutAll('uuid-1', 'session-1');
 
     expect(mockRefreshTokenService.revokeAll).toHaveBeenCalledWith('uuid-1');
+    expect(mockDeviceTrust.revokeOtherDevices).toHaveBeenCalledWith(
+      'uuid-1',
+      'device-key-of-session-1',
+    );
   });
 
   it('revokes a selected session for the current user', async () => {
@@ -930,6 +936,11 @@ describe('AuthService', () => {
     expect(mockRefreshTokenService.revokeSession).toHaveBeenCalledWith(
       'uuid-1',
       'session-2',
+    );
+    // 同一设备的其他会话一起撤，否则剩下那条续签会让设备继续在线。
+    expect(mockRefreshTokenService.revokeDeviceSessions).toHaveBeenCalledWith(
+      'uuid-1',
+      'device-key-of-session-2',
     );
     // 移除设备 = 撤销信任，下次登录要重新经受信任设备批准。
     expect(mockDeviceTrust.revokeDevice).toHaveBeenCalledWith(
@@ -1369,7 +1380,12 @@ describe('AuthService', () => {
       role: 'USER',
     });
 
-    await service.changePassword('uuid-1', 'current-password', 'new-password');
+    await service.changePassword(
+      'uuid-1',
+      'current-password',
+      'new-password',
+      'session-1',
+    );
 
     expect(mockPrisma.user.update).toHaveBeenCalledWith(
       expect.objectContaining({
@@ -1380,6 +1396,49 @@ describe('AuthService', () => {
       }),
     );
     expect(mockRefreshTokenService.revokeAll).toHaveBeenCalledWith('uuid-1');
+    // 改密 = 怀疑泄露：只保留发起改密的这台设备的信任。
+    expect(mockDeviceTrust.revokeOtherDevices).toHaveBeenCalledWith(
+      'uuid-1',
+      'device-key-of-session-1',
+    );
+  });
+
+  it('password reset by email revokes all device trust (lost-device recovery)', async () => {
+    users.push({
+      id: 'uuid-reset',
+      accountId: 'resetme',
+      email: 'reset@example.com',
+      passwordHash: 'x',
+      status: 'ACTIVE',
+      role: 'USER',
+    });
+    const prismaAny = mockPrisma as any;
+    const original = {
+      transaction: prismaAny.$transaction,
+      refreshToken: prismaAny.refreshToken,
+    };
+    prismaAny.$transaction = jest.fn(() => Promise.resolve([]));
+    prismaAny.refreshToken = { updateMany: jest.fn() };
+    (mockRefreshTokenService as any).revokeAllAccessMarkers = jest.fn(() =>
+      Promise.resolve(),
+    );
+
+    try {
+      await service.resetPassword(
+        'reset@example.com',
+        '123456',
+        'new-password',
+      );
+    } finally {
+      prismaAny.$transaction = original.transaction;
+      prismaAny.refreshToken = original.refreshToken;
+    }
+
+    // 全部撤销后，下一次登录的设备按「首台设备」处理，不必再等丢了的手机批准。
+    expect(mockDeviceTrust.revokeOtherDevices).toHaveBeenCalledWith(
+      'uuid-reset',
+      null,
+    );
   });
 
   it('changeAccountId rejects an invalid format without touching the DB', async () => {

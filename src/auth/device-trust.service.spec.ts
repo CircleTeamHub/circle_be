@@ -10,6 +10,7 @@ import {
   LOGIN_CHALLENGE_CODE_TTL_MS,
   LOGIN_CHALLENGE_DECISION_MS,
   LOGIN_CHALLENGE_MAX_ATTEMPTS,
+  LOGIN_CHALLENGE_ACCOUNT_RATE_LIMIT,
   LOGIN_CHALLENGE_RATE_LIMIT,
 } from './device-trust.service';
 
@@ -58,6 +59,7 @@ function setup() {
   const users: Record<string, { loginSecurityCodeHash: string | null }> = {
     u1: { loginSecurityCodeHash: null },
   };
+  const liveSessions = { count: 0 };
 
   const prisma = {
     trustedDevice: {
@@ -73,6 +75,9 @@ function setup() {
         async ({ where }) =>
           trusted.filter((t) => matches(t as any, where)).length,
       ),
+      create: jest.fn(async ({ data }) => {
+        trusted.push({ revokedAt: null, ...data });
+      }),
       upsert: jest.fn(async ({ where, create, update }) => {
         const { userId, deviceKey } = where.userId_deviceKey;
         const row = trusted.find(
@@ -144,6 +149,9 @@ function setup() {
     user: {
       findUnique: jest.fn(async ({ where }) => users[where.id] ?? null),
     },
+    refreshToken: {
+      count: jest.fn(async () => liveSessions.count),
+    },
   };
   const realtime = { broadcast: jest.fn() };
   const push = {
@@ -164,7 +172,17 @@ function setup() {
       revokedAt: null,
       lastSeenAt: new Date(),
     });
-  return { service, prisma, realtime, push, trusted, challenges, users, trust };
+  return {
+    service,
+    prisma,
+    realtime,
+    push,
+    trusted,
+    challenges,
+    users,
+    trust,
+    liveSessions,
+  };
 }
 
 const user = { id: 'u1', loginSecurityCodeHash: null };
@@ -253,15 +271,50 @@ describe('DeviceTrustService.evaluateLogin', () => {
     );
   });
 
-  it('rate-limits challenge creation per account', async () => {
+  it('rate-limits challenge creation per source IP without blocking other IPs', async () => {
     const { service, trust } = setup();
     trust('phone');
     for (let i = 0; i < LOGIN_CHALLENGE_RATE_LIMIT; i += 1) {
-      await service.evaluateLogin(user, { deviceKey: `stranger-${i}` });
+      await service.evaluateLogin(user, {
+        deviceKey: `stranger-${i}`,
+        ip: '198.51.100.1',
+      });
     }
     await expect(
-      service.evaluateLogin(user, { deviceKey: 'one-more' }),
+      service.evaluateLogin(user, {
+        deviceKey: 'one-more',
+        ip: '198.51.100.1',
+      }),
     ).rejects.toThrow(HttpException);
+    // 只知道密码的人刷满了自己的额度，本人从别的网络登录不受影响。
+    await expect(
+      service.evaluateLogin(user, { deviceKey: 'owner-new', ip: '192.0.2.9' }),
+    ).resolves.toEqual(expect.objectContaining({ kind: 'challenge' }));
+  });
+
+  it('caps challenges per account across all IPs', async () => {
+    const { service, trust } = setup();
+    trust('phone');
+    for (let i = 0; i < LOGIN_CHALLENGE_ACCOUNT_RATE_LIMIT; i += 1) {
+      await service.evaluateLogin(user, {
+        deviceKey: `stranger-${i}`,
+        ip: `198.51.100.${i}`,
+      });
+    }
+    await expect(
+      service.evaluateLogin(user, { deviceKey: 'x', ip: '192.0.2.200' }),
+    ).rejects.toThrow(HttpException);
+  });
+
+  it('does not auto-trust while the account still has live sessions (rollout window)', async () => {
+    const { service, liveSessions, trusted } = setup();
+    // 老账号：还没有任何信任记录，但本人手机上的旧会话还活着。
+    liveSessions.count = 1;
+    const decision = await service.evaluateLogin(user, {
+      deviceKey: 'attacker',
+    });
+    expect(decision.kind).toBe('challenge');
+    expect(trusted).toHaveLength(0);
   });
 });
 
@@ -377,6 +430,23 @@ describe('DeviceTrustService approve / verify', () => {
     expect(challenges).toHaveLength(2);
   });
 
+  it('the security-code fallback shares the per-challenge attempt cap', async () => {
+    const { service, challenges, challengeId } = await pending();
+    for (let i = 0; i < LOGIN_CHALLENGE_MAX_ATTEMPTS + 2; i += 1) {
+      await service.registerSecurityCodeFailure(challengeId);
+    }
+    expect(challenges[0].attempts).toBe(LOGIN_CHALLENGE_MAX_ATTEMPTS);
+    await expect(
+      service.loadForSecurityCode(challengeId, 'stranger'),
+    ).rejects.toThrow(/错误次数过多/);
+  });
+
+  it('listPending only asks about requests nobody has handled yet', async () => {
+    const { service, challengeId } = await pending();
+    await service.approve('u1', 'phone', challengeId);
+    await expect(service.listPending('u1', 'phone')).resolves.toEqual([]);
+  });
+
   it('listPending is empty for an untrusted caller', async () => {
     const { service } = await pending();
     await expect(service.listPending('u1', 'stranger')).resolves.toEqual([]);
@@ -394,6 +464,25 @@ describe('DeviceTrustService revocation', () => {
     expect(trusted.filter((t) => !t.revokedAt).map((t) => t.deviceKey)).toEqual(
       ['phone'],
     );
+  });
+
+  it('trustOnRefresh records a never-seen device (rollout back-fill)', async () => {
+    const { service, trusted } = setup();
+    await service.trustOnRefresh('u1', 'legacy-phone', {
+      deviceName: 'iPhone',
+    });
+    expect(trusted).toEqual([
+      expect.objectContaining({ deviceKey: 'legacy-phone', revokedAt: null }),
+    ]);
+  });
+
+  it('trustOnRefresh never revives a device removed in device management', async () => {
+    const { service, trusted, trust } = setup();
+    trust('removed');
+    const revokedAt = new Date();
+    trusted[0].revokedAt = revokedAt;
+    await service.trustOnRefresh('u1', 'removed', {});
+    expect(trusted[0].revokedAt).toBe(revokedAt);
   });
 
   it('trust() re-trusts a revoked device after it passes verification', async () => {
