@@ -22,7 +22,11 @@ import { attemptDiagnostic } from '../logging/http-failure.logger';
 /** 圈子座位对账的 advisory lock 命名空间(与 chat 的其它锁不撞)。 */
 export const CIRCLE_SYNC_LOCK_NAMESPACE = 7302;
 
-const DISABLED_ADMIN_STATES = new Set<string>([
+/**
+ * 圈子群聊默认拒绝的管理态：解散/停用及其中间态。笔记绑定群名片也按同一口径判
+ * 「群不可用」（NoteService），两边不能各写一份。
+ */
+export const DISABLED_ADMIN_STATES: ReadonlySet<string> = new Set<string>([
   'DISABLING',
   'DISABLED',
   'RESTORING',

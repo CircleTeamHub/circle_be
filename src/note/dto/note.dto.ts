@@ -145,6 +145,9 @@ export class NoteTextSectionDto {
   @IsOptional()
   @IsArray()
   @ArrayMaxSize(500)
+  // 全局管道开了 enableImplicitConversion：不声明元素类型时，class-transformer
+  // 按反射到的 Array 把每个正文块对象「转换」成空数组，富文本结构整段丢失。
+  @Type(() => Object)
   contentJson?: Record<string, unknown>[];
 }
 
@@ -211,6 +214,9 @@ export class NoteContactCardDto {
 }
 
 /** A group card is also a snapshot; it must not turn a note read into a roster read. */
+/** 群名片名称上限（按码点计，与 class-validator 的 MaxLength 同一口径）。 */
+export const NOTE_GROUP_CARD_NAME_MAX = 120;
+
 export class NoteGroupCardDto {
   @ApiProperty({ description: 'OpenIM group identifier.' })
   @IsString()
@@ -227,10 +233,19 @@ export class NoteGroupCardDto {
   @IsUUID()
   circleId?: string;
 
+  @ApiPropertyOptional({
+    description:
+      'Standalone group conversation identifier returned on reads. Accepted for roundtrips; the stored value is always resolved by the server.',
+  })
+  @IsOptional()
+  @IsString()
+  @MaxLength(120)
+  conversationID?: string;
+
   @ApiProperty()
   @IsString()
   @IsNotEmpty()
-  @MaxLength(120)
+  @MaxLength(NOTE_GROUP_CARD_NAME_MAX)
   name: string;
 
   @ApiPropertyOptional()
@@ -324,6 +339,9 @@ export class CreateNoteDto {
   @IsOptional()
   @IsArray()
   @ArrayMaxSize(500)
+  // 全局管道开了 enableImplicitConversion：不声明元素类型时，class-transformer
+  // 按反射到的 Array 把每个正文块对象「转换」成空数组，富文本结构整段丢失。
+  @Type(() => Object)
   contentJson?: Record<string, unknown>[];
 
   @ApiPropertyOptional({ type: [String] })
@@ -406,6 +424,9 @@ export class SaveNoteDraftDto {
   @IsOptional()
   @IsArray()
   @ArrayMaxSize(500)
+  // 全局管道开了 enableImplicitConversion：不声明元素类型时，class-transformer
+  // 按反射到的 Array 把每个正文块对象「转换」成空数组，富文本结构整段丢失。
+  @Type(() => Object)
   contentJson?: Record<string, unknown>[];
 
   @ApiPropertyOptional({ type: NoteSectionsDto })
@@ -725,6 +746,12 @@ export class NoteGroupCardResponseDto extends NoteContactCardResponseDto {
       'Canonical Circle primary key, including when id is a legacy OpenIM group identifier.',
   })
   circleId?: string;
+
+  @ApiPropertyOptional({
+    description:
+      'Present only on standalone group cards: the group conversation id (equal to id). Circle group cards never carry it.',
+  })
+  conversationID?: string;
 }
 
 export class NoteContactSectionResponseDto {
@@ -791,6 +818,24 @@ export class NoteDraftSectionsResponseDto {
   } | null;
 }
 
+/** 列表卡片上展示的名片摘要：只取展示所需的 id / 名称 / 头像。 */
+export class NoteCardPeerDto {
+  @ApiProperty() id: string;
+  @ApiProperty() name: string;
+  @ApiPropertyOptional({ nullable: true, type: String }) faceURL: string | null;
+  /** 仅群名片：独立群的会话 id；圈子群为 null。联系人名片不输出。 */
+  @ApiPropertyOptional({ nullable: true, type: String })
+  conversationID?: string | null;
+  /** 仅群名片：规范圈子 UUID。旧版卡片 id 是 OpenIM groupID 时靠它路由；其余为 null。 */
+  @ApiPropertyOptional({ nullable: true, type: String })
+  circleId?: string | null;
+}
+
+export class NoteCardPreviewDto {
+  @ApiProperty({ type: [NoteCardPeerDto] }) contacts: NoteCardPeerDto[];
+  @ApiProperty({ type: [NoteCardPeerDto] }) groups: NoteCardPeerDto[];
+}
+
 export class NoteSummaryDto {
   @ApiProperty() id: string;
   @ApiProperty() ownerId: string;
@@ -824,6 +869,12 @@ export class NoteSummaryDto {
   @ApiProperty() contactCount: number;
   @ApiProperty() groupCardCount: number;
   @ApiProperty() hasLocation: boolean;
+  @ApiProperty({
+    type: NoteCardPreviewDto,
+    description:
+      '笔记里添加的个人名片/群名片摘要（每类最多 3 个，总数见 contactCount/groupCardCount）；仅笔记主人可见，他人恒为空数组',
+  })
+  cardPreview: NoteCardPreviewDto;
   @ApiPropertyOptional({
     nullable: true,
     description: '聊天收藏来源快照；自建笔记为 null',

@@ -261,6 +261,9 @@ export const NoteErrorCode = {
   ExportTotalTooLarge: 'NOTE_EXPORT_TOTAL_TOO_LARGE',
   ExportTooManyMedia: 'NOTE_EXPORT_TOO_MANY_MEDIA',
   NotFound: 'NOTE_NOT_FOUND',
+  // 群名片绑定被拒：群不存在 / 不可用（解散、停用）/ 不是群主 / 已不在群里，
+  // 一律同一个码，不让调用方借错误区分别人的群是否存在。
+  GroupBindForbidden: 'NOTE_GROUP_BIND_FORBIDDEN',
   // round 3：回收站恢复撞上同源活跃收藏副本（唯一索引会拒绝）
   AlreadyCollected: 'NOTE_RESTORE_DUPLICATE',
   GroupNotFound: 'NOTE_GROUP_NOT_FOUND',

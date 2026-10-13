@@ -52,6 +52,37 @@ describe('group card readback validation', () => {
       ).not.toHaveLength(0);
     },
   );
+
+  // 独立群名片读回来带 conversationID，原样提交回来不能被严格白名单拒掉
+  // （服务端会丢弃它、自己重算）。
+  it.each([CreateNoteDto, UpdateNoteDto, SaveNoteDraftDto])(
+    '%p accepts a returned standalone conversationID with strict whitelisting',
+    (type) => {
+      const payload = {
+        title: 'Roundtrip',
+        sections: {
+          groups: {
+            items: [
+              {
+                id: 'conv-standalone',
+                conversationID: 'conv-standalone',
+                name: 'Group',
+                faceURL: null,
+              },
+            ],
+          },
+        },
+        ...(type === SaveNoteDraftDto ? {} : { media: [] }),
+      };
+      const dto = plainToInstance<SaveNoteDraftDto, typeof payload>(
+        type,
+        payload,
+      );
+      expect(
+        validateSync(dto, { whitelist: true, forbidNonWhitelisted: true }),
+      ).toHaveLength(0);
+    },
+  );
 });
 
 describe('CreateNoteDto', () => {
