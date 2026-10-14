@@ -1688,7 +1688,7 @@ model Notification {
   fromInvitation     CircleInvitation?       @relation(fields: [fromInvitationID], references: [id])
   fromFriendRequest  Friend?                 @relation("friendRequestNotifications", fields: [fromFriendRequestID], references: [id])
   systemAnnouncement SystemAnnouncement?     @relation(fields: [systemAnnouncementID], references: [id], onDelete: Restrict)
-  fromGroupAdmission GroupAdmission? @relation(fields: [fromGroupAdmissionID], references: [id])
+  fromGroupAdmission GroupAdmission? @relation(fields: [fromGroupAdmissionID], references: [id], onDelete: NoAction, onUpdate: NoAction)
   pushOutbox         NotificationPushOutbox?
 
   @@unique([systemAnnouncementID, toUserID], map: "Notification_announcement_recipient_key")
@@ -2608,7 +2608,7 @@ model GroupAdmissionDelivery {
   attempts Int @default(0)
   nextAttemptAt DateTime @default(now())
   createdAt DateTime @default(now())
-  admission GroupAdmission @relation(fields: [admissionID], references: [id])
+  admission GroupAdmission @relation(fields: [admissionID], references: [id], onDelete: NoAction, onUpdate: NoAction)
   @@unique([admissionID, recipientID, event])
   @@index([deliveredAt, nextAttemptAt])
 }

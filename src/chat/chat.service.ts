@@ -1639,8 +1639,24 @@ export class ChatService {
         select: { id: true },
       });
       for (const applicantID of memberIds) {
-        const admission = await tx.groupAdmission.create({ data: { conversationID: group.id, applicantID, inviterID: userId, kind: 'INVITE', status: 'INVITED', expiresAt: new Date(Date.now() + 7 * 86400000) } });
-        await tx.groupAdmissionDelivery.create({ data: { admissionID: admission.id, recipientID: applicantID, actorID: userId, event: 'INVITED' } });
+        const admission = await tx.groupAdmission.create({
+          data: {
+            conversationID: group.id,
+            applicantID,
+            inviterID: userId,
+            kind: 'INVITE',
+            status: 'INVITED',
+            expiresAt: new Date(Date.now() + 7 * 86400000),
+          },
+        });
+        await tx.groupAdmissionDelivery.create({
+          data: {
+            admissionID: admission.id,
+            recipientID: applicantID,
+            actorID: userId,
+            event: 'INVITED',
+          },
+        });
       }
       return group;
     });
@@ -1659,13 +1675,29 @@ export class ChatService {
 
   /** 独立群聊邀请:任一在座成员可拉自己的好友(微信语义);圈子群走圈子成员管理。 */
   /** Legacy internal entry points must not grant membership without consent. */
-  async inviteToGroupConversation(_userId: string, _conversationId: string, _memberIds: string[]): Promise<ChatConversationDto> {
-    throw new ForbiddenException({ message: '请通过群邀请流程发送邀请', errorCode: 'CHAT_GROUP_ACCEPT_REQUIRED' });
+  async inviteToGroupConversation(
+    _userId: string,
+    _conversationId: string,
+    _memberIds: string[],
+  ): Promise<ChatConversationDto> {
+    throw new ForbiddenException({
+      message: '请通过群邀请流程发送邀请',
+      errorCode: 'CHAT_GROUP_ACCEPT_REQUIRED',
+    });
   }
-  async joinStandaloneGroupViaQr(_userId: string, _conversationId: string): Promise<ChatConversationDto> {
-    throw new ForbiddenException({ message: '请先接受二维码邀请', errorCode: 'CHAT_GROUP_ACCEPT_REQUIRED' });
+  async joinStandaloneGroupViaQr(
+    _userId: string,
+    _conversationId: string,
+  ): Promise<ChatConversationDto> {
+    throw new ForbiddenException({
+      message: '请先接受二维码邀请',
+      errorCode: 'CHAT_GROUP_ACCEPT_REQUIRED',
+    });
   }
-  async getGroupConversationForMember(userId: string, id: string): Promise<ChatConversationDto> {
+  async getGroupConversationForMember(
+    userId: string,
+    id: string,
+  ): Promise<ChatConversationDto> {
     await this.requireStandaloneGroup(id, userId);
     return this.buildConversationDto(userId, id);
   }
@@ -1699,12 +1731,26 @@ export class ChatService {
         });
       }
       await tx.notification.updateMany({
-        where: { toUserID: userId, read: false, fromGroupAdmission: { conversationID: conversation.id } },
+        where: {
+          toUserID: userId,
+          read: false,
+          fromGroupAdmission: { conversationID: conversation.id },
+        },
         data: { read: true },
       });
       await tx.notificationPushOutbox.updateMany({
-        where: { notification: { toUserID: userId, fromGroupAdmission: { conversationID: conversation.id } }, status: { in: ['PENDING', 'FAILED'] } },
-        data: { status: 'TERMINAL', processedAt: new Date(), lastError: 'group-member-left' },
+        where: {
+          notification: {
+            toUserID: userId,
+            fromGroupAdmission: { conversationID: conversation.id },
+          },
+          status: { in: ['PENDING', 'FAILED'] },
+        },
+        data: {
+          status: 'TERMINAL',
+          processedAt: new Date(),
+          lastError: 'group-member-left',
+        },
       });
       const actorSeat = await tx.chatMember.findUnique({
         where: {

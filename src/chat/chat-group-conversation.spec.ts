@@ -432,7 +432,9 @@ describe('ChatService standalone group conversations', () => {
       conversationId: 'conv-1',
       userId: 'owner-1',
     });
-    expect(systemMessage.emit).not.toHaveBeenCalledWith('conv-1', { kind: 'member-left' });
+    expect(systemMessage.emit).not.toHaveBeenCalledWith('conv-1', {
+      kind: 'member-left',
+    });
     // 群日志:退群 + 转让两条;新群主收 updated 刷新群设置入口。
     expect(groupEvents.record).toHaveBeenCalledWith('conv-1', {
       kind: 'member-left',

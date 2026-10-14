@@ -3,6 +3,7 @@ import { PrismaPg } from '@prisma/adapter-pg';
 import { PrismaClient } from 'src/generated/prisma';
 import { readFileSync } from 'fs';
 import { randomUUID } from 'crypto';
+import { spawnSync } from 'child_process';
 import { GroupAdmissionService } from './group-admission.service';
 
 // Opt-in; isolated schema only. Never migrates or seeds the application's schema.
@@ -90,6 +91,30 @@ run('Group admission PostgreSQL transactions', () => {
       await admin.end();
     }
   });
+  it('the applied migration matches the Prisma schema without referential-action drift', () => {
+    const url = new URL(process.env.GROUP_ADMISSION_TEST_DATABASE_URL!);
+    url.searchParams.set('schema', schema);
+    const result = spawnSync(
+      process.execPath,
+      [
+        'node_modules/prisma/build/index.js',
+        'migrate',
+        'diff',
+        '--from-config-datasource',
+        '--to-schema',
+        'prisma/schema.prisma',
+        '--exit-code',
+      ],
+      {
+        env: { ...process.env, DATABASE_URL: url.toString() },
+        encoding: 'utf8',
+      },
+    );
+    expect({ code: result.status, output: result.stdout }).toEqual({
+      code: 0,
+      output: expect.any(String),
+    });
+  });
   it('serializes manager invites and joins exactly once only after acceptance', async () => {
     await Promise.all([
       service.invite(owner, group, [guest]),
@@ -164,13 +189,42 @@ run('Group admission PostgreSQL transactions', () => {
     const record = await db.groupAdmission.findFirstOrThrow({
       where: { status: 'PENDING' },
     });
-    await db.notification.createMany({ data: [
-      { fromUserID: second, toUserID: owner, type: 'GROUP_ADMISSION', fromGroupAdmissionID: record.id },
-      { fromUserID: second, toUserID: owner, type: 'GROUP_ADMISSION', fromGroupAdmissionID: record.id },
-      { fromUserID: second, toUserID: owner, type: 'GROUP_ADMISSION', fromGroupAdmissionID: record.id, read: true },
-      { fromUserID: second, toUserID: owner, type: 'GROUP_ADMISSION', fromGroupAdmissionID: record.id, deleted: true },
-      { fromUserID: second, toUserID: guest, type: 'GROUP_ADMISSION', fromGroupAdmissionID: record.id },
-    ] });
+    await db.notification.createMany({
+      data: [
+        {
+          fromUserID: second,
+          toUserID: owner,
+          type: 'GROUP_ADMISSION',
+          fromGroupAdmissionID: record.id,
+        },
+        {
+          fromUserID: second,
+          toUserID: owner,
+          type: 'GROUP_ADMISSION',
+          fromGroupAdmissionID: record.id,
+        },
+        {
+          fromUserID: second,
+          toUserID: owner,
+          type: 'GROUP_ADMISSION',
+          fromGroupAdmissionID: record.id,
+          read: true,
+        },
+        {
+          fromUserID: second,
+          toUserID: owner,
+          type: 'GROUP_ADMISSION',
+          fromGroupAdmissionID: record.id,
+          deleted: true,
+        },
+        {
+          fromUserID: second,
+          toUserID: guest,
+          type: 'GROUP_ADMISSION',
+          fromGroupAdmissionID: record.id,
+        },
+      ],
+    });
     const ownerPage = await service.list(owner);
     expect(ownerPage.items.length).toBeGreaterThan(0);
     expect(
@@ -178,9 +232,17 @@ run('Group admission PostgreSQL transactions', () => {
         (item) => item.group.id === group && item.group.memberCount === 200,
       ),
     ).toBe(true);
-    expect(ownerPage.items.find((item) => item.id === record.id)?.unreadCount).toBe(2);
-    await db.notification.updateMany({ where: { toUserID: owner }, data: { read: true } });
-    expect((await service.list(owner)).items.find((item) => item.id === record.id)?.unreadCount).toBe(0);
+    expect(
+      ownerPage.items.find((item) => item.id === record.id)?.unreadCount,
+    ).toBe(2);
+    await db.notification.updateMany({
+      where: { toUserID: owner },
+      data: { read: true },
+    });
+    expect(
+      (await service.list(owner)).items.find((item) => item.id === record.id)
+        ?.unreadCount,
+    ).toBe(0);
     const guestPage = await service.list(second);
     expect(guestPage.items.every((item) => item.unreadCount === 0)).toBe(true);
     expect(guestPage.items.every((item) => item.applicantId === second)).toBe(

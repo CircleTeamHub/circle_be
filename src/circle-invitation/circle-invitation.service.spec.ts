@@ -20,20 +20,34 @@ describe('CircleInvitationService', () => {
   let service: CircleInvitationService;
 
   it('returns recipient-scoped unread counts for circle invitations in one query', async () => {
-    prisma.circleInvitation.findMany.mockResolvedValue([{ id: 'invite-unread' }, { id: 'invite-read' }]);
-    prisma.notification.groupBy.mockResolvedValue([{ fromInvitationID: 'invite-unread', _count: { _all: 2 } }]);
-    const mapper = jest.spyOn(service as any, 'toInvitationDto').mockImplementation((inv: any) => ({ id: inv.id }));
+    prisma.circleInvitation.findMany.mockResolvedValue([
+      { id: 'invite-unread' },
+      { id: 'invite-read' },
+    ]);
+    prisma.notification.groupBy.mockResolvedValue([
+      { fromInvitationID: 'invite-unread', _count: { _all: 2 } },
+    ]);
+    const mapper = jest
+      .spyOn(service as any, 'toInvitationDto')
+      .mockImplementation((inv: any) => ({ id: inv.id }));
     try {
       const result = await service.getMyApplications('applicant-1');
       expect(result.map((row) => row.unreadCount)).toEqual([2, 0]);
       expect(prisma.notification.groupBy).toHaveBeenCalledWith({
         by: ['fromInvitationID'],
-        where: { toUserID: 'applicant-1', type: 'CIRCLE_INVITATION_RECEIVED', read: false, deleted: false, fromInvitationID: { in: ['invite-unread', 'invite-read'] } },
+        where: {
+          toUserID: 'applicant-1',
+          type: 'CIRCLE_INVITATION_RECEIVED',
+          read: false,
+          deleted: false,
+          fromInvitationID: { in: ['invite-unread', 'invite-read'] },
+        },
         _count: { _all: true },
       });
-    } finally { mapper.mockRestore(); }
+    } finally {
+      mapper.mockRestore();
+    }
   });
-
 
   const prisma = {
     circleInvitation: {

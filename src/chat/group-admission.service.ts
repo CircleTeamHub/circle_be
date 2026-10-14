@@ -77,8 +77,11 @@ export class GroupAdmissionService {
     if (!g.joinApprovalRequired) return false;
     // Only a direct invitation from a current manager substitutes for approval.
     // Shared QR codes continue to follow the group's QR admission policy.
-    return !(a.kind === 'INVITE' && a.inviterID &&
-      await this.manager(tx, g, a.inviterID));
+    return !(
+      a.kind === 'INVITE' &&
+      a.inviterID &&
+      (await this.manager(tx, g, a.inviterID))
+    );
   }
   private async assertInviter(tx: Tx, g: Group, inviter: string) {
     const seat = await this.member(tx, g.id, inviter);
@@ -274,12 +277,24 @@ export class GroupAdmissionService {
       ),
       cardJoinEnabled: g.cardJoinEnabled,
       joinApprovalRequired: g.joinApprovalRequired,
-      admission: admission ? {
-        ...this.dto(admission),
-        ...(admission.status === 'JOINED' && (!seat || seat.leftAt)
-          ? { status: 'LEFT', updatedAt: seat?.leftAt?.toISOString() ?? admission.updatedAt.toISOString() } : {}),
-        requiresApproval: await this.requiresApproval(this.prisma, g, admission),
-      } : null,
+      admission: admission
+        ? {
+            ...this.dto(admission),
+            ...(admission.status === 'JOINED' && (!seat || seat.leftAt)
+              ? {
+                  status: 'LEFT',
+                  updatedAt:
+                    seat?.leftAt?.toISOString() ??
+                    admission.updatedAt.toISOString(),
+                }
+              : {}),
+            requiresApproval: await this.requiresApproval(
+              this.prisma,
+              g,
+              admission,
+            ),
+          }
+        : null,
     };
   }
   async apply(user: string, id: string, reason: string) {
@@ -522,8 +537,15 @@ export class GroupAdmissionService {
         data: { deliveredAt: new Date() },
       });
       await tx.notificationPushOutbox.updateMany({
-        where: { notificationID: { in: ids }, status: { in: ['PENDING', 'FAILED'] } },
-        data: { status: 'TERMINAL', processedAt: new Date(), lastError: 'group-review-finished' },
+        where: {
+          notificationID: { in: ids },
+          status: { in: ['PENDING', 'FAILED'] },
+        },
+        data: {
+          status: 'TERMINAL',
+          processedAt: new Date(),
+          lastError: 'group-review-finished',
+        },
       });
       return tx.notification.findMany({
         where: { id: { in: ids }, read: false, deleted: false },
@@ -532,7 +554,10 @@ export class GroupAdmissionService {
     });
     for (const notice of notices)
       if (notice.toUserID)
-        await this.notifications.markNotificationRead(notice.toUserID, notice.id);
+        await this.notifications.markNotificationRead(
+          notice.toUserID,
+          notice.id,
+        );
   }
   private dto(a: GroupAdmission) {
     return {
@@ -583,11 +608,20 @@ export class GroupAdmissionService {
     const currentGroup = await this.prisma.chatConversation.findUnique({
       where: { id: a.conversationID },
     });
-    const applicantSeat = await this.member(this.prisma, a.conversationID, a.applicantID);
+    const applicantSeat = await this.member(
+      this.prisma,
+      a.conversationID,
+      a.applicantID,
+    );
     return {
       ...this.dto(a),
       ...(a.status === 'JOINED' && (!applicantSeat || applicantSeat.leftAt)
-        ? { status: 'LEFT', updatedAt: applicantSeat?.leftAt?.toISOString() ?? a.updatedAt.toISOString() } : {}),
+        ? {
+            status: 'LEFT',
+            updatedAt:
+              applicantSeat?.leftAt?.toISOString() ?? a.updatedAt.toISOString(),
+          }
+        : {}),
       requiresApproval: currentGroup
         ? await this.requiresApproval(this.prisma, currentGroup, a)
         : true,
@@ -663,52 +697,68 @@ export class GroupAdmissionService {
         ]),
       ),
     ];
-    const [groups, people, viewerSeats, counts, unreadCounts] = await Promise.all([
-      this.prisma.chatConversation.findMany({
-        where: { id: { in: groupIDs } },
-        select: {
-          id: true,
-          name: true,
-          avatarUrl: true,
-          ownerID: true,
-          cardJoinEnabled: true,
-          joinApprovalRequired: true,
-        },
-      }),
-      this.prisma.user.findMany({
-        where: { id: { in: userIDs } },
-        select: { id: true, nickname: true },
-      }),
-      this.prisma.chatMember.findMany({
-        where: { conversationID: { in: groupIDs }, userID: { in: [...userIDs, user] } },
-        select: { conversationID: true, userID: true, role: true, leftAt: true },
-      }),
-      this.prisma.chatMember.groupBy({
-        by: ['conversationID'],
-        where: { conversationID: { in: groupIDs }, leftAt: null },
-        _count: { _all: true },
-      }),
-      this.prisma.notification.groupBy({
-        by: ['fromGroupAdmissionID'],
-        where: {
-          toUserID: user,
-          type: 'GROUP_ADMISSION',
-          read: false,
-          deleted: false,
-          fromGroupAdmissionID: { in: page.map((a) => a.id) },
-        },
-        _count: { _all: true },
-      }),
-    ]);
+    const [groups, people, viewerSeats, counts, unreadCounts] =
+      await Promise.all([
+        this.prisma.chatConversation.findMany({
+          where: { id: { in: groupIDs } },
+          select: {
+            id: true,
+            name: true,
+            avatarUrl: true,
+            ownerID: true,
+            cardJoinEnabled: true,
+            joinApprovalRequired: true,
+          },
+        }),
+        this.prisma.user.findMany({
+          where: { id: { in: userIDs } },
+          select: { id: true, nickname: true },
+        }),
+        this.prisma.chatMember.findMany({
+          where: {
+            conversationID: { in: groupIDs },
+            userID: { in: [...userIDs, user] },
+          },
+          select: {
+            conversationID: true,
+            userID: true,
+            role: true,
+            leftAt: true,
+          },
+        }),
+        this.prisma.chatMember.groupBy({
+          by: ['conversationID'],
+          where: { conversationID: { in: groupIDs }, leftAt: null },
+          _count: { _all: true },
+        }),
+        this.prisma.notification.groupBy({
+          by: ['fromGroupAdmissionID'],
+          where: {
+            toUserID: user,
+            type: 'GROUP_ADMISSION',
+            read: false,
+            deleted: false,
+            fromGroupAdmissionID: { in: page.map((a) => a.id) },
+          },
+          _count: { _all: true },
+        }),
+      ]);
     const unreadByID = new Map(
       unreadCounts.map((row) => [row.fromGroupAdmissionID, row._count._all]),
     );
     const groupsByID = new Map(groups.map((g) => [g.id, g]));
     const namesByID = new Map(people.map((p) => [p.id, p.nickname]));
     const seatsByID = new Map(
-      viewerSeats.filter((seat) => seat.userID === user && !seat.leftAt).map((seat) => [seat.conversationID, seat]),
+      viewerSeats
+        .filter((seat) => seat.userID === user && !seat.leftAt)
+        .map((seat) => [seat.conversationID, seat]),
     );
-    const applicantSeatsByID = new Map(viewerSeats.map((seat) => [`${seat.conversationID}:${seat.userID}`, seat]));
+    const applicantSeatsByID = new Map(
+      viewerSeats.map((seat) => [
+        `${seat.conversationID}:${seat.userID}`,
+        seat,
+      ]),
+    );
     const countsByID = new Map(
       counts.map((count) => [count.conversationID, count._count._all]),
     );
@@ -723,8 +773,18 @@ export class GroupAdmissionService {
       return [
         {
           ...this.dto(a),
-          ...(a.status === 'JOINED' && (!applicantSeatsByID.get(`${a.conversationID}:${a.applicantID}`) || applicantSeatsByID.get(`${a.conversationID}:${a.applicantID}`)?.leftAt)
-            ? { status: 'LEFT', updatedAt: applicantSeatsByID.get(`${a.conversationID}:${a.applicantID}`)?.leftAt?.toISOString() ?? a.updatedAt.toISOString() } : {}),
+          ...(a.status === 'JOINED' &&
+          (!applicantSeatsByID.get(`${a.conversationID}:${a.applicantID}`) ||
+            applicantSeatsByID.get(`${a.conversationID}:${a.applicantID}`)
+              ?.leftAt)
+            ? {
+                status: 'LEFT',
+                updatedAt:
+                  applicantSeatsByID
+                    .get(`${a.conversationID}:${a.applicantID}`)
+                    ?.leftAt?.toISOString() ?? a.updatedAt.toISOString(),
+              }
+            : {}),
           unreadCount: unreadByID.get(a.id) ?? 0,
           applicantName: namesByID.get(a.applicantID) ?? '',
           inviterName: a.inviterID ? (namesByID.get(a.inviterID) ?? '') : '',
@@ -762,17 +822,27 @@ export class GroupAdmissionService {
           const a = job.admission;
           // Approval is already the manager's acknowledgement. Do not replay
           // obsolete review prompts or fan joined notifications to managers.
-          if ((job.event === 'PENDING' && a.status !== 'PENDING') ||
-              (job.event === 'JOINED' && job.recipientID !== a.applicantID)) {
+          if (
+            (job.event === 'PENDING' && a.status !== 'PENDING') ||
+            (job.event === 'JOINED' && job.recipientID !== a.applicantID)
+          ) {
             await this.prisma.groupAdmissionDelivery.update({
-              where: { id: job.id }, data: { deliveredAt: new Date() },
+              where: { id: job.id },
+              data: { deliveredAt: new Date() },
             });
             continue;
           }
           if (job.event === 'JOINED') {
-            const seat = await this.member(this.prisma, a.conversationID, a.applicantID);
+            const seat = await this.member(
+              this.prisma,
+              a.conversationID,
+              a.applicantID,
+            );
             if (!seat || seat.leftAt || seat.joinedAt > a.updatedAt) {
-              await this.prisma.groupAdmissionDelivery.update({ where: { id: job.id }, data: { deliveredAt: new Date() } });
+              await this.prisma.groupAdmissionDelivery.update({
+                where: { id: job.id },
+                data: { deliveredAt: new Date() },
+              });
               continue;
             }
           }

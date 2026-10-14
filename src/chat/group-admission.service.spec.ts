@@ -163,7 +163,9 @@ function harness(approval = true) {
     .fn()
     .mockResolvedValue({ id: 'direct' });
   tx.groupAdmissionDelivery.update = jest.fn().mockResolvedValue({});
-  tx.groupAdmissionDelivery.updateMany = jest.fn().mockResolvedValue({ count: 0 });
+  tx.groupAdmissionDelivery.updateMany = jest
+    .fn()
+    .mockResolvedValue({ count: 0 });
   const service = new GroupAdmissionService(
     prisma,
     chat,
@@ -220,7 +222,9 @@ describe('Group admission consent and authorization', () => {
   it('acceptance with approval required remains pending, then approval creates one seat', async () => {
     const h = harness();
     h.seats.set('member', { userID: 'member', role: 'MEMBER', leftAt: null });
-    h.tx.friend.findMany.mockResolvedValue([{ userID: 'member', friendID: 'guest' }]);
+    h.tx.friend.findMany.mockResolvedValue([
+      { userID: 'member', friendID: 'guest' },
+    ]);
     await h.service.invite('member', 'g', ['guest']);
     await h.service.act('guest', 'a0', 'accept');
     expect(h.admissions.get('a0').status).toBe('PENDING');
@@ -232,23 +236,38 @@ describe('Group admission consent and authorization', () => {
     expect(h.seats.get('guest').clearedBeforeHeight).toBe(10);
     expect(h.tx.chatMember.upsert).toHaveBeenCalledTimes(1);
   });
-  it.each(['owner', 'admin'])('a direct invitation from %s joins on acceptance even with approval enabled', async (inviter) => {
-    const h = harness();
-    if (inviter === 'admin') h.seats.set('admin', { userID: 'admin', role: 'ADMIN', leftAt: null });
-    h.tx.friend.findMany.mockResolvedValue([{ userID: inviter, friendID: 'guest' }]);
-    await h.service.invite(inviter, 'g', ['guest']);
-    expect(h.seats.has('guest')).toBe(false);
-    expect((await h.service.detail('guest', 'a0')).requiresApproval).toBe(false);
-    await Promise.all([h.service.act('guest', 'a0', 'accept'), h.service.act('guest', 'a0', 'accept')]);
-    expect(h.admissions.get('a0').status).toBe('JOINED');
-    expect(h.admissions.get('a0').decidedByID).toBe(inviter);
-    expect(h.tx.chatMember.upsert).toHaveBeenCalledTimes(1);
-    expect([...h.deliveries.values()].some((job) => job.event === 'PENDING')).toBe(false);
-  });
+  it.each(['owner', 'admin'])(
+    'a direct invitation from %s joins on acceptance even with approval enabled',
+    async (inviter) => {
+      const h = harness();
+      if (inviter === 'admin')
+        h.seats.set('admin', { userID: 'admin', role: 'ADMIN', leftAt: null });
+      h.tx.friend.findMany.mockResolvedValue([
+        { userID: inviter, friendID: 'guest' },
+      ]);
+      await h.service.invite(inviter, 'g', ['guest']);
+      expect(h.seats.has('guest')).toBe(false);
+      expect((await h.service.detail('guest', 'a0')).requiresApproval).toBe(
+        false,
+      );
+      await Promise.all([
+        h.service.act('guest', 'a0', 'accept'),
+        h.service.act('guest', 'a0', 'accept'),
+      ]);
+      expect(h.admissions.get('a0').status).toBe('JOINED');
+      expect(h.admissions.get('a0').decidedByID).toBe(inviter);
+      expect(h.tx.chatMember.upsert).toHaveBeenCalledTimes(1);
+      expect(
+        [...h.deliveries.values()].some((job) => job.event === 'PENDING'),
+      ).toBe(false);
+    },
+  );
   it('a demoted admin invitation returns to review at acceptance', async () => {
     const h = harness();
     h.seats.set('admin', { userID: 'admin', role: 'ADMIN', leftAt: null });
-    h.tx.friend.findMany.mockResolvedValue([{ userID: 'admin', friendID: 'guest' }]);
+    h.tx.friend.findMany.mockResolvedValue([
+      { userID: 'admin', friendID: 'guest' },
+    ]);
     await h.service.invite('admin', 'g', ['guest']);
     h.seats.get('admin').role = 'MEMBER';
     expect((await h.service.detail('guest', 'a0')).requiresApproval).toBe(true);
@@ -259,51 +278,84 @@ describe('Group admission consent and authorization', () => {
   it('approving clears reviewer prompts and only queues joined delivery for the applicant', async () => {
     const h = harness();
     await h.service.apply('guest', 'g', '');
-    h.tx.groupAdmissionDelivery.findMany.mockResolvedValueOnce([{ id: 'review-job' }]);
-    h.tx.notification.findMany.mockResolvedValue([{ id: 'review-job', toUserID: 'owner' }]);
+    h.tx.groupAdmissionDelivery.findMany.mockResolvedValueOnce([
+      { id: 'review-job' },
+    ]);
+    h.tx.notification.findMany.mockResolvedValue([
+      { id: 'review-job', toUserID: 'owner' },
+    ]);
     await h.service.act('owner', 'a0', 'approve');
-    expect(h.notifications.markNotificationRead).toHaveBeenCalledWith('owner', 'review-job');
-    expect(h.tx.notificationPushOutbox.updateMany).toHaveBeenCalledWith(expect.objectContaining({
-      where: { notificationID: { in: ['review-job'] }, status: { in: ['PENDING', 'FAILED'] } },
-      data: expect.objectContaining({ status: 'TERMINAL' }),
-    }));
-    expect([...h.deliveries.values()].filter((job) => job.event === 'JOINED').map((job) => job.recipientID)).toEqual(['guest']);
+    expect(h.notifications.markNotificationRead).toHaveBeenCalledWith(
+      'owner',
+      'review-job',
+    );
+    expect(h.tx.notificationPushOutbox.updateMany).toHaveBeenCalledWith(
+      expect.objectContaining({
+        where: {
+          notificationID: { in: ['review-job'] },
+          status: { in: ['PENDING', 'FAILED'] },
+        },
+        data: expect.objectContaining({ status: 'TERMINAL' }),
+      }),
+    );
+    expect(
+      [...h.deliveries.values()]
+        .filter((job) => job.event === 'JOINED')
+        .map((job) => job.recipientID),
+    ).toEqual(['guest']);
   });
   it('does not replay a completed review prompt or send a joined notice to a manager', async () => {
     const h = harness();
     await h.service.invite('owner', 'g', ['guest']);
     await h.service.act('guest', 'a0', 'accept');
     h.tx.groupAdmissionDelivery.findMany.mockResolvedValue([
-      { id: 'old-review', admission: h.admissions.get('a0'), event: 'PENDING', recipientID: 'owner' },
-      { id: 'old-joined', admission: h.admissions.get('a0'), event: 'JOINED', recipientID: 'owner' },
+      {
+        id: 'old-review',
+        admission: h.admissions.get('a0'),
+        event: 'PENDING',
+        recipientID: 'owner',
+      },
+      {
+        id: 'old-joined',
+        admission: h.admissions.get('a0'),
+        event: 'JOINED',
+        recipientID: 'owner',
+      },
     ]);
     await h.service.flush();
-    expect(h.notifications.deliverGroupAdmissionNotification).not.toHaveBeenCalled();
+    expect(
+      h.notifications.deliverGroupAdmissionNotification,
+    ).not.toHaveBeenCalled();
   });
-  it.each(['invite', 'apply'])('a departed member can rejoin through a new %s without reusing the old seat state', async (flow) => {
-    const h = harness();
-    await h.service.invite('owner', 'g', ['guest']);
-    await h.service.act('guest', 'a0', 'accept');
-    h.seats.get('guest').leftAt = new Date();
-    expect((await h.service.detail('guest', 'a0')).status).toBe('LEFT');
-    expect((await h.service.preview('guest', 'g')).admission?.status).toBe('LEFT');
-    h.tx.chatMessage.aggregate.mockResolvedValue({ _max: { height: 30 } });
-    if (flow === 'invite') {
+  it.each(['invite', 'apply'])(
+    'a departed member can rejoin through a new %s without reusing the old seat state',
+    async (flow) => {
+      const h = harness();
       await h.service.invite('owner', 'g', ['guest']);
-      expect(h.admissions.get('a1').status).toBe('INVITED');
-      expect(h.seats.get('guest').leftAt).not.toBeNull();
-      await h.service.act('guest', 'a1', 'accept');
-    } else {
-      await h.service.apply('guest', 'g', 'rejoin');
-      expect(h.admissions.get('a1').status).toBe('PENDING');
-      expect(h.seats.get('guest').leftAt).not.toBeNull();
-      await h.service.act('owner', 'a1', 'approve');
-    }
-    expect(h.admissions.get('a1').status).toBe('JOINED');
-    expect(h.seats.get('guest').leftAt).toBeNull();
-    expect(h.seats.get('guest').clearedBeforeHeight).toBe(30);
-    expect(h.seats.get('guest').role).toBe('MEMBER');
-  });
+      await h.service.act('guest', 'a0', 'accept');
+      h.seats.get('guest').leftAt = new Date();
+      expect((await h.service.detail('guest', 'a0')).status).toBe('LEFT');
+      expect((await h.service.preview('guest', 'g')).admission?.status).toBe(
+        'LEFT',
+      );
+      h.tx.chatMessage.aggregate.mockResolvedValue({ _max: { height: 30 } });
+      if (flow === 'invite') {
+        await h.service.invite('owner', 'g', ['guest']);
+        expect(h.admissions.get('a1').status).toBe('INVITED');
+        expect(h.seats.get('guest').leftAt).not.toBeNull();
+        await h.service.act('guest', 'a1', 'accept');
+      } else {
+        await h.service.apply('guest', 'g', 'rejoin');
+        expect(h.admissions.get('a1').status).toBe('PENDING');
+        expect(h.seats.get('guest').leftAt).not.toBeNull();
+        await h.service.act('owner', 'a1', 'approve');
+      }
+      expect(h.admissions.get('a1').status).toBe('JOINED');
+      expect(h.seats.get('guest').leftAt).toBeNull();
+      expect(h.seats.get('guest').clearedBeforeHeight).toBe(30);
+      expect(h.seats.get('guest').role).toBe('MEMBER');
+    },
+  );
   it('a recipient can decline and never gains membership', async () => {
     const h = harness(false);
     await h.service.invite('owner', 'g', ['guest']);

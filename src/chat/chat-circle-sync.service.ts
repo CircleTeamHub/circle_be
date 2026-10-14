@@ -728,7 +728,6 @@ export class ChatCircleSyncService {
         actorId: userId,
         targetIds: [userId],
       });
-
     }
     // Manager removal can continue even if both cleanup dispatches failed:
     // its detailed log explicitly excludes the target and all chat:msg
@@ -791,7 +790,6 @@ export class ChatCircleSyncService {
           actorId: null,
           targetIds: joined,
         });
-
       }
       if (removed.length > 0) {
         await this.groupEvents.record(conversationId, {
@@ -800,7 +798,6 @@ export class ChatCircleSyncService {
           targetIds: removed,
         });
       }
-
     } catch (error) {
       attemptDiagnostic(() =>
         this.logger.warn(

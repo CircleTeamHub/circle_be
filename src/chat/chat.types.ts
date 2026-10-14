@@ -249,10 +249,7 @@ export interface ChatTypingBroadcast {
  * - updated:会话元数据变化(预留,当前无生产方)
  */
 export type ChatConversationChangeKind =
-  | 'joined'
-  | 'left'
-  | 'removed'
-  | 'updated';
+  'joined' | 'left' | 'removed' | 'updated';
 
 /** chat:conversation 服务端定向下发(个人房):接收者本人的会话成员关系变化。 */
 export interface ChatConversationBroadcast {

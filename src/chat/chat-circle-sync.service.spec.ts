@@ -182,10 +182,7 @@ describe('ChatCircleSyncService', () => {
         /private_chat_content|private-person|SELECT/,
       );
       const records = lines.map((line) => JSON.parse(line));
-      for (const operation of [
-        'detach_seat',
-        'evict_sockets',
-      ]) {
+      for (const operation of ['detach_seat', 'evict_sockets']) {
         expect(records).toEqual(
           expect.arrayContaining([
             expect.objectContaining({
@@ -443,12 +440,20 @@ describe('ChatCircleSyncService', () => {
   // 何况 CircleMember 行已被删除,updatedAt 窗口根本扫不到这个圈子。结果就是
   // 真实的退群/踢人一条提示都没有。提示必须由删除钩子自己补。
   it('records circle membership joins and departures without creating chat messages', async () => {
-    await (service as any).emitMembershipNotices('conv-1', ['new-member'], ['departed-member']);
+    await (service as any).emitMembershipNotices(
+      'conv-1',
+      ['new-member'],
+      ['departed-member'],
+    );
     expect(groupEvents.record).toHaveBeenCalledWith('conv-1', {
-      kind: 'member-joined', actorId: null, targetIds: ['new-member'],
+      kind: 'member-joined',
+      actorId: null,
+      targetIds: ['new-member'],
     });
     expect(groupEvents.record).toHaveBeenCalledWith('conv-1', {
-      kind: 'member-left', actorId: null, targetIds: ['departed-member'],
+      kind: 'member-left',
+      actorId: null,
+      targetIds: ['departed-member'],
     });
     expect(systemMessage.emit).not.toHaveBeenCalled();
     expect(prisma.user.findMany).not.toHaveBeenCalled();
@@ -456,7 +461,9 @@ describe('ChatCircleSyncService', () => {
   it('silently releases a seat without a member-left chat message', async () => {
     await service.detachSeat('u1', 'conv-1', 'removed');
 
-    expect(systemMessage.emit).not.toHaveBeenCalledWith('conv-1', { kind: 'member-left' });
+    expect(systemMessage.emit).not.toHaveBeenCalledWith('conv-1', {
+      kind: 'member-left',
+    });
     expect(broadcast.removeUserFromConversation).toHaveBeenCalledWith(
       'u1',
       'conv-1',
@@ -527,7 +534,9 @@ describe('ChatCircleSyncService', () => {
       userId: 'u1',
     });
     // 群里其他人看到的灰条措辞不区分主动被动,保持 member-left。
-    expect(systemMessage.emit).not.toHaveBeenCalledWith('conv-1', { kind: 'member-left' });
+    expect(systemMessage.emit).not.toHaveBeenCalledWith('conv-1', {
+      kind: 'member-left',
+    });
   });
 
   it('can detach a manager-removed member without emitting a duplicate member-left notice', async () => {
