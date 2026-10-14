@@ -1,3 +1,4 @@
+import { UserThrottlerGuard } from 'src/guards/user-throttler.guard';
 import {
   Body,
   ConflictException,
@@ -229,7 +230,8 @@ export class AuthController {
   }
 
   @Post('login-challenges/:challengeId/approve')
-  @UseGuards(JwtGuard)
+  @UseGuards(JwtGuard, UserThrottlerGuard)
+  @Throttle({ default: { limit: 10, ttl: 60_000 } })
   @ApiBearerAuth()
   @ApiOperation({
     summary: 'Trusted device: approve and get a one-time code (60s)',

@@ -1,3 +1,4 @@
+import { withDatabaseWorkBudget } from '../utils/database-work-budget';
 import {
   BadRequestException,
   ConflictException,
@@ -692,12 +693,14 @@ export class AuthService {
     userId: string,
     operation: () => Promise<T>,
   ): Promise<T> {
-    return this.prisma.$transaction(
-      async (tx) => {
-        await tx.$executeRaw`SELECT pg_advisory_xact_lock(hashtextextended(${`auth_session:${userId}`}, 0))`;
-        return operation();
-      },
-      { maxWait: 10000, timeout: 30000 },
+    return withDatabaseWorkBudget(this.prisma, () =>
+      this.prisma.$transaction(
+        async (tx) => {
+          await tx.$executeRaw`SELECT pg_advisory_xact_lock(hashtextextended(${`auth_session:${userId}`}, 0))`;
+          return operation();
+        },
+        { maxWait: 10000, timeout: 30000 },
+      ),
     );
   }
 
@@ -947,6 +950,7 @@ export class AuthService {
         // 同一台设备可能有多条会话（重装、重复登录）：一起撤掉，否则剩下那条还能续签。
         await this.refreshTokenService.revokeDeviceSessions(userId, deviceKey);
         await this.deviceTrust.revokeDevice(userId, deviceKey);
+        await this.deviceTrust.invalidateChallenges(userId);
       }
       logBusinessEvent(this.logger, {
         enabled: this.loggingConfig.businessLogOn,

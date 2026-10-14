@@ -243,6 +243,18 @@ export class DeviceTrustService {
   ): Promise<{ code: string; codeExpiresAt: Date }> {
     await this.assertTrustedApprover(userId, approverDeviceKey);
     const now = new Date();
+    const pending = await this.prisma.loginChallenge.findFirst({
+      where: {
+        id: challengeId,
+        userId,
+        status: {
+          in: [LoginChallengeStatus.PENDING, LoginChallengeStatus.APPROVED],
+        },
+        expiresAt: { gt: now },
+      },
+      select: { id: true },
+    });
+    if (!pending) this.throwExpired();
     const code = randomInt(0, 1_000_000).toString().padStart(6, '0');
     const codeExpiresAt = new Date(now.getTime() + LOGIN_CHALLENGE_CODE_TTL_MS);
     const updated = await this.prisma.loginChallenge.updateMany({
@@ -349,19 +361,22 @@ export class DeviceTrustService {
       this.throwExpired();
     }
 
+    const reserved = await this.prisma.loginChallenge.updateMany({
+      where: {
+        id: challenge.id,
+        status: LoginChallengeStatus.APPROVED,
+        codeHash: challenge.codeHash,
+        codeExpiresAt: { gt: now },
+        attempts: { lt: LOGIN_CHALLENGE_MAX_ATTEMPTS },
+      },
+      data: { attempts: { increment: 1 } },
+    });
+    if (reserved.count !== 1) this.throwLocked();
     if (
       !(await argon2
         .verify(challenge.codeHash, `${challenge.id}:${code}`)
         .catch(() => false))
     ) {
-      // 条件自增：并发输错不会越过上限。
-      await this.prisma.loginChallenge.updateMany({
-        where: {
-          id: challenge.id,
-          attempts: { lt: LOGIN_CHALLENGE_MAX_ATTEMPTS },
-        },
-        data: { attempts: { increment: 1 } },
-      });
       this.logSecurity('login_challenge_code_invalid', challenge.userId, {
         challengeId: challenge.id,
         attempts: challenge.attempts + 1,
@@ -382,9 +397,13 @@ export class DeviceTrustService {
         codeHash: challenge.codeHash,
         codeExpiresAt: { gt: now },
         // 并发猜码时，别的请求可能已把次数用完。
-        attempts: { lt: LOGIN_CHALLENGE_MAX_ATTEMPTS },
+        attempts: { lte: LOGIN_CHALLENGE_MAX_ATTEMPTS },
       },
-      data: { status: LoginChallengeStatus.CONSUMED, codeHash: null },
+      data: {
+        status: LoginChallengeStatus.CONSUMED,
+        codeHash: null,
+        attempts: { decrement: 1 },
+      },
     });
     if (consumed.count !== 1) this.throwExpired();
     return { userId: challenge.userId, deviceKey: challenge.deviceKey };
@@ -515,28 +534,15 @@ export class DeviceTrustService {
 
   /** 设备管理里移除某台设备：撤销它的信任，下次登录要重新验证。 */
   async listDetachedDevices(userId: string) {
-    const active = await this.prisma.refreshToken.findMany({
-      where: { userId, revokedAt: null, expiredAt: { gt: new Date() } },
-      select: { deviceKey: true },
-    });
-    const devices = await this.prisma.trustedDevice.findMany({
-      where: {
-        userId,
-        revokedAt: null,
-        deviceKey: {
-          notIn: active.flatMap((s) => (s.deviceKey ? [s.deviceKey] : [])),
-        },
-      },
-      orderBy: { lastSeenAt: 'desc' },
-      take: 100,
-      select: {
-        id: true,
-        deviceName: true,
-        lastIp: true,
-        createdAt: true,
-        lastSeenAt: true,
-      },
-    });
+    const devices = await this.prisma.$queryRaw<
+      Array<{
+        id: string;
+        deviceName: string | null;
+        lastIp: string | null;
+        createdAt: Date;
+        lastSeenAt: Date;
+      }>
+    >`SELECT d."id", d."deviceName", d."lastIp", d."createdAt", d."lastSeenAt" FROM "TrustedDevice" d WHERE d."userId" = ${userId} AND d."revokedAt" IS NULL AND NOT EXISTS (SELECT 1 FROM "RefreshToken" r WHERE r."userId" = d."userId" AND r."deviceKey" = d."deviceKey" AND r."revokedAt" IS NULL AND r."expiredAt" > NOW()) ORDER BY d."lastSeenAt" DESC, d."id" DESC LIMIT 100`;
     return devices.map((d) => ({
       id: d.id,
       deviceName: d.deviceName,

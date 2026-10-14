@@ -1,3 +1,13 @@
+jest.mock('argon2', () => {
+  const actual = jest.requireActual('argon2');
+  return {
+    __esModule: true,
+    ...actual,
+    hash: jest.fn(actual.hash),
+    verify: jest.fn(actual.verify),
+  };
+});
+import * as argon2 from 'argon2';
 import {
   ForbiddenException,
   HttpException,
@@ -108,9 +118,10 @@ function setup() {
           .sort((a, b) => b.createdAt.getTime() - a.createdAt.getTime());
         return rows[0] ?? null;
       }),
-      findUnique: jest.fn(
-        async ({ where }) => challenges.find((c) => c.id === where.id) ?? null,
-      ),
+      findUnique: jest.fn(async ({ where }) => {
+        const row = challenges.find((c) => c.id === where.id);
+        return row ? { ...row } : null;
+      }),
       findMany: jest.fn(async ({ where }) =>
         challenges.filter((c) => matches(c as any, where)),
       ),
@@ -140,7 +151,9 @@ function setup() {
         rows.forEach((r) => {
           const next = { ...data };
           if (next.attempts && typeof next.attempts === 'object') {
-            next.attempts = r.attempts + next.attempts.increment;
+            next.attempts =
+              r.attempts +
+              (next.attempts.increment ?? -next.attempts.decrement);
           }
           Object.assign(r, next);
         });
@@ -151,7 +164,9 @@ function setup() {
         rows.forEach((r) => {
           const next = { ...data };
           if (next.attempts && typeof next.attempts === 'object') {
-            next.attempts = r.attempts + next.attempts.increment;
+            next.attempts =
+              r.attempts +
+              (next.attempts.increment ?? -next.attempts.decrement);
           }
           Object.assign(r, next);
         });
@@ -668,4 +683,43 @@ describe('account-serialized login limits', () => {
     expect(verify).toHaveBeenCalledTimes(1);
     expect(challenges[0].status).toBe('CONSUMED');
   });
+});
+
+test('invalid approval challenges are rejected before invoking Argon2', async () => {
+  const { service, trust } = setup();
+  trust('phone');
+  const hash = jest.mocked(argon2.hash);
+  hash.mockClear();
+  try {
+    await expect(service.approve('u1', 'phone', 'missing')).rejects.toThrow();
+    expect(hash).not.toHaveBeenCalled();
+  } finally {
+    hash.mockClear();
+  }
+});
+
+test('concurrent wrong candidates reserve at most five Argon2 comparisons', async () => {
+  const { service, trust, challenges } = setup();
+  trust('phone');
+  await service.evaluateLogin(user, { deviceKey: 'new' });
+  await service.approve('u1', 'phone', challenges[0].id);
+  const verify = jest
+    .mocked(argon2.verify)
+    .mockClear()
+    .mockImplementation(async () => false);
+  try {
+    await Promise.allSettled(
+      Array.from({ length: 10 }, (_, i) =>
+        service.consumeWithCode(
+          challenges[0].id,
+          'new',
+          String(i).padStart(6, '0'),
+        ),
+      ),
+    );
+    expect(verify).toHaveBeenCalledTimes(5);
+    expect(challenges[0].attempts).toBe(5);
+  } finally {
+    verify.mockImplementation(jest.requireActual('argon2').verify);
+  }
 });

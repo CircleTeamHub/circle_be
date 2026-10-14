@@ -291,6 +291,14 @@ describe('AuthService', () => {
     ).not.toHaveBeenCalled();
   });
 
+  it('removing another device invalidates challenges it could have approved', async () => {
+    mockRefreshTokenService.findSessionDeviceKey
+      .mockResolvedValueOnce('attacker')
+      .mockResolvedValueOnce('owner');
+    await service.logoutSession('uuid-1', 'attacker-session', 'owner-session');
+    expect(mockDeviceTrust.invalidateChallenges).toHaveBeenCalledWith('uuid-1');
+  });
+
   it('keeps detached trusted devices visible and removable by their opaque record IDs', async () => {
     mockRefreshTokenService.listActiveSessions.mockResolvedValueOnce([]);
     mockDeviceTrust.listDetachedDevices.mockResolvedValueOnce([
