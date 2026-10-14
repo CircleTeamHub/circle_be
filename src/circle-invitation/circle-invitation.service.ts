@@ -1571,7 +1571,7 @@ export class CircleInvitationService {
     invitationId: string,
     client: Prisma.TransactionClient = this.prisma,
   ): Promise<InvitationDto> {
-    const inv = await this.loadInvitation(invitationId);
+    const inv = await this.loadInvitation(invitationId, client);
     return this.toInvitationDto(inv);
   }
 
@@ -1698,8 +1698,11 @@ export class CircleInvitationService {
     return feedCursorWhere({ createdAt: anchor.createdAt, id: cursor });
   }
 
-  private async loadInvitation(invitationId: string) {
-    const inv = await this.prisma.circleInvitation.findUnique({
+  private async loadInvitation(
+    invitationId: string,
+    client: Prisma.TransactionClient = this.prisma,
+  ) {
+    const inv = await client.circleInvitation.findUnique({
       where: { id: invitationId },
       include: INVITATION_INCLUDE,
     });

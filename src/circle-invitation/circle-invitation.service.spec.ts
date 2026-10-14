@@ -159,6 +159,22 @@ describe('CircleInvitationService', () => {
     service = module.get(CircleInvitationService);
   });
 
+  it('reads newly created batch invitation DTOs through the creating transaction', async () => {
+    const invitation = { id: 'uncommitted' };
+    const client = {
+      circleInvitation: { findUnique: jest.fn().mockResolvedValue(invitation) },
+    };
+    const mapper = jest
+      .spyOn(service as any, 'toInvitationDto')
+      .mockReturnValue(invitation);
+    await expect(
+      (service as any).fetchInvitationDto('uncommitted', client),
+    ).resolves.toBe(invitation);
+    expect(client.circleInvitation.findUnique).toHaveBeenCalled();
+    expect(prisma.circleInvitation.findUnique).not.toHaveBeenCalled();
+    mapper.mockRestore();
+  });
+
   it('does not deliver any batch consent card when a later invite fails', async () => {
     const invite = jest
       .spyOn(service, 'invite')
