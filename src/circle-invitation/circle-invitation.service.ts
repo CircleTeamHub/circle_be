@@ -1,3 +1,4 @@
+import { withDatabaseWorkBudget } from '../utils/database-work-budget';
 import { businessMetrics } from 'src/metrics/business-metrics';
 import {
   BadRequestException,
@@ -187,43 +188,45 @@ export class CircleInvitationService {
   }
 
   private async deliverConsentInvitation(id: string) {
-    return this.prisma.$transaction(
-      async (tx) => {
-        await tx.$executeRaw`SELECT pg_advisory_xact_lock(hashtextextended(${`circle_consent_delivery:${id}`}, 0))`;
+    return withDatabaseWorkBudget(this.prisma, () =>
+      this.prisma.$transaction(
+        async (tx) => {
+          await tx.$executeRaw`SELECT pg_advisory_xact_lock(hashtextextended(${`circle_consent_delivery:${id}`}, 0))`;
 
-        const invitation = await this.loadInvitation(id, tx);
-        if (
-          !invitation.consentNoticeRequired ||
-          invitation.consentNoticeDeliveredAt
-        )
-          return;
-        await this.notificationService.deliverCircleConsentNotification({
-          id,
-          toUserID: invitation.applicantID,
-          fromUserID: invitation.inviterID,
-          circleId: invitation.circleID,
-          content: `邀请你加入「${invitation.circle.name}」`,
-        });
-        const direct = await this.chatService.getOrCreateDirectConversation(
-          invitation.inviterID,
-          invitation.applicantID,
-        );
-        await this.chatMessages.insertServerMessage(direct.id, {
-          senderID: invitation.inviterID,
-          type: 'group-invitation',
-          content: {
-            circleInvitationId: id,
-            groupName: invitation.circle.name,
-          },
-          clientMessageId: `circle_invitation_${id}`,
-          rebroadcastOnReplay: true,
-        });
-        await tx.circleInvitation.update({
-          where: { id },
-          data: { consentNoticeDeliveredAt: new Date() },
-        });
-      },
-      { maxWait: 10000, timeout: 30000 },
+          const invitation = await this.loadInvitation(id, tx);
+          if (
+            !invitation.consentNoticeRequired ||
+            invitation.consentNoticeDeliveredAt
+          )
+            return;
+          await this.notificationService.deliverCircleConsentNotification({
+            id,
+            toUserID: invitation.applicantID,
+            fromUserID: invitation.inviterID,
+            circleId: invitation.circleID,
+            content: `邀请你加入「${invitation.circle.name}」`,
+          });
+          const direct = await this.chatService.getOrCreateDirectConversation(
+            invitation.inviterID,
+            invitation.applicantID,
+          );
+          await this.chatMessages.insertServerMessage(direct.id, {
+            senderID: invitation.inviterID,
+            type: 'group-invitation',
+            content: {
+              circleInvitationId: id,
+              groupName: invitation.circle.name,
+            },
+            clientMessageId: `circle_invitation_${id}`,
+            rebroadcastOnReplay: true,
+          });
+          await tx.circleInvitation.update({
+            where: { id },
+            data: { consentNoticeDeliveredAt: new Date() },
+          });
+        },
+        { maxWait: 10000, timeout: 30000 },
+      ),
     );
   }
 
