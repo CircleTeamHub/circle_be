@@ -221,19 +221,20 @@ export class AuthService {
       entityId: user.id,
     });
 
-    const tokens = await this.issueTokens(
-      user.id,
-      user.accountId,
-      user.role,
-      sessionContext,
-    );
-    // 注册设备就是这个账号的首台受信任设备。
-    await this.deviceTrust.trustOnRefresh(
-      user.id,
-      sessionContext?.deviceKey ?? null,
-      sessionContext ?? {},
-    );
-    return tokens;
+    return this.withAccountAuthLock(user.id, async () => {
+      if (sessionContext?.deviceKey)
+        await this.deviceTrust.trust(
+          user.id,
+          sessionContext.deviceKey,
+          sessionContext,
+        );
+      return this.issueTokens(
+        user.id,
+        user.accountId,
+        user.role,
+        sessionContext,
+      );
+    });
   }
 
   async login(dto: LoginDto, sessionContext?: SessionContext) {
@@ -741,81 +742,87 @@ export class AuthService {
   }
 
   async refresh(refreshToken: string, sessionContext?: SessionContext) {
-    const {
-      token: newRefreshToken,
-      userId,
-      sessionId,
-      deviceKey,
-      deviceName,
-    } = await this.refreshTokenService.rotate(
+    const owner = await this.refreshTokenService.ownerForToken(
       refreshToken,
-      sessionContext,
       'APP',
     );
-
-    const user = await this.prisma.user.findUnique({ where: { id: userId } });
-    if (!user) {
-      throw new NotFoundException({
-        message: '用户不存在',
-        errorCode: AuthErrorCode.UserNotFound,
-      });
-    }
-
-    // Banned/deleted users must not be able to keep refreshing tokens just
-    // because they still hold a valid refresh token. Revoke their sessions
-    // and reject the rotation result.
-    if (user.status !== 'ACTIVE') {
-      this.logger.warn(
-        `Refresh blocked for non-active user ${user.id} (status=${user.status}); revoking sessions.`,
+    return this.withAccountAuthLock(owner, async () => {
+      const {
+        token: newRefreshToken,
+        userId,
+        sessionId,
+        deviceKey,
+        deviceName,
+      } = await this.refreshTokenService.rotate(
+        refreshToken,
+        sessionContext,
+        'APP',
       );
-      await this.refreshTokenService.revokeAll(user.id);
-      throw new ForbiddenException({
-        message: '账号已被禁用',
-        errorCode: AuthErrorCode.AccountDisabled,
-      });
-    }
 
-    // 与 login() 一致：ADMIN 账号不能持有 APP audience 会话。晋升前签发的 APP
-    // refresh token 否则会一直续签出 role=ADMIN 的 APP access token，而任何只看
-    // role、不看 audience 的授权判断都会把它当成管理员，等于绕开短 TTL/审计的
-    // 管理会话模型。像 adminRefresh 一样撤销全部会话；文案与普通登录失败一致
-    // （不泄露该账号是管理员）。
-    if (user.role === 'ADMIN') {
-      this.logger.warn(
-        `Refresh blocked for ADMIN account ${user.id} on the APP audience; revoking sessions.`,
-      );
-      await this.refreshTokenService.revokeAll(user.id);
-      throw new ForbiddenException({
-        message: '邮箱、用户ID或密码错误',
-        errorCode: AuthErrorCode.InvalidCredentials,
-      });
-    }
+      const user = await this.prisma.user.findUnique({ where: { id: userId } });
+      if (!user) {
+        throw new NotFoundException({
+          message: '用户不存在',
+          errorCode: AuthErrorCode.UserNotFound,
+        });
+      }
 
-    // Fire-and-forget: lastOnline is best-effort and must never block token issuance.
-    this.prisma.user
-      .update({ where: { id: user.id }, data: { lastOnline: new Date() } })
-      .catch((err) =>
+      // Banned/deleted users must not be able to keep refreshing tokens just
+      // because they still hold a valid refresh token. Revoke their sessions
+      // and reject the rotation result.
+      if (user.status !== 'ACTIVE') {
         this.logger.warn(
-          `lastOnline update failed for ${user.id}: ${err?.message}`,
-        ),
-      );
+          `Refresh blocked for non-active user ${user.id} (status=${user.status}); revoking sessions.`,
+        );
+        await this.refreshTokenService.revokeAll(user.id);
+        throw new ForbiddenException({
+          message: '账号已被禁用',
+          errorCode: AuthErrorCode.AccountDisabled,
+        });
+      }
 
-    const accessToken = await this.signAccessToken(
-      user.id,
-      user.accountId,
-      user.role,
-      sessionId,
-      'APP',
-    );
-    await this.refreshTokenService.assertSessionActive(user.id, sessionId);
-    // 持有有效会话的设备就是本人设备：功能上线前已登录的设备靠这条补记信任，
-    // 免得一升级所有人都变成「陌生设备」。只认会话绑定的设备，不认请求头里新报的。
-    // 续签请求不带设备名头：受信任记录沿用会话上登录时记下的设备名。
-    await this.deviceTrust.trustOnRefresh(user.id, deviceKey, {
-      ...sessionContext,
-      deviceName: sessionContext?.deviceName ?? deviceName,
+      // 与 login() 一致：ADMIN 账号不能持有 APP audience 会话。晋升前签发的 APP
+      // refresh token 否则会一直续签出 role=ADMIN 的 APP access token，而任何只看
+      // role、不看 audience 的授权判断都会把它当成管理员，等于绕开短 TTL/审计的
+      // 管理会话模型。像 adminRefresh 一样撤销全部会话；文案与普通登录失败一致
+      // （不泄露该账号是管理员）。
+      if (user.role === 'ADMIN') {
+        this.logger.warn(
+          `Refresh blocked for ADMIN account ${user.id} on the APP audience; revoking sessions.`,
+        );
+        await this.refreshTokenService.revokeAll(user.id);
+        throw new ForbiddenException({
+          message: '邮箱、用户ID或密码错误',
+          errorCode: AuthErrorCode.InvalidCredentials,
+        });
+      }
+
+      // Fire-and-forget: lastOnline is best-effort and must never block token issuance.
+      this.prisma.user
+        .update({ where: { id: user.id }, data: { lastOnline: new Date() } })
+        .catch((err) =>
+          this.logger.warn(
+            `lastOnline update failed for ${user.id}: ${err?.message}`,
+          ),
+        );
+
+      const accessToken = await this.signAccessToken(
+        user.id,
+        user.accountId,
+        user.role,
+        sessionId,
+        'APP',
+      );
+      await this.refreshTokenService.assertSessionActive(user.id, sessionId);
+      // 持有有效会话的设备就是本人设备：功能上线前已登录的设备靠这条补记信任，
+      // 免得一升级所有人都变成「陌生设备」。只认会话绑定的设备，不认请求头里新报的。
+      // 续签请求不带设备名头：受信任记录沿用会话上登录时记下的设备名。
+      await this.deviceTrust.trustOnRefresh(user.id, deviceKey, {
+        ...sessionContext,
+        deviceName: sessionContext?.deviceName ?? deviceName,
+      });
+      return { accessToken, refreshToken: newRefreshToken };
     });
-    return { accessToken, refreshToken: newRefreshToken };
   }
 
   async adminRefresh(refreshToken: string, sessionContext?: SessionContext) {
@@ -888,7 +895,10 @@ export class AuthService {
   }
 
   async sessions(userId: string, currentSessionId?: string) {
-    const sessions = await this.refreshTokenService.listActiveSessions(userId);
+    const sessions = [
+      ...(await this.refreshTokenService.listActiveSessions(userId)),
+      ...(await this.deviceTrust.listDetachedDevices(userId)),
+    ];
     return sessions.map((session) => ({
       ...session,
       isCurrent: currentSessionId ? session.id === currentSessionId : false,
@@ -920,10 +930,11 @@ export class AuthService {
   ): Promise<void> {
     return this.withAccountAuthLock(userId, async () => {
       // 在设备管理里移除 = 撤销信任：这台设备再登录要重新经受信任设备批准。
-      const deviceKey = await this.refreshTokenService.findSessionDeviceKey(
-        userId,
-        sessionId,
-      );
+      const deviceKey =
+        (await this.refreshTokenService.findSessionDeviceKey(
+          userId,
+          sessionId,
+        )) ?? (await this.deviceTrust.deviceKeyForRecord(userId, sessionId));
       const currentDeviceKey = currentSessionId
         ? await this.refreshTokenService.findSessionDeviceKey(
             userId,

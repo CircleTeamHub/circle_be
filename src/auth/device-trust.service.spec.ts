@@ -386,6 +386,10 @@ describe('DeviceTrustService approve / verify', () => {
     );
     expect(challenges[0].status).toBe('APPROVED');
     expect(challenges[0].codeHash).not.toContain(code);
+    expect(challenges[0].codeHash).toMatch(/^\$argon2id\$/);
+    expect(challenges[0].codeHash).not.toBe(
+      createHash('sha256').update(`${challengeId}:${code}`).digest('hex'),
+    );
   });
 
   it('the new device logs in with the right code exactly once', async () => {

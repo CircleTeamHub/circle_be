@@ -7,7 +7,8 @@ import {
   NotFoundException,
   Optional,
 } from '@nestjs/common';
-import { createHash, randomInt, timingSafeEqual } from 'crypto';
+import { createHash, randomInt } from 'crypto';
+import * as argon2 from 'argon2';
 import { LoginChallengeStatus } from 'src/generated/prisma';
 import { PrismaService } from 'src/prisma/prisma.service';
 import { AuthErrorCode } from 'src/common/app-error-codes';
@@ -48,16 +49,6 @@ const MAX_IP_LENGTH = 64;
 export function hashDeviceId(raw: string | null | undefined): string | null {
   if (typeof raw !== 'string' || !DEVICE_ID_PATTERN.test(raw)) return null;
   return createHash('sha256').update(raw).digest('hex');
-}
-
-function hashCode(challengeId: string, code: string): string {
-  return createHash('sha256').update(`${challengeId}:${code}`).digest('hex');
-}
-
-function sameHash(a: string, b: string): boolean {
-  const left = Buffer.from(a, 'hex');
-  const right = Buffer.from(b, 'hex');
-  return left.length === right.length && timingSafeEqual(left, right);
 }
 
 function truncate(value: string | null | undefined, max: number) {
@@ -265,7 +256,7 @@ export class DeviceTrustService {
       },
       data: {
         status: LoginChallengeStatus.APPROVED,
-        codeHash: hashCode(challengeId, code),
+        codeHash: await argon2.hash(`${challengeId}:${code}`),
         codeExpiresAt,
         attempts: 0,
         decidedAt: now,
@@ -358,7 +349,11 @@ export class DeviceTrustService {
       this.throwExpired();
     }
 
-    if (!sameHash(challenge.codeHash, hashCode(challenge.id, code))) {
+    if (
+      !(await argon2
+        .verify(challenge.codeHash, `${challenge.id}:${code}`)
+        .catch(() => false))
+    ) {
       // 条件自增：并发输错不会越过上限。
       await this.prisma.loginChallenge.updateMany({
         where: {
@@ -519,6 +514,52 @@ export class DeviceTrustService {
   }
 
   /** 设备管理里移除某台设备：撤销它的信任，下次登录要重新验证。 */
+  async listDetachedDevices(userId: string) {
+    const active = await this.prisma.refreshToken.findMany({
+      where: { userId, revokedAt: null, expiredAt: { gt: new Date() } },
+      select: { deviceKey: true },
+    });
+    const devices = await this.prisma.trustedDevice.findMany({
+      where: {
+        userId,
+        revokedAt: null,
+        deviceKey: {
+          notIn: active.flatMap((s) => (s.deviceKey ? [s.deviceKey] : [])),
+        },
+      },
+      orderBy: { lastSeenAt: 'desc' },
+      take: 100,
+      select: {
+        id: true,
+        deviceName: true,
+        lastIp: true,
+        createdAt: true,
+        lastSeenAt: true,
+      },
+    });
+    return devices.map((d) => ({
+      id: d.id,
+      deviceName: d.deviceName,
+      ip: d.lastIp,
+      userAgent: null,
+      createdAt: d.createdAt,
+      lastUsedAt: d.lastSeenAt,
+      expiredAt: d.lastSeenAt,
+      trustedOnly: true,
+    }));
+  }
+
+  async deviceKeyForRecord(
+    userId: string,
+    recordId: string,
+  ): Promise<string | null> {
+    const record = await this.prisma.trustedDevice.findFirst({
+      where: { id: recordId, userId, revokedAt: null },
+      select: { deviceKey: true },
+    });
+    return record?.deviceKey ?? null;
+  }
+
   async revokeDevice(userId: string, deviceKey: string | null): Promise<void> {
     if (!deviceKey) return;
     await this.prisma.trustedDevice.updateMany({

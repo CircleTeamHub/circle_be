@@ -90,6 +90,9 @@ describe('AuthService', () => {
   };
 
   const mockDeviceTrust = {
+    trust: jest.fn().mockResolvedValue(undefined),
+    listDetachedDevices: jest.fn().mockResolvedValue([]),
+    deviceKeyForRecord: jest.fn().mockResolvedValue(null),
     evaluateLogin: jest.fn(() => Promise.resolve({ kind: 'trusted' })),
     trustOnRefresh: jest.fn(() => Promise.resolve()),
     revokeDevice: jest.fn(() => Promise.resolve()),
@@ -115,6 +118,7 @@ describe('AuthService', () => {
     createSessionForCurrentSingleDeviceSetting: jest.fn(() =>
       Promise.resolve({ token: 'refresh-token', sessionId: 'session-1' }),
     ),
+    ownerForToken: jest.fn().mockResolvedValue('uuid-1'),
     rotate: jest.fn(() =>
       Promise.resolve({
         token: 'new-refresh-token',
@@ -264,6 +268,100 @@ describe('AuthService', () => {
 
   it('should be defined', () => {
     expect(service).toBeDefined();
+  });
+
+  it('does not create a session when initial trusted-device enrollment fails', async () => {
+    mockDeviceTrust.trust.mockRejectedValueOnce(
+      new Error('database unavailable'),
+    );
+    await expect(
+      service.register(
+        {
+          email: 'new@example.com',
+          confirmPassword: 'password1',
+          password: 'password1',
+          nickname: 'Test',
+        } as any,
+        { deviceKey: 'new-device' },
+      ),
+    ).rejects.toThrow('database unavailable');
+    expect(mockRefreshTokenService.createAppSession).not.toHaveBeenCalled();
+    expect(
+      mockRefreshTokenService.createSessionForCurrentSingleDeviceSetting,
+    ).not.toHaveBeenCalled();
+  });
+
+  it('keeps detached trusted devices visible and removable by their opaque record IDs', async () => {
+    mockRefreshTokenService.listActiveSessions.mockResolvedValueOnce([]);
+    mockDeviceTrust.listDetachedDevices.mockResolvedValueOnce([
+      { id: 'trusted-record', deviceName: 'Old phone' },
+    ] as never);
+    expect(await service.sessions('uuid-1')).toEqual([
+      { id: 'trusted-record', deviceName: 'Old phone', isCurrent: false },
+    ]);
+    mockRefreshTokenService.findSessionDeviceKey.mockResolvedValueOnce(null);
+    mockDeviceTrust.deviceKeyForRecord.mockResolvedValueOnce('old-device');
+    await service.logoutSession('uuid-1', 'trusted-record');
+    expect(mockDeviceTrust.deviceKeyForRecord).toHaveBeenCalledWith(
+      'uuid-1',
+      'trusted-record',
+    );
+    expect(mockDeviceTrust.revokeDevice).toHaveBeenCalledWith(
+      'uuid-1',
+      'old-device',
+    );
+  });
+
+  it('holds recovery behind refresh rotation and final device trust enrollment', async () => {
+    users.push({
+      id: 'uuid-1',
+      accountId: 'AAA111',
+      passwordHash: 'x',
+      status: 'ACTIVE',
+      role: 'USER',
+      singleDeviceLoginEnabled: false,
+    });
+    let rotating!: () => void;
+    const started = new Promise<void>((resolve) => {
+      rotating = resolve;
+    });
+    let release!: () => void;
+    const pause = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    mockRefreshTokenService.rotate.mockImplementationOnce(async () => {
+      rotating();
+      await pause;
+      return {
+        token: 'new-refresh-token',
+        userId: 'uuid-1',
+        sessionId: 'session-2',
+        deviceKey: 'old-device',
+      } as any;
+    });
+    const original = mockPrisma.$transaction.getMockImplementation();
+    let queue: Promise<unknown> = Promise.resolve();
+    mockPrisma.$transaction.mockImplementation((operation: any) => {
+      const task = queue.then(() => operation(mockPrisma));
+      queue = task.catch(() => {});
+      return task;
+    });
+    try {
+      const refresh = service.refresh('refresh-token');
+      await started;
+      const recovery = service.logoutAll('uuid-1');
+      await Promise.resolve();
+      expect(mockRefreshTokenService.revokeAll).not.toHaveBeenCalled();
+      release();
+      await Promise.all([refresh, recovery]);
+      expect(
+        mockDeviceTrust.trustOnRefresh.mock.invocationCallOrder[0],
+      ).toBeLessThan(
+        mockRefreshTokenService.revokeAll.mock.invocationCallOrder[0],
+      );
+    } finally {
+      mockPrisma.$transaction.mockImplementation(original!);
+    }
   });
 
   it('register creates user with auto accountId and returns tokens', async () => {

@@ -321,6 +321,19 @@ export class RefreshTokenService {
     await this.revokeAccessSessions(revokedSessionIds);
   }
 
+  async ownerForToken(
+    rawToken: string,
+    audience: RefreshTokenAudience = 'APP',
+  ): Promise<string> {
+    const row = await this.prisma.refreshToken.findUnique({
+      where: { token: hashToken(rawToken) },
+      select: { userId: true, audience: true },
+    });
+    if (!row || row.audience !== audience)
+      throw new UnauthorizedException('Invalid or expired refresh token');
+    return row.userId;
+  }
+
   async rotate(
     oldToken: string,
     context?: SessionContext,
