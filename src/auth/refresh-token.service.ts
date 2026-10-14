@@ -612,15 +612,20 @@ export class RefreshTokenService {
 
   /** 撤销绑定到某台设备的全部会话（设备管理里移除设备时用）。 */
   async revokeDeviceSessions(userId: string, deviceKey: string): Promise<void> {
-    const revoked = await this.prisma.refreshToken.updateManyAndReturn({
+    const now = new Date();
+    const revocableSessions = await this.prisma.refreshToken.findMany({
+      where: { userId, deviceKey, expiredAt: { gt: now } },
+      select: { id: true },
+    });
+    await this.prisma.refreshToken.updateManyAndReturn({
       where: { userId, deviceKey, revokedAt: null },
       data: {
-        revokedAt: new Date(),
+        revokedAt: now,
         revocationReason: RefreshTokenRevocationReason.SESSION_REVOKED,
       },
       select: { id: true },
     });
-    await this.revokeAccessSessions(revoked.map(({ id }) => id));
+    await this.revokeAccessSessions(revocableSessions.map(({ id }) => id));
   }
 
   async revokeOtherSessions(
@@ -631,18 +636,27 @@ export class RefreshTokenService {
       return;
     }
 
-    const revokedSessions = await this.prisma.refreshToken.updateManyAndReturn({
+    const now = new Date();
+    const revocableSessions = await this.prisma.refreshToken.findMany({
+      where: {
+        userId,
+        expiredAt: { gt: now },
+        id: { not: currentSessionId },
+      },
+      select: { id: true },
+    });
+    await this.prisma.refreshToken.updateManyAndReturn({
       where: {
         userId,
         revokedAt: null,
         id: { not: currentSessionId },
       },
       data: {
-        revokedAt: new Date(),
+        revokedAt: now,
         revocationReason: RefreshTokenRevocationReason.OTHER_SESSIONS_REVOKED,
       },
       select: { id: true },
     });
-    await this.revokeAccessSessions(revokedSessions.map(({ id }) => id));
+    await this.revokeAccessSessions(revocableSessions.map(({ id }) => id));
   }
 }

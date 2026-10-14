@@ -73,6 +73,8 @@ describe('RefreshTokenService', () => {
                 record.audience === where.audience) &&
               (where.familyId === undefined ||
                 record.familyId === where.familyId) &&
+              (where.deviceKey === undefined ||
+                record.deviceKey === where.deviceKey) &&
               (where.id?.not === undefined || record.id !== where.id.not) &&
               (where.revokedAt === undefined ||
                 record.revokedAt === where.revokedAt) &&
@@ -118,8 +120,14 @@ describe('RefreshTokenService', () => {
       updateManyAndReturn: jest.fn(async ({ where, data }) => {
         const matching = records.filter((record) => {
           if (where.userId && record.userId !== where.userId) return false;
+          if (where.deviceKey && record.deviceKey !== where.deviceKey) {
+            return false;
+          }
           if (where.id?.not && record.id === where.id.not) return false;
           if (where.revokedAt === null && record.revokedAt !== null) {
+            return false;
+          }
+          if (where.expiredAt?.gt && record.expiredAt <= where.expiredAt.gt) {
             return false;
           }
           return true;
@@ -319,6 +327,56 @@ describe('RefreshTokenService', () => {
     expect(prisma.refreshToken.updateManyAndReturn).toHaveBeenCalled();
     expect(revocation.revokeSession).toHaveBeenCalledTimes(1);
     expect(revocation.revokeSession).toHaveBeenCalledWith('other');
+  });
+
+  it('revokes access tokens for rotated sessions when removing a device', async () => {
+    const { token } = await service.create('user-1', {
+      deviceKey: 'device-a',
+    });
+    await service.rotate(token);
+    await service.create('user-1', { deviceKey: 'device-b' });
+    jest.clearAllMocks();
+
+    await service.revokeDeviceSessions('user-1', 'device-a');
+
+    expect(prisma.refreshToken.findMany).toHaveBeenCalledWith({
+      where: {
+        userId: 'user-1',
+        deviceKey: 'device-a',
+        expiredAt: { gt: expect.any(Date) },
+      },
+      select: { id: true },
+    });
+    expect(revocation.revokeSession).toHaveBeenCalledWith('session-1');
+    expect(revocation.revokeSession).toHaveBeenCalledWith('session-2');
+    expect(revocation.revokeSession).not.toHaveBeenCalledWith('session-3');
+  });
+
+  it('revokes rotated access tokens when logging out other sessions', async () => {
+    const current = await service.create('user-1', {
+      deviceKey: 'device-current',
+    });
+    const { token: otherToken } = await service.create('user-1', {
+      deviceKey: 'device-other',
+    });
+    await service.rotate(otherToken);
+    jest.clearAllMocks();
+
+    await service.revokeOtherSessions('user-1', current.sessionId);
+
+    expect(prisma.refreshToken.findMany).toHaveBeenCalledWith({
+      where: {
+        userId: 'user-1',
+        expiredAt: { gt: expect.any(Date) },
+        id: { not: current.sessionId },
+      },
+      select: { id: true },
+    });
+    expect(revocation.revokeSession).not.toHaveBeenCalledWith(
+      current.sessionId,
+    );
+    expect(revocation.revokeSession).toHaveBeenCalledWith('session-2');
+    expect(revocation.revokeSession).toHaveBeenCalledWith('session-3');
   });
 
   it('replaces single-device sessions under a per-user transaction lock', async () => {
