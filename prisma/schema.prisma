@@ -1857,12 +1857,15 @@ model DevicePushToken {
   appVersion           String?
   revocationSecretHash String?
   disabledAt           DateTime?
+  /// Server-derived sha256 device identity from the authenticated session.
+  deviceKey            String?
   createdAt            DateTime  @default(now())
   updatedAt            DateTime  @updatedAt
 
   userID String
   user   User   @relation(fields: [userID], references: [id], onDelete: Cascade)
 
+  @@index([userID, deviceKey])
   @@index([userID])
   @@index([provider, platform])
   @@index([updatedAt])

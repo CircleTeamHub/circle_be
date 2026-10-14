@@ -1,3 +1,4 @@
+import { withDatabaseWorkBudget } from 'src/utils/database-work-budget';
 import {
   BadRequestException,
   ConflictException,
@@ -148,6 +149,70 @@ export class NotificationService {
   async registerPushToken(
     userId: string,
     dto: RegisterPushTokenDto,
+    sessionId?: string,
+  ): Promise<{ deviceBound: boolean }> {
+    return withDatabaseWorkBudget(this.prisma, () =>
+      this.prisma.$transaction(
+        async (tx) => {
+          await tx.$executeRaw`SELECT pg_advisory_xact_lock(hashtextextended(${`auth_session:${userId}`}, 0))`;
+          let deviceKey: string | null = null;
+          if (sessionId) {
+            const session = await this.prisma.refreshToken.findUnique({
+              where: { id: sessionId },
+            });
+            if (
+              !session ||
+              session.userId !== userId ||
+              session.audience !== 'APP' ||
+              session.expiredAt <= new Date() ||
+              (session.revokedAt && session.revocationReason !== 'ROTATED')
+            ) {
+              throw new ForbiddenException({
+                message: '登录会话已失效',
+                errorCode: 'AUTH_DEVICE_NOT_TRUSTED',
+              });
+            }
+            if (session.revokedAt && session.revocationReason === 'ROTATED') {
+              const live = await this.prisma.refreshToken.findFirst({
+                where: {
+                  userId,
+                  familyId: session.familyId,
+                  deviceKey: session.deviceKey,
+                  audience: 'APP',
+                  revokedAt: null,
+                  expiredAt: { gt: new Date() },
+                },
+              });
+              if (!live)
+                throw new ForbiddenException({
+                  message: '登录会话已失效',
+                  errorCode: 'AUTH_DEVICE_NOT_TRUSTED',
+                });
+            }
+            deviceKey = session.deviceKey;
+            if (deviceKey) {
+              const trusted = await this.prisma.trustedDevice.findUnique({
+                where: { userId_deviceKey: { userId, deviceKey } },
+              });
+              if (!trusted || trusted.revokedAt)
+                throw new ForbiddenException({
+                  message: '设备已移除',
+                  errorCode: 'AUTH_DEVICE_NOT_TRUSTED',
+                });
+            }
+          }
+          await this.registerPushTokenForDevice(userId, dto, deviceKey);
+          return { deviceBound: Boolean(deviceKey) };
+        },
+        { maxWait: 10000, timeout: 30000 },
+      ),
+    );
+  }
+
+  private async registerPushTokenForDevice(
+    userId: string,
+    dto: RegisterPushTokenDto,
+    deviceKey: string | null,
   ): Promise<void> {
     if (
       dto.provider === 'jpush' &&
@@ -174,6 +239,7 @@ export class NotificationService {
     // 撞唯一约束(P2002)说明行确实存在但谓词不满足 = 属于别人且没证明 → 拒绝。
     const update = {
       userID: userId,
+      deviceKey,
       platform: dto.platform,
       provider: dto.provider,
       projectId: dto.projectId ?? null,
@@ -188,7 +254,10 @@ export class NotificationService {
       where: {
         token: dto.token,
         OR: [
-          { userID: userId },
+          {
+            userID: userId,
+            OR: [{ deviceKey: null }, ...(deviceKey ? [{ deviceKey }] : [])],
+          },
           ...(revocationSecretHash ? [{ revocationSecretHash }] : []),
           // 迁移通道：secret 是可选字段，存量行(以及任何没带 secret 登记过的
           // 客户端)的 revocationSecretHash 是 null。不放行的话，同一台设备换个
@@ -210,6 +279,7 @@ export class NotificationService {
           data: {
             token: dto.token,
             userID: userId,
+            deviceKey,
             platform: dto.platform,
             provider: dto.provider,
             projectId: dto.projectId ?? null,

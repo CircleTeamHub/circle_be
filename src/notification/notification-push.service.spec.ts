@@ -384,6 +384,27 @@ describe('NotificationPushService (#88 per-token delivery)', () => {
     });
   });
 
+  it('uses the held transaction connection for login-alert eligibility during shutdown', async () => {
+    prisma.$queryRaw.mockRejectedValueOnce(new Error('root pool is closing'));
+    const tx = {
+      $queryRaw: jest.fn().mockResolvedValue([
+        {
+          token: 'eligible',
+          provider: 'expo',
+          platform: 'ios',
+          projectId: null,
+        },
+      ]),
+    };
+    await expect(
+      service.listLoginAlertTokens('user', tx as any),
+    ).resolves.toEqual([
+      { token: 'eligible', provider: 'expo', platform: 'ios', projectId: null },
+    ]);
+    expect(prisma.$queryRaw).not.toHaveBeenCalled();
+    prisma.$queryRaw.mockReset();
+  });
+
   describe('listActiveTokensForUsers', () => {
     it('caps recipient tokens per user/provider inside the database query', async () => {
       prisma.$queryRaw.mockResolvedValue([

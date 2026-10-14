@@ -75,6 +75,7 @@ function setup() {
   const liveSessions = { count: 0 };
 
   const prisma = {
+    devicePushToken: { updateMany: jest.fn(async () => ({ count: 1 })) },
     trustedDevice: {
       findUnique: jest.fn(async ({ where }) => {
         const { userId, deviceKey } = where.userId_deviceKey;
@@ -198,6 +199,7 @@ function setup() {
   };
   let serial = Promise.resolve();
   const transactionScope = new AsyncLocalStorage<boolean>();
+  (prisma as any).$executeRaw = jest.fn();
   (prisma as any).$queryRaw = jest.fn().mockResolvedValue([]);
   (prisma as any).$transaction = jest.fn((fn) => {
     if (transactionScope.getStore()) return fn(prisma);
@@ -209,7 +211,9 @@ function setup() {
   });
   const realtime = { broadcast: jest.fn() };
   const push = {
-    listActiveTokens: jest.fn(async () => [{ token: 't', projectId: null }]),
+    listLoginAlertTokens: jest.fn(async () => [
+      { token: 't', projectId: null },
+    ]),
     sendToTokens: jest.fn(async () => []),
   };
   const service = new DeviceTrustService(
@@ -740,4 +744,26 @@ test('resend rechecks a source challenge invalidated during account recovery', a
   prisma.loginChallenge.create.mockClear();
   await expect(service.resend(old.id, 'new')).rejects.toThrow();
   expect(prisma.loginChallenge.create).not.toHaveBeenCalled();
+});
+
+test('removing a device disables only its bound push addresses', async () => {
+  const h = setup();
+  h.trust('removed');
+  await h.service.revokeDevice('u1', 'removed');
+  expect(h.prisma.devicePushToken.updateMany).toHaveBeenCalledWith({
+    where: { userID: 'u1', deviceKey: 'removed', disabledAt: null },
+    data: { disabledAt: expect.any(Date) },
+  });
+});
+test('removing other devices disables legacy addresses and preserves the current device', async () => {
+  const h = setup();
+  await h.service.revokeOtherDevices('u1', 'current');
+  expect(h.prisma.devicePushToken.updateMany).toHaveBeenCalledWith({
+    where: {
+      userID: 'u1',
+      disabledAt: null,
+      OR: [{ deviceKey: { not: 'current' } }, { deviceKey: null }],
+    },
+    data: { disabledAt: expect.any(Date) },
+  });
 });
