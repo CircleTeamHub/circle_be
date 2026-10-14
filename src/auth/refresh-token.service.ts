@@ -580,18 +580,19 @@ export class RefreshTokenService {
 
   /**
    * 功能上线前签发、还没绑定设备的 APP 会话：把整条 token 家族绑到这台设备上。
-   * 只认 deviceKey 为空的会话（已绑定的永不改绑），返回是否真的绑上了。
+   * 只认 deviceKey 为空的会话（已绑定的永不改绑）。绑上了返回会话记录的设备名
+   * （补记信任时用），没绑上返回 null。
    */
   async bindLegacySessionDevice(
     userId: string,
     sessionId: string,
     deviceKey: string,
-  ): Promise<boolean> {
+  ): Promise<{ deviceName: string | null } | null> {
     const session = await this.prisma.refreshToken.findFirst({
       where: { id: sessionId, userId, audience: 'APP' },
-      select: { familyId: true, deviceKey: true },
+      select: { familyId: true, deviceKey: true, deviceName: true },
     });
-    if (!session || session.deviceKey) return false;
+    if (!session || session.deviceKey) return null;
     const bound = await this.prisma.refreshToken.updateMany({
       where: {
         userId,
@@ -602,7 +603,7 @@ export class RefreshTokenService {
       },
       data: { deviceKey },
     });
-    return bound.count > 0;
+    return bound.count > 0 ? { deviceName: session.deviceName } : null;
   }
 
   async revokeSession(userId: string, sessionId: string): Promise<void> {

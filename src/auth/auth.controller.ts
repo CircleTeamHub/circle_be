@@ -105,7 +105,11 @@ export class AuthController {
       headerKey,
     );
     if (claimed) {
-      await this.deviceTrust.trustOnRefresh(userId, headerKey, context);
+      // 这类请求不带设备名头：沿用登录时记在会话上的设备名。
+      await this.deviceTrust.trustOnRefresh(userId, headerKey, {
+        ...context,
+        deviceName: context.deviceName ?? claimed.deviceName,
+      });
     }
     return headerKey;
   }
