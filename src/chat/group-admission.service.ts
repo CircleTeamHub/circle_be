@@ -60,6 +60,12 @@ export class GroupAdmissionService {
         message: '群聊不存在或已解散',
         errorCode: 'CHAT_CONVERSATION_NOT_FOUND',
       });
+    const owner = await this.member(tx, id, g.ownerID);
+    if (!owner || owner.leftAt)
+      throw new NotFoundException({
+        message: '群聊不存在或已解散',
+        errorCode: 'CHAT_CONVERSATION_NOT_FOUND',
+      });
     return g;
   }
   private async member(tx: Tx, id: string, user: string) {

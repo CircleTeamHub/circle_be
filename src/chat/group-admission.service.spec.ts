@@ -585,3 +585,10 @@ describe('Group admission durable delivery', () => {
     expect(h.tx.chatMember.upsert).toHaveBeenCalledTimes(1);
   });
 });
+
+test('cannot apply after the final owner has left the group', async () => {
+  const h = harness();
+  h.seats.get('owner').leftAt = new Date();
+  await expect(h.service.apply('guest', 'g', '')).rejects.toThrow();
+  expect(h.admissions.size).toBe(0);
+});
