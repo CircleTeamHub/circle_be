@@ -238,8 +238,11 @@ export class NotificationPushService {
   }
 
   /** Security alerts go only to bound, trusted devices with an active app session. */
-  async listLoginAlertTokens(userId: string): Promise<PushTokenTarget[]> {
-    return this.prisma.$queryRaw<PushTokenTarget[]>`
+  async listLoginAlertTokens(
+    userId: string,
+    client: Prisma.TransactionClient = this.prisma,
+  ): Promise<PushTokenTarget[]> {
+    return client.$queryRaw<PushTokenTarget[]>`
       SELECT "token", "projectId", "provider", "platform" FROM (
         SELECT p."token", p."projectId", p."provider", p."platform",
           row_number() OVER (PARTITION BY p."provider" ORDER BY p."updatedAt" DESC, p."id" DESC) AS rank

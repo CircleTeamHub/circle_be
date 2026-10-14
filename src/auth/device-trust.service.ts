@@ -585,13 +585,15 @@ export class DeviceTrustService {
 
   async revokeDevice(userId: string, deviceKey: string | null): Promise<void> {
     if (!deviceKey) return;
-    await this.prisma.trustedDevice.updateMany({
-      where: { userId, deviceKey, revokedAt: null },
-      data: { revokedAt: new Date() },
-    });
-    await this.prisma.devicePushToken.updateMany({
-      where: { userID: userId, deviceKey, disabledAt: null },
-      data: { disabledAt: new Date() },
+    await this.prisma.$transaction(async (tx) => {
+      await tx.trustedDevice.updateMany({
+        where: { userId, deviceKey, revokedAt: null },
+        data: { revokedAt: new Date() },
+      });
+      await tx.devicePushToken.updateMany({
+        where: { userID: userId, deviceKey, disabledAt: null },
+        data: { disabledAt: new Date() },
+      });
     });
   }
 
@@ -600,23 +602,30 @@ export class DeviceTrustService {
     userId: string,
     keepDeviceKey: string | null,
   ): Promise<void> {
-    await this.prisma.trustedDevice.updateMany({
-      where: {
-        userId,
-        revokedAt: null,
-        ...(keepDeviceKey ? { deviceKey: { not: keepDeviceKey } } : {}),
-      },
-      data: { revokedAt: new Date() },
-    });
-    await this.prisma.devicePushToken.updateMany({
-      where: {
-        userID: userId,
-        disabledAt: null,
-        ...(keepDeviceKey
-          ? { OR: [{ deviceKey: { not: keepDeviceKey } }, { deviceKey: null }] }
-          : {}),
-      },
-      data: { disabledAt: new Date() },
+    await this.prisma.$transaction(async (tx) => {
+      await tx.trustedDevice.updateMany({
+        where: {
+          userId,
+          revokedAt: null,
+          ...(keepDeviceKey ? { deviceKey: { not: keepDeviceKey } } : {}),
+        },
+        data: { revokedAt: new Date() },
+      });
+      await tx.devicePushToken.updateMany({
+        where: {
+          userID: userId,
+          disabledAt: null,
+          ...(keepDeviceKey
+            ? {
+                OR: [
+                  { deviceKey: { not: keepDeviceKey } },
+                  { deviceKey: null },
+                ],
+              }
+            : {}),
+        },
+        data: { disabledAt: new Date() },
+      });
     });
   }
 
@@ -1006,7 +1015,7 @@ export class DeviceTrustService {
         this.prisma.$transaction(
           async (tx) => {
             await tx.$executeRaw`SELECT pg_advisory_xact_lock(hashtextextended(${`auth_session:${userId}`}, 0))`;
-            const tokens = await this.push!.listLoginAlertTokens(userId);
+            const tokens = await this.push!.listLoginAlertTokens(userId, tx);
             if (tokens.length === 0) return;
             await this.push!.sendToTokens(tokens, {
               ...payload,

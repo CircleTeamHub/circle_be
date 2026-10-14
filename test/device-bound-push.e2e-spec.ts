@@ -192,4 +192,135 @@ describe('Device-bound security push e2e', () => {
       h.sent.mock.calls.flatMap(([tokens]) => tokens.map((t) => t.token)),
     ).toEqual(['ExponentPushToken[current]']);
   });
+  it('application shutdown does not strand a background login-alert transaction', async () => {
+    const h = await fixture();
+    const privateDb = new PrismaService();
+    await privateDb.$connect();
+    const alerts = new NotificationPushService(
+      privateDb,
+      h.app.get(ConfigService),
+    );
+    jest.spyOn(alerts, 'sendToTokens').mockResolvedValue([]);
+    let entered!: () => void;
+    let resume!: () => void;
+    const ready = new Promise<void>((resolve) => {
+      entered = resolve;
+    });
+    const barrier = new Promise<void>((resolve) => {
+      resume = resolve;
+    });
+    const select = alerts.listLoginAlertTokens.bind(alerts);
+    jest
+      .spyOn(alerts, 'listLoginAlertTokens')
+      .mockImplementation(async (user, tx) => {
+        entered();
+        await barrier;
+        return select(user, tx);
+      });
+    const trust = new DeviceTrustService(
+      privateDb,
+      { broadcast() {} } as any,
+      alerts,
+    );
+    const dispatch = (trust as any).pushToUser(h.userId, {
+      title: 'test',
+      body: 'test',
+      data: { type: 'auth.login.challenge.created' },
+    });
+    await ready;
+    const shutdown = privateDb.onModuleDestroy();
+    await Promise.resolve();
+    resume();
+    await Promise.all([dispatch, shutdown]);
+  });
+  it('expired registration sessions are rejected consistently before and after cleanup', async () => {
+    const h = await fixture();
+    const service = h.app.get(NotificationService);
+    const dto = {
+      token: 'ExponentPushToken[expired]',
+      provider: 'expo',
+      platform: 'ios',
+    } as const;
+    await expect(
+      service.registerPushToken(h.userId, dto, h.sessions.expired),
+    ).rejects.toMatchObject({ status: 403 });
+    await h.db.refreshToken.delete({ where: { id: h.sessions.expired } });
+    await expect(
+      service.registerPushToken(h.userId, dto, h.sessions.expired),
+    ).rejects.toMatchObject({ status: 403 });
+  });
+  it('a token-disable failure rolls back both single-device and other-device trust revocation', async () => {
+    const h = await fixture();
+    const fail = {
+      updateMany: async () => {
+        throw new Error('token-disable failure');
+      },
+    };
+    const failingDb = {
+      trustedDevice: h.db.trustedDevice,
+      devicePushToken: fail,
+      $transaction: (operation: any) =>
+        h.db.$transaction((tx) =>
+          operation({ trustedDevice: tx.trustedDevice, devicePushToken: fail }),
+        ),
+    };
+    const trust = new DeviceTrustService(
+      failingDb as any,
+      { broadcast() {} } as any,
+    );
+    await expect(trust.revokeDevice(h.userId, 'removed')).rejects.toThrow(
+      'token-disable failure',
+    );
+    expect(
+      (
+        await h.db.trustedDevice.findUnique({
+          where: {
+            userId_deviceKey: { userId: h.userId, deviceKey: 'removed' },
+          },
+        })
+      )?.revokedAt,
+    ).toBeNull();
+    await expect(trust.revokeOtherDevices(h.userId, 'current')).rejects.toThrow(
+      'token-disable failure',
+    );
+    expect(
+      (
+        await h.db.trustedDevice.findUnique({
+          where: {
+            userId_deviceKey: { userId: h.userId, deviceKey: 'removed' },
+          },
+        })
+      )?.revokedAt,
+    ).toBeNull();
+  });
+  it('a rotated session binds only while its same-device token family remains active', async () => {
+    const h = await fixture();
+    const current = await h.db.refreshToken.findUniqueOrThrow({
+      where: { id: h.sessions.current },
+    });
+    const rotated = await h.db.refreshToken.create({
+      data: {
+        userId: h.userId,
+        token: randomUUID(),
+        familyId: current.familyId,
+        deviceKey: 'current',
+        expiredAt: new Date(Date.now() + 60000),
+        revokedAt: new Date(),
+        revocationReason: 'ROTATED',
+      },
+    });
+    const service = h.app.get(NotificationService);
+    const dto = {
+      token: 'ExponentPushToken[current]',
+      platform: 'ios',
+      provider: 'expo',
+    } as const;
+    await expect(
+      service.registerPushToken(h.userId, dto, rotated.id),
+    ).resolves.toEqual({ deviceBound: true });
+    await h.db.refreshToken.delete({ where: { id: current.id } });
+    await expect(
+      service.registerPushToken(h.userId, dto, rotated.id),
+    ).rejects.toMatchObject({ status: 403 });
+  });
 });

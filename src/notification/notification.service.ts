@@ -164,12 +164,30 @@ export class NotificationService {
               !session ||
               session.userId !== userId ||
               session.audience !== 'APP' ||
+              session.expiredAt <= new Date() ||
               (session.revokedAt && session.revocationReason !== 'ROTATED')
             ) {
               throw new ForbiddenException({
                 message: '登录会话已失效',
                 errorCode: 'AUTH_DEVICE_NOT_TRUSTED',
               });
+            }
+            if (session.revokedAt && session.revocationReason === 'ROTATED') {
+              const live = await this.prisma.refreshToken.findFirst({
+                where: {
+                  userId,
+                  familyId: session.familyId,
+                  deviceKey: session.deviceKey,
+                  audience: 'APP',
+                  revokedAt: null,
+                  expiredAt: { gt: new Date() },
+                },
+              });
+              if (!live)
+                throw new ForbiddenException({
+                  message: '登录会话已失效',
+                  errorCode: 'AUTH_DEVICE_NOT_TRUSTED',
+                });
             }
             deviceKey = session.deviceKey;
             if (deviceKey) {

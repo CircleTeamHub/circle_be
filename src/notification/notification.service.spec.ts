@@ -22,7 +22,7 @@ describe('NotificationService', () => {
 
   const prisma = {
     $executeRaw: jest.fn(),
-    refreshToken: { findUnique: jest.fn() },
+    refreshToken: { findUnique: jest.fn(), findFirst: jest.fn() },
     trustedDevice: { findUnique: jest.fn() },
     user: {
       findMany: jest.fn(),
@@ -848,7 +848,7 @@ describe('NotificationService', () => {
         }),
       );
     });
-    it.each(['revoked', 'foreign', 'admin', 'missing', 'untrusted'])(
+    it.each(['revoked', 'foreign', 'admin', 'missing', 'untrusted', 'expired'])(
       'rejects an ineligible registration session: %s',
       async (kind) => {
         prisma.refreshToken.findUnique.mockResolvedValue(
@@ -858,6 +858,9 @@ describe('NotificationService', () => {
                 userId: kind === 'foreign' ? 'other' : 'user-1',
                 audience: kind === 'admin' ? 'ADMIN' : 'APP',
                 deviceKey: 'key',
+                expiredAt: new Date(
+                  Date.now() + (kind === 'expired' ? -60000 : 60000),
+                ),
                 revokedAt: kind === 'revoked' ? new Date() : null,
               },
         );

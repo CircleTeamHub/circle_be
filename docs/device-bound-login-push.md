@@ -5,3 +5,5 @@ Deploy backend migration `20261014140000_device_bound_push` before the updated c
 Registration returns `deviceBound`. The client upgrades cached registrations once acknowledged; old-server responses do not permanently suppress the upgrade. Revoking a device disables its addresses. Login-challenge and device-added alerts require both live device trust and an active app session, and share the account authentication lock with registration and remote removal.
 
 `test/device-bound-push.e2e-spec.ts` runs in the normal fresh-database CI harness. It covers the HTTP session binding, legacy/expired exclusions, remote removal, re-registration denial and a concurrent removal/push/registration barrier.
+
+Revoking trust and disabling addresses commit atomically. Expired session rows cannot register addresses; a rotated row additionally requires a live same-device session in its token family. Eligibility reads reuse the account-lock transaction connection during application shutdown.
