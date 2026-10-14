@@ -159,6 +159,78 @@ describe('CircleInvitationService', () => {
     service = module.get(CircleInvitationService);
   });
 
+  it('does not deliver any batch consent card when a later invite fails', async () => {
+    const invite = jest
+      .spyOn(service, 'invite')
+      .mockResolvedValueOnce({ id: 'first' } as any)
+      .mockRejectedValueOnce(new ForbiddenException());
+    const deliver = jest
+      .spyOn(service as any, 'deliverConsentInvitation')
+      .mockResolvedValue(undefined);
+    await expect(
+      service.inviteBatch('inviter', ['a', 'b'], 'circle'),
+    ).rejects.toThrow(ForbiddenException);
+    expect(prisma.$transaction).toHaveBeenCalledTimes(1);
+    expect(invite).toHaveBeenNthCalledWith(
+      1,
+      'inviter',
+      'a',
+      'circle',
+      undefined,
+      prisma,
+    );
+    expect(invite).toHaveBeenNthCalledWith(
+      2,
+      'inviter',
+      'b',
+      'circle',
+      undefined,
+      prisma,
+    );
+    expect(deliver).not.toHaveBeenCalled();
+    invite.mockRestore();
+    deliver.mockRestore();
+  });
+
+  it('does not send consent cards for an existing self-initiated application', async () => {
+    prisma.circleInvitation.findUnique.mockResolvedValue({
+      id: 'self-application',
+      consentNoticeRequired: false,
+      consentNoticeDeliveredAt: null,
+    });
+    await (service as any).deliverConsentInvitation('self-application');
+    expect(
+      notificationService.createCircleInvitationNotification,
+    ).not.toHaveBeenCalled();
+    expect(chatMessages.insertServerMessage).not.toHaveBeenCalled();
+  });
+
+  it('stops selecting consent deliveries after the final failed attempt', async () => {
+    let attempts = 7;
+    prisma.circleInvitation.findMany.mockImplementation(async ({ where }) =>
+      attempts < where.consentNoticeAttempts.lt
+        ? [{ id: 'failed', consentNoticeAttempts: attempts }]
+        : [],
+    );
+    prisma.circleInvitation.update.mockImplementation(async () => {
+      attempts++;
+      return {};
+    });
+    const deliver = jest
+      .spyOn(service as any, 'deliverConsentInvitation')
+      .mockRejectedValue(new Error('permanent failure'));
+    await service.deliverPendingConsentInvitations();
+    await service.deliverPendingConsentInvitations();
+    expect(attempts).toBe(8);
+    expect(deliver).toHaveBeenCalledTimes(1);
+    expect(prisma.circleInvitation.findMany).toHaveBeenCalledWith(
+      expect.objectContaining({
+        where: expect.objectContaining({ consentNoticeAttempts: { lt: 8 } }),
+      }),
+    );
+    deliver.mockRestore();
+  });
+
   it('rejects invitation detail access for unrelated users', async () => {
     prisma.circleInvitation.findUnique.mockResolvedValue({
       id: 'inv-1',

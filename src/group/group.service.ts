@@ -413,8 +413,7 @@ export class GroupService {
       (userID) => userID !== actorId,
     );
 
-    for (const applicantID of targetUserIDs)
-      await this.circleInvitations.invite(actorId, applicantID, circle.id);
+    await this.circleInvitations.inviteBatch(actorId, targetUserIDs, circle.id);
     return { handled: true };
   }
 

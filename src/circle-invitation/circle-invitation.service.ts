@@ -1,3 +1,4 @@
+import { businessMetrics } from 'src/metrics/business-metrics';
 import {
   BadRequestException,
   ConflictException,
@@ -187,7 +188,11 @@ export class CircleInvitationService {
 
   private async deliverConsentInvitation(id: string) {
     const invitation = await this.loadInvitation(id);
-    if (invitation.consentNoticeDeliveredAt) return;
+    if (
+      !invitation.consentNoticeRequired ||
+      invitation.consentNoticeDeliveredAt
+    )
+      return;
     await this.notificationService.deliverCircleConsentNotification({
       id,
       toUserID: invitation.applicantID,
@@ -217,10 +222,14 @@ export class CircleInvitationService {
   )
   async deliverPendingConsentInvitations() {
     const rows = await this.prisma.circleInvitation.findMany({
-      where: { consentNoticeDeliveredAt: null, consentNoticeRequired: true },
+      where: {
+        consentNoticeDeliveredAt: null,
+        consentNoticeRequired: true,
+        consentNoticeAttempts: { lt: 8 },
+      },
       orderBy: [{ consentNoticeAttempts: 'asc' }, { createdAt: 'asc' }],
       take: 50,
-      select: { id: true },
+      select: { id: true, consentNoticeAttempts: true },
     });
     for (const row of rows) {
       try {
@@ -230,11 +239,38 @@ export class CircleInvitationService {
           where: { id: row.id },
           data: { consentNoticeAttempts: { increment: 1 } },
         });
-        this.logger.warn(
-          'circle consent invitation delivery failed; retry scheduled',
-        );
+        const terminal = row.consentNoticeAttempts + 1 >= 8;
+        if (terminal)
+          businessMetrics.recordEvent(
+            'circle_consent_delivery_exhausted',
+            'failure',
+          );
+        this.logger.warn({
+          event: 'circle_consent_delivery_failed',
+          terminal,
+          retryScheduled: !terminal,
+        });
       }
     }
+  }
+
+  async inviteBatch(
+    inviterId: string,
+    applicantIds: string[],
+    circleId: string,
+  ): Promise<void> {
+    const invitations = await this.runInvitationTransaction(async (tx) => {
+      const rows: InvitationDto[] = [];
+      for (const applicantId of [...new Set(applicantIds)].sort())
+        rows.push(
+          await this.invite(inviterId, applicantId, circleId, undefined, tx),
+        );
+      return rows;
+    });
+    for (const row of invitations)
+      await this.deliverConsentInvitation(row.id).catch(() =>
+        this.logger.warn('circle consent invitation queued for retry'),
+      );
   }
 
   async invite(
@@ -252,6 +288,7 @@ export class CircleInvitationService {
       /** 圈子二维码加入：在共享策略锁内复核会话的二维码门禁。 */
       requireQrJoinEnabled?: boolean;
     },
+    transaction?: Prisma.TransactionClient,
   ): Promise<InvitationDto> {
     if (!opts?.applicantConsented) {
       // Pass real friendship status: a FRIENDS_ONLY invite permission must let
@@ -272,7 +309,7 @@ export class CircleInvitationService {
     }
 
     // 6. Create invitation; the inviter takes the first seat only if they may vouch
-    const invitation = await this.runInvitationTransaction(async (tx) => {
+    const operation = async (tx: Prisma.TransactionClient) => {
       // CircleInvitation has no DB-level unique constraint, so serialize
       // concurrent invites for the same (circle, applicant) pair with a
       // transaction-scoped advisory lock, then re-check inside the lock.
@@ -391,7 +428,11 @@ export class CircleInvitationService {
         existingInvitation &&
         (!opts?.applicantConsented || existingInvitation.status === 'PENDING')
       ) {
-        return { created: existingInvitation, admission: null };
+        return {
+          created: existingInvitation,
+          admission: null,
+          requiresConsent: Boolean(existingInvitation.consentNoticeRequired),
+        };
       }
       // 宣传期严格形态:关掉成员邀请后,只有圈主/管理员还能拉人 ——
       // requiredVerifierCount=1 时成员邀请等于「谁都能瞬间塞人进圈」,这道闸
@@ -543,8 +584,13 @@ export class CircleInvitationService {
         }
       }
 
-      return { created, admission };
-    });
+      return { created, admission, requiresConsent: !opts?.applicantConsented };
+    };
+    const invitation = transaction
+      ? await operation(transaction)
+      : await this.runInvitationTransaction(operation);
+    if (transaction)
+      return this.fetchInvitationDto(invitation.created.id, transaction);
 
     if (invitation.admission) {
       this.syncCircleSeatsSoon(invitation.admission.circleID);
@@ -563,7 +609,7 @@ export class CircleInvitationService {
       });
     }
 
-    if (!opts?.applicantConsented)
+    if (invitation.requiresConsent)
       await this.deliverConsentInvitation(invitation.created.id).catch(() =>
         this.logger.warn('circle consent invitation queued for retry'),
       );
@@ -1523,6 +1569,7 @@ export class CircleInvitationService {
 
   private async fetchInvitationDto(
     invitationId: string,
+    client: Prisma.TransactionClient = this.prisma,
   ): Promise<InvitationDto> {
     const inv = await this.loadInvitation(invitationId);
     return this.toInvitationDto(inv);
@@ -1687,16 +1734,18 @@ export class CircleInvitationService {
       requiredCount: inv.requiredCount,
       approvedCount: inv.approvedCount,
       status: inv.status,
-      verifiers: inv.verifiers.map((v): InvitationVerifierDto => ({
-        id: v.id,
-        verifier: {
-          id: v.verifier.id,
-          nickname: v.verifier.nickname,
-          avatarUrl: v.verifier.avatarUrl,
-          accountId: v.verifier.accountId,
-        },
-        status: v.status,
-      })),
+      verifiers: inv.verifiers.map(
+        (v): InvitationVerifierDto => ({
+          id: v.id,
+          verifier: {
+            id: v.verifier.id,
+            nickname: v.verifier.nickname,
+            avatarUrl: v.verifier.avatarUrl,
+            accountId: v.verifier.accountId,
+          },
+          status: v.status,
+        }),
+      ),
       createdAt: inv.createdAt.toISOString(),
     };
   }

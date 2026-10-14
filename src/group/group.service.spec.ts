@@ -63,6 +63,7 @@ describe('GroupService reportGroup', () => {
   };
   let service: GroupService;
   const circleInvitations = {
+    inviteBatch: jest.fn().mockResolvedValue(undefined),
     invite: jest.fn().mockResolvedValue({ id: 'i' }),
   };
   // 举报证据的本站存储前缀:path-style 默认桶 circle → http://10.0.0.195:9000/circle
@@ -526,10 +527,10 @@ describe('GroupService reportGroup', () => {
         userIDs: ['guest', 'guest', 'owner-1'],
       }),
     ).resolves.toEqual({ handled: true });
-    expect(circleInvitations.invite).toHaveBeenCalledTimes(1);
-    expect(circleInvitations.invite).toHaveBeenCalledWith(
+    expect(circleInvitations.inviteBatch).toHaveBeenCalledTimes(1);
+    expect(circleInvitations.inviteBatch).toHaveBeenCalledWith(
       'owner-1',
-      'guest',
+      ['guest'],
       'circle-1',
     );
     expect(admissionPolicy.activateMembers).not.toHaveBeenCalled();
@@ -540,7 +541,7 @@ describe('GroupService reportGroup', () => {
       id: 'circle-1',
       groupID: 'group-1',
     });
-    circleInvitations.invite.mockRejectedValueOnce(
+    circleInvitations.inviteBatch.mockRejectedValueOnce(
       new ForbiddenException('not allowed'),
     );
     await expect(

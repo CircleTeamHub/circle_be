@@ -1,3 +1,4 @@
+import { businessMetrics } from 'src/metrics/business-metrics';
 import {
   BadRequestException,
   ConflictException,
@@ -812,7 +813,11 @@ export class GroupAdmissionService {
     this.delivering = true;
     try {
       const jobs = await this.prisma.groupAdmissionDelivery.findMany({
-        where: { deliveredAt: null, nextAttemptAt: { lte: new Date() } },
+        where: {
+          deliveredAt: null,
+          attempts: { lt: 8 },
+          nextAttemptAt: { lte: new Date() },
+        },
         orderBy: { createdAt: 'asc' },
         take: 50,
         include: { admission: true },
@@ -908,11 +913,18 @@ export class GroupAdmissionService {
             data: { deliveredAt: new Date() },
           });
         } catch {
+          const terminal = job.attempts + 1 >= 8;
+          if (terminal)
+            businessMetrics.recordEvent(
+              'group_admission_delivery_exhausted',
+              'failure',
+            );
           this.logger.warn({
             event: 'group_admission_delivery_failed',
+            terminal,
             deliveryId: job.id,
             attempt: job.attempts + 1,
-            retryScheduled: true,
+            retryScheduled: !terminal,
           });
           await this.prisma.groupAdmissionDelivery.update({
             where: { id: job.id },

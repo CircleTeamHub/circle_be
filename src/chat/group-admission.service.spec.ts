@@ -459,6 +459,35 @@ describe('Group admission consent and authorization', () => {
 });
 
 describe('Group admission durable delivery', () => {
+  it('stops selecting a permanently failed card at the retry limit', async () => {
+    const h = harness();
+    await h.service.invite('owner', 'g', ['guest']);
+    const job = {
+      id: 'failed',
+      admission: h.admissions.get('a0'),
+      recipientID: 'guest',
+      actorID: 'owner',
+      event: 'INVITED',
+      attempts: 7,
+    };
+    h.tx.groupAdmissionDelivery.findMany.mockImplementation(
+      async ({ where }: any) => (job.attempts < where.attempts.lt ? [job] : []),
+    );
+    h.tx.groupAdmissionDelivery.update.mockImplementation(
+      async ({ data }: any) => {
+        if (data.attempts) job.attempts += data.attempts.increment;
+        return job;
+      },
+    );
+    h.messages.insertServerMessage.mockRejectedValue(
+      new Error('permanent failure'),
+    );
+    await h.service.flush();
+    await h.service.flush();
+    expect(job.attempts).toBe(8);
+    expect(h.messages.insertServerMessage).toHaveBeenCalledTimes(1);
+  });
+
   it('notification delivery survives a failed card and retries with stable deduplication keys', async () => {
     const h = harness();
     await h.service.invite('owner', 'g', ['guest']);
