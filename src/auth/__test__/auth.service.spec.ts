@@ -95,6 +95,10 @@ describe('AuthService', () => {
     revokeDevice: jest.fn(() => Promise.resolve()),
     revokeOtherDevices: jest.fn(() => Promise.resolve()),
     registerSecurityCodeFailure: jest.fn(() => Promise.resolve()),
+    invalidateChallenges: jest.fn(() => Promise.resolve()),
+    assertSecurityCodeFallbackBudget: jest.fn(() => Promise.resolve()),
+    loadForSecurityCode: jest.fn(),
+    consumeAfterSecurityCode: jest.fn(() => Promise.resolve()),
     consumeWithCode: jest.fn(),
     completeVerifiedLogin: jest.fn(() => Promise.resolve()),
   };
@@ -924,6 +928,7 @@ describe('AuthService', () => {
     await service.logoutAll('uuid-1', 'session-1');
 
     expect(mockRefreshTokenService.revokeAll).toHaveBeenCalledWith('uuid-1');
+    expect(mockDeviceTrust.invalidateChallenges).toHaveBeenCalledWith('uuid-1');
     expect(mockDeviceTrust.revokeOtherDevices).toHaveBeenCalledWith(
       'uuid-1',
       'device-key-of-session-1',
@@ -960,6 +965,62 @@ describe('AuthService', () => {
       'uuid-1',
       'device-key-of-session-1',
     );
+    expect(mockDeviceTrust.invalidateChallenges).toHaveBeenCalledWith('uuid-1');
+  });
+
+  it('removing an older session of the current device keeps this device signed in and trusted', async () => {
+    mockRefreshTokenService.findSessionDeviceKey.mockResolvedValue(
+      'same-phone' as never,
+    );
+
+    await service.logoutSession('uuid-1', 'old-session', 'current-session');
+
+    expect(mockRefreshTokenService.revokeSession).toHaveBeenCalledWith(
+      'uuid-1',
+      'old-session',
+    );
+    expect(mockRefreshTokenService.revokeDeviceSessions).not.toHaveBeenCalled();
+    expect(mockDeviceTrust.revokeDevice).not.toHaveBeenCalled();
+    mockRefreshTokenService.findSessionDeviceKey.mockImplementation(
+      (_userId: string, sessionId: string) =>
+        Promise.resolve(`device-key-of-${sessionId}`),
+    );
+  });
+
+  it('a wrong security code on the challenge path never touches the app-lock counters', async () => {
+    const securityCodeHash = await argon2.hash('2468');
+    users.push({
+      id: 'uuid-sc',
+      accountId: 'sc1',
+      email: 'sc@example.com',
+      passwordHash: 'x',
+      status: 'ACTIVE',
+      role: 'USER',
+      loginSecurityCodeHash: securityCodeHash,
+      securityCodeAttempts: 0,
+      securityCodeLockedUntil: null,
+    });
+    mockDeviceTrust.loadForSecurityCode.mockResolvedValueOnce({
+      id: 'challenge-sc',
+      userId: 'uuid-sc',
+      deviceKey: 'new-device',
+    } as never);
+    mockPrisma.user.update.mockClear();
+
+    await expect(
+      service.verifyLoginChallengeSecurityCode('challenge-sc', '1357', {
+        deviceKey: 'new-device',
+      }),
+    ).rejects.toThrow(ForbiddenException);
+
+    expect(
+      mockDeviceTrust.assertSecurityCodeFallbackBudget,
+    ).toHaveBeenCalledWith('uuid-sc');
+    expect(mockDeviceTrust.registerSecurityCodeFailure).toHaveBeenCalledWith(
+      'challenge-sc',
+    );
+    // 应用锁的计数与锁定只属于已登录的本人设备，这条无登录态的路径不能动它。
+    expect(mockPrisma.user.update).not.toHaveBeenCalled();
   });
 
   it('keeps device trust when the current session has no bound device', async () => {
@@ -1396,11 +1457,12 @@ describe('AuthService', () => {
       }),
     );
     expect(mockRefreshTokenService.revokeAll).toHaveBeenCalledWith('uuid-1');
-    // 改密 = 怀疑泄露：只保留发起改密的这台设备的信任。
+    // 改密 = 怀疑泄露：只保留发起改密的这台设备的信任，进行中的验证单作废。
     expect(mockDeviceTrust.revokeOtherDevices).toHaveBeenCalledWith(
       'uuid-1',
       'device-key-of-session-1',
     );
+    expect(mockDeviceTrust.invalidateChallenges).toHaveBeenCalledWith('uuid-1');
   });
 
   it('password reset by email revokes all device trust (lost-device recovery)', async () => {
@@ -1438,6 +1500,9 @@ describe('AuthService', () => {
     expect(mockDeviceTrust.revokeOtherDevices).toHaveBeenCalledWith(
       'uuid-reset',
       null,
+    );
+    expect(mockDeviceTrust.invalidateChallenges).toHaveBeenCalledWith(
+      'uuid-reset',
     );
   });
 

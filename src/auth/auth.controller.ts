@@ -1,5 +1,6 @@
 import {
   Body,
+  ConflictException,
   Controller,
   Delete,
   Get,
@@ -12,7 +13,6 @@ import {
   UseGuards,
 } from '@nestjs/common';
 import { Request } from 'express';
-import * as requestIp from 'request-ip';
 import { Throttle, ThrottlerGuard } from '@nestjs/throttler';
 import {
   ApiBearerAuth,
@@ -26,6 +26,7 @@ import {
   ApiUnauthorizedResponse,
 } from '@nestjs/swagger';
 import { JwtGuard } from 'src/guards/jwt.guard';
+import { AuthErrorCode } from 'src/common/app-error-codes';
 import { AuthService } from './auth.service';
 import { AuthSessionDto } from './dto/auth-session.dto';
 import { AuthTokensDto } from './dto/auth-tokens.dto';
@@ -65,7 +66,10 @@ function getSessionContext(req?: Request): SessionContext {
 
   return {
     deviceName: getHeaderValue(req.headers['x-device-name']),
-    ip: requestIp.getClientIp(req) ?? req.ip ?? null,
+    // 用 Express 的 req.ip（setup.ts 里 trust proxy = 1，取的是反代填的那一跳）。
+    // request-ip 会优先信任客户端自带的 X-Client-IP 等头，可伪造——这个 IP 用于
+    // 按来源限流陌生设备验证、并展示在受信任设备的批准弹窗里。
+    ip: req.ip ?? null,
     userAgent: getHeaderValue(req.headers['user-agent']),
     // 客户端安全存储里的随机设备 ID，只以哈希形式进入服务端。
     deviceKey: hashDeviceId(getHeaderValue(req.headers['x-device-id'])),
@@ -82,13 +86,12 @@ export class AuthController {
   ) {}
 
   /**
-   * 批准方的设备：认会话绑定的设备（不可伪造）。
+   * 批准方的设备：只认会话绑定的设备（不可伪造）。
    *
-   * 功能上线前签发的老会话还没绑定设备，原先要等下一次续签（最长一个 access
-   * token 周期）才补记信任 —— 这期间新设备发起验证，账号下没有任何设备能批准。
-   * 所以老会话第一次来这里时，就把请求头里的设备 ID 绑到会话上并记为受信任：
-   * 能拿到这条会话 access token 的就是本人设备，与续签补记同一个前提。
-   * 新登录的会话建立时就已绑定，不会走到这条分支。
+   * 功能上线前签发的老会话还没绑定设备。这里不能凭 access token 把请求头里的
+   * 设备 ID 绑上去——偷到一枚短期 access token 就能换来永久信任，还会把本人的
+   * 会话族绑到别人的设备上。改为返回 AUTH_SESSION_DEVICE_UNBOUND：客户端用
+   * refresh token 续签一次（续签时绑定设备并补记信任），再重试。
    */
   private async approverDeviceKey(req: RequestWithUser) {
     const { userId, sessionId } = req.user;
@@ -96,22 +99,13 @@ export class AuthController {
       ? await this.refreshTokens.findSessionDeviceKey(userId, sessionId)
       : null;
     if (bound) return bound;
-    const context = getSessionContext(req);
-    const headerKey = context.deviceKey ?? null;
-    if (!headerKey || !sessionId) return headerKey;
-    const claimed = await this.refreshTokens.bindLegacySessionDevice(
-      userId,
-      sessionId,
-      headerKey,
-    );
-    if (claimed) {
-      // 这类请求不带设备名头：沿用登录时记在会话上的设备名。
-      await this.deviceTrust.trustOnRefresh(userId, headerKey, {
-        ...context,
-        deviceName: context.deviceName ?? claimed.deviceName,
+    if (getSessionContext(req).deviceKey) {
+      throw new ConflictException({
+        message: '登录状态需要更新，请稍后重试',
+        errorCode: AuthErrorCode.SessionDeviceUnbound,
       });
     }
-    return headerKey;
+    return null;
   }
 
   @Post('register')
@@ -362,7 +356,11 @@ export class AuthController {
     @Param('sessionId', ParseUUIDPipe) sessionId: string,
     @Req() req: RequestWithUser,
   ) {
-    return this.authService.logoutSession(req.user.userId, sessionId);
+    return this.authService.logoutSession(
+      req.user.userId,
+      sessionId,
+      req.user.sessionId,
+    );
   }
 
   @Post('logout-others')

@@ -1,3 +1,4 @@
+import { LOGIN_CHALLENGE_RETENTION_MS } from './device-trust.service';
 import { Injectable, Logger } from '@nestjs/common';
 import { CronExpression } from '@nestjs/schedule';
 import {
@@ -103,6 +104,19 @@ export class RefreshTokenCleanup {
       }
       if (count > 0) {
         this.logger.log(`Pruned ${count} expired/revoked refresh tokens`);
+      }
+      // 陌生设备验证单（含来源 IP / UA）只在决定窗口内有用；过了保留期一律清掉。
+      // 每 10 分钟一轮，单轮量很小，不必分批。
+      const challengeCutoff = new Date(
+        now.getTime() - LOGIN_CHALLENGE_RETENTION_MS,
+      );
+      const prunedChallenges = await this.prisma.loginChallenge.deleteMany({
+        where: { createdAt: { lt: challengeCutoff } },
+      });
+      if (prunedChallenges.count > 0) {
+        this.logger.log(
+          `Pruned ${prunedChallenges.count} expired login challenges`,
+        );
       }
       if (capped) {
         this.logger.warn({

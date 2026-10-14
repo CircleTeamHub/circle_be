@@ -1,4 +1,5 @@
 -- 陌生设备登录验证：受信任设备 + 验证请求；会话绑定设备。全部是加性变更。
+-- RefreshToken 是热写表，它的新索引单独放在下一个迁移里 CONCURRENTLY 建。
 
 -- AlterTable
 ALTER TABLE "RefreshToken" ADD COLUMN "deviceKey" TEXT;
@@ -38,9 +39,6 @@ CREATE TABLE "LoginChallenge" (
 
     CONSTRAINT "LoginChallenge_pkey" PRIMARY KEY ("id")
 );
-
--- CreateIndex
-CREATE INDEX "RefreshToken_userId_deviceKey_idx" ON "RefreshToken"("userId", "deviceKey");
 
 -- CreateIndex
 CREATE UNIQUE INDEX "TrustedDevice_userId_deviceKey_key" ON "TrustedDevice"("userId", "deviceKey");

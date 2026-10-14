@@ -28,8 +28,15 @@ export const LOGIN_CHALLENGE_RATE_LIMIT = 5;
 /** 账号级总量（所有来源 IP 合计）。 */
 export const LOGIN_CHALLENGE_ACCOUNT_RATE_LIMIT = 20;
 export const LOGIN_CHALLENGE_RATE_WINDOW_MS = 10 * 60 * 1000;
-/** 超过这个年龄的验证请求在新建时顺手清掉。 */
-const LOGIN_CHALLENGE_RETENTION_MS = 24 * 60 * 60 * 1000;
+/** 超过这个年龄的验证请求在新建时顺手清掉，定时清理也按这个口径。 */
+export const LOGIN_CHALLENGE_RETENTION_MS = 24 * 60 * 60 * 1000;
+/**
+ * 登录安全码兜底的账号级额度：24 小时内该账号所有验证单累计输错（验证码 + 安全码）
+ * 达到这个数，就不再接受安全码，只能等受信任设备批准。安全码可能只有 4 位，
+ * 不能靠「每单 5 次 × 每 10 分钟 20 单」这种上限挡住穷举；也不能复用应用锁的
+ * 错误计数——那样只知道密码的人就能把本人手机的应用锁锁住。
+ */
+export const LOGIN_CHALLENGE_SECURITY_CODE_DAILY_FAILURES = 10;
 
 // 客户端设备 ID：安全存储里的随机串（UUID / base64url）。只收这个字符集，
 // 不合规就当没带 —— 它会被哈希后入库，不做任何拼接。
@@ -144,12 +151,24 @@ export class DeviceTrustService {
         expiresAt: { gt: now },
       },
       orderBy: { createdAt: 'desc' },
-      select: { id: true, expiresAt: true },
+      select: {
+        id: true,
+        userId: true,
+        status: true,
+        deviceName: true,
+        expiresAt: true,
+        codeExpiresAt: true,
+      },
     });
     if (reusable) {
+      await this.reopenIfCodeExpired(reusable, now);
       return {
         kind: 'challenge',
-        challenge: { ...reusable, securityCodeAvailable },
+        challenge: {
+          id: reusable.id,
+          expiresAt: reusable.expiresAt,
+          securityCodeAvailable,
+        },
       };
     }
 
@@ -166,10 +185,13 @@ export class DeviceTrustService {
     deviceKey: string | null,
   ): Promise<LoginChallengeView> {
     const previous = await this.findForDevice(challengeId, deviceKey);
-    const status = this.publicStatus(previous, new Date());
+    const now = new Date();
+    const status = this.publicStatus(previous, now);
     if (status === 'REJECTED') this.throwRejected();
     if (status === 'CONSUMED') this.throwInvalid();
     if (status !== 'EXPIRED') {
+      // 批准过、但 60 秒的码已过期：退回待批准并重新通知，否则要干等到 5 分钟窗口结束。
+      await this.reopenIfCodeExpired(previous, now);
       // 还在窗口里就不新建，直接沿用。
       return {
         id: previous.id,
@@ -609,16 +631,126 @@ export class DeviceTrustService {
     this.logSecurity('login_challenge_created', userId, {
       challengeId: challenge.id,
     });
+    this.notifyTrustedDevices(userId, challenge.id, context.deviceName, now);
+    return challenge;
+  }
+
+  private notifyTrustedDevices(
+    userId: string,
+    challengeId: string,
+    deviceName: string | null | undefined,
+    now: Date,
+  ) {
     this.realtime.broadcast(userId, {
       type: 'auth.login.challenge.created',
-      payload: { challengeId: challenge.id, changedAt: now.toISOString() },
+      payload: { challengeId, changedAt: now.toISOString() },
     });
     void this.pushToUser(userId, {
       title: '陌生设备登录验证',
-      body: `${context.deviceName ?? '一台新设备'} 正在尝试登录你的账号，点击查看并确认是否是你本人。`,
-      data: { type: 'auth.login.challenge', challengeId: challenge.id },
+      body: `${deviceName ?? '一台新设备'} 正在尝试登录你的账号，点击查看并确认是否是你本人。`,
+      data: { type: 'auth.login.challenge', challengeId },
     });
-    return challenge;
+  }
+
+  /**
+   * 批准后验证码已过期、决定窗口还开着：退回「待批准」并重新通知受信任设备。
+   * 条件更新，并发的两次重发只有一次生效。
+   */
+  private async reopenIfCodeExpired(
+    challenge: {
+      id: string;
+      userId: string;
+      status: LoginChallengeStatus;
+      deviceName: string | null;
+      expiresAt: Date;
+      codeExpiresAt: Date | null;
+    },
+    now: Date,
+  ): Promise<void> {
+    if (
+      challenge.status !== LoginChallengeStatus.APPROVED ||
+      !challenge.codeExpiresAt ||
+      challenge.codeExpiresAt > now ||
+      challenge.expiresAt <= now
+    ) {
+      return;
+    }
+    const reopened = await this.prisma.loginChallenge.updateMany({
+      where: {
+        id: challenge.id,
+        status: LoginChallengeStatus.APPROVED,
+        codeExpiresAt: { lte: now },
+        expiresAt: { gt: now },
+      },
+      data: {
+        status: LoginChallengeStatus.PENDING,
+        codeHash: null,
+        codeExpiresAt: null,
+      },
+    });
+    if (reopened.count === 1) {
+      this.logSecurity('login_challenge_reopened', challenge.userId, {
+        challengeId: challenge.id,
+      });
+      this.notifyTrustedDevices(
+        challenge.userId,
+        challenge.id,
+        challenge.deviceName,
+        now,
+      );
+    }
+  }
+
+  /**
+   * 改密 / 找回密码 / 全部退出 / 退出其他设备时调用：作废全部未完成的验证单。
+   * 之前拿到过密码的人手里的验证单就此失效，重发也会被拒（REJECTED）。
+   */
+  async invalidateChallenges(userId: string): Promise<void> {
+    const invalidated = await this.prisma.loginChallenge.updateManyAndReturn({
+      where: {
+        userId,
+        status: {
+          in: [LoginChallengeStatus.PENDING, LoginChallengeStatus.APPROVED],
+        },
+      },
+      data: {
+        status: LoginChallengeStatus.REJECTED,
+        codeHash: null,
+        codeExpiresAt: null,
+        decidedAt: new Date(),
+      },
+      select: { id: true },
+    });
+    for (const { id } of invalidated) {
+      this.broadcastResolved(userId, id, 'REJECTED');
+    }
+    if (invalidated.length > 0) {
+      this.logSecurity('login_challenges_invalidated', userId, {
+        count: invalidated.length,
+      });
+    }
+  }
+
+  /** 安全码兜底的账号级额度，超出即拒绝（只能等受信任设备批准）。 */
+  async assertSecurityCodeFallbackBudget(userId: string): Promise<void> {
+    const since = new Date(Date.now() - LOGIN_CHALLENGE_RETENTION_MS);
+    const failures = await this.prisma.loginChallenge.aggregate({
+      where: { userId, createdAt: { gt: since } },
+      _sum: { attempts: true },
+    });
+    if (
+      (failures._sum.attempts ?? 0) >=
+      LOGIN_CHALLENGE_SECURITY_CODE_DAILY_FAILURES
+    ) {
+      this.logSecurity(
+        'login_challenge_security_code_budget_exhausted',
+        userId,
+        {
+          failures: failures._sum.attempts,
+        },
+      );
+      this.throwLocked();
+    }
   }
 
   private async touch(

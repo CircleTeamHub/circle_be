@@ -12,6 +12,7 @@ import {
   LOGIN_CHALLENGE_MAX_ATTEMPTS,
   LOGIN_CHALLENGE_ACCOUNT_RATE_LIMIT,
   LOGIN_CHALLENGE_RATE_LIMIT,
+  LOGIN_CHALLENGE_SECURITY_CODE_DAILY_FAILURES,
 } from './device-trust.service';
 
 type Trusted = {
@@ -46,6 +47,7 @@ function matches(row: Record<string, unknown>, where: Record<string, any>) {
       if ('in' in cond) return cond.in.includes(value);
       if ('gt' in cond) return (value as any) > cond.gt;
       if ('lt' in cond) return (value as any) < cond.lt;
+      if ('lte' in cond) return (value as any) <= cond.lte;
       if ('not' in cond) return value !== cond.not;
     }
     return value === cond;
@@ -144,6 +146,18 @@ function setup() {
         });
         return { count: rows.length };
       }),
+      updateManyAndReturn: jest.fn(async ({ where, data }) => {
+        const rows = challenges.filter((c) => matches(c as any, where));
+        rows.forEach((r) => Object.assign(r, data));
+        return rows.map((r) => ({ id: r.id }));
+      }),
+      aggregate: jest.fn(async ({ where }) => ({
+        _sum: {
+          attempts: challenges
+            .filter((c) => matches(c as any, where))
+            .reduce((sum, c) => sum + c.attempts, 0),
+        },
+      })),
       deleteMany: jest.fn(async () => ({ count: 0 })),
     },
     user: {
@@ -445,6 +459,72 @@ describe('DeviceTrustService approve / verify', () => {
     const { service, challengeId } = await pending();
     await service.approve('u1', 'phone', challengeId);
     await expect(service.listPending('u1', 'phone')).resolves.toEqual([]);
+  });
+
+  it('an approved request whose code expired can be reopened instead of waiting out the window', async () => {
+    const { service, challenges, challengeId, realtime } = await pending();
+    await service.approve('u1', 'phone', challengeId);
+    challenges[0].codeExpiresAt = new Date(Date.now() - 1);
+    realtime.broadcast.mockClear();
+
+    const again = await service.resend(challengeId, 'stranger');
+
+    expect(again.id).toBe(challengeId);
+    expect(challenges[0]).toEqual(
+      expect.objectContaining({ status: 'PENDING', codeHash: null }),
+    );
+    // 受信任设备重新收到「是否是你本人」。
+    expect(realtime.broadcast).toHaveBeenCalledWith(
+      'u1',
+      expect.objectContaining({ type: 'auth.login.challenge.created' }),
+    );
+    await expect(service.listPending('u1', 'phone')).resolves.toHaveLength(1);
+  });
+
+  it('logging in again on the same device also reopens an expired code', async () => {
+    const { service, challenges, challengeId } = await pending();
+    await service.approve('u1', 'phone', challengeId);
+    challenges[0].codeExpiresAt = new Date(Date.now() - 1);
+
+    const decision = await service.evaluateLogin(user, {
+      deviceKey: 'stranger',
+    });
+
+    expect(decision).toEqual(
+      expect.objectContaining({
+        kind: 'challenge',
+        challenge: expect.objectContaining({ id: challengeId }),
+      }),
+    );
+    expect(challenges[0].status).toBe('PENDING');
+  });
+
+  it('invalidating challenges (password change, logout-all) kills open ones and blocks resend', async () => {
+    const { service, challenges, challengeId, realtime } = await pending();
+    await service.invalidateChallenges('u1');
+
+    expect(challenges[0].status).toBe('REJECTED');
+    expect(realtime.broadcast).toHaveBeenCalledWith(
+      'u1',
+      expect.objectContaining({
+        type: 'auth.login.challenge.resolved',
+        payload: expect.objectContaining({ challengeId, status: 'REJECTED' }),
+      }),
+    );
+    await expect(service.resend(challengeId, 'stranger')).rejects.toThrow(
+      /拒绝/,
+    );
+  });
+
+  it('the security-code fallback has an account-wide daily failure budget', async () => {
+    const { service, challenges } = await pending();
+    await expect(
+      service.assertSecurityCodeFallbackBudget('u1'),
+    ).resolves.toBeUndefined();
+    challenges[0].attempts = LOGIN_CHALLENGE_SECURITY_CODE_DAILY_FAILURES;
+    await expect(
+      service.assertSecurityCodeFallbackBudget('u1'),
+    ).rejects.toThrow(ForbiddenException);
   });
 
   it('listPending is empty for an untrusted caller', async () => {

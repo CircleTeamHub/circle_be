@@ -189,6 +189,7 @@ describe('AuthController', () => {
     expect(mockAuthService.logoutSession).toHaveBeenCalledWith(
       'uuid-1',
       'session-2',
+      undefined,
     );
   });
 

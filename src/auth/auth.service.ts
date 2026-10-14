@@ -402,11 +402,11 @@ export class AuthService {
         errorCode: AuthErrorCode.SecurityCodeNotSet,
       });
     }
-    // 复用安全码自身的错误计数与锁定。
-    const { ok } = await this.verifyLoginSecurityCode(
-      challenge.userId,
-      securityCode,
-    );
+    // 这条路径没有登录态，绝不能动应用锁的错误计数（securityCodeAttempts /
+    // securityCodeLockedUntil）：否则只知道密码的人能故意输错，把本人手机的应用锁
+    // 锁住，锁住期间批准弹窗也被藏起来。改用验证单自己的计次 + 账号级每日额度。
+    await this.deviceTrust.assertSecurityCodeFallbackBudget(challenge.userId);
+    const ok = await argon2.verify(user.loginSecurityCodeHash, securityCode);
     if (!ok) {
       await this.deviceTrust.registerSecurityCodeFailure(challenge.id);
       throw new ForbiddenException({
@@ -706,6 +706,7 @@ export class AuthService {
       userId,
       sessionId,
       deviceKey,
+      deviceName,
     } = await this.refreshTokenService.rotate(
       refreshToken,
       sessionContext,
@@ -769,11 +770,11 @@ export class AuthService {
     await this.refreshTokenService.assertSessionActive(user.id, sessionId);
     // 持有有效会话的设备就是本人设备：功能上线前已登录的设备靠这条补记信任，
     // 免得一升级所有人都变成「陌生设备」。只认会话绑定的设备，不认请求头里新报的。
-    await this.deviceTrust.trustOnRefresh(
-      user.id,
-      deviceKey,
-      sessionContext ?? {},
-    );
+    // 续签请求不带设备名头：受信任记录沿用会话上登录时记下的设备名。
+    await this.deviceTrust.trustOnRefresh(user.id, deviceKey, {
+      ...sessionContext,
+      deviceName: sessionContext?.deviceName ?? deviceName,
+    });
     return { accessToken, refreshToken: newRefreshToken };
   }
 
@@ -855,8 +856,10 @@ export class AuthService {
   }
 
   async logoutAll(userId: string, currentSessionId?: string): Promise<void> {
-    // 「全部退出」多半是怀疑被盗号：发起这一步的设备之外，全部撤销信任。
+    // 「全部退出」多半是怀疑被盗号：发起这一步的设备之外，全部撤销信任，
+    // 进行中的陌生设备验证一并作废。
     await this.revokeTrustExceptSession(userId, currentSessionId);
+    await this.deviceTrust.invalidateChallenges(userId);
     await this.refreshTokenService.revokeAll(userId);
     logBusinessEvent(this.logger, {
       enabled: this.loggingConfig.businessLogOn,
@@ -868,14 +871,25 @@ export class AuthService {
     });
   }
 
-  async logoutSession(userId: string, sessionId: string): Promise<void> {
+  async logoutSession(
+    userId: string,
+    sessionId: string,
+    currentSessionId?: string,
+  ): Promise<void> {
     // 在设备管理里移除 = 撤销信任：这台设备再登录要重新经受信任设备批准。
     const deviceKey = await this.refreshTokenService.findSessionDeviceKey(
       userId,
       sessionId,
     );
+    const currentDeviceKey = currentSessionId
+      ? await this.refreshTokenService.findSessionDeviceKey(
+          userId,
+          currentSessionId,
+        )
+      : null;
     await this.refreshTokenService.revokeSession(userId, sessionId);
-    if (deviceKey) {
+    // 移除的是「本机的另一条旧登录记录」时只撤那一条：不能连带撤掉当前会话和本机信任。
+    if (deviceKey && deviceKey !== currentDeviceKey) {
       // 同一台设备可能有多条会话（重装、重复登录）：一起撤掉，否则剩下那条还能续签。
       await this.refreshTokenService.revokeDeviceSessions(userId, deviceKey);
       await this.deviceTrust.revokeDevice(userId, deviceKey);
@@ -909,6 +923,7 @@ export class AuthService {
     if (currentDeviceKey) {
       await this.deviceTrust.revokeOtherDevices(userId, currentDeviceKey);
     }
+    await this.deviceTrust.invalidateChallenges(userId);
     logBusinessEvent(this.logger, {
       enabled: this.loggingConfig.businessLogOn,
       businessEvent: 'auth_other_sessions_logout',
@@ -1118,6 +1133,8 @@ export class AuthService {
     // 邮箱验证过的找回密码 = 设备丢失时的恢复通道：撤销全部信任。会话也已全撤，
     // 下一次登录的设备就是「首台设备」，不必再等一台已经找不回来的设备批准。
     await this.deviceTrust.revokeOtherDevices(user.id, null);
+    // 旧密码下发起的验证单全部作废：之前拿到密码的人不能再靠它们重发、输码。
+    await this.deviceTrust.invalidateChallenges(user.id);
     try {
       await this.refreshTokenService.revokeAllAccessMarkers(user.id);
     } catch (markerError) {
@@ -1170,6 +1187,7 @@ export class AuthService {
     // 改密通常是怀疑密码泄露：当前设备之外全部撤销信任，否则攻击者的设备
     // 拿到新密码后照样免批准登录。
     await this.revokeTrustExceptSession(userId, currentSessionId);
+    await this.deviceTrust.invalidateChallenges(userId);
     // Invalidate all existing sessions after password change
     await this.refreshTokenService.revokeAll(userId);
     logBusinessEvent(this.logger, {

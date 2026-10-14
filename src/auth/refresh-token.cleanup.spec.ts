@@ -5,7 +5,11 @@ import { Logger } from '@nestjs/common';
 describe('RefreshTokenCleanup', () => {
   const deleteMany = jest.fn();
   const findMany = jest.fn();
-  const prisma = { refreshToken: { findMany, deleteMany } } as never;
+  const challengeDeleteMany = jest.fn();
+  const prisma = {
+    refreshToken: { findMany, deleteMany },
+    loginChallenge: { deleteMany: challengeDeleteMany },
+  } as never;
   const redis = {
     tryAcquireLease: jest.fn(),
     renewLease: jest.fn(),
@@ -16,6 +20,7 @@ describe('RefreshTokenCleanup', () => {
   beforeEach(() => {
     jest.clearAllMocks();
     findMany.mockResolvedValue([]);
+    challengeDeleteMany.mockResolvedValue({ count: 0 });
     redis.tryAcquireLease.mockResolvedValue(undefined);
     redis.renewLease.mockResolvedValue(true);
   });
@@ -165,5 +170,13 @@ describe('RefreshTokenCleanup', () => {
     } finally {
       log.mockRestore();
     }
+  });
+
+  it('prunes login challenges past the retention window', async () => {
+    const now = new Date('2026-10-14T12:00:00.000Z');
+    await cleanup.sweep(now);
+    expect(challengeDeleteMany).toHaveBeenCalledWith({
+      where: { createdAt: { lt: new Date('2026-10-13T12:00:00.000Z') } },
+    });
   });
 });

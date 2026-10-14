@@ -33,6 +33,8 @@ export const AuthErrorCode = {
   LoginChallengeRejected: 'AUTH_LOGIN_CHALLENGE_REJECTED',
   LoginChallengeLocked: 'AUTH_LOGIN_CHALLENGE_LOCKED',
   SecurityCodeNotSet: 'AUTH_SECURITY_CODE_NOT_SET',
+  // 上线前签发的老会话还没绑定设备：客户端续签一次后重试批准相关接口。
+  SessionDeviceUnbound: 'AUTH_SESSION_DEVICE_UNBOUND',
 } as const;
 
 export const CoinErrorCode = {

@@ -241,6 +241,12 @@ the request context and a sanitized `reason`:
 - `login_challenge_code_invalid` — a wrong verification code (with the running
   attempt count).
 - `login_challenge_rate_limited` — too many challenges for the account / source IP.
+- `login_challenge_reopened` — an approved challenge whose code expired was put
+  back to pending (resend / re-login) and trusted devices were notified again.
+- `login_challenges_invalidated` — open challenges were rejected because the
+  password changed / was reset or the user logged out other or all devices.
+- `login_challenge_security_code_budget_exhausted` — the account used up its
+  daily failure budget for the security-code fallback.
 
 The security-log call in `AllExceptionFilter` and `ErrorLoggingInterceptor`
 is wrapped like the Sentry capture: if the log transport throws, an
