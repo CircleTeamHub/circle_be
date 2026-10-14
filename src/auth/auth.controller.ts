@@ -1,8 +1,11 @@
+import { UserThrottlerGuard } from 'src/guards/user-throttler.guard';
 import {
   Body,
+  ConflictException,
   Controller,
   Delete,
   Get,
+  Header,
   Param,
   ParseUUIDPipe,
   Post,
@@ -11,7 +14,6 @@ import {
   UseGuards,
 } from '@nestjs/common';
 import { Request } from 'express';
-import * as requestIp from 'request-ip';
 import { Throttle, ThrottlerGuard } from '@nestjs/throttler';
 import {
   ApiBearerAuth,
@@ -25,6 +27,7 @@ import {
   ApiUnauthorizedResponse,
 } from '@nestjs/swagger';
 import { JwtGuard } from 'src/guards/jwt.guard';
+import { AuthErrorCode } from 'src/common/app-error-codes';
 import { AuthService } from './auth.service';
 import { AuthSessionDto } from './dto/auth-session.dto';
 import { AuthTokensDto } from './dto/auth-tokens.dto';
@@ -42,6 +45,9 @@ import {
   SetLoginSecurityCodeDto,
 } from './dto/login-security-code.dto';
 import { SingleDeviceLoginDto } from './dto/single-device-login.dto';
+import { LoginChallengeCodeDto } from './dto/login-challenge.dto';
+import { DeviceTrustService, hashDeviceId } from './device-trust.service';
+import { RefreshTokenService } from './refresh-token.service';
 import { SelfUserDto } from 'src/user/dto/public-user.dto';
 import { Serialize } from 'src/decorators/serialize.decorator';
 import { SessionContext } from './refresh-token.service';
@@ -61,15 +67,47 @@ function getSessionContext(req?: Request): SessionContext {
 
   return {
     deviceName: getHeaderValue(req.headers['x-device-name']),
-    ip: requestIp.getClientIp(req) ?? req.ip ?? null,
+    // 用 Express 的 req.ip（setup.ts 里 trust proxy = 1，取的是反代填的那一跳）。
+    // request-ip 会优先信任客户端自带的 X-Client-IP 等头，可伪造——这个 IP 用于
+    // 按来源限流陌生设备验证、并展示在受信任设备的批准弹窗里。
+    ip: req.ip ?? null,
     userAgent: getHeaderValue(req.headers['user-agent']),
+    // 客户端安全存储里的随机设备 ID，只以哈希形式进入服务端。
+    deviceKey: hashDeviceId(getHeaderValue(req.headers['x-device-id'])),
   };
 }
 
 @Controller('auth')
 @ApiTags('Auth')
 export class AuthController {
-  constructor(private authService: AuthService) {}
+  constructor(
+    private authService: AuthService,
+    private deviceTrust: DeviceTrustService,
+    private refreshTokens: RefreshTokenService,
+  ) {}
+
+  /**
+   * 批准方的设备：只认会话绑定的设备（不可伪造）。
+   *
+   * 功能上线前签发的老会话还没绑定设备。这里不能凭 access token 把请求头里的
+   * 设备 ID 绑上去——偷到一枚短期 access token 就能换来永久信任，还会把本人的
+   * 会话族绑到别人的设备上。改为返回 AUTH_SESSION_DEVICE_UNBOUND：客户端用
+   * refresh token 续签一次（续签时绑定设备并补记信任），再重试。
+   */
+  private async approverDeviceKey(req: RequestWithUser) {
+    const { userId, sessionId } = req.user;
+    const bound = sessionId
+      ? await this.refreshTokens.findSessionDeviceKey(userId, sessionId)
+      : null;
+    if (bound) return bound;
+    if (getSessionContext(req).deviceKey) {
+      throw new ConflictException({
+        message: '登录状态需要更新，请稍后重试',
+        errorCode: AuthErrorCode.SessionDeviceUnbound,
+      });
+    }
+    return null;
+  }
 
   @Post('register')
   @ApiOperation({ summary: 'Register a new user' })
@@ -101,6 +139,127 @@ export class AuthController {
   })
   login(@Body() dto: LoginDto, @Req() req?: Request) {
     return this.authService.login(dto, getSessionContext(req));
+  }
+
+  @Post('login-challenges/:challengeId/verify')
+  @UseGuards(ThrottlerGuard)
+  @Throttle({ default: { limit: 10, ttl: 60_000 } })
+  @ApiOperation({
+    summary: 'New device: submit the code shown on a trusted device',
+  })
+  @ApiHeader({ name: 'x-device-id', required: true })
+  @ApiBody({ type: LoginChallengeCodeDto })
+  @ApiCreatedResponse({ type: AuthTokensDto })
+  verifyLoginChallenge(
+    @Param('challengeId', ParseUUIDPipe) challengeId: string,
+    @Body() dto: LoginChallengeCodeDto,
+    @Req() req: Request,
+  ) {
+    return this.authService.verifyLoginChallengeCode(
+      challengeId,
+      dto.code,
+      getSessionContext(req),
+    );
+  }
+
+  @Post('login-challenges/:challengeId/security-code')
+  @UseGuards(ThrottlerGuard)
+  @Throttle({ default: { limit: 10, ttl: 60_000 } })
+  @ApiOperation({
+    summary: 'New device: pass verification with the login security code',
+  })
+  @ApiHeader({ name: 'x-device-id', required: true })
+  @ApiBody({ type: LoginSecurityCodeDto })
+  @ApiCreatedResponse({ type: AuthTokensDto })
+  verifyLoginChallengeSecurityCode(
+    @Param('challengeId', ParseUUIDPipe) challengeId: string,
+    @Body() dto: LoginSecurityCodeDto,
+    @Req() req: Request,
+  ) {
+    return this.authService.verifyLoginChallengeSecurityCode(
+      challengeId,
+      dto.securityCode,
+      getSessionContext(req),
+    );
+  }
+
+  @Post('login-challenges/:challengeId/resend')
+  @UseGuards(ThrottlerGuard)
+  @Throttle({ default: { limit: 10, ttl: 60_000 } })
+  @ApiOperation({ summary: 'New device: start a new verification request' })
+  @ApiHeader({ name: 'x-device-id', required: true })
+  resendLoginChallenge(
+    @Param('challengeId', ParseUUIDPipe) challengeId: string,
+    @Req() req: Request,
+  ) {
+    return this.authService.resendLoginChallenge(
+      challengeId,
+      getSessionContext(req).deviceKey ?? null,
+    );
+  }
+
+  @Get('login-challenges/:challengeId/status')
+  // 状态每几秒就变，绝不能被任何一层缓存。
+  @Header('Cache-Control', 'no-store')
+  @UseGuards(ThrottlerGuard)
+  @Throttle({ default: { limit: 60, ttl: 60_000 } })
+  @ApiOperation({ summary: 'New device: poll verification status' })
+  @ApiHeader({ name: 'x-device-id', required: true })
+  loginChallengeStatus(
+    @Param('challengeId', ParseUUIDPipe) challengeId: string,
+    @Req() req: Request,
+  ) {
+    return this.deviceTrust.status(
+      challengeId,
+      getSessionContext(req).deviceKey ?? null,
+    );
+  }
+
+  @Get('login-challenges')
+  @Header('Cache-Control', 'no-store')
+  @UseGuards(JwtGuard)
+  @ApiBearerAuth()
+  @ApiOperation({
+    summary: 'Trusted device: pending login requests from unknown devices',
+  })
+  async pendingLoginChallenges(@Req() req: RequestWithUser) {
+    return this.deviceTrust.listPending(
+      req.user.userId,
+      await this.approverDeviceKey(req),
+    );
+  }
+
+  @Post('login-challenges/:challengeId/approve')
+  @UseGuards(JwtGuard, UserThrottlerGuard)
+  @Throttle({ default: { limit: 10, ttl: 60_000 } })
+  @ApiBearerAuth()
+  @ApiOperation({
+    summary: 'Trusted device: approve and get a one-time code (60s)',
+  })
+  async approveLoginChallenge(
+    @Param('challengeId', ParseUUIDPipe) challengeId: string,
+    @Req() req: RequestWithUser,
+  ) {
+    return this.deviceTrust.approve(
+      req.user.userId,
+      await this.approverDeviceKey(req),
+      challengeId,
+    );
+  }
+
+  @Post('login-challenges/:challengeId/reject')
+  @UseGuards(JwtGuard)
+  @ApiBearerAuth()
+  @ApiOperation({ summary: 'Trusted device: reject the login request' })
+  async rejectLoginChallenge(
+    @Param('challengeId', ParseUUIDPipe) challengeId: string,
+    @Req() req: RequestWithUser,
+  ) {
+    await this.deviceTrust.reject(
+      req.user.userId,
+      await this.approverDeviceKey(req),
+      challengeId,
+    );
   }
 
   @Post('admin/login')
@@ -187,7 +346,7 @@ export class AuthController {
   @ApiBearerAuth()
   @ApiOkResponse({ description: 'All device sessions revoked' })
   logoutAll(@Req() req: RequestWithUser) {
-    return this.authService.logoutAll(req.user.userId);
+    return this.authService.logoutAll(req.user.userId, req.user.sessionId);
   }
 
   @Delete('sessions/:sessionId')
@@ -199,7 +358,11 @@ export class AuthController {
     @Param('sessionId', ParseUUIDPipe) sessionId: string,
     @Req() req: RequestWithUser,
   ) {
-    return this.authService.logoutSession(req.user.userId, sessionId);
+    return this.authService.logoutSession(
+      req.user.userId,
+      sessionId,
+      req.user.sessionId,
+    );
   }
 
   @Post('logout-others')
@@ -277,6 +440,7 @@ export class AuthController {
       req.user.userId,
       dto.oldPassword,
       dto.newPassword,
+      req.user.sessionId,
     );
   }
 

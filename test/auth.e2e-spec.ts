@@ -141,13 +141,38 @@ describe('Auth e2e', () => {
   });
 
   it('login returns tokens with correct credentials', async () => {
-    await pactum.spec().post('/api/v1/auth/register').withBody(registerBody());
+    // 同一台设备注册后再登录：注册时已记为受信任设备，登录直接放行。
+    const deviceId = 'e2e-device-0000000000000001';
+    await pactum
+      .spec()
+      .post('/api/v1/auth/register')
+      .withHeaders('x-device-id', deviceId)
+      .withBody(registerBody());
 
     return spec
       .post('/api/v1/auth/login')
+      .withHeaders('x-device-id', deviceId)
       .withBody({ identifier: EMAIL, password: PASSWORD })
       .expectStatus(201)
       .expectJsonLike({ code: 0, message: 'ok', data: { accessToken: /.+/ } });
+  });
+
+  it('login from another device needs verification and returns no tokens', async () => {
+    await pactum
+      .spec()
+      .post('/api/v1/auth/register')
+      .withHeaders('x-device-id', 'e2e-device-0000000000000001')
+      .withBody(registerBody());
+
+    return spec
+      .post('/api/v1/auth/login')
+      .withHeaders('x-device-id', 'e2e-device-0000000000000002')
+      .withBody({ identifier: EMAIL, password: PASSWORD })
+      .expectStatus(201)
+      .expectJsonLike({
+        code: 0,
+        data: { deviceVerificationRequired: true, challenge: { id: /.+/ } },
+      });
   });
 
   it('login with unknown email returns 403', () => {

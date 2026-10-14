@@ -1,3 +1,4 @@
+import { LOGIN_CHALLENGE_RETENTION_MS } from './device-trust.service';
 import { Injectable, Logger } from '@nestjs/common';
 import { CronExpression } from '@nestjs/schedule';
 import {
@@ -104,6 +105,46 @@ export class RefreshTokenCleanup {
       if (count > 0) {
         this.logger.log(`Pruned ${count} expired/revoked refresh tokens`);
       }
+      const challengeCutoff = new Date(
+        now.getTime() - LOGIN_CHALLENGE_RETENTION_MS,
+      );
+      let challengeCount = 0;
+      for (
+        let batch = 0;
+        batch < RefreshTokenCleanup.MAX_BATCHES_PER_RUN;
+        batch++
+      ) {
+        if (!lease.isCurrent()) {
+          reportJobSkipped();
+          break;
+        }
+        const candidates = await this.prisma.loginChallenge.findMany({
+          where: { createdAt: { lt: challengeCutoff } },
+          select: { id: true },
+          orderBy: { id: 'asc' },
+          take: RefreshTokenCleanup.BATCH_SIZE,
+        });
+        if (!candidates.length) break;
+        if (!lease.isCurrent()) {
+          reportJobSkipped();
+          break;
+        }
+        const deleted = await this.prisma.loginChallenge.deleteMany({
+          where: {
+            createdAt: { lt: challengeCutoff },
+            id: { in: candidates.map(({ id }) => id) },
+          },
+        });
+        challengeCount += deleted.count;
+        if (candidates.length < RefreshTokenCleanup.BATCH_SIZE) break;
+        if (batch === RefreshTokenCleanup.MAX_BATCHES_PER_RUN - 1)
+          this.logger.warn({
+            event: 'login_challenge_cleanup_capped',
+            deletedCount: challengeCount,
+          });
+      }
+      if (challengeCount)
+        this.logger.log(`Pruned ${challengeCount} expired login challenges`);
       if (capped) {
         this.logger.warn({
           event: 'refresh_token_cleanup_capped',
