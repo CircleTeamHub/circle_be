@@ -19,6 +19,22 @@ const flush = () => new Promise((resolve) => setImmediate(resolve));
 describe('CircleInvitationService', () => {
   let service: CircleInvitationService;
 
+  it('returns recipient-scoped unread counts for circle invitations in one query', async () => {
+    prisma.circleInvitation.findMany.mockResolvedValue([{ id: 'invite-unread' }, { id: 'invite-read' }]);
+    prisma.notification.groupBy.mockResolvedValue([{ fromInvitationID: 'invite-unread', _count: { _all: 2 } }]);
+    const mapper = jest.spyOn(service as any, 'toInvitationDto').mockImplementation((inv: any) => ({ id: inv.id }));
+    try {
+      const result = await service.getMyApplications('applicant-1');
+      expect(result.map((row) => row.unreadCount)).toEqual([2, 0]);
+      expect(prisma.notification.groupBy).toHaveBeenCalledWith({
+        by: ['fromInvitationID'],
+        where: { toUserID: 'applicant-1', type: 'CIRCLE_INVITATION_RECEIVED', read: false, deleted: false, fromInvitationID: { in: ['invite-unread', 'invite-read'] } },
+        _count: { _all: true },
+      });
+    } finally { mapper.mockRestore(); }
+  });
+
+
   const prisma = {
     circleInvitation: {
       findUnique: jest.fn(),
@@ -43,6 +59,7 @@ describe('CircleInvitationService', () => {
       updateMany: jest.fn(),
     },
     notification: {
+      groupBy: jest.fn().mockResolvedValue([]),
       create: jest.fn(),
     },
     circle: {
@@ -1796,6 +1813,63 @@ describe('CircleInvitationService', () => {
       expect(args).not.toHaveProperty('include');
     });
 
+    it('an unaccepted invitation never activates a member even when the first vote meets the threshold', async () => {
+      arrangeInviteFlow({
+        circle: { requiredVerifierCount: 1 },
+        created: { requiredCount: 1, status: 'INVITED' },
+      });
+      await service.invite('inviter-1', 'applicant-1', 'circle-1');
+      expect(prisma.circleInvitation.create).toHaveBeenCalledWith(
+        expect.objectContaining({
+          data: expect.objectContaining({ status: 'INVITED' }),
+        }),
+      );
+      expect(admissionPolicy.activateMembers).not.toHaveBeenCalled();
+      expect(chatCircleSync.ensureCircleConversation).not.toHaveBeenCalled();
+    });
+    it('recipient acceptance upgrades the same invitation and preserves its verification policy snapshot', async () => {
+      arrangeInviteFlow({ circle: { requiredVerifierCount: 1 } });
+      const existing = {
+        id: 'inv-existing',
+        status: 'INVITED',
+        requiredCount: 10,
+        approvedCount: 1,
+        createdAt: new Date(),
+      };
+      prisma.circleInvitation.findFirst.mockResolvedValue(existing);
+      prisma.circleInvitation.update.mockResolvedValue({
+        ...existing,
+        status: 'PENDING',
+        circle: { groupID: 'circle-1' },
+      });
+      await service.invite('inviter-1', 'applicant-1', 'circle-1', {
+        applicantConsented: true,
+        acceptedInvitationId: 'inv-existing',
+      });
+      expect(prisma.circleInvitation.update).toHaveBeenCalledWith(
+        expect.objectContaining({
+          where: { id: 'inv-existing', status: 'INVITED' },
+          data: expect.objectContaining({
+            status: 'PENDING',
+            requiredCount: 10,
+          }),
+        }),
+      );
+      expect(prisma.circleInvitation.create).not.toHaveBeenCalled();
+      expect(admissionPolicy.activateMembers).not.toHaveBeenCalled();
+    });
+    it('acceptance cannot resurrect an invitation declined before the policy lock', async () => {
+      arrangeInviteFlow();
+      await expect(
+        service.invite('inviter-1', 'applicant-1', 'circle-1', {
+          applicantConsented: true,
+          acceptedInvitationId: 'declined',
+        }),
+      ).rejects.toThrow();
+      expect(prisma.circleInvitation.create).not.toHaveBeenCalled();
+      expect(admissionPolicy.activateMembers).not.toHaveBeenCalled();
+    });
+
     it('invite admits immediately when the inviter first vote satisfies the policy', async () => {
       arrangeInviteFlow({
         circle: { requiredVerifierCount: 1 },
@@ -1814,7 +1888,9 @@ describe('CircleInvitationService', () => {
         fromInvitation: { id: 'inv-new', status: 'APPROVED' },
       });
 
-      await service.invite('inviter-1', 'applicant-1', 'circle-1');
+      await service.invite('inviter-1', 'applicant-1', 'circle-1', {
+        applicantConsented: true,
+      });
 
       expect(prisma.circleInvitation.update).toHaveBeenCalledWith({
         where: { id: 'inv-new' },

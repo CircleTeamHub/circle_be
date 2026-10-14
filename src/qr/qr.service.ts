@@ -8,6 +8,7 @@ import {
 } from '@nestjs/common';
 import { ChatErrorCode, QrErrorCode } from 'src/common/app-error-codes';
 import { PrismaService } from 'src/prisma/prisma.service';
+import { GroupAdmissionService } from 'src/chat/group-admission.service';
 import { ChatService } from 'src/chat/chat.service';
 import { CircleInvitationService } from 'src/circle-invitation/circle-invitation.service';
 import type { Prisma, QrToken } from 'src/generated/prisma';
@@ -38,7 +39,13 @@ export class QrService {
     private readonly prisma: PrismaService,
     private readonly chatService: ChatService,
     private readonly circleInvitation: CircleInvitationService,
+    private readonly admissions: GroupAdmissionService,
   ) {}
+
+  async acceptGroupInvitation(viewerId: string, token: string) {
+    await this.requireValidToken(token);
+    return this.admissions.acceptQr(viewerId, token);
+  }
 
   async issueToken(
     userId: string,
@@ -232,16 +239,10 @@ export class QrService {
     }
 
     if (row.type === 'GROUP') {
-      // 群主关掉「二维码入群」后,已经签出去的码也一并失效(闸在入群这一侧)。
-      const conversation = await this.chatService.joinStandaloneGroupViaQr(
-        viewerId,
-        row.targetID,
-      );
-      return {
-        type: 'GROUP',
-        conversationId: conversation.id,
-        status: 'JOINED',
-      };
+      throw new ForbiddenException({
+        message: '请先接受群邀请',
+        errorCode: 'CHAT_GROUP_ACCEPT_REQUIRED',
+      });
     }
 
     // 圈子群关掉「二维码入群」后,圈码同样失效(圈子的会话行上记着这个开关)。

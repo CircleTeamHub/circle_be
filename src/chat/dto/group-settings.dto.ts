@@ -68,6 +68,20 @@ export class SetMyGroupAliasDto {
 }
 
 export class UpdateGroupPoliciesDto {
+  @ApiPropertyOptional({ description: '允许通过群名片申请入群' })
+  @Transform(({ obj }: { obj: Record<string, unknown> }) => obj.cardJoinEnabled)
+  @IsOptional()
+  @IsBoolean()
+  cardJoinEnabled?: boolean;
+
+  @ApiPropertyOptional({ description: '接受邀请后仍需管理员审核（独立群）' })
+  @Transform(
+    ({ obj }: { obj: Record<string, unknown> }) => obj.joinApprovalRequired,
+  )
+  @IsOptional()
+  @IsBoolean()
+  joinApprovalRequired?: boolean;
+
   @ApiPropertyOptional({ description: '普通成员能否拉人进群' })
   @Transform(({ obj }: { obj: Record<string, unknown> }) => obj.memberCanInvite)
   @IsOptional()

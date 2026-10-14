@@ -29,10 +29,18 @@ describe('圈子离线推送的门控面', () => {
   // 枚举里新增 CIRCLE_* 类型时这条会红：是加进门控面，还是刻意留在门外，
   // 必须是一次显式决定，而不是靠名字前缀默认生效。
   it('枚举里的 CIRCLE_* 类型一个不漏地做过决定', () => {
-    const circleTypes = Object.values(NotificationType).filter((type) =>
-      type.startsWith('CIRCLE_'),
+    const circleTypes = Object.values(NotificationType).filter(
+      (type) =>
+        type.startsWith('CIRCLE_') &&
+        type !== NotificationType.CIRCLE_INVITATION_RECEIVED,
     );
     expect(new Set(CIRCLE_OFFLINE_PUSH_TYPES)).toEqual(new Set(circleTypes));
+  });
+
+  it('收到圈子邀请属于联系人收件箱，不受圈内动态离线提醒开关控制', () => {
+    expect(
+      isCircleOfflinePushGated(NotificationType.CIRCLE_INVITATION_RECEIVED),
+    ).toBe(false);
   });
 
   it('非圈子通知与空值一律不门控', () => {

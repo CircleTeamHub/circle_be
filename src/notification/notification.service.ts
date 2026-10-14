@@ -319,6 +319,84 @@ export class NotificationService {
     return result;
   }
 
+  async deliverCircleConsentNotification(input: {
+    id: string;
+    circleId: string;
+    toUserID: string;
+    fromUserID: string;
+    content: string;
+  }) {
+    const row = await this.prisma.$transaction(async (tx) => {
+      const row = await tx.notification.upsert({
+        where: { id: input.id },
+        create: {
+          id: input.id,
+          type: 'CIRCLE_INVITATION_RECEIVED',
+          toUserID: input.toUserID,
+          fromUserID: input.fromUserID,
+          content: input.content,
+          fromInvitationID: input.id,
+          fromCircleID: input.circleId,
+        },
+        update: {},
+        include: NOTIFICATION_REALTIME_INCLUDE,
+      });
+      await tx.notificationPushOutbox.upsert({
+        where: { notificationID: row.id },
+        create: { notificationID: row.id },
+        update: {},
+      });
+      return row;
+    });
+    this.realtimeService.broadcastNotificationCreated(
+      input.toUserID,
+      mapNotificationRealtimeDto(row),
+    );
+    await this.broadcastUnreadForType(
+      input.toUserID,
+      'CIRCLE_INVITATION_RECEIVED',
+    );
+  }
+
+  async deliverGroupAdmissionNotification(input: {
+    id: string;
+    admissionId: string;
+    toUserID: string;
+    fromUserID: string;
+    content: string;
+  }) {
+    const row = await this.prisma.$transaction(async (tx) => {
+      const data = {
+        id: input.id,
+        toUserID: input.toUserID,
+        fromUserID: input.fromUserID,
+        content: input.content,
+        type: NotificationType.GROUP_ADMISSION,
+        fromGroupAdmissionID: input.admissionId,
+      };
+      const row = await tx.notification.upsert({
+        where: { id: input.id },
+        create: data,
+        update: {},
+        include: NOTIFICATION_REALTIME_INCLUDE,
+      });
+      await tx.notificationPushOutbox.upsert({
+        where: { notificationID: row.id },
+        create: { notificationID: row.id },
+        update: {},
+      });
+      return row;
+    });
+    this.realtimeService.broadcastNotificationCreated(
+      input.toUserID,
+      mapNotificationRealtimeDto(row),
+    );
+    await this.broadcastUnreadForType(
+      input.toUserID,
+      NotificationType.GROUP_ADMISSION,
+    );
+  }
+
   async createSystemNotification(
     toUserId: string,
     fromUserId: string,

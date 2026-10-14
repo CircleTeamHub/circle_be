@@ -32,6 +32,7 @@ describe('ChatController.listConversations', () => {
       {} as never,
       {} as never,
       {} as never,
+      {} as never,
     );
     const res = { setHeader: jest.fn() };
     return { chatService, controller, res };

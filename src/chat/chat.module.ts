@@ -12,6 +12,8 @@ import { MembershipPolicyModule } from 'src/membership/membership-policy.module'
 import { CircleMemberLockService } from 'src/circle/circle-member-lock';
 import { ChatBroadcastService } from './chat-broadcast.service';
 import { ChatCircleSyncService } from './chat-circle-sync.service';
+import { GroupAdmissionService } from './group-admission.service';
+import { GroupAdmissionController } from './group-admission.controller';
 import { ChatController } from './chat.controller';
 import { ChatGateway } from './chat.gateway';
 import { ChatGroupAdminService } from './chat-group-admin.service';
@@ -45,8 +47,9 @@ import { ChatDirectAutoReplyProcessor } from './chat-direct-auto-reply.processor
       inject: [ConfigService],
     }),
   ],
-  controllers: [ChatController],
+  controllers: [ChatController, GroupAdmissionController],
   providers: [
+    GroupAdmissionService,
     ChatGateway,
     ChatService,
     ChatBroadcastService,
@@ -64,6 +67,7 @@ import { ChatDirectAutoReplyProcessor } from './chat-direct-auto-reply.processor
     CircleMemberLockService,
   ],
   exports: [
+    GroupAdmissionService,
     ChatGroupAdminService,
     ChatMediaService,
     ChatService,

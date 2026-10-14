@@ -1623,7 +1623,7 @@ export class ChatService {
           errorCode: ChatErrorCode.PeerNotFound,
         });
       }
-      return tx.chatConversation.create({
+      const group = await tx.chatConversation.create({
         data: {
           type: 'GROUP',
           name,
@@ -1633,13 +1633,18 @@ export class ChatService {
           membersCanViewRoster: true,
           membersCanViewProfiles: true,
           members: {
-            create: [userId, ...memberIds].map((id) => ({ userID: id })),
+            create: [{ userID: userId }],
           },
         },
         select: { id: true },
       });
+      for (const applicantID of memberIds) {
+        const admission = await tx.groupAdmission.create({ data: { conversationID: group.id, applicantID, inviterID: userId, kind: 'INVITE', status: 'INVITED', expiresAt: new Date(Date.now() + 7 * 86400000) } });
+        await tx.groupAdmissionDelivery.create({ data: { admissionID: admission.id, recipientID: applicantID, actorID: userId, event: 'INVITED' } });
+      }
+      return group;
     });
-    await this.seatMembersIntoRoom(conversation.id, [userId, ...memberIds]);
+    await this.seatMembersIntoRoom(conversation.id, [userId]);
     // 建群提示一条就够;成员名单首屏可见,不再逐人刷「加入群聊」。
     void this.systemMessage
       .emit(conversation.id, { kind: 'group-created' })
@@ -1653,253 +1658,18 @@ export class ChatService {
   }
 
   /** 独立群聊邀请:任一在座成员可拉自己的好友(微信语义);圈子群走圈子成员管理。 */
-  async inviteToGroupConversation(
-    userId: string,
-    conversationId: string,
-    memberIds: string[],
-  ): Promise<ChatConversationDto> {
-    const conversation = await this.requireStandaloneGroup(
-      conversationId,
-      userId,
-    );
-    const invitees = normalizeMemberIds(userId, memberIds);
-    if (invitees.length === 0) {
-      throw new BadRequestException({
-        message: '未选择邀请对象',
-        errorCode: ChatErrorCode.InvalidPayload,
-      });
-    }
-    const toJoin = await this.prisma.$transaction(async (tx) => {
-      const locked = await tx.$queryRaw<
-        Array<{
-          id: string;
-          type: string;
-          circleID: string | null;
-          ownerID: string | null;
-          memberCanInvite: boolean;
-          clearedBeforeHeight: number;
-        }>
-      >`SELECT "id", "type", "circleID", "ownerID", "memberCanInvite", "clearedBeforeHeight"
-        FROM "ChatConversation"
-        WHERE "id" = ${conversation.id} FOR UPDATE`;
-      if (
-        locked.length === 0 ||
-        locked[0].type !== 'GROUP' ||
-        locked[0].circleID !== null
-      ) {
-        throw new NotFoundException({
-          message: '群聊不存在',
-          errorCode: ChatErrorCode.ConversationNotFound,
-        });
-      }
-      await lockUserRelationshipState(tx, [userId, ...invitees]);
-      const actorSeat = await tx.chatMember.findUnique({
-        where: {
-          conversationID_userID: {
-            conversationID: conversation.id,
-            userID: userId,
-          },
-        },
-        select: { leftAt: true, role: true },
-      });
-      if (!actorSeat || actorSeat.leftAt) {
-        throw new ForbiddenException({
-          message: '不是会话成员',
-          errorCode: ChatErrorCode.NotMember,
-        });
-      }
-      // 「成员邀请」关着时只有群主/管理员能拉人(锁后快照,与策略写串行)。
-      if (
-        locked[0].memberCanInvite === false &&
-        !isGroupManager(
-          standaloneGroupRole(locked[0].ownerID ?? null, {
-            userID: userId,
-            role: actorSeat.role,
-            leftAt: actorSeat.leftAt,
-          }),
-        )
-      ) {
-        throw new ForbiddenException({
-          message: '该群已关闭成员邀请',
-          errorCode: ChatErrorCode.GroupInviteDisabled,
-        });
-      }
-      await this.assertInviteTargetsAllowed(tx, userId, invitees);
-      const seats = await tx.chatMember.findMany({
-        where: { conversationID: conversation.id, userID: { in: invitees } },
-        select: { id: true, userID: true, leftAt: true },
-      });
-      const seated = new Map(seats.map((seat) => [seat.userID, seat]));
-      const joining = invitees.filter((id) => {
-        const seat = seated.get(id);
-        return !seat || seat.leftAt !== null;
-      });
-      if (joining.length === 0) return joining;
-      const seatedCount = await tx.chatMember.count({
-        where: { conversationID: conversation.id, leftAt: null },
-      });
-      if (seatedCount + joining.length > STANDALONE_GROUP_MAX_MEMBERS) {
-        throw new ConflictException({
-          message: '群聊人数已达上限',
-          errorCode: ChatErrorCode.GroupFull,
-        });
-      }
-      for (const id of joining) {
-        const seat = seated.get(id);
-        if (seat) {
-          // 退过群的好友重新拉回:复位座位并抬清空水位,退群前的历史不回放。
-          const top = await tx.chatMessage.aggregate({
-            where: { conversationID: conversation.id, deleted: false },
-            _max: { height: true },
-          });
-          await tx.chatMember.update({
-            where: { id: seat.id },
-            data: {
-              leftAt: null,
-              joinedAt: new Date(),
-              clearedBeforeHeight: top._max.height ?? 0,
-            },
-          });
-        } else {
-          // 新座位继承会话的全群清空水位。落 schema 默认的 0 的话，被「删除
-          // 所有人的记录」藏起来的历史会对新成员整段可见 —— 拉个新号进群就能
-          // 把清空撤销。会话行锁在上面已经拿到，与 clearHistory 天然串行。
-          await tx.chatMember.create({
-            data: {
-              conversationID: conversation.id,
-              userID: id,
-              clearedBeforeHeight: locked[0].clearedBeforeHeight,
-            },
-          });
-        }
-      }
-      return joining;
-    });
-    if (toJoin.length === 0) {
-      return this.buildConversationDto(userId, conversation.id);
-    }
-    await this.seatMembersIntoRoom(conversation.id, toJoin);
-    void this.emitGroupJoinNotice(conversation.id, toJoin);
-    void this.groupEvents.record(conversation.id, {
-      kind: 'member-joined',
-      actorId: userId,
-      targetIds: toJoin,
-    });
-    return this.buildConversationDto(userId, conversation.id);
+  /** Legacy internal entry points must not grant membership without consent. */
+  async inviteToGroupConversation(_userId: string, _conversationId: string, _memberIds: string[]): Promise<ChatConversationDto> {
+    throw new ForbiddenException({ message: '请通过群邀请流程发送邀请', errorCode: 'CHAT_GROUP_ACCEPT_REQUIRED' });
+  }
+  async joinStandaloneGroupViaQr(_userId: string, _conversationId: string): Promise<ChatConversationDto> {
+    throw new ForbiddenException({ message: '请先接受二维码邀请', errorCode: 'CHAT_GROUP_ACCEPT_REQUIRED' });
+  }
+  async getGroupConversationForMember(userId: string, id: string): Promise<ChatConversationDto> {
+    await this.requireStandaloneGroup(id, userId);
+    return this.buildConversationDto(userId, id);
   }
 
-  /**
-   * 扫码进群(独立群聊):QrService 已验过令牌,令牌即授权 —— 不要求与在座成员
-   * 是好友,群二维码本来就是递给陌生人的(微信语义)。幂等:已在座直接返回。
-   */
-  async joinStandaloneGroupViaQr(
-    userId: string,
-    conversationId: string,
-  ): Promise<ChatConversationDto> {
-    const conversation = await this.prisma.chatConversation.findUnique({
-      where: { id: conversationId },
-      select: { id: true, type: true, circleID: true },
-    });
-    if (
-      !conversation ||
-      conversation.type !== 'GROUP' ||
-      conversation.circleID
-    ) {
-      throw new NotFoundException({
-        message: '群聊不存在',
-        errorCode: ChatErrorCode.ConversationNotFound,
-      });
-    }
-    const joined = await this.prisma.$transaction(async (tx) => {
-      const locked = await tx.$queryRaw<
-        Array<{
-          id: string;
-          type: string;
-          circleID: string | null;
-          qrJoinEnabled: boolean;
-          clearedBeforeHeight: number;
-        }>
-      >`SELECT "id", "type", "circleID", "qrJoinEnabled", "clearedBeforeHeight"
-        FROM "ChatConversation"
-        WHERE "id" = ${conversationId} FOR UPDATE`;
-      if (
-        locked.length === 0 ||
-        locked[0].type !== 'GROUP' ||
-        locked[0].circleID !== null
-      ) {
-        throw new NotFoundException({
-          message: '群聊不存在',
-          errorCode: ChatErrorCode.ConversationNotFound,
-        });
-      }
-      // 群主关掉「二维码入群」后,已签发的群码一并失效(闸在入群这一侧,锁后读)。
-      if (locked[0].qrJoinEnabled === false) {
-        throw new ForbiddenException({
-          message: '该群已关闭二维码入群',
-          errorCode: ChatErrorCode.GroupQrJoinDisabled,
-        });
-      }
-      const existing = await tx.chatMember.findFirst({
-        where: { conversationID: conversationId, userID: userId },
-        select: { id: true, leftAt: true },
-      });
-      if (existing && existing.leftAt === null) return false;
-      const seated = await tx.chatMember.count({
-        where: { conversationID: conversationId, leftAt: null },
-      });
-      // 全员退光的死群,码不再开门 —— 扫进去只会得到一间没人的空房。
-      if (seated === 0) {
-        throw new NotFoundException({
-          message: '群聊不存在',
-          errorCode: ChatErrorCode.ConversationNotFound,
-        });
-      }
-      if (seated >= STANDALONE_GROUP_MAX_MEMBERS) {
-        throw new ConflictException({
-          message: '群聊人数已达上限',
-          errorCode: ChatErrorCode.GroupFull,
-        });
-      }
-      if (existing) {
-        // 退过群又扫码回来:复位座位并抬清空水位,退群前的历史不回放
-        // (与好友邀请路径同一语义)。
-        const top = await tx.chatMessage.aggregate({
-          where: { conversationID: conversationId, deleted: false },
-          _max: { height: true },
-        });
-        await tx.chatMember.update({
-          where: { id: existing.id },
-          data: {
-            leftAt: null,
-            joinedAt: new Date(),
-            clearedBeforeHeight: top._max.height ?? 0,
-          },
-        });
-      } else {
-        // 与好友邀请路径同一条理由：新座位继承会话的全群清空水位。
-        await tx.chatMember.create({
-          data: {
-            conversationID: conversationId,
-            userID: userId,
-            clearedBeforeHeight: locked[0].clearedBeforeHeight,
-          },
-        });
-      }
-      return true;
-    });
-    if (!joined) return this.buildConversationDto(userId, conversationId);
-    await this.seatMembersIntoRoom(conversationId, [userId]);
-    void this.emitGroupJoinNotice(conversationId, [userId]);
-    void this.groupEvents.record(conversationId, {
-      kind: 'member-joined',
-      actorId: userId,
-      targetIds: [userId],
-      payload: { via: 'qr' },
-    });
-    return this.buildConversationDto(userId, conversationId);
-  }
-
-  /** 独立群聊退群:座位置 leftAt;群主退群转给最早入群的在座成员。 */
   async leaveGroupConversation(
     userId: string,
     conversationId: string,
@@ -1928,6 +1698,14 @@ export class ChatService {
           errorCode: ChatErrorCode.ConversationNotFound,
         });
       }
+      await tx.notification.updateMany({
+        where: { toUserID: userId, read: false, fromGroupAdmission: { conversationID: conversation.id } },
+        data: { read: true },
+      });
+      await tx.notificationPushOutbox.updateMany({
+        where: { notification: { toUserID: userId, fromGroupAdmission: { conversationID: conversation.id } }, status: { in: ['PENDING', 'FAILED'] } },
+        data: { status: 'TERMINAL', processedAt: new Date(), lastError: 'group-member-left' },
+      });
       const actorSeat = await tx.chatMember.findUnique({
         where: {
           conversationID_userID: {
@@ -1995,9 +1773,6 @@ export class ChatService {
       conversationId: conversation.id,
       userId,
     });
-    void this.systemMessage
-      .emit(conversation.id, { kind: 'member-left' })
-      .catch(() => undefined);
     void this.groupEvents.record(conversation.id, {
       kind: 'member-left',
       actorId: userId,
@@ -2288,35 +2063,6 @@ export class ChatService {
     }
   }
 
-  /** 进群系统提示(带昵称;查不到昵称就不发,不发空名单刷屏)。 */
-  private async emitGroupJoinNotice(
-    conversationId: string,
-    joined: string[],
-  ): Promise<void> {
-    try {
-      const users = await this.prisma.user.findMany({
-        where: { id: { in: joined } },
-        select: { nickname: true },
-      });
-      const names = users.map((u) => u.nickname).filter(Boolean);
-      if (names.length > 0) {
-        await this.systemMessage.emit(conversationId, {
-          kind: 'member-joined',
-          names,
-        });
-      }
-    } catch (error) {
-      this.logger.warn(
-        sanitizeLogValue({
-          event: 'chat_group_join_notice_failed',
-          operation: 'emitGroupJoinNotice',
-          conversationId,
-          error,
-        }),
-      );
-    }
-  }
-
   /**
    * 群备注:我给这个群起的名字,**只有我看得见**(对应单聊的好友备注)。
    * 空串 = 清除,回落群名。与群昵称(alias)方向相反,两者互不影响。
@@ -2566,6 +2312,8 @@ export class ChatService {
         ? conversation.memberCanInvite
         : (circle?.memberCanInvite ?? true),
       qrJoinEnabled: conversation.qrJoinEnabled,
+      cardJoinEnabled: conversation.cardJoinEnabled,
+      joinApprovalRequired: conversation.joinApprovalRequired,
       membersCanViewRoster: conversation.membersCanViewRoster,
       membersCanViewProfiles: conversation.membersCanViewProfiles,
       membersCanAddFriends: conversation.membersCanAddFriends,

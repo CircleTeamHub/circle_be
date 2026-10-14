@@ -23,6 +23,7 @@ import { UserThrottlerGuard } from 'src/guards/user-throttler.guard';
 import { ChatGroupAdminService } from './chat-group-admin.service';
 import { ChatGroupEventService } from './chat-group-event.service';
 import { ChatGroupSettingsService } from './chat-group-settings.service';
+import { GroupAdmissionService } from './group-admission.service';
 import { ChatService } from './chat.service';
 import { ClearHistoryDto } from './dto/clear-history.dto';
 import {
@@ -78,6 +79,7 @@ import type {
 export class ChatController {
   constructor(
     private readonly chatService: ChatService,
+    private readonly admissions: GroupAdmissionService,
     private readonly groupAdmin: ChatGroupAdminService,
     private readonly groupEvents: ChatGroupEventService,
     private readonly groupSettings: ChatGroupSettingsService,
@@ -132,14 +134,19 @@ export class ChatController {
   @Post('conversations/group')
   @Throttle({ default: { limit: 10, ttl: 60_000 } })
   @ApiOperation({ summary: '创建独立群聊(不挂圈子;初始成员必须是好友)' })
-  createGroupConversation(
+  async createGroupConversation(
     @Req() req: RequestWithUser,
     @Body() body: CreateGroupConversationDto,
   ): Promise<ChatConversationDto> {
-    return this.chatService.createGroupConversation(req.user.userId, {
-      name: body.name,
-      memberIds: body.memberIds,
-    });
+    const conversation = await this.chatService.createGroupConversation(
+      req.user.userId,
+      {
+        name: body.name,
+        memberIds: body.memberIds,
+      },
+    );
+    await this.admissions.flush();
+    return conversation;
   }
 
   @Post('conversations/:id/members')
@@ -150,7 +157,7 @@ export class ChatController {
     @Param('id', ParseUUIDPipe) conversationId: string,
     @Body() body: InviteGroupMembersDto,
   ): Promise<ChatConversationDto> {
-    return this.chatService.inviteToGroupConversation(
+    return this.admissions.invite(
       req.user.userId,
       conversationId,
       body.memberIds,

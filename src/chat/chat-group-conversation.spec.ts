@@ -12,6 +12,8 @@ import { ChatService } from './chat.service';
  */
 describe('ChatService standalone group conversations', () => {
   const prisma = {
+    notification: { updateMany: jest.fn() },
+    notificationPushOutbox: { updateMany: jest.fn() },
     chatConversation: {
       findUnique: jest.fn(),
       create: jest.fn(),
@@ -27,6 +29,10 @@ describe('ChatService standalone group conversations', () => {
       update: jest.fn(),
       updateMany: jest.fn(),
     },
+    groupAdmission: {
+      create: jest.fn().mockResolvedValue({ id: 'admission-1' }),
+    },
+    groupAdmissionDelivery: { create: jest.fn() },
     chatMessage: { aggregate: jest.fn() },
     user: { findMany: jest.fn(), findUnique: jest.fn(), count: jest.fn() },
     friend: { findMany: jest.fn() },
@@ -192,7 +198,7 @@ describe('ChatService standalone group conversations', () => {
     expect(prisma.chatConversation.create).not.toHaveBeenCalled();
   });
 
-  it('creates a standalone group with owner, seats, rooms, and one notice', async () => {
+  it('creates only the owner seat and pending invitations for the selected friends', async () => {
     prisma.friend.findMany.mockResolvedValue(
       friendRows('owner-1', ['f1', 'f2']),
     );
@@ -214,14 +220,16 @@ describe('ChatService standalone group conversations', () => {
         membersCanViewRoster: true,
         membersCanViewProfiles: true,
         members: {
-          create: [{ userID: 'owner-1' }, { userID: 'f1' }, { userID: 'f2' }],
+          create: [{ userID: 'owner-1' }],
         },
       },
       select: { id: true },
     });
     // 三人各自入房 + 个人事件;建群提示只发一条 group-created,不逐人刷屏。
-    expect(broadcast.joinUserToConversation).toHaveBeenCalledTimes(3);
-    expect(broadcast.emitConversationChange).toHaveBeenCalledTimes(3);
+    expect(broadcast.joinUserToConversation).toHaveBeenCalledTimes(1);
+    expect(prisma.groupAdmission.create).toHaveBeenCalledTimes(2);
+    expect(prisma.groupAdmissionDelivery.create).toHaveBeenCalledTimes(2);
+    expect(broadcast.emitConversationChange).toHaveBeenCalledTimes(1);
     expect(systemMessage.emit).toHaveBeenCalledWith('conv-1', {
       kind: 'group-created',
     });
@@ -262,233 +270,26 @@ describe('ChatService standalone group conversations', () => {
       expect.objectContaining({
         data: expect.objectContaining({
           members: {
-            create: [
-              { userID: 'owner-1' },
-              { userID: friendId },
-              { userID: 'f2' },
-            ],
+            create: [{ userID: 'owner-1' }],
           },
         }),
       }),
     );
   });
 
-  it('rejects standalone-group operations on circle-managed groups', async () => {
-    prisma.chatMember.findUnique.mockResolvedValue(
-      seat({
-        conversation: { ...seat().conversation, circleID: 'circle-1' },
-      }),
-    );
-
+  it('legacy direct invitation and QR entry points cannot grant membership', async () => {
     await expect(
       service.inviteToGroupConversation('owner-1', 'conv-1', ['f1']),
     ).rejects.toMatchObject({
-      constructor: ForbiddenException,
-      response: { errorCode: ChatErrorCode.GroupCircleManaged },
+      response: { errorCode: 'CHAT_GROUP_ACCEPT_REQUIRED' },
     });
-  });
-
-  it('invite reactivates a left seat and raises its cleared floor', async () => {
-    prisma.chatMember.findUnique.mockResolvedValue(seat());
-    prisma.friend.findMany.mockResolvedValue(
-      friendRows('owner-1', ['f-back', 'f-seated']),
-    );
-    prisma.chatMember.findMany.mockResolvedValue([
-      // 退过群的:要复位并抬清空水位,退群前历史不回放。
-      { id: 'seat-left', userID: 'f-back', leftAt: new Date('2026-08-01') },
-      // 仍在座的:跳过,不重复建座位。
-      { id: 'seat-live', userID: 'f-seated', leftAt: null },
-    ]);
-    prisma.chatMessage.aggregate.mockResolvedValue({ _max: { height: 42 } });
-
-    await service.inviteToGroupConversation('owner-1', 'conv-1', [
-      'f-back',
-      'f-seated',
-    ]);
-
-    expect(prisma.chatMember.update).toHaveBeenCalledWith({
-      where: { id: 'seat-left' },
-      data: expect.objectContaining({
-        leftAt: null,
-        clearedBeforeHeight: 42,
-      }),
-    });
-    expect(prisma.chatMember.create).not.toHaveBeenCalled();
-    expect(systemMessage.emit).not.toHaveBeenCalledWith(
-      'conv-1',
-      expect.objectContaining({ kind: 'member-joined', names: ['f-seated'] }),
-    );
-  });
-
-  it('rejects an invite when target privacy changes to NONE before the transaction check', async () => {
-    prisma.chatMember.findUnique.mockResolvedValue(seat());
-    prisma.friend.findMany.mockResolvedValue(friendRows('owner-1', ['f1']));
-    prisma.userPrivacySetting.findMany.mockResolvedValue([
-      { userID: 'f1', groupInvitePermission: 'NONE' },
-    ]);
-    prisma.chatMember.findMany.mockResolvedValue([]);
-
     await expect(
-      service.inviteToGroupConversation('owner-1', 'conv-1', ['f1']),
+      service.joinStandaloneGroupViaQr('f1', 'conv-1'),
     ).rejects.toMatchObject({
-      constructor: ForbiddenException,
-      response: { errorCode: GroupErrorCode.InviteNotAllowed },
-    });
-    expect(prisma.chatMember.create).not.toHaveBeenCalled();
-  });
-
-  it('rejects an invite when the actor has left before the locked transaction check', async () => {
-    prisma.chatMember.findUnique.mockResolvedValue(seat());
-    prisma.friend.findMany.mockResolvedValue(friendRows('owner-1', ['f1']));
-    prisma.chatMember.findMany.mockResolvedValue([]);
-    prisma.$transaction.mockImplementation(
-      async (cb: (tx: typeof prisma) => unknown) =>
-        cb({
-          ...prisma,
-          chatMember: { ...prisma.chatMember, findUnique: jest.fn() },
-        } as typeof prisma),
-    );
-
-    await expect(
-      service.inviteToGroupConversation('owner-1', 'conv-1', ['f1']),
-    ).rejects.toMatchObject({
-      constructor: ForbiddenException,
-      response: { errorCode: ChatErrorCode.NotMember },
-    });
-    expect(prisma.chatMember.create).not.toHaveBeenCalled();
-  });
-
-  it('blocks ordinary members from inviting once memberCanInvite is off, owner still can', async () => {
-    prisma.$queryRaw.mockResolvedValue([
-      {
-        id: 'conv-1',
-        type: 'GROUP',
-        circleID: null,
-        ownerID: 'owner-1',
-        memberCanInvite: false,
-        clearedBeforeHeight: 0,
-      },
-    ]);
-    prisma.chatMember.findUnique.mockResolvedValue(seat({ userID: 'f1' }));
-
-    await expect(
-      service.inviteToGroupConversation('f1', 'conv-1', ['f2']),
-    ).rejects.toMatchObject({
-      constructor: ForbiddenException,
-      response: { errorCode: ChatErrorCode.GroupInviteDisabled },
-    });
-    expect(prisma.chatMember.create).not.toHaveBeenCalled();
-
-    // 群主不受「成员邀请」开关限制。
-    prisma.chatMember.findUnique.mockResolvedValue(seat());
-    prisma.friend.findMany.mockResolvedValue(friendRows('owner-1', ['f2']));
-    prisma.chatMember.findMany.mockResolvedValue([]);
-    prisma.chatMember.count.mockResolvedValue(2);
-    prisma.chatMember.create.mockResolvedValue({});
-    prisma.user.findMany.mockResolvedValue([{ nickname: '小方' }]);
-    await expect(
-      service.inviteToGroupConversation('owner-1', 'conv-1', ['f2']),
-    ).resolves.toEqual(conversationDto);
-    expect(prisma.chatMember.create).toHaveBeenCalled();
-  });
-
-  it('refuses QR joins once the owner turns qrJoinEnabled off', async () => {
-    prisma.chatConversation.findUnique.mockResolvedValue({
-      id: 'conv-1',
-      type: 'GROUP',
-      circleID: null,
-    });
-    prisma.$queryRaw.mockResolvedValue([
-      {
-        id: 'conv-1',
-        type: 'GROUP',
-        circleID: null,
-        qrJoinEnabled: false,
-        clearedBeforeHeight: 0,
-      },
-    ]);
-
-    await expect(
-      service.joinStandaloneGroupViaQr('scanner-1', 'conv-1'),
-    ).rejects.toMatchObject({
-      constructor: ForbiddenException,
-      response: { errorCode: ChatErrorCode.GroupQrJoinDisabled },
-    });
-    expect(prisma.chatMember.findFirst).not.toHaveBeenCalled();
-    expect(prisma.chatMember.create).not.toHaveBeenCalled();
-  });
-
-  it('rejects invitations that would exceed the 200-member cap', async () => {
-    prisma.chatMember.findUnique.mockResolvedValue(seat());
-    prisma.friend.findMany.mockResolvedValue(
-      friendRows('owner-1', ['f1', 'f2']),
-    );
-    prisma.$queryRaw.mockResolvedValue([
-      { id: 'conv-1', type: 'GROUP', circleID: null },
-    ]);
-    prisma.chatMember.findMany.mockResolvedValue([]);
-    prisma.chatMember.count.mockResolvedValue(199);
-
-    await expect(
-      service.inviteToGroupConversation('owner-1', 'conv-1', ['f1', 'f2']),
-    ).rejects.toMatchObject({
-      constructor: ConflictException,
-      response: { errorCode: ChatErrorCode.GroupFull },
+      response: { errorCode: 'CHAT_GROUP_ACCEPT_REQUIRED' },
     });
     expect(prisma.chatMember.create).not.toHaveBeenCalled();
     expect(prisma.chatMember.update).not.toHaveBeenCalled();
-  });
-
-  it('admits at most one concurrent QR join when 199 members are seated', async () => {
-    prisma.chatConversation.findUnique.mockResolvedValue({
-      id: 'conv-1',
-      type: 'GROUP',
-      circleID: null,
-    });
-    prisma.chatMember.findFirst.mockResolvedValue(null);
-
-    let seatedCount = 199;
-    prisma.chatMember.count.mockImplementation(async () => seatedCount);
-    prisma.chatMember.create.mockImplementation(async () => {
-      seatedCount += 1;
-      return { id: `seat-${seatedCount}` };
-    });
-
-    let lockTail = Promise.resolve();
-    prisma.$transaction.mockImplementation(
-      async (cb: (tx: typeof prisma) => unknown) => {
-        const previous = lockTail;
-        let releaseLock!: () => void;
-        lockTail = new Promise<void>((resolve) => {
-          releaseLock = resolve;
-        });
-        const tx = {
-          ...prisma,
-          $queryRaw: jest.fn(async () => {
-            await previous;
-            return [{ id: 'conv-1', type: 'GROUP', circleID: null }];
-          }),
-        };
-        try {
-          return await cb(tx as typeof prisma);
-        } finally {
-          releaseLock();
-        }
-      },
-    );
-
-    const results = await Promise.allSettled([
-      service.joinStandaloneGroupViaQr('u1', 'conv-1'),
-      service.joinStandaloneGroupViaQr('u2', 'conv-1'),
-    ]);
-
-    expect(
-      results.filter((result) => result.status === 'fulfilled'),
-    ).toHaveLength(1);
-    expect(
-      results.filter((result) => result.status === 'rejected'),
-    ).toHaveLength(1);
-    expect(seatedCount).toBe(200);
   });
 
   // 解散(微信语义):群主一按,群从所有人的列表里消失,所有人的记录一起没。
@@ -631,9 +432,7 @@ describe('ChatService standalone group conversations', () => {
       conversationId: 'conv-1',
       userId: 'owner-1',
     });
-    expect(systemMessage.emit).toHaveBeenCalledWith('conv-1', {
-      kind: 'member-left',
-    });
+    expect(systemMessage.emit).not.toHaveBeenCalledWith('conv-1', { kind: 'member-left' });
     // 群日志:退群 + 转让两条;新群主收 updated 刷新群设置入口。
     expect(groupEvents.record).toHaveBeenCalledWith('conv-1', {
       kind: 'member-left',

@@ -57,6 +57,15 @@ export class QrController {
     return this.qrService.resolveToken(req.user.userId, token);
   }
 
+  @Post('tokens/:token/accept')
+  @Throttle({ default: { limit: 20, ttl: 60_000 } })
+  acceptGroupInvitation(
+    @Req() req: RequestWithUser,
+    @Param('token') token: string,
+  ) {
+    return this.qrService.acceptGroupInvitation(req.user.userId, token);
+  }
+
   @Post('tokens/:token/join')
   @Throttle({ default: { limit: 15, ttl: 60_000 } })
   @ApiOperation({ summary: '扫码加入(群入座 / 圈子走邀请语义)' })

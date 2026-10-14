@@ -190,6 +190,7 @@ export type NotificationRealtimeDto = {
     firstImage: string | null;
   } | null;
   fromInvitation: { id: string; status: string } | null;
+  fromGroupAdmission?: { id: string; status: string } | null;
   requestId?: string | null;
 };
 
@@ -236,6 +237,7 @@ export const NOTIFICATION_REALTIME_INCLUDE = {
   fromCircle: { select: { id: true, name: true } },
   fromCirclePost: { select: { id: true, content: true, images: true } },
   fromInvitation: { select: { id: true, status: true } },
+  fromGroupAdmission: { select: { id: true, status: true } },
   fromFriendRequest: { select: { id: true } },
 } as const;
 
@@ -282,6 +284,14 @@ export function mapNotificationRealtimeDto(
     fromInvitation: n.fromInvitation
       ? { id: n.fromInvitation.id, status: n.fromInvitation.status }
       : null,
+    ...(n.fromGroupAdmission
+      ? {
+          fromGroupAdmission: {
+            id: n.fromGroupAdmission.id,
+            status: n.fromGroupAdmission.status,
+          },
+        }
+      : {}),
     requestId: n.fromFriendRequest?.id ?? null,
   };
 }

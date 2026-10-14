@@ -1,3 +1,4 @@
+import { GroupAdmissionService } from './group-admission.service';
 import {
   BadRequestException,
   type ExecutionContext,
@@ -55,6 +56,7 @@ describe('POST /chat/conversations/group HTTP pipeline', () => {
     const moduleRef = await Test.createTestingModule({
       controllers: [ChatController],
       providers: [
+        { provide: GroupAdmissionService, useValue: { flush: jest.fn().mockResolvedValue(undefined), invite: jest.fn() } },
         { provide: ChatService, useValue: chatService },
         { provide: ChatGroupAdminService, useValue: {} },
         { provide: ChatGroupEventService, useValue: {} },

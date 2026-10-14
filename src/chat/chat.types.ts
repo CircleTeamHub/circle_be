@@ -444,6 +444,8 @@ export interface ChatGroupPoliciesDto {
   memberCanInvite: boolean;
   /** 群二维码能否入群。 */
   qrJoinEnabled: boolean;
+  cardJoinEnabled: boolean;
+  joinApprovalRequired: boolean;
   /** 普通成员能否看到群成员名单本身。 */
   membersCanViewRoster: boolean;
   /** 普通成员能否从群里打开其他成员资料。 */

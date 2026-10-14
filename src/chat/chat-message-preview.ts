@@ -17,6 +17,7 @@ const MESSAGE_PREVIEW_LABELS: Record<string, string> = {
   'circle-card': '[圈子]',
   'plaza-post-card': '[帖子]',
   'qr-card': '[二维码]',
+  'group-invitation': '[群邀请]',
   'transfer-card': '[转账]',
   'verification-card': '[验证]',
   'call-record': '[通话]',
