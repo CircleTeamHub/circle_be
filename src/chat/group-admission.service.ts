@@ -899,6 +899,17 @@ export class GroupAdmissionService {
             });
             continue;
           }
+          if (
+            job.event === 'PENDING' &&
+            job.recipientID !== a.applicantID &&
+            !(await this.manager(this.prisma, group, job.recipientID))
+          ) {
+            await this.prisma.groupAdmissionDelivery.update({
+              where: { id: job.id },
+              data: { deliveredAt: new Date() },
+            });
+            continue;
+          }
           const name = group.name ?? '群聊';
           const copy: Record<string, string> = {
             INVITED: `邀请你加入「${name}」`,

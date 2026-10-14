@@ -236,6 +236,16 @@ describe('CircleInvitationService', () => {
       circleID: 'circle',
       circle: { name: 'Circle' },
     };
+    prisma.circle.findFirst.mockResolvedValue({
+      id: 'circle',
+      memberCanInvite: true,
+    });
+    prisma.circleMember.findUnique.mockResolvedValue({
+      status: 'ACTIVE',
+      role: 'OWNER',
+    });
+    prisma.block.findFirst.mockResolvedValue(null);
+    prisma.friend.findFirst.mockResolvedValue({ userID: 'inviter' });
     prisma.circleInvitation.findUnique.mockImplementation(
       async () => invitation,
     );
@@ -255,12 +265,51 @@ describe('CircleInvitationService', () => {
         (service as any).deliverConsentInvitation('consent'),
         (service as any).deliverConsentInvitation('consent'),
       ]);
-      expect(prisma.$executeRaw).toHaveBeenCalledTimes(2);
+      expect(prisma.$executeRaw).toHaveBeenCalledTimes(4);
       expect(chatMessages.insertServerMessage).toHaveBeenCalledTimes(1);
     } finally {
       prisma.$transaction.mockImplementation(original!);
     }
   });
+
+  it.each(['blocked', 'left', 'privacy'])(
+    'does not deliver a delayed circle invitation after eligibility changes: %s',
+    async (state) => {
+      prisma.circleInvitation.findUnique.mockResolvedValue({
+        id: 'delayed',
+        status: 'INVITED',
+        consentNoticeRequired: true,
+        consentNoticeDeliveredAt: null,
+        inviterID: 'inviter',
+        applicantID: 'applicant',
+        circleID: 'circle',
+        circle: { name: 'Circle' },
+      });
+      prisma.circle.findFirst.mockResolvedValue({
+        id: 'circle',
+        memberCanInvite: true,
+      });
+      prisma.circleMember.findUnique.mockResolvedValue(
+        state === 'left' ? null : { status: 'ACTIVE', role: 'OWNER' },
+      );
+      prisma.block.findFirst.mockResolvedValue(
+        state === 'blocked' ? { id: 'block' } : null,
+      );
+      privacySettings.canBeInvitedToGroupOrCircle.mockResolvedValue(
+        state !== 'privacy',
+      );
+      await (service as any).deliverConsentInvitation('delayed');
+      expect(chatMessages.insertServerMessage).not.toHaveBeenCalled();
+      expect(
+        notificationService.deliverCircleConsentNotification,
+      ).not.toHaveBeenCalled();
+      expect(prisma.circleInvitation.updateMany).toHaveBeenCalledWith(
+        expect.objectContaining({
+          data: expect.objectContaining({ status: 'CANCELLED' }),
+        }),
+      );
+    },
+  );
 
   it('does not send consent cards for an existing self-initiated application', async () => {
     prisma.circleInvitation.findUnique.mockResolvedValue({

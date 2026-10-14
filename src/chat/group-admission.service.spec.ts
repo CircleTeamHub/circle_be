@@ -659,3 +659,36 @@ test('notification failure does not block the admitted member joining the room',
   expect(h.broadcast.joinUserToConversation).toHaveBeenCalledWith('guest', 'g');
   expect(h.broadcast.emitConversationChange).toHaveBeenCalled();
 });
+
+test.each(['left', 'demoted'])(
+  'pending reviewer notifications are dropped when the reviewer was %s',
+  async (state) => {
+    const h = harness();
+    h.seats.set('reviewer', {
+      userID: 'reviewer',
+      role: 'ADMIN',
+      leftAt: null,
+    });
+    await h.service.apply('guest', 'g', 'Please join');
+    h.seats.set('reviewer', {
+      userID: 'reviewer',
+      role: 'MEMBER',
+      leftAt: state === 'left' ? new Date() : null,
+    });
+    h.tx.groupAdmissionDelivery.findMany.mockResolvedValue([
+      {
+        id: 'review',
+        admission: h.admissions.get('a0'),
+        recipientID: 'reviewer',
+        actorID: 'guest',
+        event: 'PENDING',
+        attempts: 0,
+      },
+    ]);
+    h.notifications.deliverGroupAdmissionNotification.mockClear();
+    await h.service.flush();
+    expect(
+      h.notifications.deliverGroupAdmissionNotification,
+    ).not.toHaveBeenCalled();
+  },
+);

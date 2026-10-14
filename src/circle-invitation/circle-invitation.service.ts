@@ -200,6 +200,67 @@ export class CircleInvitationService {
             invitation.status !== 'INVITED'
           )
             return;
+          await this.memberLock.lock(tx, invitation.circleID, [
+            invitation.inviterID,
+            invitation.applicantID,
+          ]);
+          await this.memberLock.lockPolicy(tx, invitation.circleID);
+          await lockUserRelationshipState(tx, [
+            invitation.inviterID,
+            invitation.applicantID,
+          ]);
+          const [circle, membership, blocked, friends] = await Promise.all([
+            tx.circle.findFirst({
+              where: { id: invitation.circleID, deleted: false },
+              select: { id: true, memberCanInvite: true },
+            }),
+            tx.circleMember.findUnique({
+              where: {
+                userID_circleID: {
+                  userID: invitation.inviterID,
+                  circleID: invitation.circleID,
+                },
+              },
+            }),
+            tx.block.findFirst({
+              where: {
+                OR: [
+                  {
+                    blockerID: invitation.inviterID,
+                    blockedID: invitation.applicantID,
+                  },
+                  {
+                    blockerID: invitation.applicantID,
+                    blockedID: invitation.inviterID,
+                  },
+                ],
+              },
+              select: { id: true },
+            }),
+            this.areFriends(invitation.inviterID, invitation.applicantID, tx),
+          ]);
+          const privacyAllowed =
+            await this.privacySettings.canBeInvitedToGroupOrCircle(
+              invitation.applicantID,
+              friends,
+            );
+          if (
+            !circle ||
+            membership?.status !== 'ACTIVE' ||
+            blocked ||
+            !privacyAllowed ||
+            (circle.memberCanInvite === false &&
+              !['OWNER', 'ADMIN'].includes(membership.role))
+          ) {
+            await tx.circleInvitation.updateMany({
+              where: { id, status: 'INVITED' },
+              data: {
+                status: 'CANCELLED',
+                consentNoticeDeliveredAt: new Date(),
+              },
+            });
+            return;
+          }
           await this.notificationService.deliverCircleConsentNotification({
             id,
             toUserID: invitation.applicantID,
