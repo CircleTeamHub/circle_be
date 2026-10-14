@@ -108,6 +108,7 @@ describe('CircleInvitationService', () => {
     canBeInvitedToGroupOrCircle: jest.fn(),
   };
   const notificationService = {
+    deliverCircleConsentNotification: jest.fn().mockResolvedValue(undefined),
     createCircleInvitationNotification: jest.fn(),
   };
   const admissionPolicy = {
@@ -207,6 +208,42 @@ describe('CircleInvitationService', () => {
     expect(deliver).not.toHaveBeenCalled();
     invite.mockRestore();
     deliver.mockRestore();
+  });
+
+  it('serializes concurrent consent workers and emits the card only once', async () => {
+    const invitation = {
+      id: 'consent',
+      consentNoticeRequired: true,
+      consentNoticeDeliveredAt: null,
+      applicantID: 'applicant',
+      inviterID: 'inviter',
+      circleID: 'circle',
+      circle: { name: 'Circle' },
+    };
+    prisma.circleInvitation.findUnique.mockImplementation(
+      async () => invitation,
+    );
+    prisma.circleInvitation.update.mockImplementation(async ({ data }) => {
+      Object.assign(invitation, data);
+      return invitation;
+    });
+    const original = prisma.$transaction.getMockImplementation();
+    let queue: Promise<unknown> = Promise.resolve();
+    prisma.$transaction.mockImplementation((operation: any) => {
+      const task = queue.then(() => operation(prisma));
+      queue = task.catch(() => {});
+      return task;
+    });
+    try {
+      await Promise.all([
+        (service as any).deliverConsentInvitation('consent'),
+        (service as any).deliverConsentInvitation('consent'),
+      ]);
+      expect(prisma.$executeRaw).toHaveBeenCalledTimes(2);
+      expect(chatMessages.insertServerMessage).toHaveBeenCalledTimes(1);
+    } finally {
+      prisma.$transaction.mockImplementation(original!);
+    }
   });
 
   it('does not send consent cards for an existing self-initiated application', async () => {

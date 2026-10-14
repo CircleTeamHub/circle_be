@@ -592,3 +592,21 @@ test('cannot apply after the final owner has left the group', async () => {
   await expect(h.service.apply('guest', 'g', '')).rejects.toThrow();
   expect(h.admissions.size).toBe(0);
 });
+
+test('a blocked global delivery job cannot delay a committed invitation response', async () => {
+  const h = harness();
+  const delivery = jest
+    .spyOn(h.service, 'flush')
+    .mockReturnValue(new Promise(() => {}));
+  await expect(h.service.invite('owner', 'g', ['guest'])).resolves.toEqual({
+    id: 'g',
+  });
+  expect(h.admissions.size).toBe(1);
+  delivery.mockRestore();
+});
+
+test('dissolved group previews are unavailable even while ownerID remains stored', async () => {
+  const h = harness();
+  h.seats.get('owner').leftAt = new Date();
+  await expect(h.service.preview('guest', 'g')).rejects.toThrow();
+});

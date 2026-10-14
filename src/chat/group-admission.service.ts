@@ -220,7 +220,12 @@ export class GroupAdmissionService {
         await this.event(tx, a, actor, 'INVITED', [user]);
       }
     });
-    await this.flush();
+    void this.flush().catch(() =>
+      this.logger.warn({
+        event: 'group_admission_delivery_trigger_failed',
+        retryScheduled: true,
+      }),
+    );
     return this.chat.getGroupConversationForMember(actor, group);
   }
   async preview(user: string, id: string) {
@@ -257,6 +262,12 @@ export class GroupAdmissionService {
       };
     }
     if (!g || g.type !== 'GROUP' || g.circleID || !g.ownerID)
+      throw new NotFoundException({
+        message: '群聊不存在或已解散',
+        errorCode: 'CHAT_CONVERSATION_NOT_FOUND',
+      });
+    const owner = await this.member(this.prisma, id, g.ownerID);
+    if (!owner || owner.leftAt)
       throw new NotFoundException({
         message: '群聊不存在或已解散',
         errorCode: 'CHAT_CONVERSATION_NOT_FOUND',
@@ -327,7 +338,12 @@ export class GroupAdmissionService {
       await this.event(tx, a, user, 'PENDING', await this.reviewers(tx, g));
       return a;
     });
-    await this.flush();
+    void this.flush().catch(() =>
+      this.logger.warn({
+        event: 'group_admission_delivery_trigger_failed',
+        retryScheduled: true,
+      }),
+    );
     return a
       ? this.detail(user, a.id)
       : { status: 'JOINED', conversationId: id };
@@ -446,7 +462,12 @@ export class GroupAdmissionService {
         await this.event(tx, a, user, 'PENDING', await this.reviewers(tx, g));
       return a;
     });
-    await this.flush();
+    void this.flush().catch(() =>
+      this.logger.warn({
+        event: 'group_admission_delivery_trigger_failed',
+        retryScheduled: true,
+      }),
+    );
     return {
       type: 'GROUP' as const,
       status:
@@ -529,7 +550,12 @@ export class GroupAdmissionService {
     });
     if (action === 'approve' || action === 'reject')
       await this.finishReviewNotices(id);
-    await this.flush();
+    void this.flush().catch(() =>
+      this.logger.warn({
+        event: 'group_admission_delivery_trigger_failed',
+        retryScheduled: true,
+      }),
+    );
     return this.detail(user, id);
   }
   private async finishReviewNotices(id: string) {
