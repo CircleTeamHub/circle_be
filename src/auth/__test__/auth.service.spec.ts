@@ -160,6 +160,14 @@ describe('AuthService', () => {
   beforeEach(async () => {
     users.length = 0;
     jest.clearAllMocks();
+    mockRefreshTokenService.findSessionDeviceKey.mockImplementation(
+      async (_userId: string, sessionId: string) =>
+        `device-key-of-${sessionId}`,
+    );
+    mockDeviceTrust.loadForSecurityCode.mockResolvedValue({
+      userId: 'uuid-1',
+      deviceKey: 'new-device',
+    } as never);
     mockPrisma.adminAccess.findUnique.mockResolvedValue({
       role: 'SUPER_ADMIN',
     });
@@ -1024,13 +1032,16 @@ describe('AuthService', () => {
     expect(mockPrisma.user.update).not.toHaveBeenCalled();
   });
 
-  it('keeps device trust when the current session has no bound device', async () => {
+  it('revokes all device trust when the current session has no bound device', async () => {
     mockRefreshTokenService.findSessionDeviceKey.mockResolvedValueOnce(
       null as never,
     );
     await service.logoutOtherSessions('uuid-1', 'session-1');
 
-    expect(mockDeviceTrust.revokeOtherDevices).not.toHaveBeenCalled();
+    expect(mockDeviceTrust.revokeOtherDevices).toHaveBeenCalledWith(
+      'uuid-1',
+      null,
+    );
   });
 
   it('does not issue tokens when the device needs verification', async () => {
@@ -1080,6 +1091,116 @@ describe('AuthService', () => {
     ).rejects.toThrow(ForbiddenException);
     // 错密码不能触发受信任设备弹窗，否则谁都能拿别人的账号名刷弹窗。
     expect(mockDeviceTrust.evaluateLogin).not.toHaveBeenCalled();
+  });
+
+  it('serializes challenge completion through token issuance before recovery', async () => {
+    users.push({
+      id: 'uuid-1',
+      accountId: 'AAA111',
+      passwordHash: 'x',
+      status: 'ACTIVE',
+      role: 'USER',
+      singleDeviceLoginEnabled: false,
+    });
+    let consumed!: () => void;
+    const consumedBarrier = new Promise<void>((resolve) => {
+      consumed = resolve;
+    });
+    let release!: () => void;
+    const pause = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    mockDeviceTrust.consumeWithCode.mockImplementationOnce(async () => {
+      consumed();
+      await pause;
+      return { userId: 'uuid-1', deviceKey: 'new-device' };
+    });
+    const original = mockPrisma.$transaction.getMockImplementation();
+    let queue: Promise<unknown> = Promise.resolve();
+    mockPrisma.$transaction.mockImplementation((operation: any) => {
+      const task = queue.then(() => operation(mockPrisma));
+      queue = task.catch(() => {});
+      return task;
+    });
+    try {
+      const login = service.verifyLoginChallengeCode('challenge', '123456', {
+        deviceKey: 'new-device',
+      });
+      await consumedBarrier;
+      const recovery = service.logoutAll('uuid-1');
+      await Promise.resolve();
+      expect(mockDeviceTrust.invalidateChallenges).not.toHaveBeenCalled();
+      release();
+      await Promise.all([login, recovery]);
+      expect(mockPrisma.$executeRaw).toHaveBeenCalledTimes(2);
+      expect(
+        mockRefreshTokenService.createAppSession.mock.invocationCallOrder[0],
+      ).toBeLessThan(
+        mockRefreshTokenService.revokeAll.mock.invocationCallOrder[0],
+      );
+    } finally {
+      mockPrisma.$transaction.mockImplementation(original!);
+    }
+  });
+
+  it('does not evaluate trusted login until overlapping device removal has finished', async () => {
+    users.push({
+      id: 'uuid-1',
+      accountId: 'aaa111',
+      passwordHash: await argon2.hash('password1'),
+      status: 'ACTIVE',
+      role: 'USER',
+      singleDeviceLoginEnabled: false,
+    });
+    let removing!: () => void;
+    const started = new Promise<void>((resolve) => {
+      removing = resolve;
+    });
+    let release!: () => void;
+    const pause = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    mockRefreshTokenService.findSessionDeviceKey.mockResolvedValue('removed');
+    mockRefreshTokenService.revokeSession.mockImplementationOnce(async () => {
+      removing();
+      await pause;
+    });
+    const original = mockPrisma.$transaction.getMockImplementation();
+    let queue: Promise<unknown> = Promise.resolve();
+    mockPrisma.$transaction.mockImplementation((operation: any) => {
+      const task = queue.then(() => operation(mockPrisma));
+      queue = task.catch(() => {});
+      return task;
+    });
+    mockDeviceTrust.evaluateLogin.mockResolvedValueOnce({
+      kind: 'challenge',
+      challenge: {
+        id: 'new',
+        expiresAt: new Date().toISOString(),
+        securityCodeAvailable: false,
+      },
+    } as never);
+    try {
+      const removal = service.logoutSession('uuid-1', 'other');
+      await started;
+      const login = service.login(
+        { identifier: 'AAA111', password: 'password1' },
+        {
+          deviceKey: 'removed',
+        },
+      );
+      await new Promise(setImmediate);
+      expect(mockDeviceTrust.evaluateLogin).not.toHaveBeenCalled();
+      release();
+      await removal;
+      const result = await login;
+      expect(result).toHaveProperty('deviceVerificationRequired', true);
+      expect(
+        mockDeviceTrust.revokeDevice.mock.invocationCallOrder[0],
+      ).toBeLessThan(mockDeviceTrust.evaluateLogin.mock.invocationCallOrder[0]);
+    } finally {
+      mockPrisma.$transaction.mockImplementation(original!);
+    }
   });
 
   it('issues tokens and trusts the device after a correct challenge code', async () => {
@@ -1480,7 +1601,11 @@ describe('AuthService', () => {
       transaction: prismaAny.$transaction,
       refreshToken: prismaAny.refreshToken,
     };
-    prismaAny.$transaction = jest.fn(() => Promise.resolve([]));
+    prismaAny.$transaction = jest.fn(async (operation: any) =>
+      typeof operation === 'function'
+        ? operation(prismaAny)
+        : Promise.all(operation),
+    );
     prismaAny.refreshToken = { updateMany: jest.fn() };
     (mockRefreshTokenService as any).revokeAllAccessMarkers = jest.fn(() =>
       Promise.resolve(),
