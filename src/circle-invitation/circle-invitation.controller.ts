@@ -58,6 +58,31 @@ export class CircleInvitationController {
     );
   }
 
+  @Post(':id/seen')
+  @Throttle({ default: { limit: 60, ttl: 60_000 } })
+  seen(@Param('id', ParseUUIDPipe) id: string, @Req() req: RequestWithUser) {
+    return this.invitationService.markInvitationSeen(req.user.userId, id);
+  }
+
+  @Post(':id/accept')
+  @Throttle({ default: { limit: 20, ttl: 60_000 } })
+  accept(@Param('id', ParseUUIDPipe) id: string, @Req() req: RequestWithUser) {
+    return this.invitationService.respondToInvitation(
+      req.user.userId,
+      id,
+      true,
+    );
+  }
+  @Post(':id/decline')
+  @Throttle({ default: { limit: 20, ttl: 60_000 } })
+  decline(@Param('id', ParseUUIDPipe) id: string, @Req() req: RequestWithUser) {
+    return this.invitationService.respondToInvitation(
+      req.user.userId,
+      id,
+      false,
+    );
+  }
+
   @Get('pending')
   @ApiOperation({ summary: 'My pending verification requests (as verifier)' })
   @ApiOkResponse({ type: [InvitationDto] })

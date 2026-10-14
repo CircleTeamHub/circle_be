@@ -593,7 +593,7 @@ export class ChatCircleSyncService {
         });
       }),
     );
-    // 进/退群系统提示:初始建会话是存量播种,不逐人刷屏;之后的增量变化才提示。
+    // Initial seeding is silent; subsequent membership changes only write group logs.
     if (!result.created) {
       void this.emitMembershipNotices(
         result.conversationId,
@@ -728,20 +728,6 @@ export class ChatCircleSyncService {
         actorId: userId,
         targetIds: [userId],
       });
-      void this.systemMessage
-        .emit(conversationId, { kind: 'member-left' })
-        .catch((error: unknown) =>
-          attemptDiagnostic(() =>
-            this.logger.warn(
-              sanitizeLogValue({
-                event: 'chat_circle_sync_failed',
-                operation: 'member_left_notice',
-                conversationId,
-                error,
-              }),
-            ),
-          ),
-        );
     }
     // Manager removal can continue even if both cleanup dispatches failed:
     // its detailed log explicitly excludes the target and all chat:msg
@@ -790,7 +776,7 @@ export class ChatCircleSyncService {
     }
   }
 
-  /** 结构化系统提示:本地化留给前端 im.notification.* 词表。 */
+  /** Membership changes are recorded in the group log without chat messages. */
   private async emitMembershipNotices(
     conversationId: string,
     joined: string[],
@@ -804,17 +790,6 @@ export class ChatCircleSyncService {
           actorId: null,
           targetIds: joined,
         });
-        const users = await this.prisma.user.findMany({
-          where: { id: { in: joined } },
-          select: { nickname: true },
-        });
-        const names = users.map((u) => u.nickname).filter(Boolean);
-        if (names.length > 0) {
-          await this.systemMessage.emit(conversationId, {
-            kind: 'member-joined',
-            names,
-          });
-        }
       }
       if (removed.length > 0) {
         await this.groupEvents.record(conversationId, {
@@ -822,10 +797,6 @@ export class ChatCircleSyncService {
           actorId: null,
           targetIds: removed,
         });
-      }
-      // 对账器分不清退出还是被移出,统一「有成员退出群聊」措辞。
-      for (let i = 0; i < removed.length; i += 1) {
-        await this.systemMessage.emit(conversationId, { kind: 'member-left' });
       }
     } catch (error) {
       attemptDiagnostic(() =>

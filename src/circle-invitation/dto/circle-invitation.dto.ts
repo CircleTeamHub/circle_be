@@ -74,6 +74,7 @@ export class InvitationVerifierDto {
 }
 
 export class InvitationDto {
+  unreadCount?: number;
   id: string;
   circleId: string;
   circleName: string;
@@ -81,7 +82,13 @@ export class InvitationDto {
   inviter: InvitationUserDto;
   requiredCount: number;
   approvedCount: number;
-  status: 'PENDING' | 'APPROVED' | 'REJECTED' | 'ADMIN_APPROVED' | 'CANCELLED';
+  status:
+    | 'INVITED'
+    | 'PENDING'
+    | 'APPROVED'
+    | 'REJECTED'
+    | 'ADMIN_APPROVED'
+    | 'CANCELLED';
   verifiers: InvitationVerifierDto[];
   createdAt: string;
 }

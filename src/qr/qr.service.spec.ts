@@ -40,6 +40,7 @@ describe('QrService', () => {
       prisma as any,
       chatService as any,
       circleInvitation as any,
+      {} as any,
     );
   });
 
@@ -415,25 +416,18 @@ describe('QrService', () => {
       );
     });
 
-    it('seats the scanner into a standalone group', async () => {
+    it('the legacy join endpoint cannot admit a group scanner without explicit acceptance', async () => {
       prisma.qrToken.findUnique.mockResolvedValue({
         type: 'GROUP',
         targetID: 'conv-1',
-        issuerID: 'u2',
+        issuerID: 'issuer-1',
         revokedAt: null,
         expiresAt: new Date(Date.now() + 1000_000),
       });
-      chatService.joinStandaloneGroupViaQr.mockResolvedValue({ id: 'conv-1' });
-
-      await expect(service.joinByToken('u1', 'tok')).resolves.toEqual({
-        type: 'GROUP',
-        conversationId: 'conv-1',
-        status: 'JOINED',
+      await expect(service.joinByToken('u1', 'tok')).rejects.toMatchObject({
+        response: { errorCode: 'CHAT_GROUP_ACCEPT_REQUIRED' },
       });
-      expect(chatService.joinStandaloneGroupViaQr).toHaveBeenCalledWith(
-        'u1',
-        'conv-1',
-      );
+      expect(chatService.joinStandaloneGroupViaQr).not.toHaveBeenCalled();
     });
 
     it('refuses circle QR joins once the circle conversation switched QR joining off', async () => {

@@ -339,6 +339,9 @@ export const ChatHistoryErrorCode = {
 // 自研聊天(src/chat):REST 与 socket ack 共用同一批码。
 // (注:前端 serverErrors 词条随 FE 接线批次补齐。)
 export const ChatErrorCode = {
+  GroupAcceptRequired: 'CHAT_GROUP_ACCEPT_REQUIRED',
+  GroupInvitationInvalid: 'CHAT_GROUP_INVITATION_INVALID',
+  GroupApplicationDisabled: 'CHAT_GROUP_APPLICATION_DISABLED',
   ConversationNotFound: 'CHAT_CONVERSATION_NOT_FOUND',
   NotMember: 'CHAT_NOT_MEMBER',
   MemberDirectoryForbidden: 'CHAT_MEMBER_DIRECTORY_FORBIDDEN',

@@ -119,6 +119,7 @@ export const SERVER_MESSAGE_TYPES: readonly string[] = [
   SYSTEM_MESSAGE_TYPE,
   'transfer-card',
   'verification-card',
+  'group-invitation',
   'call-record',
 ];
 

@@ -1,3 +1,4 @@
+import { CircleInvitationService } from 'src/circle-invitation/circle-invitation.service';
 import { ADMIN_ROLE_PERMISSIONS } from 'src/admin-access/admin-permission.guard';
 import {
   BadRequestException,
@@ -6,7 +7,6 @@ import {
   Injectable,
   Logger,
   NotFoundException,
-  ServiceUnavailableException,
 } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import {
@@ -38,7 +38,6 @@ import {
 import { ReportGroupDto } from './dto/group-report.dto';
 import { createLoggingConfig } from 'src/logging/logging.config';
 import { logBusinessEvent } from 'src/logging/business-event.logger';
-import { reportOperationalError } from 'src/logging/error-aggregation.service';
 
 type GroupMemberSyncResult = { handled: boolean };
 type CircleGroupLookup = {
@@ -71,6 +70,7 @@ export class GroupService {
     private readonly systemMessage: ChatSystemMessageService,
     private readonly groupEvents: ChatGroupEventService,
     private readonly config: ConfigService,
+    private readonly circleInvitations: CircleInvitationService,
   ) {
     this.storagePublicObjectBases = storagePublicObjectBasesFromConfig(
       this.config,
@@ -413,77 +413,7 @@ export class GroupService {
       (userID) => userID !== actorId,
     );
 
-    const auditGroupID = this.auditGroupID(circle, normalizedGroupID);
-    let activatedCircleId: string | null = null;
-    await runSerializableTransaction(this.prisma, async (tx) => {
-      await this.memberLock.lock(tx, circle.id, [actorId, ...targetUserIDs]);
-      const [actor, existingMemberships] = await Promise.all([
-        tx.circleMember.findUnique({
-          where: {
-            userID_circleID: { userID: actorId, circleID: circle.id },
-          },
-          select: { id: true, role: true, status: true },
-        }),
-        tx.circleMember.findMany({
-          where: {
-            circleID: circle.id,
-            userID: { in: targetUserIDs },
-          },
-          select: { userID: true, status: true },
-        }),
-      ]);
-      this.assertCanManageCircleGroup(actor, null);
-
-      const existingByUserID = new Map(
-        existingMemberships.map((membership) => [
-          membership.userID,
-          membership.status,
-        ]),
-      );
-      const invitableUserIDs = targetUserIDs.filter(
-        (userID) => existingByUserID.get(userID) !== CircleMemberStatus.ACTIVE,
-      );
-      if (invitableUserIDs.length === 0) return;
-
-      await this.assertInviteTargetsAllowInvites(tx, actorId, invitableUserIDs);
-      // invitableUserIDs 是被 actorId 拉进群的其他人：加入上限被触发时错误回给
-      // actorId，不能带上别人的额度细节。
-      const activatingUserIDs = await this.admissionPolicy.activateMembers(
-        tx,
-        circle.id,
-        invitableUserIDs,
-        { locksHeld: true, actor: 'third-party' },
-      );
-      if (activatingUserIDs.length === 0) {
-        return;
-      }
-      activatedCircleId = circle.id;
-    });
-
-    // 座位不等对账:激活提交后立刻触发一次幂等 ensure。
-    // 失败必须排进对账重试队列,不能只记日志 —— 对账扫的是
-    // `CircleMember.updatedAt` 的 2 分钟窗口,一次更久的数据库故障过后,
-    // 这次激活早已滑出窗口,被邀请的人会一直是没有聊天座位的正式成员。
-    // (邀请审批那条路径已经这么做了,这里漏了。)
-    if (activatedCircleId) {
-      const circleId = activatedCircleId;
-      void this.chatCircleSync
-        .ensureCircleConversation(circleId)
-        .catch((error: unknown) => {
-          this.chatCircleSync.scheduleRetry(circleId);
-          this.logger.warn(
-            `invite seat sync failed circle=${circleId} (queued for retry): ${
-              error instanceof Error ? error.message : String(error)
-            }`,
-          );
-          reportOperationalError(error, {
-            component: 'GroupService',
-            operation: 'inviteGroupMembers',
-            kind: 'chat_sync',
-          });
-        });
-    }
-
+    await this.circleInvitations.inviteBatch(actorId, targetUserIDs, circle.id);
     return { handled: true };
   }
 
@@ -995,68 +925,6 @@ export class GroupService {
   /** 审计元数据里的对外群号:沿用 Circle.groupID(=== circle.id),兼容历史行。 */
   private auditGroupID(circle: CircleGroupLookup, fallbackGroupID: string) {
     return circle.groupID ?? fallbackGroupID;
-  }
-
-  private async assertInviteTargetsAllowInvites(
-    tx: Prisma.TransactionClient,
-    inviterId: string,
-    targetUserIDs: string[],
-  ): Promise<void> {
-    const [friendships, privacyRows, blockRow] = await Promise.all([
-      tx.friend.findMany({
-        where: {
-          state: 'ACCEPTED',
-          OR: [
-            { userID: inviterId, friendID: { in: targetUserIDs } },
-            { friendID: inviterId, userID: { in: targetUserIDs } },
-          ],
-        },
-        select: { userID: true, friendID: true },
-      }),
-      tx.userPrivacySetting.findMany({
-        where: { userID: { in: targetUserIDs } },
-        select: { userID: true, groupInvitePermission: true },
-      }),
-      // 拉黑是比邀请权限更硬的意愿表达，两个方向都拦（同 circle-invitation）。
-      // 读在事务内、取锁之后，与并发拉黑严格串行。
-      tx.block.findFirst({
-        where: {
-          OR: [
-            { blockerID: inviterId, blockedID: { in: targetUserIDs } },
-            { blockedID: inviterId, blockerID: { in: targetUserIDs } },
-          ],
-        },
-        select: { id: true },
-      }),
-    ]);
-    // 与隐私拒绝共用同一个错误码：单独一个码就把这个接口做成了「他拉黑了你」的探针。
-    if (blockRow) {
-      throw new ForbiddenException({
-        message: 'User does not allow group invites',
-        errorCode: GroupErrorCode.InviteNotAllowed,
-      });
-    }
-    const friendSet = new Set(
-      friendships.map((record) =>
-        record.userID === inviterId ? record.friendID : record.userID,
-      ),
-    );
-    const permissionByUserID = new Map(
-      privacyRows.map((row) => [row.userID, row.groupInvitePermission]),
-    );
-    const blocked = targetUserIDs.some((targetUserID) => {
-      const permission = permissionByUserID.get(targetUserID) ?? 'EVERYONE';
-      return (
-        permission === 'NONE' ||
-        (permission === 'FRIENDS_ONLY' && !friendSet.has(targetUserID))
-      );
-    });
-    if (blocked) {
-      throw new ForbiddenException({
-        message: 'User does not allow group invites',
-        errorCode: GroupErrorCode.InviteNotAllowed,
-      });
-    }
   }
 
   private uniqueIDs(ids: string[]): string[] {

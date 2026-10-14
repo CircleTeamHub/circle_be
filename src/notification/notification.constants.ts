@@ -77,6 +77,8 @@ export const FRIEND_REQUEST_NOTIFICATION_TYPES = compactNotificationTypes([
  */
 export const DISCOVER_NOTIFICATION_TYPES = compactNotificationTypes([
   ...FRIEND_REQUEST_NOTIFICATION_TYPES,
+  NotificationType.GROUP_ADMISSION,
+  NotificationType.CIRCLE_INVITATION_RECEIVED,
   ...MOMENT_NOTIFICATION_TYPES,
   ...CIRCLE_NOTIFICATION_TYPES,
 ] as const);

@@ -3,13 +3,11 @@ import {
   ConflictException,
   ForbiddenException,
   NotFoundException,
-  ServiceUnavailableException,
 } from '@nestjs/common';
 import { GUARDS_METADATA } from '@nestjs/common/constants';
 import { ThrottlerGuard } from '@nestjs/throttler';
 import { plainToInstance } from 'class-transformer';
 import { validateSync } from 'class-validator';
-import { GroupErrorCode } from 'src/common/app-error-codes';
 import { CircleMemberRole, CircleMemberStatus } from 'src/generated/prisma';
 import { JwtGuard } from 'src/guards/jwt.guard';
 import { GroupController } from './group.controller';
@@ -64,6 +62,10 @@ describe('GroupService reportGroup', () => {
     broadcastSystemMessageExcludingUsers: jest.Mock;
   };
   let service: GroupService;
+  const circleInvitations = {
+    inviteBatch: jest.fn().mockResolvedValue(undefined),
+    invite: jest.fn().mockResolvedValue({ id: 'i' }),
+  };
   // 举报证据的本站存储前缀:path-style 默认桶 circle → http://10.0.0.195:9000/circle
   const config = {
     get: jest.fn((key: string) =>
@@ -152,6 +154,7 @@ describe('GroupService reportGroup', () => {
       chatSystemMessage as any,
       groupEvents as any,
       config as any,
+      circleInvitations as any,
     );
   });
 
@@ -223,6 +226,7 @@ describe('GroupService reportGroup', () => {
         chatSystemMessage as any,
         groupEvents as any,
         { get: jest.fn(() => null) } as any,
+        { invite: jest.fn() } as any,
       );
 
       await report(['https://cdn.example/proof.png'], unguarded);
@@ -513,514 +517,37 @@ describe('GroupService reportGroup', () => {
     expect(serviceMock.leaveGroup).toHaveBeenCalledWith('user-1', 'group-1');
   });
 
-  it('invites circle group members through backend state and queues OpenIM sync', async () => {
+  it('delegates circle invitations to the consent flow without activating members', async () => {
     prisma.circle.findFirst.mockResolvedValue({
       id: 'circle-1',
       groupID: 'group-1',
-      ownerID: 'owner-1',
     });
-    prisma.circleMember.findUnique.mockResolvedValue({
-      id: 'actor-member',
-      role: CircleMemberRole.ADMIN,
-      status: CircleMemberStatus.ACTIVE,
-    });
-    prisma.circleMember.findMany.mockResolvedValue([
-      {
-        userID: 'existing-pending',
-        status: CircleMemberStatus.PENDING,
-      },
-    ]);
-    prisma.circle.findUnique.mockResolvedValue({
-      maxMembers: null,
-      memberCount: 5,
-    });
-    prisma.circleMember.updateMany.mockResolvedValue({ count: 1 });
-    prisma.circleMember.createMany.mockResolvedValue({ count: 1 });
-    prisma.circle.update.mockResolvedValue({});
-
     await expect(
-      service.inviteGroupMembers('admin-1', 'group-1', {
-        userIDs: ['new-user', 'existing-pending', 'new-user', '  '],
+      service.inviteGroupMembers('owner-1', 'group-1', {
+        userIDs: ['guest', 'guest', 'owner-1'],
       }),
     ).resolves.toEqual({ handled: true });
-
-    expect(prisma.circleMember.findUnique).toHaveBeenCalledWith({
-      where: { userID_circleID: { userID: 'admin-1', circleID: 'circle-1' } },
-      select: { id: true, role: true, status: true },
-    });
-    expect(prisma.circleMember.findMany).toHaveBeenCalledWith({
-      where: {
-        circleID: 'circle-1',
-        userID: { in: ['new-user', 'existing-pending'] },
-      },
-      select: { userID: true, status: true },
-    });
-    expect(memberLock.lock).toHaveBeenCalledWith(prisma, 'circle-1', [
-      'admin-1',
-      'new-user',
-      'existing-pending',
-    ]);
-    expect(memberLock.lock.mock.invocationCallOrder[0]).toBeLessThan(
-      prisma.circleMember.findUnique.mock.invocationCallOrder[0],
-    );
-    // Membership writes and locks are owned by the admission policy.
-    expect(prisma.$executeRaw).not.toHaveBeenCalled();
-    expect(prisma.circleMember.createMany).not.toHaveBeenCalled();
-    expect(prisma.circleMember.updateMany).not.toHaveBeenCalled();
-    expect(prisma.circleMember.create).not.toHaveBeenCalled();
-    expect(prisma.circleMember.update).not.toHaveBeenCalled();
-    expect(prisma.$queryRaw).not.toHaveBeenCalled();
-    expect(prisma.circle.update).not.toHaveBeenCalled();
-    expect(admissionPolicy.activateMembers).toHaveBeenCalledWith(
-      prisma,
+    expect(circleInvitations.inviteBatch).toHaveBeenCalledTimes(1);
+    expect(circleInvitations.inviteBatch).toHaveBeenCalledWith(
+      'owner-1',
+      ['guest'],
       'circle-1',
-      ['new-user', 'existing-pending'],
-      { locksHeld: true, actor: 'third-party' },
     );
-  });
-
-  // Regression: memberCount used to be incremented by the size of the
-  // pre-transaction snapshot, so a target that joined concurrently was counted
-  // a second time and the circle drifted permanently.
-  it('derives the memberCount increment from the rows the writes changed', async () => {
-    admissionPolicy.activateMembers.mockResolvedValueOnce(['new-user']);
-    prisma.circle.findFirst.mockResolvedValue({
-      id: 'circle-1',
-      groupID: 'group-1',
-      ownerID: 'owner-1',
-    });
-    prisma.circleMember.findUnique.mockResolvedValue({
-      id: 'actor-member',
-      role: CircleMemberRole.ADMIN,
-      status: CircleMemberStatus.ACTIVE,
-    });
-    // The complete request is locked before this authoritative read. The
-    // racer is now ACTIVE, so it stays idempotent while new-user is admitted.
-    prisma.circleMember.findMany.mockResolvedValue([
-      { userID: 'racer', status: CircleMemberStatus.ACTIVE },
-    ]);
-    prisma.circle.findUnique.mockResolvedValue({
-      maxMembers: null,
-      memberCount: 5,
-    });
-    prisma.circleMember.createMany.mockResolvedValue({ count: 1 });
-    prisma.circle.update.mockResolvedValue({});
-
-    await expect(
-      service.inviteGroupMembers('admin-1', 'group-1', {
-        userIDs: ['new-user', 'racer'],
-      }),
-    ).resolves.toEqual({ handled: true });
-
-    expect(prisma.circleMember.updateMany).not.toHaveBeenCalled();
-    expect(prisma.$queryRaw).not.toHaveBeenCalled();
-    expect(prisma.circle.update).not.toHaveBeenCalled();
-    expect(memberLock.lock).toHaveBeenCalledWith(prisma, 'circle-1', [
-      'admin-1',
-      'new-user',
-      'racer',
-    ]);
-    expect(admissionPolicy.activateMembers).toHaveBeenCalledWith(
-      prisma,
-      'circle-1',
-      ['new-user'],
-      { locksHeld: true, actor: 'third-party' },
-    );
-  });
-
-  it('does not admit a batch after the locked inviter has left', async () => {
-    prisma.circle.findFirst.mockResolvedValue({
-      id: 'circle-1',
-      groupID: 'group-1',
-      ownerID: 'owner-1',
-    });
-    prisma.circleMember.findUnique.mockResolvedValue(null);
-
-    await expect(
-      service.inviteGroupMembers('admin-1', 'group-1', {
-        userIDs: ['target-a', 'target-b'],
-      }),
-    ).rejects.toThrow(ForbiddenException);
-
-    expect(memberLock.lock).toHaveBeenCalledWith(prisma, 'circle-1', [
-      'admin-1',
-      'target-a',
-      'target-b',
-    ]);
     expect(admissionPolicy.activateMembers).not.toHaveBeenCalled();
-  });
-
-  it('rejects a group invite that would exceed the circle member limit', async () => {
-    admissionPolicy.activateMembers.mockRejectedValueOnce(
-      new BadRequestException('Circle has reached its member limit'),
-    );
-    prisma.circle.findFirst.mockResolvedValue({
-      id: 'circle-1',
-      groupID: 'group-1',
-      ownerID: 'owner-1',
-    });
-    prisma.circleMember.findUnique.mockResolvedValue({
-      id: 'actor-member',
-      role: CircleMemberRole.ADMIN,
-      status: CircleMemberStatus.ACTIVE,
-    });
-    prisma.circleMember.findMany.mockResolvedValue([]);
-    prisma.circle.findUnique.mockResolvedValue({
-      id: 'circle-1',
-      maxMembers: 10,
-      memberCount: 8,
-    });
-    prisma.circleMember.createMany.mockResolvedValue({ count: 3 });
-    prisma.$queryRaw.mockResolvedValue([]);
-
-    await expect(
-      service.inviteGroupMembers('admin-1', 'group-1', {
-        userIDs: ['a', 'b', 'c'],
-      }),
-    ).rejects.toThrow(BadRequestException);
-
-    expect(prisma.circleMember.createMany).not.toHaveBeenCalled();
-    expect(prisma.$queryRaw).not.toHaveBeenCalled();
-    expect(prisma.circle.update).not.toHaveBeenCalled();
-  });
-
-  it('admits a group invite that exactly fills the circle', async () => {
-    prisma.circle.findFirst.mockResolvedValue({
-      id: 'circle-1',
-      groupID: 'group-1',
-      ownerID: 'owner-1',
-    });
-    prisma.circleMember.findUnique.mockResolvedValue({
-      id: 'actor-member',
-      role: CircleMemberRole.ADMIN,
-      status: CircleMemberStatus.ACTIVE,
-    });
-    prisma.circleMember.findMany.mockResolvedValue([]);
-    prisma.circle.findUnique.mockResolvedValue({
-      maxMembers: 10,
-      memberCount: 8,
-    });
-    prisma.circleMember.createMany.mockResolvedValue({ count: 2 });
-    prisma.circle.update.mockResolvedValue({});
-
-    await expect(
-      service.inviteGroupMembers('admin-1', 'group-1', {
-        userIDs: ['a', 'b'],
-      }),
-    ).resolves.toEqual({ handled: true });
-
-    expect(admissionPolicy.activateMembers).toHaveBeenCalledWith(
-      prisma,
-      'circle-1',
-      ['a', 'b'],
-      { locksHeld: true, actor: 'third-party' },
-    );
-    expect(prisma.$queryRaw).not.toHaveBeenCalled();
-    expect(prisma.circle.update).not.toHaveBeenCalled();
-  });
-
-  it('leaves the whole direct-invite batch unwritten when one user is over joined quota', async () => {
-    prisma.circle.findFirst.mockResolvedValue({
-      id: 'circle-1',
-      groupID: 'group-1',
-      ownerID: 'owner-1',
-    });
-    prisma.circleMember.findUnique.mockResolvedValue({
-      id: 'actor-member',
-      role: CircleMemberRole.ADMIN,
-      status: CircleMemberStatus.ACTIVE,
-    });
-    prisma.circleMember.findMany.mockResolvedValue([]);
-    admissionPolicy.activateMembers.mockRejectedValueOnce(
-      new ForbiddenException({
-        // 这条路径以第三方视角调用，真实策略回的是不带额度细节的 target 码。
-        errorCode: 'CIRCLE_TARGET_JOIN_LIMIT_REACHED',
-      }),
-    );
-
-    await expect(
-      service.inviteGroupMembers('admin-1', 'group-1', {
-        userIDs: ['allowed-user', 'over-quota-user', 'allowed-user'],
-      }),
-    ).rejects.toThrow(ForbiddenException);
-
-    expect(admissionPolicy.activateMembers).toHaveBeenCalledWith(
-      prisma,
-      'circle-1',
-      ['allowed-user', 'over-quota-user'],
-      { locksHeld: true, actor: 'third-party' },
-    );
-    expect(prisma.circleMember.createMany).not.toHaveBeenCalled();
-    expect(prisma.circleMember.updateMany).not.toHaveBeenCalled();
-  });
-
-  it('triggers an immediate seat sync after invite activation instead of waiting for the cron', async () => {
-    prisma.circle.findFirst.mockResolvedValue({
-      id: 'circle-1',
-      groupID: 'group-1',
-      ownerID: 'owner-1',
-    });
-    prisma.circleMember.findUnique.mockResolvedValue({
-      id: 'actor-member',
-      role: CircleMemberRole.ADMIN,
-      status: CircleMemberStatus.ACTIVE,
-    });
-    prisma.circleMember.findMany.mockResolvedValue([]);
-    prisma.circle.findUnique.mockResolvedValue({
-      maxMembers: null,
-      memberCount: 5,
-    });
-
-    await expect(
-      service.inviteGroupMembers('admin-1', 'group-1', {
-        userIDs: ['new-user'],
-      }),
-    ).resolves.toEqual({ handled: true });
-
-    // 被拉进群的人不该等 ≤1min 的对账才拿到座位/收到消息。
-    expect(chatCircleSync.ensureCircleConversation).toHaveBeenCalledWith(
-      'circle-1',
-    );
-  });
-
-  it('skips the invite seat sync when nobody was actually activated', async () => {
-    prisma.circle.findFirst.mockResolvedValue({
-      id: 'circle-1',
-      groupID: 'group-1',
-      ownerID: 'owner-1',
-    });
-    prisma.circleMember.findUnique.mockResolvedValue({
-      id: 'actor-member',
-      role: CircleMemberRole.ADMIN,
-      status: CircleMemberStatus.ACTIVE,
-    });
-    prisma.circleMember.findMany.mockResolvedValue([]);
-    prisma.circle.findUnique.mockResolvedValue({
-      maxMembers: null,
-      memberCount: 5,
-    });
-    admissionPolicy.activateMembers.mockResolvedValueOnce([]);
-
-    await expect(
-      service.inviteGroupMembers('admin-1', 'group-1', {
-        userIDs: ['new-user'],
-      }),
-    ).resolves.toEqual({ handled: true });
-
     expect(chatCircleSync.ensureCircleConversation).not.toHaveBeenCalled();
   });
-
-  it('rejects circle group invites blocked by the target privacy setting', async () => {
+  it('propagates current invitation authorization/privacy failures without creating seats', async () => {
     prisma.circle.findFirst.mockResolvedValue({
       id: 'circle-1',
       groupID: 'group-1',
-      ownerID: 'owner-1',
     });
-    prisma.circleMember.findUnique.mockResolvedValue({
-      id: 'actor-member',
-      role: CircleMemberRole.ADMIN,
-      status: CircleMemberStatus.ACTIVE,
-    });
-    prisma.circleMember.findMany.mockResolvedValue([]);
-    prisma.userPrivacySetting.findMany.mockResolvedValue([
-      { userID: 'new-user', groupInvitePermission: 'NONE' },
-    ]);
-
+    circleInvitations.inviteBatch.mockRejectedValueOnce(
+      new ForbiddenException('not allowed'),
+    );
     await expect(
-      service.inviteGroupMembers('admin-1', 'group-1', {
-        userIDs: ['new-user'],
-      }),
-    ).rejects.toThrow(ForbiddenException);
-
-    expect(prisma.$transaction).toHaveBeenCalledTimes(1);
-  });
-
-  // 拉黑是比邀请权限更硬的意愿表达:两个方向都拦。错误必须与隐私拒绝同一条
-  // (GROUP_INVITE_NOT_ALLOWED)—— 单独一个码就把这个接口做成了「他拉黑了你」的探针。
-  describe('invite block relationships', () => {
-    const adminInvitingNewUser = () => {
-      prisma.circle.findFirst.mockResolvedValue({
-        id: 'circle-1',
-        groupID: 'group-1',
-        ownerID: 'owner-1',
-      });
-      prisma.circleMember.findUnique.mockResolvedValue({
-        id: 'actor-member',
-        role: CircleMemberRole.ADMIN,
-        status: CircleMemberStatus.ACTIVE,
-      });
-      prisma.circleMember.findMany.mockResolvedValue([]);
-    };
-    type BlockCond = string | { in: string[] };
-    type BlockWhere = {
-      OR: Array<{ blockerID: BlockCond; blockedID: BlockCond }>;
-    };
-    const matches = (cond: BlockCond, value: string) =>
-      typeof cond === 'string' ? cond === value : cond.in.includes(value);
-    // 按 where.OR 模拟 Block 表语义,用例才真的验证了「两个方向都查了」,
-    // 而不只是「查过 block 表」。
-    const simulateBlockTable = (
-      rows: Array<{ blockerID: string; blockedID: string }>,
-    ) => {
-      prisma.block.findFirst.mockImplementation(
-        async ({ where }: { where: BlockWhere }) =>
-          rows.some((row) =>
-            where.OR.some(
-              (branch) =>
-                matches(branch.blockerID, row.blockerID) &&
-                matches(branch.blockedID, row.blockedID),
-            ),
-          )
-            ? { id: 'block-1' }
-            : null,
-      );
-    };
-
-    it('rejects the invite when the target has blocked the inviter', async () => {
-      adminInvitingNewUser();
-      simulateBlockTable([{ blockerID: 'new-user', blockedID: 'admin-1' }]);
-
-      const attempt = service.inviteGroupMembers('admin-1', 'group-1', {
-        userIDs: ['new-user'],
-      });
-
-      await expect(attempt).rejects.toThrow(ForbiddenException);
-      await expect(attempt).rejects.toMatchObject({
-        response: { errorCode: GroupErrorCode.InviteNotAllowed },
-      });
-      expect(admissionPolicy.activateMembers).not.toHaveBeenCalled();
-    });
-
-    it('rejects the invite when the inviter has blocked the target', async () => {
-      adminInvitingNewUser();
-      simulateBlockTable([{ blockerID: 'admin-1', blockedID: 'new-user' }]);
-
-      const attempt = service.inviteGroupMembers('admin-1', 'group-1', {
-        userIDs: ['new-user'],
-      });
-
-      await expect(attempt).rejects.toThrow(ForbiddenException);
-      await expect(attempt).rejects.toMatchObject({
-        response: { errorCode: GroupErrorCode.InviteNotAllowed },
-      });
-      expect(admissionPolicy.activateMembers).not.toHaveBeenCalled();
-    });
-
-    it('proceeds as before when neither side has blocked the other', async () => {
-      adminInvitingNewUser();
-      // 与本次邀请无关的拉黑不能误伤。
-      simulateBlockTable([{ blockerID: 'admin-1', blockedID: 'someone-else' }]);
-
-      await expect(
-        service.inviteGroupMembers('admin-1', 'group-1', {
-          userIDs: ['new-user'],
-        }),
-      ).resolves.toEqual({ handled: true });
-
-      expect(prisma.block.findFirst).toHaveBeenCalledTimes(1);
-      expect(prisma.block.findFirst).toHaveBeenCalledWith({
-        where: {
-          OR: [
-            { blockerID: 'admin-1', blockedID: { in: ['new-user'] } },
-            { blockedID: 'admin-1', blockerID: { in: ['new-user'] } },
-          ],
-        },
-        select: { id: true },
-      });
-      // 读在事务内、取锁之后:与并发拉黑严格串行(同 circle-invitation 的理由)。
-      expect(memberLock.lock.mock.invocationCallOrder[0]).toBeLessThan(
-        prisma.block.findFirst.mock.invocationCallOrder[0],
-      );
-      expect(admissionPolicy.activateMembers).toHaveBeenCalledWith(
-        prisma,
-        'circle-1',
-        ['new-user'],
-        { locksHeld: true, actor: 'third-party' },
-      );
-    });
-  });
-
-  it('allows FRIENDS_ONLY invites when the locked bulk friendship read finds the inviter', async () => {
-    prisma.circle.findFirst.mockResolvedValue({
-      id: 'circle-1',
-      groupID: 'group-1',
-      ownerID: 'owner-1',
-    });
-    prisma.circleMember.findUnique.mockResolvedValue({
-      id: 'actor-member',
-      role: CircleMemberRole.ADMIN,
-      status: CircleMemberStatus.ACTIVE,
-    });
-    prisma.circleMember.findMany.mockResolvedValue([]);
-    // admin-1 is an accepted friend of new-user (stored friendID side).
-    prisma.friend.findMany.mockResolvedValue([
-      { userID: 'admin-1', friendID: 'new-user' },
-    ]);
-    prisma.userPrivacySetting.findMany.mockResolvedValue([
-      { userID: 'new-user', groupInvitePermission: 'FRIENDS_ONLY' },
-    ]);
-
-    await expect(
-      service.inviteGroupMembers('admin-1', 'group-1', {
-        userIDs: ['new-user'],
-      }),
-    ).resolves.toEqual({ handled: true });
-
-    expect(prisma.friend.findMany).toHaveBeenCalledTimes(1);
-    expect(prisma.userPrivacySetting.findMany).toHaveBeenCalledTimes(1);
-    expect(memberLock.lock.mock.invocationCallOrder[0]).toBeLessThan(
-      prisma.friend.findMany.mock.invocationCallOrder[0],
-    );
-  });
-
-  it('uses two bounded transaction reads for a 100-target privacy check', async () => {
-    const targetUserIDs = Array.from(
-      { length: 100 },
-      (_, index) => `target-${index}`,
-    );
-    prisma.circle.findFirst.mockResolvedValue({
-      id: 'circle-1',
-      groupID: 'group-1',
-      ownerID: 'owner-1',
-    });
-    prisma.circleMember.findUnique.mockResolvedValue({
-      id: 'actor-member',
-      role: CircleMemberRole.ADMIN,
-      status: CircleMemberStatus.ACTIVE,
-    });
-    prisma.circleMember.findMany.mockResolvedValue([]);
-
-    await expect(
-      service.inviteGroupMembers('admin-1', 'group-1', {
-        userIDs: targetUserIDs,
-      }),
-    ).resolves.toEqual({ handled: true });
-
-    expect(prisma.friend.findMany).toHaveBeenCalledTimes(1);
-    expect(prisma.friend.findMany).toHaveBeenCalledWith({
-      where: {
-        state: 'ACCEPTED',
-        OR: [
-          { userID: 'admin-1', friendID: { in: targetUserIDs } },
-          { friendID: 'admin-1', userID: { in: targetUserIDs } },
-        ],
-      },
-      select: { userID: true, friendID: true },
-    });
-    expect(prisma.userPrivacySetting.findMany).toHaveBeenCalledTimes(1);
-    expect(prisma.userPrivacySetting.findMany).toHaveBeenCalledWith({
-      where: { userID: { in: targetUserIDs } },
-      select: { userID: true, groupInvitePermission: true },
-    });
-    expect(memberLock.lock.mock.invocationCallOrder[0]).toBeLessThan(
-      prisma.userPrivacySetting.findMany.mock.invocationCallOrder[0],
-    );
-    expect(admissionPolicy.activateMembers).toHaveBeenCalledWith(
-      prisma,
-      'circle-1',
-      targetUserIDs,
-      { locksHeld: true, actor: 'third-party' },
-    );
+      service.inviteGroupMembers('owner-1', 'group-1', { userIDs: ['guest'] }),
+    ).rejects.toThrow();
+    expect(admissionPolicy.activateMembers).not.toHaveBeenCalled();
   });
 
   it('returns unhandled for raw OpenIM group invites', async () => {

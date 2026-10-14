@@ -225,6 +225,7 @@ enum CircleCategory {
 }
 
 enum CircleInvitationStatus {
+  INVITED
   PENDING
   APPROVED
   REJECTED
@@ -261,6 +262,8 @@ enum NotificationType {
   FRIEND_REQUEST_REJECTED
   FRIEND_REQUEST_MESSAGE
   SYSTEM
+  GROUP_ADMISSION
+  CIRCLE_INVITATION_RECEIVED
   TRACE_LIKE
   TRACE_COMMENT
   COMMENT_REPLY
@@ -1726,6 +1729,7 @@ model Notification {
   fromCirclePostID     String?
   fromInvitationID     String?
   fromFriendRequestID  String?
+  fromGroupAdmissionID String?
   systemAnnouncementID String?
   createdAt            DateTime         @default(now())
   updatedAt            DateTime         @updatedAt
@@ -1740,6 +1744,7 @@ model Notification {
   fromInvitation     CircleInvitation?       @relation(fields: [fromInvitationID], references: [id])
   fromFriendRequest  Friend?                 @relation("friendRequestNotifications", fields: [fromFriendRequestID], references: [id])
   systemAnnouncement SystemAnnouncement?     @relation(fields: [systemAnnouncementID], references: [id], onDelete: Restrict)
+  fromGroupAdmission GroupAdmission? @relation(fields: [fromGroupAdmissionID], references: [id], onDelete: NoAction, onUpdate: NoAction)
   pushOutbox         NotificationPushOutbox?
 
   @@unique([systemAnnouncementID, toUserID], map: "Notification_announcement_recipient_key")
@@ -1748,6 +1753,7 @@ model Notification {
   // review 修复：保留期清理按裸 createdAt 截断分批删除
   @@index([createdAt])
   @@index([fromFriendRequestID])
+  @@index([fromGroupAdmissionID])
   // deleted/read 的热点列表与徽标查询使用 migration 中的 partial indexes；
   // Prisma schema 无法表达 WHERE 条件。
 }
@@ -2120,6 +2126,9 @@ model CircleInvitation {
   circleID      String
   applicantID   String
   inviterID     String
+  consentNoticeDeliveredAt DateTime?
+  consentNoticeAttempts Int @default(0)
+  consentNoticeRequired Boolean @default(false)
   /// 默认值只在「迁移已落地、旧色还没换掉」的发布窗口里有意义:新代码两条
   /// 建单路径都显式写入 Circle.requiredVerifierCount 的快照。
   requiredCount Int                    @default(1)
@@ -2296,6 +2305,8 @@ model ChatConversation {
   memberCanInvite Boolean @default(true)
   /// 群二维码能否入群（两种群）；false 时签发群码与扫码入群一律拒绝。
   qrJoinEnabled Boolean @default(true)
+  cardJoinEnabled Boolean @default(true)
+  joinApprovalRequired Boolean @default(true)
   /// 普通成员能否从群里打开其他成员的资料（两种群;群主/管理员不受限）。
   /// DB 默认**关**:圈子成员目录原本只对圈主/管理员开放,漏写的行只能更严不能更松
   /// (蓝绿窗口里老二进制建的圈子会话也会落在这个默认上)。
@@ -2619,4 +2630,41 @@ model ChatCircleSyncRetry {
   nextAttemptAt DateTime @default(now())
 
   @@index([nextAttemptAt, circleID])
+}
+
+/// Pending invitations/applications never grant a ChatMember seat.
+model GroupAdmission {
+  id String @id @default(uuid())
+  conversationID String
+  applicantID String
+  inviterID String?
+  qrToken String?
+  kind String
+  status String
+  reason String @default("")
+  expiresAt DateTime
+  acceptedAt DateTime?
+  decidedByID String?
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+  notifications Notification[]
+  deliveries GroupAdmissionDelivery[]
+  @@index([conversationID, status, createdAt])
+  @@index([applicantID, updatedAt])
+}
+
+/// Durable delivery of cards, notification push outbox, and membership broadcasts.
+model GroupAdmissionDelivery {
+  id String @id @default(uuid())
+  admissionID String
+  recipientID String
+  actorID String
+  event String
+  deliveredAt DateTime?
+  attempts Int @default(0)
+  nextAttemptAt DateTime @default(now())
+  createdAt DateTime @default(now())
+  admission GroupAdmission @relation(fields: [admissionID], references: [id], onDelete: NoAction, onUpdate: NoAction)
+  @@unique([admissionID, recipientID, event])
+  @@index([deliveredAt, nextAttemptAt])
 }

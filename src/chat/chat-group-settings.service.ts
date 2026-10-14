@@ -37,6 +37,8 @@ interface LockedGroupRow {
   avatarUrl: string | null;
   memberCanInvite: boolean;
   qrJoinEnabled: boolean;
+  cardJoinEnabled: boolean;
+  joinApprovalRequired: boolean;
   membersCanViewRoster: boolean;
   membersCanViewProfiles: boolean;
   membersCanAddFriends: boolean;
@@ -47,6 +49,8 @@ export type GroupPolicyKey = keyof ChatGroupPoliciesDto;
 const POLICY_KEYS: readonly GroupPolicyKey[] = [
   'memberCanInvite',
   'qrJoinEnabled',
+  'cardJoinEnabled',
+  'joinApprovalRequired',
   'membersCanViewRoster',
   'membersCanViewProfiles',
   'membersCanAddFriends',
@@ -479,7 +483,7 @@ export class ChatGroupSettingsService {
   ): Promise<LockedGroupRow> {
     const locked = await tx.$queryRaw<LockedGroupRow[]>`
       SELECT "id", "type", "circleID", "ownerID", "nextHeight", "muteAllAt", "notice",
-             "avatarUrl", "memberCanInvite", "qrJoinEnabled", "membersCanViewRoster",
+             "avatarUrl", "memberCanInvite", "qrJoinEnabled", "cardJoinEnabled", "joinApprovalRequired", "membersCanViewRoster",
              "membersCanViewProfiles", "membersCanAddFriends"
       FROM "ChatConversation"
       WHERE "id" = ${conversationId} FOR UPDATE`;
@@ -529,6 +533,8 @@ export class ChatGroupSettingsService {
     return {
       memberCanInvite,
       qrJoinEnabled: locked.qrJoinEnabled,
+      cardJoinEnabled: locked.cardJoinEnabled,
+      joinApprovalRequired: locked.joinApprovalRequired,
       membersCanViewRoster: locked.membersCanViewRoster,
       membersCanViewProfiles: locked.membersCanViewProfiles,
       membersCanAddFriends: locked.membersCanAddFriends,

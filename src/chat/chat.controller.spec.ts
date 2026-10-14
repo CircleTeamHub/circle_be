@@ -22,6 +22,29 @@ describe('ChatController rate limiting', () => {
 
 // 会话列表响应体保持数组（已装机 App 按数组解析），被 limit 截断时经 X-Has-More 告知 ——
 // 此前超过 100 个会话的用户在 App 里静默少一截，客户端无从得知。
+describe('ChatController.createGroupConversation', () => {
+  it('returns the committed group without waiting for global admission delivery', async () => {
+    const group = { id: 'new-group' };
+    const admissions = {
+      flush: jest.fn().mockRejectedValue(new Error('delivery down')),
+    };
+    const controller = new ChatController(
+      { createGroupConversation: jest.fn().mockResolvedValue(group) } as never,
+      admissions as never,
+      {} as never,
+      {} as never,
+      {} as never,
+    );
+    await expect(
+      controller.createGroupConversation(
+        { user: { userId: 'owner' } } as never,
+        { name: 'Group', memberIds: [] },
+      ),
+    ).resolves.toBe(group);
+    expect(admissions.flush).not.toHaveBeenCalled();
+  });
+});
+
 describe('ChatController.listConversations', () => {
   function build(page: { conversations: unknown[]; hasMore: boolean }) {
     const chatService = {
@@ -29,6 +52,7 @@ describe('ChatController.listConversations', () => {
     };
     const controller = new ChatController(
       chatService as never,
+      {} as never,
       {} as never,
       {} as never,
       {} as never,

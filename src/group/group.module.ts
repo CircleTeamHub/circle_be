@@ -1,4 +1,5 @@
 import { Module } from '@nestjs/common';
+import { CircleInvitationModule } from 'src/circle-invitation/circle-invitation.module';
 import { ChatModule } from 'src/chat/chat.module';
 import { MembershipPolicyModule } from 'src/membership/membership-policy.module';
 import { CircleAdmissionPolicy } from 'src/circle/circle-admission-policy';
@@ -7,7 +8,7 @@ import { GroupController } from './group.controller';
 import { GroupService } from './group.service';
 
 @Module({
-  imports: [ChatModule, MembershipPolicyModule],
+  imports: [ChatModule, MembershipPolicyModule, CircleInvitationModule],
   controllers: [GroupController],
   providers: [GroupService, CircleAdmissionPolicy, CircleMemberLockService],
   exports: [GroupService],

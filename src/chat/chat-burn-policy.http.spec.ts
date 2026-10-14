@@ -1,3 +1,4 @@
+import { GroupAdmissionService } from './group-admission.service';
 import {
   ForbiddenException,
   type ExecutionContext,
@@ -56,6 +57,13 @@ describe('/chat/conversations/:id/burn HTTP pipeline', () => {
     const moduleRef = await Test.createTestingModule({
       controllers: [ChatController],
       providers: [
+        {
+          provide: GroupAdmissionService,
+          useValue: {
+            flush: jest.fn().mockResolvedValue(undefined),
+            invite: jest.fn(),
+          },
+        },
         { provide: ChatService, useValue: chatService },
         { provide: ChatGroupAdminService, useValue: {} },
         { provide: ChatGroupEventService, useValue: {} },

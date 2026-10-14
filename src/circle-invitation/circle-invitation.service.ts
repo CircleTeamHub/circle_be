@@ -1,3 +1,5 @@
+import { withDatabaseWorkBudget } from '../utils/database-work-budget';
+import { businessMetrics } from 'src/metrics/business-metrics';
 import {
   BadRequestException,
   ConflictException,
@@ -124,6 +126,230 @@ export class CircleInvitationService {
       });
   }
 
+  async markInvitationSeen(userId: string, id: string) {
+    await this.getInvitationForViewer(userId, id);
+    const notifications = await this.prisma.notification.findMany({
+      where: {
+        toUserID: userId,
+        fromInvitationID: id,
+        read: false,
+        deleted: false,
+      },
+      select: { id: true },
+    });
+    for (const notification of notifications)
+      await this.notificationService.markNotificationRead(
+        userId,
+        notification.id,
+      );
+  }
+
+  async respondToInvitation(
+    userId: string,
+    id: string,
+    accept: boolean,
+  ): Promise<InvitationDto> {
+    const invitation = await this.loadInvitation(id);
+    if (invitation.applicantID !== userId)
+      throw new ForbiddenException({
+        message: '只有被邀请人可以接受或拒绝',
+        errorCode: 'CHAT_GROUP_ACCEPT_REQUIRED',
+      });
+    if (invitation.status !== 'INVITED')
+      return this.toInvitationDto(invitation);
+    if (!accept) {
+      await this.prisma.circleInvitation.updateMany({
+        where: { id, applicantID: userId, status: 'INVITED' },
+        data: { status: 'CANCELLED' },
+      });
+      return this.fetchInvitationDto(id);
+    }
+    if (invitation.createdAt.getTime() + 7 * 86400000 <= Date.now())
+      throw new ForbiddenException({
+        message: '邀请已过期',
+        errorCode: 'CHAT_GROUP_INVITATION_INVALID',
+      });
+    try {
+      return await this.invite(
+        invitation.inviterID,
+        userId,
+        invitation.circleID,
+        {
+          applicantConsented: true,
+          acceptedInvitationId: id,
+        },
+      );
+    } catch (error) {
+      const latest = await this.loadInvitation(id);
+      if (latest.applicantID === userId && latest.status !== 'INVITED')
+        return this.toInvitationDto(latest);
+      throw error;
+    }
+  }
+
+  private async deliverConsentInvitation(id: string) {
+    return withDatabaseWorkBudget(this.prisma, () =>
+      this.prisma.$transaction(
+        async (tx) => {
+          await tx.$executeRaw`SELECT pg_advisory_xact_lock(hashtextextended(${`circle_consent_delivery:${id}`}, 0))`;
+
+          const invitation = await this.loadInvitation(id, tx);
+          if (
+            !invitation.consentNoticeRequired ||
+            invitation.consentNoticeDeliveredAt ||
+            invitation.status !== 'INVITED'
+          )
+            return;
+          await this.memberLock.lock(tx, invitation.circleID, [
+            invitation.inviterID,
+            invitation.applicantID,
+          ]);
+          await this.memberLock.lockPolicy(tx, invitation.circleID);
+          await lockUserRelationshipState(tx, [
+            invitation.inviterID,
+            invitation.applicantID,
+          ]);
+          const [circle, membership, blocked, friends] = await Promise.all([
+            tx.circle.findFirst({
+              where: { id: invitation.circleID, deleted: false },
+              select: { id: true, memberCanInvite: true },
+            }),
+            tx.circleMember.findUnique({
+              where: {
+                userID_circleID: {
+                  userID: invitation.inviterID,
+                  circleID: invitation.circleID,
+                },
+              },
+            }),
+            tx.block.findFirst({
+              where: {
+                OR: [
+                  {
+                    blockerID: invitation.inviterID,
+                    blockedID: invitation.applicantID,
+                  },
+                  {
+                    blockerID: invitation.applicantID,
+                    blockedID: invitation.inviterID,
+                  },
+                ],
+              },
+              select: { id: true },
+            }),
+            this.areFriends(invitation.inviterID, invitation.applicantID, tx),
+          ]);
+          const privacyAllowed =
+            await this.privacySettings.canBeInvitedToGroupOrCircle(
+              invitation.applicantID,
+              friends,
+            );
+          if (
+            !circle ||
+            membership?.status !== 'ACTIVE' ||
+            blocked ||
+            !privacyAllowed ||
+            (circle.memberCanInvite === false &&
+              !['OWNER', 'ADMIN'].includes(membership.role))
+          ) {
+            await tx.circleInvitation.updateMany({
+              where: { id, status: 'INVITED' },
+              data: {
+                status: 'CANCELLED',
+                consentNoticeDeliveredAt: new Date(),
+              },
+            });
+            return;
+          }
+          await this.notificationService.deliverCircleConsentNotification({
+            id,
+            toUserID: invitation.applicantID,
+            fromUserID: invitation.inviterID,
+            circleId: invitation.circleID,
+            content: `邀请你加入「${invitation.circle.name}」`,
+          });
+          const direct = await this.chatService.getOrCreateDirectConversation(
+            invitation.inviterID,
+            invitation.applicantID,
+          );
+          await this.chatMessages.insertServerMessage(direct.id, {
+            senderID: invitation.inviterID,
+            type: 'group-invitation',
+            content: {
+              circleInvitationId: id,
+              groupName: invitation.circle.name,
+            },
+            clientMessageId: `circle_invitation_${id}`,
+            rebroadcastOnReplay: true,
+          });
+          await tx.circleInvitation.update({
+            where: { id },
+            data: { consentNoticeDeliveredAt: new Date() },
+          });
+        },
+        { maxWait: 10000, timeout: 30000 },
+      ),
+    );
+  }
+
+  @TrackedCron(
+    CronExpression.EVERY_MINUTE,
+    'circle_consent_invitation_delivery',
+  )
+  async deliverPendingConsentInvitations() {
+    const rows = await this.prisma.circleInvitation.findMany({
+      where: {
+        consentNoticeDeliveredAt: null,
+        consentNoticeRequired: true,
+        status: 'INVITED',
+        consentNoticeAttempts: { lt: 8 },
+      },
+      orderBy: [{ consentNoticeAttempts: 'asc' }, { createdAt: 'asc' }],
+      take: 50,
+      select: { id: true, consentNoticeAttempts: true },
+    });
+    for (const row of rows) {
+      try {
+        await this.deliverConsentInvitation(row.id);
+      } catch {
+        await this.prisma.circleInvitation.update({
+          where: { id: row.id },
+          data: { consentNoticeAttempts: { increment: 1 } },
+        });
+        const terminal = row.consentNoticeAttempts + 1 >= 8;
+        if (terminal)
+          businessMetrics.recordEvent(
+            'circle_consent_delivery_exhausted',
+            'failure',
+          );
+        this.logger.warn({
+          event: 'circle_consent_delivery_failed',
+          terminal,
+          retryScheduled: !terminal,
+        });
+      }
+    }
+  }
+
+  async inviteBatch(
+    inviterId: string,
+    applicantIds: string[],
+    circleId: string,
+  ): Promise<void> {
+    const invitations = await this.runInvitationTransaction(async (tx) => {
+      const rows: InvitationDto[] = [];
+      for (const applicantId of [...new Set(applicantIds)].sort())
+        rows.push(
+          await this.invite(inviterId, applicantId, circleId, undefined, tx),
+        );
+      return rows;
+    });
+    for (const row of invitations)
+      void this.deliverConsentInvitation(row.id).catch(() =>
+        this.logger.warn('circle consent invitation queued for retry'),
+      );
+  }
+
   async invite(
     inviterId: string,
     applicantId: string,
@@ -135,9 +361,11 @@ export class CircleInvitationService {
        * 跳过;拉黑是更硬的意愿表达,在下面的事务里照拦,两个方向都不放。
        */
       applicantConsented?: boolean;
+      acceptedInvitationId?: string;
       /** 圈子二维码加入：在共享策略锁内复核会话的二维码门禁。 */
       requireQrJoinEnabled?: boolean;
     },
+    transaction?: Prisma.TransactionClient,
   ): Promise<InvitationDto> {
     if (!opts?.applicantConsented) {
       // Pass real friendship status: a FRIENDS_ONLY invite permission must let
@@ -158,7 +386,7 @@ export class CircleInvitationService {
     }
 
     // 6. Create invitation; the inviter takes the first seat only if they may vouch
-    const invitation = await this.runInvitationTransaction(async (tx) => {
+    const operation = async (tx: Prisma.TransactionClient) => {
       // CircleInvitation has no DB-level unique constraint, so serialize
       // concurrent invites for the same (circle, applicant) pair with a
       // transaction-scoped advisory lock, then re-check inside the lock.
@@ -251,15 +479,37 @@ export class CircleInvitationService {
         where: {
           circleID: circleId,
           applicantID: applicantId,
-          status: 'PENDING',
+          status: { in: ['INVITED', 'PENDING'] },
         },
       });
       // 本人扫码是幂等的：签发人仍在圈、申请人尚未入圈、圈仍存在且双方未
       // 拉黑后，已有 PENDING 就是本次请求的完成结果。容量、额度和成员邀请
       // 开关都是仅影响“能否新建”的可变门禁，不能让一次成功申请的网络重试
       // 突然变成失败。
-      if (existingInvitation && opts?.applicantConsented) {
-        return { created: existingInvitation, admission: null };
+      if (
+        opts?.acceptedInvitationId &&
+        (existingInvitation?.id !== opts.acceptedInvitationId ||
+          existingInvitation.status !== 'INVITED')
+      )
+        throw new ConflictException('邀请已处理');
+      if (
+        existingInvitation &&
+        opts?.acceptedInvitationId &&
+        existingInvitation.createdAt.getTime() + 7 * 86400000 <= Date.now()
+      )
+        throw new ForbiddenException({
+          message: '邀请已过期',
+          errorCode: 'CHAT_GROUP_INVITATION_INVALID',
+        });
+      if (
+        existingInvitation &&
+        (!opts?.applicantConsented || existingInvitation.status === 'PENDING')
+      ) {
+        return {
+          created: existingInvitation,
+          admission: null,
+          requiresConsent: Boolean(existingInvitation.consentNoticeRequired),
+        };
       }
       // 宣传期严格形态:关掉成员邀请后,只有圈主/管理员还能拉人 ——
       // requiredVerifierCount=1 时成员邀请等于「谁都能瞬间塞人进圈」,这道闸
@@ -280,7 +530,10 @@ export class CircleInvitationService {
         actor: 'third-party',
       });
 
-      if (existingInvitation) {
+      if (
+        existingInvitation &&
+        !(opts?.applicantConsented && existingInvitation.status === 'INVITED')
+      ) {
         throw new ConflictException({
           message: 'There is already a pending invitation for this user',
           errorCode: CircleInvitationErrorCode.AlreadyPending,
@@ -328,27 +581,59 @@ export class CircleInvitationService {
         inviterMembership.role === 'ADMIN' ||
         stillFriends;
 
-      const created = await tx.circleInvitation.create({
-        data: {
-          circleID: circleId,
-          applicantID: applicantId,
-          inviterID: inviterId,
-          approvedCount: inviterCanVouch ? 1 : 0,
-          // 建单那一刻圈子策略的快照:之后调 requiredVerifierCount 不影响
-          // 在途申请(进度条/成结判定读的都是 invitation.requiredCount)。
-          requiredCount: circlePolicy.requiredVerifierCount,
-        },
-        // 事务里只读这几列；响应由 fetchInvitationDto 按窄 select 另读。此前
-        // include 了整行 circle 与 applicant / inviter 的 User 全部列。
-        select: {
-          id: true,
-          approvedCount: true,
-          requiredCount: true,
-          circle: { select: { groupID: true } },
-        },
-      });
+      const invitationData = {
+        circleID: circleId,
+        applicantID: applicantId,
+        inviterID: inviterId,
+        approvedCount: inviterCanVouch ? 1 : 0,
+        requiredCount:
+          existingInvitation?.requiredCount ??
+          circlePolicy.requiredVerifierCount,
+        status: opts?.applicantConsented
+          ? ('PENDING' as const)
+          : ('INVITED' as const),
+        consentNoticeRequired:
+          !opts?.applicantConsented ||
+          Boolean(existingInvitation?.consentNoticeRequired),
+      };
+      const selection = {
+        id: true,
+        approvedCount: true,
+        requiredCount: true,
+        circle: { select: { groupID: true } },
+      } as const;
+      const created = existingInvitation
+        ? await tx.circleInvitation.update({
+            where: { id: existingInvitation.id, status: 'INVITED' },
+            data: invitationData,
+            select: selection,
+          })
+        : await tx.circleInvitation.create({
+            data: {
+              ...invitationData,
+              // 建单那一刻圈子策略的快照:之后调 requiredVerifierCount 不影响
+              // 在途申请(进度条/成结判定读的都是 invitation.requiredCount)。
+              requiredCount: circlePolicy.requiredVerifierCount,
+            },
+            // 事务里只读这几列；响应由 fetchInvitationDto 按窄 select 另读。此前
+            // include 了整行 circle 与 applicant / inviter 的 User 全部列。
+            select: {
+              id: true,
+              approvedCount: true,
+              requiredCount: true,
+              circle: { select: { groupID: true } },
+            },
+          });
 
-      if (inviterCanVouch) {
+      if (existingInvitation && opts?.applicantConsented) {
+        await tx.circleInvitationVerifier.deleteMany({
+          where: { invitationID: created.id, verifierID: inviterId },
+        });
+      }
+      if (
+        inviterCanVouch &&
+        (!existingInvitation || opts?.applicantConsented)
+      ) {
         await tx.circleInvitationVerifier.create({
           data: {
             invitationID: created.id,
@@ -365,7 +650,10 @@ export class CircleInvitationService {
       // 同一个事务里:席位激活失败就整单回滚,不会留下「已 APPROVED 却没进圈」
       // 的半截状态等 reconcile 补。
       let admission: { circleID: string; groupID: string | null } | null = null;
-      if (created.approvedCount >= created.requiredCount) {
+      if (
+        opts?.applicantConsented &&
+        created.approvedCount >= created.requiredCount
+      ) {
         await tx.circleInvitation.update({
           where: { id: created.id },
           data: { status: 'APPROVED' },
@@ -381,8 +669,13 @@ export class CircleInvitationService {
         }
       }
 
-      return { created, admission };
-    });
+      return { created, admission, requiresConsent: !opts?.applicantConsented };
+    };
+    const invitation = transaction
+      ? await operation(transaction)
+      : await this.runInvitationTransaction(operation);
+    if (transaction)
+      return this.fetchInvitationDto(invitation.created.id, transaction);
 
     if (invitation.admission) {
       this.syncCircleSeatsSoon(invitation.admission.circleID);
@@ -401,6 +694,10 @@ export class CircleInvitationService {
       });
     }
 
+    if (invitation.requiresConsent)
+      void this.deliverConsentInvitation(invitation.created.id).catch(() =>
+        this.logger.warn('circle consent invitation queued for retry'),
+      );
     return this.fetchInvitationDto(invitation.created.id);
   }
 
@@ -1357,8 +1654,9 @@ export class CircleInvitationService {
 
   private async fetchInvitationDto(
     invitationId: string,
+    client: Prisma.TransactionClient = this.prisma,
   ): Promise<InvitationDto> {
-    const inv = await this.loadInvitation(invitationId);
+    const inv = await this.loadInvitation(invitationId, client);
     return this.toInvitationDto(inv);
   }
 
@@ -1390,7 +1688,7 @@ export class CircleInvitationService {
   ): Promise<InvitationDto[]> {
     const whereBase: Prisma.CircleInvitationWhereInput = {
       applicantID: userId,
-      status: 'PENDING',
+      status: { in: ['INVITED', 'PENDING'] },
     };
     const cursorWhere = await this.pendingInvitationCursorWhere(query.cursor, {
       applicantID: userId,
@@ -1404,7 +1702,26 @@ export class CircleInvitationService {
       take: query.limit ?? DEFAULT_INVITATION_LIST_LIMIT,
     });
 
-    return invitations.map((inv) => this.toInvitationDto(inv));
+    const unreadCounts = invitations.length
+      ? await this.prisma.notification.groupBy({
+          by: ['fromInvitationID'],
+          where: {
+            toUserID: userId,
+            type: 'CIRCLE_INVITATION_RECEIVED',
+            read: false,
+            deleted: false,
+            fromInvitationID: { in: invitations.map((inv) => inv.id) },
+          },
+          _count: { _all: true },
+        })
+      : [];
+    const unreadByID = new Map(
+      unreadCounts.map((row) => [row.fromInvitationID, row._count._all]),
+    );
+    return invitations.map((inv) => ({
+      ...this.toInvitationDto(inv),
+      unreadCount: unreadByID.get(inv.id) ?? 0,
+    }));
   }
 
   async getPendingInvitationsForCircle(
@@ -1466,8 +1783,11 @@ export class CircleInvitationService {
     return feedCursorWhere({ createdAt: anchor.createdAt, id: cursor });
   }
 
-  private async loadInvitation(invitationId: string) {
-    const inv = await this.prisma.circleInvitation.findUnique({
+  private async loadInvitation(
+    invitationId: string,
+    client: Prisma.TransactionClient = this.prisma,
+  ) {
+    const inv = await client.circleInvitation.findUnique({
       where: { id: invitationId },
       include: INVITATION_INCLUDE,
     });

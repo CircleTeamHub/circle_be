@@ -188,6 +188,12 @@ export class NotificationPushService {
         ...(notification.fromCirclePost?.id
           ? { postId: notification.fromCirclePost.id }
           : {}),
+        ...(notification.fromGroupAdmission?.id
+          ? {
+              groupAdmissionId: notification.fromGroupAdmission.id,
+              route: 'group-admission',
+            }
+          : {}),
         ...(notification.fromInvitation?.id
           ? { invitationId: notification.fromInvitation.id }
           : {}),
