@@ -6,6 +6,13 @@ export class AuthSessionDto {
   @Expose()
   id: string;
 
+  @ApiPropertyOptional({
+    description: 'Persistent device trust without an active refresh session',
+    example: true,
+  })
+  @Expose()
+  trustedOnly?: boolean;
+
   @ApiPropertyOptional({ example: 'MacBook Pro' })
   @Expose()
   deviceName: string | null;

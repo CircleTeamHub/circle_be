@@ -1,3 +1,4 @@
+import { withDatabaseWorkBudget } from '../utils/database-work-budget';
 import {
   ForbiddenException,
   HttpException,
@@ -172,6 +173,22 @@ export class DeviceTrustService {
 
   /** 验证码过期后新设备重新发起：沿用原请求的设备信息，计入频率限制。 */
   async resend(
+    challengeId: string,
+    deviceKey: string | null,
+  ): Promise<LoginChallengeView> {
+    const owner = await this.findForDevice(challengeId, deviceKey);
+    return withDatabaseWorkBudget(this.prisma, () =>
+      this.prisma.$transaction(
+        async (tx) => {
+          await tx.$queryRaw`SELECT pg_advisory_xact_lock(hashtextextended(${`auth_session:${owner.userId}`}, 0))`;
+          return this.resendLocked(challengeId, deviceKey);
+        },
+        { maxWait: 10000, timeout: 30000 },
+      ),
+    );
+  }
+
+  private async resendLocked(
     challengeId: string,
     deviceKey: string | null,
   ): Promise<LoginChallengeView> {

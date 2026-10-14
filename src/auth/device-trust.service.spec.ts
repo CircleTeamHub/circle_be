@@ -1,3 +1,4 @@
+import { AsyncLocalStorage } from 'node:async_hooks';
 jest.mock('argon2', () => {
   const actual = jest.requireActual('argon2');
   return {
@@ -196,9 +197,13 @@ function setup() {
     },
   };
   let serial = Promise.resolve();
+  const transactionScope = new AsyncLocalStorage<boolean>();
   (prisma as any).$queryRaw = jest.fn().mockResolvedValue([]);
   (prisma as any).$transaction = jest.fn((fn) => {
-    const next = serial.then(() => fn(prisma));
+    if (transactionScope.getStore()) return fn(prisma);
+    const next = serial.then(() =>
+      transactionScope.run(true, () => fn(prisma)),
+    );
     serial = next.catch(() => undefined);
     return next;
   });
@@ -722,4 +727,17 @@ test('concurrent wrong candidates reserve at most five Argon2 comparisons', asyn
   } finally {
     verify.mockImplementation(jest.requireActual('argon2').verify);
   }
+});
+
+test('resend rechecks a source challenge invalidated during account recovery', async () => {
+  const { service, trust, prisma, challenges } = setup();
+  trust('phone');
+  await service.evaluateLogin(user, { deviceKey: 'new' });
+  const old = { ...challenges[0], expiresAt: new Date(Date.now() - 1000) };
+  prisma.loginChallenge.findUnique
+    .mockResolvedValueOnce(old)
+    .mockResolvedValueOnce({ ...old, status: 'REJECTED' });
+  prisma.loginChallenge.create.mockClear();
+  await expect(service.resend(old.id, 'new')).rejects.toThrow();
+  expect(prisma.loginChallenge.create).not.toHaveBeenCalled();
 });
