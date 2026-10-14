@@ -237,6 +237,21 @@ export class NotificationPushService {
     }));
   }
 
+  /** Security alerts go only to bound, trusted devices with an active app session. */
+  async listLoginAlertTokens(userId: string): Promise<PushTokenTarget[]> {
+    return this.prisma.$queryRaw<PushTokenTarget[]>`
+      SELECT "token", "projectId", "provider", "platform" FROM (
+        SELECT p."token", p."projectId", p."provider", p."platform",
+          row_number() OVER (PARTITION BY p."provider" ORDER BY p."updatedAt" DESC, p."id" DESC) AS rank
+        FROM "DevicePushToken" p
+        WHERE p."userID" = ${userId} AND p."disabledAt" IS NULL
+          AND p."provider" IN ('expo', 'jpush') AND p."deviceKey" IS NOT NULL
+          AND EXISTS (SELECT 1 FROM "TrustedDevice" d WHERE d."userId" = p."userID" AND d."deviceKey" = p."deviceKey" AND d."revokedAt" IS NULL)
+          AND EXISTS (SELECT 1 FROM "RefreshToken" r WHERE r."userId" = p."userID" AND r."deviceKey" = p."deviceKey" AND r."audience" = 'APP' AND r."revokedAt" IS NULL AND r."expiredAt" > (NOW() AT TIME ZONE 'UTC'))
+          AND EXISTS (SELECT 1 FROM "User" u WHERE u."id" = p."userID" AND u."status" = 'ACTIVE')
+      ) eligible WHERE rank <= ${MAX_ACTIVE_TOKENS_PER_PROVIDER}`;
+  }
+
   /**
    * 多个用户的活跃 token 一次查回(每人每 provider 最近的 20 个)。聊天大群
    * 扇出用:原来每个收件人一次查询,3000 人的群一条消息就是 3000 次往返。

@@ -124,7 +124,11 @@ export class NotificationController {
     @Body() dto: RegisterPushTokenDto,
     @Req() req: RequestWithUser,
   ) {
-    return this.notificationService.registerPushToken(req.user.userId, dto);
+    return this.notificationService.registerPushToken(
+      req.user.userId,
+      dto,
+      req.user.sessionId,
+    );
   }
 
   @Delete('push-token')

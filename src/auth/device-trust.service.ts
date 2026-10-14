@@ -589,6 +589,10 @@ export class DeviceTrustService {
       where: { userId, deviceKey, revokedAt: null },
       data: { revokedAt: new Date() },
     });
+    await this.prisma.devicePushToken.updateMany({
+      where: { userID: userId, deviceKey, disabledAt: null },
+      data: { disabledAt: new Date() },
+    });
   }
 
   /** 退出其他设备：除当前设备外全部撤销信任。 */
@@ -603,6 +607,16 @@ export class DeviceTrustService {
         ...(keepDeviceKey ? { deviceKey: { not: keepDeviceKey } } : {}),
       },
       data: { revokedAt: new Date() },
+    });
+    await this.prisma.devicePushToken.updateMany({
+      where: {
+        userID: userId,
+        disabledAt: null,
+        ...(keepDeviceKey
+          ? { OR: [{ deviceKey: { not: keepDeviceKey } }, { deviceKey: null }] }
+          : {}),
+      },
+      data: { disabledAt: new Date() },
     });
   }
 
@@ -988,13 +1002,21 @@ export class DeviceTrustService {
   ): Promise<void> {
     if (!this.push) return;
     try {
-      const tokens = await this.push.listActiveTokens(userId);
-      if (tokens.length === 0) return;
-      await this.push.sendToTokens(tokens, {
-        ...payload,
-        priority: 'high',
-        ttl: Math.floor(LOGIN_CHALLENGE_DECISION_MS / 1000),
-      });
+      await withDatabaseWorkBudget(this.prisma, () =>
+        this.prisma.$transaction(
+          async (tx) => {
+            await tx.$executeRaw`SELECT pg_advisory_xact_lock(hashtextextended(${`auth_session:${userId}`}, 0))`;
+            const tokens = await this.push!.listLoginAlertTokens(userId);
+            if (tokens.length === 0) return;
+            await this.push!.sendToTokens(tokens, {
+              ...payload,
+              priority: 'high',
+              ttl: Math.floor(LOGIN_CHALLENGE_DECISION_MS / 1000),
+            });
+          },
+          { maxWait: 10000, timeout: 30000 },
+        ),
+      );
     } catch (error) {
       // 推送是加速通道：受信任设备回到前台会主动拉待处理请求。
       this.logger.warn(

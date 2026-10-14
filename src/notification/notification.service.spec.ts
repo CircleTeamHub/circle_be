@@ -21,6 +21,9 @@ describe('NotificationService', () => {
   let service: NotificationService;
 
   const prisma = {
+    $executeRaw: jest.fn(),
+    refreshToken: { findUnique: jest.fn() },
+    trustedDevice: { findUnique: jest.fn() },
     user: {
       findMany: jest.fn(),
       findUnique: jest.fn(),
@@ -668,7 +671,7 @@ describe('NotificationService', () => {
         where: {
           token: 'ExponentPushToken[abc]',
           OR: [
-            { userID: 'user-1' },
+            { userID: 'user-1', OR: [{ deviceKey: null }] },
             // 无 secret 登记时,谓词只多出 null 这一支(没有 hash 可比)。
             { revocationSecretHash: null },
           ],
@@ -808,7 +811,7 @@ describe('NotificationService', () => {
         where: {
           token: 'ExponentPushToken[abc]',
           OR: [
-            { userID: 'new-owner' },
+            { userID: 'new-owner', OR: [{ deviceKey: null }] },
             { revocationSecretHash: hash },
             // 迁移通道:存量 null-secret 行必须仍可认领,否则换账号永久 403。
             { revocationSecretHash: null },
@@ -818,6 +821,63 @@ describe('NotificationService', () => {
       });
       expect(prisma.devicePushToken.create).not.toHaveBeenCalled();
     });
+
+    it('binds registration to the server session rather than client device input', async () => {
+      prisma.refreshToken.findUnique.mockResolvedValue({
+        userId: 'user-1',
+        audience: 'APP',
+        deviceKey: 'server-key',
+        revokedAt: null,
+      });
+      prisma.trustedDevice.findUnique.mockResolvedValue({ revokedAt: null });
+      prisma.devicePushToken.updateMany.mockResolvedValue({ count: 1 });
+      await expect(
+        service.registerPushToken(
+          'user-1',
+          {
+            token: 'ExponentPushToken[abc]',
+            provider: 'expo',
+            platform: 'ios',
+          },
+          'session',
+        ),
+      ).resolves.toEqual({ deviceBound: true });
+      expect(prisma.devicePushToken.updateMany).toHaveBeenCalledWith(
+        expect.objectContaining({
+          data: expect.objectContaining({ deviceKey: 'server-key' }),
+        }),
+      );
+    });
+    it.each(['revoked', 'foreign', 'admin', 'missing', 'untrusted'])(
+      'rejects an ineligible registration session: %s',
+      async (kind) => {
+        prisma.refreshToken.findUnique.mockResolvedValue(
+          kind === 'missing'
+            ? null
+            : {
+                userId: kind === 'foreign' ? 'other' : 'user-1',
+                audience: kind === 'admin' ? 'ADMIN' : 'APP',
+                deviceKey: 'key',
+                revokedAt: kind === 'revoked' ? new Date() : null,
+              },
+        );
+        prisma.trustedDevice.findUnique.mockResolvedValue({
+          revokedAt: kind === 'untrusted' ? new Date() : null,
+        });
+        await expect(
+          service.registerPushToken(
+            'user-1',
+            {
+              token: 'ExponentPushToken[abc]',
+              provider: 'expo',
+              platform: 'ios',
+            },
+            'session',
+          ),
+        ).rejects.toBeInstanceOf(ForbiddenException);
+        expect(prisma.devicePushToken.updateMany).not.toHaveBeenCalled();
+      },
+    );
 
     it('deletes only the current user device push token', async () => {
       prisma.devicePushToken.deleteMany.mockResolvedValue({ count: 1 });

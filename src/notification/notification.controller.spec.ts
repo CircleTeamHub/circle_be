@@ -15,12 +15,13 @@ describe('NotificationController', () => {
     } as const;
 
     await controller.registerPushToken(dto, {
-      user: { userId: 'user-1' },
+      user: { userId: 'user-1', sessionId: 'signed-session' },
     } as any);
 
     expect(notificationService.registerPushToken).toHaveBeenCalledWith(
       'user-1',
       dto,
+      'signed-session',
     );
   });
 
