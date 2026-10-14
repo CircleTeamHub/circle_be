@@ -417,13 +417,18 @@ export class DeviceTrustService {
    * 安全码可能只有 4 位，不能只靠账号级的锁。
    */
   async registerSecurityCodeFailure(challengeId: string): Promise<void> {
-    await this.prisma.loginChallenge.updateMany({
+    const [counted] = await this.prisma.loginChallenge.updateManyAndReturn({
       where: {
         id: challengeId,
         attempts: { lt: LOGIN_CHALLENGE_MAX_ATTEMPTS },
       },
       data: { attempts: { increment: 1 } },
+      select: { attempts: true },
     });
+    // 与验证码路径一致：这一次正好用完次数就直接回「已作废」，新设备立刻切到重新发起。
+    if (!counted || counted.attempts >= LOGIN_CHALLENGE_MAX_ATTEMPTS) {
+      this.throwLocked();
+    }
   }
 
   async consumeAfterSecurityCode(challengeId: string): Promise<void> {

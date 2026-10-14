@@ -146,10 +146,23 @@ function setup() {
         });
         return { count: rows.length };
       }),
-      updateManyAndReturn: jest.fn(async ({ where, data }) => {
+      updateManyAndReturn: jest.fn(async ({ where, data, select }) => {
         const rows = challenges.filter((c) => matches(c as any, where));
-        rows.forEach((r) => Object.assign(r, data));
-        return rows.map((r) => ({ id: r.id }));
+        rows.forEach((r) => {
+          const next = { ...data };
+          if (next.attempts && typeof next.attempts === 'object') {
+            next.attempts = r.attempts + next.attempts.increment;
+          }
+          Object.assign(r, next);
+        });
+        return rows.map((r) =>
+          Object.fromEntries(
+            Object.keys(select ?? { id: true }).map((key) => [
+              key,
+              (r as Record<string, unknown>)[key],
+            ]),
+          ),
+        );
       }),
       aggregate: jest.fn(async ({ where }) => ({
         _sum: {
@@ -446,9 +459,16 @@ describe('DeviceTrustService approve / verify', () => {
 
   it('the security-code fallback shares the per-challenge attempt cap', async () => {
     const { service, challenges, challengeId } = await pending();
-    for (let i = 0; i < LOGIN_CHALLENGE_MAX_ATTEMPTS + 2; i += 1) {
+    for (let i = 0; i < LOGIN_CHALLENGE_MAX_ATTEMPTS - 1; i += 1) {
       await service.registerSecurityCodeFailure(challengeId);
     }
+    // 第 5 次输错即回「已作废」，之后再错也不会越过上限。
+    await expect(
+      service.registerSecurityCodeFailure(challengeId),
+    ).rejects.toThrow(/错误次数过多/);
+    await expect(
+      service.registerSecurityCodeFailure(challengeId),
+    ).rejects.toThrow(/错误次数过多/);
     expect(challenges[0].attempts).toBe(LOGIN_CHALLENGE_MAX_ATTEMPTS);
     await expect(
       service.loadForSecurityCode(challengeId, 'stranger'),
