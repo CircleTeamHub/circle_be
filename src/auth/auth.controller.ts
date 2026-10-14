@@ -3,6 +3,7 @@ import {
   Controller,
   Delete,
   Get,
+  Header,
   Param,
   ParseUUIDPipe,
   Post,
@@ -81,17 +82,32 @@ export class AuthController {
   ) {}
 
   /**
-   * 批准方的设备：优先认会话绑定的设备（不可伪造），会话还没绑定时（旧客户端
-   * 签发、尚未续签过）才回落请求头。
+   * 批准方的设备：认会话绑定的设备（不可伪造）。
+   *
+   * 功能上线前签发的老会话还没绑定设备，原先要等下一次续签（最长一个 access
+   * token 周期）才补记信任 —— 这期间新设备发起验证，账号下没有任何设备能批准。
+   * 所以老会话第一次来这里时，就把请求头里的设备 ID 绑到会话上并记为受信任：
+   * 能拿到这条会话 access token 的就是本人设备，与续签补记同一个前提。
+   * 新登录的会话建立时就已绑定，不会走到这条分支。
    */
   private async approverDeviceKey(req: RequestWithUser) {
-    const bound = req.user.sessionId
-      ? await this.refreshTokens.findSessionDeviceKey(
-          req.user.userId,
-          req.user.sessionId,
-        )
+    const { userId, sessionId } = req.user;
+    const bound = sessionId
+      ? await this.refreshTokens.findSessionDeviceKey(userId, sessionId)
       : null;
-    return bound ?? hashDeviceId(getHeaderValue(req.headers['x-device-id']));
+    if (bound) return bound;
+    const context = getSessionContext(req);
+    const headerKey = context.deviceKey ?? null;
+    if (!headerKey || !sessionId) return headerKey;
+    const claimed = await this.refreshTokens.bindLegacySessionDevice(
+      userId,
+      sessionId,
+      headerKey,
+    );
+    if (claimed) {
+      await this.deviceTrust.trustOnRefresh(userId, headerKey, context);
+    }
+    return headerKey;
   }
 
   @Post('register')
@@ -184,6 +200,8 @@ export class AuthController {
   }
 
   @Get('login-challenges/:challengeId/status')
+  // 状态每几秒就变，绝不能被任何一层缓存。
+  @Header('Cache-Control', 'no-store')
   @UseGuards(ThrottlerGuard)
   @Throttle({ default: { limit: 60, ttl: 60_000 } })
   @ApiOperation({ summary: 'New device: poll verification status' })
@@ -199,6 +217,7 @@ export class AuthController {
   }
 
   @Get('login-challenges')
+  @Header('Cache-Control', 'no-store')
   @UseGuards(JwtGuard)
   @ApiBearerAuth()
   @ApiOperation({
