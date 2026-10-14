@@ -59,6 +59,7 @@ describe('CircleInvitationService', () => {
       updateMany: jest.fn(),
     },
     circleInvitationVerifier: {
+      deleteMany: jest.fn(),
       findMany: jest.fn(),
       findFirst: jest.fn(),
       create: jest.fn(),
@@ -1849,6 +1850,40 @@ describe('CircleInvitationService', () => {
         verifiers: [],
       });
     }
+
+    it.each([
+      ['MEMBER', false],
+      ['ADMIN', true],
+    ])(
+      'reconciles the original vote when the inviter is now %s',
+      async (role, eligible) => {
+        arrangeInviteFlow({ inviterRole: role });
+        prisma.friend.findFirst.mockResolvedValue(null);
+        prisma.circleInvitation.findFirst.mockResolvedValue({
+          id: 'inv-new',
+          status: 'INVITED',
+          requiredCount: 1,
+          consentNoticeRequired: true,
+          createdAt: new Date(),
+        });
+        prisma.circleInvitation.update.mockResolvedValue({
+          id: 'inv-new',
+          approvedCount: eligible ? 1 : 0,
+          requiredCount: 1,
+          circle: { groupID: 'circle-1' },
+        });
+        await service.invite('inviter-1', 'applicant-1', 'circle-1', {
+          applicantConsented: true,
+          acceptedInvitationId: 'inv-new',
+        });
+        expect(prisma.circleInvitationVerifier.deleteMany).toHaveBeenCalledWith(
+          { where: { invitationID: 'inv-new', verifierID: 'inviter-1' } },
+        );
+        expect(prisma.circleInvitationVerifier.create).toHaveBeenCalledTimes(
+          eligible ? 1 : 0,
+        );
+      },
+    );
 
     function arrangeExistingPending() {
       prisma.circleInvitation.findFirst.mockResolvedValue({

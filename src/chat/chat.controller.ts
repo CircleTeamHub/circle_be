@@ -145,7 +145,6 @@ export class ChatController {
         memberIds: body.memberIds,
       },
     );
-    await this.admissions.flush();
     return conversation;
   }
 

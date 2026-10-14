@@ -548,7 +548,15 @@ export class CircleInvitationService {
             },
           });
 
-      if (inviterCanVouch && !existingInvitation) {
+      if (existingInvitation && opts?.applicantConsented) {
+        await tx.circleInvitationVerifier.deleteMany({
+          where: { invitationID: created.id, verifierID: inviterId },
+        });
+      }
+      if (
+        inviterCanVouch &&
+        (!existingInvitation || opts?.applicantConsented)
+      ) {
         await tx.circleInvitationVerifier.create({
           data: {
             invitationID: created.id,

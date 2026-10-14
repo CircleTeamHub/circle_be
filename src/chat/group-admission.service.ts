@@ -854,7 +854,17 @@ export class GroupAdmissionService {
           const group = await this.prisma.chatConversation.findUnique({
             where: { id: a.conversationID },
           });
-          const name = group?.name ?? '群聊';
+          const ownerSeat = group?.ownerID
+            ? await this.member(this.prisma, a.conversationID, group.ownerID)
+            : null;
+          if (!group || !ownerSeat || ownerSeat.leftAt) {
+            await this.prisma.groupAdmissionDelivery.update({
+              where: { id: job.id },
+              data: { deliveredAt: new Date() },
+            });
+            continue;
+          }
+          const name = group.name ?? '群聊';
           const copy: Record<string, string> = {
             INVITED: `邀请你加入「${name}」`,
             PENDING: `申请加入「${name}」，等待审核`,

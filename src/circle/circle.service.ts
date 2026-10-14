@@ -835,7 +835,7 @@ export class CircleService {
       // 在飞的入圈担保单必须一起作废:它们只查 PENDING + 成员数,不看圈子
       // 死活,留着的话解散之后仍会在申请人的「我的申请」里挂着。
       await tx.circleInvitation.updateMany({
-        where: { circleID: circleId, status: 'PENDING' },
+        where: { circleID: circleId, status: { in: ['INVITED', 'PENDING'] } },
         data: { status: 'CANCELLED' },
       });
       // 圈子图标是佩戴态,圈子没了就不该继续挂在任何人的名片上。

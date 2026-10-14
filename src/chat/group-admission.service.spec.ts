@@ -459,6 +459,31 @@ describe('Group admission consent and authorization', () => {
 });
 
 describe('Group admission durable delivery', () => {
+  it('does not deliver queued invitation cards after the owner seat was dissolved', async () => {
+    const h = harness();
+    await h.service.invite('owner', 'g', ['guest']);
+    h.seats.get('owner').leftAt = new Date();
+    h.tx.groupAdmissionDelivery.findMany.mockResolvedValue([
+      {
+        id: 'stale',
+        admission: h.admissions.get('a0'),
+        recipientID: 'guest',
+        actorID: 'owner',
+        event: 'INVITED',
+        attempts: 1,
+      },
+    ]);
+    await h.service.flush();
+    expect(
+      h.notifications.deliverGroupAdmissionNotification,
+    ).not.toHaveBeenCalled();
+    expect(h.messages.insertServerMessage).not.toHaveBeenCalled();
+    expect(h.tx.groupAdmissionDelivery.update).toHaveBeenCalledWith({
+      where: { id: 'stale' },
+      data: { deliveredAt: expect.any(Date) },
+    });
+  });
+
   it('stops selecting a permanently failed card at the retry limit', async () => {
     const h = harness();
     await h.service.invite('owner', 'g', ['guest']);

@@ -470,7 +470,7 @@ describe('CircleService', () => {
       });
       // 在飞担保单作废 + 佩戴中的圈子图标摘掉。
       expect(prisma.circleInvitation.updateMany).toHaveBeenCalledWith({
-        where: { circleID: 'circle-1', status: 'PENDING' },
+        where: { circleID: 'circle-1', status: { in: ['INVITED', 'PENDING'] } },
         data: { status: 'CANCELLED' },
       });
       expect(prisma.userDisplayIcon.deleteMany).toHaveBeenCalledWith({
