@@ -534,6 +534,33 @@ describe('RealtimeService', () => {
     );
   });
 
+  it.each(['auth.login.challenge.created', 'auth.login.challenge.resolved'])(
+    'delivers %s from another instance',
+    async (type) => {
+      let handler:
+        | ((channel: string, message: string) => void | Promise<void>)
+        | undefined;
+      redis.subscribePattern.mockImplementation(
+        async (pattern: string, callback) => {
+          if (pattern === 'circle:realtime:user:*') handler = callback;
+          return true;
+        },
+      );
+      await service.onModuleInit();
+      const socket = { readyState: 1, send: jest.fn() } as any;
+      service.registerClient('user-1', socket);
+      const event = {
+        type,
+        payload: { challengeId: 'challenge-1', status: 'APPROVED' },
+      };
+      await handler?.(
+        'circle:realtime:user:user-1',
+        JSON.stringify({ origin: 'another-instance', event }),
+      );
+      expect(socket.send).toHaveBeenCalledWith(JSON.stringify(event));
+    },
+  );
+
   it('delivers Redis realtime events from other instances to local sockets', async () => {
     let handler:
       | ((channel: string, message: string) => void | Promise<void>)

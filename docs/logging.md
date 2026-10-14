@@ -159,6 +159,7 @@ Auth & account:
 
 - `auth_register_success`
 - `auth_login_success`, `auth_login_failed`
+- `auth_login_device_verification_required` — correct password from an unknown device; a login challenge was opened instead of issuing tokens
 - `auth_admin_login_success`, `auth_admin_login_failed`, `auth_admin_login_locked`, `auth_admin_logout`
 - `auth_logout_all_success`, `auth_session_logout`, `auth_other_sessions_logout`
 - `auth_password_reset_requested` (no actor — unauthenticated, email never logged), `auth_password_reset_success`
@@ -234,6 +235,18 @@ the request context and a sanitized `reason`:
 - `security_code_invalid` — a wrong login security code (with the running
   attempt count).
 - `security_code_locked` — the account hit the security-code lockout.
+- `login_challenge_created` / `login_challenge_approved` / `login_challenge_rejected` /
+  `login_challenge_consumed` — unknown-device login verification lifecycle
+  (challengeId only; the code itself is never logged).
+- `login_challenge_code_invalid` — a wrong verification code (with the running
+  attempt count).
+- `login_challenge_rate_limited` — too many challenges for the account / source IP.
+- `login_challenge_reopened` — an approved challenge whose code expired was put
+  back to pending (resend / re-login) and trusted devices were notified again.
+- `login_challenges_invalidated` — open challenges were rejected because the
+  password changed / was reset or the user logged out other or all devices.
+- `login_challenge_security_code_budget_exhausted` — the account used up its
+  daily failure budget for the security-code fallback.
 
 The security-log call in `AllExceptionFilter` and `ErrorLoggingInterceptor`
 is wrapped like the Sentry capture: if the log transport throws, an

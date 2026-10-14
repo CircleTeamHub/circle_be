@@ -420,6 +420,8 @@ model User {
   updatedAt                    DateTime   @updatedAt
 
   refreshTokens                     RefreshToken[]
+  trustedDevices                    TrustedDevice[]
+  loginChallenges                   LoginChallenge[]
   qrLoginApprovals                  QrLoginSession[]  @relation("qrLoginApprover")
   invitedBy                         User?                       @relation("UserInvitations", fields: [invitedByUserId], references: [id], onDelete: SetNull)
   invitees                          User[]                      @relation("UserInvitations")
@@ -879,6 +881,8 @@ model RefreshToken {
   deviceName       String?
   ip               String?
   userAgent        String?
+  /// sha256(x-device-id)：把会话绑到受信任设备，移除设备时据此撤销信任。
+  deviceKey        String?
   expiredAt        DateTime
   revokedAt        DateTime?
   revocationReason RefreshTokenRevocationReason?
@@ -889,8 +893,60 @@ model RefreshToken {
   @@index([userId])
   @@index([userId, familyId])
   @@index([userId, audience, createdAt])
+  @@index([userId, deviceKey])
   @@index([expiredAt])
   @@index([revokedAt])
+}
+
+/// 受信任登录设备。陌生设备（不在此表或已撤销）用密码登录时，必须由一台
+/// 受信任设备批准并下发一次性验证码。「退出登录」不撤销信任，只有在设备管理里
+/// 移除 / 退出其他设备才撤销 —— 否则用户在所有设备上退出一遍，信任清空，
+/// 拿到密码的人就能当成「首台设备」直接进来。
+model TrustedDevice {
+  id         String    @id @default(uuid())
+  userId     String
+  /// sha256(客户端随机设备 ID)，原值只存在设备的安全存储里。
+  deviceKey  String
+  deviceName String?
+  lastIp     String?
+  createdAt  DateTime  @default(now())
+  lastSeenAt DateTime  @default(now())
+  revokedAt  DateTime?
+  user       User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([userId, deviceKey])
+  @@index([userId, revokedAt])
+}
+
+enum LoginChallengeStatus {
+  PENDING
+  APPROVED
+  REJECTED
+  CONSUMED
+}
+
+/// 陌生设备登录验证请求。密码正确但设备陌生时创建，不发 token；受信任设备批准后
+/// 生成 6 位验证码（只存哈希，60 秒有效），陌生设备输对后才发 token。
+model LoginChallenge {
+  id            String               @id @default(uuid())
+  userId        String
+  deviceKey     String
+  deviceName    String?
+  ip            String?
+  userAgent     String?
+  status        LoginChallengeStatus @default(PENDING)
+  codeHash      String?
+  codeExpiresAt DateTime?
+  attempts      Int                  @default(0)
+  /// 受信任设备做决定的窗口；批准后验证码另有 60 秒有效期。
+  expiresAt     DateTime
+  decidedAt     DateTime?
+  createdAt     DateTime             @default(now())
+  user          User                 @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId, createdAt])
+  @@index([userId, deviceKey, status])
+  @@index([createdAt])
 }
 
 // ─── Social ───────────────────────────────────────────────────────────────────

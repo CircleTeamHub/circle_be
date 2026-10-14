@@ -1,5 +1,6 @@
 import { Test, TestingModule } from '@nestjs/testing';
 import { AuthService } from '../auth.service';
+import { DeviceTrustService } from '../device-trust.service';
 import { JwtService } from '@nestjs/jwt';
 import { ConfigService } from '@nestjs/config';
 import {
@@ -88,6 +89,25 @@ describe('AuthService', () => {
     $transaction: jest.fn(async (operation: any) => operation(mockPrisma)),
   };
 
+  const mockDeviceTrust = {
+    trust: jest.fn().mockResolvedValue(undefined),
+    listDetachedDevices: jest.fn().mockResolvedValue([]),
+    deviceKeyForRecord: jest.fn().mockResolvedValue(null),
+    evaluateLogin: jest.fn(() => Promise.resolve({ kind: 'trusted' })),
+    trustOnRefresh: jest.fn(() => Promise.resolve()),
+    revokeDevice: jest.fn(() => Promise.resolve()),
+    revokeOtherDevices: jest.fn(() => Promise.resolve()),
+    registerSecurityCodeFailure: jest.fn(() => Promise.resolve()),
+    invalidateChallenges: jest.fn(() => Promise.resolve()),
+    assertSecurityCodeFallbackBudget: jest.fn(() => Promise.resolve()),
+    verifySecurityCodeFallback: jest.fn(async (_id, _deviceKey, verify) =>
+      verify(),
+    ),
+    loadForSecurityCode: jest.fn(),
+    consumeAfterSecurityCode: jest.fn(() => Promise.resolve()),
+    consumeWithCode: jest.fn(),
+    completeVerifiedLogin: jest.fn(() => Promise.resolve()),
+  };
   const mockRefreshTokenService = {
     create: jest.fn(() =>
       Promise.resolve({ token: 'refresh-token', sessionId: 'session-1' }),
@@ -98,6 +118,7 @@ describe('AuthService', () => {
     createSessionForCurrentSingleDeviceSetting: jest.fn(() =>
       Promise.resolve({ token: 'refresh-token', sessionId: 'session-1' }),
     ),
+    ownerForToken: jest.fn().mockResolvedValue('uuid-1'),
     rotate: jest.fn(() =>
       Promise.resolve({
         token: 'new-refresh-token',
@@ -109,6 +130,10 @@ describe('AuthService', () => {
     listActiveSessions: jest.fn(() => Promise.resolve([])),
     revokeSession: jest.fn(() => Promise.resolve()),
     revokeOtherSessions: jest.fn(() => Promise.resolve()),
+    revokeDeviceSessions: jest.fn(() => Promise.resolve()),
+    findSessionDeviceKey: jest.fn((_userId: string, sessionId: string) =>
+      Promise.resolve(`device-key-of-${sessionId}`),
+    ),
     revokeAll: jest.fn(() => Promise.resolve()),
     replaceForSingleDevice: jest.fn(() =>
       Promise.resolve({ token: 'refresh-token', sessionId: 'session-1' }),
@@ -139,6 +164,14 @@ describe('AuthService', () => {
   beforeEach(async () => {
     users.length = 0;
     jest.clearAllMocks();
+    mockRefreshTokenService.findSessionDeviceKey.mockImplementation(
+      async (_userId: string, sessionId: string) =>
+        `device-key-of-${sessionId}`,
+    );
+    mockDeviceTrust.loadForSecurityCode.mockResolvedValue({
+      userId: 'uuid-1',
+      deviceKey: 'new-device',
+    } as never);
     mockPrisma.adminAccess.findUnique.mockResolvedValue({
       role: 'SUPER_ADMIN',
     });
@@ -226,6 +259,7 @@ describe('AuthService', () => {
         { provide: ConfigService, useValue: { get: () => undefined } },
         { provide: FancyNumberService, useValue: mockFancyNumberService },
         { provide: AvatarFrameService, useValue: mockAvatarFrameService },
+        { provide: DeviceTrustService, useValue: mockDeviceTrust },
       ],
     }).compile();
 
@@ -236,6 +270,108 @@ describe('AuthService', () => {
     expect(service).toBeDefined();
   });
 
+  it('does not create a session when initial trusted-device enrollment fails', async () => {
+    mockDeviceTrust.trust.mockRejectedValueOnce(
+      new Error('database unavailable'),
+    );
+    await expect(
+      service.register(
+        {
+          email: 'new@example.com',
+          confirmPassword: 'password1',
+          password: 'password1',
+          nickname: 'Test',
+        } as any,
+        { deviceKey: 'new-device' },
+      ),
+    ).rejects.toThrow('database unavailable');
+    expect(mockRefreshTokenService.createAppSession).not.toHaveBeenCalled();
+    expect(
+      mockRefreshTokenService.createSessionForCurrentSingleDeviceSetting,
+    ).not.toHaveBeenCalled();
+  });
+
+  it('removing another device invalidates challenges it could have approved', async () => {
+    mockRefreshTokenService.findSessionDeviceKey
+      .mockResolvedValueOnce('attacker')
+      .mockResolvedValueOnce('owner');
+    await service.logoutSession('uuid-1', 'attacker-session', 'owner-session');
+    expect(mockDeviceTrust.invalidateChallenges).toHaveBeenCalledWith('uuid-1');
+  });
+
+  it('keeps detached trusted devices visible and removable by their opaque record IDs', async () => {
+    mockRefreshTokenService.listActiveSessions.mockResolvedValueOnce([]);
+    mockDeviceTrust.listDetachedDevices.mockResolvedValueOnce([
+      { id: 'trusted-record', deviceName: 'Old phone' },
+    ] as never);
+    expect(await service.sessions('uuid-1')).toEqual([
+      { id: 'trusted-record', deviceName: 'Old phone', isCurrent: false },
+    ]);
+    mockRefreshTokenService.findSessionDeviceKey.mockResolvedValueOnce(null);
+    mockDeviceTrust.deviceKeyForRecord.mockResolvedValueOnce('old-device');
+    await service.logoutSession('uuid-1', 'trusted-record');
+    expect(mockDeviceTrust.deviceKeyForRecord).toHaveBeenCalledWith(
+      'uuid-1',
+      'trusted-record',
+    );
+    expect(mockDeviceTrust.revokeDevice).toHaveBeenCalledWith(
+      'uuid-1',
+      'old-device',
+    );
+  });
+
+  it('holds recovery behind refresh rotation and final device trust enrollment', async () => {
+    users.push({
+      id: 'uuid-1',
+      accountId: 'AAA111',
+      passwordHash: 'x',
+      status: 'ACTIVE',
+      role: 'USER',
+      singleDeviceLoginEnabled: false,
+    });
+    let rotating!: () => void;
+    const started = new Promise<void>((resolve) => {
+      rotating = resolve;
+    });
+    let release!: () => void;
+    const pause = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    mockRefreshTokenService.rotate.mockImplementationOnce(async () => {
+      rotating();
+      await pause;
+      return {
+        token: 'new-refresh-token',
+        userId: 'uuid-1',
+        sessionId: 'session-2',
+        deviceKey: 'old-device',
+      } as any;
+    });
+    const original = mockPrisma.$transaction.getMockImplementation();
+    let queue: Promise<unknown> = Promise.resolve();
+    mockPrisma.$transaction.mockImplementation((operation: any) => {
+      const task = queue.then(() => operation(mockPrisma));
+      queue = task.catch(() => {});
+      return task;
+    });
+    try {
+      const refresh = service.refresh('refresh-token');
+      await started;
+      const recovery = service.logoutAll('uuid-1');
+      await Promise.resolve();
+      expect(mockRefreshTokenService.revokeAll).not.toHaveBeenCalled();
+      release();
+      await Promise.all([refresh, recovery]);
+      expect(
+        mockDeviceTrust.trustOnRefresh.mock.invocationCallOrder[0],
+      ).toBeLessThan(
+        mockRefreshTokenService.revokeAll.mock.invocationCallOrder[0],
+      );
+    } finally {
+      mockPrisma.$transaction.mockImplementation(original!);
+    }
+  });
+
   it('register creates user with auto accountId and returns tokens', async () => {
     const result = await service.register({
       email: 'new@example.com',
@@ -243,7 +379,9 @@ describe('AuthService', () => {
       password: 'password1',
       nickname: 'Test User',
     } as any);
-    expect(result.accessToken).toBe('access-token');
+    expect((result as { accessToken: string }).accessToken).toBe(
+      'access-token',
+    );
     expect(result.refreshToken).toBe('refresh-token');
     expect(users[0].accountId).toMatch(/^\d{6}$/);
     expect(users[0].inviteCode).toMatch(/^[A-Z0-9]{6}$/);
@@ -358,7 +496,9 @@ describe('AuthService', () => {
       inviteCode: ' campaign-code ',
     } as any);
 
-    expect(result.accessToken).toBe('access-token');
+    expect((result as { accessToken: string }).accessToken).toBe(
+      'access-token',
+    );
     expect(mockPrisma.campaignInvite.findUnique).toHaveBeenCalledWith(
       expect.objectContaining({ where: { code: 'CAMPAIGN-CODE' } }),
     );
@@ -460,7 +600,9 @@ describe('AuthService', () => {
       nickname: 'Race',
     } as any);
 
-    expect(result.accessToken).toBe('access-token');
+    expect((result as { accessToken: string }).accessToken).toBe(
+      'access-token',
+    );
     expect(mockPrisma.user.create).toHaveBeenCalledTimes(2);
     expect(users).toHaveLength(1);
   });
@@ -487,7 +629,9 @@ describe('AuthService', () => {
     } as any);
 
     expect(rejectedAccountId).toMatch(/^\d{6}$/);
-    expect(result.accessToken).toBe('access-token');
+    expect((result as { accessToken: string }).accessToken).toBe(
+      'access-token',
+    );
     expect(mockPrisma.user.create).toHaveBeenCalledTimes(2);
     expect(users).toHaveLength(1);
     expect(users[0].accountId).not.toBe(rejectedAccountId);
@@ -510,7 +654,9 @@ describe('AuthService', () => {
     } as any);
 
     expect(rejectedInviteCode).toMatch(/^[A-Z0-9]{6}$/);
-    expect(result.accessToken).toBe('access-token');
+    expect((result as { accessToken: string }).accessToken).toBe(
+      'access-token',
+    );
     expect(mockPrisma.user.create).toHaveBeenCalledTimes(2);
   });
 
@@ -581,7 +727,9 @@ describe('AuthService', () => {
       email: 'a@example.com',
       password: 'password1',
     } as any);
-    expect(result.accessToken).toBe('access-token');
+    expect((result as { accessToken: string }).accessToken).toBe(
+      'access-token',
+    );
   });
 
   it('login by user ID returns tokens with correct password', async () => {
@@ -598,7 +746,9 @@ describe('AuthService', () => {
       identifier: ' user_123 ',
       password: 'password1',
     } as any);
-    expect(result.accessToken).toBe('access-token');
+    expect((result as { accessToken: string }).accessToken).toBe(
+      'access-token',
+    );
   });
 
   it('login throws ForbiddenException for unknown email', async () => {
@@ -703,7 +853,9 @@ describe('AuthService', () => {
       password: 'password1',
     } as any);
 
-    expect(result.accessToken).toBe('access-token');
+    expect((result as { accessToken: string }).accessToken).toBe(
+      'access-token',
+    );
     expect(
       mockRefreshTokenService.createSessionForCurrentSingleDeviceSetting,
     ).toHaveBeenCalledWith('uuid-1', undefined, 'ADMIN');
@@ -890,9 +1042,14 @@ describe('AuthService', () => {
   });
 
   it('revokes all sessions for a user', async () => {
-    await service.logoutAll('uuid-1');
+    await service.logoutAll('uuid-1', 'session-1');
 
     expect(mockRefreshTokenService.revokeAll).toHaveBeenCalledWith('uuid-1');
+    expect(mockDeviceTrust.invalidateChallenges).toHaveBeenCalledWith('uuid-1');
+    expect(mockDeviceTrust.revokeOtherDevices).toHaveBeenCalledWith(
+      'uuid-1',
+      'device-key-of-session-1',
+    );
   });
 
   it('revokes a selected session for the current user', async () => {
@@ -901,6 +1058,16 @@ describe('AuthService', () => {
     expect(mockRefreshTokenService.revokeSession).toHaveBeenCalledWith(
       'uuid-1',
       'session-2',
+    );
+    // 同一设备的其他会话一起撤，否则剩下那条续签会让设备继续在线。
+    expect(mockRefreshTokenService.revokeDeviceSessions).toHaveBeenCalledWith(
+      'uuid-1',
+      'device-key-of-session-2',
+    );
+    // 移除设备 = 撤销信任，下次登录要重新经受信任设备批准。
+    expect(mockDeviceTrust.revokeDevice).toHaveBeenCalledWith(
+      'uuid-1',
+      'device-key-of-session-2',
     );
   });
 
@@ -911,6 +1078,291 @@ describe('AuthService', () => {
       'uuid-1',
       'session-1',
     );
+    expect(mockDeviceTrust.revokeOtherDevices).toHaveBeenCalledWith(
+      'uuid-1',
+      'device-key-of-session-1',
+    );
+    expect(mockDeviceTrust.invalidateChallenges).toHaveBeenCalledWith('uuid-1');
+  });
+
+  it('removing an older session of the current device keeps this device signed in and trusted', async () => {
+    mockRefreshTokenService.findSessionDeviceKey.mockResolvedValue(
+      'same-phone' as never,
+    );
+
+    await service.logoutSession('uuid-1', 'old-session', 'current-session');
+
+    expect(mockRefreshTokenService.revokeSession).toHaveBeenCalledWith(
+      'uuid-1',
+      'old-session',
+    );
+    expect(mockRefreshTokenService.revokeDeviceSessions).not.toHaveBeenCalled();
+    expect(mockDeviceTrust.revokeDevice).not.toHaveBeenCalled();
+    mockRefreshTokenService.findSessionDeviceKey.mockImplementation(
+      (_userId: string, sessionId: string) =>
+        Promise.resolve(`device-key-of-${sessionId}`),
+    );
+  });
+
+  it('a wrong security code on the challenge path never touches the app-lock counters', async () => {
+    const securityCodeHash = await argon2.hash('2468');
+    users.push({
+      id: 'uuid-sc',
+      accountId: 'sc1',
+      email: 'sc@example.com',
+      passwordHash: 'x',
+      status: 'ACTIVE',
+      role: 'USER',
+      loginSecurityCodeHash: securityCodeHash,
+      securityCodeAttempts: 0,
+      securityCodeLockedUntil: null,
+    });
+    mockDeviceTrust.loadForSecurityCode.mockResolvedValueOnce({
+      id: 'challenge-sc',
+      userId: 'uuid-sc',
+      deviceKey: 'new-device',
+    } as never);
+    mockPrisma.user.update.mockClear();
+
+    await expect(
+      service.verifyLoginChallengeSecurityCode('challenge-sc', '1357', {
+        deviceKey: 'new-device',
+      }),
+    ).rejects.toThrow(ForbiddenException);
+
+    expect(mockDeviceTrust.verifySecurityCodeFallback).toHaveBeenCalledWith(
+      'challenge-sc',
+      'new-device',
+      expect.any(Function),
+    );
+    expect(mockPrisma.user.update).not.toHaveBeenCalled();
+  });
+
+  it('revokes all device trust when the current session has no bound device', async () => {
+    mockRefreshTokenService.findSessionDeviceKey.mockResolvedValueOnce(
+      null as never,
+    );
+    await service.logoutOtherSessions('uuid-1', 'session-1');
+
+    expect(mockDeviceTrust.revokeOtherDevices).toHaveBeenCalledWith(
+      'uuid-1',
+      null,
+    );
+  });
+
+  it('does not issue tokens when the device needs verification', async () => {
+    const passwordHash = await argon2.hash('password1');
+    users.push({
+      id: 'uuid-new-device',
+      accountId: 'newdev1',
+      email: 'newdev@example.com',
+      passwordHash,
+      status: 'ACTIVE',
+      role: 'USER',
+    });
+    const expiresAt = new Date(Date.now() + 300_000);
+    mockDeviceTrust.evaluateLogin.mockResolvedValueOnce({
+      kind: 'challenge',
+      challenge: { id: 'challenge-1', expiresAt, securityCodeAvailable: false },
+    } as never);
+
+    const result = await service.login(
+      { identifier: 'newdev@example.com', password: 'password1' } as any,
+      { deviceKey: 'unknown-device' },
+    );
+
+    expect(result).toEqual({
+      deviceVerificationRequired: true,
+      challenge: { id: 'challenge-1', expiresAt, securityCodeAvailable: false },
+    });
+    expect(mockRefreshTokenService.createAppSession).not.toHaveBeenCalled();
+    expect(mockJwt.signAsync).not.toHaveBeenCalled();
+  });
+
+  it('never evaluates device trust when the password is wrong', async () => {
+    const passwordHash = await argon2.hash('password1');
+    users.push({
+      id: 'uuid-wrong-pw',
+      accountId: 'wrongpw1',
+      email: 'wrongpw@example.com',
+      passwordHash,
+      status: 'ACTIVE',
+      role: 'USER',
+    });
+    await expect(
+      service.login({
+        identifier: 'wrongpw@example.com',
+        password: 'password2',
+      } as any),
+    ).rejects.toThrow(ForbiddenException);
+    // 错密码不能触发受信任设备弹窗，否则谁都能拿别人的账号名刷弹窗。
+    expect(mockDeviceTrust.evaluateLogin).not.toHaveBeenCalled();
+  });
+
+  it('serializes challenge completion through token issuance before recovery', async () => {
+    users.push({
+      id: 'uuid-1',
+      accountId: 'AAA111',
+      passwordHash: 'x',
+      status: 'ACTIVE',
+      role: 'USER',
+      singleDeviceLoginEnabled: false,
+    });
+    let consumed!: () => void;
+    const consumedBarrier = new Promise<void>((resolve) => {
+      consumed = resolve;
+    });
+    let release!: () => void;
+    const pause = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    mockDeviceTrust.consumeWithCode.mockImplementationOnce(async () => {
+      consumed();
+      await pause;
+      return { userId: 'uuid-1', deviceKey: 'new-device' };
+    });
+    const original = mockPrisma.$transaction.getMockImplementation();
+    let queue: Promise<unknown> = Promise.resolve();
+    mockPrisma.$transaction.mockImplementation((operation: any) => {
+      const task = queue.then(() => operation(mockPrisma));
+      queue = task.catch(() => {});
+      return task;
+    });
+    try {
+      const login = service.verifyLoginChallengeCode('challenge', '123456', {
+        deviceKey: 'new-device',
+      });
+      await consumedBarrier;
+      const recovery = service.logoutAll('uuid-1');
+      await Promise.resolve();
+      expect(mockDeviceTrust.invalidateChallenges).not.toHaveBeenCalled();
+      release();
+      await Promise.all([login, recovery]);
+      expect(mockPrisma.$executeRaw).toHaveBeenCalledTimes(2);
+      expect(
+        mockRefreshTokenService.createAppSession.mock.invocationCallOrder[0],
+      ).toBeLessThan(
+        mockRefreshTokenService.revokeAll.mock.invocationCallOrder[0],
+      );
+    } finally {
+      mockPrisma.$transaction.mockImplementation(original!);
+    }
+  });
+
+  it('does not evaluate trusted login until overlapping device removal has finished', async () => {
+    users.push({
+      id: 'uuid-1',
+      accountId: 'aaa111',
+      passwordHash: await argon2.hash('password1'),
+      status: 'ACTIVE',
+      role: 'USER',
+      singleDeviceLoginEnabled: false,
+    });
+    let removing!: () => void;
+    const started = new Promise<void>((resolve) => {
+      removing = resolve;
+    });
+    let release!: () => void;
+    const pause = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    mockRefreshTokenService.findSessionDeviceKey.mockResolvedValue('removed');
+    mockRefreshTokenService.revokeSession.mockImplementationOnce(async () => {
+      removing();
+      await pause;
+    });
+    const original = mockPrisma.$transaction.getMockImplementation();
+    let queue: Promise<unknown> = Promise.resolve();
+    mockPrisma.$transaction.mockImplementation((operation: any) => {
+      const task = queue.then(() => operation(mockPrisma));
+      queue = task.catch(() => {});
+      return task;
+    });
+    mockDeviceTrust.evaluateLogin.mockResolvedValueOnce({
+      kind: 'challenge',
+      challenge: {
+        id: 'new',
+        expiresAt: new Date().toISOString(),
+        securityCodeAvailable: false,
+      },
+    } as never);
+    try {
+      const removal = service.logoutSession('uuid-1', 'other');
+      await started;
+      const login = service.login(
+        { identifier: 'AAA111', password: 'password1' },
+        {
+          deviceKey: 'removed',
+        },
+      );
+      await new Promise(setImmediate);
+      expect(mockDeviceTrust.evaluateLogin).not.toHaveBeenCalled();
+      release();
+      await removal;
+      const result = await login;
+      expect(result).toHaveProperty('deviceVerificationRequired', true);
+      expect(
+        mockDeviceTrust.revokeDevice.mock.invocationCallOrder[0],
+      ).toBeLessThan(mockDeviceTrust.evaluateLogin.mock.invocationCallOrder[0]);
+    } finally {
+      mockPrisma.$transaction.mockImplementation(original!);
+    }
+  });
+
+  it('issues tokens and trusts the device after a correct challenge code', async () => {
+    users.push({
+      id: 'uuid-1',
+      accountId: 'AAA111',
+      email: 'a@example.com',
+      passwordHash: 'x',
+      status: 'ACTIVE',
+      role: 'USER',
+      singleDeviceLoginEnabled: false,
+    });
+    mockDeviceTrust.consumeWithCode.mockResolvedValueOnce({
+      userId: 'uuid-1',
+      deviceKey: 'new-device',
+    } as never);
+
+    const result = await service.verifyLoginChallengeCode(
+      'challenge-1',
+      '123456',
+      { deviceKey: 'new-device', deviceName: 'Pixel 9' },
+    );
+
+    expect(result.accessToken).toBe('access-token');
+    expect(mockDeviceTrust.completeVerifiedLogin).toHaveBeenCalledWith(
+      'uuid-1',
+      'challenge-1',
+      'new-device',
+      { deviceKey: 'new-device', deviceName: 'Pixel 9' },
+    );
+    expect(mockRefreshTokenService.createAppSession).toHaveBeenCalledWith(
+      'uuid-1',
+      expect.objectContaining({ deviceKey: 'new-device' }),
+    );
+  });
+
+  it('refuses a verified challenge for a user banned meanwhile', async () => {
+    users.push({
+      id: 'uuid-banned',
+      accountId: 'banned1',
+      email: 'banned@example.com',
+      passwordHash: 'x',
+      status: 'BANNED',
+      role: 'USER',
+    });
+    mockDeviceTrust.consumeWithCode.mockResolvedValueOnce({
+      userId: 'uuid-banned',
+      deviceKey: 'new-device',
+    } as never);
+
+    await expect(
+      service.verifyLoginChallengeCode('challenge-1', '123456', {
+        deviceKey: 'new-device',
+      }),
+    ).rejects.toThrow(ForbiddenException);
+    expect(mockDeviceTrust.completeVerifiedLogin).not.toHaveBeenCalled();
   });
 
   it('reads and updates the account-level single-device login setting', async () => {
@@ -949,7 +1401,9 @@ describe('AuthService', () => {
     const beforeRefresh = Date.now();
     const result = await service.refresh('refresh-token');
 
-    expect(result.accessToken).toBe('access-token');
+    expect((result as { accessToken: string }).accessToken).toBe(
+      'access-token',
+    );
     expect(result.refreshToken).toBe('new-refresh-token');
     expect(mockRefreshTokenService.rotate).toHaveBeenCalledWith(
       'refresh-token',
@@ -1215,7 +1669,12 @@ describe('AuthService', () => {
       role: 'USER',
     });
 
-    await service.changePassword('uuid-1', 'current-password', 'new-password');
+    await service.changePassword(
+      'uuid-1',
+      'current-password',
+      'new-password',
+      'session-1',
+    );
 
     expect(mockPrisma.user.update).toHaveBeenCalledWith(
       expect.objectContaining({
@@ -1226,6 +1685,57 @@ describe('AuthService', () => {
       }),
     );
     expect(mockRefreshTokenService.revokeAll).toHaveBeenCalledWith('uuid-1');
+    // 改密 = 怀疑泄露：只保留发起改密的这台设备的信任，进行中的验证单作废。
+    expect(mockDeviceTrust.revokeOtherDevices).toHaveBeenCalledWith(
+      'uuid-1',
+      'device-key-of-session-1',
+    );
+    expect(mockDeviceTrust.invalidateChallenges).toHaveBeenCalledWith('uuid-1');
+  });
+
+  it('password reset by email revokes all device trust (lost-device recovery)', async () => {
+    users.push({
+      id: 'uuid-reset',
+      accountId: 'resetme',
+      email: 'reset@example.com',
+      passwordHash: 'x',
+      status: 'ACTIVE',
+      role: 'USER',
+    });
+    const prismaAny = mockPrisma as any;
+    const original = {
+      transaction: prismaAny.$transaction,
+      refreshToken: prismaAny.refreshToken,
+    };
+    prismaAny.$transaction = jest.fn(async (operation: any) =>
+      typeof operation === 'function'
+        ? operation(prismaAny)
+        : Promise.all(operation),
+    );
+    prismaAny.refreshToken = { updateMany: jest.fn() };
+    (mockRefreshTokenService as any).revokeAllAccessMarkers = jest.fn(() =>
+      Promise.resolve(),
+    );
+
+    try {
+      await service.resetPassword(
+        'reset@example.com',
+        '123456',
+        'new-password',
+      );
+    } finally {
+      prismaAny.$transaction = original.transaction;
+      prismaAny.refreshToken = original.refreshToken;
+    }
+
+    // 全部撤销后，下一次登录的设备按「首台设备」处理，不必再等丢了的手机批准。
+    expect(mockDeviceTrust.revokeOtherDevices).toHaveBeenCalledWith(
+      'uuid-reset',
+      null,
+    );
+    expect(mockDeviceTrust.invalidateChallenges).toHaveBeenCalledWith(
+      'uuid-reset',
+    );
   });
 
   it('changeAccountId rejects an invalid format without touching the DB', async () => {

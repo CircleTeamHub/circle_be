@@ -18,6 +18,8 @@ import { UnconfiguredMailer } from './mailer/unconfigured.mailer';
 import { SmtpMailer } from './mailer/smtp.mailer';
 import { FancyNumberModule } from 'src/fancy-number/fancy-number.module';
 import { AvatarFrameModule } from 'src/avatar-frame/avatar-frame.module';
+import { RealtimeModule } from 'src/realtime/realtime.module';
+import { DeviceTrustService } from './device-trust.service';
 
 @Global()
 @Module({
@@ -39,10 +41,12 @@ import { AvatarFrameModule } from 'src/avatar-frame/avatar-frame.module';
     }),
     FancyNumberModule,
     AvatarFrameModule,
+    RealtimeModule,
   ],
   providers: [
     AuthService,
     RefreshTokenService,
+    DeviceTrustService,
     RefreshTokenCleanup,
     SessionRevocationService,
     SessionVerifier,

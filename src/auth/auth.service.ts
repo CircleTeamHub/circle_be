@@ -1,3 +1,4 @@
+import { withDatabaseWorkBudget } from '../utils/database-work-budget';
 import {
   BadRequestException,
   ConflictException,
@@ -37,6 +38,7 @@ import {
   SessionContext,
 } from './refresh-token.service';
 import { accessTokenTtlSeconds } from './session-revocation.service';
+import { DeviceTrustService, LoginChallengeView } from './device-trust.service';
 import { ConfigService } from '@nestjs/config';
 import { createLoggingConfig } from 'src/logging/logging.config';
 import { logBusinessEvent } from 'src/logging/business-event.logger';
@@ -134,6 +136,7 @@ export class AuthService {
     private configService: ConfigService,
     private fancyNumberService: FancyNumberService,
     private avatarFrames: AvatarFrameService,
+    private deviceTrust: DeviceTrustService,
   ) {
     this.referralRules = readReferralRules(configService);
   }
@@ -219,7 +222,20 @@ export class AuthService {
       entityId: user.id,
     });
 
-    return this.issueTokens(user.id, user.accountId, user.role, sessionContext);
+    return this.withAccountAuthLock(user.id, async () => {
+      if (sessionContext?.deviceKey)
+        await this.deviceTrust.trust(
+          user.id,
+          sessionContext.deviceKey,
+          sessionContext,
+        );
+      return this.issueTokens(
+        user.id,
+        user.accountId,
+        user.role,
+        sessionContext,
+      );
+    });
   }
 
   async login(dto: LoginDto, sessionContext?: SessionContext) {
@@ -317,7 +333,149 @@ export class AuthService {
         errorCode: AuthErrorCode.InvalidCredentials,
       });
     }
-    return this.finishLogin(user, sessionContext);
+
+    return this.withAccountAuthLock(user.id, async () => {
+      const current = await this.prisma.user.findUnique({
+        where: { id: user.id },
+      });
+      if (
+        !current ||
+        current.passwordHash !== user.passwordHash ||
+        current.status !== 'ACTIVE' ||
+        current.role === 'ADMIN'
+      ) {
+        throw new ForbiddenException({
+          message: '邮箱、用户ID或密码错误',
+          errorCode: AuthErrorCode.InvalidCredentials,
+        });
+      }
+      // 密码对了也不等于能进：陌生设备必须先经受信任设备批准（只发验证单号，不发 token）。
+      const decision = await this.deviceTrust.evaluateLogin(
+        current,
+        sessionContext ?? {},
+      );
+      if (decision.kind === 'challenge') {
+        logBusinessEvent(this.logger, {
+          enabled: this.loggingConfig.businessLogOn,
+          businessEvent: 'auth_login_device_verification_required',
+          actorId: user.id,
+          result: 'success',
+          entityType: 'login_challenge',
+          entityId: decision.challenge.id,
+        });
+        return this.deviceVerificationResponse(decision.challenge);
+      }
+      return this.finishLogin(current, sessionContext);
+    });
+  }
+
+  private deviceVerificationResponse(challenge: LoginChallengeView) {
+    return {
+      deviceVerificationRequired: true as const,
+      challenge: {
+        id: challenge.id,
+        expiresAt: challenge.expiresAt,
+        securityCodeAvailable: challenge.securityCodeAvailable,
+      },
+    };
+  }
+
+  /** 新设备：受信任设备批准后输入验证码，通过即记为受信任并发 token。 */
+  async verifyLoginChallengeCode(
+    challengeId: string,
+    code: string,
+    sessionContext: SessionContext,
+  ) {
+    const pending = await this.deviceTrust.loadForSecurityCode(
+      challengeId,
+      sessionContext.deviceKey ?? null,
+    );
+    return this.withAccountAuthLock(pending.userId, async () => {
+      const { userId, deviceKey } = await this.deviceTrust.consumeWithCode(
+        challengeId,
+        sessionContext.deviceKey ?? null,
+        code,
+      );
+      return this.finishChallengeLogin(
+        userId,
+        challengeId,
+        deviceKey,
+        sessionContext,
+      );
+    });
+  }
+
+  /** 新设备：受信任设备不在身边时，改用登录安全码通过验证。 */
+  async verifyLoginChallengeSecurityCode(
+    challengeId: string,
+    securityCode: string,
+    sessionContext: SessionContext,
+  ) {
+    const challenge = await this.deviceTrust.loadForSecurityCode(
+      challengeId,
+      sessionContext.deviceKey ?? null,
+    );
+    return this.withAccountAuthLock(challenge.userId, async () => {
+      assertValidSecurityCode(securityCode);
+      const user = await this.prisma.user.findUnique({
+        where: { id: challenge.userId },
+        select: { loginSecurityCodeHash: true },
+      });
+      if (!user?.loginSecurityCodeHash) {
+        throw new ForbiddenException({
+          message: '未设置登录安全码，请在受信任设备上确认登录',
+          errorCode: AuthErrorCode.SecurityCodeNotSet,
+        });
+      }
+      // 这条路径没有登录态，绝不能动应用锁的错误计数（securityCodeAttempts /
+      // securityCodeLockedUntil）：否则只知道密码的人能故意输错，把本人手机的应用锁
+      // 锁住，锁住期间批准弹窗也被藏起来。改用验证单自己的计次 + 账号级每日额度。
+      const ok = await this.deviceTrust.verifySecurityCodeFallback(
+        challenge.id,
+        sessionContext.deviceKey ?? null,
+        () => argon2.verify(user.loginSecurityCodeHash, securityCode),
+      );
+      if (!ok) {
+        throw new ForbiddenException({
+          message: '安全码错误',
+          errorCode: AuthErrorCode.SecurityCodeInvalid,
+        });
+      }
+      return this.finishChallengeLogin(
+        challenge.userId,
+        challenge.id,
+        challenge.deviceKey,
+        sessionContext,
+      );
+    });
+  }
+
+  private async finishChallengeLogin(
+    userId: string,
+    challengeId: string,
+    deviceKey: string,
+    sessionContext: SessionContext,
+  ) {
+    const user = await this.prisma.user.findUnique({ where: { id: userId } });
+    // 验证期间账号被封 / 升成管理员：与 login() 同一套拒绝口径。
+    if (!user || user.status !== 'ACTIVE' || user.role === 'ADMIN') {
+      throw new ForbiddenException({
+        message: '邮箱、用户ID或密码错误',
+        errorCode: AuthErrorCode.InvalidCredentials,
+      });
+    }
+    await this.deviceTrust.completeVerifiedLogin(
+      userId,
+      challengeId,
+      deviceKey,
+      sessionContext,
+    );
+    return this.finishLogin(user, { ...sessionContext, deviceKey });
+  }
+
+  async resendLoginChallenge(challengeId: string, deviceKey: string | null) {
+    const challenge = await this.deviceTrust.resend(challengeId, deviceKey);
+    return this.deviceVerificationResponse(challenge);
   }
 
   /** ADMIN 账号当前是否处于登录锁定期。锁死期间不做密码比对。 */
@@ -529,6 +687,23 @@ export class AuthService {
     return { tokens, userId: user.id, accountId: user.accountId };
   }
 
+  // All admission/session issuance and account recovery share this distributed lock.
+  // It uses a dedicated advisory namespace; nested services retain their own transactions.
+  private withAccountAuthLock<T>(
+    userId: string,
+    operation: () => Promise<T>,
+  ): Promise<T> {
+    return withDatabaseWorkBudget(this.prisma, () =>
+      this.prisma.$transaction(
+        async (tx) => {
+          await tx.$executeRaw`SELECT pg_advisory_xact_lock(hashtextextended(${`auth_session:${userId}`}, 0))`;
+          return operation();
+        },
+        { maxWait: 10000, timeout: 30000 },
+      ),
+    );
+  }
+
   /** 密码登录共用的收尾：lastOnline、发 token、记日志。 */
   private async finishLogin(
     user: {
@@ -570,72 +745,87 @@ export class AuthService {
   }
 
   async refresh(refreshToken: string, sessionContext?: SessionContext) {
-    const {
-      token: newRefreshToken,
-      userId,
-      sessionId,
-    } = await this.refreshTokenService.rotate(
+    const owner = await this.refreshTokenService.ownerForToken(
       refreshToken,
-      sessionContext,
       'APP',
     );
-
-    const user = await this.prisma.user.findUnique({ where: { id: userId } });
-    if (!user) {
-      throw new NotFoundException({
-        message: '用户不存在',
-        errorCode: AuthErrorCode.UserNotFound,
-      });
-    }
-
-    // Banned/deleted users must not be able to keep refreshing tokens just
-    // because they still hold a valid refresh token. Revoke their sessions
-    // and reject the rotation result.
-    if (user.status !== 'ACTIVE') {
-      this.logger.warn(
-        `Refresh blocked for non-active user ${user.id} (status=${user.status}); revoking sessions.`,
+    return this.withAccountAuthLock(owner, async () => {
+      const {
+        token: newRefreshToken,
+        userId,
+        sessionId,
+        deviceKey,
+        deviceName,
+      } = await this.refreshTokenService.rotate(
+        refreshToken,
+        sessionContext,
+        'APP',
       );
-      await this.refreshTokenService.revokeAll(user.id);
-      throw new ForbiddenException({
-        message: '账号已被禁用',
-        errorCode: AuthErrorCode.AccountDisabled,
-      });
-    }
 
-    // 与 login() 一致：ADMIN 账号不能持有 APP audience 会话。晋升前签发的 APP
-    // refresh token 否则会一直续签出 role=ADMIN 的 APP access token，而任何只看
-    // role、不看 audience 的授权判断都会把它当成管理员，等于绕开短 TTL/审计的
-    // 管理会话模型。像 adminRefresh 一样撤销全部会话；文案与普通登录失败一致
-    // （不泄露该账号是管理员）。
-    if (user.role === 'ADMIN') {
-      this.logger.warn(
-        `Refresh blocked for ADMIN account ${user.id} on the APP audience; revoking sessions.`,
-      );
-      await this.refreshTokenService.revokeAll(user.id);
-      throw new ForbiddenException({
-        message: '邮箱、用户ID或密码错误',
-        errorCode: AuthErrorCode.InvalidCredentials,
-      });
-    }
+      const user = await this.prisma.user.findUnique({ where: { id: userId } });
+      if (!user) {
+        throw new NotFoundException({
+          message: '用户不存在',
+          errorCode: AuthErrorCode.UserNotFound,
+        });
+      }
 
-    // Fire-and-forget: lastOnline is best-effort and must never block token issuance.
-    this.prisma.user
-      .update({ where: { id: user.id }, data: { lastOnline: new Date() } })
-      .catch((err) =>
+      // Banned/deleted users must not be able to keep refreshing tokens just
+      // because they still hold a valid refresh token. Revoke their sessions
+      // and reject the rotation result.
+      if (user.status !== 'ACTIVE') {
         this.logger.warn(
-          `lastOnline update failed for ${user.id}: ${err?.message}`,
-        ),
-      );
+          `Refresh blocked for non-active user ${user.id} (status=${user.status}); revoking sessions.`,
+        );
+        await this.refreshTokenService.revokeAll(user.id);
+        throw new ForbiddenException({
+          message: '账号已被禁用',
+          errorCode: AuthErrorCode.AccountDisabled,
+        });
+      }
 
-    const accessToken = await this.signAccessToken(
-      user.id,
-      user.accountId,
-      user.role,
-      sessionId,
-      'APP',
-    );
-    await this.refreshTokenService.assertSessionActive(user.id, sessionId);
-    return { accessToken, refreshToken: newRefreshToken };
+      // 与 login() 一致：ADMIN 账号不能持有 APP audience 会话。晋升前签发的 APP
+      // refresh token 否则会一直续签出 role=ADMIN 的 APP access token，而任何只看
+      // role、不看 audience 的授权判断都会把它当成管理员，等于绕开短 TTL/审计的
+      // 管理会话模型。像 adminRefresh 一样撤销全部会话；文案与普通登录失败一致
+      // （不泄露该账号是管理员）。
+      if (user.role === 'ADMIN') {
+        this.logger.warn(
+          `Refresh blocked for ADMIN account ${user.id} on the APP audience; revoking sessions.`,
+        );
+        await this.refreshTokenService.revokeAll(user.id);
+        throw new ForbiddenException({
+          message: '邮箱、用户ID或密码错误',
+          errorCode: AuthErrorCode.InvalidCredentials,
+        });
+      }
+
+      // Fire-and-forget: lastOnline is best-effort and must never block token issuance.
+      this.prisma.user
+        .update({ where: { id: user.id }, data: { lastOnline: new Date() } })
+        .catch((err) =>
+          this.logger.warn(
+            `lastOnline update failed for ${user.id}: ${err?.message}`,
+          ),
+        );
+
+      const accessToken = await this.signAccessToken(
+        user.id,
+        user.accountId,
+        user.role,
+        sessionId,
+        'APP',
+      );
+      await this.refreshTokenService.assertSessionActive(user.id, sessionId);
+      // 持有有效会话的设备就是本人设备：功能上线前已登录的设备靠这条补记信任，
+      // 免得一升级所有人都变成「陌生设备」。只认会话绑定的设备，不认请求头里新报的。
+      // 续签请求不带设备名头：受信任记录沿用会话上登录时记下的设备名。
+      await this.deviceTrust.trustOnRefresh(user.id, deviceKey, {
+        ...sessionContext,
+        deviceName: sessionContext?.deviceName ?? deviceName,
+      });
+      return { accessToken, refreshToken: newRefreshToken };
+    });
   }
 
   async adminRefresh(refreshToken: string, sessionContext?: SessionContext) {
@@ -708,34 +898,68 @@ export class AuthService {
   }
 
   async sessions(userId: string, currentSessionId?: string) {
-    const sessions = await this.refreshTokenService.listActiveSessions(userId);
+    const sessions = [
+      ...(await this.refreshTokenService.listActiveSessions(userId)),
+      ...(await this.deviceTrust.listDetachedDevices(userId)),
+    ];
     return sessions.map((session) => ({
       ...session,
       isCurrent: currentSessionId ? session.id === currentSessionId : false,
     }));
   }
 
-  async logoutAll(userId: string): Promise<void> {
-    await this.refreshTokenService.revokeAll(userId);
-    logBusinessEvent(this.logger, {
-      enabled: this.loggingConfig.businessLogOn,
-      businessEvent: 'auth_logout_all_success',
-      actorId: userId,
-      result: 'success',
-      entityType: 'user',
-      entityId: userId,
+  async logoutAll(userId: string, currentSessionId?: string): Promise<void> {
+    return this.withAccountAuthLock(userId, async () => {
+      // 「全部退出」多半是怀疑被盗号：发起这一步的设备之外，全部撤销信任，
+      // 进行中的陌生设备验证一并作废。
+      await this.revokeTrustExceptSession(userId, currentSessionId);
+      await this.deviceTrust.invalidateChallenges(userId);
+      await this.refreshTokenService.revokeAll(userId);
+      logBusinessEvent(this.logger, {
+        enabled: this.loggingConfig.businessLogOn,
+        businessEvent: 'auth_logout_all_success',
+        actorId: userId,
+        result: 'success',
+        entityType: 'user',
+        entityId: userId,
+      });
     });
   }
 
-  async logoutSession(userId: string, sessionId: string): Promise<void> {
-    await this.refreshTokenService.revokeSession(userId, sessionId);
-    logBusinessEvent(this.logger, {
-      enabled: this.loggingConfig.businessLogOn,
-      businessEvent: 'auth_session_logout',
-      actorId: userId,
-      result: 'success',
-      entityType: 'session',
-      entityId: sessionId,
+  async logoutSession(
+    userId: string,
+    sessionId: string,
+    currentSessionId?: string,
+  ): Promise<void> {
+    return this.withAccountAuthLock(userId, async () => {
+      // 在设备管理里移除 = 撤销信任：这台设备再登录要重新经受信任设备批准。
+      const deviceKey =
+        (await this.refreshTokenService.findSessionDeviceKey(
+          userId,
+          sessionId,
+        )) ?? (await this.deviceTrust.deviceKeyForRecord(userId, sessionId));
+      const currentDeviceKey = currentSessionId
+        ? await this.refreshTokenService.findSessionDeviceKey(
+            userId,
+            currentSessionId,
+          )
+        : null;
+      await this.refreshTokenService.revokeSession(userId, sessionId);
+      // 移除的是「本机的另一条旧登录记录」时只撤那一条：不能连带撤掉当前会话和本机信任。
+      if (deviceKey && deviceKey !== currentDeviceKey) {
+        // 同一台设备可能有多条会话（重装、重复登录）：一起撤掉，否则剩下那条还能续签。
+        await this.refreshTokenService.revokeDeviceSessions(userId, deviceKey);
+        await this.deviceTrust.revokeDevice(userId, deviceKey);
+        await this.deviceTrust.invalidateChallenges(userId);
+      }
+      logBusinessEvent(this.logger, {
+        enabled: this.loggingConfig.businessLogOn,
+        businessEvent: 'auth_session_logout',
+        actorId: userId,
+        result: 'success',
+        entityType: 'session',
+        entityId: sessionId,
+      });
     });
   }
 
@@ -743,18 +967,44 @@ export class AuthService {
     userId: string,
     currentSessionId?: string,
   ): Promise<void> {
-    await this.refreshTokenService.revokeOtherSessions(
-      userId,
-      currentSessionId,
-    );
-    logBusinessEvent(this.logger, {
-      enabled: this.loggingConfig.businessLogOn,
-      businessEvent: 'auth_other_sessions_logout',
-      actorId: userId,
-      result: 'success',
-      entityType: 'user',
-      entityId: userId,
+    return this.withAccountAuthLock(userId, async () => {
+      const currentDeviceKey = currentSessionId
+        ? await this.refreshTokenService.findSessionDeviceKey(
+            userId,
+            currentSessionId,
+          )
+        : null;
+      await this.refreshTokenService.revokeOtherSessions(
+        userId,
+        currentSessionId,
+      );
+      // 「退出其他设备」通常是怀疑被盗号：其他设备的信任一并撤销。当前会话还没
+      // 绑定设备（旧客户端）时全部撤销信任，避免保留可疑设备。
+      await this.deviceTrust.revokeOtherDevices(userId, currentDeviceKey);
+      await this.deviceTrust.invalidateChallenges(userId);
+      logBusinessEvent(this.logger, {
+        enabled: this.loggingConfig.businessLogOn,
+        businessEvent: 'auth_other_sessions_logout',
+        actorId: userId,
+        result: 'success',
+        entityType: 'user',
+        entityId: userId,
+      });
     });
+  }
+
+  /** 撤销除当前会话所在设备外的全部信任；当前会话未绑定设备时全部撤销。 */
+  private async revokeTrustExceptSession(
+    userId: string,
+    currentSessionId?: string,
+  ): Promise<void> {
+    const keep = currentSessionId
+      ? await this.refreshTokenService.findSessionDeviceKey(
+          userId,
+          currentSessionId,
+        )
+      : null;
+    await this.deviceTrust.revokeOtherDevices(userId, keep);
   }
 
   async getSingleDeviceLoginStatus(
@@ -924,39 +1174,46 @@ export class AuthService {
       });
     }
 
-    const passwordHash = await argon2.hash(newPassword);
-    // round 3 review：改密与 refresh 撤销必须同事务 —— 分两步时撤销失败会
-    // 留下「新密码已生效 + 旧会话全活着」的半态，客户端却拿到失败响应。
-    await this.prisma.$transaction([
-      this.prisma.user.update({
-        where: { id: user.id },
-        data: { passwordHash, accessTokensRevokedAt: new Date() },
-      }),
-      this.prisma.refreshToken.updateMany({
-        where: { userId: user.id, revokedAt: null },
-        data: { revokedAt: new Date() },
-      }),
-    ]);
-    // access token 吊销标记（Redis）单独尽力：失败时 refresh 已死、access
-    // 最多再活一个 TTL；显式 error 让运维可见，不把已提交的改密翻成假失败。
-    try {
-      await this.refreshTokenService.revokeAllAccessMarkers(user.id);
-    } catch (markerError) {
-      this.logger.error(
-        `password reset: access-token revocation marker failed for ${user.id}: ${
-          markerError instanceof Error
-            ? markerError.message
-            : String(markerError)
-        }`,
-      );
-    }
-    logBusinessEvent(this.logger, {
-      enabled: this.loggingConfig.businessLogOn,
-      businessEvent: 'auth_password_reset_success',
-      actorId: user.id,
-      result: 'success',
-      entityType: 'user',
-      entityId: user.id,
+    return this.withAccountAuthLock(user.id, async () => {
+      const passwordHash = await argon2.hash(newPassword);
+      // round 3 review：改密与 refresh 撤销必须同事务 —— 分两步时撤销失败会
+      // 留下「新密码已生效 + 旧会话全活着」的半态，客户端却拿到失败响应。
+      await this.prisma.$transaction([
+        this.prisma.user.update({
+          where: { id: user.id },
+          data: { passwordHash, accessTokensRevokedAt: new Date() },
+        }),
+        this.prisma.refreshToken.updateMany({
+          where: { userId: user.id, revokedAt: null },
+          data: { revokedAt: new Date() },
+        }),
+      ]);
+      // access token 吊销标记（Redis）单独尽力：失败时 refresh 已死、access
+      // 最多再活一个 TTL；显式 error 让运维可见，不把已提交的改密翻成假失败。
+      // 邮箱验证过的找回密码 = 设备丢失时的恢复通道：撤销全部信任。会话也已全撤，
+      // 下一次登录的设备就是「首台设备」，不必再等一台已经找不回来的设备批准。
+      await this.deviceTrust.revokeOtherDevices(user.id, null);
+      // 旧密码下发起的验证单全部作废：之前拿到密码的人不能再靠它们重发、输码。
+      await this.deviceTrust.invalidateChallenges(user.id);
+      try {
+        await this.refreshTokenService.revokeAllAccessMarkers(user.id);
+      } catch (markerError) {
+        this.logger.error(
+          `password reset: access-token revocation marker failed for ${user.id}: ${
+            markerError instanceof Error
+              ? markerError.message
+              : String(markerError)
+          }`,
+        );
+      }
+      logBusinessEvent(this.logger, {
+        enabled: this.loggingConfig.businessLogOn,
+        businessEvent: 'auth_password_reset_success',
+        actorId: user.id,
+        result: 'success',
+        entityType: 'user',
+        entityId: user.id,
+      });
     });
   }
 
@@ -964,47 +1221,48 @@ export class AuthService {
     userId: string,
     oldPassword: string,
     newPassword: string,
+    currentSessionId?: string,
   ): Promise<void> {
-    const user = await this.prisma.user.findUnique({ where: { id: userId } });
-    if (!user) {
-      throw new NotFoundException({
-        message: '用户不存在',
-        errorCode: AuthErrorCode.UserNotFound,
+    return this.withAccountAuthLock(userId, async () => {
+      const user = await this.prisma.user.findUnique({ where: { id: userId } });
+      if (!user) {
+        throw new NotFoundException({
+          message: '用户不存在',
+          errorCode: AuthErrorCode.UserNotFound,
+        });
+      }
+
+      const valid = await argon2.verify(user.passwordHash, oldPassword);
+      if (!valid) {
+        throw new UnauthorizedException({
+          message: '当前密码不正确',
+          errorCode: AuthErrorCode.PasswordIncorrect,
+        });
+      }
+
+      const passwordHash = await argon2.hash(newPassword);
+      await this.prisma.user.update({
+        where: { id: userId },
+        data: { passwordHash },
       });
-    }
 
-    const valid = await argon2.verify(user.passwordHash, oldPassword);
-    if (!valid) {
-      throw new UnauthorizedException({
-        message: '当前密码不正确',
-        errorCode: AuthErrorCode.PasswordIncorrect,
+      // 改密通常是怀疑密码泄露：当前设备之外全部撤销信任，否则攻击者的设备
+      // 拿到新密码后照样免批准登录。
+      await this.revokeTrustExceptSession(userId, currentSessionId);
+      await this.deviceTrust.invalidateChallenges(userId);
+      // Invalidate all existing sessions after password change
+      await this.refreshTokenService.revokeAll(userId);
+      logBusinessEvent(this.logger, {
+        enabled: this.loggingConfig.businessLogOn,
+        businessEvent: 'auth_change_password_success',
+        actorId: userId,
+        result: 'success',
+        entityType: 'user',
+        entityId: userId,
       });
-    }
-
-    const passwordHash = await argon2.hash(newPassword);
-    await this.prisma.user.update({
-      where: { id: userId },
-      data: { passwordHash },
-    });
-
-    // Invalidate all existing sessions after password change
-    await this.refreshTokenService.revokeAll(userId);
-    logBusinessEvent(this.logger, {
-      enabled: this.loggingConfig.businessLogOn,
-      businessEvent: 'auth_change_password_success',
-      actorId: userId,
-      result: 'success',
-      entityType: 'user',
-      entityId: userId,
     });
   }
 
-  /**
-   * 修改 accountId（登录 / 好友搜索用的句柄）。
-   * - 不影响会话：与改密码不同，改 accountId 不撤销登录态。
-   * - 唯一性：先查重给出明确 409，并发竞态最终由 DB 唯一约束（P2002）兜底。
-   * 返回与 /auth/me 完全一致的资料，调用方据此 setUser。
-   */
   async changeAccountId(userId: string, accountId: string): Promise<SafeUser> {
     // 统一归一为小写后存储：accountId 唯一性与好友精确查找都按大小写不敏感
     // 处理，归一到小写后简单的精确查重 / DB 唯一约束即足以保证唯一性。

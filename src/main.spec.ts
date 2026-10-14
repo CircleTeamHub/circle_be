@@ -204,6 +204,7 @@ describe('buildNestFactoryOptions', () => {
         'Content-Type',
         'X-Request-Id',
         'X-Device-Name',
+        'X-Device-Id',
         'Idempotency-Key',
       ]),
     );

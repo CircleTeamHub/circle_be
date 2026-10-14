@@ -59,6 +59,8 @@ export type SessionContext = {
   deviceName?: string | null;
   ip?: string | null;
   userAgent?: string | null;
+  /** sha256(x-device-id)；绑定会话与受信任设备。 */
+  deviceKey?: string | null;
 };
 
 export type RefreshTokenAudience = 'APP' | 'ADMIN';
@@ -80,6 +82,7 @@ function normalizeContext(context?: SessionContext): SessionContext {
     deviceName: truncate(context?.deviceName, MAX_DEVICE_NAME_LENGTH),
     ip: truncate(context?.ip, MAX_IP_LENGTH),
     userAgent: truncate(context?.userAgent, MAX_USER_AGENT_LENGTH),
+    deviceKey: context?.deviceKey ?? null,
   };
 }
 
@@ -170,6 +173,7 @@ export class RefreshTokenService {
         deviceName: safe.deviceName,
         ip: safe.ip,
         userAgent: safe.userAgent,
+        deviceKey: safe.deviceKey,
         audience,
         lastUsedAt: new Date(),
       },
@@ -317,11 +321,30 @@ export class RefreshTokenService {
     await this.revokeAccessSessions(revokedSessionIds);
   }
 
+  async ownerForToken(
+    rawToken: string,
+    audience: RefreshTokenAudience = 'APP',
+  ): Promise<string> {
+    const row = await this.prisma.refreshToken.findUnique({
+      where: { token: hashToken(rawToken) },
+      select: { userId: true, audience: true },
+    });
+    if (!row || row.audience !== audience)
+      throw new UnauthorizedException('Invalid or expired refresh token');
+    return row.userId;
+  }
+
   async rotate(
     oldToken: string,
     context?: SessionContext,
     audience: RefreshTokenAudience = 'APP',
-  ): Promise<{ token: string; userId: string; sessionId: string }> {
+  ): Promise<{
+    token: string;
+    userId: string;
+    sessionId: string;
+    deviceKey: string | null;
+    deviceName: string | null;
+  }> {
     const tokenHash = hashToken(oldToken);
     const result = await this.prisma.$transaction(async (tx) => {
       const initial = await tx.refreshToken.findUnique({
@@ -342,6 +365,7 @@ export class RefreshTokenService {
           deviceName: true,
           ip: true,
           userAgent: true,
+          deviceKey: true,
           audience: true,
           familyId: true,
           revokedAt: true,
@@ -418,6 +442,9 @@ export class RefreshTokenService {
           deviceName: context?.deviceName ?? record.deviceName ?? null,
           ip: context?.ip ?? record.ip ?? null,
           userAgent: context?.userAgent ?? record.userAgent ?? null,
+          // 会话一旦绑定设备就不再改绑：换设备 ID 续签同一个 refresh token
+          // 只可能是令牌被拷走，不能借此把别的设备「洗」成受信任。
+          deviceKey: record.deviceKey ?? context?.deviceKey ?? null,
         },
         record.audience,
         record.familyId,
@@ -427,6 +454,8 @@ export class RefreshTokenService {
         token: newSession.token,
         userId: record.userId,
         sessionId: newSession.sessionId,
+        deviceKey: record.deviceKey ?? context?.deviceKey ?? null,
+        deviceName: context?.deviceName ?? record.deviceName ?? null,
       };
     });
 
@@ -552,6 +581,18 @@ export class RefreshTokenService {
     await this.revocation.revokeUser(userId);
   }
 
+  /** 会话绑定的设备（sha256 设备 ID）；不是本人的会话 / 没绑定返回 null。 */
+  async findSessionDeviceKey(
+    userId: string,
+    sessionId: string,
+  ): Promise<string | null> {
+    const session = await this.prisma.refreshToken.findFirst({
+      where: { id: sessionId, userId },
+      select: { deviceKey: true },
+    });
+    return session?.deviceKey ?? null;
+  }
+
   async revokeSession(userId: string, sessionId: string): Promise<void> {
     const result = await this.prisma.refreshToken.updateMany({
       where: { id: sessionId, userId, revokedAt: null },
@@ -567,6 +608,19 @@ export class RefreshTokenService {
     if (result.count === 1) {
       await this.revocation.revokeSession(sessionId);
     }
+  }
+
+  /** 撤销绑定到某台设备的全部会话（设备管理里移除设备时用）。 */
+  async revokeDeviceSessions(userId: string, deviceKey: string): Promise<void> {
+    const revoked = await this.prisma.refreshToken.updateManyAndReturn({
+      where: { userId, deviceKey, revokedAt: null },
+      data: {
+        revokedAt: new Date(),
+        revocationReason: RefreshTokenRevocationReason.SESSION_REVOKED,
+      },
+      select: { id: true },
+    });
+    await this.revokeAccessSessions(revoked.map(({ id }) => id));
   }
 
   async revokeOtherSessions(

@@ -73,6 +73,9 @@ function buildService(user: UserRow | null) {
     config as never,
     { ensureAccountIdChangeAllowed: jest.fn() } as never,
     null as never,
+    {
+      evaluateLogin: jest.fn().mockResolvedValue({ kind: 'trusted' }),
+    } as never,
   );
   return { service, prisma, updates, updateManyCalls, counter, jwt };
 }

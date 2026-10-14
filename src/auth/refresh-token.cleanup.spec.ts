@@ -5,7 +5,15 @@ import { Logger } from '@nestjs/common';
 describe('RefreshTokenCleanup', () => {
   const deleteMany = jest.fn();
   const findMany = jest.fn();
-  const prisma = { refreshToken: { findMany, deleteMany } } as never;
+  const challengeDeleteMany = jest.fn();
+  const challengeFindMany = jest.fn();
+  const prisma = {
+    refreshToken: { findMany, deleteMany },
+    loginChallenge: {
+      deleteMany: challengeDeleteMany,
+      findMany: challengeFindMany,
+    },
+  } as never;
   const redis = {
     tryAcquireLease: jest.fn(),
     renewLease: jest.fn(),
@@ -16,8 +24,31 @@ describe('RefreshTokenCleanup', () => {
   beforeEach(() => {
     jest.clearAllMocks();
     findMany.mockResolvedValue([]);
+    challengeDeleteMany.mockResolvedValue({ count: 0 });
+    challengeFindMany.mockResolvedValue([]);
     redis.tryAcquireLease.mockResolvedValue(undefined);
     redis.renewLease.mockResolvedValue(true);
+  });
+
+  it('caps challenge deletion at twenty indexed batches per run', async () => {
+    challengeFindMany.mockResolvedValue(
+      Array.from({ length: 1000 }, (_, i) => ({ id: `c-${i}` })),
+    );
+    challengeDeleteMany.mockResolvedValue({ count: 1000 });
+    await cleanup.sweep();
+    expect(challengeFindMany).toHaveBeenCalledTimes(20);
+    expect(challengeDeleteMany).toHaveBeenCalledTimes(20);
+    expect(challengeFindMany).toHaveBeenCalledWith(
+      expect.objectContaining({ take: 1000, orderBy: { id: 'asc' } }),
+    );
+    expect(challengeDeleteMany).toHaveBeenCalledWith(
+      expect.objectContaining({
+        where: expect.objectContaining({
+          id: { in: expect.any(Array) },
+          createdAt: expect.any(Object),
+        }),
+      }),
+    );
   });
 
   it('allows only one replica to scan and skips local overlap', async () => {
@@ -165,5 +196,17 @@ describe('RefreshTokenCleanup', () => {
     } finally {
       log.mockRestore();
     }
+  });
+
+  it('prunes login challenges past the retention window', async () => {
+    const now = new Date('2026-10-14T12:00:00.000Z');
+    challengeFindMany.mockResolvedValueOnce([{ id: 'old' }]);
+    await cleanup.sweep(now);
+    expect(challengeDeleteMany).toHaveBeenCalledWith({
+      where: {
+        createdAt: { lt: new Date('2026-10-13T12:00:00.000Z') },
+        id: { in: ['old'] },
+      },
+    });
   });
 });
