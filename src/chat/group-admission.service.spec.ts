@@ -175,6 +175,7 @@ function harness(approval = true) {
   );
   return {
     service,
+    prisma,
     tx,
     seats,
     admissions,
@@ -692,3 +693,102 @@ test.each(['left', 'demoted'])(
     ).not.toHaveBeenCalled();
   },
 );
+
+test.each(['left', 'unfriended', 'blocked', 'privacy', 'policy'])(
+  'queued group invitations are terminalized when eligibility changes: %s',
+  async (condition) => {
+    const h = harness();
+    h.seats.set('inviter', { userID: 'inviter', role: 'MEMBER', leftAt: null });
+    h.tx.friend.findMany.mockResolvedValue([
+      { userID: 'inviter', friendID: 'guest' },
+    ]);
+    await h.service.invite('inviter', 'g', ['guest']);
+    if (condition === 'left') h.seats.get('inviter').leftAt = new Date();
+    if (condition === 'unfriended') h.tx.friend.findMany.mockResolvedValue([]);
+    if (condition === 'blocked')
+      h.tx.block.findFirst.mockResolvedValue({ id: 'block' });
+    if (condition === 'privacy')
+      h.tx.userPrivacySetting.findMany.mockResolvedValue([
+        { userID: 'guest', groupInvitePermission: 'NONE' },
+      ]);
+    if (condition === 'policy') h.group.memberCanInvite = false;
+    h.tx.groupAdmissionDelivery.findMany.mockResolvedValue([
+      {
+        id: 'queued',
+        admission: h.admissions.get('a0'),
+        recipientID: 'guest',
+        actorID: 'inviter',
+        event: 'INVITED',
+        attempts: 0,
+      },
+    ]);
+    await h.service.flush();
+    expect(
+      h.notifications.deliverGroupAdmissionNotification,
+    ).not.toHaveBeenCalled();
+    expect(h.messages.insertServerMessage).not.toHaveBeenCalled();
+    expect(h.tx.groupAdmissionDelivery.update).toHaveBeenCalledWith({
+      where: { id: 'queued' },
+      data: { deliveredAt: expect.any(Date) },
+    });
+  },
+);
+
+test('reviewer delivery holds the group mutation lock through authorization and dispatch', async () => {
+  const h = harness();
+  await h.service.apply('guest', 'g', 'reason');
+  h.seats.set('reviewer', { userID: 'reviewer', role: 'ADMIN', leftAt: null });
+  h.tx.groupAdmissionDelivery.findMany.mockResolvedValue([
+    {
+      id: 'review',
+      admission: h.admissions.get('a0'),
+      recipientID: 'reviewer',
+      actorID: 'guest',
+      event: 'PENDING',
+      attempts: 0,
+    },
+  ]);
+  let checked!: () => void;
+  let resume!: () => void;
+  const reached = new Promise<void>((resolve) => {
+    checked = resolve;
+  });
+  const barrier = new Promise<void>((resolve) => {
+    resume = resolve;
+  });
+  const original = h.tx.chatMember.findUnique.getMockImplementation();
+  h.tx.chatMember.findUnique.mockImplementation(async (args: any) => {
+    const seat = original(args);
+    if (args.where.conversationID_userID.userID === 'reviewer') {
+      checked();
+      await barrier;
+    }
+    return seat;
+  });
+  const delivery = h.service.flush();
+  await reached;
+  let demoted = false;
+  const demotion = h.prisma.$transaction(async (tx: any) => {
+    await tx.$queryRaw`SELECT id FROM "ChatConversation" FOR UPDATE`;
+    h.seats.get('reviewer').role = 'MEMBER';
+    demoted = true;
+  });
+  h.notifications.deliverGroupAdmissionNotification.mockImplementation(
+    async () => {
+      expect(demoted).toBe(false);
+    },
+  );
+  await Promise.resolve();
+  expect(demoted).toBe(false);
+  resume();
+  await Promise.all([delivery, demotion]);
+  expect(demoted).toBe(true);
+  expect(
+    h.notifications.deliverGroupAdmissionNotification,
+  ).toHaveBeenCalledTimes(1);
+  h.notifications.deliverGroupAdmissionNotification.mockClear();
+  await h.service.flush();
+  expect(
+    h.notifications.deliverGroupAdmissionNotification,
+  ).not.toHaveBeenCalled();
+});

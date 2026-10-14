@@ -15,6 +15,7 @@ import { ChatService } from './chat.service';
 import { ChatBroadcastService } from './chat-broadcast.service';
 import { ChatSystemMessageService } from './chat-system-message.service';
 import { lockUserRelationshipState } from 'src/utils/user-relationship-lock';
+import { withDatabaseWorkBudget } from 'src/utils/database-work-budget';
 import { normalizeUserIdAlias } from 'src/user/user-id-alias';
 
 const ACTIVE = ['INVITED', 'PENDING'];
@@ -856,118 +857,141 @@ export class GroupAdmissionService {
       });
       for (const job of jobs) {
         try {
-          const a = await this.prisma.groupAdmission.findUnique({
-            where: { id: job.admission.id },
-          });
-          if (!a) continue;
-          // Approval is already the manager's acknowledgement. Do not replay
-          // obsolete review prompts or fan joined notifications to managers.
-          if (
-            job.event !== a.status ||
-            (job.event === 'JOINED' && job.recipientID !== a.applicantID)
-          ) {
-            await this.prisma.groupAdmissionDelivery.update({
-              where: { id: job.id },
-              data: { deliveredAt: new Date() },
-            });
-            continue;
-          }
-          if (job.event === 'JOINED') {
-            const seat = await this.member(
-              this.prisma,
-              a.conversationID,
-              a.applicantID,
-            );
-            if (!seat || seat.leftAt || seat.joinedAt > a.updatedAt) {
-              await this.prisma.groupAdmissionDelivery.update({
-                where: { id: job.id },
-                data: { deliveredAt: new Date() },
-              });
-              continue;
-            }
-          }
-          const group = await this.prisma.chatConversation.findUnique({
-            where: { id: a.conversationID },
-          });
-          const ownerSeat = group?.ownerID
-            ? await this.member(this.prisma, a.conversationID, group.ownerID)
-            : null;
-          if (!group || !ownerSeat || ownerSeat.leftAt) {
-            await this.prisma.groupAdmissionDelivery.update({
-              where: { id: job.id },
-              data: { deliveredAt: new Date() },
-            });
-            continue;
-          }
-          if (
-            job.event === 'PENDING' &&
-            job.recipientID !== a.applicantID &&
-            !(await this.manager(this.prisma, group, job.recipientID))
-          ) {
-            await this.prisma.groupAdmissionDelivery.update({
-              where: { id: job.id },
-              data: { deliveredAt: new Date() },
-            });
-            continue;
-          }
-          const name = group.name ?? '群聊';
-          const copy: Record<string, string> = {
-            INVITED: `邀请你加入「${name}」`,
-            PENDING: `申请加入「${name}」，等待审核`,
-            JOINED: `已加入「${name}」`,
-            REJECTED: `加入「${name}」的申请未通过`,
-            DECLINED: `已拒绝加入「${name}」的邀请`,
-          };
-          if (job.event === 'JOINED') {
-            const seat = await this.prisma.chatMember.findUnique({
-              where: {
-                conversationID_userID: {
-                  conversationID: a.conversationID,
-                  userID: a.applicantID,
-                },
-              },
-            });
-            if (seat && !seat.leftAt) {
-              await this.broadcast.joinUserToConversation(
-                a.applicantID,
-                a.conversationID,
-              );
-              this.broadcast.emitConversationChange(a.applicantID, {
-                kind: 'joined',
-                conversationId: a.conversationID,
-                userId: a.applicantID,
-              });
-            }
-          }
-          await this.notifications.deliverGroupAdmissionNotification({
-            id: job.id,
-            admissionId: a.id,
-            toUserID: job.recipientID,
-            fromUserID: job.actorID,
-            content: copy[job.event] ?? name,
-          });
+          await withDatabaseWorkBudget(this.prisma, () =>
+            this.prisma.$transaction(
+              async (tx) => {
+                let group: Group;
+                try {
+                  group = await this.lock(tx, job.admission.conversationID);
+                } catch (error) {
+                  if (!(error instanceof NotFoundException)) throw error;
+                  await tx.groupAdmissionDelivery.update({
+                    where: { id: job.id },
+                    data: { deliveredAt: new Date() },
+                  });
+                  return;
+                }
+                const a = await tx.groupAdmission.findUnique({
+                  where: { id: job.admission.id },
+                });
+                if (!a) return;
+                // Approval is already the manager's acknowledgement. Do not replay
+                // obsolete review prompts or fan joined notifications to managers.
+                if (
+                  job.event !== a.status ||
+                  (job.event === 'JOINED' && job.recipientID !== a.applicantID)
+                ) {
+                  await tx.groupAdmissionDelivery.update({
+                    where: { id: job.id },
+                    data: { deliveredAt: new Date() },
+                  });
+                  return;
+                }
+                if (job.event === 'JOINED') {
+                  const seat = await this.member(
+                    tx,
+                    a.conversationID,
+                    a.applicantID,
+                  );
+                  if (!seat || seat.leftAt || seat.joinedAt > a.updatedAt) {
+                    await tx.groupAdmissionDelivery.update({
+                      where: { id: job.id },
+                      data: { deliveredAt: new Date() },
+                    });
+                    return;
+                  }
+                }
+                if (
+                  job.event === 'PENDING' &&
+                  job.recipientID !== a.applicantID &&
+                  !(await this.manager(tx, group, job.recipientID))
+                ) {
+                  await tx.groupAdmissionDelivery.update({
+                    where: { id: job.id },
+                    data: { deliveredAt: new Date() },
+                  });
+                  return;
+                }
+                if (job.event === 'INVITED') {
+                  try {
+                    await this.validateSource(tx, group, a);
+                  } catch (error) {
+                    if (
+                      !(
+                        error instanceof ForbiddenException ||
+                        error instanceof NotFoundException
+                      )
+                    )
+                      throw error;
+                    await tx.groupAdmissionDelivery.update({
+                      where: { id: job.id },
+                      data: { deliveredAt: new Date() },
+                    });
+                    return;
+                  }
+                }
+                const name = group.name ?? '群聊';
+                const copy: Record<string, string> = {
+                  INVITED: `邀请你加入「${name}」`,
+                  PENDING: `申请加入「${name}」，等待审核`,
+                  JOINED: `已加入「${name}」`,
+                  REJECTED: `加入「${name}」的申请未通过`,
+                  DECLINED: `已拒绝加入「${name}」的邀请`,
+                };
+                if (job.event === 'JOINED') {
+                  const seat = await tx.chatMember.findUnique({
+                    where: {
+                      conversationID_userID: {
+                        conversationID: a.conversationID,
+                        userID: a.applicantID,
+                      },
+                    },
+                  });
+                  if (seat && !seat.leftAt) {
+                    await this.broadcast.joinUserToConversation(
+                      a.applicantID,
+                      a.conversationID,
+                    );
+                    this.broadcast.emitConversationChange(a.applicantID, {
+                      kind: 'joined',
+                      conversationId: a.conversationID,
+                      userId: a.applicantID,
+                    });
+                  }
+                }
+                await this.notifications.deliverGroupAdmissionNotification({
+                  id: job.id,
+                  admissionId: a.id,
+                  toUserID: job.recipientID,
+                  fromUserID: job.actorID,
+                  content: copy[job.event] ?? name,
+                });
 
-          if (job.event === 'INVITED' && a.inviterID) {
-            const direct = await this.chat.getOrCreateDirectConversation(
-              a.inviterID,
-              a.applicantID,
-            );
-            await this.messages.insertServerMessage(direct.id, {
-              senderID: a.inviterID,
-              type: 'group-invitation',
-              content: {
-                admissionId: a.id,
-                groupName: name,
-                avatarUrl: group?.avatarUrl ?? null,
+                if (job.event === 'INVITED' && a.inviterID) {
+                  const direct = await this.chat.getOrCreateDirectConversation(
+                    a.inviterID,
+                    a.applicantID,
+                  );
+                  await this.messages.insertServerMessage(direct.id, {
+                    senderID: a.inviterID,
+                    type: 'group-invitation',
+                    content: {
+                      admissionId: a.id,
+                      groupName: name,
+                      avatarUrl: group?.avatarUrl ?? null,
+                    },
+                    clientMessageId: `group_invitation_${a.id}`,
+                    rebroadcastOnReplay: true,
+                  });
+                }
+                await tx.groupAdmissionDelivery.update({
+                  where: { id: job.id },
+                  data: { deliveredAt: new Date() },
+                });
               },
-              clientMessageId: `group_invitation_${a.id}`,
-              rebroadcastOnReplay: true,
-            });
-          }
-          await this.prisma.groupAdmissionDelivery.update({
-            where: { id: job.id },
-            data: { deliveredAt: new Date() },
-          });
+              { timeout: 60_000 },
+            ),
+          );
         } catch {
           const terminal = job.attempts + 1 >= 8;
           if (terminal)
