@@ -856,11 +856,14 @@ export class GroupAdmissionService {
       });
       for (const job of jobs) {
         try {
-          const a = job.admission;
+          const a = await this.prisma.groupAdmission.findUnique({
+            where: { id: job.admission.id },
+          });
+          if (!a) continue;
           // Approval is already the manager's acknowledgement. Do not replay
           // obsolete review prompts or fan joined notifications to managers.
           if (
-            (job.event === 'PENDING' && a.status !== 'PENDING') ||
+            job.event !== a.status ||
             (job.event === 'JOINED' && job.recipientID !== a.applicantID)
           ) {
             await this.prisma.groupAdmissionDelivery.update({
@@ -904,14 +907,6 @@ export class GroupAdmissionService {
             REJECTED: `加入「${name}」的申请未通过`,
             DECLINED: `已拒绝加入「${name}」的邀请`,
           };
-          await this.notifications.deliverGroupAdmissionNotification({
-            id: job.id,
-            admissionId: a.id,
-            toUserID: job.recipientID,
-            fromUserID: job.actorID,
-            content: copy[job.event] ?? name,
-          });
-
           if (job.event === 'JOINED') {
             const seat = await this.prisma.chatMember.findUnique({
               where: {
@@ -933,6 +928,14 @@ export class GroupAdmissionService {
               });
             }
           }
+          await this.notifications.deliverGroupAdmissionNotification({
+            id: job.id,
+            admissionId: a.id,
+            toUserID: job.recipientID,
+            fromUserID: job.actorID,
+            content: copy[job.event] ?? name,
+          });
+
           if (job.event === 'INVITED' && a.inviterID) {
             const direct = await this.chat.getOrCreateDirectConversation(
               a.inviterID,

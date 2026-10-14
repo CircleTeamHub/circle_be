@@ -177,6 +177,21 @@ describe('CircleInvitationService', () => {
     mapper.mockRestore();
   });
 
+  it('returns a committed batch without waiting for card delivery', async () => {
+    const invite = jest
+      .spyOn(service, 'invite')
+      .mockResolvedValue({ id: 'created' } as any);
+    const delivery = jest
+      .spyOn(service as any, 'deliverConsentInvitation')
+      .mockReturnValue(new Promise(() => {}));
+    await expect(
+      service.inviteBatch('inviter', ['applicant'], 'circle'),
+    ).resolves.toBeUndefined();
+    expect(delivery).toHaveBeenCalledWith('created');
+    invite.mockRestore();
+    delivery.mockRestore();
+  });
+
   it('does not deliver any batch consent card when a later invite fails', async () => {
     const invite = jest
       .spyOn(service, 'invite')
@@ -213,6 +228,7 @@ describe('CircleInvitationService', () => {
   it('serializes concurrent consent workers and emits the card only once', async () => {
     const invitation = {
       id: 'consent',
+      status: 'INVITED',
       consentNoticeRequired: true,
       consentNoticeDeliveredAt: null,
       applicantID: 'applicant',

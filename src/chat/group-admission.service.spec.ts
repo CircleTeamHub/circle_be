@@ -610,3 +610,52 @@ test('dissolved group previews are unavailable even while ownerID remains stored
   h.seats.get('owner').leftAt = new Date();
   await expect(h.service.preview('guest', 'g')).rejects.toThrow();
 });
+
+test.each(['accept', 'decline'] as const)(
+  'resolved %s invitations are not delivered as fresh invitations',
+  async (action) => {
+    const h = harness();
+    await h.service.invite('owner', 'g', ['guest']);
+    await h.service.act('guest', 'a0', action);
+    h.notifications.deliverGroupAdmissionNotification.mockClear();
+    h.messages.insertServerMessage.mockClear();
+    h.tx.groupAdmissionDelivery.findMany.mockResolvedValue([
+      {
+        id: 'old-invite',
+        admission: { ...h.admissions.get('a0'), status: 'INVITED' },
+        recipientID: 'guest',
+        actorID: 'owner',
+        event: 'INVITED',
+        attempts: 0,
+      },
+    ]);
+    await h.service.flush();
+    expect(h.messages.insertServerMessage).not.toHaveBeenCalled();
+    expect(
+      h.notifications.deliverGroupAdmissionNotification,
+    ).not.toHaveBeenCalled();
+  },
+);
+
+test('notification failure does not block the admitted member joining the room', async () => {
+  const h = harness(false);
+  await h.service.invite('owner', 'g', ['guest']);
+  await h.service.act('guest', 'a0', 'accept');
+  const admission = h.admissions.get('a0');
+  h.tx.groupAdmissionDelivery.findMany.mockResolvedValue([
+    {
+      id: 'join',
+      admission,
+      recipientID: 'guest',
+      actorID: 'guest',
+      event: 'JOINED',
+      attempts: 0,
+    },
+  ]);
+  h.notifications.deliverGroupAdmissionNotification.mockRejectedValue(
+    new Error('notification failure'),
+  );
+  await h.service.flush();
+  expect(h.broadcast.joinUserToConversation).toHaveBeenCalledWith('guest', 'g');
+  expect(h.broadcast.emitConversationChange).toHaveBeenCalled();
+});

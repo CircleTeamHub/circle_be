@@ -196,7 +196,8 @@ export class CircleInvitationService {
           const invitation = await this.loadInvitation(id, tx);
           if (
             !invitation.consentNoticeRequired ||
-            invitation.consentNoticeDeliveredAt
+            invitation.consentNoticeDeliveredAt ||
+            invitation.status !== 'INVITED'
           )
             return;
           await this.notificationService.deliverCircleConsentNotification({
@@ -239,6 +240,7 @@ export class CircleInvitationService {
       where: {
         consentNoticeDeliveredAt: null,
         consentNoticeRequired: true,
+        status: 'INVITED',
         consentNoticeAttempts: { lt: 8 },
       },
       orderBy: [{ consentNoticeAttempts: 'asc' }, { createdAt: 'asc' }],
@@ -282,7 +284,7 @@ export class CircleInvitationService {
       return rows;
     });
     for (const row of invitations)
-      await this.deliverConsentInvitation(row.id).catch(() =>
+      void this.deliverConsentInvitation(row.id).catch(() =>
         this.logger.warn('circle consent invitation queued for retry'),
       );
   }
@@ -632,7 +634,7 @@ export class CircleInvitationService {
     }
 
     if (invitation.requiresConsent)
-      await this.deliverConsentInvitation(invitation.created.id).catch(() =>
+      void this.deliverConsentInvitation(invitation.created.id).catch(() =>
         this.logger.warn('circle consent invitation queued for retry'),
       );
     return this.fetchInvitationDto(invitation.created.id);
