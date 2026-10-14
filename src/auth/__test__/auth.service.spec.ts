@@ -97,6 +97,9 @@ describe('AuthService', () => {
     registerSecurityCodeFailure: jest.fn(() => Promise.resolve()),
     invalidateChallenges: jest.fn(() => Promise.resolve()),
     assertSecurityCodeFallbackBudget: jest.fn(() => Promise.resolve()),
+    verifySecurityCodeFallback: jest.fn(async (_id, _deviceKey, verify) =>
+      verify(),
+    ),
     loadForSecurityCode: jest.fn(),
     consumeAfterSecurityCode: jest.fn(() => Promise.resolve()),
     consumeWithCode: jest.fn(),
@@ -1013,13 +1016,11 @@ describe('AuthService', () => {
       }),
     ).rejects.toThrow(ForbiddenException);
 
-    expect(
-      mockDeviceTrust.assertSecurityCodeFallbackBudget,
-    ).toHaveBeenCalledWith('uuid-sc');
-    expect(mockDeviceTrust.registerSecurityCodeFailure).toHaveBeenCalledWith(
+    expect(mockDeviceTrust.verifySecurityCodeFallback).toHaveBeenCalledWith(
       'challenge-sc',
+      'new-device',
+      expect.any(Function),
     );
-    // 应用锁的计数与锁定只属于已登录的本人设备，这条无登录态的路径不能动它。
     expect(mockPrisma.user.update).not.toHaveBeenCalled();
   });
 

@@ -180,6 +180,13 @@ function setup() {
       count: jest.fn(async () => liveSessions.count),
     },
   };
+  let serial = Promise.resolve();
+  (prisma as any).$queryRaw = jest.fn().mockResolvedValue([]);
+  (prisma as any).$transaction = jest.fn((fn) => {
+    const next = serial.then(() => fn(prisma));
+    serial = next.catch(() => undefined);
+    return next;
+  });
   const realtime = { broadcast: jest.fn() };
   const push = {
     listActiveTokens: jest.fn(async () => [{ token: 't', projectId: null }]),
@@ -591,5 +598,70 @@ describe('DeviceTrustService revocation', () => {
     trusted[0].revokedAt = new Date();
     await service.trust('u1', 'phone', {});
     expect(trusted[0].revokedAt).toBeNull();
+  });
+});
+
+describe('account-serialized login limits', () => {
+  it('caps concurrent challenge creation across different devices at the account limit', async () => {
+    const { service, trust, challenges } = setup();
+    trust('phone');
+    const results = await Promise.allSettled(
+      Array.from({ length: 25 }, (_, i) =>
+        service.evaluateLogin(user, {
+          deviceKey: `new-${i}`,
+          ip: `203.0.113.${i + 1}`,
+        }),
+      ),
+    );
+    expect(challenges).toHaveLength(LOGIN_CHALLENGE_ACCOUNT_RATE_LIMIT);
+    expect(results.filter((r) => r.status === 'fulfilled')).toHaveLength(
+      LOGIN_CHALLENGE_ACCOUNT_RATE_LIMIT,
+    );
+  });
+
+  it('counts failed security-code guesses atomically across challenges', async () => {
+    const { service, trust, challenges } = setup();
+    trust('phone');
+    for (let i = 0; i < 3; i++)
+      await service.evaluateLogin(user, {
+        deviceKey: `new-${i}`,
+        ip: `203.0.113.${i + 1}`,
+      });
+    const verify = jest.fn(async () => false);
+    await Promise.allSettled(
+      Array.from({ length: 25 }, (_, i) =>
+        service.verifySecurityCodeFallback(
+          challenges[i % 3].id,
+          `new-${i % 3}`,
+          verify,
+        ),
+      ),
+    );
+    expect(verify).toHaveBeenCalledTimes(
+      LOGIN_CHALLENGE_SECURITY_CODE_DAILY_FAILURES,
+    );
+    expect(challenges.reduce((sum, c) => sum + c.attempts, 0)).toBe(
+      LOGIN_CHALLENGE_SECURITY_CODE_DAILY_FAILURES,
+    );
+    expect(
+      challenges.every((c) => c.attempts <= LOGIN_CHALLENGE_MAX_ATTEMPTS),
+    ).toBe(true);
+  });
+
+  it('consumes a successful fallback only once under concurrent submissions', async () => {
+    const { service, trust, challenges } = setup();
+    trust('phone');
+    await service.evaluateLogin(user, { deviceKey: 'new' });
+    const verify = jest.fn(async () => true);
+    const results = await Promise.allSettled(
+      Array.from({ length: 4 }, () =>
+        service.verifySecurityCodeFallback(challenges[0].id, 'new', verify),
+      ),
+    );
+    expect(
+      results.filter((r) => r.status === 'fulfilled' && r.value),
+    ).toHaveLength(1);
+    expect(verify).toHaveBeenCalledTimes(1);
+    expect(challenges[0].status).toBe('CONSUMED');
   });
 });

@@ -247,6 +247,8 @@ export class RealtimeService implements OnModuleInit, OnModuleDestroy {
   private static readonly SUBSCRIPTION_RETRY_MAX_MS = 30_000;
   /** Allow-list of event types accepted off the Redis backplane. */
   private static readonly REALTIME_EVENT_TYPES: ReadonlySet<string> = new Set([
+    'auth.login.challenge.created',
+    'auth.login.challenge.resolved',
     'badge.snapshot',
     'moments.feed.updated',
     'note.source.status.changed',

@@ -578,49 +578,53 @@ export class DeviceTrustService {
     deviceKey: string,
     context: SessionContext,
   ): Promise<{ id: string; expiresAt: Date }> {
-    const now = new Date();
-    const windowStart = new Date(
-      now.getTime() - LOGIN_CHALLENGE_RATE_WINDOW_MS,
-    );
-    const ip = truncate(context.ip, MAX_IP_LENGTH);
-    // 按「账号 + 来源 IP」限：只知道密码的人刷满自己 IP 的额度，挡不住本人从别处
-    // 登录；账号总量再兜一道，限制弹窗 / 推送轰炸。
-    const [fromThisIp, total] = await Promise.all([
-      this.prisma.loginChallenge.count({
-        where: { userId, ip, createdAt: { gt: windowStart } },
-      }),
-      this.prisma.loginChallenge.count({
-        where: { userId, createdAt: { gt: windowStart } },
-      }),
-    ]);
-    if (
-      fromThisIp >= LOGIN_CHALLENGE_RATE_LIMIT ||
-      total >= LOGIN_CHALLENGE_ACCOUNT_RATE_LIMIT
-    ) {
-      this.logSecurity('login_challenge_rate_limited', userId, {
-        fromThisIp,
-        total,
-      });
-      throw new HttpException(
-        {
-          message: '验证请求过于频繁，请 10 分钟后再试',
-          errorCode: AuthErrorCode.DeviceVerificationRateLimited,
-        },
-        HttpStatus.TOO_MANY_REQUESTS,
+    const challenge = await this.prisma.$transaction(async (tx) => {
+      await tx.$queryRaw`SELECT "id" FROM "User" WHERE "id" = ${userId} FOR UPDATE`;
+      const now = new Date();
+      const windowStart = new Date(
+        now.getTime() - LOGIN_CHALLENGE_RATE_WINDOW_MS,
       );
-    }
+      const ip = truncate(context.ip, MAX_IP_LENGTH);
+      // 按「账号 + 来源 IP」限：只知道密码的人刷满自己 IP 的额度，挡不住本人从别处
+      // 登录；账号总量再兜一道，限制弹窗 / 推送轰炸。
+      const [fromThisIp, total] = await Promise.all([
+        tx.loginChallenge.count({
+          where: { userId, ip, createdAt: { gt: windowStart } },
+        }),
+        tx.loginChallenge.count({
+          where: { userId, createdAt: { gt: windowStart } },
+        }),
+      ]);
+      if (
+        fromThisIp >= LOGIN_CHALLENGE_RATE_LIMIT ||
+        total >= LOGIN_CHALLENGE_ACCOUNT_RATE_LIMIT
+      ) {
+        this.logSecurity('login_challenge_rate_limited', userId, {
+          fromThisIp,
+          total,
+        });
+        throw new HttpException(
+          {
+            message: '验证请求过于频繁，请 10 分钟后再试',
+            errorCode: AuthErrorCode.DeviceVerificationRateLimited,
+          },
+          HttpStatus.TOO_MANY_REQUESTS,
+        );
+      }
 
-    const challenge = await this.prisma.loginChallenge.create({
-      data: {
-        userId,
-        deviceKey,
-        deviceName: truncate(context.deviceName, MAX_DEVICE_NAME_LENGTH),
-        ip: truncate(context.ip, MAX_IP_LENGTH),
-        userAgent: truncate(context.userAgent, MAX_USER_AGENT_LENGTH),
-        expiresAt: new Date(now.getTime() + LOGIN_CHALLENGE_DECISION_MS),
-      },
-      select: { id: true, expiresAt: true },
+      return tx.loginChallenge.create({
+        data: {
+          userId,
+          deviceKey,
+          deviceName: truncate(context.deviceName, MAX_DEVICE_NAME_LENGTH),
+          ip: truncate(context.ip, MAX_IP_LENGTH),
+          userAgent: truncate(context.userAgent, MAX_USER_AGENT_LENGTH),
+          expiresAt: new Date(now.getTime() + LOGIN_CHALLENGE_DECISION_MS),
+        },
+        select: { id: true, expiresAt: true },
+      });
     });
+    const now = new Date();
 
     void this.prisma.loginChallenge
       .deleteMany({
@@ -734,6 +738,74 @@ export class DeviceTrustService {
         count: invalidated.length,
       });
     }
+  }
+
+  /** Hold the account lock across budget checking, comparison and result recording. */
+  async verifySecurityCodeFallback(
+    challengeId: string,
+    deviceKey: string | null,
+    verify: () => Promise<boolean>,
+  ): Promise<boolean> {
+    const before = await this.findForDevice(challengeId, deviceKey);
+    const outcome = await this.prisma.$transaction(
+      async (tx) => {
+        await tx.$queryRaw`SELECT "id" FROM "User" WHERE "id" = ${before.userId} FOR UPDATE`;
+        const challenge = await tx.loginChallenge.findUnique({
+          where: { id: challengeId },
+        });
+        if (!challenge || challenge.deviceKey !== deviceKey)
+          this.throwInvalid();
+        const status = this.publicStatus(challenge, new Date());
+        if (status === 'REJECTED') this.throwRejected();
+        if (status === 'CONSUMED') this.throwInvalid();
+        if (challenge.attempts >= LOGIN_CHALLENGE_MAX_ATTEMPTS)
+          this.throwLocked();
+        if (status === 'EXPIRED') this.throwExpired();
+        const failures = await tx.loginChallenge.aggregate({
+          where: {
+            userId: before.userId,
+            createdAt: {
+              gt: new Date(Date.now() - LOGIN_CHALLENGE_RETENTION_MS),
+            },
+          },
+          _sum: { attempts: true },
+        });
+        if (
+          (failures._sum.attempts ?? 0) >=
+          LOGIN_CHALLENGE_SECURITY_CODE_DAILY_FAILURES
+        )
+          this.throwLocked();
+        if (!(await verify())) {
+          const [counted] = await tx.loginChallenge.updateManyAndReturn({
+            where: {
+              id: challengeId,
+              attempts: { lt: LOGIN_CHALLENGE_MAX_ATTEMPTS },
+            },
+            data: { attempts: { increment: 1 } },
+            select: { attempts: true },
+          });
+          return !counted || counted.attempts >= LOGIN_CHALLENGE_MAX_ATTEMPTS
+            ? 'locked'
+            : 'invalid';
+        }
+        const consumed = await tx.loginChallenge.updateMany({
+          where: {
+            id: challengeId,
+            status: {
+              in: [LoginChallengeStatus.PENDING, LoginChallengeStatus.APPROVED],
+            },
+            attempts: { lt: LOGIN_CHALLENGE_MAX_ATTEMPTS },
+          },
+          data: { status: LoginChallengeStatus.CONSUMED, codeHash: null },
+        });
+        if (consumed.count !== 1) this.throwInvalid();
+        return 'valid';
+      },
+      { maxWait: 10000, timeout: 10000 },
+    );
+    // Throw after committing the failed-attempt counter.
+    if (outcome === 'locked') this.throwLocked();
+    return outcome === 'valid';
   }
 
   /** 安全码兜底的账号级额度，超出即拒绝（只能等受信任设备批准）。 */

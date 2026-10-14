@@ -405,16 +405,17 @@ export class AuthService {
     // 这条路径没有登录态，绝不能动应用锁的错误计数（securityCodeAttempts /
     // securityCodeLockedUntil）：否则只知道密码的人能故意输错，把本人手机的应用锁
     // 锁住，锁住期间批准弹窗也被藏起来。改用验证单自己的计次 + 账号级每日额度。
-    await this.deviceTrust.assertSecurityCodeFallbackBudget(challenge.userId);
-    const ok = await argon2.verify(user.loginSecurityCodeHash, securityCode);
+    const ok = await this.deviceTrust.verifySecurityCodeFallback(
+      challenge.id,
+      sessionContext.deviceKey ?? null,
+      () => argon2.verify(user.loginSecurityCodeHash, securityCode),
+    );
     if (!ok) {
-      await this.deviceTrust.registerSecurityCodeFailure(challenge.id);
       throw new ForbiddenException({
         message: '安全码错误',
         errorCode: AuthErrorCode.SecurityCodeInvalid,
       });
     }
-    await this.deviceTrust.consumeAfterSecurityCode(challenge.id);
     return this.finishChallengeLogin(
       challenge.userId,
       challenge.id,
