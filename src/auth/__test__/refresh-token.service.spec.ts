@@ -4,6 +4,22 @@ import { UnauthorizedException } from '@nestjs/common';
 import { PrismaService } from '../../prisma/prisma.service';
 import { RefreshTokenService } from '../refresh-token.service';
 import { SessionRevocationService } from '../session-revocation.service';
+import { jobMetrics } from '../../metrics/job-metrics';
+
+function metricValue(
+  text: string,
+  name: string,
+  labels: Record<string, string>,
+): number {
+  const renderedLabels = Object.entries(labels)
+    .map(([key, value]) => `${key}="${value}"`)
+    .join(',');
+  const prefix = `${name}{${renderedLabels}} `;
+  const line = text
+    .split('\n')
+    .find((candidate) => candidate.startsWith(prefix));
+  return line ? Number(line.slice(prefix.length)) : 0;
+}
 
 describe('RefreshTokenService', () => {
   let service: RefreshTokenService;
@@ -49,6 +65,7 @@ describe('RefreshTokenService', () => {
       'revokedAt',
       'accessRevokedAt',
       'accessRevocationNotifiedAt',
+      'accessRevocationLockedAt',
     ]) {
       if (where[field] === null && record[field] != null) return false;
       if (where[field]?.not === null && record[field] == null) return false;
@@ -57,7 +74,18 @@ describe('RefreshTokenService', () => {
         if (record[field].getTime() !== where[field].getTime()) return false;
       }
     }
-    for (const field of ['expiredAt', 'createdAt', 'accessTokenExpiresAt']) {
+    if (
+      where.accessRevocationLeaseToken !== undefined &&
+      record.accessRevocationLeaseToken !== where.accessRevocationLeaseToken
+    ) {
+      return false;
+    }
+    for (const field of [
+      'expiredAt',
+      'createdAt',
+      'accessTokenExpiresAt',
+      'accessRevocationLockedAt',
+    ]) {
       const filter = where[field];
       if (filter === null && record[field] != null) return false;
       if (
@@ -100,6 +128,8 @@ describe('RefreshTokenService', () => {
           revokedAt: null,
           accessRevokedAt: null,
           accessRevocationNotifiedAt: null,
+          accessRevocationLockedAt: null,
+          accessRevocationLeaseToken: null,
           accessTokenExpiresAt: null,
           ...data,
         };
@@ -355,7 +385,7 @@ describe('RefreshTokenService', () => {
     expect(prisma.refreshToken.findMany).toHaveBeenCalledWith(
       expect.objectContaining({
         where: {
-          AND: [
+          AND: expect.arrayContaining([
             expect.objectContaining({
               userId: 'user-1',
               deviceKey: 'device-a',
@@ -364,7 +394,7 @@ describe('RefreshTokenService', () => {
             expect.objectContaining({
               accessRevocationNotifiedAt: null,
             }),
-          ],
+          ]),
         },
         select: { id: true },
         orderBy: { id: 'asc' },
@@ -376,7 +406,8 @@ describe('RefreshTokenService', () => {
     expect(revocation.revokeSession).not.toHaveBeenCalledWith('session-3');
     expect(records[0].accessRevokedAt).toBeInstanceOf(Date);
     expect(records[1].accessRevokedAt).toBeInstanceOf(Date);
-    expect(records[0].accessTokenExpiresAt.getTime()).toBeGreaterThan(
+    expect(records[0].accessTokenExpiresAt).toBeNull();
+    expect(records[0].expiredAt.getTime()).toBeGreaterThan(
       records[0].accessRevokedAt.getTime(),
     );
     expect(prisma.$transaction).toHaveBeenCalledTimes(1);
@@ -402,7 +433,7 @@ describe('RefreshTokenService', () => {
     expect(prisma.refreshToken.findMany).toHaveBeenCalledWith(
       expect.objectContaining({
         where: {
-          AND: [
+          AND: expect.arrayContaining([
             expect.objectContaining({
               userId: 'user-1',
               accessRevokedAt: expect.any(Date),
@@ -410,7 +441,7 @@ describe('RefreshTokenService', () => {
             expect.objectContaining({
               accessRevocationNotifiedAt: null,
             }),
-          ],
+          ]),
         },
         select: { id: true },
         orderBy: { id: 'asc' },
@@ -553,10 +584,10 @@ describe('RefreshTokenService', () => {
     expect(prisma.refreshToken.findMany).toHaveBeenCalledWith(
       expect.objectContaining({
         where: {
-          AND: [
+          AND: expect.arrayContaining([
             expect.objectContaining({ userId: 'user-1', audience: 'APP' }),
             expect.objectContaining({ accessRevocationNotifiedAt: null }),
-          ],
+          ]),
         },
         select: { id: true },
         take: 100,
@@ -651,7 +682,7 @@ describe('RefreshTokenService', () => {
     expect(revocation.revokeSession).not.toHaveBeenCalledWith(admin.sessionId);
   });
 
-  it('marks every unexpired replaced session when access TTL may have been shortened', async () => {
+  it('preserves legacy access tokens issued before the configured TTL was shortened', async () => {
     const configured = new RefreshTokenService(
       prisma as any,
       {
@@ -709,7 +740,7 @@ describe('RefreshTokenService', () => {
       expect.objectContaining({ take: 100 }),
     );
     expect(revocation.revokeSession).toHaveBeenCalledWith('recent-rotated');
-    expect(revocation.revokeSession).not.toHaveBeenCalledWith('stale-rotated');
+    expect(revocation.revokeSession).toHaveBeenCalledWith('stale-rotated');
     expect(revocation.revokeSession).not.toHaveBeenCalledWith(
       'expired-rotated',
     );
@@ -805,7 +836,8 @@ describe('RefreshTokenService', () => {
     await service.flushPendingAccessRevocations();
 
     expect(revocation.revokeSession).toHaveBeenCalledTimes(130);
-    expect(prisma.refreshToken.findMany).toHaveBeenCalledTimes(2);
+    // 每轮先取候选，再按唯一 lease token 读取本副本实际认领到的行。
+    expect(prisma.refreshToken.findMany).toHaveBeenCalledTimes(4);
     expect(
       records.filter(
         (record) =>
@@ -827,6 +859,113 @@ describe('RefreshTokenService', () => {
     await service.flushPendingAccessRevocations();
 
     expect(revocation.revokeSession).toHaveBeenCalledTimes(2);
+    expect(records[0].accessRevocationNotifiedAt).toBeInstanceOf(Date);
+  });
+
+  it('reports an unavailable outbox delivery as a tracked job failure', async () => {
+    const now = new Date();
+    records.push({
+      id: 'pending-revocation',
+      userId: 'user-1',
+      token: 'pending-token',
+      audience: 'APP',
+      familyId: 'pending-family',
+      revokedAt: now,
+      accessRevokedAt: now,
+      accessRevocationNotifiedAt: null,
+      accessRevocationLockedAt: null,
+      accessRevocationLeaseToken: null,
+      accessTokenExpiresAt: new Date(now.getTime() + 60_000),
+      expiredAt: new Date(now.getTime() + 60_000),
+      createdAt: now,
+      lastUsedAt: now,
+    });
+    revocation.revokeSession.mockResolvedValue(false);
+    const before = await jobMetrics.registry.metrics();
+    const failuresBefore = metricValue(before, 'circle_cron_runs_total', {
+      job: 'access_revocation_outbox',
+      result: 'failure',
+    });
+
+    await service.flushPendingAccessRevocations();
+
+    const after = await jobMetrics.registry.metrics();
+    expect(
+      metricValue(after, 'circle_cron_runs_total', {
+        job: 'access_revocation_outbox',
+        result: 'failure',
+      }),
+    ).toBe(failuresBefore + 1);
+    expect(records[0].accessRevocationNotifiedAt).toBeNull();
+  });
+
+  it('reports an overlapping outbox sweep as skipped without advancing success', async () => {
+    (service as any).accessRevocationSweepRunning = true;
+    const before = await jobMetrics.registry.metrics();
+    const skippedBefore = metricValue(before, 'circle_cron_runs_total', {
+      job: 'access_revocation_outbox',
+      result: 'skipped',
+    });
+    const successBefore = metricValue(
+      before,
+      'circle_cron_last_success_timestamp_seconds',
+      { job: 'access_revocation_outbox' },
+    );
+    const nowSpy = jest.spyOn(Date, 'now').mockReturnValue(Date.now() + 10_000);
+
+    await service.flushPendingAccessRevocations();
+
+    nowSpy.mockRestore();
+    const after = await jobMetrics.registry.metrics();
+    expect(
+      metricValue(after, 'circle_cron_runs_total', {
+        job: 'access_revocation_outbox',
+        result: 'skipped',
+      }),
+    ).toBe(skippedBefore + 1);
+    expect(
+      metricValue(after, 'circle_cron_last_success_timestamp_seconds', {
+        job: 'access_revocation_outbox',
+      }),
+    ).toBe(successBefore);
+  });
+
+  it('claims each pending SID once across concurrent outbox processors', async () => {
+    const now = new Date();
+    records.push({
+      id: 'shared-pending-revocation',
+      userId: 'user-1',
+      token: 'shared-pending-token',
+      audience: 'APP',
+      familyId: 'shared-pending-family',
+      revokedAt: now,
+      accessRevokedAt: now,
+      accessRevocationNotifiedAt: null,
+      accessRevocationLockedAt: null,
+      accessRevocationLeaseToken: null,
+      accessTokenExpiresAt: new Date(now.getTime() + 60_000),
+      expiredAt: new Date(now.getTime() + 60_000),
+      createdAt: now,
+      lastUsedAt: now,
+    });
+    const second = new RefreshTokenService(
+      prisma as any,
+      config as any,
+      revocation as any,
+    );
+    let release!: () => void;
+    const deliveryGate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    revocation.revokeSession.mockImplementation(() => deliveryGate);
+
+    const firstRun = service.flushPendingAccessRevocations();
+    const secondRun = second.flushPendingAccessRevocations();
+    await new Promise<void>((resolve) => setImmediate(resolve));
+
+    expect(revocation.revokeSession).toHaveBeenCalledTimes(1);
+    release();
+    await Promise.all([firstRun, secondRun]);
     expect(records[0].accessRevocationNotifiedAt).toBeInstanceOf(Date);
   });
 

@@ -890,6 +890,9 @@ model RefreshToken {
   accessRevokedAt DateTime?
   /// Redis 标记/实时断连已完成；null 且 accessRevokedAt 非空即持久 outbox 待办。
   accessRevocationNotifiedAt DateTime?
+  /// 多副本 outbox 处理租约；超时后允许其他副本重新认领。
+  accessRevocationLockedAt DateTime?
+  accessRevocationLeaseToken String?
   revokedAt        DateTime?
   revocationReason RefreshTokenRevocationReason?
   createdAt        DateTime                      @default(now())
@@ -900,7 +903,6 @@ model RefreshToken {
   @@index([userId, familyId])
   @@index([userId, audience, createdAt])
   @@index([userId, deviceKey])
-  @@index([accessRevocationNotifiedAt, accessTokenExpiresAt, id], map: "RefreshToken_access_revoke_outbox_idx")
   @@index([expiredAt])
   @@index([revokedAt])
 }

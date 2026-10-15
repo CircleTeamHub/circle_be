@@ -118,8 +118,11 @@ describe('RefreshTokenCleanup', () => {
           },
           {
             OR: [
-              { accessTokenExpiresAt: null },
               { accessTokenExpiresAt: { lte: now } },
+              {
+                accessTokenExpiresAt: null,
+                expiredAt: { lte: now },
+              },
             ],
           },
         ],
@@ -145,8 +148,11 @@ describe('RefreshTokenCleanup', () => {
               },
               {
                 OR: [
-                  { accessTokenExpiresAt: null },
                   { accessTokenExpiresAt: { lte: now } },
+                  {
+                    accessTokenExpiresAt: null,
+                    expiredAt: { lte: now },
+                  },
                 ],
               },
             ],

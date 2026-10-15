@@ -16,6 +16,8 @@ describe('session access revocation migrations', () => {
     expect(sql).toContain(
       'ADD COLUMN "accessRevocationNotifiedAt" TIMESTAMP(3)',
     );
+    expect(sql).toContain('ADD COLUMN "accessRevocationLockedAt" TIMESTAMP(3)');
+    expect(sql).toContain('ADD COLUMN "accessRevocationLeaseToken" TEXT');
     expect(sql).not.toContain('revocationReason');
     expect(sql).not.toMatch(/\bUPDATE\b/i);
   });
@@ -31,9 +33,9 @@ describe('session access revocation migrations', () => {
 
     expect(sql).toContain('CREATE INDEX CONCURRENTLY IF NOT EXISTS');
     expect(sql).toContain('RefreshToken_access_revoke_outbox_idx');
-    expect(sql).toContain(
-      '("accessRevocationNotifiedAt", "accessTokenExpiresAt", "id")',
-    );
+    expect(sql).toContain('("accessTokenExpiresAt", "expiredAt", "id")');
+    expect(sql).toContain('WHERE "accessRevokedAt" IS NOT NULL');
+    expect(sql).toContain('AND "accessRevocationNotifiedAt" IS NULL');
     expect(sql).not.toMatch(/\bBEGIN\b|\bCOMMIT\b/i);
   });
 });

@@ -3,12 +3,13 @@ import { ConfigService } from '@nestjs/config';
 import { CronExpression } from '@nestjs/schedule';
 import { createHash, randomBytes, randomUUID } from 'crypto';
 import { Prisma, RefreshTokenRevocationReason } from 'src/generated/prisma';
-import { TrackedCron } from 'src/metrics/tracked-cron.decorator';
-import { PrismaService } from 'src/prisma/prisma.service';
 import {
-  accessTokenTtlSeconds,
-  SessionRevocationService,
-} from './session-revocation.service';
+  reportHandledJobFailure,
+  reportJobSkipped,
+  TrackedCron,
+} from 'src/metrics/tracked-cron.decorator';
+import { PrismaService } from 'src/prisma/prisma.service';
+import { SessionRevocationService } from './session-revocation.service';
 
 const DEFAULT_REFRESH_TOKEN_TTL_DAYS = 7;
 // 管理台会话故意比用户短一个量级（#91 目标区间 8-24h）：一枚被偷的 admin
@@ -19,6 +20,7 @@ const MAX_USER_AGENT_LENGTH = 256;
 const MAX_IP_LENGTH = 64;
 const REVOCATION_BATCH_SIZE = 25;
 const REVOCATION_PAGE_SIZE = 100;
+const ACCESS_REVOCATION_CLAIM_LEASE_MS = 2 * 60_000;
 // GET /auth/sessions 的上限：正常账号只有个位数设备，100 足够列全真实会话，又不让
 // 一个刷出成千上万条会话的账号每次打开设备管理都把它们全拉回来。
 const ACTIVE_SESSION_LIST_LIMIT = 100;
@@ -94,7 +96,6 @@ export class RefreshTokenService {
   private readonly logger = new Logger(RefreshTokenService.name);
   private readonly ttlMs: number;
   private readonly adminTtlMs: number;
-  private readonly accessTtlMs: number;
   private accessRevocationSweepRunning = false;
 
   constructor(
@@ -137,10 +138,6 @@ export class RefreshTokenService {
       adminConfigured ?? parseRefreshTtlMs(DEFAULT_ADMIN_REFRESH_TTL)!,
       this.ttlMs,
     );
-    this.accessTtlMs =
-      accessTokenTtlSeconds(
-        this.config.get<string | number>('JWT_EXPIRES_IN') ?? '1h',
-      ) * 1000;
   }
 
   /** 各 audience 的会话 TTL（毫秒）。导出仅为测试可见性。 */
@@ -215,6 +212,25 @@ export class RefreshTokenService {
     where: Prisma.RefreshTokenWhereInput,
   ): Promise<number> {
     const now = new Date();
+    const staleBefore = new Date(
+      now.getTime() - ACCESS_REVOCATION_CLAIM_LEASE_MS,
+    );
+    const leaseToken = randomUUID();
+    const eligibleAccessToken: Prisma.RefreshTokenWhereInput = {
+      OR: [
+        { accessTokenExpiresAt: { gt: now } },
+        {
+          accessTokenExpiresAt: null,
+          expiredAt: { gt: now },
+        },
+      ],
+    };
+    const availableLease: Prisma.RefreshTokenWhereInput = {
+      OR: [
+        { accessRevocationLockedAt: null },
+        { accessRevocationLockedAt: { lte: staleBefore } },
+      ],
+    };
     const page = await this.prisma.refreshToken.findMany({
       where: {
         AND: [
@@ -222,8 +238,9 @@ export class RefreshTokenService {
           {
             accessRevokedAt: { not: null },
             accessRevocationNotifiedAt: null,
-            accessTokenExpiresAt: { gt: now },
           },
+          eligibleAccessToken,
+          availableLease,
         ],
       },
       select: { id: true },
@@ -232,18 +249,65 @@ export class RefreshTokenService {
     });
     if (page.length === 0) return 0;
 
-    const sessionIds = page.map(({ id }) => id);
+    const candidateIds = page.map(({ id }) => id);
+    await this.prisma.refreshToken.updateMany({
+      where: {
+        AND: [
+          { id: { in: candidateIds } },
+          {
+            accessRevokedAt: { not: null },
+            accessRevocationNotifiedAt: null,
+          },
+          eligibleAccessToken,
+          availableLease,
+        ],
+      },
+      data: {
+        accessRevocationLockedAt: now,
+        accessRevocationLeaseToken: leaseToken,
+      },
+    });
+    const claimed = await this.prisma.refreshToken.findMany({
+      where: { accessRevocationLeaseToken: leaseToken },
+      select: { id: true },
+      orderBy: { id: 'asc' },
+      take: REVOCATION_PAGE_SIZE,
+    });
+    const sessionIds = claimed.map(({ id }) => id);
+    if (sessionIds.length === 0) return 0;
+
     const notifiedSessionIds = await this.revokeAccessSessions(sessionIds);
     if (notifiedSessionIds.length > 0) {
       await this.prisma.refreshToken.updateMany({
         where: {
           id: { in: notifiedSessionIds },
           accessRevocationNotifiedAt: null,
+          accessRevocationLeaseToken: leaseToken,
         },
-        data: { accessRevocationNotifiedAt: new Date() },
+        data: {
+          accessRevocationNotifiedAt: new Date(),
+          accessRevocationLockedAt: null,
+          accessRevocationLeaseToken: null,
+        },
       });
     }
-    return page.length;
+    const failedSessionIds = sessionIds.filter(
+      (sessionId) => !notifiedSessionIds.includes(sessionId),
+    );
+    if (failedSessionIds.length > 0) {
+      await this.prisma.refreshToken.updateMany({
+        where: {
+          id: { in: failedSessionIds },
+          accessRevocationLeaseToken: leaseToken,
+        },
+        data: {
+          accessRevocationLockedAt: null,
+          accessRevocationLeaseToken: null,
+        },
+      });
+      reportHandledJobFailure();
+    }
+    return sessionIds.length;
   }
 
   /**
@@ -254,7 +318,10 @@ export class RefreshTokenService {
    */
   @TrackedCron(CronExpression.EVERY_MINUTE, 'access_revocation_outbox')
   async flushPendingAccessRevocations(): Promise<void> {
-    if (this.accessRevocationSweepRunning) return;
+    if (this.accessRevocationSweepRunning) {
+      reportJobSkipped();
+      return;
+    }
     this.accessRevocationSweepRunning = true;
     try {
       await this.notifyPendingAccessRevocations({});
@@ -282,29 +349,44 @@ export class RefreshTokenService {
     where: Prisma.RefreshTokenWhereInput,
     revokedAt: Date,
   ): Promise<void> {
-    const legacyCutoff = new Date(revokedAt.getTime() - this.accessTtlMs);
-    // Pre-migration rows do not know their exact access-token expiry. Give them
-    // a conservative full TTL from the revocation event, but only when the row
-    // was created within one access-token lifetime. Older rows cannot still
-    // carry a live access token and must not inflate the durable outbox.
+    // Pre-migration rows do not know their exact access-token expiry. Their
+    // refresh expiry is the only durable upper bound that survives a later
+    // JWT_EXPIRES_IN reduction, so keep them revocable until that bound. This
+    // may retain/broadcast a row longer than its access JWT actually lives, but
+    // never lets a still-valid legacy JWT escape revocation.
     await tx.refreshToken.updateMany({
       where: {
         AND: [
           where,
-          { accessTokenExpiresAt: null, createdAt: { gt: legacyCutoff } },
+          {
+            accessRevokedAt: null,
+            accessTokenExpiresAt: null,
+            expiredAt: { gt: revokedAt },
+          },
         ],
       },
       data: {
-        accessTokenExpiresAt: new Date(revokedAt.getTime() + this.accessTtlMs),
         accessRevokedAt: revokedAt,
         accessRevocationNotifiedAt: null,
+        accessRevocationLockedAt: null,
+        accessRevocationLeaseToken: null,
       },
     });
     await tx.refreshToken.updateMany({
-      where: { AND: [where, { accessTokenExpiresAt: { gt: revokedAt } }] },
+      where: {
+        AND: [
+          where,
+          {
+            accessRevokedAt: null,
+            accessTokenExpiresAt: { gt: revokedAt },
+          },
+        ],
+      },
       data: {
         accessRevokedAt: revokedAt,
         accessRevocationNotifiedAt: null,
+        accessRevocationLockedAt: null,
+        accessRevocationLeaseToken: null,
       },
     });
   }

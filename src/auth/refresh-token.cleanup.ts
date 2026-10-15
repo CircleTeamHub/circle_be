@@ -74,8 +74,11 @@ export class RefreshTokenCleanup {
         },
         {
           OR: [
-            { accessTokenExpiresAt: null },
             { accessTokenExpiresAt: { lte: now } },
+            {
+              accessTokenExpiresAt: null,
+              expiredAt: { lte: now },
+            },
           ],
         },
       ],
