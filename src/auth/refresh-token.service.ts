@@ -840,6 +840,36 @@ export class RefreshTokenService {
     }
   }
 
+  async revokeSessionFamily(userId: string, sessionId: string): Promise<void> {
+    const accessRevocation = await this.prisma.$transaction(async (tx) => {
+      const lockKey = `auth-user:${userId}`;
+      await tx.$executeRaw`SELECT pg_advisory_xact_lock(hashtext(${lockKey}))`;
+      const session = await tx.refreshToken.findFirst({
+        where: { id: sessionId, userId },
+        select: { familyId: true },
+      });
+      if (!session) return null;
+
+      const now = new Date();
+      const target = { userId, familyId: session.familyId };
+      await this.markAccessRevokedWithClient(tx, target, now);
+      await tx.refreshToken.updateMany({
+        where: { ...target, revokedAt: null },
+        data: {
+          revokedAt: now,
+          revocationReason: RefreshTokenRevocationReason.SESSION_REVOKED,
+        },
+      });
+      return { accessRevokedAt: now, where: target };
+    });
+    if (accessRevocation) {
+      await this.notifyPendingAccessRevocationsBestEffort({
+        ...accessRevocation.where,
+        accessRevokedAt: accessRevocation.accessRevokedAt,
+      });
+    }
+  }
+
   /** 撤销绑定到某台设备的全部会话（设备管理里移除设备时用）。 */
   async revokeDeviceSessions(userId: string, deviceKey: string): Promise<void> {
     const revokedAt = await this.prisma.$transaction(async (tx) => {

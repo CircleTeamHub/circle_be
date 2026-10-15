@@ -4,6 +4,7 @@ import { UnauthorizedException } from '@nestjs/common';
 import { PrismaService } from '../../prisma/prisma.service';
 import { RefreshTokenService } from '../refresh-token.service';
 import { SessionRevocationService } from '../session-revocation.service';
+import { SessionVerifier } from '../session-verifier.service';
 import { jobMetrics } from '../../metrics/job-metrics';
 
 function metricValue(
@@ -138,7 +139,9 @@ describe('RefreshTokenService', () => {
       }),
       findUnique: jest.fn(({ where }) =>
         Promise.resolve(
-          records.find((record) => record.token === where.token) ?? null,
+          records.find((record) =>
+            where.id ? record.id === where.id : record.token === where.token,
+          ) ?? null,
         ),
       ),
       findFirst: jest.fn(({ where }) =>
@@ -336,6 +339,54 @@ describe('RefreshTokenService', () => {
     expect(revocation.revokeSession).toHaveBeenCalledWith('session-1');
     expect(revocation.revokeSession).toHaveBeenCalledTimes(1);
     expect(revocation.revokeSession).not.toHaveBeenCalledWith('session-2');
+  });
+
+  it('durably revokes rotated ancestors when removing the current session family', async () => {
+    const { token, sessionId: ancestorSessionId } = await service.create(
+      'user-1',
+      { deviceKey: 'device-a' },
+    );
+    const current = await service.rotate(token);
+    jest.clearAllMocks();
+
+    await service.revokeSessionFamily('user-1', current.sessionId);
+
+    const ancestor = records.find((record) => record.id === ancestorSessionId);
+    const currentRecord = records.find(
+      (record) => record.id === current.sessionId,
+    );
+    expect(ancestor).toMatchObject({
+      revocationReason: 'ROTATED',
+      accessRevokedAt: expect.any(Date),
+    });
+    expect(currentRecord).toMatchObject({
+      revocationReason: 'SESSION_REVOKED',
+      accessRevokedAt: expect.any(Date),
+    });
+    expect(revocation.revokeSession).toHaveBeenCalledWith(ancestorSessionId);
+    expect(revocation.revokeSession).toHaveBeenCalledWith(current.sessionId);
+
+    const verifier = new SessionVerifier(
+      { checkRevocation: jest.fn().mockResolvedValue('unknown') } as any,
+      {
+        user: {
+          findUnique: jest.fn().mockResolvedValue({
+            status: 'ACTIVE',
+            accessTokensRevokedAt: null,
+          }),
+        },
+        refreshToken: {
+          findUnique: jest.fn(({ where }) =>
+            Promise.resolve(
+              records.find((record) => record.id === where.id) ?? null,
+            ),
+          ),
+        },
+      } as any,
+    );
+    await expect(
+      verifier.verify({ sub: 'user-1', sid: ancestorSessionId }),
+    ).resolves.toBe('revoked');
   });
 
   it('revokes all active sessions except the current session', async () => {

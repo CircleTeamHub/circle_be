@@ -129,6 +129,7 @@ describe('AuthService', () => {
     revoke: jest.fn(() => Promise.resolve()),
     listActiveSessions: jest.fn(() => Promise.resolve([])),
     revokeSession: jest.fn(() => Promise.resolve()),
+    revokeSessionFamily: jest.fn(() => Promise.resolve()),
     revokeOtherSessions: jest.fn(() => Promise.resolve()),
     revokeDeviceSessions: jest.fn(() => Promise.resolve()),
     findSessionDeviceKey: jest.fn((_userId: string, sessionId: string) =>
@@ -1106,6 +1107,22 @@ describe('AuthService', () => {
     );
   });
 
+  it('revokes the whole token family when removing the current session', async () => {
+    mockRefreshTokenService.findSessionDeviceKey.mockResolvedValue(
+      'same-phone' as never,
+    );
+
+    await service.logoutSession('uuid-1', 'current-session', 'current-session');
+
+    expect(mockRefreshTokenService.revokeSessionFamily).toHaveBeenCalledWith(
+      'uuid-1',
+      'current-session',
+    );
+    expect(mockRefreshTokenService.revokeSession).not.toHaveBeenCalled();
+    expect(mockRefreshTokenService.revokeDeviceSessions).not.toHaveBeenCalled();
+    expect(mockDeviceTrust.revokeDevice).not.toHaveBeenCalled();
+  });
+
   it('revokes other sessions while keeping the current session', async () => {
     await service.logoutOtherSessions('uuid-1', 'session-1');
 
@@ -1131,6 +1148,7 @@ describe('AuthService', () => {
       'uuid-1',
       'old-session',
     );
+    expect(mockRefreshTokenService.revokeSessionFamily).not.toHaveBeenCalled();
     expect(mockRefreshTokenService.revokeDeviceSessions).not.toHaveBeenCalled();
     expect(mockDeviceTrust.revokeDevice).not.toHaveBeenCalled();
     mockRefreshTokenService.findSessionDeviceKey.mockImplementation(
