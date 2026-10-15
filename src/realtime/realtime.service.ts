@@ -53,6 +53,9 @@ export type RealtimeSocketIdentity = {
   sessionId: string | null;
   /** `issuedAtMs` (or `iat` x1000); null when the token carries neither. */
   issuedAtMs: number | null;
+  familyId?: string | null;
+  audience?: 'APP' | 'ADMIN' | null;
+  deviceKey?: string | null;
 };
 
 type BadgeSnapshot = {
@@ -1182,10 +1185,7 @@ export class RealtimeService implements OnModuleInit, OnModuleDestroy {
    * for local and remote means one behaviour to reason about.
    */
   closeRevokedSockets(broadcast: SessionRevocationBroadcast): number {
-    const revoked =
-      broadcast.kind === 'user'
-        ? this.socketsRevokedForUser(broadcast.userId, broadcast.revokedAtMs)
-        : this.socketsRevokedForSession(broadcast.sessionId);
+    const revoked = this.socketsRevokedBy(broadcast);
 
     for (const socket of revoked) {
       try {
@@ -1198,15 +1198,31 @@ export class RealtimeService implements OnModuleInit, OnModuleDestroy {
     }
 
     if (revoked.length > 0) {
-      const target =
-        broadcast.kind === 'user'
-          ? `user ${broadcast.userId}`
-          : `session ${broadcast.sessionId}`;
+      const target = this.revocationTargetLabel(broadcast);
       this.logger.log(
         `Closed ${revoked.length} realtime socket(s) for revoked ${target}.`,
       );
     }
     return revoked.length;
+  }
+
+  private socketsRevokedBy(broadcast: SessionRevocationBroadcast): WebSocket[] {
+    if (broadcast.kind === 'user') {
+      return this.socketsRevokedForUser(
+        broadcast.userId,
+        broadcast.revokedAtMs,
+      );
+    }
+    if (broadcast.kind === 'session') {
+      return this.socketsRevokedForSession(broadcast.sessionId);
+    }
+    return this.socketsRevokedForScope(broadcast);
+  }
+
+  private revocationTargetLabel(broadcast: SessionRevocationBroadcast): string {
+    if (broadcast.kind === 'user') return `user ${broadcast.userId}`;
+    if (broadcast.kind === 'session') return `session ${broadcast.sessionId}`;
+    return `${broadcast.scope.toLowerCase()} ${broadcast.scopeKey}`;
   }
 
   private socketsRevokedForUser(
@@ -1244,6 +1260,30 @@ export class RealtimeService implements OnModuleInit, OnModuleDestroy {
       }
     }
     return [...revoked];
+  }
+
+  private socketsRevokedForScope(
+    broadcast: Extract<SessionRevocationBroadcast, { kind: 'scope' }>,
+  ): WebSocket[] {
+    const group = new Set([
+      ...(this.clients.get(broadcast.userId) ?? []),
+      ...(this.pendingClients.get(broadcast.userId) ?? []),
+    ]);
+    return [...group].filter((socket) => {
+      const identity = this.socketIdentities.get(socket);
+      if (!identity) return false;
+      if (identity.familyId === broadcast.exemptFamilyId) return false;
+      switch (broadcast.scope) {
+        case 'ACCOUNT':
+          return true;
+        case 'AUDIENCE':
+          return identity.audience === broadcast.scopeKey;
+        case 'DEVICE':
+          return identity.deviceKey === broadcast.scopeKey;
+        case 'FAMILY':
+          return identity.familyId === broadcast.scopeKey;
+      }
+    });
   }
 
   private parseRedisEnvelope(

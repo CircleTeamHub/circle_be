@@ -16,6 +16,23 @@ describe('parseSessionRevocationBroadcast', () => {
         JSON.stringify({ kind: 'session', sessionId: 's1' }),
       ),
     ).toEqual({ kind: 'session', sessionId: 's1' });
+    expect(
+      parseSessionRevocationBroadcast(
+        JSON.stringify({
+          kind: 'scope',
+          userId: 'u1',
+          scope: 'DEVICE',
+          scopeKey: 'device-1',
+          exemptFamilyId: null,
+        }),
+      ),
+    ).toEqual({
+      kind: 'scope',
+      userId: 'u1',
+      scope: 'DEVICE',
+      scopeKey: 'device-1',
+      exemptFamilyId: null,
+    });
   });
 
   it.each([
@@ -32,6 +49,15 @@ describe('parseSessionRevocationBroadcast', () => {
       JSON.stringify({ kind: 'user', userId: 'u1', revokedAtMs: 'x' }),
     ],
     ['missing sessionId', JSON.stringify({ kind: 'session' })],
+    [
+      'unknown scope',
+      JSON.stringify({
+        kind: 'scope',
+        userId: 'u1',
+        scope: 'UNKNOWN',
+        scopeKey: '*',
+      }),
+    ],
   ])('rejects %s rather than throwing', (_label, message) => {
     expect(parseSessionRevocationBroadcast(message)).toBeNull();
   });

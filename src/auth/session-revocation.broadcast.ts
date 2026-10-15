@@ -22,7 +22,15 @@ export type SessionRevocationBroadcast =
   /** Every token this user was issued at or before `revokedAtMs` is dead. */
   | { kind: 'user'; userId: string; revokedAtMs: number }
   /** One session (one device) is dead; the user's other devices survive. */
-  | { kind: 'session'; sessionId: string };
+  | { kind: 'session'; sessionId: string }
+  /** One durable generation scope advanced; matching live sockets are dead. */
+  | {
+      kind: 'scope';
+      userId: string;
+      scope: 'ACCOUNT' | 'AUDIENCE' | 'DEVICE' | 'FAMILY';
+      scopeKey: string;
+      exemptFamilyId: string | null;
+    };
 
 /**
  * Parses a message off the backplane. Anything malformed or foreign returns
@@ -55,6 +63,32 @@ export function parseSessionRevocationBroadcast(
     const { sessionId } = candidate;
     if (typeof sessionId !== 'string' || sessionId.length === 0) return null;
     return { kind: 'session', sessionId };
+  }
+
+  if (candidate.kind === 'scope') {
+    const { userId, scope, scopeKey, exemptFamilyId } = candidate;
+    if (typeof userId !== 'string' || userId.length === 0) return null;
+    if (
+      scope !== 'ACCOUNT' &&
+      scope !== 'AUDIENCE' &&
+      scope !== 'DEVICE' &&
+      scope !== 'FAMILY'
+    ) {
+      return null;
+    }
+    if (typeof scopeKey !== 'string' || scopeKey.length === 0) return null;
+    if (exemptFamilyId !== null && typeof exemptFamilyId !== 'string') {
+      return null;
+    }
+    const normalizedExemption =
+      typeof exemptFamilyId === 'string' ? exemptFamilyId : null;
+    return {
+      kind: 'scope',
+      userId,
+      scope,
+      scopeKey,
+      exemptFamilyId: normalizedExemption,
+    };
   }
 
   return null;

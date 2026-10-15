@@ -36,7 +36,7 @@ function fakeSocket(overrides: Record<string, unknown> = {}) {
 
 describe('ChatGateway', () => {
   const jwtService = { verify: jest.fn(), decode: jest.fn() };
-  const sessionVerifier = { verify: jest.fn() };
+  const sessionVerifier = { verifyWithIdentity: jest.fn() };
   // 连接时一次读回全部在座会话和它们的类型(在线状态不进群房间);默认都是单聊。
   const seats = (...ids: string[]) =>
     ids.map((conversationId) => ({ conversationId, type: 'DIRECT' }));
@@ -124,7 +124,10 @@ describe('ChatGateway', () => {
 
   beforeEach(() => {
     jest.clearAllMocks();
-    sessionVerifier.verify.mockResolvedValue('active');
+    sessionVerifier.verifyWithIdentity.mockResolvedValue({
+      verdict: 'active',
+      identity: null,
+    });
     configService.get.mockReturnValue('guest-secret');
     // 默认不是访客 token:app 分支的既有用例不受分流影响。
     jwtService.decode.mockReturnValue({ sub: 'u1' });
@@ -186,7 +189,10 @@ describe('ChatGateway', () => {
         accountId: 'acc1',
         aud: 'APP',
       });
-      sessionVerifier.verify.mockResolvedValue('revoked');
+      sessionVerifier.verifyWithIdentity.mockResolvedValue({
+        verdict: 'revoked',
+        identity: null,
+      });
       const revoked = fakeSocket();
       await expect(
         gateway['authenticate'](revoked as never),
@@ -203,7 +209,10 @@ describe('ChatGateway', () => {
         accountId: 'acc1',
         aud: 'APP',
       });
-      sessionVerifier.verify.mockResolvedValue('unavailable');
+      sessionVerifier.verifyWithIdentity.mockResolvedValue({
+        verdict: 'unavailable',
+        identity: null,
+      });
       const socket = fakeSocket();
 
       await expect(
@@ -244,7 +253,7 @@ describe('ChatGateway', () => {
       ).resolves.toBeNull();
       expect(socket.data.authFailureReason).toBe('wrong_audience');
       // 连吊销检查都不该走到 —— 这类 token 根本不该进入聊天面。
-      expect(sessionVerifier.verify).not.toHaveBeenCalled();
+      expect(sessionVerifier.verifyWithIdentity).not.toHaveBeenCalled();
     });
 
     it('rejects a token with no audience claim at all', async () => {
@@ -677,7 +686,7 @@ describe('ChatGateway', () => {
       // 访客没有 app 会话,吊销广播的两个判据都不该命中它。
       expect(socket.data.sessionId).toBeNull();
       expect(socket.data.issuedAtMs).toBeNull();
-      expect(sessionVerifier.verify).not.toHaveBeenCalled();
+      expect(sessionVerifier.verifyWithIdentity).not.toHaveBeenCalled();
     });
 
     it('rejects once the room is no longer active', async () => {

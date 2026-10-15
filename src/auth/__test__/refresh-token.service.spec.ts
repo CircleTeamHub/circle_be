@@ -27,6 +27,7 @@ describe('RefreshTokenService', () => {
 
   const records: any[] = [];
   const userSettings = new Map<string, boolean>();
+  const scopeGenerations = new Map<string, any>();
   const loopbackIp = ['127', '0', '0', '1'].join('.');
   const privateIp = ['10', '0', '0', '1'].join('.');
 
@@ -180,17 +181,90 @@ describe('RefreshTokenService', () => {
         return matching.map(({ id }) => ({ id }));
       }),
     },
+    sessionScopeGeneration: {
+      findMany: jest.fn(({ where }) =>
+        Promise.resolve(
+          [...scopeGenerations.values()].filter((row) => {
+            if (where.userId !== undefined && row.userId !== where.userId) {
+              return false;
+            }
+            if (
+              where.notificationPending !== undefined &&
+              row.notificationPending !== where.notificationPending
+            ) {
+              return false;
+            }
+            return (
+              !where.OR ||
+              where.OR.some(
+                (scope: any) =>
+                  (scope.userId === undefined || scope.userId === row.userId) &&
+                  (scope.scope === undefined || scope.scope === row.scope) &&
+                  (scope.scopeKey === undefined ||
+                    scope.scopeKey === row.scopeKey) &&
+                  (scope.generation === undefined ||
+                    scope.generation === row.generation),
+              )
+            );
+          }),
+        ),
+      ),
+      upsert: jest.fn(async ({ where, create, update }) => {
+        const key = `${where.userId_scope_scopeKey.userId}:${where.userId_scope_scopeKey.scope}:${where.userId_scope_scopeKey.scopeKey}`;
+        const existing = scopeGenerations.get(key);
+        const row = existing
+          ? {
+              ...existing,
+              generation:
+                existing.generation + (update.generation?.increment ?? 0),
+              exemptFamilyId: update.exemptFamilyId,
+              notificationPending: update.notificationPending,
+            }
+          : { ...create };
+        scopeGenerations.set(key, row);
+        return row;
+      }),
+      updateMany: jest.fn(async ({ where, data }) => {
+        let count = 0;
+        for (const [key, row] of scopeGenerations) {
+          const directMatch =
+            (where.userId === undefined || where.userId === row.userId) &&
+            (where.scope === undefined || where.scope === row.scope) &&
+            (where.scopeKey === undefined || where.scopeKey === row.scopeKey) &&
+            (where.generation === undefined ||
+              where.generation === row.generation) &&
+            (where.notificationPending === undefined ||
+              where.notificationPending === row.notificationPending);
+          const orMatch =
+            !where.OR ||
+            where.OR.some(
+              (candidate: any) =>
+                candidate.userId === row.userId &&
+                candidate.scope === row.scope &&
+                candidate.scopeKey === row.scopeKey &&
+                candidate.generation === row.generation,
+            );
+          if (directMatch && orMatch) {
+            scopeGenerations.set(key, { ...row, ...data });
+            count += 1;
+          }
+        }
+        return { count };
+      }),
+    },
   };
 
   const config = { get: jest.fn().mockReturnValue(undefined) };
   const revocation = {
     revokeUser: jest.fn().mockResolvedValue(undefined),
     revokeSession: jest.fn().mockResolvedValue(undefined),
+    revokeScope: jest.fn().mockResolvedValue(true),
   };
 
   beforeEach(async () => {
     records.length = 0;
     userSettings.clear();
+    scopeGenerations.clear();
     userSettings.set('user-1', false);
     jest.clearAllMocks();
 
@@ -357,14 +431,15 @@ describe('RefreshTokenService', () => {
     );
     expect(ancestor).toMatchObject({
       revocationReason: 'ROTATED',
-      accessRevokedAt: expect.any(Date),
+      accessRevokedAt: null,
     });
     expect(currentRecord).toMatchObject({
       revocationReason: 'SESSION_REVOKED',
-      accessRevokedAt: expect.any(Date),
+      accessRevokedAt: null,
     });
-    expect(revocation.revokeSession).toHaveBeenCalledWith(ancestorSessionId);
-    expect(revocation.revokeSession).toHaveBeenCalledWith(current.sessionId);
+    expect(revocation.revokeScope).toHaveBeenCalledWith(
+      expect.objectContaining({ scope: 'FAMILY' }),
+    );
 
     const verifier = new SessionVerifier(
       { checkRevocation: jest.fn().mockResolvedValue('unknown') } as any,
@@ -382,11 +457,45 @@ describe('RefreshTokenService', () => {
             ),
           ),
         },
+        sessionScopeGeneration: prisma.sessionScopeGeneration,
       } as any,
     );
     await expect(
       verifier.verify({ sub: 'user-1', sid: ancestorSessionId }),
     ).resolves.toBe('revoked');
+  });
+
+  it('revokes a rotated family by incrementing one scope generation without rewriting history', async () => {
+    const { token, sessionId: ancestorSessionId } = await service.create(
+      'user-1',
+      { deviceKey: 'device-a' },
+    );
+    const current = await service.rotate(token);
+    jest.clearAllMocks();
+
+    await service.revokeSessionFamily('user-1', current.sessionId);
+
+    expect(prisma.sessionScopeGeneration.upsert).toHaveBeenCalledTimes(1);
+    expect(prisma.sessionScopeGeneration.upsert).toHaveBeenCalledWith(
+      expect.objectContaining({
+        where: {
+          userId_scope_scopeKey: {
+            userId: 'user-1',
+            scope: 'FAMILY',
+            scopeKey: records[0].familyId,
+          },
+        },
+      }),
+    );
+    expect(
+      records.find(({ id }) => id === ancestorSessionId).accessRevokedAt,
+    ).toBeNull();
+    expect(revocation.revokeScope).toHaveBeenCalledWith({
+      userId: 'user-1',
+      scope: 'FAMILY',
+      scopeKey: records[0].familyId,
+      exemptFamilyId: null,
+    });
   });
 
   it('revokes all active sessions except the current session', async () => {
@@ -419,8 +528,12 @@ describe('RefreshTokenService', () => {
     expect(records[0].revokedAt).toBeNull();
     expect(records[1].revokedAt).toBeInstanceOf(Date);
     expect(prisma.$transaction).toHaveBeenCalledTimes(1);
-    expect(revocation.revokeSession).toHaveBeenCalledTimes(1);
-    expect(revocation.revokeSession).toHaveBeenCalledWith('other');
+    expect(revocation.revokeScope).toHaveBeenCalledWith({
+      userId: 'user-1',
+      scope: 'ACCOUNT',
+      scopeKey: '*',
+      exemptFamilyId: 'current-family',
+    });
   });
 
   it('revokes access tokens for rotated sessions when removing a device', async () => {
@@ -433,34 +546,17 @@ describe('RefreshTokenService', () => {
 
     await service.revokeDeviceSessions('user-1', 'device-a');
 
-    expect(prisma.refreshToken.findMany).toHaveBeenCalledWith(
-      expect.objectContaining({
-        where: {
-          AND: expect.arrayContaining([
-            expect.objectContaining({
-              userId: 'user-1',
-              deviceKey: 'device-a',
-              accessRevokedAt: expect.any(Date),
-            }),
-            expect.objectContaining({
-              accessRevocationNotifiedAt: null,
-            }),
-          ]),
-        },
-        select: { id: true },
-        orderBy: { id: 'asc' },
-        take: 100,
-      }),
-    );
-    expect(revocation.revokeSession).toHaveBeenCalledWith('session-1');
-    expect(revocation.revokeSession).toHaveBeenCalledWith('session-2');
-    expect(revocation.revokeSession).not.toHaveBeenCalledWith('session-3');
-    expect(records[0].accessRevokedAt).toBeInstanceOf(Date);
-    expect(records[1].accessRevokedAt).toBeInstanceOf(Date);
+    expect(prisma.sessionScopeGeneration.upsert).toHaveBeenCalledTimes(1);
+    expect(revocation.revokeScope).toHaveBeenCalledWith({
+      userId: 'user-1',
+      scope: 'DEVICE',
+      scopeKey: 'device-a',
+      exemptFamilyId: null,
+    });
+    expect(records[0].accessRevokedAt).toBeNull();
+    expect(records[1].accessRevokedAt).toBeNull();
     expect(records[0].accessTokenExpiresAt).toBeNull();
-    expect(records[0].expiredAt.getTime()).toBeGreaterThan(
-      records[0].accessRevokedAt.getTime(),
-    );
+    expect(records[0].expiredAt.getTime()).toBeGreaterThan(Date.now() - 1);
     expect(prisma.$transaction).toHaveBeenCalledTimes(1);
     expect(prisma.$executeRaw).toHaveBeenCalledTimes(1);
     expect(prisma.$executeRaw).toHaveBeenCalledWith(
@@ -481,29 +577,15 @@ describe('RefreshTokenService', () => {
 
     await service.revokeOtherSessions('user-1', current.sessionId);
 
-    expect(prisma.refreshToken.findMany).toHaveBeenCalledWith(
-      expect.objectContaining({
-        where: {
-          AND: expect.arrayContaining([
-            expect.objectContaining({
-              userId: 'user-1',
-              accessRevokedAt: expect.any(Date),
-            }),
-            expect.objectContaining({
-              accessRevocationNotifiedAt: null,
-            }),
-          ]),
-        },
-        select: { id: true },
-        orderBy: { id: 'asc' },
-        take: 100,
-      }),
-    );
-    expect(revocation.revokeSession).not.toHaveBeenCalledWith(
-      current.sessionId,
-    );
-    expect(revocation.revokeSession).toHaveBeenCalledWith('session-2');
-    expect(revocation.revokeSession).toHaveBeenCalledWith('session-3');
+    expect(revocation.revokeScope).toHaveBeenCalledWith({
+      userId: 'user-1',
+      scope: 'ACCOUNT',
+      scopeKey: '*',
+      exemptFamilyId: records.find(({ id }) => id === current.sessionId)
+        ?.familyId,
+    });
+    expect(records[1].accessRevokedAt).toBeNull();
+    expect(records[2].accessRevokedAt).toBeNull();
   });
 
   it('preserves every SID in the current token family when logging out other sessions', async () => {
@@ -519,18 +601,24 @@ describe('RefreshTokenService', () => {
 
     await service.revokeOtherSessions('user-1', currentOldSid);
 
-    expect(revocation.revokeSession).not.toHaveBeenCalledWith(currentOldSid);
-    expect(revocation.revokeSession).not.toHaveBeenCalledWith(
-      current.sessionId,
-    );
-    expect(revocation.revokeSession).toHaveBeenCalledWith(otherOldSid);
-    expect(revocation.revokeSession).toHaveBeenCalledWith(other.sessionId);
+    expect(revocation.revokeScope).toHaveBeenCalledWith({
+      userId: 'user-1',
+      scope: 'ACCOUNT',
+      scopeKey: '*',
+      exemptFamilyId: records.find(({ id }) => id === currentOldSid)?.familyId,
+    });
     expect(
       records.find((record) => record.id === currentOldSid)?.accessRevokedAt,
     ).toBeNull();
     expect(
       records.find((record) => record.id === current.sessionId)?.revokedAt,
     ).toBeNull();
+    expect(
+      records.find((record) => record.id === otherOldSid)?.accessRevokedAt,
+    ).toBeNull();
+    expect(
+      records.find((record) => record.id === other.sessionId)?.revokedAt,
+    ).toBeInstanceOf(Date);
   });
 
   it('replaces single-device sessions under a per-user transaction lock', async () => {
@@ -585,11 +673,7 @@ describe('RefreshTokenService', () => {
     const revocationStarted = new Promise<void>((resolve) => {
       signalRevocationStarted = resolve;
     });
-    revocation.revokeUser.mockImplementationOnce(() => {
-      signalRevocationStarted();
-      return lateRevocation;
-    });
-    revocation.revokeSession.mockImplementationOnce(() => {
+    revocation.revokeScope.mockImplementationOnce(() => {
       signalRevocationStarted();
       return lateRevocation;
     });
@@ -615,9 +699,7 @@ describe('RefreshTokenService', () => {
         deviceName: 'second',
       }),
     ]);
-    expect(revocation.revokeUser).not.toHaveBeenCalled();
-    expect(revocation.revokeSession).toHaveBeenCalledWith('session-1');
-    expect(revocation.revokeSession).toHaveBeenCalledWith('session-2');
+    expect(revocation.revokeScope).toHaveBeenCalledTimes(2);
   });
 
   it('revokes access tokens for active and already-rotated unexpired sessions', async () => {
@@ -632,23 +714,16 @@ describe('RefreshTokenService', () => {
     );
 
     expect(replacement.sessionId).toBe('session-3');
-    expect(prisma.refreshToken.findMany).toHaveBeenCalledWith(
+    expect(prisma.sessionScopeGeneration.upsert).toHaveBeenCalledTimes(1);
+    expect(revocation.revokeScope).toHaveBeenCalledWith(
       expect.objectContaining({
-        where: {
-          AND: expect.arrayContaining([
-            expect.objectContaining({ userId: 'user-1', audience: 'APP' }),
-            expect.objectContaining({ accessRevocationNotifiedAt: null }),
-          ]),
-        },
-        select: { id: true },
-        take: 100,
+        userId: 'user-1',
+        scope: 'AUDIENCE',
+        scopeKey: 'APP',
       }),
     );
-    expect(revocation.revokeSession).toHaveBeenCalledWith('session-1');
-    expect(revocation.revokeSession).toHaveBeenCalledWith('session-2');
-    expect(revocation.revokeSession).not.toHaveBeenCalledWith('session-3');
-    expect(records[0].accessRevokedAt).toBeInstanceOf(Date);
-    expect(records[1].accessRevokedAt).toBeInstanceOf(Date);
+    expect(records[0].accessRevokedAt).toBeNull();
+    expect(records[1].accessRevokedAt).toBeNull();
   });
 
   it('does not treat a single-device replacement token as reuse', async () => {
@@ -733,7 +808,7 @@ describe('RefreshTokenService', () => {
     expect(revocation.revokeSession).not.toHaveBeenCalledWith(admin.sessionId);
   });
 
-  it('preserves legacy access tokens issued before the configured TTL was shortened', async () => {
+  it('revokes legacy rotated access tokens through one audience generation', async () => {
     const configured = new RefreshTokenService(
       prisma as any,
       {
@@ -787,17 +862,16 @@ describe('RefreshTokenService', () => {
 
     await configured.replaceForSingleDevice('user-1');
 
-    expect(prisma.refreshToken.findMany).toHaveBeenCalledWith(
-      expect.objectContaining({ take: 100 }),
+    expect(prisma.sessionScopeGeneration.upsert).toHaveBeenCalledTimes(1);
+    expect(revocation.revokeScope).toHaveBeenCalledWith(
+      expect.objectContaining({ scope: 'AUDIENCE', scopeKey: 'APP' }),
     );
-    expect(revocation.revokeSession).toHaveBeenCalledWith('recent-rotated');
-    expect(revocation.revokeSession).toHaveBeenCalledWith('stale-rotated');
-    expect(revocation.revokeSession).not.toHaveBeenCalledWith(
-      'expired-rotated',
+    expect(records.every((record) => record.accessRevokedAt == null)).toBe(
+      true,
     );
   });
 
-  it('applies access revocation markers with bounded concurrency', async () => {
+  it('does one generation write regardless of rotation history length', async () => {
     const now = new Date();
     for (let index = 0; index < 30; index += 1) {
       records.push({
@@ -812,32 +886,19 @@ describe('RefreshTokenService', () => {
         lastUsedAt: now,
       });
     }
-    let releaseMarkers!: () => void;
-    const markerGate = new Promise<void>((resolve) => {
-      releaseMarkers = resolve;
-    });
-    let activeMarkers = 0;
-    let maxActiveMarkers = 0;
-    revocation.revokeSession.mockImplementation(async () => {
-      activeMarkers += 1;
-      maxActiveMarkers = Math.max(maxActiveMarkers, activeMarkers);
-      await markerGate;
-      activeMarkers -= 1;
-    });
+    await service.replaceForSingleDevice('user-1');
 
-    const replacement = service.replaceForSingleDevice('user-1');
-    await new Promise<void>((resolve) => setImmediate(resolve));
-
-    expect(revocation.revokeSession).toHaveBeenCalledTimes(25);
-    expect(maxActiveMarkers).toBe(25);
-
-    releaseMarkers();
-    await replacement;
-    expect(revocation.revokeSession).toHaveBeenCalledTimes(30);
-    expect(maxActiveMarkers).toBe(25);
+    expect(prisma.sessionScopeGeneration.upsert).toHaveBeenCalledTimes(1);
+    expect(revocation.revokeScope).toHaveBeenCalledTimes(1);
+    expect(revocation.revokeSession).not.toHaveBeenCalled();
+    expect(
+      records
+        .slice(0, 30)
+        .every(({ accessRevokedAt }) => accessRevokedAt == null),
+    ).toBe(true);
   });
 
-  it('bounds request work and durably drains remaining access revocations', async () => {
+  it('keeps logout-other generation work constant with many sessions', async () => {
     const now = new Date();
     records.push({
       id: 'current',
@@ -863,67 +924,42 @@ describe('RefreshTokenService', () => {
         lastUsedAt: now,
       });
     }
-    let releaseMarkers!: () => void;
-    const markerGate = new Promise<void>((resolve) => {
-      releaseMarkers = resolve;
-    });
-    revocation.revokeSession.mockImplementation(() => markerGate);
+    await service.revokeOtherSessions('user-1', 'current');
 
-    const revoking = service.revokeOtherSessions('user-1', 'current');
-    await new Promise<void>((resolve) => setImmediate(resolve));
-    const callsBeforeRelease = revocation.revokeSession.mock.calls.length;
-    releaseMarkers();
-    await revoking;
-
-    expect(callsBeforeRelease).toBe(25);
-    expect(revocation.revokeSession).toHaveBeenCalledTimes(100);
+    expect(prisma.sessionScopeGeneration.upsert).toHaveBeenCalledTimes(1);
+    expect(revocation.revokeScope).toHaveBeenCalledTimes(1);
+    expect(revocation.revokeSession).not.toHaveBeenCalled();
     expect(
-      records.filter(
-        (record) =>
-          record.accessRevokedAt && !record.accessRevocationNotifiedAt,
-      ),
-    ).toHaveLength(30);
-
-    await service.flushPendingAccessRevocations();
-
-    expect(revocation.revokeSession).toHaveBeenCalledTimes(130);
-    // 每轮先取候选，再按唯一 lease token 读取本副本实际认领到的行。
-    expect(prisma.refreshToken.findMany).toHaveBeenCalledTimes(4);
-    expect(
-      records.filter(
-        (record) =>
-          record.accessRevokedAt && !record.accessRevocationNotifiedAt,
-      ),
-    ).toHaveLength(0);
+      records.slice(1).every(({ accessRevokedAt }) => accessRevokedAt == null),
+    ).toBe(true);
   });
 
-  it('retries outbox rows when the realtime revocation broadcast is not delivered', async () => {
+  it('keeps durable generation revocation when realtime broadcast is not delivered', async () => {
     await service.create('user-1', { deviceKey: 'device-a' });
-    revocation.revokeSession.mockResolvedValueOnce(false);
+    revocation.revokeScope.mockResolvedValueOnce(false);
 
     await service.revokeDeviceSessions('user-1', 'device-a');
 
-    expect(records[0].accessRevokedAt).toBeInstanceOf(Date);
-    expect(records[0].accessRevocationNotifiedAt).toBeNull();
-    expect(prisma.refreshToken.findMany.mock.calls[1][0].where).toMatchObject({
-      id: { in: ['session-1'] },
-      accessRevocationLeaseToken: expect.any(String),
-    });
+    expect(records[0].revokedAt).toBeInstanceOf(Date);
+    expect(prisma.sessionScopeGeneration.upsert).toHaveBeenCalledTimes(1);
+    expect(scopeGenerations.get('user-1:DEVICE:device-a')?.generation).toBe(1);
+    expect(
+      scopeGenerations.get('user-1:DEVICE:device-a')?.notificationPending,
+    ).toBe(true);
 
-    revocation.revokeSession.mockResolvedValueOnce(true);
+    revocation.revokeScope.mockResolvedValueOnce(true);
     await service.flushPendingAccessRevocations();
 
-    expect(revocation.revokeSession).toHaveBeenCalledTimes(2);
-    expect(records[0].accessRevocationNotifiedAt).toBeInstanceOf(Date);
+    expect(revocation.revokeScope).toHaveBeenCalledTimes(2);
+    expect(
+      scopeGenerations.get('user-1:DEVICE:device-a')?.notificationPending,
+    ).toBe(false);
   });
 
   it('keeps device trust revocation reachable when immediate outbox delivery fails', async () => {
     await service.create('user-1', { deviceKey: 'device-a' });
-    const warn = jest
-      .spyOn((service as any).logger, 'warn')
-      .mockImplementation(() => undefined);
-    prisma.refreshToken.findMany.mockRejectedValueOnce(
-      new Error('database temporarily unavailable'),
+    revocation.revokeScope.mockRejectedValueOnce(
+      new Error('redis temporarily unavailable'),
     );
 
     await expect(
@@ -932,20 +968,17 @@ describe('RefreshTokenService', () => {
 
     expect(records[0]).toMatchObject({
       revokedAt: expect.any(Date),
-      accessRevokedAt: expect.any(Date),
+      accessRevokedAt: null,
       accessRevocationNotifiedAt: null,
     });
-    expect(warn).toHaveBeenCalledWith({
-      event: 'access_revocation_delivery_deferred',
-      errorType: 'Error',
-    });
+    expect(scopeGenerations.get('user-1:DEVICE:device-a')?.generation).toBe(1);
   });
 
   it('keeps other-device trust revocation reachable when immediate outbox delivery fails', async () => {
     const current = await service.create('user-1', { deviceKey: 'device-a' });
     await service.create('user-1', { deviceKey: 'device-b' });
-    prisma.refreshToken.findMany.mockRejectedValueOnce(
-      new Error('database temporarily unavailable'),
+    revocation.revokeScope.mockRejectedValueOnce(
+      new Error('redis temporarily unavailable'),
     );
 
     await expect(
@@ -955,7 +988,7 @@ describe('RefreshTokenService', () => {
     expect(records[0].revokedAt).toBeNull();
     expect(records[1]).toMatchObject({
       revokedAt: expect.any(Date),
-      accessRevokedAt: expect.any(Date),
+      accessRevokedAt: null,
       accessRevocationNotifiedAt: null,
     });
   });
@@ -1090,15 +1123,9 @@ describe('RefreshTokenService', () => {
     expect(userSettings.get('user-1')).toBe(false);
   });
 
-  it('returns the committed replacement session when immediate revocation delivery fails', async () => {
+  it('returns the committed replacement session after generation broadcast succeeds', async () => {
     await service.create('user-1', { deviceName: 'old login' });
     userSettings.set('user-1', true);
-    const warn = jest
-      .spyOn((service as any).logger, 'warn')
-      .mockImplementation(() => undefined);
-    prisma.refreshToken.findMany.mockRejectedValueOnce(
-      new Error('database temporarily unavailable'),
-    );
 
     await expect(
       service.createAppSession('user-1', { deviceName: 'new login' }),
@@ -1109,13 +1136,12 @@ describe('RefreshTokenService', () => {
 
     expect(records[0]).toMatchObject({
       revokedAt: expect.any(Date),
-      accessRevokedAt: expect.any(Date),
+      accessRevokedAt: null,
       accessRevocationNotifiedAt: null,
     });
-    expect(warn).toHaveBeenCalledWith({
-      event: 'access_revocation_delivery_deferred',
-      errorType: 'Error',
-    });
+    expect(revocation.revokeScope).toHaveBeenCalledWith(
+      expect.objectContaining({ scope: 'AUDIENCE', scopeKey: 'APP' }),
+    );
   });
 
   it('revokes other ADMIN sessions when enabling single-device login', async () => {
@@ -1135,11 +1161,13 @@ describe('RefreshTokenService', () => {
     expect(
       records.find((record) => record.id === otherApp.sessionId)?.revokedAt,
     ).toBeInstanceOf(Date);
-    expect(revocation.revokeSession).toHaveBeenCalledWith(admin.sessionId);
-    expect(revocation.revokeSession).toHaveBeenCalledWith(otherApp.sessionId);
-    expect(revocation.revokeSession).not.toHaveBeenCalledWith(
-      current.sessionId,
-    );
+    expect(revocation.revokeScope).toHaveBeenCalledWith({
+      userId: 'user-1',
+      scope: 'ACCOUNT',
+      scopeKey: '*',
+      exemptFamilyId: records.find(({ id }) => id === current.sessionId)
+        ?.familyId,
+    });
   });
 
   it('durably revokes rotated prior devices while preserving the current family', async () => {
@@ -1156,16 +1184,17 @@ describe('RefreshTokenService', () => {
     expect(records[1].accessRevokedAt).toBeNull();
     expect(
       records.find((record) => record.id === otherOldSid)?.accessRevokedAt,
-    ).toBeInstanceOf(Date);
+    ).toBeNull();
     expect(
       records.find((record) => record.id === other.sessionId)?.accessRevokedAt,
-    ).toBeInstanceOf(Date);
-    expect(revocation.revokeSession).not.toHaveBeenCalledWith(records[0].id);
-    expect(revocation.revokeSession).not.toHaveBeenCalledWith(
-      current.sessionId,
+    ).toBeNull();
+    expect(revocation.revokeScope).toHaveBeenCalledWith(
+      expect.objectContaining({
+        scope: 'ACCOUNT',
+        exemptFamilyId: records.find(({ id }) => id === current.sessionId)
+          ?.familyId,
+      }),
     );
-    expect(revocation.revokeSession).toHaveBeenCalledWith(otherOldSid);
-    expect(revocation.revokeSession).toHaveBeenCalledWith(other.sessionId);
   });
 
   it('does not revoke sessions when the current session id is missing', async () => {
@@ -1288,7 +1317,9 @@ describe('RefreshTokenService', () => {
       where: { id: 'user-1' },
       select: { singleDeviceLoginEnabled: true },
     });
-    expect(revocation.revokeSession).toHaveBeenCalledWith('session-1');
+    expect(revocation.revokeScope).toHaveBeenCalledWith(
+      expect.objectContaining({ scope: 'AUDIENCE', scopeKey: 'ADMIN' }),
+    );
   });
 
   it('rejects rotating an unknown refresh token', async () => {

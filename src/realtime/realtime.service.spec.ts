@@ -445,6 +445,9 @@ describe('RealtimeService', () => {
     service.registerPendingClient('user-pending', socket, {
       sessionId: 'session-pending',
       issuedAtMs: 100,
+      familyId: 'family-pending',
+      audience: 'APP',
+      deviceKey: 'device-pending',
     });
 
     expect(service.getConnectionCount('user-pending')).toBe(1);
@@ -461,6 +464,37 @@ describe('RealtimeService', () => {
       REVOKED_CLOSE_CODE,
       REVOKED_CLOSE_REASON,
     );
+  });
+
+  it('closes only sockets matched by a scoped device revocation', () => {
+    const revokedSocket = { close: jest.fn() } as any;
+    const survivingSocket = { close: jest.fn() } as any;
+    service.registerClient('user-1', revokedSocket, {
+      sessionId: 'session-a',
+      issuedAtMs: 100,
+      familyId: 'family-a',
+      audience: 'APP',
+      deviceKey: 'device-a',
+    });
+    service.registerClient('user-1', survivingSocket, {
+      sessionId: 'session-b',
+      issuedAtMs: 100,
+      familyId: 'family-b',
+      audience: 'APP',
+      deviceKey: 'device-b',
+    });
+
+    expect(
+      service.closeRevokedSockets({
+        kind: 'scope',
+        userId: 'user-1',
+        scope: 'DEVICE',
+        scopeKey: 'device-a',
+        exemptFamilyId: null,
+      }),
+    ).toBe(1);
+    expect(revokedSocket.close).toHaveBeenCalled();
+    expect(survivingSocket.close).not.toHaveBeenCalled();
   });
 
   it('safeBroadcastAll does not throw even when callbacks fail', async () => {

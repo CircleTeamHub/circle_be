@@ -13,6 +13,7 @@ import { SessionVerifier } from 'src/auth/session-verifier.service';
 import {
   SESSION_REVOCATION_CHANNEL,
   parseSessionRevocationBroadcast,
+  type SessionRevocationBroadcast,
 } from 'src/auth/session-revocation.broadcast';
 import { RedisService } from 'src/redis/redis.service';
 import { ChatErrorCode, type AppErrorCode } from 'src/common/app-error-codes';
@@ -631,16 +632,19 @@ export class ChatGateway implements OnModuleDestroy {
     // Redis 不可用时回退查库（SessionVerifier）。库也查不到才判「无法校验」：
     // 不放行可能已吊销的会话，也不把可重试的服务端故障说成未授权 ——
     // 与 REST（503）和 /realtime（close 1013）同一口径。
-    const verdict = await this.sessionVerifier.verify(payload);
-    if (verdict === 'revoked') {
+    const verification = await this.sessionVerifier.verifyWithIdentity(payload);
+    if (verification.verdict === 'revoked') {
       return this.rejectAuth(socket, 'revoked');
     }
-    if (verdict === 'unavailable') {
+    if (verification.verdict === 'unavailable') {
       return this.rejectAuth(socket, 'session_unverifiable');
     }
     socket.data.sessionId =
       typeof payload.sid === 'string' ? payload.sid : null;
     socket.data.issuedAtMs = issuedAtMsOf(payload);
+    socket.data.familyId = verification.identity?.familyId ?? null;
+    socket.data.audience = verification.identity?.audience ?? null;
+    socket.data.deviceKey = verification.identity?.deviceKey ?? null;
     socket.data.expMs =
       typeof payload.exp === 'number' ? payload.exp * 1000 : null;
     return payload.sub;
@@ -746,19 +750,50 @@ export class ChatGateway implements OnModuleDestroy {
     const broadcast = parseSessionRevocationBroadcast(message);
     if (!broadcast) return;
     const sockets =
-      broadcast.kind === 'user'
+      broadcast.kind === 'user' || broadcast.kind === 'scope'
         ? await io.in(userRoom(broadcast.userId)).fetchSockets()
         : await io.fetchSockets();
     for (const socket of sockets) {
       const data = socket.data as {
         sessionId?: string | null;
         issuedAtMs?: number | null;
+        familyId?: string | null;
+        audience?: 'APP' | 'ADMIN' | null;
+        deviceKey?: string | null;
       };
-      const dead =
-        broadcast.kind === 'user'
-          ? data.issuedAtMs == null || data.issuedAtMs <= broadcast.revokedAtMs
-          : data.sessionId === broadcast.sessionId;
+      const dead = this.revocationMatchesSocket(broadcast, data);
       if (dead) socket.disconnect(true);
+    }
+  }
+
+  private revocationMatchesSocket(
+    broadcast: SessionRevocationBroadcast,
+    data: {
+      sessionId?: string | null;
+      issuedAtMs?: number | null;
+      familyId?: string | null;
+      audience?: 'APP' | 'ADMIN' | null;
+      deviceKey?: string | null;
+    },
+  ): boolean {
+    if (broadcast.kind === 'user') {
+      return (
+        data.issuedAtMs == null || data.issuedAtMs <= broadcast.revokedAtMs
+      );
+    }
+    if (broadcast.kind === 'session') {
+      return data.sessionId === broadcast.sessionId;
+    }
+    if (data.familyId === broadcast.exemptFamilyId) return false;
+    switch (broadcast.scope) {
+      case 'ACCOUNT':
+        return true;
+      case 'AUDIENCE':
+        return data.audience === broadcast.scopeKey;
+      case 'DEVICE':
+        return data.deviceKey === broadcast.scopeKey;
+      case 'FAMILY':
+        return data.familyId === broadcast.scopeKey;
     }
   }
 

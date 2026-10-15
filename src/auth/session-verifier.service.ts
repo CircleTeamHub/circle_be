@@ -1,5 +1,10 @@
 import { Injectable, Logger } from '@nestjs/common';
-import { RefreshTokenRevocationReason, UserStatus } from 'src/generated/prisma';
+import {
+  RefreshTokenAudience,
+  RefreshTokenRevocationReason,
+  SessionRevocationScope,
+  UserStatus,
+} from 'src/generated/prisma';
 import { PrismaService } from 'src/prisma/prisma.service';
 import { SessionRevocationService } from './session-revocation.service';
 
@@ -14,6 +19,19 @@ import { SessionRevocationService } from './session-revocation.service';
  *   log every online user out.
  */
 export type SessionVerdict = 'active' | 'revoked' | 'unavailable';
+
+export type VerifiedSessionIdentity = {
+  sessionId: string;
+  familyId: string;
+  audience: RefreshTokenAudience;
+  deviceKey: string | null;
+  issuedAtMs: number | null;
+};
+
+export type SessionVerification = {
+  verdict: SessionVerdict;
+  identity: VerifiedSessionIdentity | null;
+};
 
 /**
  * The claims the check reads. Both the HTTP `JwtPayload` and the realtime
@@ -71,17 +89,25 @@ export class SessionVerifier {
   ) {}
 
   async verify(token: VerifiableToken): Promise<SessionVerdict> {
+    return (await this.verifyWithIdentity(token)).verdict;
+  }
+
+  async verifyWithIdentity(
+    token: VerifiableToken,
+  ): Promise<SessionVerification> {
     const state = await this.revocation.checkRevocation(token);
-    if (state === 'revoked') return 'revoked';
+    if (state === 'revoked') return { verdict: 'revoked', identity: null };
     return this.verifyInDatabase(token);
   }
 
   private async verifyInDatabase(
     token: VerifiableToken,
-  ): Promise<SessionVerdict> {
+  ): Promise<SessionVerification> {
     // Every access token we sign carries a string subject; anything else cannot
     // be tied to an account, so it is never let through.
-    if (typeof token.sub !== 'string') return 'revoked';
+    if (typeof token.sub !== 'string') {
+      return { verdict: 'revoked', identity: null };
+    }
     const userId = token.sub;
     const sessionId = typeof token.sid === 'string' ? token.sid : null;
 
@@ -98,6 +124,13 @@ export class SessionVerifier {
               revokedAt: true,
               revocationReason: true,
               accessRevokedAt: true,
+              familyId: true,
+              audience: true,
+              deviceKey: true,
+              accountGeneration: true,
+              audienceGeneration: true,
+              deviceGeneration: true,
+              familyGeneration: true,
             },
           })
         : Promise.resolve(null),
@@ -112,17 +145,19 @@ export class SessionVerifier {
         return null;
       },
     );
-    if (lookup === null) return 'unavailable';
+    if (lookup === null) return { verdict: 'unavailable', identity: null };
 
     const [user, session] = lookup;
-    if (user?.status !== UserStatus.ACTIVE) return 'revoked';
+    if (user?.status !== UserStatus.ACTIVE) {
+      return { verdict: 'revoked', identity: null };
+    }
     const tokenIssuedAt = issuedAtMs(token);
     if (
       user.accessTokensRevokedAt != null &&
       (tokenIssuedAt === null ||
         tokenIssuedAt <= user.accessTokensRevokedAt.getTime())
     ) {
-      return 'revoked';
+      return { verdict: 'revoked', identity: null };
     }
     if (
       session !== null &&
@@ -131,8 +166,67 @@ export class SessionVerifier {
         (session.revokedAt !== null &&
           session.revocationReason !== RefreshTokenRevocationReason.ROTATED))
     ) {
-      return 'revoked';
+      return { verdict: 'revoked', identity: null };
     }
-    return 'active';
+    if (session === null || sessionId === null) {
+      return { verdict: 'active', identity: null };
+    }
+
+    const requestedScopes = [
+      { scope: SessionRevocationScope.ACCOUNT, scopeKey: '*' },
+      { scope: SessionRevocationScope.AUDIENCE, scopeKey: session.audience },
+      ...(session.deviceKey
+        ? [
+            {
+              scope: SessionRevocationScope.DEVICE,
+              scopeKey: session.deviceKey,
+            },
+          ]
+        : []),
+      { scope: SessionRevocationScope.FAMILY, scopeKey: session.familyId },
+    ];
+    const generations = await this.prisma.sessionScopeGeneration
+      .findMany({
+        where: { userId, OR: requestedScopes },
+        select: {
+          scope: true,
+          generation: true,
+          exemptFamilyId: true,
+        },
+      })
+      .catch((error: unknown) => {
+        this.logger.warn(
+          `Session generation lookup failed: ${
+            error instanceof Error ? error.message : String(error)
+          }`,
+        );
+        return null;
+      });
+    if (generations === null) {
+      return { verdict: 'unavailable', identity: null };
+    }
+
+    const snapshots: Record<SessionRevocationScope, number> = {
+      ACCOUNT: session.accountGeneration,
+      AUDIENCE: session.audienceGeneration,
+      DEVICE: session.deviceGeneration,
+      FAMILY: session.familyGeneration,
+    };
+    const stale = generations.some(
+      ({ scope, generation, exemptFamilyId }) =>
+        generation !== snapshots[scope] && exemptFamilyId !== session.familyId,
+    );
+    if (stale) return { verdict: 'revoked', identity: null };
+
+    return {
+      verdict: 'active',
+      identity: {
+        sessionId,
+        familyId: session.familyId,
+        audience: session.audience,
+        deviceKey: session.deviceKey,
+        issuedAtMs: tokenIssuedAt,
+      },
+    };
   }
 }

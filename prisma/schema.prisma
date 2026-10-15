@@ -78,6 +78,13 @@ enum RefreshTokenRevocationReason {
   TOKEN_FAMILY_REUSE
 }
 
+enum SessionRevocationScope {
+  ACCOUNT
+  AUDIENCE
+  DEVICE
+  FAMILY
+}
+
 enum EmailCodePurpose {
   REGISTER
   LOGIN
@@ -420,13 +427,14 @@ model User {
   updatedAt                    DateTime   @updatedAt
 
   refreshTokens                     RefreshToken[]
+  sessionScopeGenerations           SessionScopeGeneration[]
   trustedDevices                    TrustedDevice[]
   loginChallenges                   LoginChallenge[]
-  qrLoginApprovals                  QrLoginSession[]  @relation("qrLoginApprover")
+  qrLoginApprovals                  QrLoginSession[]            @relation("qrLoginApprover")
   invitedBy                         User?                       @relation("UserInvitations", fields: [invitedByUserId], references: [id], onDelete: SetNull)
   invitees                          User[]                      @relation("UserInvitations")
   referralsSent                     Referral[]                  @relation("ReferralInviter")
-  referralReceived                 Referral?                   @relation("ReferralInvitee")
+  referralReceived                  Referral?                   @relation("ReferralInvitee")
   friendsAsUser                     Friend[]                    @relation("userFriends")
   friendsAsFriend                   Friend[]                    @relation("userFriendsTo")
   blocksIssued                      Block[]                     @relation("blocker")
@@ -705,41 +713,41 @@ model AccountIdentifier {
   createdAt         DateTime @default(now())
   updatedAt         DateTime @updatedAt
 
-  currentUser User?        @relation("currentAccountIdentifier", fields: [currentUserID], references: [id], onDelete: Restrict)
-  reservedFor User?        @relation("reservedAccountIdentifier", fields: [reservedForUserID], references: [id], onDelete: Restrict)
-  inviteOwner User?        @relation("inviteAccountIdentifier", fields: [inviteOwnerUserID], references: [id], onDelete: Restrict)
-  accountUser User?        @relation("userAccountIdRegistry")
-  fancyNumber FancyNumber?
+  currentUser    User?           @relation("currentAccountIdentifier", fields: [currentUserID], references: [id], onDelete: Restrict)
+  reservedFor    User?           @relation("reservedAccountIdentifier", fields: [reservedForUserID], references: [id], onDelete: Restrict)
+  inviteOwner    User?           @relation("inviteAccountIdentifier", fields: [inviteOwnerUserID], references: [id], onDelete: Restrict)
+  accountUser    User?           @relation("userAccountIdRegistry")
+  fancyNumber    FancyNumber?
   campaignInvite CampaignInvite?
 }
 
 model AdminAccess {
-  userID    String @id
+  userID    String           @id
   role      AdminConsoleRole
-  version   Int @default(1)
-  createdAt DateTime @default(now())
-  updatedAt DateTime @updatedAt
-  user      User @relation(fields: [userID], references: [id], onDelete: Cascade)
+  version   Int              @default(1)
+  createdAt DateTime         @default(now())
+  updatedAt DateTime         @updatedAt
+  user      User             @relation(fields: [userID], references: [id], onDelete: Cascade)
 
   @@index([role])
 }
 
 model CampaignInvite {
-  id          String @id @default(uuid())
-  code        String @unique
-  identifierValue String @unique
-  name        String
-  ownerUserID String
-  enabled     Boolean @default(true)
-  maxUses     Int
-  usedCount   Int @default(0)
-  expiresAt   DateTime
-  version     Int @default(1)
-  createdAt   DateTime @default(now())
-  updatedAt   DateTime @updatedAt
-  owner       User @relation(fields: [ownerUserID], references: [id], onDelete: Restrict)
-  identifier  AccountIdentifier @relation(fields: [identifierValue], references: [value], onDelete: Restrict)
-  uses        CampaignInviteUse[]
+  id              String              @id @default(uuid())
+  code            String              @unique
+  identifierValue String              @unique
+  name            String
+  ownerUserID     String
+  enabled         Boolean             @default(true)
+  maxUses         Int
+  usedCount       Int                 @default(0)
+  expiresAt       DateTime
+  version         Int                 @default(1)
+  createdAt       DateTime            @default(now())
+  updatedAt       DateTime            @updatedAt
+  owner           User                @relation(fields: [ownerUserID], references: [id], onDelete: Restrict)
+  identifier      AccountIdentifier   @relation(fields: [identifierValue], references: [value], onDelete: Restrict)
+  uses            CampaignInviteUse[]
 
   @@index([ownerUserID, createdAt])
   @@index([enabled, expiresAt])
@@ -748,41 +756,42 @@ model CampaignInvite {
 }
 
 model CampaignInviteUse {
-  id         String @id @default(uuid())
+  id         String         @id @default(uuid())
   campaignID String
-  userID     String @unique
-  createdAt  DateTime @default(now())
+  userID     String         @unique
+  createdAt  DateTime       @default(now())
   campaign   CampaignInvite @relation(fields: [campaignID], references: [id], onDelete: Restrict)
-  user       User @relation(fields: [userID], references: [id], onDelete: Restrict)
+  user       User           @relation(fields: [userID], references: [id], onDelete: Restrict)
 
   @@index([campaignID, createdAt])
 }
 
 model AdminAdvertisement {
-  id         String @id @default(uuid())
-  title      String
-  imageUrl   String
-  targetUrl  String
-  placement  String
-  sortOrder  Int @default(0)
-  enabled    Boolean @default(false)
-  startsAt   DateTime
-  endsAt     DateTime
-  version    Int @default(1)
-  createdAt  DateTime @default(now())
-  updatedAt  DateTime @updatedAt
+  id        String   @id @default(uuid())
+  title     String
+  imageUrl  String
+  targetUrl String
+  placement String
+  sortOrder Int      @default(0)
+  enabled   Boolean  @default(false)
+  startsAt  DateTime
+  endsAt    DateTime
+  version   Int      @default(1)
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
 
   @@index([placement, enabled, startsAt, endsAt])
   @@index([title(ops: raw("gin_trgm_ops"))], type: Gin, map: "AdminAdvertisement_title_trgm_idx")
 }
 
 model AdminOperationRequest {
-  id        String @id
+  id        String   @id
   actorID   String
   inputHash String
   result    Json
   createdAt DateTime @default(now())
-  actor     User @relation(fields: [actorID], references: [id], onDelete: Restrict)
+  actor     User     @relation(fields: [actorID], references: [id], onDelete: Restrict)
+
   @@index([actorID, createdAt])
 }
 
@@ -873,31 +882,37 @@ model SessionRevocationOutbox {
 }
 
 model RefreshToken {
-  id               String                        @id @default(uuid())
-  userId           String
-  token            String                        @unique
-  familyId         String                        @default(dbgenerated("(gen_random_uuid())::text"))
-  audience         RefreshTokenAudience          @default(APP)
-  deviceName       String?
-  ip               String?
-  userAgent        String?
+  id                         String                        @id @default(uuid())
+  userId                     String
+  token                      String                        @unique
+  familyId                   String                        @default(dbgenerated("(gen_random_uuid())::text"))
+  /// Scope generations captured when this row is created. A mismatch with the
+  /// current scope row durably revokes access tokens without rewriting history.
+  accountGeneration          Int                           @default(0)
+  audienceGeneration         Int                           @default(0)
+  deviceGeneration           Int                           @default(0)
+  familyGeneration           Int                           @default(0)
+  audience                   RefreshTokenAudience          @default(APP)
+  deviceName                 String?
+  ip                         String?
+  userAgent                  String?
   /// sha256(x-device-id)：把会话绑到受信任设备，移除设备时据此撤销信任。
-  deviceKey        String?
-  expiredAt        DateTime
+  deviceKey                  String?
+  expiredAt                  DateTime
   /// 该 sid 最近一次签发的 access token 到期时间；用于有界地补发逐会话吊销标记。
-  accessTokenExpiresAt DateTime?
+  accessTokenExpiresAt       DateTime?
   /// 独立于 refresh token 轮换原因的持久化 access token 吊销状态。
-  accessRevokedAt DateTime?
+  accessRevokedAt            DateTime?
   /// Redis 标记/实时断连已完成；null 且 accessRevokedAt 非空即持久 outbox 待办。
   accessRevocationNotifiedAt DateTime?
   /// 多副本 outbox 处理租约；超时后允许其他副本重新认领。
-  accessRevocationLockedAt DateTime?
+  accessRevocationLockedAt   DateTime?
   accessRevocationLeaseToken String?
-  revokedAt        DateTime?
-  revocationReason RefreshTokenRevocationReason?
-  createdAt        DateTime                      @default(now())
-  lastUsedAt       DateTime                      @default(now())
-  user             User                          @relation(fields: [userId], references: [id], onDelete: Cascade)
+  revokedAt                  DateTime?
+  revocationReason           RefreshTokenRevocationReason?
+  createdAt                  DateTime                      @default(now())
+  lastUsedAt                 DateTime                      @default(now())
+  user                       User                          @relation(fields: [userId], references: [id], onDelete: Cascade)
 
   @@index([userId])
   @@index([userId, familyId])
@@ -905,6 +920,28 @@ model RefreshToken {
   @@index([userId, deviceKey])
   @@index([expiredAt])
   @@index([revokedAt])
+}
+
+/// Monotonic revocation generation for one user-owned session scope. Revoking
+/// a device/family/audience/account scope updates one row regardless of refresh
+/// rotation history length.
+model SessionScopeGeneration {
+  id                  String                 @id @default(uuid())
+  userId              String
+  scope               SessionRevocationScope
+  scopeKey            String
+  generation          Int                    @default(0)
+  /// ACCOUNT/AUDIENCE increments may preserve the family that initiated the
+  /// operation; null means the whole scope is invalidated.
+  exemptFamilyId      String?
+  notificationPending Boolean                @default(false)
+  createdAt           DateTime               @default(now())
+  updatedAt           DateTime               @updatedAt
+  user                User                   @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([userId, scope, scopeKey])
+  @@index([userId])
+  @@index([notificationPending, updatedAt])
 }
 
 /// 受信任登录设备。陌生设备（不在此表或已撤销）用密码登录时，必须由一台
@@ -1135,33 +1172,33 @@ model CreditEvent {
 }
 
 model Note {
-  id                  String     @id @default(uuid())
-  ownerID             String
-  clientDraftID       String?
-  groupID             String?
-  title               String
-  content             String?
-  contentJson         Json?
-  sections            Json?
-  status              NoteStatus     @default(ACTIVE)
-  available           Boolean        @default(true)
-  workStatus          NoteWorkStatus?
+  id                   String          @id @default(uuid())
+  ownerID              String
+  clientDraftID        String?
+  groupID              String?
+  title                String
+  content              String?
+  contentJson          Json?
+  sections             Json?
+  status               NoteStatus      @default(ACTIVE)
+  available            Boolean         @default(true)
+  workStatus           NoteWorkStatus?
   /// 老板在群设置中绑定的来源聊天会话；收藏副本不继承此字段。
   sourceConversationID String?
-  pinned              Boolean    @default(false)
-  coverMediaID        String?    @unique
-  mediaCount          Int        @default(0)
-  imageCount          Int        @default(0)
-  videoCount          Int        @default(0)
-  audioCount          Int        @default(0)
+  pinned               Boolean         @default(false)
+  coverMediaID         String?         @unique
+  mediaCount           Int             @default(0)
+  imageCount           Int             @default(0)
+  videoCount           Int             @default(0)
+  audioCount           Int             @default(0)
   // 仅笔记主人可见的私人备注 —— 不随分享/访客视图外发（序列化时按 viewer 判空）。
-  remark              String?
+  remark               String?
   // 从聊天收藏他人笔记时的来源快照（会话类型、群/发送者名片、消息定位信息）。
   // 自建笔记为 null；collectedFromNoteID 冗余成单列用于幂等去重查询。
-  collectedFrom       Json?
-  collectedFromNoteID String?
-  createdAt           DateTime   @default(now())
-  updatedAt           DateTime   @updatedAt
+  collectedFrom        Json?
+  collectedFromNoteID  String?
+  createdAt            DateTime        @default(now())
+  updatedAt            DateTime        @updatedAt
 
   owner            User                  @relation(fields: [ownerID], references: [id], onDelete: Cascade)
   group            NoteGroup?            @relation(fields: [groupID], references: [id], onDelete: SetNull)
@@ -1181,19 +1218,19 @@ model Note {
 }
 
 model NoteDraft {
-  id            String   @id @default(uuid())
-  ownerID       String
-  clientDraftID String
-  sourceNoteID  String?
-  title         String   @default("")
-  content       String?
-  contentJson   Json?
-  sections      Json?
-  groupIDs      String[] @default([])
-  mediaKeys     String[] @default([])
-  createdAt     DateTime @default(now())
-  updatedAt     DateTime @updatedAt
-  consumedAt    DateTime?
+  id              String    @id @default(uuid())
+  ownerID         String
+  clientDraftID   String
+  sourceNoteID    String?
+  title           String    @default("")
+  content         String?
+  contentJson     Json?
+  sections        Json?
+  groupIDs        String[]  @default([])
+  mediaKeys       String[]  @default([])
+  createdAt       DateTime  @default(now())
+  updatedAt       DateTime  @updatedAt
+  consumedAt      DateTime?
   // Durable write outcome; retained even if the published note is deleted.
   publishedNoteID String?
 
@@ -1527,43 +1564,43 @@ model UserTracePreference {
 }
 
 model UserPrivacySetting {
-  id                      String   @id @default(uuid())
-  userID                  String   @unique
+  id                            String    @id @default(uuid())
+  userID                        String    @unique
   /// 全局阅后即焚窗口(秒),0 = 关闭。档位见 src/common/burn-durations.ts。
   /// messageSelfDestructDays(天)是它的前身,只能选整天,与会话级焚毁的秒数
   /// 白名单是两张表;20260907120000 迁移已按 *86400 回填到这一列。
   /// 旧列留到下一版再删(expand/contract:蓝绿窗口里旧二进制还在读它)。
-  messageSelfDestructSec  Int      @default(0)
+  messageSelfDestructSec        Int       @default(0)
   /// 全局阅后即焚的开启时间；仅该时间之后发出的消息受 messageSelfDestructSec 约束。
   /// NULL = 从未开启过。不带它的窗口会把开关打开之前的历史一次性隐藏。
-  messageSelfDestructStartedAt DateTime?
-  messageSelfDestructDays Int      @default(0)
-  momentsVisibility       String   @default("ALL")
-  allowStrangerMessages   Boolean  @default(true)
-  showPhone               Boolean  @default(false)
+  messageSelfDestructStartedAt  DateTime?
+  messageSelfDestructDays       Int       @default(0)
+  momentsVisibility             String    @default("ALL")
+  allowStrangerMessages         Boolean   @default(true)
+  showPhone                     Boolean   @default(false)
   /// 注册邮箱是账号找回入口,默认不外露 —— 与 showPhone 同档,而不是 showWechat 那档。
-  showEmail               Boolean  @default(false)
-  showWechat              Boolean  @default(true)
-  showQQ                  Boolean  @default(true)
-  showWhatsup             Boolean  @default(true)
-  addMeByAccount          Boolean  @default(true)
-  addMeByPhone            Boolean  @default(false)
-  addMeByQrCode           Boolean  @default(true)
-  addMeByGroup            Boolean  @default(true)
-  callPermission          String   @default("EVERYONE")
-  groupInvitePermission   String   @default("EVERYONE")
-  directMessageAutoReplyEnabled Boolean  @default(false)
-  directMessageAutoReplyText    String   @default("") @db.VarChar(200)
+  showEmail                     Boolean   @default(false)
+  showWechat                    Boolean   @default(true)
+  showQQ                        Boolean   @default(true)
+  showWhatsup                   Boolean   @default(true)
+  addMeByAccount                Boolean   @default(true)
+  addMeByPhone                  Boolean   @default(false)
+  addMeByQrCode                 Boolean   @default(true)
+  addMeByGroup                  Boolean   @default(true)
+  callPermission                String    @default("EVERYONE")
+  groupInvitePermission         String    @default("EVERYONE")
+  directMessageAutoReplyEnabled Boolean   @default(false)
+  directMessageAutoReplyText    String    @default("") @db.VarChar(200)
   /// 是否让别人看到我的在线状态与最近在线时间(chat:presence 查询/上下线广播、
   /// 资料页与好友列表里的 lastOnline)。关掉后这几条通道一律不再透出。
-  shareOnlineStatus       Boolean  @default(true)
+  shareOnlineStatus             Boolean   @default(true)
   /// 单聊 / 群聊里是否向对方上报「正在输入」。上报由客户端按它门禁;它只影响
   /// 本人向外泄露的信息,服务端不为每条 typing 事件再查一次库。
-  shareTypingInDirect     Boolean  @default(true)
-  shareTypingInGroup      Boolean  @default(true)
-  createdAt               DateTime @default(now())
-  updatedAt               DateTime @updatedAt
-  user                    User     @relation(fields: [userID], references: [id], onDelete: Cascade)
+  shareTypingInDirect           Boolean   @default(true)
+  shareTypingInGroup            Boolean   @default(true)
+  createdAt                     DateTime  @default(now())
+  updatedAt                     DateTime  @updatedAt
+  user                          User      @relation(fields: [userID], references: [id], onDelete: Cascade)
 
   @@index([userID])
 }
@@ -1753,8 +1790,10 @@ model Notification {
   fromInvitation     CircleInvitation?       @relation(fields: [fromInvitationID], references: [id])
   fromFriendRequest  Friend?                 @relation("friendRequestNotifications", fields: [fromFriendRequestID], references: [id])
   systemAnnouncement SystemAnnouncement?     @relation(fields: [systemAnnouncementID], references: [id], onDelete: Restrict)
-  fromGroupAdmission GroupAdmission? @relation(fields: [fromGroupAdmissionID], references: [id], onDelete: NoAction, onUpdate: NoAction)
+  fromGroupAdmission GroupAdmission?         @relation(fields: [fromGroupAdmissionID], references: [id], onDelete: NoAction, onUpdate: NoAction)
   pushOutbox         NotificationPushOutbox?
+  // deleted/read 的热点列表与徽标查询使用 migration 中的 partial indexes；
+  // Prisma schema 无法表达 WHERE 条件。
 
   @@unique([systemAnnouncementID, toUserID], map: "Notification_announcement_recipient_key")
   @@index([fromUserID, toUserID])
@@ -1763,17 +1802,15 @@ model Notification {
   @@index([createdAt])
   @@index([fromFriendRequestID])
   @@index([fromGroupAdmissionID])
-  // deleted/read 的热点列表与徽标查询使用 migration 中的 partial indexes；
-  // Prisma schema 无法表达 WHERE 条件。
 }
 
 model SystemAnnouncement {
-  id                 String   @id @default(uuid())
-  idempotencyKey     String   @unique
+  id                 String    @id @default(uuid())
+  idempotencyKey     String    @unique
   requestFingerprint String
   operatorID         String
   content            String
-  createdAt          DateTime @default(now())
+  createdAt          DateTime  @default(now())
   auditRecordedAt    DateTime?
   fanoutCompletedAt  DateTime?
   recipientCount     Int?
@@ -1873,14 +1910,14 @@ model DevicePushToken {
 
   userID String
   user   User   @relation(fields: [userID], references: [id], onDelete: Cascade)
+  // disabledAt IS NULL 的用户/供应商/最近更新时间查询使用 migration 中的
+  // partial index；Prisma schema 无法表达 WHERE 条件。
 
   @@index([userID, deviceKey])
   @@index([userID])
   @@index([provider, platform])
   @@index([updatedAt])
   @@index([disabledAt])
-  // disabledAt IS NULL 的用户/供应商/最近更新时间查询使用 migration 中的
-  // partial index；Prisma schema 无法表达 WHERE 条件。
 }
 
 // ─── Circle Plaza ────────────────────────────────────────────────────────────
@@ -2134,20 +2171,20 @@ model CollaborationRecognition {
 }
 
 model CircleInvitation {
-  id            String                 @id @default(uuid())
-  circleID      String
-  applicantID   String
-  inviterID     String
+  id                       String                 @id @default(uuid())
+  circleID                 String
+  applicantID              String
+  inviterID                String
   consentNoticeDeliveredAt DateTime?
-  consentNoticeAttempts Int @default(0)
-  consentNoticeRequired Boolean @default(false)
+  consentNoticeAttempts    Int                    @default(0)
+  consentNoticeRequired    Boolean                @default(false)
   /// 默认值只在「迁移已落地、旧色还没换掉」的发布窗口里有意义:新代码两条
   /// 建单路径都显式写入 Circle.requiredVerifierCount 的快照。
-  requiredCount Int                    @default(1)
-  approvedCount Int                    @default(0)
-  status        CircleInvitationStatus @default(PENDING)
-  createdAt     DateTime               @default(now())
-  updatedAt     DateTime               @updatedAt
+  requiredCount            Int                    @default(1)
+  approvedCount            Int                    @default(0)
+  status                   CircleInvitationStatus @default(PENDING)
+  createdAt                DateTime               @default(now())
+  updatedAt                DateTime               @updatedAt
 
   circle        Circle                     @relation(fields: [circleID], references: [id], onDelete: Cascade)
   applicant     User                       @relation("invitationApplicant", fields: [applicantID], references: [id], onDelete: Cascade)
@@ -2160,19 +2197,19 @@ model CircleInvitation {
 }
 
 model CircleInvitationVerifier {
-  id           String                         @id @default(uuid())
-  invitationID String
-  verifierID   String
-  addedByID    String
-  status       CircleInvitationVerifierStatus @default(PENDING)
-  respondedAt  DateTime?
+  id              String                         @id @default(uuid())
+  invitationID    String
+  verifierID      String
+  addedByID       String
+  status          CircleInvitationVerifierStatus @default(PENDING)
+  respondedAt     DateTime?
   /// 验证邀请卡片的投递状态。席位提交后由 addVerifier 就地签发并置位；
   /// 失败(聊天侧抖动/对端会话解析失败)留空，由 sweepUndeliveredVerificationCards
   /// 逐轮补投。与 CoinGift 的 cardDeliveredAt/cardAttempts 同构 —— 差别是那张卡
   /// 是收款方拿到钱的唯一凭证，这张卡之外还有站内通知与待验证列表两条通道。
   cardDeliveredAt DateTime?
-  cardAttempts    Int                         @default(0)
-  createdAt    DateTime                       @default(now())
+  cardAttempts    Int                            @default(0)
+  createdAt       DateTime                       @default(now())
 
   invitation CircleInvitation @relation(fields: [invitationID], references: [id], onDelete: Cascade)
   verifier   User             @relation("verifierUser", fields: [verifierID], references: [id], onDelete: Cascade)
@@ -2292,27 +2329,27 @@ enum ChatMemberRole {
 /// userID 类字段一律不建 User 外键 —— 聊天行是高频写入的历史数据，
 /// 不随账号删除级联清除（保留群聊上下文；同 SensitiveWord.createdBy 先例）。
 model ChatConversation {
-  id         String               @id @default(uuid())
-  type       ChatConversationType
+  id                     String               @id @default(uuid())
+  type                   ChatConversationType
   /// DIRECT 会话防重键：两个 userID 升序以 ':' 拼接；其余类型为 null。
-  directKey  String?              @unique
+  directKey              String?              @unique
   /// GROUP 会话 ←→ Circle.id（一圈一群）；TEMP 会话 ←→ TempChat.id。
   /// circleID 为 null 的 GROUP = 独立群聊（微信群语义，成员即 ChatMember）。
-  circleID   String?              @unique
-  tempChatID String?              @unique
+  circleID               String?              @unique
+  tempChatID             String?              @unique
   /// 独立群聊的群名（可空 = 客户端按成员昵称兜底）；圈子群名走 Circle.name。
-  name       String?
+  name                   String?
   /// 独立群聊的群主（建群人；退群时转给最早入群的在座成员）。不建 User 外键，
   /// 同 ChatMessage.senderID 先例：聊天行不随账号删除级联。
-  ownerID    String?
+  ownerID                String?
   /// 会话列表排序依据；发送事务内更新。
-  lastMessageAt DateTime?
+  lastMessageAt          DateTime?
   /// 全员禁言（管理台或群主/管理员开启;圈主/管理员、独立群群主/管理员豁免）；null=未禁言。
-  muteAllAt     DateTime?
+  muteAllAt              DateTime?
   /// 独立群聊公告（圈子群走 Circle.description）。
-  notice        String?
+  notice                 String?
   /// 独立群聊头像（圈子群走 Circle.avatarUrl）；只接受本应用存储的 URL。
-  avatarUrl     String?
+  avatarUrl              String?
   /// 独立群聊:普通成员能否拉好友进群（圈子群看 Circle.memberCanInvite）。
   memberCanInvite Boolean @default(true)
   /// 群二维码能否入群（两种群）；false 时签发群码与扫码入群一律拒绝。
@@ -2331,12 +2368,12 @@ model ChatConversation {
   /// 普通成员能否通过群加其他成员为好友（两种群;群主/管理员不受限）。
   membersCanAddFriends Boolean @default(true)
   /// 会话级阅后即焚秒数（S-01）：任一方设置双方生效；null=关。到期由 sweeper 真删。
-  burnDurationSec Int?
+  burnDurationSec        Int?
   /// 本轮焚毁策略开启时刻；之前的消息不属于本轮焚毁范围。
-  burnStartedAt DateTime?
+  burnStartedAt          DateTime?
   /// height 计数器（G-05）：最后已分配的 height。取号 = SELECT..FOR UPDATE 行锁下 +1；
   /// 迁移时必须回填成 MAX(height)，默认 0 会撞 (conversationID, height) 唯一约束。
-  nextHeight Int @default(0)
+  nextHeight             Int                  @default(0)
   /// 「删除所有人的记录」的会话级水位：这条线以下的消息对**所有人**隐藏，
   /// 包括清空之后才入座的新成员。
   ///
@@ -2345,7 +2382,7 @@ model ChatConversation {
   /// 把「已清空」的历史全部读回来 —— 清空等于没清。新座位继承这个值，读路径
   /// 也按 max(座位水位, 会话水位) 兜底。
   /// 只前进不后退，与座位水位同义。
-  clearedBeforeHeight Int @default(0)
+  clearedBeforeHeight    Int                  @default(0)
   /// 会话变更序号流的计数器：触发器最后一次分配的 revision。
   ///
   /// 新消息、撤回、编辑、表情回应、焚毁墓碑都在这里取号，由数据库触发器
@@ -2357,14 +2394,16 @@ model ChatConversation {
   /// 会话的序号水位是 max(nextRevision, nextHeight)，不是这一列本身：存量消息回填成
   /// revision = height，计数器没有整表初始化（取号用的也是 GREATEST）。读侧一律走
   /// ChatService 的 conversationSyncRevision。应用代码不要手写这一列。
-  nextRevision Int @default(0)
-  createdAt  DateTime             @default(now())
-  updatedAt  DateTime             @updatedAt
+  nextRevision           Int                  @default(0)
+  createdAt              DateTime             @default(now())
+  updatedAt              DateTime             @updatedAt
 
-  members  ChatMember[]
-  messages ChatMessage[]
+  members               ChatMember[]
+  messages              ChatMessage[]
   directAutoReplyStates ChatDirectAutoReplyState[]
-  groupEvents ChatGroupEvent[]
+  groupEvents           ChatGroupEvent[]
+  // burnDurationSec IS NOT NULL 的轮转扫描使用 migration 中的 partial index；
+  // Prisma schema 无法表达 WHERE 条件。
 
   // 会话列表按成员置顶后再按末条消息时间排序；该索引减少关联排序前的
   // ChatConversation 扫描范围。ChatMember 的 active/pinned partial index 在
@@ -2373,46 +2412,46 @@ model ChatConversation {
   @@index([id(ops: raw("gin_trgm_ops"))], type: Gin, map: "ChatConversation_id_trgm_idx")
   @@index([name(ops: raw("gin_trgm_ops"))], type: Gin, map: "ChatConversation_name_trgm_idx")
   @@index([circleID(ops: raw("gin_trgm_ops"))], type: Gin, map: "ChatConversation_circleID_trgm_idx")
-  // burnDurationSec IS NOT NULL 的轮转扫描使用 migration 中的 partial index；
-  // Prisma schema 无法表达 WHERE 条件。
 }
 
 /// 会话成员。成员行的存在即成员资格（发送/收取的授权来源）；
 /// pinned/muted 是每成员的会话偏好（原 OpenIM 会话属性）。
 model ChatMember {
-  id             String    @id @default(uuid())
-  conversationID String
-  userID         String
+  id                  String         @id @default(uuid())
+  conversationID      String
+  userID              String
   /// 已读水位：该成员已读的最大 height，只前进不后退。
-  lastReadHeight Int       @default(0)
+  lastReadHeight      Int            @default(0)
   /// 送达水位（G-07）：客户端收到 chat:msg 后回报的最大 height；只前进。
-  lastDeliveredHeight Int  @default(0)
+  lastDeliveredHeight Int            @default(0)
   /// 清空聊天记录水位（G-14）：本人只看得到 height 大于该值的消息；只前进。
-  clearedBeforeHeight Int  @default(0)
-  pinned         Boolean   @default(false)
+  clearedBeforeHeight Int            @default(0)
+  pinned              Boolean        @default(false)
   /// 免打扰(只影响推送)。**不是禁言** —— 禁言看下面的 silenced*。
-  muted          Boolean   @default(false)
+  muted               Boolean        @default(false)
   /// 独立群聊的管理员标记(圈子群忽略,见 ChatMemberRole)。退群/被移出时复位。
-  role           ChatMemberRole @default(MEMBER)
+  role                ChatMemberRole @default(MEMBER)
   /// 本人在这个群里的昵称，对全群可见；null = 用账号昵称。
   /// 这是「我给自己起的名字、群里所有人看见」。
-  alias          String?
+  alias               String?
   /// 群备注：我给这个群起的名字，**只有我看得见**（对应单聊的好友备注）。
   /// 与 alias 正好相反，也与 ChatConversation.name / Circle.name 无关 ——
   /// 那两个是全群共享的群名，改了所有人都看到。null = 用群名。
-  remark         String?
+  remark              String?
   /// 禁言(不能发言;群主/管理员对成员施加)。silencedAt 非空 = 处于禁言,
   /// silencedUntil 空 = 直到解除。词汇约定:代码里 mute = 免打扰,silence = 禁言;
   /// 只有会话上的 muteAllAt / 错误码 CHAT_CONVERSATION_MUTED 是更早的遗留命名。
   /// 退群/被移出**不**清除:否则退群再扫码回来就等于自助解禁。
-  silencedAt     DateTime?
-  silencedUntil  DateTime?
+  silencedAt          DateTime?
+  silencedUntil       DateTime?
   /// 从列表隐藏(swipe hide);新消息落库时清空,会话重新浮出(微信式语义)。
-  hiddenAt       DateTime?
-  joinedAt       DateTime  @default(now())
-  leftAt         DateTime?
+  hiddenAt            DateTime?
+  joinedAt            DateTime       @default(now())
+  leftAt              DateTime?
 
   conversation ChatConversation @relation(fields: [conversationID], references: [id], onDelete: Cascade)
+  // leftAt IS NULL AND hiddenAt IS NULL 的会话列表使用 migration 中的 partial
+  // index；Prisma schema 无法表达 WHERE 条件。
 
   @@unique([conversationID, userID])
   @@index([userID])
@@ -2421,8 +2460,6 @@ model ChatMember {
   // 尾部的 userID / muted 不参与过滤，只为让两条查询走 index-only scan。
   // 详见 migrations/20260906010000_add_chat_member_fanout_index。
   @@index([conversationID, leftAt, clearedBeforeHeight, userID, muted], map: "ChatMember_fanout_idx")
-  // leftAt IS NULL AND hiddenAt IS NULL 的会话列表使用 migration 中的 partial
-  // index；Prisma schema 无法表达 WHERE 条件。
 }
 
 /// 聊天消息。height 在发送事务内于 pg_advisory_xact_lock 下分配，
@@ -2452,7 +2489,7 @@ model ChatGroupEvent {
 }
 
 model ChatMessage {
-  id              String   @id @default(uuid())
+  id              String    @id @default(uuid())
   conversationID  String
   height          Int
   /// 发送者 userID；系统消息为 null。
@@ -2461,12 +2498,12 @@ model ChatMessage {
   type            String
   content         Json
   /// 客户端幂等键；系统消息为 null（null 不参与唯一约束冲突）。
-  clientMessageId String?  @db.VarChar(128)
+  clientMessageId String?   @db.VarChar(128)
   /// 客户端发送请求的指纹（chatSendRequestHash，sha256 hex）。同一个 d 带着不同内容
   /// 重发时拒收；服务端/系统消息与本列加上之前的历史行为 null（不比对）。
-  requestHash     String?  @db.VarChar(64)
+  requestHash     String?   @db.VarChar(64)
   replyToID       String?
-  deleted         Boolean  @default(false)
+  deleted         Boolean   @default(false)
   /// Timestamp when the message was burned. Unlike revokedAt/editedAt this is
   /// the mutation clock for durable deletion tombstones delivered to offline clients.
   deletedAt       DateTime?
@@ -2480,12 +2517,12 @@ model ChatMessage {
   contentHistory  Json?
   /// 这条消息最近一次客户端可见变更占用的会话序号（见 ChatConversation.nextRevision）。
   /// 创建时即分配；height 是它在时间线上的位置，永不改变。由触发器维护，应用代码不写。
-  revision        Int      @default(0)
-  createdAt       DateTime @default(now())
+  revision        Int       @default(0)
+  createdAt       DateTime  @default(now())
 
-  conversation ChatConversation @relation(fields: [conversationID], references: [id], onDelete: Cascade)
-  reactions    ChatMessageReaction[]
-  mediaReferences ChatMediaReference[]
+  conversation       ChatConversation        @relation(fields: [conversationID], references: [id], onDelete: Cascade)
+  reactions          ChatMessageReaction[]
+  mediaReferences    ChatMediaReference[]
   directAutoReplyJob ChatDirectAutoReplyJob? @relation("directAutoReplySource")
 
   @@unique([conversationID, height])
@@ -2562,15 +2599,15 @@ model ChatMediaReference {
 /// 超过重试次数的故障、或者一次普通的重启,那个 key 就永远丢了 ——
 /// 被撤回的图片继续留在桶里,而 StorageAudit 只报告孤儿、不删。
 model ChatMediaDeletion {
-  id        String   @id @default(uuid())
+  id            String   @id @default(uuid())
   /// object storage key（只收 chat/ 前缀）。
-  objectKey String   @unique
-  attempts  Int      @default(0)
+  objectKey     String   @unique
+  attempts      Int      @default(0)
   /// 最近一次失败原因（排障用，不外发）。
-  lastError String?
+  lastError     String?
   /// 下次可重试时刻（指数退避）。
   nextAttemptAt DateTime @default(now())
-  createdAt DateTime @default(now())
+  createdAt     DateTime @default(now())
 
   @@index([nextAttemptAt])
 }
@@ -2616,16 +2653,16 @@ model QrToken {
 /// 手机端扫码确认后置 APPROVED，网页轮询用 qrToken+pollKey 一次性换正式会话
 /// （CONSUMED 后不可复用）。双令牌：旁观者拍到二维码只有 qrToken，无法轮询换token。
 model QrLoginSession {
-  id           String        @id @default(uuid())
-  qrToken      String        @unique
-  pollKey      String        @unique
-  requestDevice String       @default("Unknown browser · Unknown OS")
-  status       QrLoginStatus @default(PENDING)
-  approvedByID String?
-  approvedBy   User?         @relation("qrLoginApprover", fields: [approvedByID], references: [id], onDelete: Cascade)
-  createdAt    DateTime      @default(now())
-  expiresAt    DateTime
-  consumedAt   DateTime?
+  id            String        @id @default(uuid())
+  qrToken       String        @unique
+  pollKey       String        @unique
+  requestDevice String        @default("Unknown browser · Unknown OS")
+  status        QrLoginStatus @default(PENDING)
+  approvedByID  String?
+  approvedBy    User?         @relation("qrLoginApprover", fields: [approvedByID], references: [id], onDelete: Cascade)
+  createdAt     DateTime      @default(now())
+  expiresAt     DateTime
+  consumedAt    DateTime?
 
   @@index([expiresAt])
 }
@@ -2646,37 +2683,39 @@ model ChatCircleSyncRetry {
 
 /// Pending invitations/applications never grant a ChatMember seat.
 model GroupAdmission {
-  id String @id @default(uuid())
+  id             String                   @id @default(uuid())
   conversationID String
-  applicantID String
-  inviterID String?
-  qrToken String?
-  kind String
-  status String
-  reason String @default("")
-  expiresAt DateTime
-  acceptedAt DateTime?
-  decidedByID String?
-  createdAt DateTime @default(now())
-  updatedAt DateTime @updatedAt
-  notifications Notification[]
-  deliveries GroupAdmissionDelivery[]
+  applicantID    String
+  inviterID      String?
+  qrToken        String?
+  kind           String
+  status         String
+  reason         String                   @default("")
+  expiresAt      DateTime
+  acceptedAt     DateTime?
+  decidedByID    String?
+  createdAt      DateTime                 @default(now())
+  updatedAt      DateTime                 @updatedAt
+  notifications  Notification[]
+  deliveries     GroupAdmissionDelivery[]
+
   @@index([conversationID, status, createdAt])
   @@index([applicantID, updatedAt])
 }
 
 /// Durable delivery of cards, notification push outbox, and membership broadcasts.
 model GroupAdmissionDelivery {
-  id String @id @default(uuid())
-  admissionID String
-  recipientID String
-  actorID String
-  event String
-  deliveredAt DateTime?
-  attempts Int @default(0)
-  nextAttemptAt DateTime @default(now())
-  createdAt DateTime @default(now())
-  admission GroupAdmission @relation(fields: [admissionID], references: [id], onDelete: NoAction, onUpdate: NoAction)
+  id            String         @id @default(uuid())
+  admissionID   String
+  recipientID   String
+  actorID       String
+  event         String
+  deliveredAt   DateTime?
+  attempts      Int            @default(0)
+  nextAttemptAt DateTime       @default(now())
+  createdAt     DateTime       @default(now())
+  admission     GroupAdmission @relation(fields: [admissionID], references: [id], onDelete: NoAction, onUpdate: NoAction)
+
   @@unique([admissionID, recipientID, event])
   @@index([deliveredAt, nextAttemptAt])
 }
