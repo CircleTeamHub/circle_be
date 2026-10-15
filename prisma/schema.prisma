@@ -884,6 +884,10 @@ model RefreshToken {
   /// sha256(x-device-id)：把会话绑到受信任设备，移除设备时据此撤销信任。
   deviceKey        String?
   expiredAt        DateTime
+  /// 该 sid 最近一次签发的 access token 到期时间；用于有界地补发逐会话吊销标记。
+  accessTokenExpiresAt DateTime?
+  /// 独立于 refresh token 轮换原因的持久化 access token 吊销状态。
+  accessRevokedAt DateTime?
   revokedAt        DateTime?
   revocationReason RefreshTokenRevocationReason?
   createdAt        DateTime                      @default(now())
@@ -894,6 +898,7 @@ model RefreshToken {
   @@index([userId, familyId])
   @@index([userId, audience, createdAt])
   @@index([userId, deviceKey])
+  @@index([userId, accessRevokedAt, id])
   @@index([expiredAt])
   @@index([revokedAt])
 }

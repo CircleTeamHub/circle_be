@@ -13,6 +13,52 @@ describe('RefreshTokenService', () => {
   const loopbackIp = ['127', '0', '0', '1'].join('.');
   const privateIp = ['10', '0', '0', '1'].join('.');
 
+  const matchesWhere = (record: any, where: any): boolean => {
+    if (!where) return true;
+    if (
+      where.AND &&
+      !where.AND.every((part: any) => matchesWhere(record, part))
+    ) {
+      return false;
+    }
+    if (where.OR && !where.OR.some((part: any) => matchesWhere(record, part))) {
+      return false;
+    }
+    for (const field of ['userId', 'token', 'audience', 'deviceKey']) {
+      if (where[field] !== undefined && record[field] !== where[field])
+        return false;
+    }
+    if (typeof where.id === 'string' && record.id !== where.id) return false;
+    if (where.id?.not !== undefined && record.id === where.id.not) return false;
+    if (where.id?.gt !== undefined && record.id <= where.id.gt) return false;
+    if (
+      typeof where.familyId === 'string' &&
+      record.familyId !== where.familyId
+    ) {
+      return false;
+    }
+    if (
+      where.familyId?.not !== undefined &&
+      record.familyId === where.familyId.not
+    ) {
+      return false;
+    }
+    for (const field of ['revokedAt', 'accessRevokedAt']) {
+      if (where[field] === null && record[field] != null) return false;
+      if (where[field] instanceof Date) {
+        if (!(record[field] instanceof Date)) return false;
+        if (record[field].getTime() !== where[field].getTime()) return false;
+      }
+    }
+    for (const field of ['expiredAt', 'createdAt', 'accessTokenExpiresAt']) {
+      const filter = where[field];
+      if (filter === null && record[field] != null) return false;
+      if (filter?.gt && record[field] <= filter.gt) return false;
+      if (filter?.lte && record[field] > filter.lte) return false;
+    }
+    return true;
+  };
+
   const prisma = {
     $executeRaw: jest.fn().mockResolvedValue(0),
     $transaction: jest.fn(async (callback) =>
@@ -41,6 +87,8 @@ describe('RefreshTokenService', () => {
           createdAt: new Date(),
           lastUsedAt: new Date(),
           revokedAt: null,
+          accessRevokedAt: null,
+          accessTokenExpiresAt: null,
           ...data,
         };
         records.push(record);
@@ -53,85 +101,36 @@ describe('RefreshTokenService', () => {
       ),
       findFirst: jest.fn(({ where }) =>
         Promise.resolve(
-          records.find(
-            (record) =>
-              record.id === where.id &&
-              record.userId === where.userId &&
-              (where.audience === undefined ||
-                record.audience === where.audience) &&
-              record.revokedAt === null &&
-              record.expiredAt > where.expiredAt.gt,
-          ) ?? null,
+          records.find((record) => matchesWhere(record, where)) ?? null,
         ),
       ),
-      findMany: jest.fn(({ where }) =>
-        Promise.resolve(
-          records.filter(
-            (record) =>
-              record.userId === where.userId &&
-              (where.audience === undefined ||
-                record.audience === where.audience) &&
-              (where.familyId === undefined ||
-                record.familyId === where.familyId) &&
-              (where.deviceKey === undefined ||
-                record.deviceKey === where.deviceKey) &&
-              (where.id?.not === undefined || record.id !== where.id.not) &&
-              (where.revokedAt === undefined ||
-                record.revokedAt === where.revokedAt) &&
-              (where.expiredAt?.gt === undefined ||
-                record.expiredAt > where.expiredAt.gt) &&
-              (where.createdAt?.gt === undefined ||
-                record.createdAt > where.createdAt.gt),
-          ),
-        ),
-      ),
+      findMany: jest.fn(({ where, orderBy, take }) => {
+        const matching = records.filter((record) =>
+          matchesWhere(record, where),
+        );
+        if (orderBy?.id === 'asc') {
+          matching.sort((left, right) => left.id.localeCompare(right.id));
+        }
+        return Promise.resolve(
+          typeof take === 'number' ? matching.slice(0, take) : matching,
+        );
+      }),
       update: jest.fn(async ({ where, data }) => {
         const record = records.find((item) => item.id === where.id);
         Object.assign(record, data);
         return record;
       }),
       updateMany: jest.fn(async ({ where, data }) => {
-        const matching = records.filter((record) => {
-          if (where.userId && record.userId !== where.userId) return false;
-          if (where.familyId && record.familyId !== where.familyId) {
-            return false;
-          }
-          if (where.token && record.token !== where.token) return false;
-          if (where.audience && record.audience !== where.audience) {
-            return false;
-          }
-          if (typeof where.id === 'string' && record.id !== where.id) {
-            return false;
-          }
-          if (where.id?.not && record.id === where.id.not) {
-            return false;
-          }
-          if (where.revokedAt === null && record.revokedAt !== null) {
-            return false;
-          }
-          if (where.expiredAt?.gt && record.expiredAt <= where.expiredAt.gt) {
-            return false;
-          }
-          return true;
-        });
+        const matching = records.filter((record) =>
+          matchesWhere(record, where),
+        );
         matching.forEach((record) => Object.assign(record, data));
         return { count: matching.length };
       }),
       updateManyAndReturn: jest.fn(async ({ where, data }) => {
-        const matching = records.filter((record) => {
-          if (where.userId && record.userId !== where.userId) return false;
-          if (where.deviceKey && record.deviceKey !== where.deviceKey) {
-            return false;
-          }
-          if (where.id?.not && record.id === where.id.not) return false;
-          if (where.revokedAt === null && record.revokedAt !== null) {
-            return false;
-          }
-          if (where.expiredAt?.gt && record.expiredAt <= where.expiredAt.gt) {
-            return false;
-          }
-          return true;
-        });
+        const matching = records.filter((record) =>
+          matchesWhere(record, where),
+        );
         matching.forEach((record) => Object.assign(record, data));
         return matching.map(({ id }) => ({ id }));
       }),
@@ -304,6 +303,7 @@ describe('RefreshTokenService', () => {
         id: 'current',
         userId: 'user-1',
         token: 'token-1',
+        familyId: 'current-family',
         revokedAt: null,
         expiredAt: new Date(now.getTime() + 1000 * 60),
         createdAt: now,
@@ -313,6 +313,7 @@ describe('RefreshTokenService', () => {
         id: 'other',
         userId: 'user-1',
         token: 'token-2',
+        familyId: 'other-family',
         revokedAt: null,
         expiredAt: new Date(now.getTime() + 1000 * 60),
         createdAt: now,
@@ -324,7 +325,7 @@ describe('RefreshTokenService', () => {
 
     expect(records[0].revokedAt).toBeNull();
     expect(records[1].revokedAt).toBeInstanceOf(Date);
-    expect(prisma.refreshToken.updateManyAndReturn).toHaveBeenCalled();
+    expect(prisma.$transaction).toHaveBeenCalledTimes(1);
     expect(revocation.revokeSession).toHaveBeenCalledTimes(1);
     expect(revocation.revokeSession).toHaveBeenCalledWith('other');
   });
@@ -339,17 +340,32 @@ describe('RefreshTokenService', () => {
 
     await service.revokeDeviceSessions('user-1', 'device-a');
 
-    expect(prisma.refreshToken.findMany).toHaveBeenCalledWith({
-      where: {
-        userId: 'user-1',
-        deviceKey: 'device-a',
-        expiredAt: { gt: expect.any(Date) },
-      },
-      select: { id: true },
-    });
+    expect(prisma.refreshToken.findMany).toHaveBeenCalledWith(
+      expect.objectContaining({
+        where: expect.objectContaining({
+          userId: 'user-1',
+          deviceKey: 'device-a',
+          accessRevokedAt: expect.any(Date),
+        }),
+        select: { id: true },
+        orderBy: { id: 'asc' },
+        take: 100,
+      }),
+    );
     expect(revocation.revokeSession).toHaveBeenCalledWith('session-1');
     expect(revocation.revokeSession).toHaveBeenCalledWith('session-2');
     expect(revocation.revokeSession).not.toHaveBeenCalledWith('session-3');
+    expect(records[0].accessRevokedAt).toBeInstanceOf(Date);
+    expect(records[1].accessRevokedAt).toBeInstanceOf(Date);
+    expect(records[0].accessTokenExpiresAt.getTime()).toBeGreaterThan(
+      records[0].accessRevokedAt.getTime(),
+    );
+    expect(prisma.$transaction).toHaveBeenCalledTimes(1);
+    expect(prisma.$executeRaw).toHaveBeenCalledTimes(1);
+    expect(prisma.$executeRaw).toHaveBeenCalledWith(
+      expect.anything(),
+      'auth-user:user-1',
+    );
   });
 
   it('revokes rotated access tokens when logging out other sessions', async () => {
@@ -364,19 +380,49 @@ describe('RefreshTokenService', () => {
 
     await service.revokeOtherSessions('user-1', current.sessionId);
 
-    expect(prisma.refreshToken.findMany).toHaveBeenCalledWith({
-      where: {
-        userId: 'user-1',
-        expiredAt: { gt: expect.any(Date) },
-        id: { not: current.sessionId },
-      },
-      select: { id: true },
-    });
+    expect(prisma.refreshToken.findMany).toHaveBeenCalledWith(
+      expect.objectContaining({
+        where: expect.objectContaining({
+          userId: 'user-1',
+          accessRevokedAt: expect.any(Date),
+        }),
+        select: { id: true },
+        orderBy: { id: 'asc' },
+        take: 100,
+      }),
+    );
     expect(revocation.revokeSession).not.toHaveBeenCalledWith(
       current.sessionId,
     );
     expect(revocation.revokeSession).toHaveBeenCalledWith('session-2');
     expect(revocation.revokeSession).toHaveBeenCalledWith('session-3');
+  });
+
+  it('preserves every SID in the current token family when logging out other sessions', async () => {
+    const { token: currentToken, sessionId: currentOldSid } =
+      await service.create('user-1', { deviceKey: 'device-current' });
+    const current = await service.rotate(currentToken);
+    const { token: otherToken, sessionId: otherOldSid } = await service.create(
+      'user-1',
+      { deviceKey: 'device-other' },
+    );
+    const other = await service.rotate(otherToken);
+    jest.clearAllMocks();
+
+    await service.revokeOtherSessions('user-1', currentOldSid);
+
+    expect(revocation.revokeSession).not.toHaveBeenCalledWith(currentOldSid);
+    expect(revocation.revokeSession).not.toHaveBeenCalledWith(
+      current.sessionId,
+    );
+    expect(revocation.revokeSession).toHaveBeenCalledWith(otherOldSid);
+    expect(revocation.revokeSession).toHaveBeenCalledWith(other.sessionId);
+    expect(
+      records.find((record) => record.id === currentOldSid)?.accessRevokedAt,
+    ).toBeNull();
+    expect(
+      records.find((record) => record.id === current.sessionId)?.revokedAt,
+    ).toBeNull();
   });
 
   it('replaces single-device sessions under a per-user transaction lock', async () => {
@@ -695,7 +741,7 @@ describe('RefreshTokenService', () => {
       createdAt: now,
       lastUsedAt: now,
     });
-    for (let index = 0; index < 30; index += 1) {
+    for (let index = 0; index < 130; index += 1) {
       records.push({
         id: `other-${index}`,
         userId: 'user-1',
@@ -721,7 +767,8 @@ describe('RefreshTokenService', () => {
     await revoking;
 
     expect(callsBeforeRelease).toBe(25);
-    expect(revocation.revokeSession).toHaveBeenCalledTimes(30);
+    expect(revocation.revokeSession).toHaveBeenCalledTimes(130);
+    expect(prisma.refreshToken.findMany).toHaveBeenCalledTimes(2);
   });
 
   it('serializes APP session creation and setting changes with the same user lock', async () => {

@@ -93,7 +93,12 @@ export class SessionVerifier {
       sessionId
         ? this.prisma.refreshToken.findUnique({
             where: { id: sessionId },
-            select: { userId: true, revokedAt: true, revocationReason: true },
+            select: {
+              userId: true,
+              revokedAt: true,
+              revocationReason: true,
+              accessRevokedAt: true,
+            },
           })
         : Promise.resolve(null),
     ]).then(
@@ -122,6 +127,7 @@ export class SessionVerifier {
     if (
       session !== null &&
       (session.userId !== userId ||
+        session.accessRevokedAt != null ||
         (session.revokedAt !== null &&
           session.revocationReason !== RefreshTokenRevocationReason.ROTATED))
     ) {

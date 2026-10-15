@@ -140,6 +140,7 @@ describe('AuthService', () => {
     ),
     setSingleDeviceLogin: jest.fn(() => Promise.resolve()),
     assertSessionActive: jest.fn(() => Promise.resolve()),
+    recordAccessTokenIssued: jest.fn(() => Promise.resolve()),
   };
 
   const mockJwt = {
@@ -810,6 +811,16 @@ describe('AuthService', () => {
         aud: 'APP',
         issuedAtMs: expect.any(Number),
       }),
+    );
+    const [[signedPayload]] = mockJwt.signAsync.mock.calls as unknown as [
+      [{ issuedAtMs: number }],
+    ];
+    expect(
+      mockRefreshTokenService.recordAccessTokenIssued,
+    ).toHaveBeenCalledWith(
+      'uuid-1',
+      'session-1',
+      new Date(signedPayload.issuedAtMs + 60 * 60 * 1000),
     );
   });
 

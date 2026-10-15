@@ -58,6 +58,7 @@ function buildService(user: UserRow | null) {
       .fn()
       .mockResolvedValue({ token: 'r', sessionId: 's1' }),
     assertSessionActive: jest.fn().mockResolvedValue(undefined),
+    recordAccessTokenIssued: jest.fn().mockResolvedValue(undefined),
     revokeAll: jest.fn(),
     revoke: jest.fn(),
   };

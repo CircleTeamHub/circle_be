@@ -31,6 +31,7 @@ const liveSession = {
   userId: 'user-1',
   revokedAt: null,
   revocationReason: null,
+  accessRevokedAt: null,
 };
 
 describe('SessionVerifier', () => {
@@ -100,7 +101,12 @@ describe('SessionVerifier', () => {
       // sid 就是 RefreshToken 的主键（refresh-token.service 的 revoke 注释）。
       expect(prisma.refreshToken.findUnique).toHaveBeenCalledWith({
         where: { id: 'session-1' },
-        select: { userId: true, revokedAt: true, revocationReason: true },
+        select: {
+          userId: true,
+          revokedAt: true,
+          revocationReason: true,
+          accessRevokedAt: true,
+        },
       });
     });
 
@@ -143,6 +149,21 @@ describe('SessionVerifier', () => {
       });
 
       await expect(verifier.verify(payload)).resolves.toBe('active');
+    });
+
+    it('rejects a rotated session after durable per-session access revocation', async () => {
+      prisma.user.findUnique.mockResolvedValue({
+        status: 'ACTIVE',
+        accessTokensRevokedAt: null,
+      });
+      prisma.refreshToken.findUnique.mockResolvedValue({
+        userId: 'user-1',
+        revokedAt: new Date('2026-09-01T00:00:00.000Z'),
+        revocationReason: 'ROTATED',
+        accessRevokedAt: new Date('2026-09-02T00:00:00.000Z'),
+      });
+
+      await expect(verifier.verify(payload)).resolves.toBe('revoked');
     });
 
     it('rejects a rotated session after a durable user-wide revocation', async () => {

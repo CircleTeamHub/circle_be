@@ -108,10 +108,20 @@ describe('RefreshTokenCleanup', () => {
 
     expect(findMany).toHaveBeenCalledWith({
       where: {
-        OR: [
-          { expiredAt: { lt: now } },
-          // 30 days before `now`.
-          { revokedAt: { lt: new Date('2026-06-15T04:00:00.000Z') } },
+        AND: [
+          {
+            OR: [
+              { expiredAt: { lt: now } },
+              // 30 days before `now`.
+              { revokedAt: { lt: new Date('2026-06-15T04:00:00.000Z') } },
+            ],
+          },
+          {
+            OR: [
+              { accessTokenExpiresAt: null },
+              { accessTokenExpiresAt: { lte: now } },
+            ],
+          },
         ],
       },
       select: { id: true },
@@ -122,9 +132,23 @@ describe('RefreshTokenCleanup', () => {
       where: {
         AND: [
           {
-            OR: [
-              { expiredAt: { lt: now } },
-              { revokedAt: { lt: new Date('2026-06-15T04:00:00.000Z') } },
+            AND: [
+              {
+                OR: [
+                  { expiredAt: { lt: now } },
+                  {
+                    revokedAt: {
+                      lt: new Date('2026-06-15T04:00:00.000Z'),
+                    },
+                  },
+                ],
+              },
+              {
+                OR: [
+                  { accessTokenExpiresAt: null },
+                  { accessTokenExpiresAt: { lte: now } },
+                ],
+              },
             ],
           },
           { id: { in: ['token-1', 'token-2'] } },
