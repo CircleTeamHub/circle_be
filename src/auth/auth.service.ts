@@ -944,11 +944,7 @@ export class AuthService {
             currentSessionId,
           )
         : null;
-      if (currentSessionId === sessionId) {
-        await this.refreshTokenService.revokeSessionFamily(userId, sessionId);
-      } else {
-        await this.refreshTokenService.revokeSession(userId, sessionId);
-      }
+      await this.refreshTokenService.revokeSessionFamily(userId, sessionId);
       // 移除的是「本机的另一条旧登录记录」时只撤那一条：不能连带撤掉当前会话和本机信任。
       if (deviceKey && deviceKey !== currentDeviceKey) {
         // 同一台设备可能有多条会话（重装、重复登录）：一起撤掉，否则剩下那条还能续签。

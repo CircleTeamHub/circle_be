@@ -1091,10 +1091,11 @@ describe('AuthService', () => {
   it('revokes a selected session for the current user', async () => {
     await service.logoutSession('uuid-1', 'session-2');
 
-    expect(mockRefreshTokenService.revokeSession).toHaveBeenCalledWith(
+    expect(mockRefreshTokenService.revokeSessionFamily).toHaveBeenCalledWith(
       'uuid-1',
       'session-2',
     );
+    expect(mockRefreshTokenService.revokeSession).not.toHaveBeenCalled();
     // 同一设备的其他会话一起撤，否则剩下那条续签会让设备继续在线。
     expect(mockRefreshTokenService.revokeDeviceSessions).toHaveBeenCalledWith(
       'uuid-1',
@@ -1137,18 +1138,18 @@ describe('AuthService', () => {
     expect(mockDeviceTrust.invalidateChallenges).toHaveBeenCalledWith('uuid-1');
   });
 
-  it('removing an older session of the current device keeps this device signed in and trusted', async () => {
+  it('revokes an older selected token family while keeping the same device trusted', async () => {
     mockRefreshTokenService.findSessionDeviceKey.mockResolvedValue(
       'same-phone' as never,
     );
 
     await service.logoutSession('uuid-1', 'old-session', 'current-session');
 
-    expect(mockRefreshTokenService.revokeSession).toHaveBeenCalledWith(
+    expect(mockRefreshTokenService.revokeSessionFamily).toHaveBeenCalledWith(
       'uuid-1',
       'old-session',
     );
-    expect(mockRefreshTokenService.revokeSessionFamily).not.toHaveBeenCalled();
+    expect(mockRefreshTokenService.revokeSession).not.toHaveBeenCalled();
     expect(mockRefreshTokenService.revokeDeviceSessions).not.toHaveBeenCalled();
     expect(mockDeviceTrust.revokeDevice).not.toHaveBeenCalled();
     mockRefreshTokenService.findSessionDeviceKey.mockImplementation(
@@ -1320,10 +1321,12 @@ describe('AuthService', () => {
       release = resolve;
     });
     mockRefreshTokenService.findSessionDeviceKey.mockResolvedValue('removed');
-    mockRefreshTokenService.revokeSession.mockImplementationOnce(async () => {
-      removing();
-      await pause;
-    });
+    mockRefreshTokenService.revokeSessionFamily.mockImplementationOnce(
+      async () => {
+        removing();
+        await pause;
+      },
+    );
     const original = mockPrisma.$transaction.getMockImplementation();
     let queue: Promise<unknown> = Promise.resolve();
     mockPrisma.$transaction.mockImplementation((operation: any) => {
