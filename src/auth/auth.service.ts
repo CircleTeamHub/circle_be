@@ -944,7 +944,7 @@ export class AuthService {
             currentSessionId,
           )
         : null;
-      await this.refreshTokenService.revokeSession(userId, sessionId);
+      await this.refreshTokenService.revokeSessionFamily(userId, sessionId);
       // 移除的是「本机的另一条旧登录记录」时只撤那一条：不能连带撤掉当前会话和本机信任。
       if (deviceKey && deviceKey !== currentDeviceKey) {
         // 同一台设备可能有多条会话（重装、重复登录）：一起撤掉，否则剩下那条还能续签。
@@ -1681,21 +1681,27 @@ export class AuthService {
     return { accessToken, refreshToken };
   }
 
-  private signAccessToken(
+  private async signAccessToken(
     userId: string,
     accountId: string,
     role: string,
     sessionId?: string,
     audience: RefreshTokenAudience = 'APP',
   ): Promise<string> {
+    const issuedAtMs = Date.now();
     const payload = {
       sub: userId,
       accountId,
       role,
       sid: sessionId,
       aud: audience,
-      issuedAtMs: Date.now(),
+      issuedAtMs,
     };
+    const globalSeconds = accessTokenTtlSeconds(
+      this.configService.get<string | number>('JWT_EXPIRES_IN') ?? '1h',
+    );
+    let expiresIn = globalSeconds;
+    let accessToken: string;
     // ADMIN audience 用更短的 access TTL（#91）：全局 JWT_EXPIRES_IN 仍管普通
     // 用户；管理台 access token 默认 15 分钟，可用 ADMIN_JWT_EXPIRES_IN 覆盖。
     if (audience === 'ADMIN') {
@@ -1706,9 +1712,6 @@ export class AuthService {
       // TTL 按全局 JWT_EXPIRES_IN 定长 —— admin access TTL 若配得更长，
       // 标记先过期、被吊销的 admin token 会「复活」。上限=全局 TTL。
       const adminSeconds = accessTokenTtlSeconds(adminExpiresIn);
-      const globalSeconds = accessTokenTtlSeconds(
-        this.configService.get<string | number>('JWT_EXPIRES_IN') ?? '1h',
-      );
       if (adminSeconds > globalSeconds) {
         this.logger.warn(
           `ADMIN_JWT_EXPIRES_IN (${adminExpiresIn}) exceeds JWT_EXPIRES_IN — ` +
@@ -1716,10 +1719,30 @@ export class AuthService {
             'markers always outlive the token',
         );
       }
-      return this.jwt.signAsync(payload, {
-        expiresIn: Math.min(adminSeconds, globalSeconds),
-      });
+      expiresIn = Math.min(adminSeconds, globalSeconds);
+      accessToken = await this.jwt.signAsync(payload, { expiresIn });
+    } else {
+      accessToken = await this.jwt.signAsync(payload);
     }
-    return this.jwt.signAsync(payload);
+    if (sessionId) {
+      try {
+        await this.refreshTokenService.recordAccessTokenIssued(
+          userId,
+          sessionId,
+          new Date(issuedAtMs + expiresIn * 1000),
+        );
+      } catch (error) {
+        // Rotation already committed before signing. Failing the response here
+        // strands the new refresh token and makes a retry look like token reuse.
+        // A null expiry is safe: revocation records a conservative full TTL.
+        this.logger.warn({
+          event: 'access_token_expiry_metadata_persist_failed',
+          operation: 'signAccessToken',
+          fallback: 'conservative_access_ttl',
+          errorName: error instanceof Error ? error.name : 'UnknownError',
+        });
+      }
+    }
+    return accessToken;
   }
 }

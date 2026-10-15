@@ -23,10 +23,12 @@ function fakePrisma(
     oldest: Date | null;
     dead?: number;
   }) => ({
-    aggregate: jest.fn().mockResolvedValue({
+    aggregate: jest.fn(async ({ _min }) => ({
       _count: { _all: reading.count },
-      _min: { createdAt: reading.oldest },
-    }),
+      _min: Object.fromEntries(
+        Object.keys(_min).map((field) => [field, reading.oldest]),
+      ),
+    })),
     count: jest.fn().mockResolvedValue(reading.dead ?? 0),
   });
 
@@ -43,6 +45,7 @@ function fakePrisma(
     ),
     chatDirectAutoReplyJob: delegate(overrides.chatDirectAutoReplyJob ?? empty),
     supportRechargeJob: delegate(overrides.supportRechargeJob ?? empty),
+    refreshToken: delegate(overrides.refreshToken ?? empty),
   };
 }
 
@@ -194,8 +197,13 @@ describe('collectOutboxDepths', () => {
       return value;
     };
     const delegate = () => ({
-      aggregate: jest.fn(() =>
-        track({ _count: { _all: 0 }, _min: { createdAt: null } }),
+      aggregate: jest.fn(({ _min }) =>
+        track({
+          _count: { _all: 0 },
+          _min: Object.fromEntries(
+            Object.keys(_min).map((field) => [field, null]),
+          ),
+        }),
       ),
       count: jest.fn(() => track(0)),
     });
@@ -207,6 +215,7 @@ describe('collectOutboxDepths', () => {
       circleInvitationVerifier: delegate(),
       chatDirectAutoReplyJob: delegate(),
       supportRechargeJob: delegate(),
+      refreshToken: delegate(),
     } as unknown as OutboxDepthSource;
 
     const samples = await collectOutboxDepths(prisma, NOW);
@@ -247,5 +256,32 @@ describe('collectOutboxDepths', () => {
       cardDeliveredAt: null,
     });
     expect(where.cardAttempts).toEqual({ lt: 36 });
+  });
+
+  it('tracks the durable access-revocation backlog from its revocation time', async () => {
+    const prisma = fakePrisma({
+      refreshToken: { count: 7, oldest: TEN_MINUTES_AGO },
+    });
+
+    const samples = await collectOutboxDepths(prisma, NOW);
+
+    expect(
+      samples.find((sample) => sample.queue === 'access_revocation'),
+    ).toEqual({
+      queue: 'access_revocation',
+      pending: 7,
+      oldestAgeSeconds: 600,
+      dead: 0,
+    });
+    const aggregate = prisma.refreshToken.aggregate as jest.Mock;
+    expect(aggregate).toHaveBeenCalledWith(
+      expect.objectContaining({
+        where: expect.objectContaining({
+          accessRevokedAt: { not: null },
+          accessRevocationNotifiedAt: null,
+        }),
+        _min: { accessRevokedAt: true },
+      }),
+    );
   });
 });
