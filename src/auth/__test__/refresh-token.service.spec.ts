@@ -854,12 +854,59 @@ describe('RefreshTokenService', () => {
 
     expect(records[0].accessRevokedAt).toBeInstanceOf(Date);
     expect(records[0].accessRevocationNotifiedAt).toBeNull();
+    expect(prisma.refreshToken.findMany.mock.calls[1][0].where).toMatchObject({
+      id: { in: ['session-1'] },
+      accessRevocationLeaseToken: expect.any(String),
+    });
 
     revocation.revokeSession.mockResolvedValueOnce(true);
     await service.flushPendingAccessRevocations();
 
     expect(revocation.revokeSession).toHaveBeenCalledTimes(2);
     expect(records[0].accessRevocationNotifiedAt).toBeInstanceOf(Date);
+  });
+
+  it('keeps device trust revocation reachable when immediate outbox delivery fails', async () => {
+    await service.create('user-1', { deviceKey: 'device-a' });
+    const warn = jest
+      .spyOn((service as any).logger, 'warn')
+      .mockImplementation(() => undefined);
+    prisma.refreshToken.findMany.mockRejectedValueOnce(
+      new Error('database temporarily unavailable'),
+    );
+
+    await expect(
+      service.revokeDeviceSessions('user-1', 'device-a'),
+    ).resolves.toBeUndefined();
+
+    expect(records[0]).toMatchObject({
+      revokedAt: expect.any(Date),
+      accessRevokedAt: expect.any(Date),
+      accessRevocationNotifiedAt: null,
+    });
+    expect(warn).toHaveBeenCalledWith({
+      event: 'access_revocation_delivery_deferred',
+      errorType: 'Error',
+    });
+  });
+
+  it('keeps other-device trust revocation reachable when immediate outbox delivery fails', async () => {
+    const current = await service.create('user-1', { deviceKey: 'device-a' });
+    await service.create('user-1', { deviceKey: 'device-b' });
+    prisma.refreshToken.findMany.mockRejectedValueOnce(
+      new Error('database temporarily unavailable'),
+    );
+
+    await expect(
+      service.revokeOtherSessions('user-1', current.sessionId),
+    ).resolves.toBeUndefined();
+
+    expect(records[0].revokedAt).toBeNull();
+    expect(records[1]).toMatchObject({
+      revokedAt: expect.any(Date),
+      accessRevokedAt: expect.any(Date),
+      accessRevocationNotifiedAt: null,
+    });
   });
 
   it('reports an unavailable outbox delivery as a tracked job failure', async () => {

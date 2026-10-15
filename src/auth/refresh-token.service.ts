@@ -268,7 +268,10 @@ export class RefreshTokenService {
       },
     });
     const claimed = await this.prisma.refreshToken.findMany({
-      where: { accessRevocationLeaseToken: leaseToken },
+      where: {
+        id: { in: candidateIds },
+        accessRevocationLeaseToken: leaseToken,
+      },
       select: { id: true },
       orderBy: { id: 'asc' },
       take: REVOCATION_PAGE_SIZE,
@@ -541,7 +544,7 @@ export class RefreshTokenService {
       return { accessRevokedAt: now, where: target };
     });
     if (accessRevocation) {
-      await this.notifyPendingAccessRevocations({
+      await this.notifyPendingAccessRevocationsBestEffort({
         ...accessRevocation.where,
         accessRevokedAt: accessRevocation.accessRevokedAt,
       });
@@ -853,7 +856,7 @@ export class RefreshTokenService {
       });
       return now;
     });
-    await this.notifyPendingAccessRevocations({
+    await this.notifyPendingAccessRevocationsBestEffort({
       userId,
       deviceKey,
       accessRevokedAt: revokedAt,
@@ -893,7 +896,7 @@ export class RefreshTokenService {
       });
       return { revokedAt: now, keepCurrent };
     });
-    await this.notifyPendingAccessRevocations({
+    await this.notifyPendingAccessRevocationsBestEffort({
       userId,
       ...result.keepCurrent,
       accessRevokedAt: result.revokedAt,
