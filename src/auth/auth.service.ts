@@ -1725,11 +1725,23 @@ export class AuthService {
       accessToken = await this.jwt.signAsync(payload);
     }
     if (sessionId) {
-      await this.refreshTokenService.recordAccessTokenIssued(
-        userId,
-        sessionId,
-        new Date(issuedAtMs + expiresIn * 1000),
-      );
+      try {
+        await this.refreshTokenService.recordAccessTokenIssued(
+          userId,
+          sessionId,
+          new Date(issuedAtMs + expiresIn * 1000),
+        );
+      } catch (error) {
+        // Rotation already committed before signing. Failing the response here
+        // strands the new refresh token and makes a retry look like token reuse.
+        // A null expiry is safe: revocation records a conservative full TTL.
+        this.logger.warn({
+          event: 'access_token_expiry_metadata_persist_failed',
+          operation: 'signAccessToken',
+          fallback: 'conservative_access_ttl',
+          errorName: error instanceof Error ? error.name : 'UnknownError',
+        });
+      }
     }
     return accessToken;
   }

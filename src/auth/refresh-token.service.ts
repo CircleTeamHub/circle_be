@@ -1,7 +1,9 @@
 import { Injectable, Logger, UnauthorizedException } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
+import { CronExpression } from '@nestjs/schedule';
 import { createHash, randomBytes, randomUUID } from 'crypto';
 import { Prisma, RefreshTokenRevocationReason } from 'src/generated/prisma';
+import { TrackedCron } from 'src/metrics/tracked-cron.decorator';
 import { PrismaService } from 'src/prisma/prisma.service';
 import {
   accessTokenTtlSeconds,
@@ -93,6 +95,7 @@ export class RefreshTokenService {
   private readonly ttlMs: number;
   private readonly adminTtlMs: number;
   private readonly accessTtlMs: number;
+  private accessRevocationSweepRunning = false;
 
   constructor(
     private prisma: PrismaService,
@@ -183,34 +186,80 @@ export class RefreshTokenService {
     return { token: rawToken, sessionId: session.id };
   }
 
-  private async revokeAccessSessions(sessionIds: string[]): Promise<void> {
+  private async revokeAccessSessions(sessionIds: string[]): Promise<string[]> {
+    const notified: string[] = [];
     for (
       let offset = 0;
       offset < sessionIds.length;
       offset += REVOCATION_BATCH_SIZE
     ) {
       const batch = sessionIds.slice(offset, offset + REVOCATION_BATCH_SIZE);
-      await Promise.all(
-        batch.map((sessionId) => this.revocation.revokeSession(sessionId)),
+      const results = await Promise.all(
+        batch.map(async (sessionId) => ({
+          sessionId,
+          delivered: await this.revocation.revokeSession(sessionId),
+        })),
+      );
+      notified.push(
+        ...results
+          // Older mocks and compatible implementations returned void; only an
+          // explicit false means pub/sub delivery needs an outbox retry.
+          .filter(({ delivered }) => delivered !== false)
+          .map(({ sessionId }) => sessionId),
       );
     }
+    return notified;
   }
 
-  private async revokeAccessSessionsByPage(
+  private async notifyPendingAccessRevocations(
     where: Prisma.RefreshTokenWhereInput,
-  ): Promise<void> {
-    let lastId: string | undefined;
-    for (;;) {
-      const page = await this.prisma.refreshToken.findMany({
-        where: lastId ? { AND: [where, { id: { gt: lastId } }] } : where,
-        select: { id: true },
-        orderBy: { id: 'asc' },
-        take: REVOCATION_PAGE_SIZE,
+  ): Promise<number> {
+    const now = new Date();
+    const page = await this.prisma.refreshToken.findMany({
+      where: {
+        AND: [
+          where,
+          {
+            accessRevokedAt: { not: null },
+            accessRevocationNotifiedAt: null,
+            accessTokenExpiresAt: { gt: now },
+          },
+        ],
+      },
+      select: { id: true },
+      orderBy: { id: 'asc' },
+      take: REVOCATION_PAGE_SIZE,
+    });
+    if (page.length === 0) return 0;
+
+    const sessionIds = page.map(({ id }) => id);
+    const notifiedSessionIds = await this.revokeAccessSessions(sessionIds);
+    if (notifiedSessionIds.length > 0) {
+      await this.prisma.refreshToken.updateMany({
+        where: {
+          id: { in: notifiedSessionIds },
+          accessRevocationNotifiedAt: null,
+        },
+        data: { accessRevocationNotifiedAt: new Date() },
       });
-      if (page.length === 0) return;
-      await this.revokeAccessSessions(page.map(({ id }) => id));
-      if (page.length < REVOCATION_PAGE_SIZE) return;
-      lastId = page[page.length - 1].id;
+    }
+    return page.length;
+  }
+
+  /**
+   * RefreshToken rows are the durable outbox for per-session Redis markers and
+   * socket-close broadcasts. One bounded page per minute keeps request work
+   * capped while guaranteeing that overflow from large rotation chains is
+   * eventually delivered after transient failures or process restarts.
+   */
+  @TrackedCron(CronExpression.EVERY_MINUTE, 'access_revocation_outbox')
+  async flushPendingAccessRevocations(): Promise<void> {
+    if (this.accessRevocationSweepRunning) return;
+    this.accessRevocationSweepRunning = true;
+    try {
+      await this.notifyPendingAccessRevocations({});
+    } finally {
+      this.accessRevocationSweepRunning = false;
     }
   }
 
@@ -233,19 +282,30 @@ export class RefreshTokenService {
     where: Prisma.RefreshTokenWhereInput,
     revokedAt: Date,
   ): Promise<void> {
+    const legacyCutoff = new Date(revokedAt.getTime() - this.accessTtlMs);
     // Pre-migration rows do not know their exact access-token expiry. Give them
-    // a conservative full TTL from the revocation event so cleanup cannot
-    // erase the durable deny while a legacy access token may still be alive.
+    // a conservative full TTL from the revocation event, but only when the row
+    // was created within one access-token lifetime. Older rows cannot still
+    // carry a live access token and must not inflate the durable outbox.
     await tx.refreshToken.updateMany({
-      where: { ...where, accessTokenExpiresAt: null },
+      where: {
+        AND: [
+          where,
+          { accessTokenExpiresAt: null, createdAt: { gt: legacyCutoff } },
+        ],
+      },
       data: {
         accessTokenExpiresAt: new Date(revokedAt.getTime() + this.accessTtlMs),
         accessRevokedAt: revokedAt,
+        accessRevocationNotifiedAt: null,
       },
     });
     await tx.refreshToken.updateMany({
-      where: { ...where, accessTokenExpiresAt: { gt: revokedAt } },
-      data: { accessRevokedAt: revokedAt },
+      where: { AND: [where, { accessTokenExpiresAt: { gt: revokedAt } }] },
+      data: {
+        accessRevokedAt: revokedAt,
+        accessRevocationNotifiedAt: null,
+      },
     });
   }
 
@@ -256,10 +316,7 @@ export class RefreshTokenService {
     audience: RefreshTokenAudience = 'APP',
   ) {
     const now = new Date();
-    const revocableSessions = await tx.refreshToken.findMany({
-      where: { userId, audience, expiredAt: { gt: now } },
-      select: { id: true },
-    });
+    await this.markAccessRevokedWithClient(tx, { userId, audience }, now);
     await tx.refreshToken.updateMany({
       where: { userId, audience, revokedAt: null },
       data: {
@@ -270,7 +327,8 @@ export class RefreshTokenService {
     const session = await this.createWithClient(tx, userId, context, audience);
     return {
       session,
-      revokedSessionIds: revocableSessions.map(({ id }) => id),
+      accessRevokedAt: now,
+      accessRevocationWhere: { userId, audience },
     };
   }
 
@@ -299,10 +357,16 @@ export class RefreshTokenService {
       }
       return {
         session: await this.createWithClient(tx, userId, context, audience),
-        revokedSessionIds: [],
+        accessRevokedAt: null,
+        accessRevocationWhere: null,
       };
     });
-    await this.revokeAccessSessions(result.revokedSessionIds);
+    if (result.accessRevokedAt && result.accessRevocationWhere) {
+      await this.notifyPendingAccessRevocations({
+        ...result.accessRevocationWhere,
+        accessRevokedAt: result.accessRevokedAt,
+      });
+    }
     return result.session;
   }
 
@@ -332,7 +396,10 @@ export class RefreshTokenService {
         audience,
       );
     });
-    await this.revokeAccessSessions(replacement.revokedSessionIds);
+    await this.notifyPendingAccessRevocations({
+      ...replacement.accessRevocationWhere,
+      accessRevokedAt: replacement.accessRevokedAt,
+    });
     return replacement.session;
   }
 
@@ -341,38 +408,49 @@ export class RefreshTokenService {
     enabled: boolean,
     currentSessionId?: string,
   ): Promise<void> {
-    const revokedSessionIds = await this.prisma.$transaction(async (tx) => {
+    const accessRevocation = await this.prisma.$transaction(async (tx) => {
       const lockKey = `auth-user:${userId}`;
       await tx.$executeRaw`SELECT pg_advisory_xact_lock(hashtext(${lockKey}))`;
       await tx.user.update({
         where: { id: userId },
         data: { singleDeviceLoginEnabled: enabled },
       });
-      if (!enabled) return [];
+      if (!enabled) return null;
 
       const now = new Date();
-      const revocableSessions = await tx.refreshToken.findMany({
-        where: {
-          userId,
-          expiredAt: { gt: now },
-          ...(currentSessionId ? { id: { not: currentSessionId } } : {}),
-        },
-        select: { id: true },
-      });
+      const current = currentSessionId
+        ? await tx.refreshToken.findFirst({
+            where: { id: currentSessionId, userId },
+            select: { familyId: true },
+          })
+        : null;
+      let preserveCurrent: Prisma.RefreshTokenWhereInput = {};
+      if (current) {
+        preserveCurrent = { familyId: { not: current.familyId } };
+      } else if (currentSessionId) {
+        preserveCurrent = { id: { not: currentSessionId } };
+      }
+      const target = { userId, ...preserveCurrent };
+      await this.markAccessRevokedWithClient(tx, target, now);
       await tx.refreshToken.updateMany({
         where: {
           userId,
           revokedAt: null,
-          ...(currentSessionId ? { id: { not: currentSessionId } } : {}),
+          ...preserveCurrent,
         },
         data: {
           revokedAt: now,
           revocationReason: RefreshTokenRevocationReason.OTHER_SESSIONS_REVOKED,
         },
       });
-      return revocableSessions.map(({ id }) => id);
+      return { accessRevokedAt: now, where: target };
     });
-    await this.revokeAccessSessions(revokedSessionIds);
+    if (accessRevocation) {
+      await this.notifyPendingAccessRevocations({
+        ...accessRevocation.where,
+        accessRevokedAt: accessRevocation.accessRevokedAt,
+      });
+    }
   }
 
   async ownerForToken(
@@ -680,7 +758,7 @@ export class RefreshTokenService {
       });
       return now;
     });
-    await this.revokeAccessSessionsByPage({
+    await this.notifyPendingAccessRevocations({
       userId,
       deviceKey,
       accessRevokedAt: revokedAt,
@@ -720,7 +798,7 @@ export class RefreshTokenService {
       });
       return { revokedAt: now, keepCurrent };
     });
-    await this.revokeAccessSessionsByPage({
+    await this.notifyPendingAccessRevocations({
       userId,
       ...result.keepCurrent,
       accessRevokedAt: result.revokedAt,

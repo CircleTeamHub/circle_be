@@ -824,6 +824,30 @@ describe('AuthService', () => {
     );
   });
 
+  it('does not burn a rotated refresh token when expiry metadata persistence fails', async () => {
+    users.push({
+      id: 'uuid-1',
+      accountId: 'testuser',
+      passwordHash: 'hash',
+      status: 'ACTIVE',
+      role: 'USER',
+    });
+    mockRefreshTokenService.recordAccessTokenIssued.mockRejectedValueOnce(
+      new Error('transient database failure'),
+    );
+
+    await expect(service.refresh('refresh-token')).resolves.toEqual(
+      expect.objectContaining({
+        accessToken: 'access-token',
+        refreshToken: 'new-refresh-token',
+      }),
+    );
+    expect(mockRefreshTokenService.assertSessionActive).toHaveBeenCalledWith(
+      'uuid-1',
+      'session-2',
+    );
+  });
+
   it('login revokes existing sessions first when single-device login is enabled', async () => {
     const passwordHash = await argon2.hash('password1');
     users.push({

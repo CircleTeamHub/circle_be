@@ -888,6 +888,8 @@ model RefreshToken {
   accessTokenExpiresAt DateTime?
   /// 独立于 refresh token 轮换原因的持久化 access token 吊销状态。
   accessRevokedAt DateTime?
+  /// Redis 标记/实时断连已完成；null 且 accessRevokedAt 非空即持久 outbox 待办。
+  accessRevocationNotifiedAt DateTime?
   revokedAt        DateTime?
   revocationReason RefreshTokenRevocationReason?
   createdAt        DateTime                      @default(now())
@@ -898,7 +900,7 @@ model RefreshToken {
   @@index([userId, familyId])
   @@index([userId, audience, createdAt])
   @@index([userId, deviceKey])
-  @@index([userId, accessRevokedAt, id])
+  @@index([accessRevocationNotifiedAt, accessTokenExpiresAt, id])
   @@index([expiredAt])
   @@index([revokedAt])
 }
