@@ -310,6 +310,19 @@ export class RefreshTokenService {
     return sessionIds.length;
   }
 
+  private async notifyPendingAccessRevocationsBestEffort(
+    where: Prisma.RefreshTokenWhereInput,
+  ): Promise<void> {
+    try {
+      await this.notifyPendingAccessRevocations(where);
+    } catch (error) {
+      this.logger.warn({
+        event: 'access_revocation_delivery_deferred',
+        errorType: error instanceof Error ? error.name : typeof error,
+      });
+    }
+  }
+
   /**
    * RefreshToken rows are the durable outbox for per-session Redis markers and
    * socket-close broadcasts. One bounded page per minute keeps request work
@@ -444,7 +457,7 @@ export class RefreshTokenService {
       };
     });
     if (result.accessRevokedAt && result.accessRevocationWhere) {
-      await this.notifyPendingAccessRevocations({
+      await this.notifyPendingAccessRevocationsBestEffort({
         ...result.accessRevocationWhere,
         accessRevokedAt: result.accessRevokedAt,
       });
@@ -478,7 +491,7 @@ export class RefreshTokenService {
         audience,
       );
     });
-    await this.notifyPendingAccessRevocations({
+    await this.notifyPendingAccessRevocationsBestEffort({
       ...replacement.accessRevocationWhere,
       accessRevokedAt: replacement.accessRevokedAt,
     });

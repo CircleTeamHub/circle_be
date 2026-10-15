@@ -992,6 +992,34 @@ describe('RefreshTokenService', () => {
     expect(userSettings.get('user-1')).toBe(false);
   });
 
+  it('returns the committed replacement session when immediate revocation delivery fails', async () => {
+    await service.create('user-1', { deviceName: 'old login' });
+    userSettings.set('user-1', true);
+    const warn = jest
+      .spyOn((service as any).logger, 'warn')
+      .mockImplementation(() => undefined);
+    prisma.refreshToken.findMany.mockRejectedValueOnce(
+      new Error('database temporarily unavailable'),
+    );
+
+    await expect(
+      service.createAppSession('user-1', { deviceName: 'new login' }),
+    ).resolves.toMatchObject({
+      token: expect.any(String),
+      sessionId: 'session-2',
+    });
+
+    expect(records[0]).toMatchObject({
+      revokedAt: expect.any(Date),
+      accessRevokedAt: expect.any(Date),
+      accessRevocationNotifiedAt: null,
+    });
+    expect(warn).toHaveBeenCalledWith({
+      event: 'access_revocation_delivery_deferred',
+      errorType: 'Error',
+    });
+  });
+
   it('revokes other ADMIN sessions when enabling single-device login', async () => {
     const admin = await service.create('user-1', undefined, 'ADMIN');
     const current = await service.create('user-1', undefined, 'APP');
