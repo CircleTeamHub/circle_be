@@ -900,7 +900,7 @@ model RefreshToken {
   @@index([userId, familyId])
   @@index([userId, audience, createdAt])
   @@index([userId, deviceKey])
-  @@index([accessRevocationNotifiedAt, accessTokenExpiresAt, id])
+  @@index([accessRevocationNotifiedAt, accessTokenExpiresAt, id], map: "RefreshToken_access_revoke_outbox_idx")
   @@index([expiredAt])
   @@index([revokedAt])
 }

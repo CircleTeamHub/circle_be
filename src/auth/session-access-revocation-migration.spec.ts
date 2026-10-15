@@ -30,9 +30,7 @@ describe('session access revocation migrations', () => {
     );
 
     expect(sql).toContain('CREATE INDEX CONCURRENTLY IF NOT EXISTS');
-    expect(sql).toContain(
-      'RefreshToken_accessRevocationNotifiedAt_accessTokenExpiresAt_id_idx',
-    );
+    expect(sql).toContain('RefreshToken_access_revoke_outbox_idx');
     expect(sql).toContain(
       '("accessRevocationNotifiedAt", "accessTokenExpiresAt", "id")',
     );
