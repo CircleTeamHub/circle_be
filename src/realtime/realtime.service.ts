@@ -20,6 +20,7 @@ import {
 import type { NotificationRealtimeDto } from 'src/notification/notification.dto';
 import {
   SESSION_REVOCATION_CHANNEL,
+  ScopeRevocationFence,
   parseSessionRevocationBroadcast,
   type SessionRevocationBroadcast,
 } from 'src/auth/session-revocation.broadcast';
@@ -53,6 +54,9 @@ export type RealtimeSocketIdentity = {
   sessionId: string | null;
   /** `issuedAtMs` (or `iat` x1000); null when the token carries neither. */
   issuedAtMs: number | null;
+  familyId?: string | null;
+  audience?: 'APP' | 'ADMIN' | null;
+  deviceKey?: string | null;
 };
 
 type BadgeSnapshot = {
@@ -286,6 +290,7 @@ export class RealtimeService implements OnModuleInit, OnModuleDestroy {
     WebSocket,
     RealtimeSocketIdentity
   >();
+  private readonly scopeRevocationFence = new ScopeRevocationFence();
   private readonly instanceId = randomUUID();
   /** De-dupes concurrent cache-miss recomputes for the same key within this instance. */
   private readonly inFlightReads = new Map<string, Promise<unknown>>();
@@ -364,7 +369,7 @@ export class RealtimeService implements OnModuleInit, OnModuleDestroy {
       this.revocationSubscriptionActive =
         await this.redisService.subscribePattern(
           SESSION_REVOCATION_CHANNEL,
-          (_channel, message) => this.handleRevocationMessage(message),
+          (_channel, message) => void this.handleRevocationMessage(message),
         );
     }
 
@@ -1163,13 +1168,59 @@ export class RealtimeService implements OnModuleInit, OnModuleDestroy {
     this.deliverLocal(userId, envelope.event);
   }
 
-  private handleRevocationMessage(message: string) {
+  private async handleRevocationMessage(message: string): Promise<void> {
     const broadcast = parseSessionRevocationBroadcast(message);
     if (!broadcast) {
       this.logger.warn('Discarded malformed session-revocation broadcast.');
       return;
     }
-    this.closeRevokedSockets(broadcast);
+    const lease =
+      broadcast.kind === 'scope'
+        ? this.scopeRevocationFence.begin(broadcast)
+        : null;
+    try {
+      const revoked = this.socketsRevokedBy(broadcast);
+      if (revoked.length === 0) return;
+      if (broadcast.kind === 'scope') {
+        if (!lease?.isLatest()) return;
+        if (!(await this.isCurrentScopeRevocation(broadcast))) return;
+        if (!lease.isLatest()) return;
+      }
+      this.closeRevokedSockets(broadcast, revoked);
+    } finally {
+      lease?.release();
+    }
+  }
+
+  private async isCurrentScopeRevocation(
+    broadcast: Extract<SessionRevocationBroadcast, { kind: 'scope' }>,
+  ): Promise<boolean> {
+    try {
+      const current = await this.prisma.sessionScopeGeneration.findUnique({
+        where: {
+          userId_scope_scopeKey: {
+            userId: broadcast.userId,
+            scope: broadcast.scope,
+            scopeKey: broadcast.scopeKey,
+          },
+        },
+        select: { generation: true, exemptFamilyId: true },
+      });
+      return (
+        current?.generation === broadcast.generation &&
+        current.exemptFamilyId === broadcast.exemptFamilyId
+      );
+    } catch (error) {
+      // Failing closed here means applying the revocation. A transient lookup
+      // failure may disconnect an exempt socket, but must never leave a revoked
+      // socket alive until token expiry.
+      this.logger.warn({
+        event: 'scope_revocation_freshness_check_failed',
+        scope: broadcast.scope,
+        errorType: error instanceof Error ? error.name : typeof error,
+      });
+      return true;
+    }
   }
 
   /**
@@ -1181,12 +1232,10 @@ export class RealtimeService implements OnModuleInit, OnModuleDestroy {
    * publishing process on its separate subscriber connection). One code path
    * for local and remote means one behaviour to reason about.
    */
-  closeRevokedSockets(broadcast: SessionRevocationBroadcast): number {
-    const revoked =
-      broadcast.kind === 'user'
-        ? this.socketsRevokedForUser(broadcast.userId, broadcast.revokedAtMs)
-        : this.socketsRevokedForSession(broadcast.sessionId);
-
+  closeRevokedSockets(
+    broadcast: SessionRevocationBroadcast,
+    revoked = this.socketsRevokedBy(broadcast),
+  ): number {
     for (const socket of revoked) {
       try {
         socket.close(REVOKED_CLOSE_CODE, REVOKED_CLOSE_REASON);
@@ -1198,15 +1247,31 @@ export class RealtimeService implements OnModuleInit, OnModuleDestroy {
     }
 
     if (revoked.length > 0) {
-      const target =
-        broadcast.kind === 'user'
-          ? `user ${broadcast.userId}`
-          : `session ${broadcast.sessionId}`;
+      const target = this.revocationTargetLabel(broadcast);
       this.logger.log(
         `Closed ${revoked.length} realtime socket(s) for revoked ${target}.`,
       );
     }
     return revoked.length;
+  }
+
+  private socketsRevokedBy(broadcast: SessionRevocationBroadcast): WebSocket[] {
+    if (broadcast.kind === 'user') {
+      return this.socketsRevokedForUser(
+        broadcast.userId,
+        broadcast.revokedAtMs,
+      );
+    }
+    if (broadcast.kind === 'session') {
+      return this.socketsRevokedForSession(broadcast.sessionId);
+    }
+    return this.socketsRevokedForScope(broadcast);
+  }
+
+  private revocationTargetLabel(broadcast: SessionRevocationBroadcast): string {
+    if (broadcast.kind === 'user') return `user ${broadcast.userId}`;
+    if (broadcast.kind === 'session') return `session ${broadcast.sessionId}`;
+    return broadcast.scope.toLowerCase();
   }
 
   private socketsRevokedForUser(
@@ -1244,6 +1309,30 @@ export class RealtimeService implements OnModuleInit, OnModuleDestroy {
       }
     }
     return [...revoked];
+  }
+
+  private socketsRevokedForScope(
+    broadcast: Extract<SessionRevocationBroadcast, { kind: 'scope' }>,
+  ): WebSocket[] {
+    const group = new Set([
+      ...(this.clients.get(broadcast.userId) ?? []),
+      ...(this.pendingClients.get(broadcast.userId) ?? []),
+    ]);
+    return [...group].filter((socket) => {
+      const identity = this.socketIdentities.get(socket);
+      if (!identity) return false;
+      if (identity.familyId === broadcast.exemptFamilyId) return false;
+      switch (broadcast.scope) {
+        case 'ACCOUNT':
+          return true;
+        case 'AUDIENCE':
+          return identity.audience === broadcast.scopeKey;
+        case 'DEVICE':
+          return identity.deviceKey === broadcast.scopeKey;
+        case 'FAMILY':
+          return identity.familyId === broadcast.scopeKey;
+      }
+    });
   }
 
   private parseRedisEnvelope(

@@ -116,6 +116,18 @@ export class SessionRevocationService {
     return this.announce({ kind: 'session', sessionId });
   }
 
+  /** Broadcast a durable database generation change to already-open sockets. */
+  async revokeScope(event: {
+    userId: string;
+    scope: 'ACCOUNT' | 'AUDIENCE' | 'DEVICE' | 'FAMILY';
+    scopeKey: string;
+    exemptFamilyId: string | null;
+    generation: number;
+  }): Promise<boolean> {
+    if (!this.redis.isEnabled()) return true;
+    return this.announce({ kind: 'scope', ...event });
+  }
+
   /**
    * Tells every instance to drop the WebSockets this revocation just killed.
    * The marker above only gates the *next* request; a live socket has no such

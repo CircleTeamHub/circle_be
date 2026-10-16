@@ -22,7 +22,66 @@ export type SessionRevocationBroadcast =
   /** Every token this user was issued at or before `revokedAtMs` is dead. */
   | { kind: 'user'; userId: string; revokedAtMs: number }
   /** One session (one device) is dead; the user's other devices survive. */
-  | { kind: 'session'; sessionId: string };
+  | { kind: 'session'; sessionId: string }
+  /** One durable generation scope advanced; matching live sockets are dead. */
+  | {
+      kind: 'scope';
+      userId: string;
+      scope: 'ACCOUNT' | 'AUDIENCE' | 'DEVICE' | 'FAMILY';
+      scopeKey: string;
+      exemptFamilyId: string | null;
+      generation: number;
+    };
+
+type ScopeRevocationBroadcast = Extract<
+  SessionRevocationBroadcast,
+  { kind: 'scope' }
+>;
+
+export type ScopeRevocationLease = {
+  isLatest(): boolean;
+  release(): void;
+};
+
+/**
+ * Prevents an older async scope handler from taking effect after a newer
+ * generation for the same durable scope has already reached this process.
+ * Entries live only while handlers are active, so device/family cardinality
+ * cannot turn this into an unbounded process-lifetime cache.
+ */
+export class ScopeRevocationFence {
+  private readonly active = new Map<
+    string,
+    { latestGeneration: number; handlers: number }
+  >();
+
+  begin(event: ScopeRevocationBroadcast): ScopeRevocationLease {
+    const key = JSON.stringify([event.userId, event.scope, event.scopeKey]);
+    const state = this.active.get(key) ?? {
+      latestGeneration: event.generation,
+      handlers: 0,
+    };
+    state.latestGeneration = Math.max(state.latestGeneration, event.generation);
+    state.handlers += 1;
+    this.active.set(key, state);
+    let released = false;
+
+    return {
+      isLatest: () =>
+        !released &&
+        this.active.get(key) === state &&
+        state.latestGeneration === event.generation,
+      release: () => {
+        if (released) return;
+        released = true;
+        state.handlers -= 1;
+        if (state.handlers === 0 && this.active.get(key) === state) {
+          this.active.delete(key);
+        }
+      },
+    };
+  }
+}
 
 /**
  * Parses a message off the backplane. Anything malformed or foreign returns
@@ -55,6 +114,40 @@ export function parseSessionRevocationBroadcast(
     const { sessionId } = candidate;
     if (typeof sessionId !== 'string' || sessionId.length === 0) return null;
     return { kind: 'session', sessionId };
+  }
+
+  if (candidate.kind === 'scope') {
+    const { userId, scope, scopeKey, exemptFamilyId, generation } = candidate;
+    if (typeof userId !== 'string' || userId.length === 0) return null;
+    if (
+      scope !== 'ACCOUNT' &&
+      scope !== 'AUDIENCE' &&
+      scope !== 'DEVICE' &&
+      scope !== 'FAMILY'
+    ) {
+      return null;
+    }
+    if (typeof scopeKey !== 'string' || scopeKey.length === 0) return null;
+    if (exemptFamilyId !== null && typeof exemptFamilyId !== 'string') {
+      return null;
+    }
+    if (
+      typeof generation !== 'number' ||
+      !Number.isSafeInteger(generation) ||
+      generation < 1
+    ) {
+      return null;
+    }
+    const normalizedExemption =
+      typeof exemptFamilyId === 'string' ? exemptFamilyId : null;
+    return {
+      kind: 'scope',
+      userId,
+      scope,
+      scopeKey,
+      exemptFamilyId: normalizedExemption,
+      generation,
+    };
   }
 
   return null;

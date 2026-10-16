@@ -12,9 +12,12 @@ import type { JwtPayload } from 'src/auth/types';
 import { SessionVerifier } from 'src/auth/session-verifier.service';
 import {
   SESSION_REVOCATION_CHANNEL,
+  ScopeRevocationFence,
   parseSessionRevocationBroadcast,
+  type SessionRevocationBroadcast,
 } from 'src/auth/session-revocation.broadcast';
 import { RedisService } from 'src/redis/redis.service';
+import { PrismaService } from 'src/prisma/prisma.service';
 import { ChatErrorCode, type AppErrorCode } from 'src/common/app-error-codes';
 import { reportOperationalError } from 'src/logging/error-aggregation.service';
 import { randomUUID } from 'node:crypto';
@@ -236,6 +239,7 @@ export class ChatGateway implements OnModuleDestroy {
   /** 初始化期间只保留一个小型 FIFO；超过它说明客户端正在洪泛而不是正常抢发。 */
   private static readonly MAX_PRE_READY_EVENTS = 64;
   private readonly connectionsByUser = new Map<string, Set<Socket>>();
+  private readonly scopeRevocationFence = new ScopeRevocationFence();
   /**
    * 「正在输入」开关的短 TTL 缓存。typing 每人每 5 秒最多 10 条,30 秒的 TTL 把
    * 数据库读压到「每人每 30 秒一次」,同时把多端改设置的追平窗口收在 30 秒内。
@@ -257,6 +261,7 @@ export class ChatGateway implements OnModuleDestroy {
     private readonly broadcast: ChatBroadcastService,
     private readonly chatPush: ChatPushService,
     private readonly redisService: RedisService,
+    private readonly prisma: PrismaService,
     private readonly configService: ConfigService,
     private readonly presence: ChatPresenceRegistry,
     private readonly supportRecharge: ChatSupportRechargeProcessor,
@@ -560,7 +565,17 @@ export class ChatGateway implements OnModuleDestroy {
     if (!this.redisService.isEnabled()) return;
     void this.redisService
       .subscribePattern(SESSION_REVOCATION_CHANNEL, (_channel, message) => {
-        void this.handleRevocation(message);
+        void this.handleRevocation(message).catch((error: unknown) => {
+          reportOperationalError(error, {
+            component: 'ChatGateway',
+            operation: 'handleRevocation',
+            kind: 'websocket',
+          });
+          this.logger.warn({
+            event: 'session_revocation_delivery_failed',
+            errorType: error instanceof Error ? error.name : typeof error,
+          });
+        });
       })
       .then((subscribed) => {
         if (subscribed) {
@@ -631,16 +646,19 @@ export class ChatGateway implements OnModuleDestroy {
     // Redis 不可用时回退查库（SessionVerifier）。库也查不到才判「无法校验」：
     // 不放行可能已吊销的会话，也不把可重试的服务端故障说成未授权 ——
     // 与 REST（503）和 /realtime（close 1013）同一口径。
-    const verdict = await this.sessionVerifier.verify(payload);
-    if (verdict === 'revoked') {
+    const verification = await this.sessionVerifier.verifyWithIdentity(payload);
+    if (verification.verdict === 'revoked') {
       return this.rejectAuth(socket, 'revoked');
     }
-    if (verdict === 'unavailable') {
+    if (verification.verdict === 'unavailable') {
       return this.rejectAuth(socket, 'session_unverifiable');
     }
     socket.data.sessionId =
       typeof payload.sid === 'string' ? payload.sid : null;
     socket.data.issuedAtMs = issuedAtMsOf(payload);
+    socket.data.familyId = verification.identity?.familyId ?? null;
+    socket.data.audience = verification.identity?.audience ?? null;
+    socket.data.deviceKey = verification.identity?.deviceKey ?? null;
     socket.data.expMs =
       typeof payload.exp === 'number' ? payload.exp * 1000 : null;
     return payload.sub;
@@ -745,20 +763,98 @@ export class ChatGateway implements OnModuleDestroy {
     if (!io) return;
     const broadcast = parseSessionRevocationBroadcast(message);
     if (!broadcast) return;
-    const sockets =
-      broadcast.kind === 'user'
-        ? await io.in(userRoom(broadcast.userId)).fetchSockets()
-        : await io.fetchSockets();
-    for (const socket of sockets) {
-      const data = socket.data as {
-        sessionId?: string | null;
-        issuedAtMs?: number | null;
-      };
-      const dead =
-        broadcast.kind === 'user'
-          ? data.issuedAtMs == null || data.issuedAtMs <= broadcast.revokedAtMs
-          : data.sessionId === broadcast.sessionId;
-      if (dead) socket.disconnect(true);
+    const lease =
+      broadcast.kind === 'scope'
+        ? this.scopeRevocationFence.begin(broadcast)
+        : null;
+    try {
+      // Namespace middleware has completed for these sockets. Connections still
+      // inside middleware are fenced by handleConnection's final verification.
+      const sockets = await io.local.fetchSockets();
+      const revoked = sockets.filter((socket) => {
+        const data = socket.data as {
+          userId?: string;
+          sessionId?: string | null;
+          issuedAtMs?: number | null;
+          familyId?: string | null;
+          audience?: 'APP' | 'ADMIN' | null;
+          deviceKey?: string | null;
+        };
+        if (broadcast.kind !== 'session' && data.userId !== broadcast.userId) {
+          return false;
+        }
+        return this.revocationMatchesSocket(broadcast, data);
+      });
+      if (revoked.length === 0) return;
+      if (broadcast.kind === 'scope') {
+        if (!lease?.isLatest()) return;
+        if (!(await this.isCurrentScopeRevocation(broadcast))) return;
+        // The durable lookup may have started before a newer broadcast reached
+        // this process. Recheck the synchronous high-water mark after await.
+        if (!lease.isLatest()) return;
+      }
+      for (const socket of revoked) socket.disconnect(true);
+    } finally {
+      lease?.release();
+    }
+  }
+
+  private async isCurrentScopeRevocation(
+    broadcast: Extract<SessionRevocationBroadcast, { kind: 'scope' }>,
+  ): Promise<boolean> {
+    try {
+      const current = await this.prisma.sessionScopeGeneration.findUnique({
+        where: {
+          userId_scope_scopeKey: {
+            userId: broadcast.userId,
+            scope: broadcast.scope,
+            scopeKey: broadcast.scopeKey,
+          },
+        },
+        select: { generation: true, exemptFamilyId: true },
+      });
+      return (
+        current?.generation === broadcast.generation &&
+        current.exemptFamilyId === broadcast.exemptFamilyId
+      );
+    } catch (error) {
+      this.logger.warn({
+        event: 'scope_revocation_freshness_check_failed',
+        scope: broadcast.scope,
+        errorType: error instanceof Error ? error.name : typeof error,
+      });
+      return true;
+    }
+  }
+
+  private revocationMatchesSocket(
+    broadcast: SessionRevocationBroadcast,
+    data: {
+      sessionId?: string | null;
+      issuedAtMs?: number | null;
+      familyId?: string | null;
+      audience?: 'APP' | 'ADMIN' | null;
+      deviceKey?: string | null;
+    },
+  ): boolean {
+    if (broadcast.kind === 'user') {
+      return (
+        data.issuedAtMs == null || data.issuedAtMs <= broadcast.revokedAtMs
+      );
+    }
+    if (broadcast.kind === 'session') {
+      return data.sessionId === broadcast.sessionId;
+    }
+    if (data.familyId === broadcast.exemptFamilyId) return false;
+    switch (broadcast.scope) {
+      case 'ACCOUNT':
+        return true;
+      case 'AUDIENCE':
+        return data.audience === broadcast.scopeKey;
+      case 'DEVICE':
+        return data.deviceKey === broadcast.scopeKey;
+      case 'FAMILY':
+        return data.familyId === broadcast.scopeKey;
     }
   }
 
@@ -1035,6 +1131,40 @@ export class ChatGateway implements OnModuleDestroy {
       failAdmission();
       socket.disconnect(true);
       return;
+    }
+    // Socket.IO does not expose namespace-middleware sockets through the
+    // adapter. Once handleConnection starts the socket is visible to broadcast
+    // scans; this second verifier closes the pre-connect race before room
+    // membership or queued business events can become active. Presence is a
+    // pending connection slot here, matching RealtimeGateway's admission fence.
+    if (!guestConversationId) {
+      const finalVerdict = await this.sessionVerifier.verify({
+        sub: userId,
+        sid:
+          typeof socket.data.sessionId === 'string'
+            ? socket.data.sessionId
+            : undefined,
+        issuedAtMs:
+          typeof socket.data.issuedAtMs === 'number'
+            ? socket.data.issuedAtMs
+            : undefined,
+      });
+      if (socket.disconnected) return;
+      if (finalVerdict !== 'active') {
+        failAdmission();
+        socket.data.authFailureReason =
+          finalVerdict === 'revoked' ? 'revoked' : 'session_unverifiable';
+        this.observeAuthRejection(socket, traceId);
+        if (finalVerdict === 'unavailable') {
+          // A transport failure is reconnectable. Socket.IO treats an explicit
+          // server namespace disconnect as terminal, which would turn a brief
+          // verifier outage into a connection that never retries.
+          socket.conn.close();
+        } else {
+          socket.disconnect(true);
+        }
+        return;
+      }
     }
     this.scheduleExpiryDisconnect(socket);
     // 在后台建立的连接(安卓后台重连、iOS 后台唤醒)一开始就按后台登记。等连上

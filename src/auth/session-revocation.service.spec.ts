@@ -16,6 +16,25 @@ describe('parseSessionRevocationBroadcast', () => {
         JSON.stringify({ kind: 'session', sessionId: 's1' }),
       ),
     ).toEqual({ kind: 'session', sessionId: 's1' });
+    expect(
+      parseSessionRevocationBroadcast(
+        JSON.stringify({
+          kind: 'scope',
+          userId: 'u1',
+          scope: 'DEVICE',
+          scopeKey: 'device-1',
+          exemptFamilyId: null,
+          generation: 3,
+        }),
+      ),
+    ).toEqual({
+      kind: 'scope',
+      userId: 'u1',
+      scope: 'DEVICE',
+      scopeKey: 'device-1',
+      exemptFamilyId: null,
+      generation: 3,
+    });
   });
 
   it.each([
@@ -32,6 +51,25 @@ describe('parseSessionRevocationBroadcast', () => {
       JSON.stringify({ kind: 'user', userId: 'u1', revokedAtMs: 'x' }),
     ],
     ['missing sessionId', JSON.stringify({ kind: 'session' })],
+    [
+      'unknown scope',
+      JSON.stringify({
+        kind: 'scope',
+        userId: 'u1',
+        scope: 'UNKNOWN',
+        scopeKey: '*',
+      }),
+    ],
+    [
+      'scope without generation',
+      JSON.stringify({
+        kind: 'scope',
+        userId: 'u1',
+        scope: 'DEVICE',
+        scopeKey: 'device-1',
+        exemptFamilyId: null,
+      }),
+    ],
   ])('rejects %s rather than throwing', (_label, message) => {
     expect(parseSessionRevocationBroadcast(message)).toBeNull();
   });
@@ -247,6 +285,28 @@ describe('SessionRevocationService', () => {
       expect(redis.publish).toHaveBeenCalledWith(
         SESSION_REVOCATION_CHANNEL,
         JSON.stringify({ kind: 'session', sessionId: 's1' }),
+      );
+    });
+
+    it('announces the durable generation with a scoped revocation', async () => {
+      await svc.revokeScope({
+        userId: 'u1',
+        scope: 'DEVICE',
+        scopeKey: 'device-1',
+        exemptFamilyId: null,
+        generation: 3,
+      });
+
+      expect(redis.publish).toHaveBeenCalledWith(
+        SESSION_REVOCATION_CHANNEL,
+        JSON.stringify({
+          kind: 'scope',
+          userId: 'u1',
+          scope: 'DEVICE',
+          scopeKey: 'device-1',
+          exemptFamilyId: null,
+          generation: 3,
+        }),
       );
     });
 
