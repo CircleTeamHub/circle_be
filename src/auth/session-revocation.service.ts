@@ -122,6 +122,7 @@ export class SessionRevocationService {
     scope: 'ACCOUNT' | 'AUDIENCE' | 'DEVICE' | 'FAMILY';
     scopeKey: string;
     exemptFamilyId: string | null;
+    generation: number;
   }): Promise<boolean> {
     if (!this.redis.isEnabled()) return true;
     return this.announce({ kind: 'scope', ...event });

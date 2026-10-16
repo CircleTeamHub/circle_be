@@ -24,6 +24,7 @@ describe('parseSessionRevocationBroadcast', () => {
           scope: 'DEVICE',
           scopeKey: 'device-1',
           exemptFamilyId: null,
+          generation: 3,
         }),
       ),
     ).toEqual({
@@ -32,6 +33,7 @@ describe('parseSessionRevocationBroadcast', () => {
       scope: 'DEVICE',
       scopeKey: 'device-1',
       exemptFamilyId: null,
+      generation: 3,
     });
   });
 
@@ -56,6 +58,16 @@ describe('parseSessionRevocationBroadcast', () => {
         userId: 'u1',
         scope: 'UNKNOWN',
         scopeKey: '*',
+      }),
+    ],
+    [
+      'scope without generation',
+      JSON.stringify({
+        kind: 'scope',
+        userId: 'u1',
+        scope: 'DEVICE',
+        scopeKey: 'device-1',
+        exemptFamilyId: null,
       }),
     ],
   ])('rejects %s rather than throwing', (_label, message) => {
@@ -273,6 +285,28 @@ describe('SessionRevocationService', () => {
       expect(redis.publish).toHaveBeenCalledWith(
         SESSION_REVOCATION_CHANNEL,
         JSON.stringify({ kind: 'session', sessionId: 's1' }),
+      );
+    });
+
+    it('announces the durable generation with a scoped revocation', async () => {
+      await svc.revokeScope({
+        userId: 'u1',
+        scope: 'DEVICE',
+        scopeKey: 'device-1',
+        exemptFamilyId: null,
+        generation: 3,
+      });
+
+      expect(redis.publish).toHaveBeenCalledWith(
+        SESSION_REVOCATION_CHANNEL,
+        JSON.stringify({
+          kind: 'scope',
+          userId: 'u1',
+          scope: 'DEVICE',
+          scopeKey: 'device-1',
+          exemptFamilyId: null,
+          generation: 3,
+        }),
       );
     });
 

@@ -404,15 +404,14 @@ export class RefreshTokenService {
     generation: number;
   }): Promise<void> {
     try {
-      const { generation, ...broadcast } = event;
-      const delivered = await this.revocation.revokeScope(broadcast);
+      const delivered = await this.revocation.revokeScope(event);
       if (delivered !== false) {
         await this.prisma.sessionScopeGeneration.updateMany({
           where: {
             userId: event.userId,
             scope: event.scope,
             scopeKey: event.scopeKey,
-            generation,
+            generation: event.generation,
             notificationPending: true,
           },
           data: { notificationPending: false },
@@ -455,6 +454,7 @@ export class RefreshTokenService {
             scope: row.scope,
             scopeKey: row.scopeKey,
             exemptFamilyId: row.exemptFamilyId,
+            generation: row.generation,
           }),
         })),
       );

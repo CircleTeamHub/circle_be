@@ -20,6 +20,7 @@ import {
 import type { NotificationRealtimeDto } from 'src/notification/notification.dto';
 import {
   SESSION_REVOCATION_CHANNEL,
+  ScopeRevocationFence,
   parseSessionRevocationBroadcast,
   type SessionRevocationBroadcast,
 } from 'src/auth/session-revocation.broadcast';
@@ -289,6 +290,7 @@ export class RealtimeService implements OnModuleInit, OnModuleDestroy {
     WebSocket,
     RealtimeSocketIdentity
   >();
+  private readonly scopeRevocationFence = new ScopeRevocationFence();
   private readonly instanceId = randomUUID();
   /** De-dupes concurrent cache-miss recomputes for the same key within this instance. */
   private readonly inFlightReads = new Map<string, Promise<unknown>>();
@@ -367,7 +369,7 @@ export class RealtimeService implements OnModuleInit, OnModuleDestroy {
       this.revocationSubscriptionActive =
         await this.redisService.subscribePattern(
           SESSION_REVOCATION_CHANNEL,
-          (_channel, message) => this.handleRevocationMessage(message),
+          (_channel, message) => void this.handleRevocationMessage(message),
         );
     }
 
@@ -1166,13 +1168,59 @@ export class RealtimeService implements OnModuleInit, OnModuleDestroy {
     this.deliverLocal(userId, envelope.event);
   }
 
-  private handleRevocationMessage(message: string) {
+  private async handleRevocationMessage(message: string): Promise<void> {
     const broadcast = parseSessionRevocationBroadcast(message);
     if (!broadcast) {
       this.logger.warn('Discarded malformed session-revocation broadcast.');
       return;
     }
-    this.closeRevokedSockets(broadcast);
+    const lease =
+      broadcast.kind === 'scope'
+        ? this.scopeRevocationFence.begin(broadcast)
+        : null;
+    try {
+      const revoked = this.socketsRevokedBy(broadcast);
+      if (revoked.length === 0) return;
+      if (broadcast.kind === 'scope') {
+        if (!lease?.isLatest()) return;
+        if (!(await this.isCurrentScopeRevocation(broadcast))) return;
+        if (!lease.isLatest()) return;
+      }
+      this.closeRevokedSockets(broadcast, revoked);
+    } finally {
+      lease?.release();
+    }
+  }
+
+  private async isCurrentScopeRevocation(
+    broadcast: Extract<SessionRevocationBroadcast, { kind: 'scope' }>,
+  ): Promise<boolean> {
+    try {
+      const current = await this.prisma.sessionScopeGeneration.findUnique({
+        where: {
+          userId_scope_scopeKey: {
+            userId: broadcast.userId,
+            scope: broadcast.scope,
+            scopeKey: broadcast.scopeKey,
+          },
+        },
+        select: { generation: true, exemptFamilyId: true },
+      });
+      return (
+        current?.generation === broadcast.generation &&
+        current.exemptFamilyId === broadcast.exemptFamilyId
+      );
+    } catch (error) {
+      // Failing closed here means applying the revocation. A transient lookup
+      // failure may disconnect an exempt socket, but must never leave a revoked
+      // socket alive until token expiry.
+      this.logger.warn({
+        event: 'scope_revocation_freshness_check_failed',
+        scope: broadcast.scope,
+        errorType: error instanceof Error ? error.name : typeof error,
+      });
+      return true;
+    }
   }
 
   /**
@@ -1184,9 +1232,10 @@ export class RealtimeService implements OnModuleInit, OnModuleDestroy {
    * publishing process on its separate subscriber connection). One code path
    * for local and remote means one behaviour to reason about.
    */
-  closeRevokedSockets(broadcast: SessionRevocationBroadcast): number {
-    const revoked = this.socketsRevokedBy(broadcast);
-
+  closeRevokedSockets(
+    broadcast: SessionRevocationBroadcast,
+    revoked = this.socketsRevokedBy(broadcast),
+  ): number {
     for (const socket of revoked) {
       try {
         socket.close(REVOKED_CLOSE_CODE, REVOKED_CLOSE_REASON);
@@ -1222,7 +1271,7 @@ export class RealtimeService implements OnModuleInit, OnModuleDestroy {
   private revocationTargetLabel(broadcast: SessionRevocationBroadcast): string {
     if (broadcast.kind === 'user') return `user ${broadcast.userId}`;
     if (broadcast.kind === 'session') return `session ${broadcast.sessionId}`;
-    return `${broadcast.scope.toLowerCase()} ${broadcast.scopeKey}`;
+    return broadcast.scope.toLowerCase();
   }
 
   private socketsRevokedForUser(

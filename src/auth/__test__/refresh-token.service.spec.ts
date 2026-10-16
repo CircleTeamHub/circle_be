@@ -495,6 +495,7 @@ describe('RefreshTokenService', () => {
       scope: 'FAMILY',
       scopeKey: records[0].familyId,
       exemptFamilyId: null,
+      generation: 1,
     });
   });
 
@@ -533,6 +534,7 @@ describe('RefreshTokenService', () => {
       scope: 'ACCOUNT',
       scopeKey: '*',
       exemptFamilyId: 'current-family',
+      generation: 1,
     });
   });
 
@@ -552,6 +554,7 @@ describe('RefreshTokenService', () => {
       scope: 'DEVICE',
       scopeKey: 'device-a',
       exemptFamilyId: null,
+      generation: 1,
     });
     expect(records[0].accessRevokedAt).toBeNull();
     expect(records[1].accessRevokedAt).toBeNull();
@@ -583,6 +586,7 @@ describe('RefreshTokenService', () => {
       scopeKey: '*',
       exemptFamilyId: records.find(({ id }) => id === current.sessionId)
         ?.familyId,
+      generation: 1,
     });
     expect(records[1].accessRevokedAt).toBeNull();
     expect(records[2].accessRevokedAt).toBeNull();
@@ -606,6 +610,7 @@ describe('RefreshTokenService', () => {
       scope: 'ACCOUNT',
       scopeKey: '*',
       exemptFamilyId: records.find(({ id }) => id === currentOldSid)?.familyId,
+      generation: 1,
     });
     expect(
       records.find((record) => record.id === currentOldSid)?.accessRevokedAt,
@@ -1167,6 +1172,7 @@ describe('RefreshTokenService', () => {
       scopeKey: '*',
       exemptFamilyId: records.find(({ id }) => id === current.sessionId)
         ?.familyId,
+      generation: 1,
     });
   });
 

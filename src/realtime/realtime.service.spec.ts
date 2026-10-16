@@ -7,6 +7,14 @@ import {
   RealtimeService,
 } from './realtime.service';
 
+function deferred<T>() {
+  let resolve!: (value: T | PromiseLike<T>) => void;
+  const promise = new Promise<T>((done) => {
+    resolve = done;
+  });
+  return { promise, resolve };
+}
+
 describe('RealtimeService', () => {
   let service: RealtimeService;
   const redis = {
@@ -38,6 +46,9 @@ describe('RealtimeService', () => {
     },
     userDisplayIcon: {
       findFirst: jest.fn(),
+    },
+    sessionScopeGeneration: {
+      findUnique: jest.fn(),
     },
   };
 
@@ -491,10 +502,146 @@ describe('RealtimeService', () => {
         scope: 'DEVICE',
         scopeKey: 'device-a',
         exemptFamilyId: null,
+        generation: 1,
       }),
     ).toBe(1);
     expect(revokedSocket.close).toHaveBeenCalled();
     expect(survivingSocket.close).not.toHaveBeenCalled();
+  });
+
+  it('ignores a scoped broadcast superseded by a newer durable generation', async () => {
+    const socket = { close: jest.fn() } as any;
+    service.registerClient('user-1', socket, {
+      sessionId: 'session-b',
+      issuedAtMs: 100,
+      familyId: 'family-b',
+      audience: 'APP',
+      deviceKey: 'device-b',
+    });
+    prisma.sessionScopeGeneration.findUnique.mockResolvedValue({
+      generation: 2,
+      exemptFamilyId: 'family-b',
+    });
+
+    await service['handleRevocationMessage'](
+      JSON.stringify({
+        kind: 'scope',
+        userId: 'user-1',
+        scope: 'ACCOUNT',
+        scopeKey: '*',
+        exemptFamilyId: 'family-a',
+        generation: 1,
+      }),
+    );
+
+    expect(socket.close).not.toHaveBeenCalled();
+  });
+
+  it('does not let an older concurrent scope handler override a newer exemption', async () => {
+    const familyA = { close: jest.fn() } as any;
+    const familyB = { close: jest.fn() } as any;
+    service.registerClient('user-1', familyA, {
+      sessionId: 'session-a',
+      issuedAtMs: 100,
+      familyId: 'family-a',
+      audience: 'APP',
+      deviceKey: 'device-a',
+    });
+    service.registerClient('user-1', familyB, {
+      sessionId: 'session-b',
+      issuedAtMs: 100,
+      familyId: 'family-b',
+      audience: 'APP',
+      deviceKey: 'device-b',
+    });
+    const generation1 = deferred<{
+      generation: number;
+      exemptFamilyId: string;
+    }>();
+    const generation2 = deferred<{
+      generation: number;
+      exemptFamilyId: string;
+    }>();
+    prisma.sessionScopeGeneration.findUnique
+      .mockReturnValueOnce(generation1.promise)
+      .mockReturnValueOnce(generation2.promise);
+
+    const older = service['handleRevocationMessage'](
+      JSON.stringify({
+        kind: 'scope',
+        userId: 'user-1',
+        scope: 'ACCOUNT',
+        scopeKey: '*',
+        exemptFamilyId: 'family-a',
+        generation: 1,
+      }),
+    );
+    await Promise.resolve();
+    const newer = service['handleRevocationMessage'](
+      JSON.stringify({
+        kind: 'scope',
+        userId: 'user-1',
+        scope: 'ACCOUNT',
+        scopeKey: '*',
+        exemptFamilyId: 'family-b',
+        generation: 2,
+      }),
+    );
+    await Promise.resolve();
+
+    generation2.resolve({ generation: 2, exemptFamilyId: 'family-b' });
+    await newer;
+    generation1.resolve({ generation: 1, exemptFamilyId: 'family-a' });
+    await older;
+
+    expect(familyA.close).toHaveBeenCalledWith(
+      REVOKED_CLOSE_CODE,
+      REVOKED_CLOSE_REASON,
+    );
+    expect(familyB.close).not.toHaveBeenCalled();
+  });
+
+  it('skips the scope generation lookup when this instance has no target socket', async () => {
+    await service['handleRevocationMessage'](
+      JSON.stringify({
+        kind: 'scope',
+        userId: 'user-1',
+        scope: 'ACCOUNT',
+        scopeKey: '*',
+        exemptFamilyId: null,
+        generation: 1,
+      }),
+    );
+
+    expect(prisma.sessionScopeGeneration.findUnique).not.toHaveBeenCalled();
+  });
+
+  it('does not write device or family scope keys to revocation logs', () => {
+    const socket = { close: jest.fn() } as any;
+    const log = jest
+      .spyOn((service as any).logger, 'log')
+      .mockImplementation(() => undefined);
+    service.registerClient('user-1', socket, {
+      sessionId: 'session-a',
+      issuedAtMs: 100,
+      familyId: 'family-secret',
+      audience: 'APP',
+      deviceKey: 'device-secret',
+    });
+
+    service.closeRevokedSockets({
+      kind: 'scope',
+      userId: 'user-1',
+      scope: 'DEVICE',
+      scopeKey: 'device-secret',
+      exemptFamilyId: null,
+      generation: 1,
+    });
+
+    const output = JSON.stringify(log.mock.calls);
+    expect(output).toContain('device');
+    expect(output).not.toContain('device-secret');
+    expect(output).not.toContain('family-secret');
   });
 
   it('safeBroadcastAll does not throw even when callbacks fail', async () => {
