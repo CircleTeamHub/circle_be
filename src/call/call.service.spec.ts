@@ -118,6 +118,7 @@ describe('CallService', () => {
 
   function mockCircleMembers() {
     prisma.circle.findFirst.mockResolvedValue({
+      adminState: 'ACTIVE',
       id: 'circle-1',
       groupID: 'group-1',
       ownerID: 'user-1',
@@ -433,6 +434,7 @@ describe('CallService', () => {
     async function errorCodeFor(permitted: boolean) {
       jest.clearAllMocks();
       prisma.circle.findFirst.mockResolvedValue({
+        adminState: 'ACTIVE',
         id: 'circle-1',
         groupID: 'group-1',
         ownerID: 'user-1',
@@ -494,6 +496,7 @@ describe('CallService', () => {
 
   it('rejects invalid invitees with a stable error code', async () => {
     prisma.circle.findFirst.mockResolvedValue({
+      adminState: 'ACTIVE',
       id: 'circle-1',
       groupID: 'group-1',
       ownerID: 'user-1',
@@ -514,6 +517,7 @@ describe('CallService', () => {
 
   it('rejects calls when the initiator is not an active mapped group member', async () => {
     prisma.circle.findFirst.mockResolvedValue({
+      adminState: 'ACTIVE',
       id: 'circle-1',
       groupID: 'group-1',
       ownerID: 'owner-1',
@@ -595,7 +599,135 @@ describe('CallService', () => {
     expect(prisma.callParticipant.findFirst).toHaveBeenCalled();
   });
 
+  describe('current group authorization at token issuance', () => {
+    const participant = (status: string) => ({
+      callID: 'call-1',
+      userID: 'user-2',
+      status,
+      user: { id: 'user-2', nickname: 'Bob', avatarUrl: null },
+      call: {
+        id: 'call-1',
+        conversationID: 'group-1',
+        sessionType: 3,
+        callType: 'AUDIO',
+        status: 'ACTIVE',
+        livekitRoomName: 'room-1',
+        participants: [{ userID: 'user-1' }, { userID: 'user-2' }],
+      },
+    });
+    it.each(['INVITED', 'JOINED'])(
+      'rejects accept after removal even with a %s participant record',
+      async (status) => {
+        mockCircleMembers();
+        prisma.circleMember.findMany.mockResolvedValue([]);
+        prisma.callParticipant.findUnique.mockResolvedValue(
+          participant(status),
+        );
+        await expectErrorCode(
+          service.acceptCall('user-2', 'call-1'),
+          CallErrorCode.NotGroupMember,
+        );
+        expect(livekit.mintJoinToken).not.toHaveBeenCalled();
+        expect(prisma.callParticipant.updateMany).not.toHaveBeenCalled();
+      },
+    );
+    it('rejects refresh after circle membership is suspended', async () => {
+      mockCircleMembers();
+      prisma.circleMember.findMany.mockResolvedValue([
+        { userID: 'user-2', status: 'SUSPENDED' },
+      ]);
+      prisma.callParticipant.findUnique.mockResolvedValue(
+        participant('JOINED'),
+      );
+      await expectErrorCode(
+        service.createJoinToken('user-2', 'call-1'),
+        CallErrorCode.NotGroupMember,
+      );
+      expect(livekit.mintJoinToken).not.toHaveBeenCalled();
+    });
+    it('rejects a removed standalone-group seat', async () => {
+      prisma.circle.findFirst.mockResolvedValue(null);
+      prisma.chatConversation = {
+        findUnique: jest
+          .fn()
+          .mockResolvedValue({ type: 'GROUP', circleID: null }),
+      };
+      prisma.chatMember = { findMany: jest.fn().mockResolvedValue([]) };
+      prisma.callParticipant.findUnique.mockResolvedValue(
+        participant('JOINED'),
+      );
+      await expectErrorCode(
+        service.createJoinToken('user-2', 'call-1'),
+        CallErrorCode.NotGroupMember,
+      );
+      expect(livekit.mintJoinToken).not.toHaveBeenCalled();
+    });
+    it('does not use a stale ChatMember seat to bypass circle membership', async () => {
+      prisma.circle.findFirst
+        .mockResolvedValueOnce(null)
+        .mockResolvedValueOnce({ id: 'circle-1' });
+      prisma.chatConversation = {
+        findUnique: jest
+          .fn()
+          .mockResolvedValue({ type: 'GROUP', circleID: 'circle-1' }),
+      };
+      prisma.circleMember.findMany.mockResolvedValue([]);
+      prisma.callParticipant.findUnique.mockResolvedValue(
+        participant('JOINED'),
+      );
+      await expectErrorCode(
+        service.createJoinToken('user-2', 'call-1'),
+        CallErrorCode.NotGroupMember,
+      );
+      expect(livekit.mintJoinToken).not.toHaveBeenCalled();
+    });
+    it.each(['ended', 'expired', 'missing'])(
+      'rejects a token for a %s temporary room even with an old seat',
+      async (state) => {
+        prisma.circle.findFirst.mockResolvedValue(null);
+        prisma.chatConversation = {
+          findUnique: jest.fn().mockResolvedValue({
+            type: 'TEMP',
+            circleID: null,
+            tempChatID: 'temp-1',
+          }),
+        };
+        prisma.tempChat = {
+          findUnique: jest.fn().mockResolvedValue(
+            state === 'missing'
+              ? null
+              : {
+                  status: state === 'ended' ? 'ENDED' : 'ACTIVE',
+                  endedAt: null,
+                  expiresAt: new Date(
+                    now.getTime() + (state === 'expired' ? -1 : 60_000),
+                  ),
+                },
+          ),
+        };
+        prisma.callParticipant.findUnique.mockResolvedValue(
+          participant('JOINED'),
+        );
+        await expectErrorCode(
+          service.createJoinToken('user-2', 'call-1'),
+          CallErrorCode.NotGroupMember,
+        );
+        expect(livekit.mintJoinToken).not.toHaveBeenCalled();
+      },
+    );
+    it('allows a current member to refresh', async () => {
+      mockCircleMembers();
+      prisma.callParticipant.findUnique.mockResolvedValue(
+        participant('JOINED'),
+      );
+      await expect(
+        service.createJoinToken('user-2', 'call-1'),
+      ).resolves.toMatchObject({ livekit: { token: 'livekit-token' } });
+    });
+  });
+
   it('accepts an invited participant and returns their LiveKit token', async () => {
+    mockCircleMembers();
     prisma.callParticipant.findUnique.mockResolvedValue({
       callID: 'call-1',
       userID: 'user-2',
@@ -665,6 +797,7 @@ describe('CallService', () => {
   });
 
   it('treats repeated accept as idempotent when the participant already joined', async () => {
+    mockCircleMembers();
     prisma.callParticipant.findUnique.mockResolvedValue({
       callID: 'call-1',
       userID: 'user-2',

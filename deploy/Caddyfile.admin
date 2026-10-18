@@ -77,6 +77,23 @@
 
 	# 自研 chat 网关(socket.io,/chat-ws)与 /realtime 原生 WS 都挂在 circle_be
 	# 同一 HTTP 端口,由下面的 catch-all 反代;reverse_proxy 自动处理 WS 升级。
+	@websocket_upgrade {
+		path /chat-ws /chat-ws/* /realtime
+		header Upgrade websocket
+	}
+	handle @websocket_upgrade {
+		rate_limit {
+			zone websocket_handshake {
+				key {remote_host}
+				events 60
+				window 1m
+			}
+		}
+		reverse_proxy {$CIRCLE_BE_UPSTREAM:circle-be-blue:3000} {
+			header_up X-Connection-Trace-Id {http.vars.connection_trace_id}
+		}
+	}
+
 	handle {
 		# 业务 API 的兜底闸。circle_be 自己有每 IP 300 次/分钟的全局限流
 		# （src/setup.ts），这里放宽到 600 只做 DoS 兜底：真正的业务额度由后端

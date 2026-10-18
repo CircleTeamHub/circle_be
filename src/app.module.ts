@@ -1,10 +1,14 @@
 import { Logger, Module } from '@nestjs/common';
+import { APP_GUARD, APP_INTERCEPTOR } from '@nestjs/core';
+import { HttpCapacityInterceptor } from './interceptors/http-capacity.interceptor';
+import { DefaultAuthGuard } from './guards/default-auth.guard';
 import { UserModule } from './user/user.module';
 import { ConfigModule } from '@nestjs/config';
 import * as dotenv from 'dotenv';
 import { ScheduleModule } from '@nestjs/schedule';
 // ThrottlerModule.forRoot is registered globally so @Throttle metadata works,
 // but the ThrottlerGuard is applied per-controller (see TempChatController),
+// not via a global APP_GUARD — rate limiting stays scoped to temp-chat.
 import { ThrottlerModule } from '@nestjs/throttler';
 
 import { AuthModule } from './auth/auth.module';
@@ -122,6 +126,8 @@ const envFilePath = `.env.${nodeEnv}`;
   controllers: [],
   providers: [
     Logger,
+    { provide: APP_GUARD, useClass: DefaultAuthGuard },
+    { provide: APP_INTERCEPTOR, useClass: HttpCapacityInterceptor },
   ],
   exports: [Logger],
 })

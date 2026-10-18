@@ -53,7 +53,24 @@ export class ModerationAdminService {
       }),
       this.prisma.circlePostReport.count({ where: { status } }),
     ]);
-    return { items, total, page, limit: take };
+    // Post reports retain scalar IDs, so resolve this page in one bounded query.
+    const reporterIds = [...new Set(items.map((item) => item.reporterID))];
+    const reporters = reporterIds.length
+      ? await this.prisma.user.findMany({
+          where: { id: { in: reporterIds } },
+          select: { id: true, nickname: true, accountId: true, status: true },
+        })
+      : [];
+    const usersById = new Map(reporters.map((user) => [user.id, user]));
+    return {
+      items: items.map((item) => ({
+        ...item,
+        reporter: usersById.get(item.reporterID) ?? null,
+      })),
+      total,
+      page,
+      limit: take,
+    };
   }
 
   // ─── 报告审核 ────────────────────────────────────────────────────────────────

@@ -1,3 +1,4 @@
+import { ChatService } from 'src/chat/chat.service';
 import {
   BadRequestException,
   ConflictException,
@@ -107,8 +108,7 @@ type BNTableContent = {
   columnWidths?: (number | undefined)[];
   rows: {
     cells: (
-      | BNInlineContent[]
-      | { type: 'tableCell'; content: BNInlineContent[] }
+      BNInlineContent[] | { type: 'tableCell'; content: BNInlineContent[] }
     )[];
   }[];
 };
@@ -492,6 +492,7 @@ export class NoteService {
     private readonly prisma: PrismaService,
     private readonly config: ConfigService,
     private readonly membershipPolicy: MembershipPolicyService,
+    private readonly chat: ChatService,
     @Optional() private readonly uploadService?: UploadService,
     @Optional() private readonly realtime?: RealtimeService,
     @Optional() private readonly circleSync?: ChatCircleSyncService,
@@ -3973,34 +3974,32 @@ export class NoteService {
    * collect request body.
    */
   private async resolveCollectedFromMessageSnapshot(
+    viewerID: string,
+    noteID: string,
     source: NoteCollectSourceDto,
   ): Promise<NoteCollectSourceDto> {
-    const chatMessage = (this.prisma as any).chatMessage;
-    if (!chatMessage?.findFirst || !source.clientMsgID) return source;
-
-    // Despite its OpenIM-era name, clientMsgID carries the server message UUID
-    // (ChatMessageDto.id). Do not switch this to clientMessageId: the `d` key is
-    // only delivered to the author, so collectors never know it.
-    const row = await chatMessage.findFirst({
-      where: {
-        id: source.clientMsgID,
-        conversationID: source.conversationID,
-        type: 'note-card',
-        deleted: false,
-        revokedAt: null,
-      },
-      select: { senderID: true, content: true },
-    });
+    // A public note does not grant access to the private message that shared it.
+    // Reuse the history/forward visibility gate, including membership, clear
+    // watermarks, revocation and burn expiry, before reading any card snapshot.
+    const { row, conversation } = await this.chat.requireVisibleMessage(
+      viewerID,
+      source.clientMsgID,
+    );
+    const content = row.content as Record<string, unknown> | null;
     if (
-      !row ||
-      !row.content ||
-      typeof row.content !== 'object' ||
-      Array.isArray(row.content)
+      row.conversationID !== source.conversationID ||
+      row.type !== 'note-card' ||
+      !content ||
+      Array.isArray(content) ||
+      typeof content !== 'object' ||
+      content.noteId !== noteID
     ) {
-      return source;
+      throw new NotFoundException({
+        message: 'Note source message not found',
+        errorCode: NoteErrorCode.NotFound,
+      });
     }
 
-    const content = row.content as Record<string, unknown>;
     const normalizePeer = (
       value: unknown,
       expectedID?: string | null,
@@ -4022,13 +4021,22 @@ export class NoteService {
     };
 
     const sender = normalizePeer(
-      content.personalCardSnapshot,
+      content.personalCardSnapshot ?? source.sender,
       typeof row.senderID === 'string' ? row.senderID : null,
     );
-    const group = normalizePeer(content.sourceGroupCardSnapshot);
+    if (!sender || !row.senderID) {
+      throw new BadRequestException('Invalid note source sender');
+    }
+    const group =
+      normalizePeer(content.sourceGroupCardSnapshot) ??
+      (conversation.type === 'GROUP'
+        ? normalizePeer(source.group, conversation.circleID ?? conversation.id)
+        : null);
     return {
-      ...source,
-      ...(sender ? { sender } : {}),
+      conversationType: conversation.type === 'DIRECT' ? 'private' : 'group',
+      conversationID: row.conversationID,
+      clientMsgID: row.id,
+      sender,
       ...(group ? { group } : {}),
     };
   }
@@ -4437,7 +4445,11 @@ export class NoteService {
     }
 
     const effectiveCollectSource =
-      await this.resolveCollectedFromMessageSnapshot(dto.source);
+      await this.resolveCollectedFromMessageSnapshot(
+        userID,
+        source.id,
+        dto.source,
+      );
     const collectedFrom = this.buildCollectedFrom(
       effectiveCollectSource,
       source,

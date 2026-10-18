@@ -1,3 +1,4 @@
+import { AnonymousAccess } from 'src/guards/anonymous-access.decorator';
 import { Controller, Get, Param, UseGuards } from '@nestjs/common';
 import { ApiOkResponse, ApiOperation, ApiTags } from '@nestjs/swagger';
 import { Throttle, ThrottlerGuard } from '@nestjs/throttler';
@@ -26,6 +27,7 @@ export class NoteShareLinkPublicController {
    * 30 次/分钟。setup.ts 里 note 的 express 限流只挂写方法（POST/PATCH/PUT/DELETE），
    * 本路由是 GET，不在其覆盖范围内，这里的 @Throttle 是唯一一道路由级限流。
    */
+  @AnonymousAccess('Opaque share token')
   @Get('share-links/:token')
   @UseGuards(ThrottlerGuard)
   @Throttle({ default: { limit: 30, ttl: 60_000 } })

@@ -50,7 +50,7 @@ jobs:
 
       - name: Verify release contracts
         run: |
-          node --test scripts/release-hardening.test.mjs
+          node --test scripts/release-hardening.test.mjs scripts/check-gateway-exposure.test.mjs
           node --test test/release-workflow.test.js
           bash test/release-deploy.spec.sh
           bash test/release-launcher.spec.sh
@@ -136,7 +136,17 @@ jobs:
           assert_route external-heartbeat alertname=Watchdog severity=none
           assert_route external-heartbeat-failure alertname=AlertmanagerNotificationFailures severity=critical
           assert_route discord-critical   alertname=RedisDown severity=critical
+          assert_route discord-critical   alertname=GatewayCapacityRejecting severity=critical
+          assert_route discord-warning    alertname=GatewayCapacityNearLimit severity=warning
+          assert_route discord-warning    alertname=ApiAuthFailureSpike severity=warning
           assert_route discord-warning    alertname=HostCpuSaturated severity=warning
+
+      - name: Smoke-test local Discord alert delivery
+        run: |
+          alert_validation_container="$(docker create prom/alertmanager:v0.29.0)"
+          trap 'docker rm "$alert_validation_container" >/dev/null' EXIT
+          docker cp "$alert_validation_container:/bin/alertmanager" /tmp/circle-alertmanager
+          ALERTMANAGER_BIN=/tmp/circle-alertmanager python3 scripts/test-alert-delivery.py
 
       - name: Validate optional log stack compose
         env:
@@ -348,6 +358,9 @@ jobs:
           export MINIO_ROOT_PASSWORD=test-only-password
           export API_DOMAIN=api.example.test
           export ADMIN_DOMAIN=admin.example.test
+          export ACME_EMAIL=ops@example.test
+          docker compose -f docker-compose.prod.yml -f docker-compose.release.yml \
+            config --format json | node scripts/check-gateway-exposure.mjs
           export ACME_EMAIL=ops@example.test
           project="circle-env-read-$GITHUB_RUN_ID"
           cleanup() {

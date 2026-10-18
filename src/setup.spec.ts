@@ -7,6 +7,7 @@ import { createWriteMethodLimiterMount, setupApp } from './setup';
 import { redisMetrics } from './redis/redis.metrics';
 import { uploadMetrics } from './metrics/upload-metrics';
 import { chatMetrics } from './chat/chat-metrics';
+import { gatewayMetrics } from './metrics/gateway-metrics';
 import * as errorAggregation from './logging/error-aggregation.service';
 import * as rejectionGuard from './logging/unhandled-rejection-guard';
 
@@ -227,8 +228,7 @@ describe('setupApp', () => {
       ([path]) => path === '/metrics',
     );
     const handler = metricsCall?.[1] as
-      | ((req: unknown, res: unknown) => Promise<void>)
-      | undefined;
+      ((req: unknown, res: unknown) => Promise<void>) | undefined;
     const response = {
       setHeader: jest.fn(),
       end: jest.fn(),
@@ -263,6 +263,7 @@ describe('setupApp', () => {
 
   it('exposes the production chat metrics singleton on the metrics endpoint', async () => {
     chatMetrics.observeConnectionOpened(1);
+    gatewayMetrics.setBudget('chat_connections', 17, 2000);
     try {
       const app = buildAppMock();
       setupApp(app as any);
@@ -270,8 +271,7 @@ describe('setupApp', () => {
         ([path]) => path === '/metrics',
       );
       const handler = metricsCall?.[1] as
-        | ((req: unknown, res: unknown) => Promise<void>)
-        | undefined;
+        ((req: unknown, res: unknown) => Promise<void>) | undefined;
       const response = {
         setHeader: jest.fn(),
         end: jest.fn(),
@@ -283,8 +283,14 @@ describe('setupApp', () => {
       expect(response.end).toHaveBeenCalledWith(
         expect.stringMatching(/chat_connections_active\s+1/),
       );
+      expect(response.end).toHaveBeenCalledWith(
+        expect.stringContaining(
+          'circle_gateway_capacity_used{pool="chat_connections"} 17',
+        ),
+      );
     } finally {
       chatMetrics.observeConnectionClosed(0);
+      gatewayMetrics.setBudget('chat_connections', 0, 2000);
     }
   });
 

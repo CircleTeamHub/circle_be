@@ -36,6 +36,7 @@ import { ChatPushService } from './chat-push.service';
 import { ChatSupportRechargeProcessor } from './chat-support-recharge.processor';
 import { ChatDirectAutoReplyProcessor } from './chat-direct-auto-reply.processor';
 import { ChatService } from './chat.service';
+import { SocketAdmission } from 'src/realtime/socket-admission';
 import {
   chatMetrics as defaultChatMetrics,
   type ChatAuthFailureReason,
@@ -186,6 +187,7 @@ export class ChatGateway implements OnModuleDestroy {
   private readonly logger = new Logger(ChatGateway.name);
   private metrics: ChatMetrics = defaultChatMetrics;
   private io: Server | null = null;
+  private readonly admission = new SocketAdmission(2000, 128, 10_000, 'chat');
 
   // G-04:限流走 Redis ZSET 滑动窗口(跨实例全局配额),Redis 缺席回退每实例本地。
   private readonly sendLimiter: DistributedRateLimiter;
@@ -294,6 +296,7 @@ export class ChatGateway implements OnModuleDestroy {
    * unref 过(不阻止退出),但留着会在关闭后继续对已销毁的 io 动手。
    */
   onModuleDestroy(): void {
+    this.admission.destroy();
     if (this.revocationRetryTimer) {
       clearTimeout(this.revocationRetryTimer);
       this.revocationRetryTimer = null;
@@ -315,6 +318,13 @@ export class ChatGateway implements OnModuleDestroy {
       ...buildChatCorsOptions(options.corsOrigin),
       // 单条 socket 报文上限,与 content 8KB 上限同数量级留余量。
       maxHttpBufferSize: 64 * 1024,
+    });
+    io.engine.on('connection', (connection) => {
+      if (!this.admission.acquire(connection, () => connection.close(true))) {
+        connection.close(true);
+        return;
+      }
+      connection.once('close', () => this.admission.release(connection));
     });
     io.engine.on('connection_error', (error) => {
       this.observeEngineConnectionError(error);
@@ -638,6 +648,12 @@ export class ChatGateway implements OnModuleDestroy {
     if (verdict === 'unavailable') {
       return this.rejectAuth(socket, 'session_unverifiable');
     }
+    socket.data.authPayload = {
+      sub: payload.sub,
+      sid: payload.sid,
+      iat: payload.iat,
+      issuedAtMs: payload.issuedAtMs,
+    };
     socket.data.sessionId =
       typeof payload.sid === 'string' ? payload.sid : null;
     socket.data.issuedAtMs = issuedAtMsOf(payload);
@@ -654,7 +670,7 @@ export class ChatGateway implements OnModuleDestroy {
    * 「让 token 短命」这个前提就不成立了。RealtimeGateway 早就是这么做的
    * (realtime.gateway.ts 的 expiryTimers),chat 侧对齐。
    *
-   * 访客 token 走另一条分支(expMs 为 undefined),其时效由房间生命周期兜底。
+   * App 与访客 JWT 都按 exp 到期断连;临时房生命周期另由服务层检查。
    */
   private scheduleExpiryDisconnect(socket: Socket): void {
     const expMs = socket.data.expMs as number | null | undefined;
@@ -710,7 +726,7 @@ export class ChatGateway implements OnModuleDestroy {
       this.logger.warn('TEMP_CHAT_LINK_SECRET 未配置,访客握手一律拒绝');
       return this.rejectAuth(socket, 'guest_secret_missing');
     }
-    let payload: GuestChatTokenPayload;
+    let payload: GuestChatTokenPayload & { exp?: number };
     try {
       payload = this.jwtService.verify<GuestChatTokenPayload>(token, {
         secret,
@@ -733,6 +749,8 @@ export class ChatGateway implements OnModuleDestroy {
       !(await this.chatService.hasSeat(payload.conversationId, payload.guestId))
     )
       return this.rejectAuth(socket, 'guest_no_seat');
+    socket.data.expMs =
+      typeof payload.exp === 'number' ? payload.exp * 1000 : null;
     socket.data.guestConversationId = payload.conversationId;
     socket.data.sessionId = null;
     socket.data.issuedAtMs = null;
@@ -749,7 +767,13 @@ export class ChatGateway implements OnModuleDestroy {
       broadcast.kind === 'user'
         ? await io.in(userRoom(broadcast.userId)).fetchSockets()
         : await io.fetchSockets();
-    for (const socket of sockets) {
+    const local =
+      broadcast.kind === 'user'
+        ? [...(this.connectionsByUser.get(broadcast.userId) ?? [])]
+        : [...this.connectionsByUser.values()].flatMap((connections) => [
+            ...connections,
+          ]);
+    for (const socket of [...sockets, ...local]) {
       const data = socket.data as {
         sessionId?: string | null;
         issuedAtMs?: number | null;
@@ -1060,11 +1084,25 @@ export class ChatGateway implements OnModuleDestroy {
           .filter((seat) => seat.type !== 'GROUP')
           .map((seat) => seat.conversationId);
       }
+      // Registered in connectionsByUser before the first await, so revocation
+      // broadcasts can close pending sockets. Recheck after registration to catch
+      // a revocation that raced the initial handshake database lookup.
+      if (!guestConversationId) {
+        const payload = socket.data.authPayload as JwtPayload | undefined;
+        if (!payload) throw new Error('Missing authenticated claims');
+        const verdict = await this.sessionVerifier.verify(payload);
+        if (verdict !== 'active') {
+          failAdmission();
+          socket.disconnect(true);
+          return;
+        }
+      }
+      if (socket.disconnected) return;
       await socket.join(userRoom(userId));
       // 访客只进个人房:消息/编辑按在座成员逐个个人房投递,照样送得到;会话房里的
       // 已读、正在输入、在线状态、表情、撤回广播都带着房主真实 userId,访客页一个都
       // 不消费,进房只会把房主账号 UUID 与在线规律交给匿名访客。
-      if (!guestConversationId) {
+      if (!guestConversationId && !socket.disconnected) {
         await socket.join(conversationIds.map(conversationRoom));
       }
     } catch (error) {
@@ -1085,6 +1123,8 @@ export class ChatGateway implements OnModuleDestroy {
       socket.disconnect(true);
       return;
     }
+    if (socket.disconnected) return;
+    this.admission.authenticate(socket.conn);
     admissionState = 'ready';
     reachedReady = true;
     this.logger.log({

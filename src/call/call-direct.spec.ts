@@ -117,6 +117,39 @@ describe('CallService direct calls (#113 #115) + current (#FE93)', () => {
     });
   }
 
+  it.each(['unfriend', 'block', 'privacy'])(
+    'rejects reconnect when %s removes direct-call access after invitation',
+    async (reason) => {
+      mockFriendship({
+        friends: reason !== 'unfriend',
+        blocked: reason === 'block',
+      });
+      privacySettings.canBeCalled.mockResolvedValue(reason !== 'privacy');
+      prisma.callParticipant.findUnique.mockResolvedValue({
+        userID: 'user-2',
+        status: 'JOINED',
+        user: { id: 'user-2', nickname: 'Bob', avatarUrl: null },
+        call: {
+          id: 'call-1',
+          conversationID: 'direct-1',
+          sessionType: 1,
+          callType: 'AUDIO',
+          status: 'ACTIVE',
+          livekitRoomName: 'room-1',
+          initiatorID: 'user-1',
+          participants: [{ userID: 'user-1' }, { userID: 'user-2' }],
+        },
+      });
+      await expectErrorCode(
+        service.createJoinToken('user-2', 'call-1'),
+        reason === 'privacy'
+          ? CallErrorCode.PermissionDenied
+          : CallErrorCode.NotFriend,
+      );
+      expect(livekit.mintJoinToken).not.toHaveBeenCalled();
+    },
+  );
+
   it('rejects a callee who is not an accepted friend with CALL_NOT_FRIEND', async () => {
     mockFriendship({ friends: false });
     await expectErrorCode(
@@ -227,7 +260,7 @@ describe('CallService direct calls (#113 #115) + current (#FE93)', () => {
     prisma.callSession.create.mockImplementation(async (args: any) => ({
       ...args.data,
       createdAt: now,
-      participants: [],
+      participants: [{ userID: 'user-1' }, { userID: 'user-2' }],
       initiator: { id: 'user-1', nickname: 'Alice', avatarUrl: null },
     }));
     await expect(

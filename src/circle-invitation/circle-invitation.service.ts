@@ -1822,18 +1822,16 @@ export class CircleInvitationService {
       requiredCount: inv.requiredCount,
       approvedCount: inv.approvedCount,
       status: inv.status,
-      verifiers: inv.verifiers.map(
-        (v): InvitationVerifierDto => ({
-          id: v.id,
-          verifier: {
-            id: v.verifier.id,
-            nickname: v.verifier.nickname,
-            avatarUrl: v.verifier.avatarUrl,
-            accountId: v.verifier.accountId,
-          },
-          status: v.status,
-        }),
-      ),
+      verifiers: inv.verifiers.map((v): InvitationVerifierDto => ({
+        id: v.id,
+        verifier: {
+          id: v.verifier.id,
+          nickname: v.verifier.nickname,
+          avatarUrl: v.verifier.avatarUrl,
+          accountId: v.verifier.accountId,
+        },
+        status: v.status,
+      })),
       createdAt: inv.createdAt.toISOString(),
     };
   }
