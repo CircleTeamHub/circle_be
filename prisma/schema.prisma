@@ -366,6 +366,9 @@ enum AdminGroupOperationStatus {
 // ─── Core Models ──────────────────────────────────────────────────────────────
 
 model User {
+  consoleEvents ConsoleEvent[]
+  consoleInstallations AppInstallation[]
+  consoleApiKeys ConsoleApiKey[]
   encryptionRecovery E2eeRecovery[]
   id                           String     @id @default(uuid())
   accountId                    String     @unique
@@ -1784,6 +1787,7 @@ model NotificationPushOutbox {
   lastError      String?
   nextAttemptAt  DateTime                     @default(now())
   lockedAt       DateTime?
+  completionReason String?
   processedAt    DateTime?
   /// Immutable snapshot of the composed push payload (#88) — retries resend
   /// exactly what was originally composed instead of re-reading live rows.
@@ -2767,9 +2771,91 @@ model E2eeArchive {
   @@index([messageID])
 }
 
+model ConsoleEvent {
+  id String @id @default(uuid())
+  userID String
+  name String
+  source String @default("SERVER")
+  entityType String?
+  entityID String?
+  platform String?
+  appVersion String?
+  createdAt DateTime @default(dbgenerated("(CURRENT_TIMESTAMP AT TIME ZONE 'UTC'::text)"))
+  user User @relation(fields: [userID], references: [id], onDelete: Cascade)
+  @@index([userID, createdAt, id])
+  @@index([name, createdAt])
+  @@index([createdAt])
+}
 
+model AppInstallation {
+  id String @id @default(uuid())
+  userID String
+  deviceKey String
+  platform String
+  appVersion String
+  build Int
+  channel String @default("stable")
+  lastSeenAt DateTime @default(dbgenerated("(CURRENT_TIMESTAMP AT TIME ZONE 'UTC'::text)"))
+  user User @relation(fields: [userID], references: [id], onDelete: Cascade)
+  @@unique([userID, deviceKey])
+  @@index([platform, channel, build])
+}
 
+model ConsoleApiKey {
+  id String @id @default(uuid())
+  userID String
+  name String
+  prefix String
+  secretHash String @unique
+  scopes String[]
+  expiresAt DateTime
+  revokedAt DateTime?
+  lastUsedAt DateTime?
+  createdAt DateTime @default(dbgenerated("(CURRENT_TIMESTAMP AT TIME ZONE 'UTC'::text)"))
+  user User @relation(fields: [userID], references: [id], onDelete: Cascade)
+  @@index([userID, createdAt])
+}
 
+model ConsoleRelease {
+  id String @id @default(uuid())
+  platform String
+  channel String
+  version String
+  build Int
+  url String
+  sha256 String
+  sizeBytes Int
+  notes String
+  withdrawnAt DateTime?
+  createdAt DateTime @default(dbgenerated("(CURRENT_TIMESTAMP AT TIME ZONE 'UTC'::text)"))
+  plans ConsoleReleasePlan[]
+  @@unique([platform, channel, build])
+}
 
+model ConsoleReleasePlan {
+  id String @id @default(uuid())
+  releaseID String
+  rollout Int
+  minBuild Int
+  maxBuild Int
+  forceBelow Int
+  startsAt DateTime
+  endsAt DateTime
+  enabled Boolean @default(true)
+  version Int @default(1)
+  createdAt DateTime @default(dbgenerated("(CURRENT_TIMESTAMP AT TIME ZONE 'UTC'::text)"))
+  release ConsoleRelease @relation(fields: [releaseID], references: [id], onDelete: Restrict)
+  @@index([enabled, startsAt, endsAt])
+}
 
+model ConsolePushSettings {
+  id String @id @default("global")
+  enabled Boolean @default(true)
+  version Int @default(1)
+  updatedAt DateTime @default(dbgenerated("(CURRENT_TIMESTAMP AT TIME ZONE 'UTC'::text)")) @updatedAt
+}
 
+model ConsoleCollectionState {
+  id String @id @default("global")
+  startedAt DateTime @default(dbgenerated("(CURRENT_TIMESTAMP AT TIME ZONE 'UTC'::text)"))
+}

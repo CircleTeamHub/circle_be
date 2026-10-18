@@ -1,3 +1,4 @@
+import { ConsoleModule } from './admin-console/console.module';
 import { Logger, Module } from '@nestjs/common';
 import { APP_GUARD, APP_INTERCEPTOR } from '@nestjs/core';
 import { HttpCapacityInterceptor } from './interceptors/http-capacity.interceptor';
@@ -122,6 +123,7 @@ const envFilePath = `.env.${nodeEnv}`;
     AdminContentModule,
     AdminImModule,
     E2eeModule,
+    ConsoleModule,
   ],
   controllers: [],
   providers: [

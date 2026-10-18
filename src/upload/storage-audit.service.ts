@@ -403,6 +403,18 @@ export class StorageAuditService {
       (row) => add(row.objectKey),
     );
 
+    // Release URLs currently point to GitHub/App Store; keep them in the URL inventory
+    // so future storage source changes cannot silently bypass reference checks.
+    await this.collectFrom(
+      (cursor, take) =>
+        this.prisma.consoleRelease.findMany({
+          select: { id: true, url: true },
+          orderBy: { id: 'asc' },
+          take,
+          ...(cursor ? { cursor: { id: cursor }, skip: 1 } : {}),
+        }),
+      (row) => add(row.url),
+    );
     return keys;
   }
 
