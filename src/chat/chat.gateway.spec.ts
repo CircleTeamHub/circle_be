@@ -6,6 +6,14 @@ import * as errorAggregation from '../logging/error-aggregation.service';
 
 type Handler = (...args: unknown[]) => void;
 
+function deferred<T>() {
+  let resolve!: (value: T | PromiseLike<T>) => void;
+  const promise = new Promise<T>((done) => {
+    resolve = done;
+  });
+  return { promise, resolve };
+}
+
 function fakeSocket(overrides: Record<string, unknown> = {}) {
   const handlers = new Map<string, Handler>();
   return {
@@ -39,7 +47,10 @@ function fakeSocket(overrides: Record<string, unknown> = {}) {
 
 describe('ChatGateway', () => {
   const jwtService = { verify: jest.fn(), decode: jest.fn() };
-  const sessionVerifier = { verify: jest.fn() };
+  const sessionVerifier = {
+    verify: jest.fn(),
+    verifyWithIdentity: jest.fn(),
+  };
   // 连接时一次读回全部在座会话和它们的类型(在线状态不进群房间);默认都是单聊。
   const seats = (...ids: string[]) =>
     ids.map((conversationId) => ({ conversationId, type: 'DIRECT' }));
@@ -83,6 +94,11 @@ describe('ChatGateway', () => {
     slidingWindowAcquire: jest.fn().mockResolvedValue(null),
     getAdapterClients: jest.fn().mockResolvedValue(null),
   };
+  const prisma = {
+    sessionScopeGeneration: {
+      findUnique: jest.fn(),
+    },
+  };
   const configService = { get: jest.fn().mockReturnValue('guest-secret') };
   const presence = {
     registerSocket: jest.fn().mockResolvedValue(null),
@@ -118,6 +134,7 @@ describe('ChatGateway', () => {
     broadcast as never,
     chatPush as never,
     redisService as never,
+    prisma as never,
     configService as never,
     presence as never,
     supportRecharge as never,
@@ -127,7 +144,15 @@ describe('ChatGateway', () => {
 
   beforeEach(() => {
     jest.clearAllMocks();
+    sessionVerifier.verifyWithIdentity.mockResolvedValue({
+      verdict: 'active',
+      identity: null,
+    });
     sessionVerifier.verify.mockResolvedValue('active');
+    prisma.sessionScopeGeneration.findUnique.mockResolvedValue({
+      generation: 1,
+      exemptFamilyId: null,
+    });
     configService.get.mockReturnValue('guest-secret');
     // 默认不是访客 token:app 分支的既有用例不受分流影响。
     jwtService.decode.mockReturnValue({ sub: 'u1' });
@@ -144,6 +169,7 @@ describe('ChatGateway', () => {
     // 开关与会话类型都有缓存,逐例之间要清掉,否则上一条用例的值会漏过来。
     (gateway as any).typingPolicyCache.clear();
     (gateway as any).conversationTypeCache.clear();
+    (gateway as any).connectionsByUser.clear();
   });
 
   afterEach(() => jest.restoreAllMocks());
@@ -189,7 +215,10 @@ describe('ChatGateway', () => {
         accountId: 'acc1',
         aud: 'APP',
       });
-      sessionVerifier.verify.mockResolvedValue('revoked');
+      sessionVerifier.verifyWithIdentity.mockResolvedValue({
+        verdict: 'revoked',
+        identity: null,
+      });
       const revoked = fakeSocket();
       await expect(
         gateway['authenticate'](revoked as never),
@@ -206,7 +235,10 @@ describe('ChatGateway', () => {
         accountId: 'acc1',
         aud: 'APP',
       });
-      sessionVerifier.verify.mockResolvedValue('unavailable');
+      sessionVerifier.verifyWithIdentity.mockResolvedValue({
+        verdict: 'unavailable',
+        identity: null,
+      });
       const socket = fakeSocket();
 
       await expect(
@@ -247,7 +279,7 @@ describe('ChatGateway', () => {
       ).resolves.toBeNull();
       expect(socket.data.authFailureReason).toBe('wrong_audience');
       // 连吊销检查都不该走到 —— 这类 token 根本不该进入聊天面。
-      expect(sessionVerifier.verify).not.toHaveBeenCalled();
+      expect(sessionVerifier.verifyWithIdentity).not.toHaveBeenCalled();
     });
 
     it('rejects a token with no audience claim at all', async () => {
@@ -680,7 +712,7 @@ describe('ChatGateway', () => {
       // 访客没有 app 会话,吊销广播的两个判据都不该命中它。
       expect(socket.data.sessionId).toBeNull();
       expect(socket.data.issuedAtMs).toBeNull();
-      expect(sessionVerifier.verify).not.toHaveBeenCalled();
+      expect(sessionVerifier.verifyWithIdentity).not.toHaveBeenCalled();
     });
 
     it('rejects once the room is no longer active', async () => {
@@ -733,11 +765,7 @@ describe('ChatGateway', () => {
     it('finds pending connections during user revocation before room membership exists', async () => {
       const socket = fakeSocket();
       socket.data.issuedAtMs = 100;
-      const io = {
-        in: jest
-          .fn()
-          .mockReturnValue({ fetchSockets: jest.fn().mockResolvedValue([]) }),
-      };
+      const io = { local: { fetchSockets: jest.fn().mockResolvedValue([]) } };
       (gateway as any).io = io;
       (gateway as any).connectionsByUser.set('u1', new Set([socket]));
       await gateway['handleRevocation'](
@@ -746,6 +774,233 @@ describe('ChatGateway', () => {
       expect(socket.disconnect).toHaveBeenCalledWith(true);
       (gateway as any).io = null;
       (gateway as any).connectionsByUser.clear();
+    });
+
+    it('rechecks an app session after namespace admission before joining rooms', async () => {
+      const socket = fakeSocket({
+        data: {
+          userId: 'u1',
+          sessionId: 'session-a',
+          issuedAtMs: 100,
+        },
+      });
+      sessionVerifier.verify.mockResolvedValue('revoked');
+
+      await gateway['handleConnection'](socket as never);
+
+      expect(sessionVerifier.verify).toHaveBeenCalledWith({
+        sub: 'u1',
+        sid: 'session-a',
+        issuedAtMs: 100,
+      });
+      expect(socket.disconnect).toHaveBeenCalledWith(true);
+      expect(presence.registerSocket).toHaveBeenCalled();
+      expect(socket.join).not.toHaveBeenCalled();
+    });
+
+    it('uses a reconnectable transport close when the final verifier is unavailable', async () => {
+      const close = jest.fn();
+      const socket = fakeSocket({
+        conn: { close },
+        data: {
+          userId: 'u1',
+          sessionId: 'session-a',
+          issuedAtMs: 100,
+        },
+      });
+      sessionVerifier.verify.mockResolvedValue('unavailable');
+
+      await gateway['handleConnection'](socket as never);
+
+      expect(close).toHaveBeenCalled();
+      expect(socket.disconnect).not.toHaveBeenCalled();
+      expect(socket.join).not.toHaveBeenCalled();
+    });
+
+    it('disconnects an authenticated socket even before it joins the user room', async () => {
+      const socket = fakeSocket({
+        data: {
+          userId: 'u1',
+          sessionId: 'session-a',
+          issuedAtMs: 100,
+          familyId: 'family-a',
+          audience: 'APP',
+          deviceKey: 'device-a',
+        },
+      });
+      const fetchSockets = jest.fn().mockResolvedValue([socket]);
+      const roomFetchSockets = jest.fn().mockResolvedValue([]);
+      (gateway as any).io = {
+        local: { fetchSockets },
+        in: jest.fn(() => ({ fetchSockets: roomFetchSockets })),
+      };
+
+      await gateway['handleRevocation'](
+        JSON.stringify({
+          kind: 'scope',
+          userId: 'u1',
+          scope: 'DEVICE',
+          scopeKey: 'device-a',
+          exemptFamilyId: null,
+          generation: 1,
+        }),
+      );
+
+      expect(fetchSockets).toHaveBeenCalled();
+      expect(socket.disconnect).toHaveBeenCalledWith(true);
+    });
+
+    it('applies scoped revocation to registered pending sockets missing from the adapter', async () => {
+      const socket = fakeSocket({
+        data: {
+          userId: 'u1',
+          sessionId: 'session-a',
+          familyId: 'family-a',
+          audience: 'APP',
+          deviceKey: 'device-a',
+        },
+      });
+      prisma.sessionScopeGeneration.findUnique.mockResolvedValue({
+        generation: 1,
+        exemptFamilyId: null,
+      });
+      (gateway as any).io = {
+        local: { fetchSockets: jest.fn().mockResolvedValue([]) },
+      };
+      (gateway as any).connectionsByUser.set('u1', new Set([socket]));
+      await gateway['handleRevocation'](
+        JSON.stringify({
+          kind: 'scope',
+          userId: 'u1',
+          scope: 'DEVICE',
+          scopeKey: 'device-a',
+          exemptFamilyId: null,
+          generation: 1,
+        }),
+      );
+      expect(socket.disconnect).toHaveBeenCalledWith(true);
+    });
+
+    it('ignores a scoped broadcast superseded by a newer durable generation', async () => {
+      const socket = fakeSocket({
+        data: {
+          userId: 'u1',
+          sessionId: 'session-b',
+          issuedAtMs: 100,
+          familyId: 'family-b',
+          audience: 'APP',
+          deviceKey: 'device-b',
+        },
+      });
+      prisma.sessionScopeGeneration.findUnique.mockResolvedValue({
+        generation: 2,
+        exemptFamilyId: 'family-b',
+      });
+      const fetchSockets = jest.fn().mockResolvedValue([socket]);
+      (gateway as any).io = {
+        local: { fetchSockets },
+        in: jest.fn(() => ({ fetchSockets: jest.fn() })),
+      };
+
+      await gateway['handleRevocation'](
+        JSON.stringify({
+          kind: 'scope',
+          userId: 'u1',
+          scope: 'ACCOUNT',
+          scopeKey: '*',
+          exemptFamilyId: 'family-a',
+          generation: 1,
+        }),
+      );
+
+      expect(socket.disconnect).not.toHaveBeenCalled();
+    });
+
+    it('does not let an older concurrent scope handler override a newer exemption', async () => {
+      const familyA = fakeSocket({
+        id: 'socket-a',
+        data: {
+          userId: 'u1',
+          familyId: 'family-a',
+          audience: 'APP',
+          deviceKey: 'device-a',
+        },
+      });
+      const familyB = fakeSocket({
+        id: 'socket-b',
+        data: {
+          userId: 'u1',
+          familyId: 'family-b',
+          audience: 'APP',
+          deviceKey: 'device-b',
+        },
+      });
+      const generation1 = deferred<{
+        generation: number;
+        exemptFamilyId: string;
+      }>();
+      const generation2 = deferred<{
+        generation: number;
+        exemptFamilyId: string;
+      }>();
+      prisma.sessionScopeGeneration.findUnique
+        .mockReturnValueOnce(generation1.promise)
+        .mockReturnValueOnce(generation2.promise);
+      (gateway as any).io = {
+        local: {
+          fetchSockets: jest.fn().mockResolvedValue([familyA, familyB]),
+        },
+      };
+
+      const older = gateway['handleRevocation'](
+        JSON.stringify({
+          kind: 'scope',
+          userId: 'u1',
+          scope: 'ACCOUNT',
+          scopeKey: '*',
+          exemptFamilyId: 'family-a',
+          generation: 1,
+        }),
+      );
+      await Promise.resolve();
+      const newer = gateway['handleRevocation'](
+        JSON.stringify({
+          kind: 'scope',
+          userId: 'u1',
+          scope: 'ACCOUNT',
+          scopeKey: '*',
+          exemptFamilyId: 'family-b',
+          generation: 2,
+        }),
+      );
+      await Promise.resolve();
+
+      generation2.resolve({ generation: 2, exemptFamilyId: 'family-b' });
+      await newer;
+      generation1.resolve({ generation: 1, exemptFamilyId: 'family-a' });
+      await older;
+
+      expect(familyA.disconnect).toHaveBeenCalledWith(true);
+      expect(familyB.disconnect).not.toHaveBeenCalled();
+    });
+
+    it('skips the scope generation lookup when this instance has no target socket', async () => {
+      (gateway as any).io = {
+        local: { fetchSockets: jest.fn().mockResolvedValue([]) },
+      };
+
+      await gateway['handleRevocation'](
+        JSON.stringify({
+          kind: 'scope',
+          userId: 'u1',
+          scope: 'ACCOUNT',
+          scopeKey: '*',
+          exemptFamilyId: null,
+          generation: 1,
+        }),
+      );
+
+      expect(prisma.sessionScopeGeneration.findUnique).not.toHaveBeenCalled();
     });
 
     it('joins the personal room plus every membership conversation room', async () => {

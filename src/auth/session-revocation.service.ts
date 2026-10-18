@@ -106,14 +106,26 @@ export class SessionRevocationService {
   }
 
   /** Revoke a single session's access token (single logout / kill one session). */
-  async revokeSession(sessionId: string): Promise<void> {
-    if (!this.redis.isEnabled()) return;
+  async revokeSession(sessionId: string): Promise<boolean> {
+    if (!this.redis.isEnabled()) return true;
     await this.redis.setJson(
       this.sessionKey(sessionId),
       1,
       this.markerTtlSeconds,
     );
-    await this.announce({ kind: 'session', sessionId });
+    return this.announce({ kind: 'session', sessionId });
+  }
+
+  /** Broadcast a durable database generation change to already-open sockets. */
+  async revokeScope(event: {
+    userId: string;
+    scope: 'ACCOUNT' | 'AUDIENCE' | 'DEVICE' | 'FAMILY';
+    scopeKey: string;
+    exemptFamilyId: string | null;
+    generation: number;
+  }): Promise<boolean> {
+    if (!this.redis.isEnabled()) return true;
+    return this.announce({ kind: 'scope', ...event });
   }
 
   /**

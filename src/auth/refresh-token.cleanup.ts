@@ -65,7 +65,23 @@ export class RefreshTokenCleanup {
         RefreshTokenCleanup.REVOKED_RETENTION_DAYS * 24 * 60 * 60 * 1000,
     );
     const staleWhere = {
-      OR: [{ expiredAt: { lt: now } }, { revokedAt: { lt: revokedCutoff } }],
+      AND: [
+        {
+          OR: [
+            { expiredAt: { lt: now } },
+            { revokedAt: { lt: revokedCutoff } },
+          ],
+        },
+        {
+          OR: [
+            { accessTokenExpiresAt: { lte: now } },
+            {
+              accessTokenExpiresAt: null,
+              expiredAt: { lte: now },
+            },
+          ],
+        },
+      ],
     } satisfies Prisma.RefreshTokenWhereInput;
     let count = 0;
     let capped = false;

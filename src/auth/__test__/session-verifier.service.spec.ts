@@ -16,6 +16,7 @@ function createPrismaMock() {
   return {
     user: { findUnique: jest.fn() },
     refreshToken: { findUnique: jest.fn() },
+    sessionScopeGeneration: { findMany: jest.fn().mockResolvedValue([]) },
   };
 }
 
@@ -29,8 +30,17 @@ const payload = {
 
 const liveSession = {
   userId: 'user-1',
+  familyId: 'family-1',
+  audience: 'APP',
+  deviceKey: 'device-1',
+  createdAt: new Date('2026-09-01T00:00:00.000Z'),
+  accountGeneration: 0,
+  audienceGeneration: 0,
+  deviceGeneration: 0,
+  familyGeneration: 0,
   revokedAt: null,
   revocationReason: null,
+  accessRevokedAt: null,
 };
 
 describe('SessionVerifier', () => {
@@ -100,7 +110,15 @@ describe('SessionVerifier', () => {
       // sid 就是 RefreshToken 的主键（refresh-token.service 的 revoke 注释）。
       expect(prisma.refreshToken.findUnique).toHaveBeenCalledWith({
         where: { id: 'session-1' },
-        select: { userId: true, revokedAt: true, revocationReason: true },
+        select: expect.objectContaining({
+          userId: true,
+          revokedAt: true,
+          revocationReason: true,
+          accessRevokedAt: true,
+          familyId: true,
+          audience: true,
+          deviceKey: true,
+        }),
       });
     });
 
@@ -143,6 +161,76 @@ describe('SessionVerifier', () => {
       });
 
       await expect(verifier.verify(payload)).resolves.toBe('active');
+    });
+
+    it('rejects a rotated session after durable per-session access revocation', async () => {
+      prisma.user.findUnique.mockResolvedValue({
+        status: 'ACTIVE',
+        accessTokensRevokedAt: null,
+      });
+      prisma.refreshToken.findUnique.mockResolvedValue({
+        userId: 'user-1',
+        revokedAt: new Date('2026-09-01T00:00:00.000Z'),
+        revocationReason: 'ROTATED',
+        accessRevokedAt: new Date('2026-09-02T00:00:00.000Z'),
+      });
+
+      await expect(verifier.verify(payload)).resolves.toBe('revoked');
+    });
+
+    it('rejects an access token whose device generation is stale', async () => {
+      prisma.user.findUnique.mockResolvedValue({
+        status: 'ACTIVE',
+        accessTokensRevokedAt: null,
+      });
+      prisma.refreshToken.findUnique.mockResolvedValue(liveSession);
+      prisma.sessionScopeGeneration.findMany.mockResolvedValue([
+        {
+          scope: 'DEVICE',
+          scopeKey: 'device-1',
+          generation: 1,
+          exemptFamilyId: null,
+        },
+      ]);
+
+      await expect(verifier.verify(payload)).resolves.toBe('revoked');
+    });
+
+    it('keeps the preserved family active across an account generation bump', async () => {
+      prisma.user.findUnique.mockResolvedValue({
+        status: 'ACTIVE',
+        accessTokensRevokedAt: null,
+      });
+      prisma.refreshToken.findUnique.mockResolvedValue(liveSession);
+      prisma.sessionScopeGeneration.findMany.mockResolvedValue([
+        {
+          scope: 'ACCOUNT',
+          scopeKey: '*',
+          generation: 1,
+          exemptFamilyId: 'family-1',
+        },
+      ]);
+
+      await expect(verifier.verify(payload)).resolves.toBe('active');
+    });
+
+    it('returns the durable scope identity used by realtime revocation', async () => {
+      prisma.user.findUnique.mockResolvedValue({
+        status: 'ACTIVE',
+        accessTokensRevokedAt: null,
+      });
+      prisma.refreshToken.findUnique.mockResolvedValue(liveSession);
+
+      await expect(verifier.verifyWithIdentity(payload)).resolves.toEqual({
+        verdict: 'active',
+        identity: {
+          sessionId: 'session-1',
+          familyId: 'family-1',
+          audience: 'APP',
+          deviceKey: 'device-1',
+          issuedAtMs: null,
+        },
+      });
     });
 
     it('rejects a rotated session after a durable user-wide revocation', async () => {

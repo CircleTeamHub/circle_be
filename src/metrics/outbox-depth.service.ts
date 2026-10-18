@@ -11,8 +11,11 @@ export interface OutboxDelegateLike {
   aggregate(args: {
     where?: unknown;
     _count: { _all: true };
-    _min: { createdAt: true };
-  }): Promise<{ _count: { _all: number }; _min: { createdAt: Date | null } }>;
+    _min: Record<string, true>;
+  }): Promise<{
+    _count: { _all: number };
+    _min: Record<string, Date | null>;
+  }>;
   count(args: { where?: unknown }): Promise<number>;
 }
 
@@ -24,6 +27,7 @@ export interface OutboxDepthSource {
   circleInvitationVerifier: OutboxDelegateLike;
   chatDirectAutoReplyJob: OutboxDelegateLike;
   supportRechargeJob: OutboxDelegateLike;
+  refreshToken: OutboxDelegateLike;
 }
 
 interface OutboxQueueSpec {
@@ -32,7 +36,9 @@ interface OutboxQueueSpec {
   /** 读哪张表。 */
   model: keyof OutboxDepthSource;
   /** 仍会被重试的行。 */
-  pendingWhere: unknown;
+  pendingWhere: unknown | ((now: Date) => unknown);
+  /** 用哪一列计算最老待办；绝大多数队列用 createdAt。 */
+  oldestField?: 'createdAt' | 'accessRevokedAt';
   /**
    * 已放弃、不会再被重试的行。留空表示该队列没有终态 —— 不要为了「对称」
    * 编一个出来，那只会让一条永远为 0 的告警训练人忽略它。
@@ -66,6 +72,19 @@ export const OUTBOX_QUEUES: readonly OutboxQueueSpec[] = [
     name: 'session_revocation',
     model: 'sessionRevocationOutbox',
     pendingWhere: undefined,
+  },
+  {
+    name: 'access_revocation',
+    model: 'refreshToken',
+    pendingWhere: (now: Date) => ({
+      accessRevokedAt: { not: null },
+      accessRevocationNotifiedAt: null,
+      OR: [
+        { accessTokenExpiresAt: { gt: now } },
+        { accessTokenExpiresAt: null, expiredAt: { gt: now } },
+      ],
+    }),
+    oldestField: 'accessRevokedAt',
   },
   {
     name: 'notification_push',
@@ -147,16 +166,21 @@ export async function collectOutboxDepths(
   for (const queue of OUTBOX_QUEUES) {
     const delegate = prisma[queue.model];
     try {
+      const oldestField = queue.oldestField ?? 'createdAt';
+      const pendingWhere =
+        typeof queue.pendingWhere === 'function'
+          ? queue.pendingWhere(now)
+          : queue.pendingWhere;
       const pending = await delegate.aggregate({
-        where: queue.pendingWhere,
+        where: pendingWhere,
         _count: { _all: true },
-        _min: { createdAt: true },
+        _min: { [oldestField]: true },
       });
       const dead = queue.deadWhere
         ? await delegate.count({ where: queue.deadWhere })
         : 0;
 
-      const oldest = pending._min.createdAt;
+      const oldest = pending._min[oldestField];
       samples.push({
         queue: queue.name,
         pending: pending._count._all,

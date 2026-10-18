@@ -129,6 +129,7 @@ describe('AuthService', () => {
     revoke: jest.fn(() => Promise.resolve()),
     listActiveSessions: jest.fn(() => Promise.resolve([])),
     revokeSession: jest.fn(() => Promise.resolve()),
+    revokeSessionFamily: jest.fn(() => Promise.resolve()),
     revokeOtherSessions: jest.fn(() => Promise.resolve()),
     revokeDeviceSessions: jest.fn(() => Promise.resolve()),
     findSessionDeviceKey: jest.fn((_userId: string, sessionId: string) =>
@@ -140,6 +141,7 @@ describe('AuthService', () => {
     ),
     setSingleDeviceLogin: jest.fn(() => Promise.resolve()),
     assertSessionActive: jest.fn(() => Promise.resolve()),
+    recordAccessTokenIssued: jest.fn(() => Promise.resolve()),
   };
 
   const mockJwt = {
@@ -811,6 +813,40 @@ describe('AuthService', () => {
         issuedAtMs: expect.any(Number),
       }),
     );
+    const [[signedPayload]] = mockJwt.signAsync.mock.calls as unknown as [
+      [{ issuedAtMs: number }],
+    ];
+    expect(
+      mockRefreshTokenService.recordAccessTokenIssued,
+    ).toHaveBeenCalledWith(
+      'uuid-1',
+      'session-1',
+      new Date(signedPayload.issuedAtMs + 60 * 60 * 1000),
+    );
+  });
+
+  it('does not burn a rotated refresh token when expiry metadata persistence fails', async () => {
+    users.push({
+      id: 'uuid-1',
+      accountId: 'testuser',
+      passwordHash: 'hash',
+      status: 'ACTIVE',
+      role: 'USER',
+    });
+    mockRefreshTokenService.recordAccessTokenIssued.mockRejectedValueOnce(
+      new Error('transient database failure'),
+    );
+
+    await expect(service.refresh('refresh-token')).resolves.toEqual(
+      expect.objectContaining({
+        accessToken: 'access-token',
+        refreshToken: 'new-refresh-token',
+      }),
+    );
+    expect(mockRefreshTokenService.assertSessionActive).toHaveBeenCalledWith(
+      'uuid-1',
+      'session-2',
+    );
   });
 
   it('login revokes existing sessions first when single-device login is enabled', async () => {
@@ -1090,10 +1126,11 @@ describe('AuthService', () => {
   it('revokes a selected session for the current user', async () => {
     await service.logoutSession('uuid-1', 'session-2');
 
-    expect(mockRefreshTokenService.revokeSession).toHaveBeenCalledWith(
+    expect(mockRefreshTokenService.revokeSessionFamily).toHaveBeenCalledWith(
       'uuid-1',
       'session-2',
     );
+    expect(mockRefreshTokenService.revokeSession).not.toHaveBeenCalled();
     // 同一设备的其他会话一起撤，否则剩下那条续签会让设备继续在线。
     expect(mockRefreshTokenService.revokeDeviceSessions).toHaveBeenCalledWith(
       'uuid-1',
@@ -1104,6 +1141,22 @@ describe('AuthService', () => {
       'uuid-1',
       'device-key-of-session-2',
     );
+  });
+
+  it('revokes the whole token family when removing the current session', async () => {
+    mockRefreshTokenService.findSessionDeviceKey.mockResolvedValue(
+      'same-phone' as never,
+    );
+
+    await service.logoutSession('uuid-1', 'current-session', 'current-session');
+
+    expect(mockRefreshTokenService.revokeSessionFamily).toHaveBeenCalledWith(
+      'uuid-1',
+      'current-session',
+    );
+    expect(mockRefreshTokenService.revokeSession).not.toHaveBeenCalled();
+    expect(mockRefreshTokenService.revokeDeviceSessions).not.toHaveBeenCalled();
+    expect(mockDeviceTrust.revokeDevice).not.toHaveBeenCalled();
   });
 
   it('revokes other sessions while keeping the current session', async () => {
@@ -1120,17 +1173,18 @@ describe('AuthService', () => {
     expect(mockDeviceTrust.invalidateChallenges).toHaveBeenCalledWith('uuid-1');
   });
 
-  it('removing an older session of the current device keeps this device signed in and trusted', async () => {
+  it('revokes an older selected token family while keeping the same device trusted', async () => {
     mockRefreshTokenService.findSessionDeviceKey.mockResolvedValue(
       'same-phone' as never,
     );
 
     await service.logoutSession('uuid-1', 'old-session', 'current-session');
 
-    expect(mockRefreshTokenService.revokeSession).toHaveBeenCalledWith(
+    expect(mockRefreshTokenService.revokeSessionFamily).toHaveBeenCalledWith(
       'uuid-1',
       'old-session',
     );
+    expect(mockRefreshTokenService.revokeSession).not.toHaveBeenCalled();
     expect(mockRefreshTokenService.revokeDeviceSessions).not.toHaveBeenCalled();
     expect(mockDeviceTrust.revokeDevice).not.toHaveBeenCalled();
     mockRefreshTokenService.findSessionDeviceKey.mockImplementation(
@@ -1302,10 +1356,12 @@ describe('AuthService', () => {
       release = resolve;
     });
     mockRefreshTokenService.findSessionDeviceKey.mockResolvedValue('removed');
-    mockRefreshTokenService.revokeSession.mockImplementationOnce(async () => {
-      removing();
-      await pause;
-    });
+    mockRefreshTokenService.revokeSessionFamily.mockImplementationOnce(
+      async () => {
+        removing();
+        await pause;
+      },
+    );
     const original = mockPrisma.$transaction.getMockImplementation();
     let queue: Promise<unknown> = Promise.resolve();
     mockPrisma.$transaction.mockImplementation((operation: any) => {

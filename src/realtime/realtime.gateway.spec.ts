@@ -105,6 +105,7 @@ function createVerifierPrismaStub() {
   return {
     user: { findUnique: jest.fn().mockResolvedValue({ status: 'ACTIVE' }) },
     refreshToken: { findUnique: jest.fn().mockResolvedValue(null) },
+    sessionScopeGeneration: { findMany: jest.fn().mockResolvedValue([]) },
   };
 }
 
@@ -156,7 +157,12 @@ describe('RealtimeGateway failure logging privacy', () => {
           .mockReturnValue({ sub: 'user-1', accountId: 'account-1' }),
       } as any,
       realtime as any,
-      { verify: jest.fn().mockResolvedValue('active') } as any,
+      {
+        verifyWithIdentity: jest
+          .fn()
+          .mockResolvedValue({ verdict: 'active', identity: null }),
+        verify: jest.fn().mockResolvedValue('active'),
+      } as any,
     );
     const socket = Object.assign(new EventEmitter(), {
       readyState: WebSocket.OPEN,

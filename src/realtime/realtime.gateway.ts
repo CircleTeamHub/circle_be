@@ -280,9 +280,9 @@ export class RealtimeGateway implements OnModuleDestroy {
     // Same verdict the HTTP strategy reaches (F-02, via SessionVerifier), so a
     // banned or logged-out token cannot open a new stream — including when Redis
     // is off, where the verifier consults the database instead of failing open.
-    const admission = await this.sessions.verify(verified.payload);
-    if (admission !== 'active') {
-      this.closeUnverifiedSocket(socket, admission);
+    const admission = await this.sessions.verifyWithIdentity(verified.payload);
+    if (admission.verdict !== 'active') {
+      this.closeUnverifiedSocket(socket, admission.verdict);
       return;
     }
 
@@ -301,7 +301,11 @@ export class RealtimeGateway implements OnModuleDestroy {
       return;
     }
 
-    this.realtimeService.registerPendingClient(userId, socket, identity);
+    this.realtimeService.registerPendingClient(
+      userId,
+      socket,
+      admission.identity ?? identity,
+    );
 
     socket.on('error', (error) => {
       this.logger.warn(
@@ -417,6 +421,9 @@ export class RealtimeGateway implements OnModuleDestroy {
         identity: {
           sessionId: typeof payload.sid === 'string' ? payload.sid : null,
           issuedAtMs: issuedAtMs(payload),
+          familyId: null,
+          audience: null,
+          deviceKey: null,
         },
         payload,
       };

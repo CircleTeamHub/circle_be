@@ -71,6 +71,9 @@ describe('RefreshTokenService TTL wiring (#84 #91)', () => {
       get: (key: string) => (key === 'REFRESH_EXPIRES_IN' ? '30d' : undefined),
     } as unknown as ConfigService;
     const prisma = {
+      sessionScopeGeneration: {
+        findMany: jest.fn().mockResolvedValue([]),
+      },
       refreshToken: {
         create: jest.fn((args: { data: { expiredAt: Date } }) => {
           created.push(args);
