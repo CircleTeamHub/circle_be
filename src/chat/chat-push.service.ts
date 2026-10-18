@@ -9,10 +9,7 @@ import { ChatBroadcastService } from './chat-broadcast.service';
 import { CHAT_PUSH_CHANNEL_ID } from './chat.constants';
 import type { ChatMessageDto } from './chat.types';
 import { reportOperationalError } from 'src/logging/error-aggregation.service';
-import {
-  PrivacySettingsService,
-  type SelfDestructPolicy,
-} from 'src/privacy/privacy-settings.service';
+import { PrivacySettingsService } from 'src/privacy/privacy-settings.service';
 
 /**
  * 聊天离线推送(best-effort):socket 广播覆盖在线端,本服务只管离线成员。
@@ -243,12 +240,10 @@ export class ChatPushService implements OnModuleDestroy {
     const everyone = [...groups.values()].flatMap((group) => group.recipients);
     // G-18:小规模扇出附 per-recipient 角标(iOS 杀后台也有数字)。大群跳过 ——
     // 逐人聚合未读的代价与收益不成比;拿不到就不带 badge,推送照发。
-    const [badges, viewerPolicies] = await Promise.all([
+    const badges =
       everyone.length <= BADGE_TARGETS_MAX
-        ? this.loadUnreadBadges(everyone)
-        : Promise.resolve(new Map<string, number>()),
-      this.privacySettings.getSelfDestructPoliciesForUsers(everyone),
-    ]);
+        ? await this.loadUnreadBadges(everyone)
+        : new Map<string, number>();
     for (const { message, mention, recipients } of groups.values()) {
       const payload = {
         ...(await this.composePayload(message, conversation)),
@@ -260,7 +255,6 @@ export class ChatPushService implements OnModuleDestroy {
         payload,
         badges,
         foregroundTokens,
-        viewerPolicies,
       );
     }
   }
@@ -340,7 +334,6 @@ export class ChatPushService implements OnModuleDestroy {
     payload: ExpoPushPayload,
     badges: Map<string, number>,
     foregroundTokens: Map<string, Set<string>>,
-    viewerPolicies: Map<string, SelfDestructPolicy>,
   ): Promise<void> {
     // 收件人的 token 一次查回、消息整批交给推送服务按 100 条一批发。原来是每个
     // 收件人各查一次 token、各发一次 HTTPS:3000 人的群一条消息就是 3000 + 3000 次。
@@ -362,12 +355,10 @@ export class ChatPushService implements OnModuleDestroy {
     const owners: string[] = [];
     const messages = recipients.flatMap((userId) => {
       const badge = badges.get(userId);
-      const viewerBurnSeconds = this.viewerBurnSeconds(
-        message,
-        viewerPolicies.get(userId),
-      );
+      const senderBurnSeconds =
+        (message.burnDurationSec ?? 0) > 0 ? message.burnDurationSec : null;
       const privacyPayload =
-        viewerBurnSeconds === null
+        senderBurnSeconds === null
           ? payload
           : {
               ...payload,
@@ -379,7 +370,7 @@ export class ChatPushService implements OnModuleDestroy {
                     : BURN_PREVIEW,
               ttl: Math.min(
                 payload.ttl ?? CHAT_PUSH_TTL_SECONDS,
-                viewerBurnSeconds,
+                senderBurnSeconds,
               ),
             };
       const perUser =
@@ -488,6 +479,7 @@ export class ChatPushService implements OnModuleDestroy {
           AND cm."hiddenAt" IS NULL
           AND cm."muted" = false
           AND m."deleted" = false
+          AND (m."burnExpiresAt" IS NULL OR m."burnExpiresAt" > NOW())
           AND m."revokedAt" IS NULL
           AND m."height" > GREATEST(cm."lastReadHeight", cm."clearedBeforeHeight")
           AND (m."senderID" IS NULL OR m."senderID" <> cm."userID")
@@ -629,17 +621,5 @@ export class ChatPushService implements OnModuleDestroy {
       default:
         return '[消息]';
     }
-  }
-
-  private viewerBurnSeconds(
-    message: ChatMessageDto,
-    policy: SelfDestructPolicy | undefined,
-  ): number | null {
-    if (!policy || policy.sec <= 0 || !policy.startedAt) return null;
-    const createdAt = new Date(message.createdAt);
-    if (Number.isNaN(createdAt.getTime()) || createdAt < policy.startedAt) {
-      return null;
-    }
-    return policy.sec;
   }
 }

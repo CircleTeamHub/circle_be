@@ -192,16 +192,9 @@ export interface ChatMessageDto {
   editedAt?: string | null;
   /** 表情回应聚合;无回应缺省。 */
   reactions?: ChatReactionSummary[];
-  /**
-   * 所属会话的阅后即焚秒数;null = 该会话未开启。
-   *
-   * 这是会话级设置,却要逐条消息带上:客户端此前只能从**会话列表缓存**里查这个
-   * 值,而推送冷启动时消息可能先于会话列表到达 —— 查不到就当成「没开焚毁」,
-   * 于是本该阅后即焚的图片按普通图片处理:原图落盘缓存、长按可存进相册。
-   * 缓存补齐之后再翻转已经晚了,文件已经写下去了。带在消息上,渲染这条消息所
-   * 需的一切就都在消息里,不再依赖任何加载顺序。
-   */
+  /** 发送者首次发送时确定的时长；媒体缓存/转发限制逐条读取，不继承查看者设置。 */
   burnDurationSec?: number | null;
+  burnExpiresAt?: string | null;
   /** 发送者本人的 ack 与广播共用此字段做本地乐观消息对账。 */
   d: string | null;
   createdAt: string;
@@ -249,10 +242,7 @@ export interface ChatTypingBroadcast {
  * - updated:会话元数据变化(预留,当前无生产方)
  */
 export type ChatConversationChangeKind =
-  | 'joined'
-  | 'left'
-  | 'removed'
-  | 'updated';
+  'joined' | 'left' | 'removed' | 'updated';
 
 /** chat:conversation 服务端定向下发(个人房):接收者本人的会话成员关系变化。 */
 export interface ChatConversationBroadcast {
@@ -359,6 +349,7 @@ export interface ChatPresenceBroadcast {
 
 /** 会话列表项 DTO(REST GET /chat/conversations)。 */
 export interface ChatConversationDto {
+  textEncryption?: string;
   id: string;
   type: 'DIRECT' | 'GROUP' | 'TEMP' | 'SUPPORT';
   /** DIRECT 会话的对端用户;其余类型为 null。 */
@@ -398,9 +389,9 @@ export interface ChatConversationDto {
   myRole: 'OWNER' | 'ADMIN' | 'MEMBER' | null;
   /** 群策略(仅 GROUP);其他类型为 null。 */
   policies: ChatGroupPoliciesDto | null;
-  /** 会话级阅后即焚秒数(S-01);null=关。 */
+  /** 本人新发送消息的焚毁秒数；null=关。 */
   burnDurationSec?: number | null;
-  /** 本轮会话级焚毁的开启时刻；此前消息永久排除在本轮焚毁之外。 */
+  /** 本人发送策略的设置时刻；已发送消息的到期时间不受其改变。 */
   burnStartedAt?: string | null;
   /**
    * DIRECT 会话对端座位的已读水位(ChatMember.lastReadHeight);其余类型为 null。

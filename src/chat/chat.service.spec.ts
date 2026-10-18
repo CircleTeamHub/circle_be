@@ -278,7 +278,14 @@ describe('ChatService', () => {
     const [[args]] = prisma.chatMessage.findMany.mock.calls as [
       [{ where: Record<string, unknown> }],
     ];
-    expect(args.where.AND).toBeUndefined();
+    expect(args.where.AND).toEqual([
+      {
+        OR: [
+          { burnExpiresAt: null },
+          { burnExpiresAt: { gt: expect.any(Date) } },
+        ],
+      },
+    ]);
     // 隐私设置压根不该被查 —— 访客 id 不对应任何 User。
     expect(privacySettings.getSettings).not.toHaveBeenCalled();
   });
@@ -300,63 +307,71 @@ describe('ChatService', () => {
       [{ where: Record<string, unknown> }],
     ];
     // 边界缺失时宁可不过滤:这是查看者自己视图上的读过滤,失效不外泄给任何人。
-    expect(args.where.AND).toBeUndefined();
+    expect(args.where.AND).toEqual([
+      {
+        OR: [
+          { burnExpiresAt: null },
+          { burnExpiresAt: { gt: expect.any(Date) } },
+        ],
+      },
+    ]);
   });
 
   describe('getNoteCardNoteId', () => {
-    it('returns a note pointer only from a visible card in the same conversation', async () => {
-      prisma.chatMember.findUnique.mockResolvedValue(membership());
-      prisma.chatMessage.findFirst.mockResolvedValueOnce({
-        content: { noteId: 'note-1' },
-      });
-
-      await expect(
-        service.getNoteCardNoteId('u1', 'conv-1', 'msg-1'),
-      ).resolves.toBe('note-1');
-      expect(prisma.chatMessage.findFirst).toHaveBeenCalledWith({
-        where: {
-          id: 'msg-1',
-          conversationID: 'conv-1',
-          type: 'note-card',
-          deleted: false,
-          revokedAt: null,
-        },
-        select: { content: true },
-      });
+    const card = (overrides: Record<string, unknown> = {}) => ({
+      id: 'msg-1',
+      conversationID: 'conv-1',
+      senderID: 'host-1',
+      height: 9,
+      createdAt: new Date(),
+      deleted: false,
+      revokedAt: null,
+      type: 'note-card',
+      content: { noteId: 'note-1' },
+      ...overrides,
     });
-
-    it('does not resolve a missing, revoked, or malformed card', async () => {
+    beforeEach(() => {
       prisma.chatMember.findUnique.mockResolvedValue(membership());
-      prisma.chatMessage.findFirst.mockResolvedValueOnce({ content: {} });
-
-      await expect(
-        service.getNoteCardNoteId('u1', 'conv-1', 'msg-1'),
-      ).rejects.toThrow(NotFoundException);
+      prisma.chatMessage.findUnique.mockResolvedValue(card());
     });
-
-    // 访客读笔记的纵深防御:即使网关的类型闸门被绕过,访客自己(或另一名访客)
-    // 发的 note-card 也不能成为读取入口 —— 只认房主发出的卡片。
-    it('pins the card to the required sender when one is given', async () => {
-      prisma.chatMember.findUnique.mockResolvedValue(membership());
-      prisma.chatMessage.findFirst.mockResolvedValueOnce({
-        content: { noteId: 'note-1' },
-      });
-
+    it('returns the authorized note pointer and validates its sender', async () => {
       await expect(
         service.getNoteCardNoteId('u1', 'conv-1', 'msg-1', 'host-1'),
       ).resolves.toBe('note-1');
-      expect(prisma.chatMessage.findFirst).toHaveBeenCalledWith({
-        where: {
-          id: 'msg-1',
-          conversationID: 'conv-1',
-          type: 'note-card',
-          deleted: false,
-          revokedAt: null,
-          senderID: 'host-1',
-        },
-        select: { content: true },
-      });
     });
+    it.each([
+      { conversationID: 'other-conversation' },
+      { senderID: 'other-user' },
+      { type: 'text' },
+      { content: {} },
+      { deleted: true },
+      { revokedAt: new Date() },
+      { burnExpiresAt: new Date(0) },
+    ])('rejects an inaccessible or mismatched card: %j', async (change) => {
+      prisma.chatMessage.findUnique.mockResolvedValue(card(change));
+      await expect(
+        service.getNoteCardNoteId('u1', 'conv-1', 'msg-1', 'host-1'),
+      ).rejects.toBeInstanceOf(NotFoundException);
+    });
+    it('rejects a card at the personal clear watermark', async () => {
+      prisma.chatMember.findUnique.mockResolvedValue(
+        membership({ clearedBeforeHeight: 9 }),
+      );
+      await expect(
+        service.getNoteCardNoteId('u1', 'conv-1', 'msg-1'),
+      ).rejects.toBeInstanceOf(NotFoundException);
+    });
+    it.each([null, { leftAt: new Date() }])(
+      'rejects a missing/left seat',
+      async (seat) => {
+        prisma.chatMember.findUnique.mockResolvedValue(
+          seat && membership(seat),
+        );
+        await expect(
+          service.getNoteCardNoteId('u1', 'conv-1', 'msg-1'),
+        ).rejects.toBeInstanceOf(ForbiddenException);
+      },
+    );
   });
 
   // 事务已提交,之后的富化只是装饰。抛出去的话 handleSend 既不广播也不推送,
@@ -866,6 +881,8 @@ describe('ChatService', () => {
         id: 'source-message',
         conversationID: 'source-conv',
         senderID: 'u2',
+        burnDurationSec: 60,
+        burnExpiresAt: new Date(Date.now() + 60_000),
         height: 8,
         type: 'image',
         content: { key: 'chat/u2/source.jpg' },
@@ -1020,6 +1037,8 @@ describe('ChatService', () => {
         id: 'source-message',
         conversationID: 'source-conv',
         senderID: 'u1',
+        burnDurationSec: 60,
+        burnExpiresAt: new Date(Date.now() - 60_000),
         height: 8,
         type: 'image',
         content: { key: 'chat/u1/mine.jpg' },
@@ -2430,7 +2449,7 @@ describe('ChatService', () => {
     // 阅后即焚是会话级设置，却必须逐条消息带上：客户端此前只能查会话列表缓存，
     // 而推送冷启动时消息可能先于列表到达，查不到就按「没开焚毁」渲染 —— 原图
     // 落盘、长按可存相册，等缓存补齐已经晚了。带在消息上就不依赖加载顺序。
-    it('stamps each message with its conversation burn duration', async () => {
+    it('returns each author-stamped duration independently of my conversation setting', async () => {
       prisma.chatMember.findUnique.mockResolvedValue(
         membership({
           conversation: {
@@ -2445,8 +2464,8 @@ describe('ChatService', () => {
         }),
       );
       prisma.chatMessage.findMany.mockResolvedValue([
-        { ...createdRow, id: 'msg-5', height: 5 },
-        { ...createdRow, id: 'msg-4', height: 4 },
+        { ...createdRow, id: 'msg-5', height: 5, burnDurationSec: 60 },
+        { ...createdRow, id: 'msg-4', height: 4, burnDurationSec: 60 },
       ]);
 
       const page = await service.getHistory('u1', 'conv-1', undefined, 50);
@@ -2519,7 +2538,7 @@ describe('ChatService', () => {
 
     // 按日期过滤同样写 createdAt。销毁截止若和它并在同一层,会被整个盖掉 ——
     // 客户端带上 date 就能翻出窗口之外的消息。两者必须同时成立。
-    it('keeps the self-destruct cutoff when a date filter is also supplied', async () => {
+    it('keeps message expiry when a date filter is supplied', async () => {
       privacySettings.getSelfDestructPolicy.mockResolvedValue({
         sec: 172800,
         startedAt: LONG_AGO,
@@ -2544,8 +2563,8 @@ describe('ChatService', () => {
       expect(args.where.AND).toEqual([
         {
           OR: [
-            { createdAt: { lt: LONG_AGO } },
-            { createdAt: { gte: expect.any(Date) } },
+            { burnExpiresAt: null },
+            { burnExpiresAt: { gt: expect.any(Date) } },
           ],
         },
       ]);
@@ -2752,22 +2771,14 @@ describe('ChatService', () => {
 
       await service.searchAllMessages('u1', 'hello');
 
-      // 查看者窗口现在由 chatRetentionWhere 统一构造,落在 where.AND 上 ——
-      // 和 getHistory 走的是同一个函数,这正是本用例要钉住的「同一把尺子」。
-      const [[args]] = prisma.chatMessage.findMany.mock.calls as [
-        [
-          {
-            where: {
-              AND?: Array<{ OR?: Array<{ createdAt?: { gte?: Date } }> }>;
-            };
-          },
-        ],
-      ];
-      const gte = args.where.AND?.[0]?.OR?.[1]?.createdAt?.gte;
-      expect(gte).toBeInstanceOf(Date);
-      const ageMs = Date.now() - (gte as Date).getTime();
-      expect(ageMs).toBeGreaterThan(47 * 60 * 60 * 1000);
-      expect(ageMs).toBeLessThan(49 * 60 * 60 * 1000);
+      expect(prisma.chatMessage.findMany.mock.calls[0][0].where.AND).toEqual([
+        {
+          OR: [
+            { burnExpiresAt: null },
+            { burnExpiresAt: { gt: expect.any(Date) } },
+          ],
+        },
+      ]);
     });
 
     // 开关打开之前发出的消息不受这个窗口约束 —— 历史里翻得到,搜索也必须搜得到,
@@ -2785,12 +2796,14 @@ describe('ChatService', () => {
 
       await service.searchAllMessages('u1', 'hello');
 
-      const [[args]] = prisma.chatMessage.findMany.mock.calls as [
-        [{ where: { AND?: Array<{ OR?: Array<Record<string, any>> }> } }],
-      ];
-      const or = args.where.AND?.[0]?.OR;
-      expect(or?.[0]).toEqual({ createdAt: { lt: startedAt } });
-      expect(or?.[1]?.createdAt?.gte).toBeInstanceOf(Date);
+      expect(prisma.chatMessage.findMany.mock.calls[0][0].where.AND).toEqual([
+        {
+          OR: [
+            { burnExpiresAt: null },
+            { burnExpiresAt: { gt: expect.any(Date) } },
+          ],
+        },
+      ]);
     });
 
     it('scopes the search to conversations the user is seated in', async () => {
@@ -2919,16 +2932,10 @@ describe('ChatService', () => {
 
       await service.listConversations('u1');
 
-      expect(privacySettings.getSelfDestructPolicy).toHaveBeenCalledWith('u1');
-      const cutoffParams = (prisma.$queryRaw.mock.calls as unknown[][])
-        .map((call) => call.slice(1))
-        .flat()
-        .filter(
-          (param): param is (Date | null)[] =>
-            Array.isArray(param) && param[0] instanceof Date,
-        );
-      // preview / unread 两条查询各贡献 viewerCutoffs 与 viewerStarts 两个数组。
-      expect(cutoffParams).toHaveLength(4);
+      expect(privacySettings.getSelfDestructPolicy).not.toHaveBeenCalled();
+      for (const [strings] of prisma.$queryRaw.mock.calls) {
+        expect(strings.join('')).toContain('"burnExpiresAt"');
+      }
     });
 
     it('returns dtos with unread counts excluding own messages', async () => {
@@ -3974,7 +3981,7 @@ describe('ChatService', () => {
       [0, 3600],
       [1000, 3600],
     ])(
-      'preserves the activation boundary when editing at offset %i',
+      'preserves the immutable message duration when editing at offset %i',
       async (offset, expectedDuration) => {
         const burnStartedAt = new Date(Date.now() - 2000);
         const seat = membership();
@@ -3989,6 +3996,7 @@ describe('ChatService', () => {
         );
         const row = editableRow({
           createdAt: new Date(burnStartedAt.getTime() + offset),
+          burnDurationSec: expectedDuration,
         });
         prisma.chatMessage.findUnique.mockResolvedValue(row);
         prisma.chatMessage.updateMany.mockResolvedValue({ count: 1 });
@@ -4402,6 +4410,8 @@ describe('ChatService', () => {
       burnStartedAt: Date | null = null,
     ) =>
       membership({
+        burnDurationSec,
+        burnStartedAt,
         ...seat,
         conversation: {
           id: 'conv-1',
@@ -4416,7 +4426,7 @@ describe('ChatService', () => {
       });
 
     // 已装机的 App 每次打开私聊都会 GET 这个路径;此前只有 POST,每开一次一个 404。
-    it('returns the current conversation policy in the POST response shape', async () => {
+    it('returns my member policy instead of the shared conversation policy', async () => {
       const burnStartedAt = new Date('2026-09-14T10:00:00.000Z');
       prisma.chatMember.findUnique.mockResolvedValue(
         directSeat(3600, {}, burnStartedAt),
@@ -4463,335 +4473,129 @@ describe('ChatService', () => {
     });
   });
 
-  describe('setBurnDuration(S-01 会话级阅后即焚)', () => {
-    it('any DIRECT member sets it for both sides and a notice is left', async () => {
-      prisma.chatMember.findUnique.mockResolvedValue(
-        membership({
-          conversation: {
-            id: 'conv-1',
-            type: 'DIRECT',
-            directKey: 'a:b',
-            circleID: null,
-            tempChatID: null,
-            lastMessageAt: null,
-            burnDurationSec: null,
-          },
-        }),
-      );
-      prisma.chatConversation.update.mockResolvedValue({
-        id: 'conv-1',
-        burnDurationSec: 3600,
-        burnStartedAt: new Date('2026-09-14T10:00:00.000Z'),
+  describe('sender-owned burn settings', () => {
+    const setup = (type = 'DIRECT') => {
+      const policies = new Map<
+        string,
+        { burnDurationSec: number | null; burnStartedAt: Date | null }
+      >();
+      prisma.chatMember.findUnique.mockImplementation(({ where }) => {
+        const id = where.conversationID_userID.userID;
+        return Promise.resolve(
+          membership({
+            userID: id,
+            ...policies.get(id),
+            conversation: {
+              ...membership().conversation,
+              type,
+              directKey: 'u1:u2',
+            },
+          }),
+        );
       });
-
-      const result = await service.setBurnDuration('u1', 'conv-1', 3600);
-
-      expect(prisma.chatConversation.update).toHaveBeenCalledWith({
-        where: { id: 'conv-1' },
-        data: {
-          burnDurationSec: 3600,
-          burnStartedAt: expect.any(Date),
-        },
+      prisma.chatMember.update.mockImplementation(({ where, data }) => {
+        policies.set(where.conversationID_userID.userID, data);
+        return Promise.resolve(data);
       });
-      // 开关变更必须留系统痕迹,防「对方偷偷开了焚毁」——
-      // 而且要和设置更新在同一个事务里(emit 内部吞异常,await 它等于没做)。
-      expect(systemMessage.insertSystemMessageInTx).toHaveBeenCalledWith(
-        expect.anything(),
-        'conv-1',
-        {
-          kind: 'burn-changed',
-          seconds: 3600,
-          burnStartedAt: expect.any(String),
-        },
-      );
-      // 广播在提交之后,否则事务回滚了客户端却已经收到那条提示。
-      expect(systemMessage.broadcastSystemMessage).toHaveBeenCalled();
-      expect(result.burnDurationSec).toBe(3600);
-      expect(result.burnStartedAt).toBe('2026-09-14T10:00:00.000Z');
-    });
-
-    it('preserves the activation boundary when an active duration changes', async () => {
-      const burnStartedAt = new Date('2026-09-14T09:00:00.000Z');
-      prisma.chatMember.findUnique.mockResolvedValue(
-        membership({
-          conversation: {
-            id: 'conv-1',
-            type: 'DIRECT',
-            directKey: 'a:b',
-            circleID: null,
-            tempChatID: null,
-            lastMessageAt: null,
-            burnDurationSec: 3600,
-            burnStartedAt,
-          },
-        }),
-      );
-      prisma.chatConversation.update.mockResolvedValue({
-        id: 'conv-1',
-        burnDurationSec: 60,
-        burnStartedAt,
-      });
-
+      return policies;
+    };
+    it('A enables 60 seconds while B stays off; B can choose independently', async () => {
+      setup();
       await service.setBurnDuration('u1', 'conv-1', 60);
-
-      expect(prisma.chatConversation.update).toHaveBeenCalledWith({
-        where: { id: 'conv-1' },
-        data: { burnDurationSec: 60, burnStartedAt },
+      expect(await service.getBurnPolicy('u1', 'conv-1')).toMatchObject({
+        burnDurationSec: 60,
       });
-      expect(systemMessage.insertSystemMessageInTx).toHaveBeenCalledWith(
-        expect.anything(),
-        'conv-1',
-        {
-          kind: 'burn-changed',
-          seconds: 60,
-          burnStartedAt: burnStartedAt.toISOString(),
-        },
-      );
-    });
-
-    it('returns the committed burn setting when post-commit audit delivery fails', async () => {
-      prisma.chatMember.findUnique.mockResolvedValue(
-        membership({
-          conversation: {
-            id: 'conv-1',
-            type: 'DIRECT',
-            directKey: 'a:b',
-            circleID: null,
-            tempChatID: null,
-            lastMessageAt: null,
-            burnDurationSec: null,
-          },
-        }),
-      );
-      prisma.chatConversation.update.mockResolvedValue({
-        id: 'conv-1',
-        burnDurationSec: 3600,
-        burnStartedAt: new Date('2026-09-14T10:00:00.000Z'),
-      });
-      systemMessage.broadcastSystemMessage.mockRejectedValueOnce(
-        new Error('adapter leaked private content'),
-      );
-      const warn = jest
-        .spyOn((service as any).logger, 'warn')
-        .mockImplementation(() => undefined);
-
-      await expect(
-        service.setBurnDuration('u1', 'conv-1', 3600),
-      ).resolves.toEqual({
-        burnDurationSec: 3600,
-        burnStartedAt: '2026-09-14T10:00:00.000Z',
-      });
-
-      expect(prisma.chatConversation.update).toHaveBeenCalledTimes(1);
-      expect(systemMessage.insertSystemMessageInTx).toHaveBeenCalledTimes(1);
-      expect(warn).toHaveBeenCalledWith(
-        'burn audit realtime delivery failed after commit (Error)',
-      );
-      expect(JSON.stringify(warn.mock.calls)).not.toMatch(
-        /private content|adapter leaked/,
-      );
-    });
-
-    it('normalizes 0 to off(null)', async () => {
-      prisma.chatMember.findUnique.mockResolvedValue(
-        membership({
-          conversation: {
-            id: 'conv-1',
-            type: 'DIRECT',
-            directKey: 'a:b',
-            circleID: null,
-            tempChatID: null,
-            lastMessageAt: null,
-            burnDurationSec: 3600,
-          },
-        }),
-      );
-      prisma.chatConversation.update.mockResolvedValue({
-        id: 'conv-1',
+      expect(await service.getBurnPolicy('u2', 'conv-1')).toEqual({
         burnDurationSec: null,
+        burnStartedAt: null,
       });
-
-      // 关掉焚毁 = 放宽:先把旧策略下已过期的消息真删掉(分批,这里一批清完)。
-      prisma.chatMessage.findMany.mockResolvedValue([]);
-
-      const result = await service.setBurnDuration('u1', 'conv-1', 0);
-      expect(prisma.chatConversation.update).toHaveBeenCalledWith({
-        where: { id: 'conv-1' },
-        data: { burnDurationSec: null, burnStartedAt: null },
+      await service.setBurnDuration('u2', 'conv-1', 300);
+      expect(await service.getBurnPolicy('u1', 'conv-1')).toMatchObject({
+        burnDurationSec: 60,
       });
-      expect(result.burnDurationSec).toBeNull();
+      expect(await service.getBurnPolicy('u2', 'conv-1')).toMatchObject({
+        burnDurationSec: 300,
+      });
+      expect(prisma.chatConversation.update).not.toHaveBeenCalled();
       expect(systemMessage.insertSystemMessageInTx).toHaveBeenCalledWith(
-        expect.anything(),
+        prisma,
         'conv-1',
-        { kind: 'burn-changed', seconds: 0, burnStartedAt: null },
+        expect.objectContaining({ userId: 'u1', seconds: 60 }),
       );
     });
-
-    // 放宽前的兜底真删同样是墓碑:不通知的话,对端设备上这批已经烧掉的正文还留在本地。
-    it('announces the ids tombstoned before a relax, after they commit', async () => {
-      prisma.chatMember.findUnique.mockResolvedValue(
-        membership({
-          conversation: {
-            id: 'conv-1',
-            type: 'DIRECT',
-            directKey: 'a:b',
-            circleID: null,
-            tempChatID: null,
-            lastMessageAt: null,
-            burnDurationSec: 60,
-          },
-        }),
+    it('the sender choice is stamped only onto their own new messages', async () => {
+      setup();
+      prisma.chatMessage.findFirst.mockResolvedValue(null);
+      prisma.chatMessage.findUnique.mockResolvedValue(null);
+      prisma.chatMessage.create.mockImplementation(({ data }) =>
+        Promise.resolve({ ...createdRow, ...data }),
       );
-      prisma.chatConversation.update.mockResolvedValue({
-        id: 'conv-1',
-        burnDurationSec: null,
-      });
-      prisma.chatMessage.findMany.mockResolvedValueOnce([
-        { id: 'expired-1', type: 'text', content: { text: 'gone' } },
-        { id: 'expired-2', type: 'text', content: { text: 'gone too' } },
-      ]);
-      // RETURNING 带回触发器分配的序号,随通知下发。
-      prisma.chatMessage.updateManyAndReturn.mockResolvedValue([
-        { id: 'expired-1', revision: 21 },
-        { id: 'expired-2', revision: 22 },
-      ]);
-
-      await service.setBurnDuration('u1', 'conv-1', 0);
-
-      expect(broadcast.emitBurnedMessages).toHaveBeenCalledWith('conv-1', [
-        { id: 'expired-1', revision: 21 },
-        { id: 'expired-2', revision: 22 },
-      ]);
+      await service.setBurnDuration('u1', 'conv-1', 60);
+      const a = await service.sendMessage('u1', sendPayload());
+      const b = await service.sendMessage('u2', sendPayload({ d: 'b-send' }));
+      expect(a.message.burnDurationSec).toBe(60);
       expect(
-        prisma.chatMessage.updateManyAndReturn.mock.invocationCallOrder[0],
-      ).toBeLessThan(broadcast.emitBurnedMessages.mock.invocationCallOrder[0]);
+        Date.parse(a.message.burnExpiresAt!) - Date.parse(a.message.createdAt),
+      ).toBe(60_000);
+      expect(b.message.burnDurationSec).toBeNull();
+      expect(b.message.burnExpiresAt).toBeNull();
     });
-
-    it('announces nothing when the duration only gets stricter', async () => {
-      prisma.chatMember.findUnique.mockResolvedValue(
-        membership({
-          conversation: {
-            id: 'conv-1',
-            type: 'DIRECT',
-            directKey: 'a:b',
-            circleID: null,
-            tempChatID: null,
-            lastMessageAt: null,
-            burnDurationSec: 3600,
-          },
-        }),
-      );
-      prisma.chatConversation.update.mockResolvedValue({
-        id: 'conv-1',
-        burnDurationSec: 60,
-      });
-
+    it('turning off affects new sends and leaves existing expiries and peer data alone', async () => {
+      setup();
       await service.setBurnDuration('u1', 'conv-1', 60);
-
-      expect(broadcast.emitBurnedMessages).not.toHaveBeenCalled();
-    });
-
-    it('GROUP requires a circle owner/admin', async () => {
-      prisma.chatMember.findUnique.mockResolvedValue(
-        membership({
-          conversation: {
-            id: 'conv-1',
-            type: 'GROUP',
-            directKey: null,
-            circleID: 'circle-1',
-            tempChatID: null,
-            lastMessageAt: null,
-            burnDurationSec: null,
-          },
-        }),
-      );
-      prisma.circleMember.findUnique.mockResolvedValue({
-        role: 'MEMBER',
-        status: 'ACTIVE',
+      await service.setBurnDuration('u1', 'conv-1', 0);
+      expect(await service.getBurnPolicy('u1', 'conv-1')).toEqual({
+        burnDurationSec: null,
+        burnStartedAt: null,
       });
-
+      expect(prisma.chatMessage.updateManyAndReturn).not.toHaveBeenCalled();
+      expect(prisma.chatMessage.updateMany).not.toHaveBeenCalled();
+    });
+    it('regular group members set only their own policy', async () => {
+      setup('GROUP');
       await expect(
-        service.setBurnDuration('u1', 'conv-1', 3600),
-      ).rejects.toMatchObject({
-        response: { errorCode: 'GROUP_MANAGER_ONLY' },
-      });
-    });
-
-    it('standalone GROUP lets the owner set it (no circle role exists there)', async () => {
-      prisma.chatMember.findUnique.mockResolvedValue(
-        membership({
-          conversation: {
-            id: 'conv-1',
-            type: 'GROUP',
-            directKey: null,
-            circleID: null,
-            tempChatID: null,
-            ownerID: 'u1',
-            lastMessageAt: null,
-            burnDurationSec: null,
-          },
-        }),
-      );
-
-      prisma.chatConversation.update.mockResolvedValue({
-        id: 'conv-1',
-        burnDurationSec: 3600,
-        burnStartedAt: new Date('2026-09-14T10:00:00.000Z'),
-      });
-
-      const result = await service.setBurnDuration('u1', 'conv-1', 3600);
-
-      expect(result).toEqual({
-        burnDurationSec: 3600,
-        burnStartedAt: '2026-09-14T10:00:00.000Z',
-      });
-      // 独立群聊没有 CircleMember 表可查,不该去查。
+        service.setBurnDuration('u1', 'conv-1', 60),
+      ).resolves.toMatchObject({ burnDurationSec: 60 });
       expect(prisma.circleMember.findUnique).not.toHaveBeenCalled();
-    });
-
-    it('standalone GROUP rejects a plain member', async () => {
-      prisma.chatMember.findUnique.mockResolvedValue(
-        membership({
-          userID: 'u2',
-          conversation: {
-            id: 'conv-1',
-            type: 'GROUP',
-            directKey: null,
-            circleID: null,
-            tempChatID: null,
-            ownerID: 'u1',
-            lastMessageAt: null,
-            burnDurationSec: null,
+      expect(prisma.chatMember.update).toHaveBeenCalledWith(
+        expect.objectContaining({
+          where: {
+            conversationID_userID: { conversationID: 'conv-1', userID: 'u1' },
           },
         }),
       );
-
-      await expect(
-        service.setBurnDuration('u2', 'conv-1', 3600),
-      ).rejects.toMatchObject({
-        response: { errorCode: 'GROUP_MANAGER_ONLY' },
-      });
     });
-
-    it('TEMP conversations reject the toggle (guest retention = room lifetime)', async () => {
-      prisma.chatMember.findUnique.mockResolvedValue(
-        membership({
-          conversation: {
-            id: 'conv-1',
-            type: 'TEMP',
-            directKey: null,
-            circleID: null,
-            tempChatID: 'tc-1',
-            lastMessageAt: null,
-            burnDurationSec: null,
-          },
-        }),
+    it('nonmembers cannot change a sender policy', async () => {
+      prisma.chatMember.findUnique.mockResolvedValue(null);
+      await expect(service.setBurnDuration('u1', 'conv-1', 60)).rejects.toThrow(
+        ForbiddenException,
+      );
+      expect(prisma.chatMember.update).not.toHaveBeenCalled();
+    });
+    it('a failed notice transaction rejects without broadcasting', async () => {
+      setup();
+      systemMessage.insertSystemMessageInTx.mockRejectedValueOnce(
+        new Error('transaction failed'),
+      );
+      await expect(service.setBurnDuration('u1', 'conv-1', 60)).rejects.toThrow(
+        'transaction failed',
+      );
+      expect(systemMessage.broadcastSystemMessage).not.toHaveBeenCalled();
+    });
+    it('a failed post-commit broadcast does not discard the committed setting', async () => {
+      setup();
+      systemMessage.broadcastSystemMessage.mockRejectedValueOnce(
+        new Error('broadcast failed'),
       );
       await expect(
-        service.setBurnDuration('u1', 'conv-1', 3600),
-      ).rejects.toMatchObject({
-        response: { errorCode: 'CHAT_INVALID_PAYLOAD' },
-      });
+        service.setBurnDuration('u1', 'conv-1', 60),
+      ).resolves.toMatchObject({ burnDurationSec: 60 });
+    });
+    it('temporary chats cannot opt into sender burn', async () => {
+      setup('TEMP');
+      await expect(service.setBurnDuration('u1', 'conv-1', 60)).rejects.toThrow(
+        BadRequestException,
+      );
     });
   });
 
@@ -5945,29 +5749,14 @@ describe('ChatService', () => {
 
       await service.getHistory('u1', 'conv-1', undefined, 50);
 
-      const [[args]] = prisma.chatMessage.findMany.mock.calls as [
-        [
-          {
-            where: {
-              AND?: Array<
-                | { createdAt: { gte: Date } }
-                | { OR: Array<{ createdAt: { gte?: Date } }> }
-              >;
-            };
-          },
-        ],
-      ];
-      const cutoff = args.where.AND?.flatMap((condition) =>
-        'OR' in condition ? condition.OR : [condition],
-      )
-        .map((condition) => condition.createdAt.gte)
-        .filter((value): value is Date => value instanceof Date)
-        .sort((a, b) => b.getTime() - a.getTime())[0];
-      expect(cutoff).toBeInstanceOf(Date);
-      // 更严 = 更晚的截止:1 小时焚毁窗口应覆盖 1 周的查看者设置。
-      expect(Date.now() - (cutoff as Date).getTime()).toBeLessThan(
-        2 * 60 * 60 * 1000,
-      );
+      expect(prisma.chatMessage.findMany.mock.calls[0][0].where.AND).toEqual([
+        {
+          OR: [
+            { burnExpiresAt: null },
+            { burnExpiresAt: { gt: expect.any(Date) } },
+          ],
+        },
+      ]);
     });
   });
 
@@ -6260,63 +6049,18 @@ describe('ChatService', () => {
     });
   });
 
-  describe('放宽焚毁时长前先落地已过期的消息', () => {
-    it('tombstones already-expired rows before relaxing the policy', async () => {
-      const burnStartedAt = new Date(Date.now() - 10 * 60_000);
-      prisma.chatMember.findUnique.mockResolvedValue(
-        membership({
-          conversation: {
-            id: 'conv-1',
-            type: 'GROUP',
-            directKey: null,
-            circleID: 'circle-1',
-            tempChatID: null,
-            lastMessageAt: null,
-            burnDurationSec: 60,
-            burnStartedAt,
-          },
-        }),
-      );
-      prisma.circleMember.findUnique.mockResolvedValue({
-        role: 'OWNER',
-        status: 'ACTIVE',
+  describe('message expiry survives setting relaxation', () => {
+    it('an expired message stays unavailable even when the viewer and conversation have no burn setting', async () => {
+      prisma.chatMember.findUnique.mockResolvedValue(membership());
+      prisma.chatMessage.findUnique.mockResolvedValue({
+        ...createdRow,
+        burnDurationSec: 60,
+        burnExpiresAt: new Date(Date.now() - 1),
+        revokedAt: null,
       });
-      prisma.chatMessage.findMany.mockResolvedValue([
-        { id: 'old-1', type: 'image', content: { key: 'chat/u1/a.jpg' } },
-      ]);
-      prisma.chatMessage.updateManyAndReturn.mockResolvedValue([
-        { id: 'old-1', revision: 9 },
-      ]);
-      prisma.chatConversation.update.mockResolvedValue({
-        id: 'conv-1',
-        burnDurationSec: null,
-      });
-
-      await service.setBurnDuration('admin-1', 'conv-1', null);
-
-      expect(prisma.chatMessage.findMany).toHaveBeenCalledWith(
-        expect.objectContaining({
-          where: expect.objectContaining({
-            createdAt: { gte: burnStartedAt, lt: expect.any(Date) },
-          }),
-        }),
-      );
-
-      // 已到期、只是还没轮到 sweeper 的行必须先真删,否则关掉焚毁之后
-      // 那些「已经烧掉」的消息连同新签名的媒体 URL 一起重新可读。
-      expect(prisma.chatMessage.updateManyAndReturn).toHaveBeenCalledWith(
-        expect.objectContaining({
-          data: expect.objectContaining({
-            deleted: true,
-            content: {},
-            contentHistory: [],
-          }),
-        }),
-      );
-      expect(media.deleteObjects).toHaveBeenCalledWith(['chat/u1/a.jpg']);
-      expect(media.queueDeletions).toHaveBeenCalledWith(prisma, [
-        'chat/u1/a.jpg',
-      ]);
+      await expect(
+        service.requireVisibleMessage('u1', 'msg-1'),
+      ).rejects.toThrow(NotFoundException);
     });
   });
 
@@ -6593,7 +6337,18 @@ describe('ChatService', () => {
       // 清空过的会话单独一支带 height 下界;没清空过的仍走同一个 IN。
       expect(args.where.OR).toEqual([
         { conversationID: { in: ['conv-2'] } },
-        { conversationID: 'conv-1', height: { gt: 7 } },
+        {
+          conversationID: 'conv-1',
+          height: { gt: 7 },
+          AND: [
+            {
+              OR: [
+                { burnExpiresAt: null },
+                { burnExpiresAt: { gt: expect.any(Date) } },
+              ],
+            },
+          ],
+        },
       ]);
     });
   });
@@ -6725,7 +6480,7 @@ describe('ChatService', () => {
       await expectMessageNotFound(service.requireVisibleMessage('u1', 'msg-1'));
     });
 
-    it('rejects a message past the viewer self-destruct window', async () => {
+    it('my viewer setting cannot hide a peer message without an expiry', async () => {
       privacySettings.getSelfDestructPolicy.mockResolvedValue({
         sec: 60,
         startedAt: LONG_AGO,
@@ -6734,13 +6489,16 @@ describe('ChatService', () => {
         visibleRow({ createdAt: new Date(Date.now() - 5 * 60_000) }),
       );
 
-      await expectMessageNotFound(service.requireVisibleMessage('u1', 'msg-1'));
+      await expect(
+        service.requireVisibleMessage('u1', 'msg-1'),
+      ).resolves.toBeDefined();
     });
 
     it('rejects a message past the conversation burn window even for its own sender', async () => {
       prisma.chatMessage.findUnique.mockResolvedValue(
         visibleRow({
           senderID: 'u1',
+          burnExpiresAt: new Date(Date.now() - 1),
           createdAt: new Date(Date.now() - 5 * 60_000),
         }),
       );

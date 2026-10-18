@@ -84,6 +84,7 @@ export const conversationRoom = (conversationId: string): string =>
  * 同理(目前没有生产者,但语义属同一类,先按服务端专属收口,免得日后接线时漏掉)。
  */
 export const CLIENT_MESSAGE_TYPES = [
+  'encrypted-text',
   'text',
   'quote',
   'image',

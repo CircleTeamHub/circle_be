@@ -51,7 +51,7 @@ describe('chat text search migrations', () => {
     // 会话内搜索与全局搜索各一处。
     expect(lookups).toHaveLength(2);
     const predicates = service.match(
-      /m\."deleted" = false\s+AND m\."type" IN \('text', 'quote'\)\s+AND chat_text_bigrams/g,
+      /m\."deleted" = false\s+AND \(m\."burnExpiresAt" IS NULL OR m\."burnExpiresAt" > NOW\(\)\)\s+AND m\."type" IN \('text', 'quote'\)\s+AND chat_text_bigrams/g,
     );
     expect(predicates).toHaveLength(2);
   });

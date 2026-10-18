@@ -237,15 +237,19 @@ describe('ChatBurnSweeperService', () => {
     await service.sweep();
 
     const [[query]] = prisma.chatMessage.findMany.mock.calls as [
-      [{ where: { createdAt: { lt: Date } } }],
+      [{ where: { burnExpiresAt: { lte: Date } } }],
     ];
     // 截止 = 现在 - burnDurationSec,允许极小的执行耗时误差。
     expect(
-      Math.abs(Date.now() - 3600_000 - query.where.createdAt.lt.getTime()),
+      Math.abs(Date.now() - query.where.burnExpiresAt.lte.getTime()),
     ).toBeLessThan(5_000);
     // 软删 + 清 content:height 坐标保留,读路径靠 deleted 过滤。
     expect(prisma.chatMessage.updateManyAndReturn).toHaveBeenCalledWith({
-      where: { id: { in: ['m1', 'm2'] }, deleted: false },
+      where: {
+        id: { in: ['m1', 'm2'] },
+        deleted: false,
+        burnExpiresAt: { lte: expect.any(Date) },
+      },
       // contentHistory 一起清:只清 content 的话,编辑过的旧正文还完整留在库里。
       data: {
         deleted: true,
@@ -293,7 +297,7 @@ describe('ChatBurnSweeperService', () => {
         await jest.advanceTimersByTimeAsync(41_000);
         fail(new Error('failed query'));
         await round;
-        expect(prisma.chatConversation.findUnique).toHaveBeenCalledTimes(1);
+        expect(prisma.chatMessage.findMany).toHaveBeenCalledTimes(1);
         expect(redis.setJsonIfVersionMatches).not.toHaveBeenCalled();
         expect((fresh as any).cursor).toBeNull();
       } finally {
@@ -313,15 +317,14 @@ describe('ChatBurnSweeperService', () => {
         burnDurationSec: 60,
       }));
       prisma.chatConversation.findMany.mockResolvedValue(conversations);
-      prisma.chatConversation.findUnique
-        .mockResolvedValue({ burnDurationSec: 60 })
+      prisma.chatMessage.findMany
+        .mockResolvedValue([])
         .mockRejectedValueOnce(new Error('single conversation failure'));
-      prisma.chatMessage.findMany.mockResolvedValue([]);
       const log = jest.spyOn(Logger.prototype, 'error').mockImplementation();
       try {
         const fresh = makeService();
         await fresh.sweep();
-        expect(prisma.chatConversation.findUnique).toHaveBeenCalledTimes(200);
+        expect(prisma.chatMessage.findMany).toHaveBeenCalledTimes(200);
         expect(redis.setJsonIfVersionMatches).toHaveBeenCalledWith(
           'job-cursor:chat_burn_sweeper',
           'job-lease:chat_burn_sweeper',
@@ -488,7 +491,11 @@ describe('ChatBurnSweeperService', () => {
 
       expect(prisma.chatMessage.updateManyAndReturn).toHaveBeenCalledWith(
         expect.objectContaining({
-          where: { id: { in: ['m1'] }, deleted: false },
+          where: {
+            id: { in: ['m1'] },
+            deleted: false,
+            burnExpiresAt: { lte: expect.any(Date) },
+          },
         }),
       );
       expect(broadcast.emitBurnedMessages).not.toHaveBeenCalled();
@@ -501,7 +508,7 @@ describe('ChatBurnSweeperService', () => {
     expect(prisma.chatMessage.findMany).not.toHaveBeenCalled();
   });
 
-  it('never tombstones messages from before the current burn activation', async () => {
+  it('queries only expired author-stamped messages; unstamped peer messages are excluded', async () => {
     const burnStartedAt = new Date('2026-09-14T10:00:00.000Z');
     prisma.chatConversation.findMany.mockResolvedValue([
       { id: 'conv-1', burnDurationSec: 60, burnStartedAt },
@@ -514,10 +521,7 @@ describe('ChatBurnSweeperService', () => {
     expect(prisma.chatMessage.findMany).toHaveBeenCalledWith(
       expect.objectContaining({
         where: expect.objectContaining({
-          createdAt: {
-            gte: burnStartedAt,
-            lt: expect.any(Date),
-          },
+          burnExpiresAt: { lte: expect.any(Date) },
         }),
       }),
     );
@@ -559,7 +563,7 @@ describe('ChatBurnSweeperService', () => {
     expect(prisma.chatMessage.findMany).toHaveBeenCalledTimes(1);
   });
 
-  it('stops deleting when the burn policy is turned off mid-sweep', async () => {
+  it('setting changes cannot reschedule existing immutable message expiries', async () => {
     // 进入本轮时是 60 秒,但批与批之间用户把焚毁关掉了 —— 拿旧 cutoff 接着删,
     // 删掉的就是用户刚决定要留下的消息,而且不可逆。
     prisma.chatConversation.findMany.mockResolvedValue([
@@ -569,8 +573,10 @@ describe('ChatBurnSweeperService', () => {
 
     await service.sweep();
 
-    expect(prisma.chatMessage.findMany).not.toHaveBeenCalled();
-    expect(prisma.chatMessage.updateManyAndReturn).not.toHaveBeenCalled();
+    expect(prisma.chatMessage.findMany).toHaveBeenCalled();
+    expect(
+      prisma.chatMessage.findMany.mock.calls[0][0].where.burnExpiresAt.lte,
+    ).toBeInstanceOf(Date);
   });
 
   // 服务端把正文清空了,在线设备却无从得知 —— 本地缓存、冷启动水合与本地 FTS

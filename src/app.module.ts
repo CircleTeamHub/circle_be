@@ -5,7 +5,6 @@ import * as dotenv from 'dotenv';
 import { ScheduleModule } from '@nestjs/schedule';
 // ThrottlerModule.forRoot is registered globally so @Throttle metadata works,
 // but the ThrottlerGuard is applied per-controller (see TempChatController),
-// not via a global APP_GUARD — rate limiting stays scoped to temp-chat.
 import { ThrottlerModule } from '@nestjs/throttler';
 
 import { AuthModule } from './auth/auth.module';
@@ -53,6 +52,7 @@ import { AdminAccessModule } from './admin-access/admin-access.module';
 import { AdminOperationsModule } from './admin-operations/admin-operations.module';
 import { AdminCommerceModule } from './admin-commerce/admin-commerce.module';
 import { AdminContentModule } from './admin-content/admin-content.module';
+import { E2eeModule } from './e2ee/e2ee.module';
 import { AdminImModule } from './admin-im/admin-im.module';
 
 const nodeEnv = process.env.NODE_ENV || 'development';
@@ -117,9 +117,12 @@ const envFilePath = `.env.${nodeEnv}`;
     AdminCommerceModule,
     AdminContentModule,
     AdminImModule,
+    E2eeModule,
   ],
   controllers: [],
-  providers: [Logger],
+  providers: [
+    Logger,
+  ],
   exports: [Logger],
 })
 export class AppModule {}

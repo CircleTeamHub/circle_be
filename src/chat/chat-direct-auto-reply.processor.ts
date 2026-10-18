@@ -249,17 +249,19 @@ export class ChatDirectAutoReplyProcessor {
       const message = source as SourceMessage;
 
       // Serialize all jobs for one conversation before reading members/cooldown.
-      const counter = await tx.$queryRaw<Array<{ nextHeight: number }>>`
-        SELECT "nextHeight" FROM "ChatConversation"
+      const counter = await tx.$queryRaw<
+        Array<{ nextHeight: number; textEncryption: string }>
+      >`
+        SELECT "nextHeight", "textEncryption" FROM "ChatConversation"
         WHERE "id" = ${message.conversationID} FOR UPDATE`;
-      if (counter.length === 0) {
+      if (counter.length === 0 || counter[0].textEncryption === 'MLS_V1') {
         await this.completeJob(tx, jobId);
         return null;
       }
 
       const seats = await tx.chatMember.findMany({
         where: { conversationID: message.conversationID, leftAt: null },
-        select: { userID: true },
+        select: { userID: true, burnDurationSec: true },
       });
       const senderIsActive = seats.some(
         (seat) => seat.userID === message.senderID,
@@ -279,7 +281,7 @@ export class ChatDirectAutoReplyProcessor {
       await lockUserRelationshipState(tx, [message.senderID, responderID]);
       const currentSeats = await tx.chatMember.findMany({
         where: { conversationID: message.conversationID, leftAt: null },
-        select: { userID: true },
+        select: { userID: true, burnDurationSec: true },
       });
       if (
         currentSeats.length !== 2 ||
@@ -321,6 +323,7 @@ export class ChatDirectAutoReplyProcessor {
       const settings = await tx.userPrivacySetting.findUnique({
         where: { userID: responderID },
         select: {
+          messageSelfDestructSec: true,
           directMessageAutoReplyEnabled: true,
           directMessageAutoReplyText: true,
         },
@@ -399,6 +402,12 @@ export class ChatDirectAutoReplyProcessor {
 
       const height = counter[0].nextHeight + 1;
       const content = { text, autoReply: true };
+      const durations = [
+        currentSeats.find((seat) => seat.userID === responderID)
+          ?.burnDurationSec ?? 0,
+        settings.messageSelfDestructSec ?? 0,
+      ].filter((value) => value > 0);
+      const burnDurationSec = durations.length ? Math.min(...durations) : null;
       const created = await tx.chatMessage.create({
         data: {
           conversationID: message.conversationID,
@@ -409,6 +418,10 @@ export class ChatDirectAutoReplyProcessor {
           clientMessageId,
           replyToID: null,
           createdAt: now,
+          burnDurationSec,
+          burnExpiresAt: burnDurationSec
+            ? new Date(now.getTime() + burnDurationSec * 1000)
+            : null,
         },
       });
       await tx.chatConversation.update({
@@ -454,6 +467,8 @@ export class ChatDirectAutoReplyProcessor {
         d: created.clientMessageId,
         // 触发器在 INSERT 时分配;create 的 RETURNING 已经带回来。
         revision: created.revision,
+        burnDurationSec: created.burnDurationSec ?? null,
+        burnExpiresAt: created.burnExpiresAt?.toISOString() ?? null,
         createdAt: created.createdAt.toISOString(),
       };
     });
