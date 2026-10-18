@@ -563,6 +563,10 @@ model UserAvatarFrameGrant {
 }
 
 model MembershipGrant {
+  /// Daily-plan units; historical and non-daily grants use one.
+  quantity               Int                     @default(1)
+  /// Purchase duration variant; null means the historical level-based plan.
+  planId                 String?
   id                     String                  @id @default(uuid())
   idempotencyKey         String                  @unique
   targetUserID           String
