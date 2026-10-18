@@ -45,7 +45,7 @@ describe('RefreshTokenCleanup', () => {
       expect.objectContaining({
         where: expect.objectContaining({
           id: { in: expect.any(Array) },
-          createdAt: expect.any(Object),
+          expiresAt: expect.any(Object),
         }),
       }),
     );
@@ -228,13 +228,20 @@ describe('RefreshTokenCleanup', () => {
     }
   });
 
-  it('prunes login challenges past the retention window', async () => {
+  it('prunes login challenges by expiry, so a pending recovery outlives its creation day', async () => {
     const now = new Date('2026-10-14T12:00:00.000Z');
     challengeFindMany.mockResolvedValueOnce([{ id: 'old' }]);
     await cleanup.sweep(now);
+    // 按 expiresAt 而不是 createdAt：找回申请的有效期延长到等待期之后，按创建时间
+    // 清会在它刚能完成（创建满 24 小时）时把它删掉。
+    expect(challengeFindMany).toHaveBeenCalledWith(
+      expect.objectContaining({
+        where: { expiresAt: { lt: new Date('2026-10-13T12:00:00.000Z') } },
+      }),
+    );
     expect(challengeDeleteMany).toHaveBeenCalledWith({
       where: {
-        createdAt: { lt: new Date('2026-10-13T12:00:00.000Z') },
+        expiresAt: { lt: new Date('2026-10-13T12:00:00.000Z') },
         id: { in: ['old'] },
       },
     });

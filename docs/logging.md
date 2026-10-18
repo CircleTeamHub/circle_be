@@ -160,6 +160,7 @@ Auth & account:
 - `auth_register_success`
 - `auth_login_success`, `auth_login_failed`
 - `auth_login_device_verification_required` — correct password from an unknown device; a login challenge was opened instead of issuing tokens
+- `auth_login_recovered` — a password login from the device that requested recovery after the waiting period; this device became the only trusted device and every other session / trust / open challenge was revoked
 - `auth_admin_login_success`, `auth_admin_login_failed`, `auth_admin_login_locked`, `auth_admin_logout`
 - `auth_logout_all_success`, `auth_session_logout`, `auth_other_sessions_logout`
 - `auth_password_reset_requested` (no actor — unauthenticated, email never logged), `auth_password_reset_success`
@@ -245,6 +246,13 @@ the request context and a sanitized `reason`:
   back to pending (resend / re-login) and trusted devices were notified again.
 - `login_challenges_invalidated` — open challenges were rejected because the
   password changed / was reset or the user logged out other or all devices.
+- `login_recovery_requested` — a new device asked for waiting-period recovery
+  because no trusted device can approve it (challengeId only).
+- `login_recovery_limited` — the account already has the maximum number of
+  active recovery requests.
+- `login_recoveries_cancelled_by_trusted_device` — a trusted device logged in or
+  refreshed during the waiting period, so pending recovery requests were rejected.
+- `login_recovery_completed` — the recovery finished (see `auth_login_recovered`).
 - `login_challenge_security_code_budget_exhausted` — the account used up its
   daily failure budget for the security-code fallback.
 

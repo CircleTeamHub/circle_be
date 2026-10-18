@@ -24,6 +24,8 @@ import {
   LOGIN_CHALLENGE_ACCOUNT_RATE_LIMIT,
   LOGIN_CHALLENGE_RATE_LIMIT,
   LOGIN_CHALLENGE_SECURITY_CODE_DAILY_FAILURES,
+  LOGIN_RECOVERY_DELAY_MS,
+  LOGIN_RECOVERY_MAX_ACTIVE,
 } from './device-trust.service';
 
 type Trusted = {
@@ -49,12 +51,21 @@ type Challenge = {
   expiresAt: Date;
   decidedAt: Date | null;
   createdAt: Date;
+  recoveryRequestedAt: Date | null;
+  recoveryAvailableAt: Date | null;
 };
 
 function matches(row: Record<string, unknown>, where: Record<string, any>) {
   return Object.entries(where).every(([key, cond]) => {
     const value = row[key];
     if (cond && typeof cond === 'object' && !(cond instanceof Date)) {
+      // 与 SQL 一致：NULL 不参与大小比较（JS 里 null <= date 会被当成 0 <= date）。
+      if (
+        ('gt' in cond || 'lt' in cond || 'lte' in cond) &&
+        (value === null || value === undefined)
+      ) {
+        return false;
+      }
       if ('in' in cond) return cond.in.includes(value);
       if ('gt' in cond) return (value as any) > cond.gt;
       if ('lt' in cond) return (value as any) < cond.lt;
@@ -143,6 +154,8 @@ function setup() {
           deviceName: null,
           ip: null,
           userAgent: null,
+          recoveryRequestedAt: null,
+          recoveryAvailableAt: null,
           ...data,
         };
         challenges.push(row);
@@ -300,6 +313,7 @@ describe('DeviceTrustService.evaluateLogin', () => {
         id: challenges[0].id,
         expiresAt: challenges[0].expiresAt,
         securityCodeAvailable: false,
+        recoveryAvailableAt: null,
       },
     });
     const window = challenges[0].expiresAt.getTime() - Date.now();
@@ -765,5 +779,195 @@ test('removing other devices disables legacy addresses and preserves the current
       OR: [{ deviceKey: { not: 'current' } }, { deviceKey: null }],
     },
     data: { disabledAt: expect.any(Date) },
+  });
+});
+
+describe('DeviceTrustService recovery (no trusted device available)', () => {
+  async function pendingChallenge() {
+    const ctx = setup();
+    // 唯一的受信任设备是重装前的那个 ID，再也登不上来。
+    ctx.trust('old-install');
+    const decision = await ctx.service.evaluateLogin(user, {
+      deviceKey: 'reinstalled',
+      deviceName: 'SM-F9360',
+    });
+    if (decision.kind !== 'challenge') throw new Error('expected challenge');
+    return { ...ctx, challengeId: decision.challenge.id };
+  }
+
+  it('requesting recovery starts the waiting period and alerts trusted devices', async () => {
+    const { service, challenges, challengeId, realtime, push } =
+      await pendingChallenge();
+    realtime.broadcast.mockClear();
+    const before = Date.now();
+
+    const view = await service.requestRecovery(challengeId, 'reinstalled');
+
+    const delay = view.recoveryAvailableAt!.getTime() - before;
+    expect(delay).toBeGreaterThanOrEqual(LOGIN_RECOVERY_DELAY_MS - 1000);
+    expect(delay).toBeLessThanOrEqual(LOGIN_RECOVERY_DELAY_MS + 1000);
+    // 有效期延长到等待期之后，期间仍然能被批准 / 拒绝 / 列出。
+    expect(challenges[0].expiresAt.getTime()).toBeGreaterThan(
+      view.recoveryAvailableAt!.getTime(),
+    );
+    expect(challenges[0].recoveryRequestedAt).toBeInstanceOf(Date);
+    expect(realtime.broadcast).toHaveBeenCalledWith(
+      'u1',
+      expect.objectContaining({ type: 'auth.login.challenge.created' }),
+    );
+    await new Promise((r) => setImmediate(r));
+    expect(push.sendToTokens).toHaveBeenCalledWith(
+      expect.anything(),
+      expect.objectContaining({ ttl: LOGIN_RECOVERY_DELAY_MS / 1000 }),
+    );
+  });
+
+  it('requesting twice keeps the original waiting period', async () => {
+    const { service, challengeId } = await pendingChallenge();
+    const first = await service.requestRecovery(challengeId, 'reinstalled');
+    const second = await service.requestRecovery(challengeId, 'reinstalled');
+    expect(second.recoveryAvailableAt).toEqual(first.recoveryAvailableAt);
+  });
+
+  it('only the device that started the challenge can request recovery', async () => {
+    const { service, challengeId } = await pendingChallenge();
+    await expect(
+      service.requestRecovery(challengeId, 'someone-else'),
+    ).rejects.toThrow(NotFoundException);
+  });
+
+  it('logging in again before the waiting period ends reuses the request', async () => {
+    const { service, challenges, challengeId } = await pendingChallenge();
+    await service.requestRecovery(challengeId, 'reinstalled');
+
+    const decision = await service.evaluateLogin(user, {
+      deviceKey: 'reinstalled',
+    });
+
+    expect(decision).toEqual({
+      kind: 'challenge',
+      challenge: expect.objectContaining({
+        id: challengeId,
+        recoveryAvailableAt: expect.any(Date),
+      }),
+    });
+    expect(challenges).toHaveLength(1);
+  });
+
+  it('after the waiting period a password login from the same device completes recovery', async () => {
+    const { service, challenges, challengeId } = await pendingChallenge();
+    await service.requestRecovery(challengeId, 'reinstalled');
+    challenges[0].recoveryAvailableAt = new Date(Date.now() - 1000);
+
+    const decision = await service.evaluateLogin(user, {
+      deviceKey: 'reinstalled',
+    });
+
+    expect(decision).toEqual({ kind: 'recovered', challengeId });
+    expect(challenges[0].status).toBe('CONSUMED');
+  });
+
+  it('a matured recovery is not usable from another device', async () => {
+    const { service, challenges, challengeId } = await pendingChallenge();
+    await service.requestRecovery(challengeId, 'reinstalled');
+    challenges[0].recoveryAvailableAt = new Date(Date.now() - 1000);
+
+    const decision = await service.evaluateLogin(user, {
+      deviceKey: 'attacker',
+    });
+
+    expect(decision.kind).toBe('challenge');
+    expect(challenges[0].status).toBe('PENDING');
+  });
+
+  it('a rejected request can never complete', async () => {
+    const { service, challenges, challengeId } = await pendingChallenge();
+    await service.requestRecovery(challengeId, 'reinstalled');
+    await service.reject('u1', 'old-install', challengeId);
+    challenges[0].recoveryAvailableAt = new Date(Date.now() - 1000);
+
+    const decision = await service.evaluateLogin(user, {
+      deviceKey: 'reinstalled',
+    });
+
+    expect(decision.kind).toBe('challenge');
+    expect(challenges[0].status).toBe('REJECTED');
+  });
+
+  it('a trusted device that is still in use cancels recovery requests', async () => {
+    const { service, challenges, challengeId, realtime } =
+      await pendingChallenge();
+    await service.requestRecovery(challengeId, 'reinstalled');
+
+    // 本人那台受信任设备其实还在：它一登录，找回申请就作废（能直接批准）。
+    const decision = await service.evaluateLogin(user, {
+      deviceKey: 'old-install',
+    });
+
+    expect(decision.kind).toBe('trusted');
+    expect(challenges[0].status).toBe('REJECTED');
+    expect(realtime.broadcast).toHaveBeenCalledWith(
+      'u1',
+      expect.objectContaining({
+        type: 'auth.login.challenge.resolved',
+        payload: expect.objectContaining({ challengeId, status: 'REJECTED' }),
+      }),
+    );
+  });
+
+  it('cancelling on activity leaves ordinary login challenges alone', async () => {
+    const { service, challenges } = await pendingChallenge();
+    await service.cancelRecoveriesForActiveDevice('u1', 'old-install');
+    expect(challenges[0].status).toBe('PENDING');
+  });
+
+  it('password change / logout-all invalidation also cancels recovery', async () => {
+    const { service, challenges, challengeId } = await pendingChallenge();
+    await service.requestRecovery(challengeId, 'reinstalled');
+    await service.invalidateChallenges('u1');
+    expect(challenges[0].status).toBe('REJECTED');
+    await expect(
+      service.requestRecovery(challengeId, 'reinstalled'),
+    ).rejects.toThrow(/拒绝/);
+  });
+
+  it('a locked challenge (too many wrong codes) cannot be turned into recovery', async () => {
+    const { service, challenges, challengeId } = await pendingChallenge();
+    challenges[0].attempts = LOGIN_CHALLENGE_MAX_ATTEMPTS;
+    await expect(
+      service.requestRecovery(challengeId, 'reinstalled'),
+    ).rejects.toThrow(/错误次数过多/);
+  });
+
+  it('caps active recovery requests per account', async () => {
+    const ctx = setup();
+    ctx.trust('old-install');
+    for (let i = 0; i < LOGIN_RECOVERY_MAX_ACTIVE; i += 1) {
+      const d = await ctx.service.evaluateLogin(user, {
+        deviceKey: `device-${i}`,
+        ip: `198.51.100.${i}`,
+      });
+      if (d.kind !== 'challenge') throw new Error('expected challenge');
+      await ctx.service.requestRecovery(d.challenge.id, `device-${i}`);
+    }
+    const extra = await ctx.service.evaluateLogin(user, {
+      deviceKey: 'device-extra',
+      ip: '198.51.100.99',
+    });
+    if (extra.kind !== 'challenge') throw new Error('expected challenge');
+    await expect(
+      ctx.service.requestRecovery(extra.challenge.id, 'device-extra'),
+    ).rejects.toThrow(HttpException);
+  });
+
+  it('trusted devices see when a pending request would complete on its own', async () => {
+    const { service, challengeId } = await pendingChallenge();
+    const view = await service.requestRecovery(challengeId, 'reinstalled');
+    await expect(service.listPending('u1', 'old-install')).resolves.toEqual([
+      expect.objectContaining({
+        id: challengeId,
+        recoveryAvailableAt: view.recoveryAvailableAt,
+      }),
+    ]);
   });
 });

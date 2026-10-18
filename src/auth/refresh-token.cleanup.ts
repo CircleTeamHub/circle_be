@@ -121,6 +121,8 @@ export class RefreshTokenCleanup {
       if (count > 0) {
         this.logger.log(`Pruned ${count} expired/revoked refresh tokens`);
       }
+      // 按过期时间清理验证单：找回申请的有效期会延长到等待期之后，按创建时间清
+      // 会在它刚能完成时把它删掉。
       const challengeCutoff = new Date(
         now.getTime() - LOGIN_CHALLENGE_RETENTION_MS,
       );
@@ -135,7 +137,7 @@ export class RefreshTokenCleanup {
           break;
         }
         const candidates = await this.prisma.loginChallenge.findMany({
-          where: { createdAt: { lt: challengeCutoff } },
+          where: { expiresAt: { lt: challengeCutoff } },
           select: { id: true },
           orderBy: { id: 'asc' },
           take: RefreshTokenCleanup.BATCH_SIZE,
@@ -147,7 +149,7 @@ export class RefreshTokenCleanup {
         }
         const deleted = await this.prisma.loginChallenge.deleteMany({
           where: {
-            createdAt: { lt: challengeCutoff },
+            expiresAt: { lt: challengeCutoff },
             id: { in: candidates.map(({ id }) => id) },
           },
         });
