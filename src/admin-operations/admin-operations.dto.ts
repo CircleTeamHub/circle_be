@@ -1,13 +1,11 @@
-import { Transform, Type } from 'class-transformer';
+import { Transform } from 'class-transformer';
 import {
   IsBoolean,
   IsDateString,
   IsEnum,
-  IsIn,
   IsInt,
   IsOptional,
   IsString,
-  IsUrl,
   IsUUID,
   Length,
   Max,
@@ -55,34 +53,4 @@ export class UpdateCampaignDto {
   @Transform(({ value }) => (typeof value === 'string' ? value.trim() : value))
   @Length(2, 500)
   reason: string;
-}
-
-export class AdvertisementDto {
-  @IsString()
-  @Transform(({ value }) => (typeof value === 'string' ? value.trim() : value))
-  @Length(1, 80)
-  title: string;
-  @IsUrl({ protocols: ['https'], require_protocol: true })
-  @MaxLength(2048)
-  imageUrl: string;
-  @IsUrl({ protocols: ['https'], require_protocol: true })
-  @MaxLength(2048)
-  targetUrl: string;
-  @IsIn(['CIRCLE_HOME']) placement: string;
-  @IsInt() @Min(0) @Max(10000) sortOrder: number;
-  @IsBoolean() enabled: boolean;
-  @IsDateString() startsAt: string;
-  @IsDateString() endsAt: string;
-  @IsString()
-  @Transform(({ value }) => (typeof value === 'string' ? value.trim() : value))
-  @Length(2, 500)
-  reason: string;
-}
-
-export class UpdateAdvertisementDto extends AdvertisementDto {
-  @IsInt() @Min(1) version: number;
-}
-
-export class PublishedAdvertisementQuery {
-  @IsIn(['CIRCLE_HOME']) placement: string;
 }

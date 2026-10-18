@@ -15,8 +15,6 @@ const NUMERIC = /^\d+$/;
 // sync with the real router when adding controllers, or new routes silently
 // fall to the id-collapse fallback.
 export const STATIC_ROUTES = new Set([
-  '/api/v1/admin/operations/advertisements',
-  '/api/v1/advertisements',
   '/api/v1/admin/console/analytics',
   '/api/v1/admin/console/diagnostics',
   '/api/v1/admin/console/events',
@@ -191,7 +189,6 @@ export const STATIC_ROUTES = new Set([
   '/api/v1/user/vip-levels',
 ]);
 export const DYNAMIC_ROUTE_TEMPLATES = [
-  '/api/v1/admin/operations/advertisements/:id',
   '/api/v1/admin/community/circles/:id',
   '/api/v1/admin/community/circles/:id/members',
   '/api/v1/admin/community/circles/:id/posts',
