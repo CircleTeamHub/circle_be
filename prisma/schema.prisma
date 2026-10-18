@@ -1770,6 +1770,9 @@ model SystemAnnouncement {
   id                 String   @id @default(uuid())
   idempotencyKey     String   @unique
   requestFingerprint String
+  title              String?
+  scrolling          Boolean  @default(false)
+  deletedAt          DateTime?
   operatorID         String
   content            String
   createdAt          DateTime @default(now())

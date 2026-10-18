@@ -71,7 +71,43 @@ export class NotificationDomainQueryDto {
   domain?: NotificationDomain;
 }
 
+export class EditSystemAnnouncementDto {
+  @ApiProperty({ minLength: 1, maxLength: 100 })
+  @Transform(({ value }) => (typeof value === 'string' ? value.trim() : value))
+  @IsString()
+  @IsNotEmpty()
+  @MaxLength(100)
+  title: string;
+
+  @ApiProperty({ minLength: 1, maxLength: 5000 })
+  @Transform(({ value }) => (typeof value === 'string' ? value.trim() : value))
+  @IsString()
+  @IsNotEmpty()
+  @MaxLength(5000)
+  content: string;
+}
+
+export class AnnouncementScrollingDto {
+  @ApiProperty()
+  @IsBoolean()
+  scrolling: boolean;
+}
+
 export class PublishSystemAnnouncementDto {
+  @ApiPropertyOptional({ default: false })
+  @IsOptional()
+  @IsBoolean()
+  scrolling?: boolean;
+
+  // Optional for older clients and historical announcements; new publishing UI requires it.
+  @ApiPropertyOptional({ minLength: 1, maxLength: 100 })
+  @Transform(({ value }) => (typeof value === 'string' ? value.trim() : value))
+  @IsOptional()
+  @IsString()
+  @IsNotEmpty()
+  @MaxLength(100)
+  title?: string;
+
   @ApiProperty({ minLength: 1, maxLength: 5000 })
   @Transform(({ value }) => (typeof value === 'string' ? value.trim() : value))
   @IsString()
@@ -175,6 +211,7 @@ export class RevokePushTokenDto {
 }
 
 export type NotificationRealtimeDto = {
+  title?: string | null;
   id: string;
   type: NotificationType;
   content: string;
@@ -231,6 +268,7 @@ export function decodeNotificationCursor(
 }
 
 export const NOTIFICATION_REALTIME_INCLUDE = {
+  systemAnnouncement: { select: { title: true } },
   fromUser: { select: { id: true, nickname: true, avatarUrl: true } },
   fromTrace: { select: { id: true, content: true, images: true } },
   fromReply: { select: { id: true, content: true } },
@@ -252,6 +290,7 @@ export function mapNotificationRealtimeDto(
     id: n.id,
     type: n.type,
     content: n.content,
+    title: n.systemAnnouncement?.title ?? null,
     read: n.read,
     createdAt: n.createdAt.toISOString(),
     fromUser: n.fromUser

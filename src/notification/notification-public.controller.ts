@@ -1,3 +1,4 @@
+import { AnonymousAccess } from 'src/guards/anonymous-access.decorator';
 import {
   Body,
   Controller,
@@ -34,6 +35,7 @@ export class NotificationPublicController {
     private readonly redisService?: RedisService,
   ) {}
 
+  @AnonymousAccess('Push token revocation secret')
   @Delete('push-token/revoke')
   @ApiOperation({ summary: 'Revoke a device push token with its secret' })
   async revokePushToken(
@@ -87,8 +89,7 @@ export class NotificationPublicController {
           NotificationPublicController.MAX_LOCAL_BUCKETS
       ) {
         const oldestKey = this.localRevokeCounts.keys().next().value as
-          | string
-          | undefined;
+          string | undefined;
         if (oldestKey) this.localRevokeCounts.delete(oldestKey);
       }
       this.localRevokeCounts.set(callerHash, {

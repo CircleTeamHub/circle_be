@@ -7,6 +7,7 @@ import {
   HttpStatus,
   Injectable,
   Logger,
+  NotFoundException,
   Optional,
   ServiceUnavailableException,
 } from '@nestjs/common';
@@ -32,6 +33,7 @@ import {
   type RegisterPushTokenDto,
   type NotificationRealtimeDto,
   type PublishSystemAnnouncementDto,
+  type EditSystemAnnouncementDto,
   type RevokePushTokenDto,
 } from './notification.dto';
 import { NotificationPushService } from './notification-push.service';
@@ -491,6 +493,235 @@ export class NotificationService {
     return dto;
   }
 
+  async profileNotificationDetail(userId: string, id: string) {
+    const row = await this.prisma.notification.findFirst({
+      where: {
+        id,
+        toUserID: userId,
+        deleted: false,
+        type: { in: [...PROFILE_NOTIFICATION_TYPES] },
+      },
+      include: NOTIFICATION_REALTIME_INCLUDE,
+    });
+    if (!row) throw new NotFoundException('Notification not found');
+    return mapNotificationRealtimeDto(row);
+  }
+
+  async scrollingAnnouncements(userId: string) {
+    const items = await this.prisma.systemAnnouncement.findMany({
+      where: {
+        scrolling: true,
+        deletedAt: null,
+        fanoutCompletedAt: { not: null },
+        notifications: { some: { toUserID: userId, deleted: false } },
+      },
+      select: {
+        id: true,
+        title: true,
+        content: true,
+        createdAt: true,
+        notifications: {
+          where: { toUserID: userId, deleted: false },
+          select: { id: true },
+          take: 1,
+        },
+      },
+      orderBy: [{ createdAt: 'desc' }, { id: 'desc' }],
+      take: 1,
+    });
+    return {
+      items: items.flatMap(({ notifications, ...item }) =>
+        notifications[0]
+          ? [{ ...item, notificationID: notifications[0].id }]
+          : [],
+      ),
+    };
+  }
+
+  async adminAnnouncements() {
+    return {
+      items: await this.prisma.systemAnnouncement.findMany({
+        where: { deletedAt: null },
+        select: {
+          id: true,
+          title: true,
+          content: true,
+          scrolling: true,
+          createdAt: true,
+          fanoutCompletedAt: true,
+        },
+        orderBy: [{ createdAt: 'desc' }, { id: 'desc' }],
+        take: 50,
+      }),
+    };
+  }
+
+  private async editableAnnouncement(tx: Prisma.TransactionClient, id: string) {
+    const row = await tx.systemAnnouncement.findFirst({
+      where: { id, deletedAt: null },
+    });
+    if (!row) throw new NotFoundException('公告不存在或已删除');
+    if (!row.fanoutCompletedAt)
+      throw new ConflictException('公告发布处理中，请稍后重试');
+    return row;
+  }
+
+  private async notifyAnnouncementChanged(id: string | string[]) {
+    try {
+      let cursor: string | undefined;
+      while (true) {
+        const rows = await this.prisma.notification.findMany({
+          where: {
+            systemAnnouncementID: Array.isArray(id) ? { in: id } : id,
+            ...(cursor ? { id: { gt: cursor } } : {}),
+          },
+          select: { id: true, toUserID: true },
+          orderBy: { id: 'asc' },
+          take: 500,
+        });
+        await Promise.allSettled(
+          rows
+            .filter((row) => row.toUserID)
+            .map((row) =>
+              this.realtimeService.broadcastAnnouncementChanged(row.toUserID),
+            ),
+        );
+        if (rows.length < 500) break;
+        cursor = rows[rows.length - 1].id;
+      }
+    } catch {
+      // The mutation already committed; reconnect/focus refresh repairs a missed poke.
+      this.logger.warn('Announcement realtime refresh notification failed');
+    }
+  }
+
+  async editAnnouncement(
+    actorID: string,
+    id: string,
+    dto: EditSystemAnnouncementDto,
+  ) {
+    const result = await this.prisma.$transaction(async (tx) => {
+      await tx.$queryRaw`SELECT pg_advisory_xact_lock(hashtext('system-announcement-scrolling'))::text`;
+      await this.editableAnnouncement(tx, id);
+      const updated = await tx.systemAnnouncement.update({
+        where: { id },
+        data: { title: dto.title, content: dto.content },
+        select: { id: true, title: true, content: true },
+      });
+      await tx.notification.updateMany({
+        where: { systemAnnouncementID: id, deleted: false },
+        data: { content: dto.content },
+      });
+      await this.auditService.recordStrict(tx, {
+        actorID,
+        action: 'system_announcement_edit',
+        entityType: 'SystemAnnouncement',
+        entityID: id,
+        after: { title: dto.title },
+      });
+      return updated;
+    });
+    await this.notifyAnnouncementChanged(id);
+    return result;
+  }
+
+  async deleteAnnouncement(actorID: string, id: string) {
+    const result = await this.prisma.$transaction(async (tx) => {
+      await tx.$queryRaw`SELECT pg_advisory_xact_lock(hashtext('system-announcement-scrolling'))::text`;
+      await this.editableAnnouncement(tx, id);
+      await tx.systemAnnouncement.update({
+        where: { id },
+        data: { deletedAt: new Date(), scrolling: false },
+      });
+      await tx.notification.updateMany({
+        where: { systemAnnouncementID: id },
+        data: { deleted: true },
+      });
+      await tx.notificationPushOutbox.updateMany({
+        where: {
+          notification: { systemAnnouncementID: id },
+          status: { in: ['PENDING', 'FAILED', 'PROCESSING'] },
+        },
+        data: {
+          status: 'TERMINAL',
+          completionReason: 'ANNOUNCEMENT_DELETED',
+          leaseToken: null,
+          lockedAt: null,
+        },
+      });
+      await tx.notificationPushDelivery.updateMany({
+        where: {
+          outbox: { notification: { systemAnnouncementID: id } },
+          status: { in: ['PENDING', 'FAILED'] },
+        },
+        data: { status: 'TERMINAL', lastError: 'ANNOUNCEMENT_DELETED' },
+      });
+      await this.auditService.recordStrict(tx, {
+        actorID,
+        action: 'system_announcement_delete',
+        entityType: 'SystemAnnouncement',
+        entityID: id,
+      });
+      return { deleted: true };
+    });
+    await this.notifyAnnouncementChanged(id);
+    return result;
+  }
+
+  private async selectScrollingAnnouncement(
+    tx: Prisma.TransactionClient,
+    id: string,
+    scrolling: boolean,
+  ) {
+    await tx.$queryRaw`SELECT pg_advisory_xact_lock(hashtext('system-announcement-scrolling'))::text`;
+    await this.editableAnnouncement(tx, id);
+    const previous = scrolling
+      ? await tx.systemAnnouncement.findMany({
+          where: { scrolling: true, deletedAt: null },
+          select: { id: true },
+          take: 1,
+        })
+      : [];
+    if (scrolling)
+      await tx.systemAnnouncement.updateMany({
+        where: { scrolling: true, id: { not: id } },
+        data: { scrolling: false },
+      });
+    const updated = await tx.systemAnnouncement.update({
+      where: { id },
+      data: { scrolling },
+      select: { id: true, scrolling: true },
+    });
+    return {
+      ...updated,
+      affectedIDs: [...new Set([id, ...previous.map((row) => row.id)])],
+    };
+  }
+
+  async setAnnouncementScrolling(
+    actorID: string,
+    id: string,
+    scrolling: boolean,
+  ) {
+    const result = await this.prisma.$transaction(async (tx) => {
+      const announcement = await this.selectScrollingAnnouncement(
+        tx,
+        id,
+        scrolling,
+      );
+      await this.auditService.recordStrict(tx, {
+        actorID,
+        action: 'system_announcement_scrolling_update',
+        entityType: 'SystemAnnouncement',
+        entityID: id,
+        after: { scrolling },
+      });
+      return announcement;
+    });
+    await this.notifyAnnouncementChanged(result.affectedIDs);
+    return { id: result.id, scrolling: result.scrolling };
+  }
+
   async publishSystemAnnouncement(
     operatorId: string,
     dto: PublishSystemAnnouncementDto,
@@ -538,12 +769,18 @@ export class NotificationService {
     idempotencyKey: string,
     auditContext?: SystemAnnouncementAuditContext,
   ): Promise<{ createdCount: number }> {
-    const requestFingerprint = `${operatorId}:${dto.content}`;
+    const requestFingerprint = dto.scrolling
+      ? JSON.stringify([operatorId, dto.title ?? null, dto.content, true])
+      : dto.title
+        ? JSON.stringify([operatorId, dto.title, dto.content])
+        : `${operatorId}:${dto.content}`;
     const announcement = await this.prisma.systemAnnouncement.upsert({
       where: { idempotencyKey },
       create: {
         idempotencyKey,
         requestFingerprint,
+        title: dto.title ?? null,
+        scrolling: false,
         operatorID: operatorId,
         content: dto.content,
       },
@@ -625,10 +862,29 @@ export class NotificationService {
         where: { systemAnnouncementID: announcement.id },
       });
       const completedAt = new Date();
-      const completed = await this.prisma.systemAnnouncement.updateMany({
-        where: { id: announcement.id, fanoutCompletedAt: null },
-        data: { fanoutCompletedAt: completedAt, recipientCount: createdCount },
+      const affectedIDs = new Set<string>();
+      const completed = await this.prisma.$transaction(async (tx) => {
+        const result = await tx.systemAnnouncement.updateMany({
+          where: { id: announcement.id, fanoutCompletedAt: null },
+          data: {
+            fanoutCompletedAt: completedAt,
+            recipientCount: createdCount,
+          },
+        });
+        // Completion and first activation commit together. Retries never
+        // replace an announcement selected after the original publish.
+        if (result.count > 0 && dto.scrolling) {
+          const selected = await this.selectScrollingAnnouncement(
+            tx,
+            announcement.id,
+            true,
+          );
+          selected.affectedIDs.forEach((id) => affectedIDs.add(id));
+        }
+        return result;
       });
+      if (affectedIDs.size)
+        await this.notifyAnnouncementChanged([...affectedIDs]);
       if (completed.count === 0) {
         const persisted =
           await this.prisma.systemAnnouncement.findUniqueOrThrow({

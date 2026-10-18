@@ -133,6 +133,7 @@ export type NoteSourceStatusPayload = {
 
 type RealtimeEvent =
   | { type: 'badge.snapshot'; payload: BadgeSnapshot }
+  | { type: 'system.announcement.changed'; payload: { changedAt: string } }
   | {
       type: 'moments.feed.updated';
       payload: { authorId: string; changedAt: string };
@@ -250,6 +251,7 @@ export class RealtimeService implements OnModuleInit, OnModuleDestroy {
     'auth.login.challenge.created',
     'auth.login.challenge.resolved',
     'badge.snapshot',
+    'system.announcement.changed',
     'moments.feed.updated',
     'note.source.status.changed',
     'call.invite',
@@ -615,6 +617,17 @@ export class RealtimeService implements OnModuleInit, OnModuleDestroy {
         changedAt: new Date().toISOString(),
       },
     });
+  }
+
+  async broadcastAnnouncementChanged(userId: string) {
+    try {
+      await this.invalidateBadgeSnapshotCache(userId);
+    } finally {
+      this.broadcast(userId, {
+        type: 'system.announcement.changed',
+        payload: { changedAt: new Date().toISOString() },
+      });
+    }
   }
 
   async broadcastSystemNotificationUnread(userId: string) {

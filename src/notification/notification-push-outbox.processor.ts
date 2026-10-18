@@ -94,9 +94,10 @@ export class NotificationPushOutboxProcessor {
           ) AS rn
         FROM "NotificationPushOutbox" AS o
         JOIN "Notification" AS n ON n."id" = o."notificationID"
-        WHERE (o."status" = 'PENDING' AND o."nextAttemptAt" <= ${now})
+        WHERE EXISTS (SELECT 1 FROM "ConsolePushSettings" WHERE id='global' AND enabled)
+          AND ((o."status" = 'PENDING' AND o."nextAttemptAt" <= ${now})
            OR (o."status" = 'FAILED' AND o."nextAttemptAt" <= ${now})
-           OR (o."status" = 'PROCESSING' AND o."lockedAt" < ${staleBefore})
+           OR (o."status" = 'PROCESSING' AND o."lockedAt" < ${staleBefore}))
       )
       SELECT "id"
       FROM eligible
@@ -161,7 +162,12 @@ export class NotificationPushOutboxProcessor {
           userId &&
           circleOfflinePushByUser.get(userId) === false
         ) {
-          await this.finishJob(job.id, leaseToken, 'COMPLETED');
+          await this.finishJob(
+            job.id,
+            leaseToken,
+            'COMPLETED',
+            'CIRCLE_PUSH_DISABLED',
+          );
           // 这一轮确实处理掉了一个任务（用户主动关的，不是失败），要计数，
           // 否则调度器会以为这批没干活。
           processed += 1;
@@ -257,11 +263,40 @@ export class NotificationPushOutboxProcessor {
               },
             );
           }
-          await this.finishJob(job.id, leaseToken, finalStatus);
+          await this.finishJob(
+            job.id,
+            leaseToken,
+            finalStatus,
+            tokens.length === 0 ? 'NO_ACTIVE_DEVICE' : null,
+          );
           processed += 1;
           continue;
         }
 
+        // A deleted announcement may have been hydrated before its tasks were
+        // cancelled. Recheck the lease immediately before external delivery.
+        if (job.notification.systemAnnouncementID) {
+          const active = await this.prisma.notificationPushOutbox.findFirst({
+            where: {
+              id: job.id,
+              leaseToken,
+              status: 'PROCESSING',
+              notification: { deleted: false },
+            },
+            select: { id: true },
+          });
+          if (!active) {
+            await this.prisma.notificationPushDelivery.updateMany({
+              where: {
+                outboxID: job.id,
+                status: { in: ['PENDING', 'FAILED'] },
+                outbox: { completionReason: 'ANNOUNCEMENT_DELETED' },
+              },
+              data: { status: 'TERMINAL', lastError: 'ANNOUNCEMENT_DELETED' },
+            });
+            continue;
+          }
+        }
         const projectByToken = new Map(tokens.map((row) => [row.token, row]));
         const outcomes = await this.pushService.sendToTokens(
           pendingDeliveries.map((delivery) => {
@@ -398,11 +433,13 @@ export class NotificationPushOutboxProcessor {
     jobId: string,
     leaseToken: string,
     status: 'COMPLETED' | 'TERMINAL',
+    completionReason: 'CIRCLE_PUSH_DISABLED' | 'NO_ACTIVE_DEVICE' | null = null,
   ): Promise<void> {
     await this.prisma.notificationPushOutbox.updateMany({
       where: { id: jobId, leaseToken, status: 'PROCESSING' },
       data: {
         status,
+        completionReason,
         processedAt: new Date(),
         lockedAt: null,
         leaseToken: null,
