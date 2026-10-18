@@ -533,9 +533,16 @@ export class AuthService {
     }
   }
 
+  private adminLoginWhere(dto: LoginDto): Prisma.UserWhereUniqueInput {
+    const identifier = loginIdentifier(dto);
+    return identifier.includes('@')
+      ? {email:normalizeEmail(identifier)}
+      : {accountId:identifier.toLowerCase()};
+  }
+
   async adminLogin(dto: LoginDto, sessionContext?: SessionContext) {
     const target = await this.prisma.user.findUnique({
-      where: { email: normalizeEmail(loginIdentifier(dto)) },
+      where: this.adminLoginWhere(dto),
       select: { id: true, accountId: true, role: true },
     });
     try {
@@ -577,8 +584,7 @@ export class AuthService {
     dto: LoginDto,
     sessionContext?: SessionContext,
   ) {
-    const email = normalizeEmail(loginIdentifier(dto));
-    const user = await this.prisma.user.findUnique({ where: { email } });
+    const user = await this.prisma.user.findUnique({ where: this.adminLoginWhere(dto) });
     // 管理台事件必须可追溯来源（#90）：ip/userAgent 一律进 metadata。
     const adminAuditContext = {
       ip: sessionContext?.ip ?? null,
@@ -671,6 +677,7 @@ export class AuthService {
       sessionContext,
       {
         audience: 'ADMIN',
+        expectedPasswordHash: user.passwordHash,
       },
     );
 
@@ -1097,6 +1104,8 @@ export class AuthService {
   /** FE#92 忘记密码第一步：发送重置验证码。防枚举语义在 email-verification 内。 */
   async requestPasswordReset(email: string): Promise<void> {
     try {
+      const account = await this.prisma.user.findUnique({where:{email:normalizeEmail(email)},select:{role:true}});
+      if (account?.role === 'ADMIN') return;
       await this.emailVerification.requestCode(
         normalizeEmail(email),
         'RESET_PASSWORD',
@@ -1167,7 +1176,7 @@ export class AuthService {
     }
 
     const user = await this.prisma.user.findUnique({ where: { email } });
-    if (!user || user.status !== 'ACTIVE') {
+    if (!user || user.status !== 'ACTIVE' || user.role === 'ADMIN') {
       throw new ForbiddenException({
         message: '验证码错误或已过期',
         errorCode: AuthErrorCode.CodeInvalid,
@@ -1231,6 +1240,8 @@ export class AuthService {
           errorCode: AuthErrorCode.UserNotFound,
         });
       }
+
+      if (user.role === 'ADMIN') throw new ForbiddenException('管理员密码由超级管理员设置，请联系超级管理员');
 
       const valid = await argon2.verify(user.passwordHash, oldPassword);
       if (!valid) {
@@ -1651,6 +1662,7 @@ export class AuthService {
     sessionContext?: SessionContext,
     options?: {
       audience?: RefreshTokenAudience;
+      expectedPasswordHash?: string;
     },
   ) {
     const audience = options?.audience ?? 'APP';
@@ -1670,6 +1682,14 @@ export class AuthService {
     }
 
     const { token: refreshToken, sessionId } = await createSession;
+    // Reject a login authenticated with a password reset during session issuance.
+    if (audience === 'ADMIN' && options?.expectedPasswordHash) {
+      const current = await this.prisma.user.findUnique({where:{id:userId},select:{passwordHash:true,status:true,role:true,accountId:true}});
+      if (current?.passwordHash !== options.expectedPasswordHash || current.status !== 'ACTIVE' || current.role !== 'ADMIN' || current.accountId !== accountId) {
+        await this.refreshTokenService.revoke(refreshToken);
+        throw new UnauthorizedException('密码或账号状态已变化，请重新登录');
+      }
+    }
     const accessToken = await this.signAccessToken(
       userId,
       accountId,
@@ -1681,7 +1701,7 @@ export class AuthService {
     return { accessToken, refreshToken };
   }
 
-  private signAccessToken(
+  private async signAccessToken(
     userId: string,
     accountId: string,
     role: string,

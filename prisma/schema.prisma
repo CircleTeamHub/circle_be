@@ -374,6 +374,7 @@ model User {
   accountId                    String     @unique
   inviteCode                   String     @unique
   invitedByUserId              String?
+  mustChangePassword           Boolean    @default(false)
   passwordHash                 String
   loginSecurityCodeHash        String?
   securityCodeAttempts         Int        @default(0)

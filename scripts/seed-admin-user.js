@@ -47,7 +47,6 @@ async function main() {
       update: {
         inviteCode,
         passwordHash,
-        nickname: 'Local Admin',
         email,
         role: 'ADMIN',
         status: 'ACTIVE',

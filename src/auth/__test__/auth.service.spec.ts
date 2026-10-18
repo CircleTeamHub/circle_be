@@ -888,6 +888,41 @@ describe('AuthService', () => {
     });
   });
 
+  it('rejects an old-password admin login if a super administrator resets it while issuing a session', async () => {
+    const user={id:'uuid-1',accountId:'admin',email:'admin@example.com',passwordHash:await argon2.hash('InitialPass1234'),status:'ACTIVE',role:'ADMIN'};
+    users.push(user);
+    mockRefreshTokenService.createSessionForCurrentSingleDeviceSetting.mockImplementationOnce(async()=>{user.passwordHash=await argon2.hash('NewPassword5678');return {token:'refresh-token',sessionId:'session-1'};});
+    await expect(service.adminLogin({email:user.email,password:'InitialPass1234'})).rejects.toThrow('密码或账号状态已变化');
+    expect(mockJwt.signAsync).not.toHaveBeenCalled();expect(mockRefreshTokenService.revoke).toHaveBeenCalledWith('refresh-token');
+  });
+
+  it('does not send self-service password recovery codes for administrator accounts',async()=>{
+    users.push({id:'uuid-1',email:'admin@example.com',role:'ADMIN',status:'ACTIVE'});
+    await service.requestPasswordReset('admin@example.com');
+    expect(mockEmailVerification.requestCode).not.toHaveBeenCalled();
+  });
+  it('rejects email-code password reset for administrator accounts even with a valid code',async()=>{
+    users.push({id:'uuid-1',email:'admin@example.com',role:'ADMIN',status:'ACTIVE',passwordHash:'existing-hash'});
+    await expect(service.resetPassword('admin@example.com','123456','NewPassword5678')).rejects.toThrow(ForbiddenException);
+    expect(users[0].passwordHash).toBe('existing-hash');
+    expect(mockRefreshTokenService.revokeAll).not.toHaveBeenCalled();
+  });
+  it('denies self-service password changes for administrator accounts',async()=>{
+    users.push({id:'uuid-1',email:'admin@example.com',role:'ADMIN',status:'ACTIVE',passwordHash:await argon2.hash('InitialPass1234')});
+    await expect(service.changePassword('uuid-1','InitialPass1234','NewPassword5678')).rejects.toThrow('管理员密码由超级管理员设置');
+  });
+
+  it('logs in an administrator by account name without an email and normalizes casing',async()=>{
+    users.push({id:'uuid-1',accountId:'support_01',email:null,role:'ADMIN',status:'ACTIVE',passwordHash:await argon2.hash('AccountPass1234')});
+    await expect(service.adminLogin({identifier:'  SUPPORT_01  ',password:'AccountPass1234'})).resolves.toEqual(expect.objectContaining({accessToken:'access-token'}));
+    expect(mockJwt.signAsync).toHaveBeenCalledWith(expect.objectContaining({accountId:'support_01',aud:'ADMIN'}),expect.anything());
+  });
+  it('does not grant admin access to ordinary app users logging in by account name',async()=>{
+    users.push({id:'uuid-1',accountId:'support_01',email:null,role:'USER',status:'ACTIVE',passwordHash:await argon2.hash('AccountPass1234')});
+    await expect(service.adminLogin({identifier:'support_01',password:'AccountPass1234'})).rejects.toThrow(ForbiddenException);
+    expect(mockJwt.signAsync).not.toHaveBeenCalled();
+  });
+
   it('adminLogin rejects an admin without assigned console access before issuing tokens', async () => {
     users.push({
       id: 'uuid-1',

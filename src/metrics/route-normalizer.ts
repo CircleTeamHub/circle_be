@@ -15,6 +15,7 @@ const NUMERIC = /^\d+$/;
 // sync with the real router when adding controllers, or new routes silently
 // fall to the id-collapse fallback.
 export const STATIC_ROUTES = new Set([
+  '/api/v1/admin/access/me/nickname',
   '/api/v1/notification/announcements/scrolling',
   '/api/v1/admin/console/analytics',
   '/api/v1/admin/console/diagnostics',
@@ -54,6 +55,7 @@ export const STATIC_ROUTES = new Set([
   '/api/v1/admin/e2ee/devices',
   '/api/v1/admin/e2ee/packages',
   '/api/v1/admin/access/accounts',
+  '/api/v1/admin/access/accounts/availability',
   '/api/v1/admin/access/me',
   '/api/v1/admin/commerce/fancy-number-orders',
   '/api/v1/admin/commerce/fancy-number-ownership',
@@ -227,6 +229,7 @@ export const DYNAMIC_ROUTE_TEMPLATES = [
   '/api/v1/admin/e2ee/devices/:id/approve',
   '/api/v1/admin/e2ee/devices/:id/revoke',
   '/api/v1/admin/e2ee/conversations/:id/events',
+  '/api/v1/admin/access/accounts/:id/password',
   '/api/v1/admin/access/accounts/:id',
   '/api/v1/admin/commerce/memberships/:userId/grants',
   '/api/v1/admin/content/posts/:id',
