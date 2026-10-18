@@ -1,9 +1,11 @@
 import {
   BadRequestException,
+  ForbiddenException,
   Injectable,
   NotFoundException,
 } from '@nestjs/common';
 import { PrismaService } from 'src/prisma/prisma.service';
+import { ADMIN_ROLE_PERMISSIONS } from 'src/admin-access/admin-permission.guard';
 import { Prisma } from 'src/generated/prisma';
 import { ChatGroupAdminService } from 'src/chat/chat-group-admin.service';
 import { UploadService } from 'src/upload/upload.service';
@@ -100,6 +102,7 @@ export class AdminImService {
       items: rows.map(({ members, _count, ...r }) => ({
         ...r,
         name: r.name ?? circles.find((c) => c.id === r.circleID)?.name ?? null,
+        circle: circles.find((c) => c.id === r.circleID) ?? null,
         source: 'SELF_HOSTED',
         memberCount: _count.members,
         participants: members.map((m) => ({
@@ -121,6 +124,28 @@ export class AdminImService {
     if (q.from && q.to && new Date(q.from) > new Date(q.to))
       throw new BadRequestException('Invalid date range');
     const result = await this.prisma.$transaction(async (tx) => {
+      // Recheck after the HTTP guard. Hold both account and grant rows until
+      // the content read and its audit record commit, ordering against revoke.
+      await tx.$queryRaw`SELECT "id" FROM "User" WHERE "id" = ${actorID} FOR SHARE`;
+      await tx.$queryRaw`SELECT "userID" FROM "AdminAccess" WHERE "userID" = ${actorID} FOR SHARE`;
+      const actor = await tx.user.findUnique({
+        where: { id: actorID },
+        select: {
+          role: true,
+          status: true,
+          adminAccess: { select: { role: true } },
+        },
+      });
+      if (
+        actor?.role !== 'ADMIN' ||
+        actor.status !== 'ACTIVE' ||
+        !actor.adminAccess ||
+        !(ADMIN_ROLE_PERMISSIONS[actor.adminAccess.role] ?? []).includes(
+          'IM_READ',
+        )
+      ) {
+        throw new ForbiddenException('无权限查看聊天记录');
+      }
       // The shared conversation lock orders this read against clear/recall/burn writes.
       await tx.$queryRaw`SELECT "id" FROM "ChatConversation" WHERE "id" = ${id} FOR SHARE`;
       const conversation = await tx.chatConversation.findUnique({
@@ -274,6 +299,8 @@ export class AdminImService {
     value: Prisma.JsonValue,
   ): Record<string, unknown> {
     if (!value || typeof value !== 'object' || Array.isArray(value)) return {};
+    if (type === 'encrypted-text')
+      return { envelope: value.envelope, signature: value.signature };
     const fields =
       type === 'text'
         ? ['text']

@@ -8,6 +8,7 @@ const postSelect = {
   content: true,
   images: true,
   tags: true,
+  _count: { select: { signups: true } },
   status: true,
   createdAt: true,
   updatedAt: true,
@@ -53,20 +54,10 @@ export class AdminContentService {
       }),
       this.prisma.circlePost.count({ where }),
     ]);
-    const counts = posts.length
-      ? await this.prisma.circlePostReport.groupBy({
-          by: ['postID'],
-          where: { postID: { in: posts.map((post) => post.id) } },
-          _count: { _all: true },
-        })
-      : [];
-    const countMap = new Map(
-      counts.map((row) => [row.postID, row._count._all]),
-    );
     return {
-      items: posts.map((post) => ({
+      items: posts.map(({ _count, ...post }) => ({
         ...post,
-        reportCount: countMap.get(post.id) ?? 0,
+        signupCount: _count.signups,
       })),
       total,
       page: query.page,
@@ -80,9 +71,42 @@ export class AdminContentService {
       select: postSelect,
     });
     if (!post) throw new NotFoundException('Post not found');
-    const reportCount = await this.prisma.circlePostReport.count({
-      where: { postID: id },
-    });
-    return { ...post, reportCount };
+    const { _count, ...detail } = post;
+    return { ...detail, signupCount: _count.signups };
+  }
+  async signups(id: string, query: { page: number; limit: number }) {
+    if (
+      !(await this.prisma.circlePost.findUnique({
+        where: { id },
+        select: { id: true },
+      }))
+    )
+      throw new NotFoundException('动态不存在');
+    const where = { postID: id };
+    const [items, total] = await Promise.all([
+      this.prisma.circlePostSignup.findMany({
+        where,
+        select: {
+          id: true,
+          createdAt: true,
+          seenByAuthor: true,
+          seenAt: true,
+          user: {
+            select: {
+              id: true,
+              nickname: true,
+              accountId: true,
+              avatarUrl: true,
+              status: true,
+            },
+          },
+        },
+        orderBy: [{ createdAt: 'desc' }, { id: 'desc' }],
+        skip: (query.page - 1) * query.limit,
+        take: query.limit,
+      }),
+      this.prisma.circlePostSignup.count({ where }),
+    ]);
+    return { items, total, page: query.page, limit: query.limit };
   }
 }

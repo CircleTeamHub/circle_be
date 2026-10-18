@@ -1,3 +1,4 @@
+import { IconService } from 'src/icon/icon.service';
 import {
   BadRequestException,
   ConflictException,
@@ -43,6 +44,11 @@ const ADMIN_USER_LIST_SELECT = {
 } as const;
 
 const ADMIN_USER_DETAIL_SELECT = {
+  persona: true,
+  helloWords: true,
+  birthday: true,
+  cover: true,
+  receivedLikeCount: true,
   id: true,
   accountId: true,
   nickname: true,
@@ -75,6 +81,7 @@ export class AdminUserService {
     private readonly audit: AdminUserAuditService,
     private readonly sessionRevocation: SessionRevocationService,
     private readonly realtime: RealtimeService,
+    private readonly icons: IconService,
   ) {}
 
   async listUsers(query: ListAdminUsersQueryDto) {
@@ -192,6 +199,12 @@ export class AdminUserService {
 
     return {
       profile: {
+        persona: user.persona ?? null,
+        helloWords: user.helloWords ?? null,
+        birthday: user.birthday ?? null,
+        cover: user.cover ?? null,
+        receivedLikeCount: user.receivedLikeCount ?? 0,
+        displayIcons: await this.icons.getDisplayIconsForUser(id),
         id: user.id,
         accountId: user.accountId,
         nickname: user.nickname,
@@ -308,7 +321,7 @@ export class AdminUserService {
     }
 
     const result = await this.prisma.$transaction(async (tx) => {
-      await tx.$queryRaw`SELECT pg_advisory_xact_lock(72419930)`;
+      await tx.$executeRaw`SELECT pg_advisory_xact_lock(72419930)`;
       const current = await tx.user.findUnique({
         where: { id: targetId },
         select: {

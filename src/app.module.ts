@@ -1,3 +1,4 @@
+import { AdminUserResourcesModule } from './admin-user/admin-user-resources.module';
 import { ConsoleModule } from './admin-console/console.module';
 import { Logger, Module } from '@nestjs/common';
 import { APP_GUARD, APP_INTERCEPTOR } from '@nestjs/core';
@@ -104,6 +105,7 @@ const envFilePath = `.env.${nodeEnv}`;
     CreditModule,
     CallModule,
     AdminUserModule,
+    AdminUserResourcesModule,
     FancyNumberModule,
     GroupExpansionModule,
     GeoModule,
