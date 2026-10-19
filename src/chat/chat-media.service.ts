@@ -88,7 +88,7 @@ export class ChatMediaService implements OnModuleDestroy {
     keys: string[],
   ): Promise<void> {
     for (const key of this.noteImportKeys(keys)) {
-      await tx.$queryRaw`SELECT pg_advisory_xact_lock(hashtext(${key}))`;
+      await tx.$executeRaw`SELECT pg_advisory_xact_lock(hashtext(${key}))`;
     }
   }
 

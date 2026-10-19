@@ -21,7 +21,7 @@ export async function runAdminOperation<T>(
     .update(JSON.stringify(payload))
     .digest('hex');
   return prisma.$transaction(async (tx) => {
-    await tx.$queryRaw`SELECT pg_advisory_xact_lock(hashtextextended(${id}, 0))`;
+    await tx.$executeRaw`SELECT pg_advisory_xact_lock(hashtextextended(${id}, 0))`;
     const previous = await tx.adminOperationRequest.findUnique({
       where: { id },
     });

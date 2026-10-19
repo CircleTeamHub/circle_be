@@ -308,7 +308,7 @@ export class AdminUserService {
     }
 
     const result = await this.prisma.$transaction(async (tx) => {
-      await tx.$queryRaw`SELECT pg_advisory_xact_lock(72419930)`;
+      await tx.$executeRaw`SELECT pg_advisory_xact_lock(72419930)`;
       const current = await tx.user.findUnique({
         where: { id: targetId },
         select: {

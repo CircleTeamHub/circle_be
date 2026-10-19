@@ -31,6 +31,7 @@ describe('ChatMediaService', () => {
   const prisma = {
     $transaction: jest.fn(),
     $queryRaw: jest.fn(),
+    $executeRaw: jest.fn().mockResolvedValue(0),
     chatMediaDeletion: {
       createMany: jest.fn(),
       upsert: jest.fn(),

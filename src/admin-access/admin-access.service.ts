@@ -82,7 +82,7 @@ export class AdminAccessService {
     if (actorID === userID)
       throw new BadRequestException('不能修改自己的管理员角色');
     return this.prisma.$transaction(async (tx) => {
-      await tx.$queryRaw`SELECT pg_advisory_xact_lock(72419930)`;
+      await tx.$executeRaw`SELECT pg_advisory_xact_lock(72419930)`;
       const actor = await tx.user.findUnique({
         where: { id: actorID },
         select: { role: true, status: true, adminAccess: true },

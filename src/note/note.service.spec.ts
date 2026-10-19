@@ -2986,6 +2986,7 @@ describe('NoteService', () => {
     const isolatedPrisma = {
       $transaction: jest.fn(),
       $queryRaw: jest.fn(),
+      $executeRaw: jest.fn().mockResolvedValue(0),
       note: { findMany: jest.fn() },
       noteGroup: { findFirst: jest.fn() },
       noteShareLink: { count: jest.fn(), create: jest.fn() },
@@ -5439,8 +5440,8 @@ describe('NoteService', () => {
           }),
         }),
       );
-      expect(prisma.$queryRaw).toHaveBeenCalledTimes(1);
-      expect(prisma.$queryRaw.mock.invocationCallOrder[0]).toBeLessThan(
+      expect(prisma.$executeRaw).toHaveBeenCalledTimes(1);
+      expect(prisma.$executeRaw.mock.invocationCallOrder[0]).toBeLessThan(
         prisma.chatMediaDeletion.upsert.mock.invocationCallOrder[0],
       );
       expect(
@@ -5511,7 +5512,7 @@ describe('NoteService', () => {
       expect(prisma.chatMediaDeletion.upsert).not.toHaveBeenCalled();
       expect(uploadService.copyObjectToKey).not.toHaveBeenCalled();
       // 检查发生在同一把 key 锁之内。
-      expect(prisma.$queryRaw.mock.invocationCallOrder[0]).toBeLessThan(
+      expect(prisma.$executeRaw.mock.invocationCallOrder[0]).toBeLessThan(
         prisma.chatMediaDeletion.findUnique.mock.invocationCallOrder[0],
       );
     });
