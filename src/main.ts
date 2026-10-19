@@ -38,6 +38,12 @@ export function resolveAppPort(value: unknown): number {
 import { resolveCorsOriginChecker } from './config/cors-origin';
 export { resolveCorsOriginChecker } from './config/cors-origin';
 
+export function configureHttpBodyParser(
+  app: Pick<NestExpressApplication, 'useBodyParser'>,
+) {
+  app.useBodyParser('json', { limit: '2mb' });
+}
+
 export function buildNestFactoryOptions() {
   return {
     cors: {
@@ -211,7 +217,7 @@ async function bootstrap() {
     AppModule,
     buildNestFactoryOptions(),
   );
-  app.useBodyParser('json', { limit: '2mb' });
+  configureHttpBodyParser(app);
   const errorAggregation = setupApp(app);
 
   if (!isProduction) {
