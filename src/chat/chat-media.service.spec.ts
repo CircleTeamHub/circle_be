@@ -76,7 +76,11 @@ describe('ChatMediaService', () => {
     prisma.$transaction.mockImplementation(
       async (callback: (tx: typeof prisma) => unknown) => callback(prisma),
     );
-    prisma.$queryRaw.mockResolvedValue([]);
+    prisma.$queryRaw.mockImplementation(async (strings, ...values) =>
+      strings.join(' ').includes('SELECT wanted.key')
+        ? values[0].map((key: string) => ({ key }))
+        : [],
+    );
   });
 
   it('bounds an issued pending-read media grant before the first read can start a timer', async () => {
@@ -183,6 +187,27 @@ describe('ChatMediaService', () => {
     const sql = prisma.$queryRaw.mock.calls[1][0].join(' ');
     expect(sql).toContain('"ChatMessage"');
     expect(sql).toContain('"ChatBurnArchive"');
+  });
+  it('never queues physical deletion when another live or retained reference still owns the key', async () => {
+    prisma.$queryRaw.mockResolvedValue([]);
+    await service.queueDeletions(prisma as never, ['chat/u1/shared.jpg']);
+    expect(prisma.chatMediaDeletion.createMany).not.toHaveBeenCalled();
+  });
+  it('drops a stale deletion task rather than deleting media referenced by a retained archive', async () => {
+    const row = {
+      id: 'deletion',
+      objectKey: 'chat/u1/shared.jpg',
+      attempts: 0,
+      nextAttemptAt: new Date(0),
+    };
+    prisma.chatMediaDeletion.findMany.mockResolvedValue([row]);
+    prisma.chatMediaDeletion.findUnique.mockResolvedValue(row);
+    prisma.$queryRaw.mockResolvedValue([]);
+    await service.drainPendingDeletions();
+    expect(uploadService.deleteObjectByKey).not.toHaveBeenCalled();
+    expect(prisma.chatMediaDeletion.delete).toHaveBeenCalledWith({
+      where: { id: row.id },
+    });
   });
   it('blocks media reuse once archive cleanup queued physical deletion', async () => {
     prisma.chatMediaDeletion.findFirst.mockResolvedValue({ id: 'pending' });

@@ -211,11 +211,12 @@ export class ChatMediaService implements OnModuleDestroy {
     tx: Prisma.TransactionClient,
     keys: string[],
   ): Promise<void> {
-    const objectKeys = [...new Set(keys)].filter(
+    let objectKeys = [...new Set(keys)].filter(
       (key) =>
         key.startsWith(CHAT_MEDIA_KEY_PREFIX) &&
         !key.includes(`/${CHAT_NOTE_IMPORT_SEGMENT}`),
     );
+    objectKeys = await this.unreferencedArchiveMedia(tx, objectKeys, '');
     if (objectKeys.length === 0) return;
     await tx.chatMediaDeletion.createMany({
       data: objectKeys.map((objectKey) => ({
@@ -282,7 +283,7 @@ export class ChatMediaService implements OnModuleDestroy {
     const rows = await tx.$queryRaw<Array<{ key: string }>>`
       SELECT wanted.key FROM unnest(${owned}::text[]) AS wanted(key)
       WHERE NOT EXISTS (
-        SELECT 1 FROM "ChatMessage" m WHERE m."deleted" = false
+        SELECT 1 FROM "ChatMessage" m WHERE m."deleted" = false AND m."revokedAt" IS NULL
         AND (m.content->>'key' = wanted.key OR m.content->>'thumbKey' = wanted.key OR m.content->>'coverKey' = wanted.key)
       ) AND NOT EXISTS (
         SELECT 1 FROM "ChatBurnArchive" a WHERE a.id <> ${archiveId}
@@ -456,6 +457,8 @@ export class ChatMediaService implements OnModuleDestroy {
         // 超时回滚,行既没删掉也没记下重试状态,还白占一个连接和 advisory lock。
         const claimed = await this.prisma.$transaction(async (tx) => {
           await this.lockNoteImportKeys(tx, [row.objectKey]);
+          if (!row.objectKey.includes(`/${CHAT_NOTE_IMPORT_SEGMENT}`))
+            await tx.$queryRaw`SELECT pg_advisory_xact_lock(hashtext(${row.objectKey}))`;
           const current = await tx.chatMediaDeletion.findUnique({
             where: { id: row.id },
           });
@@ -470,6 +473,14 @@ export class ChatMediaService implements OnModuleDestroy {
             where: { objectKey: current.objectKey },
           });
           if (referenceCount > 0) {
+            await tx.chatMediaDeletion.delete({ where: { id: current.id } });
+            return null;
+          }
+          if (
+            !current.objectKey.includes(`/${CHAT_NOTE_IMPORT_SEGMENT}`) &&
+            !(await this.unreferencedArchiveMedia(tx, [current.objectKey], ''))
+              .length
+          ) {
             await tx.chatMediaDeletion.delete({ where: { id: current.id } });
             return null;
           }

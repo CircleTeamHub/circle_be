@@ -3712,11 +3712,8 @@ describe('ChatService', () => {
           }),
         }),
       );
-      // 撤回即焚:对象存储里的媒体一并删,只清 DB 等于没撤。
-      expect(media.deleteObjects).toHaveBeenCalledWith([
-        'chat/u1/a.jpg',
-        'chat/u1/a.t.jpg',
-      ]);
+      // The durable deletion worker rechecks shared archive references.
+      expect(media.drainPendingDeletions).toHaveBeenCalled();
       expect(media.queueDeletions).toHaveBeenCalledWith(prisma, [
         'chat/u1/a.jpg',
         'chat/u1/a.t.jpg',

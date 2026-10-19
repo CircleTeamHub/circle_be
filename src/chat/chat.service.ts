@@ -4243,11 +4243,7 @@ export class ChatService {
         userId,
       );
     }
-    if (mediaKeys.length > 0) {
-      // 尽力而为:删失败只留孤儿对象,不让撤回失败(deleteObjects 内部逐个 catch)。
-      void this.media.deleteObjects(mediaKeys);
-    }
-    if (noteImportKeys.length > 0) {
+    if (mediaKeys.length > 0 || noteImportKeys.length > 0) {
       void this.media.drainPendingDeletions();
     }
     this.broadcast.emitRevoke({

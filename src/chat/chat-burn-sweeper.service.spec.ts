@@ -262,10 +262,11 @@ describe('ChatBurnSweeperService', () => {
       select: { id: true, revision: true },
     });
     // 只软删不删对象 = 焚毁只焚了个寂寞。
-    expect(media.deleteObjects).toHaveBeenCalledWith([
+    expect(media.queueDeletions).toHaveBeenCalledWith(prisma, [
       'chat/u1/a.jpg',
       'chat/u1/a.t.jpg',
     ]);
+    expect(media.drainPendingDeletions).toHaveBeenCalled();
   });
 
   describe('with several instances', () => {
@@ -547,7 +548,7 @@ describe('ChatBurnSweeperService', () => {
       ['m1'],
       [shared],
     );
-    expect(media.deleteObjects).toHaveBeenCalledWith([owned]);
+    expect(media.drainPendingDeletions).toHaveBeenCalled();
     expect(media.queueDeletions).toHaveBeenCalledWith(prisma, [owned]);
   });
 

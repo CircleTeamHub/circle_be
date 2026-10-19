@@ -268,11 +268,7 @@ export class ChatBurnSweeperService {
       if (burned === null) return;
       // 墓碑已提交才通知:事务回滚了却已经播出去,对端会删掉服务端其实还留着的消息。
       await this.announceBurned(conversationId, burned);
-      if (ownedMediaKeys.length > 0) {
-        // deleteObjects 内部逐 key 尽力而为;失败只留孤儿对象,不中断焚毁。
-        void this.media.deleteObjects(ownedMediaKeys);
-      }
-      if (noteImportKeys.length > 0) {
+      if (ownedMediaKeys.length > 0 || noteImportKeys.length > 0) {
         void this.media.drainPendingDeletions();
       }
       this.logger.log(
