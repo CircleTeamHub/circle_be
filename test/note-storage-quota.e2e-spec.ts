@@ -137,6 +137,23 @@ describePostgres('Note storage quota concurrency e2e', () => {
     });
     const token = accessToken(user);
 
+    const conversation = await prisma.chatConversation.create({
+      data: {
+        type: 'DIRECT',
+        nextHeight: 1,
+        members: { create: [{ userID: user.id }, { userID: sourceOwner.id }] },
+      },
+    });
+    const sourceMessage = await prisma.chatMessage.create({
+      data: {
+        conversationID: conversation.id,
+        height: 1,
+        senderID: sourceOwner.id,
+        type: 'note-card',
+        content: { noteId: source.id },
+      },
+    });
+
     await expectOneQuotaWinner(user.id, [
       createRequest(token, 'Parallel create'),
       request(getE2eApp().getHttpServer())
@@ -146,8 +163,8 @@ describePostgres('Note storage quota concurrency e2e', () => {
           noteId: source.id,
           source: {
             conversationType: 'private',
-            conversationID: 'quota-race-chat',
-            clientMsgID: 'quota-race-message',
+            conversationID: conversation.id,
+            clientMsgID: sourceMessage.id,
             sender: { id: sourceOwner.id, name: sourceOwner.nickname },
           },
         }),

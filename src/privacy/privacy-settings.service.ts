@@ -64,7 +64,12 @@ type StoredPrivacySettings = PrivacySettingsDto & {
 };
 
 export type ProfilePrivacyField =
-  'phoneNumber' | 'email' | 'wechat' | 'qq' | 'whatsup' | 'lastOnline';
+  | 'phoneNumber'
+  | 'email'
+  | 'wechat'
+  | 'qq'
+  | 'whatsup'
+  | 'lastOnline';
 
 @Injectable()
 export class PrivacySettingsService {

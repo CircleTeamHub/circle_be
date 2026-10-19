@@ -916,10 +916,12 @@ export class GroupAdmissionService {
                   try {
                     await this.validateSource(tx, group, a);
                   } catch (error) {
-                    if (!(
-                      error instanceof ForbiddenException ||
-                      error instanceof NotFoundException
-                    ))
+                    if (
+                      !(
+                        error instanceof ForbiddenException ||
+                        error instanceof NotFoundException
+                      )
+                    )
                       throw error;
                     await tx.groupAdmissionDelivery.update({
                       where: { id: job.id },

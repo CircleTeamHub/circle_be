@@ -40,6 +40,9 @@ export class ImMemberActionDto {
   reason: string;
   @Equals(true) confirmed: boolean;
   @IsIn(['mute', 'unmute', 'remove', 'role']) action:
-    'mute' | 'unmute' | 'remove' | 'role';
+    | 'mute'
+    | 'unmute'
+    | 'remove'
+    | 'role';
   @IsOptional() @IsIn(['ADMIN', 'MEMBER']) role?: 'ADMIN' | 'MEMBER';
 }
