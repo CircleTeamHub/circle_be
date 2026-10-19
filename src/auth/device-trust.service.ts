@@ -439,6 +439,29 @@ export class DeviceTrustService {
     }
   }
 
+  /**
+   * 找回完成中途失败时调用：把刚领取（CONSUMED）的找回退回 PENDING，重试可以再次领取。
+   * 只认找回单（recoveryAvailableAt 非空），不会把普通验证单「复活」。尽力而为。
+   */
+  async releaseRecoveryClaim(challengeId: string): Promise<void> {
+    try {
+      await this.prisma.loginChallenge.updateMany({
+        where: {
+          id: challengeId,
+          status: LoginChallengeStatus.CONSUMED,
+          recoveryAvailableAt: { not: null },
+        },
+        data: { status: LoginChallengeStatus.PENDING, decidedAt: null },
+      });
+    } catch (error) {
+      this.logger.warn(
+        `release recovery claim failed for ${challengeId}: ${
+          error instanceof Error ? error.message : String(error)
+        }`,
+      );
+    }
+  }
+
   /** 找回完成后的通知（只走实时通道：此时其他设备的信任和会话马上被撤销）。 */
   logRecoveryCompleted(userId: string, challengeId: string) {
     this.logSecurity('login_recovery_completed', userId, { challengeId });

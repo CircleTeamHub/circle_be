@@ -366,11 +366,18 @@ export class AuthService {
         return this.deviceVerificationResponse(decision.challenge);
       }
       if (decision.kind === 'recovered') {
-        return this.completeRecoveryLogin(
-          current,
-          decision.challengeId,
-          sessionContext ?? {},
-        );
+        try {
+          return await this.completeRecoveryLogin(
+            current,
+            decision.challengeId,
+            sessionContext ?? {},
+          );
+        } catch (error) {
+          // 领取已提交、后续步骤中途失败：退回「可领取」，让重试从头完整执行一遍。
+          // 否则要么白等 24 小时重来，要么新设备已被信任却没撤掉丢失设备的信任和会话。
+          await this.deviceTrust.releaseRecoveryClaim(decision.challengeId);
+          throw error;
+        }
       }
       return this.finishLogin(current, sessionContext);
     });
@@ -896,11 +903,23 @@ export class AuthService {
         deviceName: sessionContext?.deviceName ?? deviceName,
       });
       // 受信任设备还在正常使用：别的设备发起的找回申请取消（本人能直接批准）。
-      if (deviceKey && (await this.deviceTrust.isTrusted(user.id, deviceKey))) {
-        await this.deviceTrust.cancelRecoveriesForActiveDevice(
-          user.id,
-          deviceKey,
-        );
+      // 尽力而为：此时 refresh token 已经轮换，这里抛错会让客户端拿不到新 token、
+      // 重试被当成 token 复用而整族吊销。下一次续签 / 登录会再取消一次。
+      if (deviceKey) {
+        try {
+          if (await this.deviceTrust.isTrusted(user.id, deviceKey)) {
+            await this.deviceTrust.cancelRecoveriesForActiveDevice(
+              user.id,
+              deviceKey,
+            );
+          }
+        } catch (error) {
+          this.logger.warn(
+            `cancel recoveries on refresh failed for ${user.id}: ${
+              error instanceof Error ? error.message : String(error)
+            }`,
+          );
+        }
       }
       return { accessToken, refreshToken: newRefreshToken };
     });

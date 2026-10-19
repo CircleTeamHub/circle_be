@@ -960,6 +960,33 @@ describe('DeviceTrustService recovery (no trusted device available)', () => {
     ).rejects.toThrow(HttpException);
   });
 
+  it('a claimed recovery can be handed back after a failure, ordinary challenges cannot', async () => {
+    const { service, challenges, challengeId } = await pendingChallenge();
+    await service.requestRecovery(challengeId, 'reinstalled');
+    challenges[0].recoveryAvailableAt = new Date(Date.now() - 1000);
+    await service.evaluateLogin(user, { deviceKey: 'reinstalled' });
+    expect(challenges[0].status).toBe('CONSUMED');
+
+    await service.releaseRecoveryClaim(challengeId);
+    expect(challenges[0].status).toBe('PENDING');
+    // 重试能再次领取。
+    await expect(
+      service.evaluateLogin(user, { deviceKey: 'reinstalled' }),
+    ).resolves.toEqual({ kind: 'recovered', challengeId });
+
+    // 普通验证单（不是找回）用码消费后，不会被这个口子「复活」。
+    challenges.push({
+      ...challenges[0],
+      id: 'ordinary',
+      status: 'CONSUMED',
+      recoveryAvailableAt: null,
+    });
+    await service.releaseRecoveryClaim('ordinary');
+    expect(challenges.find((c) => c.id === 'ordinary')!.status).toBe(
+      'CONSUMED',
+    );
+  });
+
   it('trusted devices see when a pending request would complete on its own', async () => {
     const { service, challengeId } = await pendingChallenge();
     const view = await service.requestRecovery(challengeId, 'reinstalled');

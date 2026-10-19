@@ -111,6 +111,7 @@ describe('AuthService', () => {
     cancelRecoveriesForActiveDevice: jest.fn(() => Promise.resolve()),
     requestRecovery: jest.fn(),
     logRecoveryCompleted: jest.fn(),
+    releaseRecoveryClaim: jest.fn(() => Promise.resolve()),
   };
   const mockRefreshTokenService = {
     create: jest.fn(() =>
@@ -1294,6 +1295,39 @@ describe('AuthService', () => {
     );
   });
 
+  it('a failure midway through recovery hands the claim back so a retry runs it fully', async () => {
+    const passwordHash = await argon2.hash('password1');
+    users.push({
+      id: 'uuid-recover-fail',
+      accountId: 'recoverfail',
+      email: 'recover-fail@example.com',
+      passwordHash,
+      status: 'ACTIVE',
+      role: 'USER',
+      singleDeviceLoginEnabled: false,
+    });
+    mockDeviceTrust.evaluateLogin.mockResolvedValueOnce({
+      kind: 'recovered',
+      challengeId: 'challenge-r',
+    } as never);
+    mockDeviceTrust.revokeOtherDevices.mockRejectedValueOnce(
+      new Error('database unavailable') as never,
+    );
+
+    await expect(
+      service.login(
+        {
+          identifier: 'recover-fail@example.com',
+          password: 'password1',
+        } as any,
+        { deviceKey: 'reinstalled' },
+      ),
+    ).rejects.toThrow('database unavailable');
+    expect(mockDeviceTrust.releaseRecoveryClaim).toHaveBeenCalledWith(
+      'challenge-r',
+    );
+  });
+
   it('requesting recovery answers with the waiting deadline', async () => {
     const recoveryAvailableAt = new Date(Date.now() + 86_400_000);
     mockDeviceTrust.requestRecovery.mockResolvedValueOnce({
@@ -1592,6 +1626,30 @@ describe('AuthService', () => {
     expect(
       mockDeviceTrust.cancelRecoveriesForActiveDevice,
     ).toHaveBeenCalledWith('uuid-1', 'owner-phone');
+  });
+
+  it('a failing recovery cancellation never breaks the refresh (the token is already rotated)', async () => {
+    users.push({
+      id: 'uuid-1',
+      accountId: 'testuser',
+      passwordHash: 'hash',
+      status: 'ACTIVE',
+      role: 'USER',
+      lastOnline: null,
+    });
+    mockRefreshTokenService.rotate.mockResolvedValueOnce({
+      token: 'new-refresh-token',
+      userId: 'uuid-1',
+      sessionId: 'session-2',
+      deviceKey: 'owner-phone',
+    } as never);
+    mockDeviceTrust.cancelRecoveriesForActiveDevice.mockRejectedValueOnce(
+      new Error('database unavailable') as never,
+    );
+
+    await expect(service.refresh('refresh-token')).resolves.toEqual(
+      expect.objectContaining({ refreshToken: 'new-refresh-token' }),
+    );
   });
 
   it('a refresh from an untrusted session does not cancel recovery', async () => {
