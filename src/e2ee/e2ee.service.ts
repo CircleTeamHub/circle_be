@@ -941,6 +941,9 @@ export class E2eeService {
         ],
         dto.recoverySignature,
       );
+      // Serialize inserts per recovery so cursor allocation also follows commit
+      // order across devices; a late commit must not appear behind a read cursor.
+      await tx.$executeRaw`SELECT pg_advisory_xact_lock(hashtext('e2ee-archive'), hashtext(${recovery.id}))`;
       let count = 0;
       for (const item of [...dto.items].sort((a, b) =>
         a.conversationId.localeCompare(b.conversationId),
