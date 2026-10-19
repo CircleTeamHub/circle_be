@@ -261,7 +261,7 @@ export class ChatMediaService implements OnModuleDestroy {
       ),
     ].sort();
     for (const key of keys)
-      await tx.$queryRaw`SELECT pg_advisory_xact_lock(hashtext(${key}))`;
+      await tx.$queryRaw`SELECT pg_advisory_xact_lock(hashtext(${key}))::text`;
     if (
       keys.length &&
       (await tx.chatMediaDeletion.findFirst({
@@ -291,7 +291,7 @@ export class ChatMediaService implements OnModuleDestroy {
     ].sort();
     if (!owned.length) return [];
     for (const key of owned)
-      await tx.$queryRaw`SELECT pg_advisory_xact_lock(hashtext(${key}))`;
+      await tx.$queryRaw`SELECT pg_advisory_xact_lock(hashtext(${key}))::text`;
     const primaryTypes = Object.keys(CHAT_MEDIA_KEY_FIELDS).filter((type) =>
       CHAT_MEDIA_KEY_FIELDS[type].some((field) => field.key === 'key'),
     );
@@ -476,7 +476,7 @@ export class ChatMediaService implements OnModuleDestroy {
         const claimed = await this.prisma.$transaction(async (tx) => {
           await this.lockNoteImportKeys(tx, [row.objectKey]);
           if (!row.objectKey.includes(`/${CHAT_NOTE_IMPORT_SEGMENT}`))
-            await tx.$queryRaw`SELECT pg_advisory_xact_lock(hashtext(${row.objectKey}))`;
+            await tx.$queryRaw`SELECT pg_advisory_xact_lock(hashtext(${row.objectKey}))::text`;
           const current = await tx.chatMediaDeletion.findUnique({
             where: { id: row.id },
           });
