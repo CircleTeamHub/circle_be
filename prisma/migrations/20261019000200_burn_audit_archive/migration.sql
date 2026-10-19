@@ -44,9 +44,12 @@ BEGIN
   DELETE FROM "E2eeArchive" a USING "ChatMessage" m, "E2eeRecovery" r
   WHERE a."messageID"=m."id" AND a."recoveryID"=r."id"
    AND m."conversationID"=NEW."id" AND m."height"<=NEW."clearedBeforeHeight"
-   AND (r."purpose" <> 'AUDIT' OR NOT EXISTS (
+   AND (r."purpose" <> 'AUDIT' OR (NOT (
+     COALESCE(m."burnDurationSec", 0) > 0 AND NOT m."deleted" AND m."revokedAt" IS NULL
+     AND (m."burnExpiresAt" IS NULL OR m."burnExpiresAt" + INTERVAL '180 days' > clock_timestamp())
+   ) AND NOT EXISTS (
      SELECT 1 FROM "ChatBurnArchive" retained WHERE retained."id"=m."id" AND retained."retainUntil">clock_timestamp()
-   ));
+   )));
  END IF;
  RETURN NEW;
 END $$;

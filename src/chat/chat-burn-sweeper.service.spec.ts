@@ -704,4 +704,22 @@ describe('ChatBurnSweeperService', () => {
       { id: 'retained', revision: 1 },
     ]);
   });
+  it('a duplicate sweep with no returned tombstones cannot delete the first sweeper retained media', async () => {
+    prisma.chatMessage.findMany.mockResolvedValue([
+      {
+        id: 'already-burned',
+        type: 'image',
+        content: { key: 'chat/u1/retained.jpg' },
+      },
+    ]);
+    prisma.chatMessage.updateManyAndReturn.mockResolvedValue([]);
+    await (service as any).sweepConversation('c1', { isCurrent: () => true });
+    expect(media.queueDeletions).toHaveBeenCalledWith(prisma, []);
+    expect(media.deleteObjects).not.toHaveBeenCalled();
+    expect(media.releaseNoteImportReferences).toHaveBeenCalledWith(
+      prisma,
+      [],
+      [],
+    );
+  });
 });

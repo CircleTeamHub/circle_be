@@ -228,6 +228,70 @@ export class ChatMediaService implements OnModuleDestroy {
     });
   }
 
+  /** Serialize re-use of an owned key against archive deletion scheduling. */
+  async lockOwnedKeysForSend(
+    tx: Prisma.TransactionClient,
+    type: string,
+    content: Record<string, unknown>,
+    reserved: string[] = [],
+  ): Promise<void> {
+    const keys = [
+      ...new Set(
+        (CHAT_MEDIA_KEY_FIELDS[type] ?? [])
+          .map((field) => content[field.key])
+          .filter(
+            (key): key is string =>
+              typeof key === 'string' &&
+              key.startsWith(CHAT_MEDIA_KEY_PREFIX) &&
+              !key.includes(`/${CHAT_NOTE_IMPORT_SEGMENT}`),
+          ),
+      ),
+    ].sort();
+    for (const key of keys)
+      await tx.$queryRaw`SELECT pg_advisory_xact_lock(hashtext(${key}))`;
+    if (
+      keys.length &&
+      (await tx.chatMediaDeletion.findFirst({
+        where: {
+          objectKey: { in: keys.filter((key) => !reserved.includes(key)) },
+        },
+        select: { id: true },
+      }))
+    )
+      throw new BadRequestException('Media deletion is already scheduled');
+  }
+
+  /** All senders use the same key locks, so a new reference cannot race this check. */
+  async unreferencedArchiveMedia(
+    tx: Prisma.TransactionClient,
+    keys: string[],
+    archiveId: string,
+  ): Promise<string[]> {
+    const owned = [
+      ...new Set(
+        keys.filter(
+          (key) =>
+            key.startsWith(CHAT_MEDIA_KEY_PREFIX) &&
+            !key.includes(`/${CHAT_NOTE_IMPORT_SEGMENT}`),
+        ),
+      ),
+    ].sort();
+    if (!owned.length) return [];
+    for (const key of owned)
+      await tx.$queryRaw`SELECT pg_advisory_xact_lock(hashtext(${key}))`;
+    const rows = await tx.$queryRaw<Array<{ key: string }>>`
+      SELECT wanted.key FROM unnest(${owned}::text[]) AS wanted(key)
+      WHERE NOT EXISTS (
+        SELECT 1 FROM "ChatMessage" m WHERE m."deleted" = false
+        AND (m.content->>'key' = wanted.key OR m.content->>'thumbKey' = wanted.key OR m.content->>'coverKey' = wanted.key)
+      ) AND NOT EXISTS (
+        SELECT 1 FROM "ChatBurnArchive" a WHERE a.id <> ${archiveId}
+        AND a."retainUntil" > clock_timestamp()
+        AND (a.content->>'key' = wanted.key OR a.content->>'thumbKey' = wanted.key OR a.content->>'coverKey' = wanted.key)
+      )`;
+    return rows.map((row) => row.key);
+  }
+
   /**
    * 转发媒体时复制对象到转发者自己的命名空间。源 key 只从已通过消息可见性
    * 校验的数据库行读取；展示 URL 会被移除，目标消息只持久化新 key。
@@ -496,68 +560,121 @@ export class ChatMediaService implements OnModuleDestroy {
    * 存储未配置/签名失败时降级:保留 key、缺 url,前端按占位图处理 ——
    * 读路径绝不因媒体签名把整页历史打挂。
    */
-  async attachMediaUrls(messages: ChatMessageDto[]): Promise<void> {
-    const wanted = new Set<string>();
-    for (const message of messages) {
-      const fields = CHAT_MEDIA_KEY_FIELDS[message.type];
-      if (!fields) continue;
-      for (const field of fields) {
-        const value = message.content[field.key];
-        // 只给 chat/ 目录下的 key 签名。发送校验已经把新消息收口到
-        // chat/{senderId}/,这里是第二道:历史行里若混进别的目录(notes/ 等),
-        // 读路径也不会把它变成一条新的可分发签名 URL。
-        if (
-          typeof value === 'string' &&
-          value.startsWith(CHAT_MEDIA_KEY_PREFIX)
-        )
-          wanted.add(value);
+  private async burnMediaGrants(
+    messages: ChatMessageDto[],
+  ): Promise<Map<string, { date: Date; ttl: number }>> {
+    const pending = messages.filter(
+      (message) =>
+        !!CHAT_MEDIA_KEY_FIELDS[message.type] &&
+        !!(message.burnExpiresAt || message.burnDurationSec),
+    );
+    if (!pending.length) return new Map();
+    return this.prisma.$transaction(async (tx) => {
+      const conversations = [
+        ...new Set(pending.map((message) => message.conversationId)),
+      ].sort();
+      await tx.$queryRaw`SELECT "id" FROM "ChatConversation" WHERE "id" = ANY(${conversations}::text[]) ORDER BY "id" FOR SHARE`;
+      const rows = await tx.chatMessage.findMany({
+        where: { id: { in: pending.map((message) => message.id) } },
+        select: {
+          id: true,
+          deleted: true,
+          revokedAt: true,
+          burnExpiresAt: true,
+          burnDurationSec: true,
+        },
+      });
+      const grants = new Map<string, { date: Date; ttl: number }>();
+      const date = new Date();
+      for (const current of rows) {
+        if (current.deleted || current.revokedAt) continue;
+        const deadline =
+          current.burnExpiresAt?.getTime() ??
+          (current.burnDurationSec
+            ? date.getTime() + current.burnDurationSec * 1000
+            : date.getTime());
+        const ttl = Math.min(
+          CHAT_MEDIA_URL_TTL_SECONDS,
+          Math.floor((deadline - date.getTime()) / 1000),
+        );
+        if (ttl > 0) grants.set(current.id, { date, ttl });
       }
-    }
-    if (wanted.size === 0) return;
+      return grants;
+    });
+  }
 
-    const signingDate = new Date(
+  async attachMediaUrls(messages: ChatMessageDto[]): Promise<void> {
+    let burnGrants = new Map<string, { date: Date; ttl: number }>();
+    try {
+      burnGrants = await this.burnMediaGrants(messages);
+    } catch (error) {
+      this.logger.warn(
+        sanitizeLogValue({
+          event: 'chat_media_presign_failed',
+          operation: 'burnMediaGrants',
+          ...diagnosticFailureDetails(error),
+        }),
+      );
+    }
+    const signed = new Map<string, Promise<string | undefined>>();
+    const windowDate = new Date(
       Math.floor(Date.now() / CHAT_MEDIA_URL_WINDOW_MS) *
         CHAT_MEDIA_URL_WINDOW_MS,
     );
-    const signed = new Map<string, string>();
     await Promise.all(
-      [...wanted].map(async (key) => {
+      messages.map(async (message) => {
+        const fields = CHAT_MEDIA_KEY_FIELDS[message.type];
+        if (!fields) return;
+        message.content = { ...message.content };
+        for (const field of fields) delete message.content[field.url];
+        let grant: { date: Date; ttl: number } | null = {
+          date: windowDate,
+          ttl: CHAT_MEDIA_URL_TTL_SECONDS,
+        };
         try {
-          const result = await this.uploadService.createPresignedGetUrl(
-            key,
-            CHAT_MEDIA_URL_TTL_SECONDS,
-            signingDate,
-          );
-          signed.set(key, result.url);
+          if (message.burnExpiresAt || message.burnDurationSec)
+            grant = burnGrants.get(message.id) ?? null;
+          if (!grant) return;
+          const patch: Record<string, unknown> = {};
+          for (const field of fields) {
+            const key = message.content[field.key];
+            if (
+              typeof key !== 'string' ||
+              !key.startsWith(CHAT_MEDIA_KEY_PREFIX)
+            )
+              continue;
+            const cacheKey = `${key}:${grant.date.getTime()}:${grant.ttl}`;
+            if (!signed.has(cacheKey))
+              signed.set(
+                cacheKey,
+                this.uploadService
+                  .createPresignedGetUrl(key, grant.ttl, grant.date)
+                  .then((result) => result.url)
+                  .catch((error) => {
+                    this.logger.warn(
+                      sanitizeLogValue({
+                        event: 'chat_media_presign_failed',
+                        operation: 'attachMediaUrls',
+                        ...diagnosticFailureDetails(error),
+                      }),
+                    );
+                    return undefined;
+                  }),
+              );
+            const url = await signed.get(cacheKey);
+            if (url) patch[field.url] = url;
+          }
+          message.content = { ...message.content, ...patch };
         } catch (error) {
           this.logger.warn(
             sanitizeLogValue({
               event: 'chat_media_presign_failed',
-              operation: 'attachMediaUrls',
-              objectKey: key,
+              operation: 'burnMediaGrant',
               ...diagnosticFailureDetails(error),
-              error,
             }),
           );
         }
       }),
     );
-    if (signed.size === 0) return;
-
-    for (const message of messages) {
-      const fields = CHAT_MEDIA_KEY_FIELDS[message.type];
-      if (!fields) continue;
-      const patch: Record<string, unknown> = {};
-      for (const field of fields) {
-        const value = message.content[field.key];
-        if (typeof value === 'string') {
-          const url = signed.get(value);
-          if (url) patch[field.url] = url;
-        }
-      }
-      if (Object.keys(patch).length > 0) {
-        message.content = { ...message.content, ...patch };
-      }
-    }
   }
 }

@@ -419,9 +419,7 @@ export class ChatDirectAutoReplyProcessor {
           replyToID: null,
           createdAt: now,
           burnDurationSec,
-          burnExpiresAt: burnDurationSec
-            ? new Date(now.getTime() + burnDurationSec * 1000)
-            : null,
+          burnExpiresAt: null,
         },
       });
       await tx.chatConversation.update({

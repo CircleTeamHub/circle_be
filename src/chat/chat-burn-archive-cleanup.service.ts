@@ -3,7 +3,10 @@ import { CronExpression } from '@nestjs/schedule';
 import { PrismaService } from 'src/prisma/prisma.service';
 import { RedisService } from 'src/redis/redis.service';
 import { runWithJobLease } from 'src/redis/job-lease';
-import { TrackedCron } from 'src/metrics/tracked-cron.decorator';
+import {
+  reportJobSkipped,
+  TrackedCron,
+} from 'src/metrics/tracked-cron.decorator';
 import { ChatMediaService } from './chat-media.service';
 import { CHAT_NOTE_IMPORT_SEGMENT } from './chat.constants';
 
@@ -16,7 +19,7 @@ export class ChatBurnArchiveCleanupService {
   ) {}
   @TrackedCron(CronExpression.EVERY_MINUTE, 'chat_burn_archive_cleanup')
   async sweep(): Promise<void> {
-    await runWithJobLease(
+    const ran = await runWithJobLease(
       this.redis,
       'chat_burn_archive_cleanup',
       120_000,
@@ -43,7 +46,12 @@ export class ChatBurnArchiveCleanupService {
             const imports = keys.filter((key) =>
               key.includes(`/${CHAT_NOTE_IMPORT_SEGMENT}`),
             );
-            await this.media.queueDeletions(tx, keys);
+            const owned = await this.media.unreferencedArchiveMedia(
+              tx,
+              keys,
+              row.id,
+            );
+            await this.media.queueDeletions(tx, owned);
             await this.media.releaseNoteImportReferences(tx, [row.id], imports);
             await tx.e2eeArchive.deleteMany({
               where: { messageID: row.id, recovery: { purpose: 'AUDIT' } },
@@ -53,6 +61,10 @@ export class ChatBurnArchiveCleanupService {
         }
       },
     );
+    if (!ran) {
+      reportJobSkipped();
+      return;
+    }
     await this.media.drainPendingDeletions();
   }
 }

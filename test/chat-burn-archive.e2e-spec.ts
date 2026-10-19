@@ -24,7 +24,7 @@ integration(
         'utf8',
       );
     const service = readFileSync(
-      join(process.cwd(), 'src/chat/chat.service.ts'),
+      join(process.cwd(), 'src/chat/read-burn-timers.ts'),
       'utf8',
     );
     const end =
@@ -40,7 +40,7 @@ integration(
       db = new Client({ connectionString: databaseUrl });
       await db.connect();
       await db.query(`CREATE SCHEMA "${schema}"; SET search_path TO "${schema}";
-      CREATE TABLE "ChatConversation" (id text primary key, "nextHeight" integer default 10, "nextRevision" integer default 10, "clearedBeforeHeight" integer default 0);
+      CREATE TABLE "ChatConversation" (id text primary key, "type" text default 'DIRECT', "nextHeight" integer default 10, "nextRevision" integer default 10, "clearedBeforeHeight" integer default 0);
       CREATE TABLE "ChatMember" ("conversationID" text, "userID" text, "leftAt" timestamp, "joinedAt" timestamp, "lastReadHeight" integer, "clearedBeforeHeight" integer default 0);
       CREATE TABLE "ChatMessage" (id text primary key, "conversationID" text, height integer, type text default 'text', "senderID" text, "createdAt" timestamp, "burnDurationSec" integer, "burnExpiresAt" timestamp, deleted boolean default false, "revokedAt" timestamp, "editedAt" timestamp, content jsonb default '{"text":"private"}', revision integer default 0, "clientMessageId" text);
       CREATE TABLE "E2eeRecovery" (id text primary key, purpose text, "userID" text);
@@ -73,9 +73,13 @@ integration(
     });
     const row = async () =>
       (await db.query('SELECT * FROM "ChatMessage" WHERE id=\'m1\'')).rows[0];
-    const start = async (user = 'reader', floor = 0, joinedAt = joined) =>
-      (await db.query(startSql, ['c1', 1, floor, user, joinedAt])).rows[0]
-        .revision;
+    const start = async (user = 'reader', floor = 0, joinedAt = joined) => {
+      await db.query(
+        'UPDATE "ChatMember" SET "clearedBeforeHeight"=$1, "joinedAt"=$2 WHERE "userID"=$3',
+        [floor, joinedAt, user],
+      );
+      return (await db.query(startSql, ['c1', 1, user])).rows[0].revision;
+    };
     const burn = async () =>
       db.query(
         `UPDATE "ChatMessage" SET "burnExpiresAt"=NOW()-INTERVAL '1 second' WHERE id='m1'; UPDATE "ChatMessage" SET deleted=true, content='{}' WHERE id='m1'`,
@@ -146,6 +150,59 @@ integration(
       expect((await db.query('SELECT id FROM "E2eeArchive"')).rows).toEqual([
         { id: 'audit-copy' },
       ]);
+    });
+    it('preserves authorized audit recovery when clearing occurs before the burn sweep', async () => {
+      await db.query(
+        `INSERT INTO "E2eeRecovery" VALUES ('app','APP','reader'),('audit','AUDIT','admin'); INSERT INTO "E2eeArchive" VALUES ('app-copy','m1','app'),('audit-copy','m1','audit')`,
+      );
+      await start();
+      await db.query(
+        `UPDATE "ChatConversation" SET "clearedBeforeHeight"=1 WHERE id='c1'`,
+      );
+      expect((await db.query('SELECT id FROM "E2eeArchive"')).rows).toEqual([
+        { id: 'audit-copy' },
+      ]);
+      await burn();
+      expect((await db.query('SELECT id FROM "E2eeArchive"')).rows).toEqual([
+        { id: 'audit-copy' },
+      ]);
+      expect((await db.query('SELECT id FROM "ChatBurnArchive"')).rows).toEqual(
+        [{ id: 'm1' }],
+      );
+    });
+    it('still purges audit recovery for a globally cleared non-burn message', async () => {
+      await db.query(
+        `INSERT INTO "E2eeRecovery" VALUES ('audit','AUDIT','admin'); INSERT INTO "E2eeArchive" VALUES ('audit-copy','m1','audit'); UPDATE "ChatMessage" SET "burnDurationSec"=NULL WHERE id='m1'; UPDATE "ChatConversation" SET "clearedBeforeHeight"=1 WHERE id='c1'`,
+      );
+      expect((await db.query('SELECT id FROM "E2eeArchive"')).rows).toEqual([]);
+    });
+    it('only queues owned media after its last live message and retained archive references disappear', async () => {
+      const code = readFileSync(
+        join(process.cwd(), 'src/chat/chat-media.service.ts'),
+        'utf8',
+      );
+      const begin = code.indexOf('SELECT wanted.key');
+      const template = code.slice(begin, code.indexOf('`;', begin));
+      let parameter = 0;
+      const sql = template.replace(/\$\{[^}]+\}/g, () => `$${++parameter}`);
+      const key = 'chat/sender/shared.jpg';
+      await db.query(
+        `UPDATE "ChatMessage" SET type='image',content=jsonb_build_object('key',$1::text) WHERE id='m1'`,
+        [key],
+      );
+      await burn();
+      // burn() replaces user content; the BEFORE trigger retains the prior key.
+      await db.query(
+        `INSERT INTO "ChatBurnArchive" SELECT 'm2',"conversationID","senderID","clientMessageId",2,type,content,"createdAt","burnExpiresAt","burnDurationSec","retainUntil"+INTERVAL '1 day' FROM "ChatBurnArchive" WHERE id='m1'`,
+      );
+      expect((await db.query(sql, [[key], 'm1'])).rows).toEqual([]);
+      await db.query(`DELETE FROM "ChatBurnArchive" WHERE id='m2'`);
+      expect((await db.query(sql, [[key], 'm1'])).rows).toEqual([{ key }]);
+      await db.query(
+        `INSERT INTO "ChatMessage" (id,"conversationID",height,content) VALUES ('live','c1',2,jsonb_build_object('key',$1::text))`,
+        [key],
+      );
+      expect((await db.query(sql, [[key], 'm1'])).rows).toEqual([]);
     });
     it('rolls archive creation back together with a failed burn transaction', async () => {
       await db.query('BEGIN');

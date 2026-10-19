@@ -12,7 +12,7 @@
 ## 发布
 
 1. 先合并基础后端 [#273](https://github.com/CircleTeamHub/circle_be/pull/273)、App [#294](https://github.com/CircleTeamHub/Circle_frontend/pull/294) 和后台 [#11](https://github.com/CircleTeamHub/circle_admin_web/pull/11)。本后端 PR 基于 #273 分支。
-2. 维护窗口停止或排空全部旧后端写入、焚毁扫描和媒体清理任务，再执行 `20261019000000_read_started_burn_revision`、`20261019000100_pending_read_burn_index`、`20261019000200_burn_audit_archive` 三项迁移。第二项含 `CREATE INDEX CONCURRENTLY`，不要将整批迁移额外包进一个事务。
+2. 维护窗口停止或排空全部旧后端写入、焚毁扫描和媒体清理任务，再执行 `20261019000000_read_started_burn_revision`、`20261019000100_pending_read_burn_index`、`20261019000200_burn_audit_archive`、`20261019000300_burn_media_reference_indexes` 四项迁移。第二和第四项含 `CREATE INDEX CONCURRENTLY`，不要将整批迁移额外包进一个事务。
 3. 运行 `npx prisma generate` 并部署本后端版本，确认旧实例已全部退出。旧代码可能继续写入发送起算期限或删除应留存的媒体，不能长期混跑，也不能直接回滚到旧清理逻辑。
 4. 再发布配套 App [#296](https://github.com/CircleTeamHub/Circle_frontend/pull/296)，使首次已读后的失效事件即时拉取新的 revision，并向用户展示180天审计留存说明。
 5. 再发布后台 [#12](https://github.com/CircleTeamHub/circle_admin_web/pull/12)，统一展示普通与有权限访问的留存记录。昵称入口整理不依赖此 API。
@@ -28,3 +28,11 @@ BURN_ARCHIVE_TEST_DATABASE_URL=postgresql://localhost/circle_burn_test NODE_ENV=
 ```
 
 测试仅在数据库名包含 test 且 NODE_ENV=test 时运行，在独立 schema 建最小表，验证真实迁移触发器和实际起算 SQL，结束删掉测试 schema。不启动应用或连接现有业务数据库。
+
+## 审查修复
+
+- 私聊手动已读、清空即已读和客服自动已读共用同一事务内计时函数；自动回复同样等待对方首次已读。
+- 用户媒体链接在会话共享锁下批量核对消息，签名的绝对截止时间不晚于焚毁期限；尚未起算时最多一个焚毁窗口，避免先发出的两小时链接跨过用户侧焚毁。重复键按各自授权期限签名，不复用普通消息的长授权。
+- 管理员归档到期前检查活跃消息及其他留存归档的媒体引用，和发送路径共享对象键锁；已排队删除的对象不能被新消息重新引用。新增表达式索引支持引用检查。
+- 重复焚毁扫描仅处理本事务真正返回的墓碑，不删除其他实例保留的附件；未获得清理租约的实例记录 skipped，不刷新成功心跳。
+- 审计读取失败不删除恢复密文；全局清空先于焚毁扫描时保留待焚毁消息的 AUDIT 副本，撤回和普通非焚毁消息仍遵循原清理规则。

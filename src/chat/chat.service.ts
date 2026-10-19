@@ -1,3 +1,4 @@
+import { startReadBurnTimers } from './read-burn-timers';
 import { assertEncryptedTextSend } from 'src/e2ee/e2ee-proof';
 import {
   BadRequestException,
@@ -830,6 +831,12 @@ export class ChatService {
           );
         }
 
+        await this.media.lockOwnedKeysForSend(
+          tx,
+          effectivePayload.type,
+          effectivePayload.content as Record<string, unknown>,
+          copiedKeys,
+        );
         const senderBurn = await tx.chatMember.findUnique({
           where: {
             conversationID_userID: {
@@ -1256,21 +1263,15 @@ export class ChatService {
       // Exclude the author and history preceding this reader's membership.
       // IS NULL makes repeated receipts and multiple devices unable to restart
       // a timer. Evaluate even on a repeated watermark, to recover a missed ack.
-      const started = await tx.$queryRaw<Array<{ revision: number }>>`
-        WITH started AS (UPDATE "ChatMessage" m
-        SET "burnExpiresAt" = clock_timestamp() + m."burnDurationSec" * INTERVAL '1 second'
-        WHERE m."conversationID" = ${conversationId}
-          AND m."height" <= ${clamped}
-          AND m."height" > ${Math.max(seat.clearedBeforeHeight ?? 0, conversation.clearedBeforeHeight)}
-          AND m."senderID" <> ${userId}
-          AND m."createdAt" >= ${seat.joinedAt}
-          AND m."burnDurationSec" > 0 AND m."burnExpiresAt" IS NULL
-          AND m."deleted" = false AND m."revokedAt" IS NULL
-        RETURNING m."revision")
-        SELECT COALESCE(MAX("revision"), 0)::integer AS revision FROM started`;
+      const revision = await startReadBurnTimers(
+        tx,
+        conversationId,
+        userId,
+        clamped,
+      );
       return {
         advanced: updated.count > 0,
-        revision: Math.max(0, ...started.map((row) => row.revision)),
+        revision,
       };
     });
     if (result.revision > 0) {
@@ -4776,154 +4777,178 @@ export class ChatService {
         errorCode: ChatErrorCode.InvalidPayload,
       });
     }
-    const { watermark, isGlobalClear, advancedReaders, notice, isGroup } =
-      await this.prisma.$transaction(async (tx) => {
-        // 与发消息/进群/退群保持同一顺序:会话行锁永远最先。
-        // 锁后的会话和座位才是授权与目标集的权威快照。
-        const locked = await tx.$queryRaw<
-          Array<{
-            id: string;
-            type: string;
-            circleID: string | null;
-            ownerID: string | null;
-            nextHeight: number;
-          }>
-        >`SELECT "id", "type", "circleID", "ownerID", "nextHeight"
+    const {
+      watermark,
+      isGlobalClear,
+      advancedReaders,
+      notice,
+      isGroup,
+      burnRevision,
+    } = await this.prisma.$transaction(async (tx) => {
+      // 与发消息/进群/退群保持同一顺序:会话行锁永远最先。
+      // 锁后的会话和座位才是授权与目标集的权威快照。
+      const locked = await tx.$queryRaw<
+        Array<{
+          id: string;
+          type: string;
+          circleID: string | null;
+          ownerID: string | null;
+          nextHeight: number;
+        }>
+      >`SELECT "id", "type", "circleID", "ownerID", "nextHeight"
           FROM "ChatConversation"
           WHERE "id" = ${conversationId} FOR UPDATE`;
-        if (locked.length === 0) {
-          throw new ForbiddenException({
-            message: '不是会话成员',
-            errorCode: ChatErrorCode.NotMember,
-          });
-        }
-        const conversation = locked[0];
-        const actorSeat = await tx.chatMember.findUnique({
-          where: {
-            conversationID_userID: {
-              conversationID: conversationId,
-              userID: userId,
-            },
-          },
-          select: { leftAt: true, role: true },
+      if (locked.length === 0) {
+        throw new ForbiddenException({
+          message: '不是会话成员',
+          errorCode: ChatErrorCode.NotMember,
         });
-        if (!actorSeat || actorSeat.leftAt) {
+      }
+      const conversation = locked[0];
+      const actorSeat = await tx.chatMember.findUnique({
+        where: {
+          conversationID_userID: {
+            conversationID: conversationId,
+            userID: userId,
+          },
+        },
+        select: { leftAt: true, role: true },
+      });
+      if (!actorSeat || actorSeat.leftAt) {
+        throw new ForbiddenException({
+          message: '不是会话成员',
+          errorCode: ChatErrorCode.NotMember,
+        });
+      }
+      const globalClear =
+        forEveryone &&
+        (conversation.type === 'DIRECT' || conversation.type === 'GROUP');
+      if (globalClear && conversation.type === 'GROUP') {
+        // 独立群聊:群主或管理员(管理员标记在锁后的座位行上,与圈子群的
+        // 圈主/管理员同一档);圈子群:下面按 CircleMember 判。
+        let authorized =
+          conversation.ownerID === userId || actorSeat.role === 'ADMIN';
+        if (conversation.circleID) {
+          // GroupService 的降权/移除/退群也持有这把成员锁。会话锁先拿,
+          // 再等成员锁,确保授权读取发生在已提交的成员变更之后。
+          await this.circleMemberLock.lock(tx, conversation.circleID, [userId]);
+          const circleMember = await tx.circleMember.findUnique({
+            where: {
+              userID_circleID: {
+                userID: userId,
+                circleID: conversation.circleID,
+              },
+            },
+            select: { role: true, status: true },
+          });
+          authorized =
+            circleMember?.status === 'ACTIVE' &&
+            (circleMember.role === 'OWNER' || circleMember.role === 'ADMIN');
+        }
+        if (!authorized) {
           throw new ForbiddenException({
-            message: '不是会话成员',
-            errorCode: ChatErrorCode.NotMember,
+            message: '仅群主或管理员可清空全群记录',
+            errorCode: GroupErrorCode.ManagerOnly,
           });
         }
-        const globalClear =
-          forEveryone &&
-          (conversation.type === 'DIRECT' || conversation.type === 'GROUP');
-        if (globalClear && conversation.type === 'GROUP') {
-          // 独立群聊:群主或管理员(管理员标记在锁后的座位行上,与圈子群的
-          // 圈主/管理员同一档);圈子群:下面按 CircleMember 判。
-          let authorized =
-            conversation.ownerID === userId || actorSeat.role === 'ADMIN';
-          if (conversation.circleID) {
-            // GroupService 的降权/移除/退群也持有这把成员锁。会话锁先拿,
-            // 再等成员锁,确保授权读取发生在已提交的成员变更之后。
-            await this.circleMemberLock.lock(tx, conversation.circleID, [
-              userId,
-            ]);
-            const circleMember = await tx.circleMember.findUnique({
-              where: {
-                userID_circleID: {
-                  userID: userId,
-                  circleID: conversation.circleID,
-                },
-              },
-              select: { role: true, status: true },
-            });
-            authorized =
-              circleMember?.status === 'ACTIVE' &&
-              (circleMember.role === 'OWNER' || circleMember.role === 'ADMIN');
-          }
-          if (!authorized) {
-            throw new ForbiddenException({
-              message: '仅群主或管理员可清空全群记录',
-              errorCode: GroupErrorCode.ManagerOnly,
-            });
-          }
+      }
+      const currentTop = conversation.nextHeight;
+      const clearThrough = Math.min(currentTop, targetHeight ?? currentTop);
+      if (clearThrough <= 0) {
+        return {
+          watermark: 0,
+          burnRevision: 0,
+          isGlobalClear: globalClear,
+          advancedReaders: [],
+          notice: null,
+          isGroup: conversation.type === 'GROUP',
+        };
+      }
+      const targetUserIds = globalClear
+        ? (
+            await tx.chatMember.findMany({
+              where: { conversationID: conversationId, leftAt: null },
+              select: { userID: true },
+            })
+          ).map((target) => target.userID)
+        : [userId];
+      let burnRevision = 0;
+      if (conversation.type === 'DIRECT') {
+        for (const reader of targetUserIds) {
+          burnRevision = Math.max(
+            burnRevision,
+            await startReadBurnTimers(tx, conversationId, reader, clearThrough),
+          );
         }
-        const currentTop = conversation.nextHeight;
-        const clearThrough = Math.min(currentTop, targetHeight ?? currentTop);
-        if (clearThrough <= 0) {
-          return {
-            watermark: 0,
-            isGlobalClear: globalClear,
-            advancedReaders: [],
-            notice: null,
-            isGroup: conversation.type === 'GROUP',
-          };
-        }
-        const targetUserIds = globalClear
-          ? (
-              await tx.chatMember.findMany({
-                where: { conversationID: conversationId, leftAt: null },
-                select: { userID: true },
-              })
-            ).map((target) => target.userID)
-          : [userId];
-        const cleared = await tx.chatMember.updateMany({
+      }
+      const cleared = await tx.chatMember.updateMany({
+        where: {
+          conversationID: conversationId,
+          userID: { in: targetUserIds },
+          ...(globalClear ? { leftAt: null } : {}),
+          clearedBeforeHeight: { lt: clearThrough },
+        },
+        data: { clearedBeforeHeight: clearThrough },
+      });
+      const readers = await tx.chatMember.updateManyAndReturn({
+        where: {
+          conversationID: conversationId,
+          userID: { in: targetUserIds },
+          ...(globalClear ? { leftAt: null } : {}),
+          lastReadHeight: { lt: clearThrough },
+        },
+        data: { lastReadHeight: clearThrough },
+        select: { userID: true },
+      });
+      // 全群清空要落一条会话级水位，不能只推进当时在座的人：新座位建出来是
+      // schema 默认的 0，清空之后拉一个新号进群就能把「已清空」的历史全部读
+      // 回来。入座路径继承这一列，读路径再按 max(座位, 会话) 兜底。
+      // 只前进不后退 —— 用 targetHeight 指定一个更低的水位不该把已经藏起来
+      // 的消息放回去。
+      if (globalClear) {
+        await tx.chatConversation.updateMany({
           where: {
-            conversationID: conversationId,
-            userID: { in: targetUserIds },
-            ...(globalClear ? { leftAt: null } : {}),
+            id: conversationId,
             clearedBeforeHeight: { lt: clearThrough },
           },
           data: { clearedBeforeHeight: clearThrough },
         });
-        const readers = await tx.chatMember.updateManyAndReturn({
-          where: {
-            conversationID: conversationId,
-            userID: { in: targetUserIds },
-            ...(globalClear ? { leftAt: null } : {}),
-            lastReadHeight: { lt: clearThrough },
-          },
-          data: { lastReadHeight: clearThrough },
-          select: { userID: true },
+      }
+      const changed = (cleared?.count ?? 0) > 0 || readers.length > 0;
+      const auditMessage =
+        globalClear && changed
+          ? await this.systemMessage.insertSystemMessageAfterLockedConversationInTx(
+              tx,
+              conversationId,
+              currentTop,
+              { kind: 'history-cleared', actorId: userId },
+            )
+          : null;
+      if (auditMessage && conversation.type === 'GROUP') {
+        await this.groupEvents.recordInTx(tx, conversationId, {
+          kind: 'history-cleared',
+          actorId: userId,
         });
-        // 全群清空要落一条会话级水位，不能只推进当时在座的人：新座位建出来是
-        // schema 默认的 0，清空之后拉一个新号进群就能把「已清空」的历史全部读
-        // 回来。入座路径继承这一列，读路径再按 max(座位, 会话) 兜底。
-        // 只前进不后退 —— 用 targetHeight 指定一个更低的水位不该把已经藏起来
-        // 的消息放回去。
-        if (globalClear) {
-          await tx.chatConversation.updateMany({
-            where: {
-              id: conversationId,
-              clearedBeforeHeight: { lt: clearThrough },
-            },
-            data: { clearedBeforeHeight: clearThrough },
-          });
-        }
-        const changed = (cleared?.count ?? 0) > 0 || readers.length > 0;
-        const auditMessage =
-          globalClear && changed
-            ? await this.systemMessage.insertSystemMessageAfterLockedConversationInTx(
-                tx,
-                conversationId,
-                currentTop,
-                { kind: 'history-cleared', actorId: userId },
-              )
-            : null;
-        if (auditMessage && conversation.type === 'GROUP') {
-          await this.groupEvents.recordInTx(tx, conversationId, {
-            kind: 'history-cleared',
-            actorId: userId,
-          });
-        }
-        return {
-          isGroup: conversation.type === 'GROUP',
-          watermark: clearThrough,
-          isGlobalClear: globalClear,
-          advancedReaders: readers,
-          notice: auditMessage,
-        };
-      });
+      }
+      return {
+        isGroup: conversation.type === 'GROUP',
+        watermark: clearThrough,
+        burnRevision,
+        isGlobalClear: globalClear,
+        advancedReaders: readers,
+        notice: auditMessage,
+      };
+    });
     if (watermark <= 0) return { clearedBeforeHeight: 0 };
+    if (burnRevision) {
+      try {
+        await this.broadcast.emitBurnStarted(conversationId, burnRevision);
+      } catch (error) {
+        this.logger.warn(
+          `clear burn-start delivery failed: ${error instanceof Error ? error.name : 'unknown error'}`,
+        );
+      }
+    }
     // 清空即已读 —— 但这条路径绕开了网关的 chat:read 广播,于是对端的已读回执
     // 和本账号其他设备的未读红点会一直停在旧水位。既然语义上就是「读到当前最高」,
     // 那就播出和 markRead 完全一样的事件。

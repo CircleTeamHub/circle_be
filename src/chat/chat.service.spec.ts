@@ -69,6 +69,7 @@ describe('ChatService', () => {
   const sensitiveWords = { check: jest.fn() };
   const circleSync = { ensureCircleConversation: jest.fn() };
   const media = {
+    lockOwnedKeysForSend: jest.fn().mockResolvedValue(undefined),
     attachMediaUrls: jest.fn().mockResolvedValue(undefined),
     copyForForward: jest.fn(),
     deleteObjects: jest.fn().mockResolvedValue(undefined),
@@ -4800,6 +4801,8 @@ describe('ChatService', () => {
             nextHeight: 50,
           },
         ])
+        .mockResolvedValueOnce([{ revision: 0 }])
+        .mockResolvedValueOnce([{ revision: 0 }])
         .mockResolvedValueOnce([
           {
             id: 'conv-1',
@@ -4808,7 +4811,9 @@ describe('ChatService', () => {
             ownerID: null,
             nextHeight: 60,
           },
-        ]);
+        ])
+        .mockResolvedValueOnce([{ revision: 0 }])
+        .mockResolvedValueOnce([{ revision: 0 }]);
       prisma.chatMember.findUnique.mockResolvedValue(
         membership({
           conversation: {
@@ -6099,6 +6104,26 @@ describe('ChatService', () => {
   });
 
   describe('清空即已读要广播', () => {
+    it('starts incoming direct burn timers before advancing the personal clear floor', async () => {
+      prisma.$queryRaw.mockImplementation(async (parts) =>
+        parts.join(' ').includes('WITH started')
+          ? [{ revision: 31 }]
+          : [{ id: 'conv-1', type: 'DIRECT', nextHeight: 9 }],
+      );
+      prisma.chatMember.findUnique.mockResolvedValue(membership());
+      prisma.chatMember.updateMany.mockResolvedValue({ count: 1 });
+      prisma.chatMember.updateManyAndReturn.mockResolvedValue([
+        { userID: 'u1' },
+      ]);
+      await service.clearHistory('u1', 'conv-1');
+      expect(prisma.$queryRaw.mock.calls[1][0].join(' ')).toContain(
+        '"burnExpiresAt" IS NULL',
+      );
+      expect(prisma.$queryRaw.mock.invocationCallOrder[1]).toBeLessThan(
+        prisma.chatMember.updateMany.mock.invocationCallOrder[0],
+      );
+      expect(broadcast.emitBurnStarted).toHaveBeenCalledWith('conv-1', 31);
+    });
     it('emits the same read event markRead would', async () => {
       prisma.chatMember.findUnique.mockResolvedValue(membership());
       prisma.chatMessage.aggregate.mockResolvedValue({ _max: { height: 9 } });

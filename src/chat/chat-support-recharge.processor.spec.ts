@@ -38,6 +38,8 @@ function textMessageHarness(
   } = {},
 ) {
   const prisma = {
+    $transaction: jest.fn(async (fn) => fn(prisma)),
+    $queryRaw: jest.fn().mockResolvedValue([]),
     supportRechargeJob: {
       findUnique: jest.fn().mockResolvedValue({ id: 'job-text' }),
       updateMany: jest.fn().mockResolvedValue({ count: 1 }),
@@ -91,7 +93,10 @@ function textMessageHarness(
   };
   const messages = { insertServerMessage: jest.fn().mockResolvedValue({}) };
   const upload = { copyObjectToKey: jest.fn().mockResolvedValue(undefined) };
-  const broadcast = { emitRead: jest.fn() };
+  const broadcast = {
+    emitRead: jest.fn(),
+    emitBurnStarted: jest.fn().mockResolvedValue(undefined),
+  };
   const processor = new ChatSupportRechargeProcessor(
     prisma as never,
     messages as never,
@@ -102,6 +107,21 @@ function textMessageHarness(
 }
 
 describe('ChatSupportRechargeProcessor payment evidence', () => {
+  it('starts direct burn timers transactionally when automation marks an incoming message read', async () => {
+    const { processor, prisma, broadcast } = textMessageHarness('你好');
+    prisma.$queryRaw.mockImplementation(async (parts) =>
+      parts.join(' ').includes('WITH started') ? [{ revision: 18 }] : [],
+    );
+    await processor.processMessage('message-text');
+    expect(prisma.$transaction).toHaveBeenCalled();
+    expect(broadcast.emitBurnStarted).toHaveBeenCalledWith(
+      'conversation-1',
+      18,
+    );
+    expect(prisma.$queryRaw.mock.invocationCallOrder[1]).toBeLessThan(
+      prisma.chatMember.updateMany.mock.invocationCallOrder[0],
+    );
+  });
   it('shows the short numbered menu for an unclassified message', async () => {
     const { processor, messages } = textMessageHarness('你好');
 
@@ -231,6 +251,8 @@ describe('ChatSupportRechargeProcessor payment evidence', () => {
       status: 'AWAITING_PROOF',
     };
     const prisma = {
+      $transaction: jest.fn(async (fn) => fn(prisma)),
+      $queryRaw: jest.fn().mockResolvedValue([]),
       supportRechargeJob: {
         findUnique: jest.fn().mockResolvedValue({ id: 'job-1' }),
         updateMany: jest.fn().mockResolvedValue({ count: 1 }),
@@ -273,7 +295,10 @@ describe('ChatSupportRechargeProcessor payment evidence', () => {
     };
     const messages = { insertServerMessage: jest.fn().mockResolvedValue({}) };
     const upload = { copyObjectToKey: jest.fn().mockResolvedValue(undefined) };
-    const broadcast = { emitRead: jest.fn() };
+    const broadcast = {
+      emitRead: jest.fn(),
+      emitBurnStarted: jest.fn().mockResolvedValue(undefined),
+    };
     const processor = new ChatSupportRechargeProcessor(
       prisma as never,
       messages as never,
@@ -316,6 +341,8 @@ describe('ChatSupportRechargeProcessor payment evidence', () => {
 
   it('copies the configured QR into a message-specific object before sending', async () => {
     const prisma = {
+      $transaction: jest.fn(async (fn) => fn(prisma)),
+      $queryRaw: jest.fn().mockResolvedValue([]),
       supportRechargeJob: {
         findUnique: jest.fn().mockResolvedValue({ id: 'job-2' }),
         updateMany: jest.fn().mockResolvedValue({ count: 1 }),
@@ -404,6 +431,8 @@ describe('ChatSupportRechargeProcessor payment evidence', () => {
 
   it('does not consume or mark screenshots read while a human owns the conversation', async () => {
     const prisma = {
+      $transaction: jest.fn(async (fn) => fn(prisma)),
+      $queryRaw: jest.fn().mockResolvedValue([]),
       supportRechargeJob: {
         findUnique: jest.fn().mockResolvedValue({ id: 'job-human-image' }),
         updateMany: jest.fn().mockResolvedValue({ count: 1 }),
@@ -441,7 +470,10 @@ describe('ChatSupportRechargeProcessor payment evidence', () => {
     };
     const messages = { insertServerMessage: jest.fn() };
     const upload = { copyObjectToKey: jest.fn() };
-    const broadcast = { emitRead: jest.fn() };
+    const broadcast = {
+      emitRead: jest.fn(),
+      emitBurnStarted: jest.fn().mockResolvedValue(undefined),
+    };
     const processor = new ChatSupportRechargeProcessor(
       prisma as never,
       messages as never,

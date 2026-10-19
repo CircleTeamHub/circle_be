@@ -190,21 +190,9 @@ export class ChatBurnSweeperService {
         take: SWEEP_BATCH,
       });
       if (rows.length === 0) return;
-      const allMediaKeys = rows
-        .filter((row) => MEDIA_MESSAGE_TYPES.includes(row.type))
-        .flatMap((row) => {
-          const content = (row.content ?? {}) as Record<string, unknown>;
-          return ['key', 'thumbKey']
-            .map((field) => content[field])
-            .filter((v): v is string => typeof v === 'string' && v.length > 0);
-        });
       const messageIds = rows.map((row) => row.id);
-      let noteImportKeys = allMediaKeys.filter((key) =>
-        key.includes(`/${CHAT_NOTE_IMPORT_SEGMENT}`),
-      );
-      let ownedMediaKeys = allMediaKeys.filter(
-        (key) => !key.includes(`/${CHAT_NOTE_IMPORT_SEGMENT}`),
-      );
+      let noteImportKeys: string[] = [];
+      let ownedMediaKeys: string[] = [];
       if (!lease.isCurrent()) return;
       const burned = await this.prisma.$transaction(async (tx) => {
         // 会话行锁先拿:消息行上的触发器要更新会话计数器。先锁一批消息行再等会话行,
@@ -233,6 +221,24 @@ export class ChatBurnSweeperService {
           },
           select: { id: true, revision: true },
         });
+        const burnedIds = new Set(tombstones.map((row) => row.id));
+        const allMediaKeys = rows
+          .filter(
+            (row) =>
+              burnedIds.has(row.id) && MEDIA_MESSAGE_TYPES.includes(row.type),
+          )
+          .flatMap((row) => {
+            const content = (row.content ?? {}) as Record<string, unknown>;
+            return ['key', 'thumbKey', 'coverKey']
+              .map((field) => content[field])
+              .filter((key): key is string => typeof key === 'string');
+          });
+        ownedMediaKeys = allMediaKeys.filter(
+          (key) => !key.includes(`/${CHAT_NOTE_IMPORT_SEGMENT}`),
+        );
+        noteImportKeys = allMediaKeys.filter((key) =>
+          key.includes(`/${CHAT_NOTE_IMPORT_SEGMENT}`),
+        );
         const retained = await tx.chatBurnArchive.findMany({
           where: {
             id: { in: tombstones.map((row) => row.id) },
@@ -254,7 +260,7 @@ export class ChatBurnSweeperService {
         await this.media.queueDeletions(tx, ownedMediaKeys);
         await this.media.releaseNoteImportReferences(
           tx,
-          messageIds.filter((id) => !retainedIds.has(id)),
+          tombstones.map((row) => row.id).filter((id) => !retainedIds.has(id)),
           noteImportKeys,
         );
         return tombstones;

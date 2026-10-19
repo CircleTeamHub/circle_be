@@ -1058,27 +1058,25 @@ export class E2eeService {
             : null;
         const body = retained?.content ?? row.message.content;
         const content = body as { envelope?: EncryptionMessageRefDto };
-        if (
-          content.envelope &&
-          (await this.visibleArchiveMessage(
-            tx,
-            userID,
-            purpose,
-            content.envelope,
-          ))
-        )
+        const visible = content.envelope
+          ? await this.visibleArchiveMessage(
+              tx,
+              userID,
+              purpose,
+              content.envelope,
+            )
+          : null;
+        if (visible)
           items.push({
             id: row.id,
             messageID: row.messageID,
-            expiresAt:
-              (
-                row.message as { burnExpiresAt?: Date }
-              ).burnExpiresAt?.toISOString() ?? null,
-            ref: this.ref(content.envelope),
+            expiresAt: visible.burnExpiresAt?.toISOString() ?? null,
+            ref: this.ref(content.envelope!),
             ciphertext: row.ciphertext,
             content: body,
           });
-        else await tx.e2eeArchive.delete({ where: { id: row.id } });
+        // Visibility can fail because the caller lost a permission. Retention
+        // triggers and cleanup own deletion; an unauthorized read never does.
       }
       return {
         items,

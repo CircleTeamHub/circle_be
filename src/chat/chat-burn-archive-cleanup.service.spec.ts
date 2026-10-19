@@ -1,3 +1,4 @@
+import { jobMetrics } from '../metrics/job-metrics';
 import { ChatBurnArchiveCleanupService } from './chat-burn-archive-cleanup.service';
 
 describe('180-day burn archive cleanup', () => {
@@ -12,6 +13,7 @@ describe('180-day burn archive cleanup', () => {
   };
   const media: any = {
     queueDeletions: jest.fn(),
+    unreferencedArchiveMedia: jest.fn(),
     releaseNoteImportReferences: jest.fn(),
     drainPendingDeletions: jest.fn(),
   };
@@ -23,6 +25,9 @@ describe('180-day burn archive cleanup', () => {
   const service = new ChatBurnArchiveCleanupService(prisma, media, redis);
   beforeEach(() => {
     jest.clearAllMocks();
+    media.unreferencedArchiveMedia.mockImplementation(
+      async (_tx, keys) => keys,
+    );
     redis.tryAcquireLease.mockResolvedValue(undefined);
     prisma.$transaction = jest.fn(async (fn) => fn(prisma));
     prisma.chatBurnArchive.findMany.mockResolvedValue([
@@ -33,6 +38,31 @@ describe('180-day burn archive cleanup', () => {
       retainUntil: new Date(0),
       content: { key: 'chat/u1/a.jpg' },
     });
+  });
+  it('does not physically delete a key still referenced by a later archive or live message', async () => {
+    media.unreferencedArchiveMedia.mockResolvedValue([]);
+    await service.sweep();
+    expect(media.queueDeletions).toHaveBeenCalledWith(prisma, []);
+    expect(prisma.chatBurnArchive.delete).toHaveBeenCalledWith({
+      where: { id: 'm1' },
+    });
+  });
+  it('records a held-lease invocation as skipped rather than refreshing success', async () => {
+    redis.tryAcquireLease.mockResolvedValue(null);
+    const run = jest.spyOn(jobMetrics, 'recordRun');
+    try {
+      await service.sweep();
+      expect(run).toHaveBeenCalledWith(
+        'chat_burn_archive_cleanup',
+        'skipped',
+        expect.any(Number),
+        undefined,
+      );
+      expect(prisma.chatBurnArchive.findMany).not.toHaveBeenCalled();
+      expect(media.drainPendingDeletions).not.toHaveBeenCalled();
+    } finally {
+      run.mockRestore();
+    }
   });
   it('durably schedules attachment cleanup before erasing expired snapshots and audit recovery', async () => {
     await service.sweep();
