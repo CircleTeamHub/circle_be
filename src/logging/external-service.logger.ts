@@ -53,8 +53,7 @@ export function logExternalCallFailure(
   try {
     const requestContext = getRequestContext();
     const error = sanitizeLogValue(payload.error) as
-      | { name?: string }
-      | undefined;
+      { name?: string } | undefined;
     logger.warn(
       {
         ...(sanitizeLogValue({

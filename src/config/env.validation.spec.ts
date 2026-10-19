@@ -702,3 +702,16 @@ describe('JPush credentials', () => {
     expect(value.JPUSH_APNS_PRODUCTION).toBe(true);
   });
 });
+
+it.each([undefined, ''])('encryption requires an audit root (%s)', (root) => {
+  const env = {
+    NODE_ENV: 'development',
+    DATABASE_URL: 'postgresql://user:pass@localhost:5432/db',
+    SECRET: 'test-secret',
+    E2EE_TEXT_ENABLED: 'true',
+    E2EE_AUDIT_ROOT_PUBLIC_KEY: root,
+  };
+  expect(createEnvValidationSchema(env).validate(env).error?.message).toContain(
+    'E2EE_AUDIT_ROOT_PUBLIC_KEY',
+  );
+});

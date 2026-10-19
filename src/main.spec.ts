@@ -1,11 +1,14 @@
 import {
   buildNestFactoryOptions,
+  configureHttpBodyParser,
   createGracefulShutdownHandler,
   resolveAppPort,
   resolveCorsOriginChecker,
   runBootstrap,
 } from './main';
 import {
+  Body,
+  Post,
   Controller,
   Get,
   INestApplication,
@@ -19,6 +22,10 @@ import request from 'supertest';
 
 @Controller('cors-probe')
 class CorsProbeController {
+  @Post()
+  body(@Body() body: { data: string }) {
+    return { length: body.data.length };
+  }
   @Get()
   probe(@Res({ passthrough: true }) response: Response) {
     response.setHeader('X-Request-Id', 'server-request-id');
@@ -114,6 +121,7 @@ describe('production HTTP CORS integration', () => {
       ...buildNestFactoryOptions(),
       logger: false,
     });
+    configureHttpBodyParser(app as any);
     await app.listen(0, '127.0.0.1');
   });
 
@@ -399,5 +407,29 @@ describe('runBootstrap', () => {
     expect(sinks.exit).toHaveBeenCalledWith(1);
     expect(jest.getTimerCount()).toBe(0);
     jest.useRealTimers();
+  });
+});
+
+describe('encryption JSON payload size', () => {
+  it('accepts contract-sized payloads and rejects bodies above the explicit bound', async () => {
+    const app = await NestFactory.create(CorsProbeModule, {
+      rawBody: true,
+      logger: false,
+    });
+    configureHttpBodyParser(app as any);
+    await app.init();
+    try {
+      await request(app.getHttpServer())
+        .post('/cors-probe')
+        .send({ data: 'a'.repeat(1_000_000) })
+        .expect(201)
+        .expect({ length: 1_000_000 });
+      await request(app.getHttpServer())
+        .post('/cors-probe')
+        .send({ data: 'a'.repeat(2_100_000) })
+        .expect(413);
+    } finally {
+      await app.close();
+    }
   });
 });

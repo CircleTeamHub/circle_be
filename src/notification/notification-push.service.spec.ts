@@ -53,8 +53,15 @@ describe('NotificationPushService (#88 per-token delivery)', () => {
 
   describe('composeMessage', () => {
     it('uses the announcement title in phone push notifications', () => {
-      const result = service.composeMessage('u', {id:'n',type:'SYSTEM',title:'维护通知',content:'公告正文'} as any);
-      expect(result).toEqual(expect.objectContaining({title:'维护通知',body:'公告正文'}));
+      const result = service.composeMessage('u', {
+        id: 'n',
+        type: 'SYSTEM',
+        title: '维护通知',
+        content: '公告正文',
+      } as any);
+      expect(result).toEqual(
+        expect.objectContaining({ title: '维护通知', body: '公告正文' }),
+      );
     });
     it.each([1020, 1021, 1022, 1023])(
       'truncates emoji at a %i-byte boundary without splitting code points',

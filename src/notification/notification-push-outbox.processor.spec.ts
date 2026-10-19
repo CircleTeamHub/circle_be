@@ -88,7 +88,7 @@ function buildHarness({
       .fn()
       .mockResolvedValue(jobs.map((job: { id: string }) => ({ id: job.id }))),
     notificationPushOutbox: {
-      findFirst: jest.fn().mockResolvedValue({id:'active'}),
+      findFirst: jest.fn().mockResolvedValue({ id: 'active' }),
       findMany: jest.fn().mockResolvedValue(jobs),
       updateMany: jest.fn().mockResolvedValue({ count: 1 }),
     },
@@ -128,15 +128,28 @@ function buildHarness({
 }
 
 describe('NotificationPushOutboxProcessor (#88 per-token)', () => {
-  it('does not send an announcement cancelled after the job was claimed',async()=>{
-    const {prisma,push,processor}=buildHarness({
-      jobs:[{id:'job-1',notificationID:'notification-1',attempts:0,payload:{title:'T',body:'B',data:{}},notification:{...notification,systemAnnouncementID:'a'}}],
-      pendingDeliveries:[{id:'delivery-1',token:'tok-a'}],outcomes:[],
+  it('does not send an announcement cancelled after the job was claimed', async () => {
+    const { prisma, push, processor } = buildHarness({
+      jobs: [
+        {
+          id: 'job-1',
+          notificationID: 'notification-1',
+          attempts: 0,
+          payload: { title: 'T', body: 'B', data: {} },
+          notification: { ...notification, systemAnnouncementID: 'a' },
+        },
+      ],
+      pendingDeliveries: [{ id: 'delivery-1', token: 'tok-a' }],
+      outcomes: [],
     });
     prisma.notificationPushOutbox.findFirst.mockResolvedValue(null);
     await processor.processPending();
     expect(push.sendToTokens).not.toHaveBeenCalled();
-    expect(prisma.notificationPushDelivery.updateMany).toHaveBeenCalledWith(expect.objectContaining({data:{status:'TERMINAL',lastError:'ANNOUNCEMENT_DELETED'}}));
+    expect(prisma.notificationPushDelivery.updateMany).toHaveBeenCalledWith(
+      expect.objectContaining({
+        data: { status: 'TERMINAL', lastError: 'ANNOUNCEMENT_DELETED' },
+      }),
+    );
   });
 
   it('keeps an existing JPush delivery retryable when credentials are absent', async () => {

@@ -56,8 +56,7 @@ export type FancyNumberPurchaseResult = {
 };
 
 type FancyNumberTarget =
-  | { kind: 'inventory'; id: string }
-  | { kind: 'custom'; value: string };
+  { kind: 'inventory'; id: string } | { kind: 'custom'; value: string };
 
 @Injectable()
 export class FancyNumberService {

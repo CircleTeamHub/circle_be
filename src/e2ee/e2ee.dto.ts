@@ -160,7 +160,10 @@ export class EncryptionArchiveWriteDto extends EncryptionDeviceActionDto {
 }
 export class EncryptionArchiveReadDto extends EncryptionDeviceActionDto {
   @ApiProperty() @IsUUID() recoveryId: string;
-  @ApiProperty() @IsString() @Matches(/^(?:[a-f0-9]{64})?$/) after: string;
+  @ApiProperty()
+  @IsString()
+  @Matches(/^(?:[a-f0-9]{64}|v1:[0-9]{20})?$/)
+  after: string;
   @ApiPropertyOptional()
   @IsOptional()
   @IsString()

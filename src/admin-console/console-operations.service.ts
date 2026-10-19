@@ -459,7 +459,7 @@ export class ConsoleOperationsService {
           await tx.notification.create({
             data: {
               toUserID: userID,
-              fromUserID: actorID,
+              fromUserID: userID,
               type: 'SYSTEM',
               content: announcement.content,
               systemAnnouncementID: announcement.id,

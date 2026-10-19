@@ -713,17 +713,14 @@ export class NoteSectionMediaResponseDto {
   @ApiProperty() objectKey: string;
   @ApiPropertyOptional() url?: string;
   @ApiPropertyOptional({ type: String, nullable: true }) mimeType?:
-    | string
-    | null;
+    string | null;
   @ApiPropertyOptional({ type: Number, nullable: true }) size?: number | null;
   @ApiPropertyOptional({ type: Number, nullable: true }) width?: number | null;
   @ApiPropertyOptional({ type: Number, nullable: true }) height?: number | null;
   @ApiPropertyOptional({ type: Number, nullable: true }) durationMs?:
-    | number
-    | null;
+    number | null;
   @ApiPropertyOptional({ type: String, nullable: true }) posterUrl?:
-    | string
-    | null;
+    string | null;
   @ApiProperty() sortOrder: number;
 }
 
@@ -736,8 +733,7 @@ export class NoteContactCardResponseDto {
   @ApiProperty() id: string;
   @ApiProperty() name: string;
   @ApiPropertyOptional({ type: String, nullable: true }) faceURL?:
-    | string
-    | null;
+    string | null;
 }
 
 export class NoteGroupCardResponseDto extends NoteContactCardResponseDto {
@@ -789,11 +785,9 @@ export class NoteSectionsResponseDto {
 
 export class NoteDraftTextSectionResponseDto {
   @ApiPropertyOptional({ type: String, nullable: true }) content?:
-    | string
-    | null;
+    string | null;
   @ApiPropertyOptional({ type: [Object], nullable: true }) contentJson?:
-    | Record<string, unknown>[]
-    | null;
+    Record<string, unknown>[] | null;
 }
 
 /** Drafts preserve omitted sections and fields rather than filling published defaults. */
@@ -897,8 +891,7 @@ export class NoteDraftSummaryDto {
 export class NoteDraftDto extends NoteDraftSummaryDto {
   @ApiPropertyOptional() content: string | null;
   @ApiPropertyOptional({ type: [Object], nullable: true }) contentJson:
-    | Record<string, unknown>[]
-    | null;
+    Record<string, unknown>[] | null;
   @ApiPropertyOptional({ type: NoteDraftSectionsResponseDto, nullable: true })
   sections: NoteDraftSectionsResponseDto | null;
   @ApiProperty({ type: [String] }) groupIds: string[];
@@ -908,8 +901,7 @@ export class NoteDraftDto extends NoteDraftSummaryDto {
 export class NoteDetailDto extends NoteSummaryDto {
   @ApiPropertyOptional() content: string | null;
   @ApiPropertyOptional({ type: [Object] }) contentJson?:
-    | Record<string, unknown>[]
-    | null;
+    Record<string, unknown>[] | null;
   @ApiProperty({ type: [NoteMediaDto] }) media: NoteMediaDto[];
   @ApiProperty({ type: NoteSectionsResponseDto })
   sections: NoteSectionsResponseDto;

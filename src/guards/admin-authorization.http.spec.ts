@@ -43,12 +43,12 @@ describe('administrator HTTP authorization boundaries', () => {
   const audit = jest.fn();
   const prisma: any = {
     user: {
-      update:jest.fn(),
+      update: jest.fn(),
       findUnique: jest.fn(({ where }) =>
         where.id === actorID ? actor : target,
       ),
     },
-    refreshToken: {updateMany:jest.fn()},
+    refreshToken: { updateMany: jest.fn() },
     adminAccess: { upsert: mutation, count: jest.fn(() => 2) },
     adminAuditLog: { create: audit },
     $executeRaw: jest.fn(),
@@ -141,28 +141,65 @@ describe('administrator HTTP authorization boundaries', () => {
     await change(token(), targetID, 3).expect(409);
     expect(mutation).not.toHaveBeenCalled();
   });
-  it.each(['SUPPORT','OPERATIONS','MODERATOR'])('role %s cannot reset administrator passwords through HTTP',async(role)=>{
-    actor.adminAccess.role=role;
-    await request(app.getHttpServer()).patch(`/admin/access/accounts/${actorID}/password`).auth(token(),{type:'bearer'}).send({newPassword:'NewPassword5678',reason:'重置密码'}).expect(403);
+  it.each(['SUPPORT', 'OPERATIONS', 'MODERATOR'])(
+    'role %s cannot reset administrator passwords through HTTP',
+    async (role) => {
+      actor.adminAccess.role = role;
+      await request(app.getHttpServer())
+        .patch(`/admin/access/accounts/${actorID}/password`)
+        .auth(token(), { type: 'bearer' })
+        .send({ newPassword: 'NewPassword5678', reason: '重置密码' })
+        .expect(403);
+    },
+  );
+  it('removes the old self-service initial-password route', async () => {
+    await request(app.getHttpServer())
+      .patch('/admin/access/me/initial-password')
+      .auth(token(), { type: 'bearer' })
+      .send({ oldPassword: 'InitialPass1234', newPassword: 'NewPassword5678' })
+      .expect(404);
   });
-  it('removes the old self-service initial-password route',async()=>{
-    await request(app.getHttpServer()).patch('/admin/access/me/initial-password').auth(token(),{type:'bearer'}).send({oldPassword:'InitialPass1234',newPassword:'NewPassword5678'}).expect(404);
+  it.each(['SUPPORT', 'OPERATIONS', 'MODERATOR'])(
+    'role %s cannot delete an administrator through HTTP',
+    async (role) => {
+      actor.adminAccess.role = role;
+      await request(app.getHttpServer())
+        .delete(`/admin/access/accounts/${targetID}`)
+        .auth(token(), { type: 'bearer' })
+        .send({ version: 4, reason: '删除账号' })
+        .expect(403);
+    },
+  );
+  it('requires a deletion reason and prevents deletion of the current account', async () => {
+    await request(app.getHttpServer())
+      .delete(`/admin/access/accounts/${targetID}`)
+      .auth(token(), { type: 'bearer' })
+      .send({ version: 4 })
+      .expect(400);
+    await request(app.getHttpServer())
+      .delete(`/admin/access/accounts/${actorID}`)
+      .auth(token(), { type: 'bearer' })
+      .send({ version: 1, reason: '删除自己' })
+      .expect(400);
   });
-  it.each(['SUPPORT','OPERATIONS','MODERATOR'])('role %s cannot delete an administrator through HTTP',async(role)=>{
-    actor.adminAccess.role=role;
-    await request(app.getHttpServer()).delete(`/admin/access/accounts/${targetID}`).auth(token(),{type:'bearer'}).send({version:4,reason:'删除账号'}).expect(403);
-  });
-  it('requires a deletion reason and prevents deletion of the current account',async()=>{
-    await request(app.getHttpServer()).delete(`/admin/access/accounts/${targetID}`).auth(token(),{type:'bearer'}).send({version:4}).expect(400);
-    await request(app.getHttpServer()).delete(`/admin/access/accounts/${actorID}`).auth(token(),{type:'bearer'}).send({version:1,reason:'删除自己'}).expect(400);
-  });
-  it.each(['SUPPORT','OPERATIONS','MODERATOR'])('role %s cannot enumerate account availability',async(role)=>{
-    actor.adminAccess.role=role;
-    await request(app.getHttpServer()).get('/admin/access/accounts/availability?accountId=admin').auth(token(),{type:'bearer'}).expect(403);
-  });
-  it('validates availability queries and rejects unauthenticated checks',async()=>{
-    await request(app.getHttpServer()).get('/admin/access/accounts/availability?accountId=admin').expect(401);
-    await request(app.getHttpServer()).get('/admin/access/accounts/availability?accountId=bad%20account').auth(token(),{type:'bearer'}).expect(400);
+  it.each(['SUPPORT', 'OPERATIONS', 'MODERATOR'])(
+    'role %s cannot enumerate account availability',
+    async (role) => {
+      actor.adminAccess.role = role;
+      await request(app.getHttpServer())
+        .get('/admin/access/accounts/availability?accountId=admin')
+        .auth(token(), { type: 'bearer' })
+        .expect(403);
+    },
+  );
+  it('validates availability queries and rejects unauthenticated checks', async () => {
+    await request(app.getHttpServer())
+      .get('/admin/access/accounts/availability?accountId=admin')
+      .expect(401);
+    await request(app.getHttpServer())
+      .get('/admin/access/accounts/availability?accountId=bad%20account')
+      .auth(token(), { type: 'bearer' })
+      .expect(400);
   });
   it('keeps an authorized change and its audit record working', async () => {
     await change().expect(200, { role: 'MODERATOR', version: 5 });
