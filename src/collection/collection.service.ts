@@ -125,7 +125,11 @@ export class CollectionService {
       rawMessageId,
     );
 
-    if (row.senderID !== userId && Boolean(conversation.burnDurationSec)) {
+    const isEphemeral =
+      (row.burnDurationSec ?? 0) > 0 ||
+      row.burnExpiresAt != null ||
+      Boolean(conversation.burnDurationSec);
+    if (row.senderID !== userId && isEphemeral) {
       throw new ForbiddenException({
         message: '阅后即焚会话中的消息不可收藏',
         errorCode: CollectionErrorCode.EphemeralForbidden,

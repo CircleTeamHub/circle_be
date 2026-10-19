@@ -195,6 +195,24 @@ describe('CollectionService', () => {
     expect(prisma.userCollection.create).not.toHaveBeenCalled();
   });
 
+  it('refuses to collect a peer message with a sender-owned burn policy', async () => {
+    chat.requireVisibleMessage.mockResolvedValue(
+      visible(
+        { senderID: 'peer-1', burnDurationSec: 60 },
+        { burnDurationSec: null },
+      ),
+    );
+
+    await expect(
+      service.create('user-1', messageCollection('msg-1')),
+    ).rejects.toMatchObject({
+      response: expect.objectContaining({
+        errorCode: 'COLLECTION_EPHEMERAL_FORBIDDEN',
+      }),
+    });
+    expect(prisma.userCollection.create).not.toHaveBeenCalled();
+  });
+
   // 与转发口径一致：自己的内容重发一次效果完全一样，拦下来不保护任何人。
   it('still collects your own message from a burn conversation', async () => {
     chat.requireVisibleMessage.mockResolvedValue(
