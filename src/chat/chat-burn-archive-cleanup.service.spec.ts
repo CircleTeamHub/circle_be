@@ -42,7 +42,7 @@ describe('180-day burn archive cleanup', () => {
   it('does not physically delete a key still referenced by a later archive or live message', async () => {
     media.unreferencedArchiveMedia.mockResolvedValue([]);
     await service.sweep();
-    expect(media.queueDeletions).toHaveBeenCalledWith(prisma, []);
+    expect(media.queueDeletions).toHaveBeenCalledWith(prisma, [], 'm1');
     expect(prisma.chatBurnArchive.delete).toHaveBeenCalledWith({
       where: { id: 'm1' },
     });
@@ -66,9 +66,11 @@ describe('180-day burn archive cleanup', () => {
   });
   it('durably schedules attachment cleanup before erasing expired snapshots and audit recovery', async () => {
     await service.sweep();
-    expect(media.queueDeletions).toHaveBeenCalledWith(prisma, [
-      'chat/u1/a.jpg',
-    ]);
+    expect(media.queueDeletions).toHaveBeenCalledWith(
+      prisma,
+      ['chat/u1/a.jpg'],
+      'm1',
+    );
     expect(media.releaseNoteImportReferences).toHaveBeenCalledWith(
       prisma,
       ['m1'],

@@ -210,13 +210,18 @@ export class ChatMediaService implements OnModuleDestroy {
   async queueDeletions(
     tx: Prisma.TransactionClient,
     keys: string[],
+    deletingArchiveId = '',
   ): Promise<void> {
     let objectKeys = [...new Set(keys)].filter(
       (key) =>
         key.startsWith(CHAT_MEDIA_KEY_PREFIX) &&
         !key.includes(`/${CHAT_NOTE_IMPORT_SEGMENT}`),
     );
-    objectKeys = await this.unreferencedArchiveMedia(tx, objectKeys, '');
+    objectKeys = await this.unreferencedArchiveMedia(
+      tx,
+      objectKeys,
+      deletingArchiveId,
+    );
     if (objectKeys.length === 0) return;
     await tx.chatMediaDeletion.createMany({
       data: objectKeys.map((objectKey) => ({

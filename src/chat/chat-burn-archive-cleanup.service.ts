@@ -51,7 +51,7 @@ export class ChatBurnArchiveCleanupService {
               keys,
               row.id,
             );
-            await this.media.queueDeletions(tx, owned);
+            await this.media.queueDeletions(tx, owned, row.id);
             await this.media.releaseNoteImportReferences(tx, [row.id], imports);
             await tx.e2eeArchive.deleteMany({
               where: { messageID: row.id, recovery: { purpose: 'AUDIT' } },
