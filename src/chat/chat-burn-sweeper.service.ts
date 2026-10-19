@@ -18,11 +18,10 @@ import {
 } from './chat.constants';
 
 /**
- * S-01 会话级阅后即焚的真删器:每分钟扫描开了焚毁的会话,把超龄消息软删
- * (deleted=true + content 清空,height 坐标保留)并删除对象存储里的媒体
- * —— 只软删不删对象等于焚毁只焚了个寂寞。
+ * 每分钟为到期消息提交用户端焚毁墓碑并清空正文。数据库触发器先生成
+ * 180天管理员归档；有归档的附件和笔记导入引用交给归档到期清理任务释放。
  *
- * 读路径同时按 burnDurationSec 过滤,盖住「已到期、尚未被扫掉」的 ≤1min 间隙,
+ * 读路径同时按 burnExpiresAt 过滤,盖住「已到期、尚未被扫掉」的 ≤1min 间隙,
  * 所以这里晚一拍无碍;单轮批量有上限,防止长会话首开焚毁时一口气删爆。
  */
 const SWEEP_BATCH = 500;
@@ -93,10 +92,12 @@ export class ChatBurnSweeperService {
       const cursor = await this.readCursor();
       const burning = await this.prisma.chatConversation.findMany({
         where: {
-          burnDurationSec: { not: null },
+          messages: {
+            some: { deleted: false, burnExpiresAt: { lte: new Date() } },
+          },
           ...(cursor ? { id: { gt: cursor } } : {}),
         },
-        select: { id: true, burnDurationSec: true, burnStartedAt: true },
+        select: { id: true },
         orderBy: { id: 'asc' },
         take: SWEEP_CONVERSATIONS_MAX,
       });
@@ -105,10 +106,8 @@ export class ChatBurnSweeperService {
           reportJobSkipped();
           return;
         }
-        const seconds = conversation.burnDurationSec;
-        if (!seconds || seconds <= 0) continue;
         try {
-          await this.sweepConversation(conversation.id, seconds, lease);
+          await this.sweepConversation(conversation.id, lease);
         } catch (error) {
           this.recordFailure('conversation', error, conversation.id);
         }
@@ -177,54 +176,23 @@ export class ChatBurnSweeperService {
 
   private async sweepConversation(
     conversationId: string,
-    seconds: number,
     lease: JobLeaseContext,
   ): Promise<void> {
     for (let round = 0; round < SWEEP_BATCHES_MAX; round += 1) {
       if (!lease.isCurrent()) return;
-      // 每一批都重读当前策略,而不是复用进入本轮时的那份。批与批之间可能过了
-      // 好几秒,期间 POST /burn 完全可能把时长改长或关掉 —— 拿旧 cutoff 接着删,
-      // 删掉的就是用户刚刚决定要留下的消息,而且不可逆。
-      const current = await this.prisma.chatConversation.findUnique({
-        where: { id: conversationId },
-        select: { burnDurationSec: true, burnStartedAt: true },
-      });
-      const live = current?.burnDurationSec ?? null;
-      if (!live || live <= 0) return;
-      if (round === 0 && live !== seconds) {
-        this.logger.log(
-          `burn duration changed mid-sweep conversation=${conversationId}`,
-        );
-      }
-      const cutoff = new Date(Date.now() - live * 1000);
       const rows = await this.prisma.chatMessage.findMany({
         where: {
           conversationID: conversationId,
           deleted: false,
-          createdAt: {
-            ...(current?.burnStartedAt ? { gte: current.burnStartedAt } : {}),
-            lt: cutoff,
-          },
+          burnExpiresAt: { lte: new Date() },
         },
         select: { id: true, type: true, content: true },
         take: SWEEP_BATCH,
       });
       if (rows.length === 0) return;
-      const allMediaKeys = rows
-        .filter((row) => MEDIA_MESSAGE_TYPES.includes(row.type))
-        .flatMap((row) => {
-          const content = (row.content ?? {}) as Record<string, unknown>;
-          return ['key', 'thumbKey']
-            .map((field) => content[field])
-            .filter((v): v is string => typeof v === 'string' && v.length > 0);
-        });
       const messageIds = rows.map((row) => row.id);
-      const noteImportKeys = allMediaKeys.filter((key) =>
-        key.includes(`/${CHAT_NOTE_IMPORT_SEGMENT}`),
-      );
-      const ownedMediaKeys = allMediaKeys.filter(
-        (key) => !key.includes(`/${CHAT_NOTE_IMPORT_SEGMENT}`),
-      );
+      let noteImportKeys: string[] = [];
+      let ownedMediaKeys: string[] = [];
       if (!lease.isCurrent()) return;
       const burned = await this.prisma.$transaction(async (tx) => {
         // 会话行锁先拿:消息行上的触发器要更新会话计数器。先锁一批消息行再等会话行,
@@ -238,7 +206,11 @@ export class ChatBurnSweeperService {
         const tombstones = await tx.chatMessage.updateManyAndReturn({
           // deleted=false:租约过期后两个实例可能扫到同一批,已经烧掉的行不能再改
           // 一遍(白花一次变更序号)、再播一遍。
-          where: { id: { in: messageIds }, deleted: false },
+          where: {
+            id: { in: messageIds },
+            deleted: false,
+            burnExpiresAt: { lte: new Date() },
+          },
           // contentHistory 一起清:编辑过的消息把每一版旧正文都留在这里,只清
           // content 的话,「烧掉」的其实只有最后一版,前面几版连同备份长期留在库里。
           data: {
@@ -249,10 +221,46 @@ export class ChatBurnSweeperService {
           },
           select: { id: true, revision: true },
         });
+        const burnedIds = new Set(tombstones.map((row) => row.id));
+        const allMediaKeys = rows
+          .filter(
+            (row) =>
+              burnedIds.has(row.id) && MEDIA_MESSAGE_TYPES.includes(row.type),
+          )
+          .flatMap((row) => {
+            const content = (row.content ?? {}) as Record<string, unknown>;
+            return ['key', 'thumbKey', 'coverKey']
+              .map((field) => content[field])
+              .filter((key): key is string => typeof key === 'string');
+          });
+        ownedMediaKeys = allMediaKeys.filter(
+          (key) => !key.includes(`/${CHAT_NOTE_IMPORT_SEGMENT}`),
+        );
+        noteImportKeys = allMediaKeys.filter((key) =>
+          key.includes(`/${CHAT_NOTE_IMPORT_SEGMENT}`),
+        );
+        const retained = await tx.chatBurnArchive.findMany({
+          where: {
+            id: { in: tombstones.map((row) => row.id) },
+            retainUntil: { gt: new Date() },
+          },
+          select: { id: true, content: true },
+        });
+        const retainedIds = new Set(retained.map((row) => row.id));
+        const retainedKeys = new Set(
+          retained.flatMap((row) => {
+            const content = row.content as Record<string, unknown>;
+            return ['key', 'thumbKey', 'coverKey']
+              .map((field) => content[field])
+              .filter((key): key is string => typeof key === 'string');
+          }),
+        );
+        ownedMediaKeys = ownedMediaKeys.filter((key) => !retainedKeys.has(key));
+        noteImportKeys = noteImportKeys.filter((key) => !retainedKeys.has(key));
         await this.media.queueDeletions(tx, ownedMediaKeys);
         await this.media.releaseNoteImportReferences(
           tx,
-          messageIds,
+          tombstones.map((row) => row.id).filter((id) => !retainedIds.has(id)),
           noteImportKeys,
         );
         return tombstones;
@@ -260,11 +268,7 @@ export class ChatBurnSweeperService {
       if (burned === null) return;
       // 墓碑已提交才通知:事务回滚了却已经播出去,对端会删掉服务端其实还留着的消息。
       await this.announceBurned(conversationId, burned);
-      if (ownedMediaKeys.length > 0) {
-        // deleteObjects 内部逐 key 尽力而为;失败只留孤儿对象,不中断焚毁。
-        void this.media.deleteObjects(ownedMediaKeys);
-      }
-      if (noteImportKeys.length > 0) {
+      if (ownedMediaKeys.length > 0 || noteImportKeys.length > 0) {
         void this.media.drainPendingDeletions();
       }
       this.logger.log(

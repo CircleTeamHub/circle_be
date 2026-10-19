@@ -177,6 +177,23 @@ export class ChatBroadcastService implements OnModuleInit, OnModuleDestroy {
    * 查询失败只记日志,不能冒泡成调用方(sweeper / 放宽焚毁)的失败;没收到通知的
    * 设备下次拉历史仍以 deleted=true 为准。
    */
+  async emitBurnStarted(
+    conversationId: string,
+    revision: number,
+  ): Promise<void> {
+    const server = this.requireServer('emitBurnStarted');
+    if (!server) return;
+    const seats = await this.prisma.chatMember.findMany({
+      where: { conversationID: conversationId, leftAt: null },
+      select: { userID: true },
+    });
+    const rooms = [...new Set(seats.map((seat) => userRoom(seat.userID)))];
+    if (rooms.length)
+      server
+        .to(rooms)
+        .emit(CHAT_EVENTS.burnStarted, { conversationId, revision });
+  }
+
   async emitBurnedMessages(
     conversationId: string,
     burned: ReadonlyArray<{ id: string; revision: number }>,

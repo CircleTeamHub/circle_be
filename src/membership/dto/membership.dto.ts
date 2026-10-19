@@ -2,6 +2,7 @@ import { ApiProperty, ApiPropertyOptional } from '@nestjs/swagger';
 import { Transform } from 'class-transformer';
 import {
   IsInt,
+  IsIn,
   IsOptional,
   IsString,
   IsUUID,
@@ -123,6 +124,26 @@ export class EnableMembershipProgramResponseDto {
 }
 
 export class CreateMembershipGrantDto {
+  @ApiPropertyOptional({
+    minimum: 1,
+    maximum: 30,
+    default: 1,
+    description: '每日会员数量，每份24小时；其他方案只能为1',
+  })
+  @IsOptional()
+  @IsInt()
+  @Min(1)
+  @Max(30)
+  quantity?: number;
+
+  @ApiPropertyOptional({
+    enum: ['daily'],
+    description: '1-day silver plan; omit for the usual level-based duration',
+  })
+  @IsOptional()
+  @IsIn(['daily'])
+  planId?: 'daily';
+
   @ApiProperty({ minimum: 1, maximum: 4 })
   @IsInt()
   @Min(1)
@@ -142,6 +163,8 @@ export class CreateMembershipGrantDto {
 }
 
 export class MembershipGrantAuditDto {
+  @ApiProperty() planId: string;
+  @ApiProperty() quantity: number;
   @ApiProperty() id: string;
   @ApiProperty({ format: 'uuid' }) idempotencyKey: string;
   @ApiProperty({ format: 'uuid' }) targetUserId: string;

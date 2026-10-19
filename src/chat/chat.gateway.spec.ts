@@ -19,7 +19,10 @@ function fakeSocket(overrides: Record<string, unknown> = {}) {
   return {
     id: 'socket-1',
     // 网关会往 data 上钉 guestConversationId / sessionId / issuedAtMs。
-    data: { userId: 'u1' } as Record<string, unknown>,
+    data: {
+      userId: 'u1',
+      authPayload: { sub: 'u1', accountId: 'acc1', aud: 'APP' },
+    } as Record<string, unknown>,
     rooms: new Set<string>(['socket-1', 'c:conv-1']),
     handshake: {
       auth: {
@@ -746,6 +749,33 @@ describe('ChatGateway', () => {
   });
 
   describe('handleConnection', () => {
+    it('rejects revocation between handshake verification and admission without joining any room', async () => {
+      const socket = fakeSocket();
+      chatService.listConversationSeats.mockResolvedValue(seats('conv-1'));
+      sessionVerifier.verify.mockResolvedValueOnce('revoked');
+      await gateway['handleConnection'](socket as never);
+      expect(socket.disconnect).toHaveBeenCalledWith(true);
+      expect(socket.join).not.toHaveBeenCalled();
+      const ack = jest.fn();
+      socket.handlers.get('chat:send')?.({ conversationId: 'conv-1' }, ack);
+      await Promise.resolve();
+      expect(chatService.sendMessage).not.toHaveBeenCalled();
+    });
+
+    it('finds pending connections during user revocation before room membership exists', async () => {
+      const socket = fakeSocket();
+      socket.data.issuedAtMs = 100;
+      const io = { local: { fetchSockets: jest.fn().mockResolvedValue([]) } };
+      (gateway as any).io = io;
+      (gateway as any).connectionsByUser.set('u1', new Set([socket]));
+      await gateway['handleRevocation'](
+        JSON.stringify({ kind: 'user', userId: 'u1', revokedAtMs: 200 }),
+      );
+      expect(socket.disconnect).toHaveBeenCalledWith(true);
+      (gateway as any).io = null;
+      (gateway as any).connectionsByUser.clear();
+    });
+
     it('rechecks an app session after namespace admission before joining rooms', async () => {
       const socket = fakeSocket({
         data: {
@@ -817,6 +847,37 @@ describe('ChatGateway', () => {
       );
 
       expect(fetchSockets).toHaveBeenCalled();
+      expect(socket.disconnect).toHaveBeenCalledWith(true);
+    });
+
+    it('applies scoped revocation to registered pending sockets missing from the adapter', async () => {
+      const socket = fakeSocket({
+        data: {
+          userId: 'u1',
+          sessionId: 'session-a',
+          familyId: 'family-a',
+          audience: 'APP',
+          deviceKey: 'device-a',
+        },
+      });
+      prisma.sessionScopeGeneration.findUnique.mockResolvedValue({
+        generation: 1,
+        exemptFamilyId: null,
+      });
+      (gateway as any).io = {
+        local: { fetchSockets: jest.fn().mockResolvedValue([]) },
+      };
+      (gateway as any).connectionsByUser.set('u1', new Set([socket]));
+      await gateway['handleRevocation'](
+        JSON.stringify({
+          kind: 'scope',
+          userId: 'u1',
+          scope: 'DEVICE',
+          scopeKey: 'device-a',
+          exemptFamilyId: null,
+          generation: 1,
+        }),
+      );
       expect(socket.disconnect).toHaveBeenCalledWith(true);
     });
 

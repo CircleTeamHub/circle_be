@@ -454,6 +454,7 @@ export class CallService {
         errorCode: CallErrorCode.Expired,
       });
     }
+    await this.assertCurrentCallAccess(call, userID);
     const joinedAt = new Date();
     // round 3 review ×2：接听的复检与状态转换放进**同一把 pair 锁事务**并
     // 全程 CAS——
@@ -1000,10 +1001,15 @@ export class CallService {
           })),
         ],
       },
-      select: { id: true, groupID: true, ownerID: true },
+      select: { id: true, groupID: true, ownerID: true, adminState: true },
     });
 
     if (circle) {
+      if (circle.adminState !== 'ACTIVE')
+        throw new ForbiddenException({
+          message: 'CALL_NOT_GROUP_MEMBER',
+          errorCode: CallErrorCode.NotGroupMember,
+        });
       const members = await this.prisma.circleMember.findMany({
         where: {
           circleID: circle.id,
@@ -1039,13 +1045,71 @@ export class CallService {
     // 好友关系和双向拉黑都不再校验,被拉黑的人可以照样把对方呼起来。
     const conversation = await this.prisma.chatConversation.findUnique({
       where: { id: conversationID },
-      select: { type: true },
+      select: {
+        type: true,
+        circleID: true,
+        tempChatID: true,
+      },
     });
-    if (conversation?.type === 'DIRECT') {
+    if (!conversation || !['GROUP', 'TEMP'].includes(conversation.type)) {
       throw new BadRequestException({
         message: 'CALL_INVITEE_INVALID',
         errorCode: CallErrorCode.InviteeInvalid,
       });
+    }
+    if (conversation.circleID) {
+      const currentCircle = await this.prisma.circle.findFirst({
+        where: {
+          id: conversation.circleID,
+          deleted: false,
+          adminState: 'ACTIVE',
+        },
+        select: { id: true },
+      });
+      if (!currentCircle) {
+        throw new ForbiddenException({
+          message: 'CALL_NOT_GROUP_MEMBER',
+          errorCode: CallErrorCode.NotGroupMember,
+        });
+      }
+      const members = await this.prisma.circleMember.findMany({
+        where: {
+          circleID: conversation.circleID,
+          userID: { in: participantIDs },
+          status: CircleMemberStatus.ACTIVE,
+        },
+        select: { userID: true },
+      });
+      const active = new Set(members.map((m) => m.userID));
+      if (!active.has(initiatorID))
+        throw new ForbiddenException({
+          message: 'CALL_NOT_GROUP_MEMBER',
+          errorCode: CallErrorCode.NotGroupMember,
+        });
+      if (!participantIDs.every((id) => active.has(id)))
+        throw new BadRequestException({
+          message: 'CALL_INVITEE_INVALID',
+          errorCode: CallErrorCode.InviteeInvalid,
+        });
+    }
+    if (conversation.type === 'TEMP') {
+      const room = conversation.tempChatID
+        ? await this.prisma.tempChat.findUnique({
+            where: { id: conversation.tempChatID },
+            select: { status: true, endedAt: true, expiresAt: true },
+          })
+        : null;
+      if (
+        !room ||
+        room.status !== 'ACTIVE' ||
+        room.endedAt ||
+        room.expiresAt.getTime() <= Date.now()
+      ) {
+        throw new ForbiddenException({
+          message: 'CALL_NOT_GROUP_MEMBER',
+          errorCode: CallErrorCode.NotGroupMember,
+        });
+      }
     }
 
     const seats = await this.prisma.chatMember.findMany({
@@ -1284,10 +1348,35 @@ export class CallService {
     })) as CallWithParticipants | null;
   }
 
+  /** A historical invitation is not a permanent grant to the media room. */
+  private async assertCurrentCallAccess(
+    call: CallWithParticipants,
+    userID: string,
+  ) {
+    if (call.sessionType === GROUP_SESSION_TYPE) {
+      await this.assertGroupMembers(call.conversationID, [userID], userID);
+    } else if (call.sessionType === SINGLE_SESSION_TYPE && call.initiatorID) {
+      const calleeID =
+        userID !== call.initiatorID
+          ? userID
+          : call.participants.find((p) => p.userID !== call.initiatorID)
+              ?.userID;
+      if (!calleeID)
+        throw new ForbiddenException({
+          message: 'CALL_NOT_FRIEND',
+          errorCode: CallErrorCode.NotFriend,
+        });
+      await this.assertDirectCallee(call.initiatorID, calleeID);
+    } else {
+      throw new ForbiddenException('CALL_NOT_FOUND');
+    }
+  }
+
   private async mintToken(call: CallWithParticipants, user: UserLite) {
     if (!call.livekitRoomName || !call.callType) {
       throw new ServiceUnavailableException('LIVEKIT_UNAVAILABLE');
     }
+    await this.assertCurrentCallAccess(call, user.id);
     return this.livekit.mintJoinToken({
       identity: user.id,
       name: user.nickname,

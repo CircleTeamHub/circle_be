@@ -1,5 +1,7 @@
 import {
+  Delete,
   Body,
+  Post,
   Controller,
   Get,
   Param,
@@ -17,7 +19,15 @@ import {
   RequireAdminPermission,
 } from './admin-permission.guard';
 import { AdminAccessService } from './admin-access.service';
-import { AdminPageQuery, UpdateAdminAccessDto } from './admin-access.dto';
+import {
+  AdminAccountAvailabilityQuery,
+  DeleteAdminAccountDto,
+  CreateAdminAccountDto,
+  ResetAdminPasswordDto,
+  AdminPageQuery,
+  UpdateAdminAccessDto,
+  UpdateAdminNicknameDto,
+} from './admin-access.dto';
 
 @Controller('admin/access')
 @UseGuards(JwtGuard, AdminGuard, AdminPermissionGuard)
@@ -28,6 +38,37 @@ export class AdminAccessController {
   me(@Req() req: RequestWithUser) {
     return this.service.getMine(req.user.userId);
   }
+  @Patch('me/nickname')
+  @RequireAdminPermission('USER_READ')
+  updateNickname(
+    @Req() req: RequestWithUser,
+    @Body() dto: UpdateAdminNicknameDto,
+  ) {
+    return this.service.updateNickname(req.user.userId, dto.nickname);
+  }
+
+  @Post('accounts')
+  @RequireAdminPermission('ACCESS_MANAGE')
+  create(@Req() req: RequestWithUser, @Body() dto: CreateAdminAccountDto) {
+    return this.service.create(req.user.userId, dto);
+  }
+
+  @Patch('accounts/:id/password')
+  @RequireAdminPermission('ACCESS_MANAGE')
+  resetPassword(
+    @Req() req: RequestWithUser,
+    @Param('id', ParseUUIDPipe) id: string,
+    @Body() dto: ResetAdminPasswordDto,
+  ) {
+    return this.service.resetPassword(req.user.userId, id, dto);
+  }
+
+  @Get('accounts/availability')
+  @RequireAdminPermission('ACCESS_MANAGE')
+  availability(@Query() query: AdminAccountAvailabilityQuery) {
+    return this.service.availability(query);
+  }
+
   @Get('accounts')
   @RequireAdminPermission('ACCESS_MANAGE')
   list(@Query() query: AdminPageQuery) {
@@ -41,5 +82,14 @@ export class AdminAccessController {
     @Body() dto: UpdateAdminAccessDto,
   ) {
     return this.service.update(req.user.userId, id, dto);
+  }
+  @Delete('accounts/:id')
+  @RequireAdminPermission('ACCESS_MANAGE')
+  remove(
+    @Req() req: RequestWithUser,
+    @Param('id', ParseUUIDPipe) id: string,
+    @Body() dto: DeleteAdminAccountDto,
+  ) {
+    return this.service.remove(req.user.userId, id, dto);
   }
 }

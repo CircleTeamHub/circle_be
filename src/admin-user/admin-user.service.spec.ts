@@ -46,17 +46,20 @@ describe('AdminUserService', () => {
     invalidateUserProfileSummaryCache: jest.fn(),
     broadcastUserProfileSummary: jest.fn(),
   };
+  const icons = { getDisplayIconsForUser: jest.fn() };
   const service = new AdminUserService(
     prisma as never,
     audit as never,
     sessionRevocation as never,
     realtime as never,
+    icons as never,
   );
 
   beforeEach(() => {
     jest.resetAllMocks();
+    icons.getDisplayIconsForUser.mockResolvedValue([]);
     prisma.$transaction.mockImplementation((callback) => callback(tx));
-    tx.$queryRaw.mockResolvedValue([]);
+    tx.$executeRaw.mockResolvedValue([]);
     sessionRevocation.revokeUserAt.mockResolvedValue(true);
     sessionRevocation.revocationExpiresAt.mockImplementation(
       (revokedAtMs: number) => new Date(revokedAtMs + 60 * 60 * 1000),
@@ -197,6 +200,11 @@ describe('AdminUserService', () => {
         accountId: 'jim-1001',
         nickname: 'Jim',
         avatarUrl: null,
+        persona: '热爱摄影',
+        helloWords: '欢迎交流',
+        birthday: new Date('2000-01-01T00:00:00Z'),
+        cover: 'https://example.test/cover.jpg',
+        receivedLikeCount: 12,
         role: UserRole.USER,
         status: UserStatus.ACTIVE,
         city: 'Shanghai',
@@ -264,6 +272,12 @@ describe('AdminUserService', () => {
       });
       expect(result).toEqual({
         profile: {
+          persona: '热爱摄影',
+          helloWords: '欢迎交流',
+          birthday: new Date('2000-01-01T00:00:00Z'),
+          cover: 'https://example.test/cover.jpg',
+          receivedLikeCount: 12,
+          displayIcons: [],
           id: 'user-1',
           accountId: 'jim-1001',
           nickname: 'Jim',
@@ -812,6 +826,7 @@ describe('AdminUserService', () => {
           audit as never,
           sessionRevocation as never,
           realtime as never,
+          icons as never,
         );
         const logSpy = jest
           .spyOn(Logger.prototype, 'log')

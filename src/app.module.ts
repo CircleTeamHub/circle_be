@@ -1,4 +1,9 @@
+import { AdminUserResourcesModule } from './admin-user/admin-user-resources.module';
+import { ConsoleModule } from './admin-console/console.module';
 import { Logger, Module } from '@nestjs/common';
+import { APP_GUARD, APP_INTERCEPTOR } from '@nestjs/core';
+import { HttpCapacityInterceptor } from './interceptors/http-capacity.interceptor';
+import { DefaultAuthGuard } from './guards/default-auth.guard';
 import { UserModule } from './user/user.module';
 import { ConfigModule } from '@nestjs/config';
 import * as dotenv from 'dotenv';
@@ -53,6 +58,7 @@ import { AdminAccessModule } from './admin-access/admin-access.module';
 import { AdminOperationsModule } from './admin-operations/admin-operations.module';
 import { AdminCommerceModule } from './admin-commerce/admin-commerce.module';
 import { AdminContentModule } from './admin-content/admin-content.module';
+import { E2eeModule } from './e2ee/e2ee.module';
 import { AdminImModule } from './admin-im/admin-im.module';
 
 const nodeEnv = process.env.NODE_ENV || 'development';
@@ -99,6 +105,7 @@ const envFilePath = `.env.${nodeEnv}`;
     CreditModule,
     CallModule,
     AdminUserModule,
+    AdminUserResourcesModule,
     FancyNumberModule,
     GroupExpansionModule,
     GeoModule,
@@ -117,9 +124,15 @@ const envFilePath = `.env.${nodeEnv}`;
     AdminCommerceModule,
     AdminContentModule,
     AdminImModule,
+    E2eeModule,
+    ConsoleModule,
   ],
   controllers: [],
-  providers: [Logger],
+  providers: [
+    Logger,
+    { provide: APP_GUARD, useClass: DefaultAuthGuard },
+    { provide: APP_INTERCEPTOR, useClass: HttpCapacityInterceptor },
+  ],
   exports: [Logger],
 })
 export class AppModule {}

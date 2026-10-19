@@ -950,3 +950,12 @@ test('note-exports lifecycle rule is re-appliable and has a documented rollout',
     /docker compose -f docker-compose\.prod\.yml run --rm minio-init/,
   );
 });
+
+
+test('websocket upgrades have a separate edge budget before the API fallback', () => {
+  const caddy = read('deploy/Caddyfile.admin');
+  assert.match(caddy, /@websocket_upgrade\s*\{[^}]*path \/chat-ws \/chat-ws\/\* \/realtime[^}]*header Upgrade websocket/);
+  const block = caddy.slice(caddy.indexOf('handle @websocket_upgrade'), caddy.indexOf('zone api_fallback'));
+  assert.match(block, /zone websocket_handshake/);
+  assert.match(block, /events 60\s+window 1m/);
+});

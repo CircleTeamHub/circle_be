@@ -15,7 +15,7 @@ describe('requestPasswordReset anti-enumeration (PR #120 review)', () => {
       ...args: unknown[]
     ) => AuthService;
     return new LooseAuthService(
-      {}, // prisma —— 本路径不触达
+      { user: { findUnique: jest.fn().mockResolvedValue({ role: 'USER' }) } }, // account-role guard
       {}, // refreshTokenService
       {}, // jwt
       {}, // iconService

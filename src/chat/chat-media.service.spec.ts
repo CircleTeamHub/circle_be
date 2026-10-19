@@ -32,9 +32,12 @@ describe('ChatMediaService', () => {
     $transaction: jest.fn(),
     $queryRaw: jest.fn(),
     $executeRaw: jest.fn().mockResolvedValue(0),
+    chatMessage: { findMany: jest.fn() },
+    chatBurnArchive: { findMany: jest.fn() },
     chatMediaDeletion: {
       createMany: jest.fn(),
       upsert: jest.fn(),
+      findFirst: jest.fn(),
       findUnique: jest.fn(),
       findMany: jest.fn(),
       update: jest.fn(),
@@ -54,6 +57,9 @@ describe('ChatMediaService', () => {
 
   beforeEach(() => {
     jest.clearAllMocks();
+    prisma.chatMessage.findMany.mockResolvedValue([]);
+    prisma.chatBurnArchive.findMany.mockResolvedValue([]);
+    prisma.chatMediaDeletion.findFirst.mockResolvedValue(null);
     uploadService.createPresignedGetUrl.mockImplementation((key: string) =>
       Promise.resolve({ url: `https://signed/${key}`, expiresAt: new Date() }),
     );
@@ -73,9 +79,159 @@ describe('ChatMediaService', () => {
     prisma.$transaction.mockImplementation(
       async (callback: (tx: typeof prisma) => unknown) => callback(prisma),
     );
-    prisma.$queryRaw.mockResolvedValue([]);
+    prisma.$queryRaw.mockImplementation(async (strings, ...values) =>
+      strings.join(' ').includes('SELECT wanted.key')
+        ? values[0].map((key: string) => ({ key }))
+        : [],
+    );
   });
 
+  it('bounds an issued pending-read media grant before the first read can start a timer', async () => {
+    prisma.chatMessage.findMany.mockResolvedValue([
+      {
+        id: 'm1',
+        deleted: false,
+        revokedAt: null,
+        burnDurationSec: 60,
+        burnExpiresAt: null,
+      },
+    ]);
+    const before = Date.now();
+    const message = dto({
+      type: 'image',
+      burnDurationSec: 60,
+      content: { key: 'chat/u1/a.jpg' },
+    });
+    await service.attachMediaUrls([message]);
+    const [, ttl, signedAt] = uploadService.createPresignedGetUrl.mock.calls[0];
+    expect(ttl).toBe(60);
+    expect(signedAt.getTime()).toBeGreaterThanOrEqual(before);
+    expect(prisma.$queryRaw.mock.calls[0][0].join(' ')).toContain('FOR SHARE');
+  });
+  it('never gives an expiring message the ordinary two-hour grant or a cached longer grant for the same key', async () => {
+    const deadline = new Date(Date.now() + 15_000);
+    prisma.chatMessage.findMany.mockResolvedValue([
+      {
+        id: 'm1',
+        deleted: false,
+        revokedAt: null,
+        burnDurationSec: 60,
+        burnExpiresAt: deadline,
+      },
+    ]);
+    const key = 'chat/u1/a.jpg';
+    await service.attachMediaUrls([
+      dto({ type: 'image', content: { key } }),
+      dto({
+        id: 'm1',
+        type: 'image',
+        burnDurationSec: 60,
+        burnExpiresAt: deadline.toISOString(),
+        content: { key },
+      }),
+    ]);
+    expect(uploadService.createPresignedGetUrl).toHaveBeenCalledTimes(2);
+    const [, ttl, signedAt] = uploadService.createPresignedGetUrl.mock.calls[1];
+    expect(ttl).toBeLessThanOrEqual(15);
+    expect(signedAt.getTime() + ttl * 1000).toBeLessThanOrEqual(
+      deadline.getTime(),
+    );
+  });
+  it('strips a previously issued URL when the authoritative message already burned', async () => {
+    prisma.chatMessage.findMany.mockResolvedValue([
+      { id: 'm1', deleted: true },
+    ]);
+    const message = dto({
+      type: 'image',
+      burnDurationSec: 60,
+      content: { key: 'chat/u1/a.jpg', url: 'old-user-grant' },
+    });
+    await service.attachMediaUrls([message]);
+    expect(message.content.url).toBeUndefined();
+    expect(uploadService.createPresignedGetUrl).not.toHaveBeenCalled();
+  });
+  it('batch checks burn media under one conversation snapshot rather than one transaction per bubble', async () => {
+    prisma.chatMessage.findMany.mockResolvedValue(
+      ['m1', 'm2', 'm3'].map((id) => ({
+        id,
+        deleted: false,
+        revokedAt: null,
+        burnDurationSec: 60,
+        burnExpiresAt: null,
+      })),
+    );
+    await service.attachMediaUrls(
+      ['m1', 'm2', 'm3'].map((id) =>
+        dto({
+          id,
+          type: 'image',
+          burnDurationSec: 60,
+          content: { key: `chat/u1/${id}.jpg` },
+        }),
+      ),
+    );
+    expect(prisma.$transaction).toHaveBeenCalledTimes(1);
+    expect(prisma.chatMessage.findMany).toHaveBeenCalledTimes(1);
+    expect(uploadService.createPresignedGetUrl).toHaveBeenCalledTimes(3);
+  });
+  it('checks shared live and archive references while holding the same owned-key lock as send', async () => {
+    prisma.$queryRaw
+      .mockResolvedValueOnce([])
+      .mockResolvedValueOnce([{ key: 'chat/u1/orphan.jpg' }]);
+    const keys = await service.unreferencedArchiveMedia(
+      prisma as never,
+      ['chat/u1/orphan.jpg'],
+      'archive-1',
+    );
+    expect(keys).toEqual(['chat/u1/orphan.jpg']);
+    expect(prisma.$queryRaw.mock.calls[0][0].join(' ')).toContain(
+      'pg_advisory_xact_lock',
+    );
+    const sql = prisma.$queryRaw.mock.calls[1][0].join(' ');
+    expect(sql).toContain('"ChatMessage"');
+    expect(sql).toContain('"ChatBurnArchive"');
+  });
+  it('never queues physical deletion when another live or retained reference still owns the key', async () => {
+    prisma.$queryRaw.mockResolvedValue([]);
+    await service.queueDeletions(prisma as never, ['chat/u1/shared.jpg']);
+    expect(prisma.chatMediaDeletion.createMany).not.toHaveBeenCalled();
+  });
+  it('drops a stale deletion task rather than deleting media referenced by a retained archive', async () => {
+    const row = {
+      id: 'deletion',
+      objectKey: 'chat/u1/shared.jpg',
+      attempts: 0,
+      nextAttemptAt: new Date(0),
+    };
+    prisma.chatMediaDeletion.findMany.mockResolvedValue([row]);
+    prisma.chatMediaDeletion.findUnique.mockResolvedValue(row);
+    prisma.$queryRaw.mockResolvedValue([]);
+    await service.drainPendingDeletions();
+    expect(uploadService.deleteObjectByKey).not.toHaveBeenCalled();
+    expect(prisma.chatMediaDeletion.delete).toHaveBeenCalledWith({
+      where: { id: row.id },
+    });
+  });
+  it('preserves a note-import reference after an expired recall created an audit archive', async () => {
+    prisma.chatBurnArchive.findMany.mockResolvedValue([
+      { id: 'expired-message' },
+    ]);
+    await service.releaseNoteImportReferences(
+      prisma as never,
+      ['expired-message'],
+      ['chat/u1/note-import/a.jpg'],
+    );
+    expect(prisma.chatMediaReference.deleteMany).not.toHaveBeenCalled();
+    expect(prisma.chatMediaDeletion.upsert).not.toHaveBeenCalled();
+  });
+  it('blocks media reuse once archive cleanup queued physical deletion', async () => {
+    prisma.chatMediaDeletion.findFirst.mockResolvedValue({ id: 'pending' });
+    await expect(
+      service.lockOwnedKeysForSend(prisma as never, 'image', {
+        key: 'chat/u1/shared.jpg',
+      }),
+    ).rejects.toThrow('deletion is already scheduled');
+  });
   it('persists a failed deletion instead of losing the key on restart', async () => {
     // 消息 content 在撤回那一刻已经清空:key 只存在于这条待办里,
     // 内存队列一重启就等于把那张图永久留在桶里。
@@ -142,13 +298,11 @@ describe('ChatMediaService', () => {
       expect(warn).toHaveBeenCalledWith(
         expect.objectContaining({
           event: 'chat_media_delete_failed',
-          objectKey: '[redacted]',
         }),
       );
       expect(errorLog).toHaveBeenCalledWith(
         expect.objectContaining({
           event: 'chat_media_delete_queue_failed',
-          objectKey: '[redacted]',
         }),
       );
       expect(
@@ -182,7 +336,6 @@ describe('ChatMediaService', () => {
       expect(warn).toHaveBeenCalledWith(
         expect.objectContaining({
           event: 'chat_media_presign_failed',
-          objectKey: '[redacted]',
           failureCode: 'ECONNREFUSED',
         }),
       );
@@ -252,7 +405,6 @@ describe('ChatMediaService', () => {
           operation: 'deleteObject',
           deletionId: 'deletion-1',
           attempts: 8,
-          objectKey: '[redacted]',
         }),
       );
       expect(JSON.stringify(log.mock.calls)).not.toMatch(

@@ -1,3 +1,4 @@
+import type { Response } from 'express';
 import {
   Controller,
   Get,
@@ -5,6 +6,7 @@ import {
   ParseUUIDPipe,
   Query,
   UseGuards,
+  Res,
 } from '@nestjs/common';
 import { JwtGuard } from 'src/guards/jwt.guard';
 import { AdminGuard } from 'src/guards/admin.guard';
@@ -26,6 +28,18 @@ export class AdminContentController {
   @Get('posts/:id') detail(@Param('id', ParseUUIDPipe) id: string) {
     return this.service.detail(id);
   }
+  // Circle operators can already inspect circle members and post details.
+  @Get('posts/:id/signups')
+  @RequireAdminPermission('COMMUNITY_MANAGE')
+  signups(
+    @Param('id', ParseUUIDPipe) id: string,
+    @Query() query: ListAdminWordsDto,
+    @Res({ passthrough: true }) response: Response,
+  ) {
+    response.setHeader('Cache-Control', 'no-store');
+    return this.service.signups(id, query);
+  }
+
   @Get('sensitive-words')
   @RequireAdminPermission('CONTENT_MANAGE')
   words(@Query() query: ListAdminWordsDto) {

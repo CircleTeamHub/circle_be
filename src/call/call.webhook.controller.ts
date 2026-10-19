@@ -1,3 +1,4 @@
+import { AnonymousAccess } from 'src/guards/anonymous-access.decorator';
 import {
   BadRequestException,
   Controller,
@@ -21,6 +22,7 @@ export class CallWebhookController {
     private readonly callService: CallService,
   ) {}
 
+  @AnonymousAccess('LiveKit signed webhook')
   @Post('webhook')
   async handleLiveKitWebhook(
     @Headers('authorization') authorization: string | undefined,

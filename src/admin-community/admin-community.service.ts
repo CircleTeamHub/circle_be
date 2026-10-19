@@ -150,9 +150,23 @@ export class AdminCommunityService {
     const operations = await this.latestOperations(
       circles.flatMap((circle) => (circle.groupID ? [circle.groupID] : [])),
     );
+    // The persisted conversation is authoritative; Circle.groupID is a legacy field.
+    const conversations = circles.length
+      ? await this.prisma.chatConversation.findMany({
+          where: {
+            circleID: { in: circles.map((circle) => circle.id) },
+            type: 'GROUP',
+          },
+          select: { id: true, circleID: true, name: true },
+        })
+      : [];
+    const conversationByCircle = new Map(
+      conversations.map((item) => [item.circleID, item]),
+    );
     return {
       items: circles.map((circle) => ({
         ...circle,
+        associatedGroup: conversationByCircle.get(circle.id) ?? null,
         latestOperation: circle.groupID
           ? (operations.get(circle.groupID) ?? null)
           : null,
@@ -163,57 +177,480 @@ export class AdminCommunityService {
     };
   }
 
-  async listGroups(query: { page: number; limit: number; search?: string }) {
-    // 自研栈:群 = 圈子,列表直接查 Circle(禁言态来自会话 muteAllAt)。
-    const where = {
-      deleted: false,
-      ...(query.search
-        ? { name: { contains: query.search, mode: 'insensitive' as const } }
-        : {}),
+  async circleDetail(id: string) {
+    const circle = await this.prisma.circle.findUnique({
+      where: { id },
+      select: {
+        id: true,
+        name: true,
+        description: true,
+        avatarUrl: true,
+        cover: true,
+        currentIconAsset: { select: { imageUrl: true } },
+        cities: true,
+        categories: true,
+        rules: true,
+        tags: true,
+        isPublic: true,
+        joinVipRestriction: true,
+        joinCreditRestriction: true,
+        joinFancyRestriction: true,
+        maxMembers: true,
+        expansionSeats: true,
+        memberCanPost: true,
+        memberCanInvite: true,
+        requiredVerifierCount: true,
+        memberCount: true,
+        postCount: true,
+        deleted: true,
+        adminState: true,
+        adminDisabledAt: true,
+        adminDisabledBy: true,
+        adminDisableReason: true,
+        createdAt: true,
+        updatedAt: true,
+        owner: {
+          select: {
+            id: true,
+            accountId: true,
+            nickname: true,
+            avatarUrl: true,
+          },
+        },
+      },
+    });
+    if (!circle) throw new NotFoundException('圈子不存在');
+    const associatedGroup = await this.prisma.chatConversation.findFirst({
+      where: { circleID: id, type: 'GROUP' },
+      select: {
+        id: true,
+        name: true,
+        muteAllAt: true,
+        textEncryption: true,
+        qrJoinEnabled: true,
+        cardJoinEnabled: true,
+        joinApprovalRequired: true,
+        membersCanViewProfiles: true,
+        membersCanViewRoster: true,
+        membersCanAddFriends: true,
+      },
+    });
+    const { currentIconAsset, ...details } = circle;
+    return {
+      ...details,
+      currentIconUrl: currentIconAsset?.imageUrl ?? null,
+      associatedGroup,
     };
-    const [total, circles] = await Promise.all([
-      this.prisma.circle.count({ where }),
-      this.prisma.circle.findMany({
+  }
+
+  private async assertCircleExists(id: string) {
+    if (
+      !(await this.prisma.circle.findUnique({
+        where: { id },
+        select: { id: true },
+      }))
+    )
+      throw new NotFoundException('圈子不存在');
+  }
+
+  async circleMembers(id: string, query: { page: number; limit: number }) {
+    await this.assertCircleExists(id);
+    const where = { circleID: id };
+    const [items, total] = await Promise.all([
+      this.prisma.circleMember.findMany({
         where,
-        orderBy: { createdAt: 'desc' },
-        skip: (query.page - 1) * query.limit,
-        take: query.limit,
         select: {
           id: true,
-          name: true,
-          groupID: true,
-          memberCount: true,
-          ownerID: true,
-          owner: { select: { nickname: true } },
+          role: true,
+          status: true,
+          createdAt: true,
+          user: {
+            select: {
+              id: true,
+              accountId: true,
+              nickname: true,
+              avatarUrl: true,
+            },
+          },
         },
+        orderBy: [{ createdAt: 'desc' }, { id: 'desc' }],
+        skip: (query.page - 1) * query.limit,
+        take: query.limit,
       }),
+      this.prisma.circleMember.count({ where }),
     ]);
-    const groupIds = circles.map((circle) => circle.groupID ?? circle.id);
-    const [operations, conversations] = await Promise.all([
-      this.latestOperations(groupIds),
+    return { items, total, page: query.page, limit: query.limit };
+  }
+
+  async circlePosts(id: string, query: { page: number; limit: number }) {
+    await this.assertCircleExists(id);
+    // Multi-circle links are authoritative; retain legacy primary-circle posts too.
+    const where: Prisma.CirclePostWhereInput = {
+      OR: [{ circleID: id }, { circleLinks: { some: { circleID: id } } }],
+    };
+    const [items, total] = await Promise.all([
+      this.prisma.circlePost.findMany({
+        where,
+        select: {
+          id: true,
+          content: true,
+          images: true,
+          tags: true,
+          city: true,
+          cities: true,
+          isHorn: true,
+          noteID: true,
+          status: true,
+          viewCount: true,
+          signupCount: true,
+          _count: { select: { signups: true } },
+          vipRestriction: true,
+          creditRestriction: true,
+          fancyRestriction: true,
+          signupVipRestriction: true,
+          signupCreditRestriction: true,
+          signupFancyRestriction: true,
+          createdAt: true,
+          updatedAt: true,
+          endedAt: true,
+          expiresAt: true,
+          author: {
+            select: {
+              id: true,
+              accountId: true,
+              nickname: true,
+              avatarUrl: true,
+            },
+          },
+          circle: { select: { id: true, name: true } },
+          circleLinks: {
+            select: { circle: { select: { id: true, name: true } } },
+          },
+        },
+        orderBy: [{ createdAt: 'desc' }, { id: 'desc' }],
+        skip: (query.page - 1) * query.limit,
+        take: query.limit,
+      }),
+      this.prisma.circlePost.count({ where }),
+    ]);
+    return {
+      items: items.map(({ _count, ...post }) => ({
+        ...post,
+        signupCount: _count.signups,
+      })),
+      total,
+      page: query.page,
+      limit: query.limit,
+    };
+  }
+
+  async listGroups(query: { page: number; limit: number; search?: string }) {
+    const search = query.search?.trim();
+    // Search the authoritative circle name in SQL so matching circles are not
+    // truncated to a preloaded subset, and neither IDs nor names are interpolated.
+    let matchingIDs: string[] | undefined;
+    let matchingTotal: number | undefined;
+    if (search) {
+      const pattern = `%${search.replace(/[\\%_]/g, '\\$&')}%`;
+      const filter = Prisma.sql`FROM "ChatConversation" g LEFT JOIN "Circle" c ON c.id = g."circleID"
+        WHERE g.type = 'GROUP' AND (COALESCE(c.name, g.name, '') ILIKE ${pattern} OR g.id ILIKE ${pattern})`;
+      const [matches, counts] = await Promise.all([
+        this.prisma.$queryRaw<{ id: string }[]>(
+          Prisma.sql`SELECT g.id ${filter} ORDER BY g."createdAt" DESC, g.id DESC OFFSET ${(query.page - 1) * query.limit} LIMIT ${query.limit}`,
+        ),
+        this.prisma.$queryRaw<{ total: number }[]>(
+          Prisma.sql`SELECT COUNT(*)::int AS total ${filter}`,
+        ),
+      ]);
+      matchingIDs = matches.map((row) => row.id);
+      matchingTotal = counts[0]?.total ?? 0;
+    }
+    const where: Prisma.ChatConversationWhereInput = {
+      type: 'GROUP',
+      ...(matchingIDs ? { id: { in: matchingIDs } } : {}),
+    };
+    const [rows, total] = await Promise.all([
       this.prisma.chatConversation.findMany({
-        where: { circleID: { in: circles.map((circle) => circle.id) } },
-        select: { circleID: true, muteAllAt: true },
+        where,
+        select: {
+          id: true,
+          circleID: true,
+          name: true,
+          avatarUrl: true,
+          ownerID: true,
+          muteAllAt: true,
+          _count: { select: { members: { where: { leftAt: null } } } },
+        },
+        orderBy: [{ createdAt: 'desc' }, { id: 'desc' }],
+        skip: matchingIDs ? 0 : (query.page - 1) * query.limit,
+        take: query.limit,
       }),
+      matchingTotal ?? this.prisma.chatConversation.count({ where }),
     ]);
-    const mutedByCircle = new Map(
-      conversations.map((c) => [c.circleID, c.muteAllAt !== null]),
+    const circles = rows.length
+      ? await this.prisma.circle.findMany({
+          where: {
+            id: { in: rows.flatMap((r) => (r.circleID ? [r.circleID] : [])) },
+          },
+          select: {
+            id: true,
+            name: true,
+            groupID: true,
+            avatarUrl: true,
+            ownerID: true,
+            deleted: true,
+          },
+        })
+      : [];
+    const circleById = new Map(circles.map((c) => [c.id, c]));
+    const ownerIDs = [
+      ...new Set(
+        rows.flatMap((r) => {
+          const owner =
+            (r.circleID ? circleById.get(r.circleID)?.ownerID : null) ??
+            r.ownerID;
+          return owner ? [owner] : [];
+        }),
+      ),
+    ];
+    const owners = ownerIDs.length
+      ? await this.prisma.user.findMany({
+          where: { id: { in: ownerIDs } },
+          select: { id: true, nickname: true, accountId: true },
+        })
+      : [];
+    const ownersById = new Map(owners.map((u) => [u.id, u]));
+    const operations = await this.latestOperations(
+      rows.map((r) => {
+        const c = r.circleID ? circleById.get(r.circleID) : null;
+        return c ? (c.groupID ?? c.id) : r.id;
+      }),
     );
     return {
-      items: circles.map((circle) => {
-        const groupId = circle.groupID ?? circle.id;
+      items: rows.map((row) => {
+        const circle = row.circleID ? circleById.get(row.circleID) : null;
+        const ownerUserId = circle?.ownerID ?? row.ownerID;
+        const owner = ownerUserId ? ownersById.get(ownerUserId) : null;
+        const groupId = circle ? (circle.groupID ?? circle.id) : row.id;
         return {
           groupId,
-          name: circle.name,
-          status: mutedByCircle.get(circle.id) ? 3 : 0,
-          muted: mutedByCircle.get(circle.id) ?? false,
-          memberCount: circle.memberCount,
-          ownerUserId: circle.ownerID,
-          ownerName: circle.owner?.nickname ?? null,
-          linkedCircle: { id: circle.id, name: circle.name },
+          conversationId: row.id,
+          name: circle?.name ?? row.name ?? '未命名群聊',
+          faceUrl: circle ? circle.avatarUrl : row.avatarUrl,
+          status: circle?.deleted ? 2 : row.muteAllAt ? 3 : 0,
+          muted: !!row.muteAllAt,
+          memberCount: row._count.members,
+          ownerUserId,
+          ownerName: owner?.nickname || owner?.accountId || null,
+          linkedCircle: circle ? { id: circle.id, name: circle.name } : null,
           pendingOperation: operations.get(groupId) ?? null,
+          managementSupported: !!circle,
         };
       }),
+      total,
+      page: query.page,
+      limit: query.limit,
+    };
+  }
+
+  private async requireGroup(id: string) {
+    const group = await this.prisma.chatConversation.findUnique({
+      where: { id },
+      select: {
+        id: true,
+        type: true,
+        circleID: true,
+        name: true,
+        avatarUrl: true,
+        notice: true,
+        ownerID: true,
+        createdAt: true,
+        updatedAt: true,
+        lastMessageAt: true,
+        muteAllAt: true,
+        textEncryption: true,
+        memberCanInvite: true,
+        qrJoinEnabled: true,
+        cardJoinEnabled: true,
+        joinApprovalRequired: true,
+        membersCanViewProfiles: true,
+        membersCanViewRoster: true,
+        membersCanAddFriends: true,
+      },
+    });
+    if (!group || group.type !== 'GROUP')
+      throw new NotFoundException('群聊不存在');
+    return group;
+  }
+
+  async groupDetail(id: string) {
+    const group = await this.requireGroup(id);
+    let circle: Awaited<
+      ReturnType<AdminCommunityService['circleDetail']>
+    > | null = null;
+    if (group.circleID) {
+      try {
+        circle = await this.circleDetail(group.circleID);
+      } catch (error) {
+        if (!(error instanceof NotFoundException)) throw error;
+      }
+    }
+    const ownerID = circle?.owner.id ?? group.ownerID;
+    const [owner, memberCount] = await Promise.all([
+      ownerID
+        ? this.prisma.user.findUnique({
+            where: { id: ownerID },
+            select: {
+              id: true,
+              nickname: true,
+              accountId: true,
+              avatarUrl: true,
+            },
+          })
+        : null,
+      this.prisma.chatMember.count({
+        where: { conversationID: id, leftAt: null },
+      }),
+    ]);
+    return {
+      ...group,
+      name: circle?.name ?? group.name ?? '未命名群聊',
+      avatarUrl: circle ? circle.avatarUrl : group.avatarUrl,
+      notice: circle?.description ?? group.notice,
+      memberCanInvite: circle?.memberCanInvite ?? group.memberCanInvite,
+      owner,
+      memberCount,
+      circle: circle
+        ? {
+            id: circle.id,
+            name: circle.name,
+            deleted: circle.deleted,
+            adminState: circle.adminState,
+          }
+        : null,
+    };
+  }
+
+  async groupMembers(id: string, query: { page: number; limit: number }) {
+    const group = await this.requireGroup(id);
+    const where = { conversationID: id };
+    const [rows, total] = await Promise.all([
+      this.prisma.chatMember.findMany({
+        where,
+        select: {
+          id: true,
+          userID: true,
+          role: true,
+          alias: true,
+          joinedAt: true,
+          leftAt: true,
+          silencedAt: true,
+          silencedUntil: true,
+        },
+        orderBy: [{ joinedAt: 'desc' }, { id: 'desc' }],
+        skip: (query.page - 1) * query.limit,
+        take: query.limit,
+      }),
+      this.prisma.chatMember.count({ where }),
+    ]);
+    const userIDs = rows.map((r) => r.userID);
+    const [users, memberships] = await Promise.all([
+      userIDs.length
+        ? this.prisma.user.findMany({
+            where: { id: { in: userIDs } },
+            select: {
+              id: true,
+              nickname: true,
+              accountId: true,
+              avatarUrl: true,
+            },
+          })
+        : [],
+      group.circleID && userIDs.length
+        ? this.prisma.circleMember.findMany({
+            where: {
+              circleID: group.circleID,
+              userID: { in: userIDs },
+              status: 'ACTIVE',
+            },
+            select: { userID: true, role: true },
+          })
+        : [],
+    ]);
+    const userById = new Map(users.map((u) => [u.id, u] as const));
+    const roleByUser = new Map(
+      memberships.map((m) => [m.userID, m.role] as const),
+    );
+    return {
+      items: rows.map((r) => ({
+        ...r,
+        role: group.circleID
+          ? (roleByUser.get(r.userID) ?? 'MEMBER')
+          : r.userID === group.ownerID
+            ? 'OWNER'
+            : r.role,
+        user: userById.get(r.userID) ?? null,
+      })),
+      total,
+      page: query.page,
+      limit: query.limit,
+    };
+  }
+
+  async groupEvents(id: string, query: { page: number; limit: number }) {
+    await this.requireGroup(id);
+    const where = { conversationID: id };
+    const [rows, total] = await Promise.all([
+      this.prisma.chatGroupEvent.findMany({
+        where,
+        select: {
+          id: true,
+          kind: true,
+          actorID: true,
+          targetIDs: true,
+          payload: true,
+          createdAt: true,
+        },
+        orderBy: [{ createdAt: 'desc' }, { id: 'desc' }],
+        skip: (query.page - 1) * query.limit,
+        take: query.limit,
+      }),
+      this.prisma.chatGroupEvent.count({ where }),
+    ]);
+    const ids = [
+      ...new Set(
+        rows.flatMap((r) => [
+          ...(r.actorID ? [r.actorID] : []),
+          ...r.targetIDs,
+        ]),
+      ),
+    ];
+    const users = ids.length
+      ? await this.prisma.user.findMany({
+          where: { id: { in: ids } },
+          select: {
+            id: true,
+            nickname: true,
+            accountId: true,
+            avatarUrl: true,
+          },
+        })
+      : [];
+    const byId = new Map(users.map((u) => [u.id, u] as const));
+    return {
+      items: rows.map(({ actorID, targetIDs, ...r }) => ({
+        ...r,
+        actor: actorID ? (byId.get(actorID) ?? null) : null,
+        targets: targetIDs.map(
+          (userID) =>
+            byId.get(userID) ?? {
+              id: userID,
+              nickname: '已注销用户',
+              accountId: '',
+              avatarUrl: null,
+            },
+        ),
+      })),
       total,
       page: query.page,
       limit: query.limit,

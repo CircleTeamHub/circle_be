@@ -1,5 +1,6 @@
 import { BadRequestException, Injectable } from '@nestjs/common';
 import { PrismaService } from 'src/prisma/prisma.service';
+import { FAILED_AUDIT_WHERE } from './audit-record-kind';
 import { AuditQuery } from './admin-operations.dto';
 
 @Injectable()
@@ -9,6 +10,7 @@ export class AdminAuditQueryService {
     if (query.from && query.to && new Date(query.from) > new Date(query.to))
       throw new BadRequestException('开始时间不能晚于结束时间');
     const where = {
+      NOT: FAILED_AUDIT_WHERE,
       ...(query.actorID ? { actorID: query.actorID } : {}),
       ...(query.action
         ? { action: { contains: query.action, mode: 'insensitive' as const } }

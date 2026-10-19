@@ -162,23 +162,9 @@ describe('ChatPushService', () => {
 
     expect(
       privacySettings.getSelfDestructPoliciesForUsers,
-    ).toHaveBeenCalledWith(['u-private', 'u-plain']);
-    const byToken = new Map(
-      push.sendMessages.mock.calls[0][0].map(
-        (entry: { token: string; payload: Record<string, unknown> }) => [
-          entry.token,
-          entry.payload,
-        ],
-      ),
-    );
-    expect(byToken.get('ExponentPushToken[a]')).toBeDefined();
-    const payloads = push.sendMessages.mock.calls.flatMap(
-      ([entries]: [Array<{ payload: Record<string, unknown> }>]) =>
-        entries.map((entry) => entry.payload),
-    );
-    expect(payloads).toEqual(
+    ).not.toHaveBeenCalled();
+    expect(sentPayloads()).toEqual(
       expect.arrayContaining([
-        expect.objectContaining({ body: '[阅后即焚消息]', ttl: 300 }),
         expect.objectContaining({ body: 'hello world', ttl: 86400 }),
       ]),
     );
@@ -353,11 +339,33 @@ describe('ChatPushService', () => {
       const [payload] = sentPayloads();
       // 焚毁之后通知栏里的原文还在,等于没烧;过了焚毁时限也不该再补发。
       expect(payload).toEqual(
-        expect.objectContaining({ body: '[阅后即焚消息]', ttl: 300 }),
+        expect.objectContaining({ body: '[阅后即焚消息]', ttl: 24 * 60 * 60 }),
       );
       expect(JSON.stringify(payload)).not.toContain('只给你看的内容');
     });
 
+    it('keeps the normal delivery lifetime for unread direct messages with a short burn duration', async () => {
+      prisma.chatMember.findMany.mockResolvedValue([seat('u-peer')]);
+      await pushNow(msg({ burnDurationSec: 60, burnExpiresAt: null }));
+      expect(sentPayloads()[0]).toEqual(
+        expect.objectContaining({ ttl: 86400, body: '[阅后即焚消息]' }),
+      );
+    });
+    it('retains the send-started duration cap for group messages', async () => {
+      prisma.chatConversation.findUnique.mockResolvedValue({
+        type: 'GROUP',
+        circleID: null,
+        name: '朋友群',
+      });
+      prisma.chatMember.findMany.mockResolvedValue([seat('u-peer')]);
+      await pushNow(
+        msg({
+          burnDurationSec: 60,
+          burnExpiresAt: new Date(Date.now() + 60_000).toISOString(),
+        }),
+      );
+      expect(sentPayloads()[0]).toEqual(expect.objectContaining({ ttl: 60 }));
+    });
     it('keeps a mention in its own notification so later chatter cannot replace it', async () => {
       push.listActiveTokensForUsers.mockImplementation((userIds: string[]) =>
         Promise.resolve(

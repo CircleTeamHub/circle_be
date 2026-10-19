@@ -165,12 +165,28 @@ describe('ChatDirectAutoReplyProcessor', () => {
     });
   });
 
+  it('leaves burn-enabled automatic direct replies pending the peer first read', async () => {
+    prisma.userPrivacySetting.findUnique.mockResolvedValue({
+      directMessageAutoReplyEnabled: true,
+      directMessageAutoReplyText: '稍后回复',
+      messageSelfDestructSec: 60,
+    });
+    await processor.processMessage('source-1');
+    expect(prisma.chatMessage.create).toHaveBeenCalledWith(
+      expect.objectContaining({
+        data: expect.objectContaining({
+          burnDurationSec: 60,
+          burnExpiresAt: null,
+        }),
+      }),
+    );
+  });
   it('uses current active members to send a trimmed deterministic reply as the peer', async () => {
     await processor.processMessage('source-1');
 
     expect(prisma.chatMember.findMany).toHaveBeenCalledWith({
       where: { conversationID: 'conv-1', leftAt: null },
-      select: { userID: true },
+      select: { userID: true, burnDurationSec: true },
     });
     expect(prisma.chatMessage.create).toHaveBeenCalledWith({
       data: {
@@ -180,6 +196,8 @@ describe('ChatDirectAutoReplyProcessor', () => {
         type: 'text',
         content: { text: '稍后回复', autoReply: true },
         clientMessageId: 'dm-auto:source-1:u2',
+        burnDurationSec: null,
+        burnExpiresAt: null,
         replyToID: null,
         createdAt,
       },

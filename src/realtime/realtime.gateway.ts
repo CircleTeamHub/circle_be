@@ -16,6 +16,9 @@ import {
 import { reportOperationalError } from 'src/logging/error-aggregation.service';
 import { sanitizeLogValue } from 'src/logging/log-sanitizer';
 
+import { resolveCorsOriginChecker } from 'src/config/cors-origin';
+import { SocketAdmission } from './socket-admission';
+
 const HEARTBEAT_INTERVAL_MS = 30_000;
 const MAX_CONNECTIONS_PER_USER = 5;
 const AUTH_TIMEOUT_MS = 10_000;
@@ -78,6 +81,12 @@ type VerifiedToken = {
 export class RealtimeGateway implements OnModuleDestroy {
   private readonly logger = new Logger(RealtimeGateway.name);
   private server: WebSocketServer | null = null;
+  private readonly admission = new SocketAdmission(
+    2000,
+    128,
+    10_000,
+    'realtime',
+  );
   /** noServer 模式下自己挂/自己摘 'upgrade' 监听,两个引用都要留着。 */
   private httpServer: Server | null = null;
   private upgradeHandler: UpgradeHandler | null = null;
@@ -122,8 +131,29 @@ export class RealtimeGateway implements OnModuleDestroy {
         // 不是我们的路径:什么都不做,交给同一个 server 上的其它 'upgrade' 监听。
         return;
       }
-      wss.handleUpgrade(req, socket, head, (client) => {
-        wss.emit('connection', client, req);
+      const origin = req.headers.origin;
+      resolveCorsOriginChecker()(origin, (error, allowed) => {
+        if (socket.destroyed) return;
+        if (error || !allowed) {
+          socket.end(
+            'HTTP/1.1 403 Forbidden\r\nConnection: close\r\nContent-Length: 0\r\n\r\n',
+          );
+          return;
+        }
+        if (!this.admission.hasCapacity()) {
+          socket.end(
+            'HTTP/1.1 503 Service Unavailable\r\nConnection: close\r\nContent-Length: 0\r\n\r\n',
+          );
+          return;
+        }
+        wss.handleUpgrade(req, socket, head, (client) => {
+          if (!this.admission.acquire(client, () => client.terminate())) {
+            client.terminate();
+            return;
+          }
+          client.once('close', () => this.admission.release(client));
+          wss.emit('connection', client, req);
+        });
       });
     };
     this.httpServer = httpServer;
@@ -146,6 +176,7 @@ export class RealtimeGateway implements OnModuleDestroy {
   }
 
   onModuleDestroy() {
+    this.admission.destroy();
     if (this.heartbeatTimer) {
       clearInterval(this.heartbeatTimer);
       this.heartbeatTimer = null;
@@ -328,6 +359,7 @@ export class RealtimeGateway implements OnModuleDestroy {
       return;
     }
     clearTimeout(authTimeout);
+    this.admission.authenticate(socket);
 
     try {
       await this.realtimeService.emitSnapshot(userId);

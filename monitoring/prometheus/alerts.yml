@@ -331,15 +331,55 @@ groups:
         annotations:
           summary: 'Self-hosted chat message broadcast p95 > 200ms for 5m'
 
-      # 20k is the current product target. Alert before the target is reached;
-      # this is a connection count, so summing across instances is valid.
-      - alert: ChatConnectionsNearTarget
-        expr: sum(chat_connections_active) > 16000
-        for: 10m
+      # Budgets are enforced per process and per pool. Do not sum across
+      # blue/green instances: an idle replica must not hide a saturated one.
+      - alert: GatewayCapacityNearLimit
+        expr: circle_gateway_capacity_used / circle_gateway_capacity_limit > 0.8
+        for: 2m
         labels:
           severity: warning
         annotations:
-          summary: 'Self-hosted chat connections > 16k for 10m'
+          summary: 'Gateway {{ $labels.instance }} {{ $labels.pool }} budget above 80% for 2m'
+
+      - alert: GatewayCapacityRejecting
+        expr: sum by (instance, pool) (rate(circle_gateway_rejections_total{reason="capacity"}[5m])) > 1
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: 'Gateway {{ $labels.instance }} {{ $labels.pool }} rejects more than 1 request or connection per second for 2m'
+
+      - alert: GatewayAuthTimeoutSpike
+        expr: sum by (instance, pool) (rate(circle_gateway_rejections_total{reason="auth_timeout"}[5m])) > 5
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: 'Gateway {{ $labels.instance }} {{ $labels.pool }} authentication timeouts exceed 5/s for 5m'
+
+      - alert: ApiAuthFailureSpike
+        expr: sum(rate(http_requests_total{job="circle-be",status_code=~"401|403"}[5m])) > 10
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: 'API 401/403 responses exceed 10/s for 5m; investigate abuse or a client authentication regression'
+
+      - alert: ApiRateLimitSpike
+        expr: sum(rate(http_requests_total{job="circle-be",status_code="429"}[5m])) > 5
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: 'API rate-limited responses exceed 5/s for 5m; check shared NAT and abusive clients'
+
+      - alert: ChatAuthFailureSpike
+        expr: sum(rate(chat_auth_failures_total[5m])) > 5
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: 'Chat authentication failures exceed 5/s for 5m; investigate abuse or a client authentication regression'
 
       - alert: ChatRateLimitSpike
         expr: sum(rate(chat_messages_received_total{result="rate_limited"}[5m])) > 5

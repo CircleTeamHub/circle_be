@@ -46,7 +46,8 @@ test('queries cover alerts, target health, alert delivery, probes, and host capa
     'prometheus_rule_evaluation_failures_total', 'probe_success', 'probe_ssl_earliest_cert_expiry',
     'node_memory_MemAvailable_bytes', 'node_memory_MemTotal_bytes', 'node_filesystem_avail_bytes',
     'node_filesystem_size_bytes', 'node_filesystem_readonly', 'loki_write_batch_retries_total',
-    'loki_write_dropped_entries_total',
+    'loki_write_dropped_entries_total', 'circle_gateway_capacity_used', 'circle_gateway_capacity_limit',
+    'circle_gateway_rejections_total', 'http_requests_total',
   ]) {
     assert.match(joined, new RegExp(metric));
   }

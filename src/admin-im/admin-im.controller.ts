@@ -45,6 +45,17 @@ export class AdminImController {
     response.setHeader('Cache-Control', 'no-store');
     return this.service.messages(req.user.userId, id, dto);
   }
+  @Post(':id/archives/query')
+  @RequireAdminPermission('IM_ARCHIVE_READ')
+  archives(
+    @Param('id', ParseUUIDPipe) id: string,
+    @Body() dto: ImMessageQueryDto,
+    @Req() req: RequestWithUser,
+    @Res({ passthrough: true }) response: Response,
+  ) {
+    response.setHeader('Cache-Control', 'no-store');
+    return this.service.messages(req.user.userId, id, dto, true);
+  }
   @Get(':id/members')
   @RequireAdminPermission('IM_MODERATE')
   members(@Param('id', ParseUUIDPipe) id: string, @Query() query: ImListDto) {

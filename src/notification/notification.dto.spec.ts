@@ -2,6 +2,10 @@ import { plainToInstance } from 'class-transformer';
 import { validateSync } from 'class-validator';
 import { MAX_PAGE } from 'src/common/pagination';
 import {
+  EditSystemAnnouncementDto,
+  AnnouncementScrollingDto,
+  PublishSystemAnnouncementDto,
+  mapNotificationRealtimeDto,
   NotificationListQueryDto,
   NotificationPageQueryDto,
   RegisterPushTokenDto,
@@ -215,4 +219,78 @@ describe('notification page bound', () => {
         .sort(),
     ).toEqual(['cursorMode']);
   });
+});
+
+describe('announcement title', () => {
+  it('trims and bounds titles while accepting legacy requests without titles', () => {
+    const valid = plainToInstance(PublishSystemAnnouncementDto, {
+      title: '  维护通知  ',
+      content: '正文',
+    });
+    expect(validateSync(valid)).toHaveLength(0);
+    expect(valid.title).toBe('维护通知');
+    for (const title of ['', '   ', 'x'.repeat(101)]) {
+      expect(
+        validateSync(
+          plainToInstance(PublishSystemAnnouncementDto, {
+            title,
+            content: '正文',
+          }),
+        ).map((e) => e.property),
+      ).toContain('title');
+    }
+    expect(
+      validateSync(
+        plainToInstance(PublishSystemAnnouncementDto, {
+          content: '旧客户端正文',
+        }),
+      ),
+    ).toHaveLength(0);
+  });
+  it('returns the announcement title with its notification body', () => {
+    const dto = mapNotificationRealtimeDto({
+      id: 'n',
+      type: 'SYSTEM',
+      content: '公告正文',
+      read: false,
+      createdAt: new Date(),
+      systemAnnouncement: { title: '公告标题' },
+    } as any);
+    expect(dto).toEqual(
+      expect.objectContaining({ title: '公告标题', content: '公告正文' }),
+    );
+  });
+});
+
+it('requires a boolean scrolling setting and does not coerce strings', () => {
+  expect(
+    validateSync(
+      plainToInstance(AnnouncementScrollingDto, { scrolling: false }),
+    ),
+  ).toHaveLength(0);
+  for (const scrolling of ['false', 'true', null, undefined, 1])
+    expect(
+      validateSync(plainToInstance(AnnouncementScrollingDto, { scrolling })),
+    ).not.toHaveLength(0);
+});
+
+it('requires both title and body for announcement edits', () => {
+  for (const fields of [
+    { content: '正文' },
+    { title: '标题' },
+    { title: ' ', content: '正文' },
+    { title: '标题', content: ' ' },
+    { title: 'x'.repeat(101), content: '正文' },
+  ]) {
+    expect(
+      validateSync(plainToInstance(EditSystemAnnouncementDto, fields)),
+    ).not.toHaveLength(0);
+  }
+  const dto = plainToInstance(EditSystemAnnouncementDto, {
+    title: ' 标题 ',
+    content: ' 正文 ',
+  });
+  expect(validateSync(dto)).toHaveLength(0);
+  expect(dto.title).toBe('标题');
+  expect(dto.content).toBe('正文');
 });

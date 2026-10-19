@@ -195,6 +195,8 @@ describe('MembershipAdminService', () => {
         previousExpiresAt: null,
         newExpiresAt: expiresAt,
         benefitTypesSnapshot: [],
+        planId: 'silver',
+        quantity: 1,
         note: 'case approved',
       },
     });
@@ -765,5 +767,190 @@ describe('MembershipAdminService', () => {
     ).resolves.toMatchObject({ replayed: false });
 
     expect(realtime.invalidateUserHotCache).toHaveBeenCalledTimes(2);
+  });
+  it.each([null, new Date('2027-07-20T12:00:00Z')])(
+    'activates daily silver for exactly 24 hours from now, including expired accounts',
+    async (expiresAt) => {
+      tx.user.findUnique.mockResolvedValue(user(expiresAt ? 1 : 0, expiresAt));
+      const result = await service.grant(operatorId, targetId, {
+        targetLevel: 1,
+        planId: 'daily',
+        idempotencyKey,
+      });
+      expect(tx.user.update).toHaveBeenCalledWith({
+        where: { id: targetId },
+        data: { vipLevel: 1, vipExpiresAt: new Date('2027-07-22T12:00:00Z') },
+      });
+      expect(result.grant).toMatchObject({
+        planId: 'daily',
+        newLevel: 1,
+        newExpiresAt: new Date('2027-07-22T12:00:00Z'),
+      });
+    },
+  );
+  it('adds a day after an active silver expiry rather than truncating the existing time', async () => {
+    tx.user.findUnique.mockResolvedValue(
+      user(1, new Date('2027-08-05T12:00:00Z')),
+    );
+    await service.grant(operatorId, targetId, {
+      targetLevel: 1,
+      planId: 'daily',
+      idempotencyKey,
+    });
+    expect(tx.user.update).toHaveBeenCalledWith({
+      where: { id: targetId },
+      data: { vipLevel: 1, vipExpiresAt: new Date('2027-08-06T12:00:00Z') },
+    });
+  });
+  it('rejects daily grants to higher effective tiers or mismatched target levels', async () => {
+    tx.user.findUnique.mockResolvedValue(
+      user(2, new Date('2027-08-05T12:00:00Z')),
+    );
+    await expect(
+      service.grant(operatorId, targetId, {
+        targetLevel: 1,
+        planId: 'daily',
+        idempotencyKey,
+      }),
+    ).rejects.toBeInstanceOf(ConflictException);
+    await expect(
+      service.grant(operatorId, targetId, {
+        targetLevel: 2,
+        planId: 'daily',
+        idempotencyKey,
+      }),
+    ).rejects.toBeInstanceOf(BadRequestException);
+    expect(tx.user.update).not.toHaveBeenCalled();
+  });
+  it('replays daily grants without granting another day and detects monthly/daily key reuse', async () => {
+    tx.membershipGrant.findUnique.mockResolvedValue(
+      existingGrant({
+        newLevel: 1,
+        planId: 'daily',
+        note: null,
+        newExpiresAt: new Date('2027-07-22T12:00:00Z'),
+        benefitGrants: [],
+      }),
+    );
+    expect(
+      await service.grant(operatorId, targetId, {
+        targetLevel: 1,
+        planId: 'daily',
+        idempotencyKey,
+      }),
+    ).toMatchObject({ replayed: true, grant: { planId: 'daily' } });
+    expect(tx.user.update).not.toHaveBeenCalled();
+    await expect(
+      service.grant(operatorId, targetId, { targetLevel: 1, idempotencyKey }),
+    ).rejects.toBeInstanceOf(ConflictException);
+    tx.membershipGrant.findUnique.mockResolvedValue(
+      existingGrant({ newLevel: 1, planId: null, note: null }),
+    );
+    await expect(
+      service.grant(operatorId, targetId, {
+        targetLevel: 1,
+        planId: 'daily',
+        idempotencyKey,
+      }),
+    ).rejects.toBeInstanceOf(ConflictException);
+  });
+  it('does not replace legacy non-expiring silver with a one-day expiry', async () => {
+    tx.user.findUnique.mockResolvedValue(user(1, null));
+    await expect(
+      service.grant(operatorId, targetId, {
+        targetLevel: 1,
+        planId: 'daily',
+        idempotencyKey,
+      }),
+    ).rejects.toBeInstanceOf(ConflictException);
+    expect(tx.user.update).not.toHaveBeenCalled();
+  });
+
+  it.each([1, 30])(
+    'grants exactly %i daily units and persists the quantity',
+    async (quantity) => {
+      tx.user.findUnique.mockResolvedValue(user(0, null));
+      const result = await service.grant(operatorId, targetId, {
+        targetLevel: 1,
+        planId: 'daily',
+        quantity,
+        idempotencyKey,
+      });
+      expect(tx.user.update).toHaveBeenCalledWith({
+        where: { id: targetId },
+        data: {
+          vipLevel: 1,
+          vipExpiresAt: new Date(now.getTime() + quantity * 86400000),
+        },
+      });
+      expect(result.grant.quantity).toBe(quantity);
+      expect(tx.membershipGrant.create).toHaveBeenCalledWith({
+        data: expect.objectContaining({ quantity, planId: 'daily' }),
+      });
+    },
+  );
+  it('appends multiple daily units to an active silver expiry', async () => {
+    const expiry = new Date(now.getTime() + 2 * 86400000);
+    tx.user.findUnique.mockResolvedValue(user(1, expiry));
+    await service.grant(operatorId, targetId, {
+      targetLevel: 1,
+      planId: 'daily',
+      quantity: 7,
+      idempotencyKey,
+    });
+    expect(tx.user.update).toHaveBeenCalledWith({
+      where: { id: targetId },
+      data: {
+        vipLevel: 1,
+        vipExpiresAt: new Date(now.getTime() + 9 * 86400000),
+      },
+    });
+  });
+  it.each([0, 31, 1.5, -1, NaN])(
+    'rejects invalid daily quantity %s before creating a grant',
+    async (quantity) => {
+      await expect(
+        service.grant(operatorId, targetId, {
+          targetLevel: 1,
+          planId: 'daily',
+          quantity,
+          idempotencyKey,
+        }),
+      ).rejects.toBeInstanceOf(BadRequestException);
+      expect(tx.membershipGrant.create).not.toHaveBeenCalled();
+    },
+  );
+  it('rejects quantities for non-daily plans', async () => {
+    await expect(
+      service.grant(operatorId, targetId, {
+        targetLevel: 1,
+        quantity: 2,
+        idempotencyKey,
+      }),
+    ).rejects.toBeInstanceOf(BadRequestException);
+  });
+  it('replays the same quantity once and rejects quantity changes under the same key', async () => {
+    tx.membershipGrant.findUnique.mockResolvedValue(
+      existingGrant({ planId: 'daily', newLevel: 1, quantity: 7, note: null }),
+    );
+    expect(
+      (
+        await service.grant(operatorId, targetId, {
+          targetLevel: 1,
+          planId: 'daily',
+          quantity: 7,
+          idempotencyKey,
+        })
+      ).replayed,
+    ).toBe(true);
+    await expect(
+      service.grant(operatorId, targetId, {
+        targetLevel: 1,
+        planId: 'daily',
+        quantity: 8,
+        idempotencyKey,
+      }),
+    ).rejects.toBeInstanceOf(ConflictException);
+    expect(tx.membershipGrant.create).not.toHaveBeenCalled();
   });
 });

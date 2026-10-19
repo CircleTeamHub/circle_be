@@ -373,29 +373,34 @@ enum AdminGroupOperationStatus {
 // ─── Core Models ──────────────────────────────────────────────────────────────
 
 model User {
-  id                           String     @id @default(uuid())
-  accountId                    String     @unique
-  inviteCode                   String     @unique
+  consoleEvents                ConsoleEvent[]
+  consoleInstallations         AppInstallation[]
+  consoleApiKeys               ConsoleApiKey[]
+  encryptionRecovery           E2eeRecovery[]
+  id                           String            @id @default(uuid())
+  accountId                    String            @unique
+  inviteCode                   String            @unique
   invitedByUserId              String?
+  mustChangePassword           Boolean           @default(false)
   passwordHash                 String
   loginSecurityCodeHash        String?
-  securityCodeAttempts         Int        @default(0)
+  securityCodeAttempts         Int               @default(0)
   securityCodeLockedUntil      DateTime?
   // Admin console brute-force lockout (#83) — mirrors the security-code pair.
-  adminLoginAttempts           Int        @default(0)
+  adminLoginAttempts           Int               @default(0)
   adminLoginLockedUntil        DateTime?
-  singleDeviceLoginEnabled     Boolean    @default(false)
+  singleDeviceLoginEnabled     Boolean           @default(false)
   /// 圈子通知「离线提醒」：APP 离线时是否向该用户投递 CIRCLE_* 推送。
   /// 默认 true —— 与既有行为一致（此前推送不读任何用户偏好，人人都收）。
   /// 客户端的总闸关掉时也会把这里同步成 false，服务端只认这一个值。
-  circleOfflinePushEnabled     Boolean    @default(true)
+  circleOfflinePushEnabled     Boolean           @default(true)
   nickname                     String
   avatarUrl                    String?
   avatarFrame                  String?
   selectedAvatarFrameID        String?
   selectedAvatarFrameExpiresAt DateTime?
   cover                        String?
-  email                        String?    @unique
+  email                        String?           @unique
   phoneNumber                  String?
   wechat                       String?
   qq                           String?
@@ -405,26 +410,26 @@ model User {
   birthday                     DateTime?
   city                         String?
   region                       String?
-  gender                       Gender     @default(unset)
-  role                         UserRole   @default(USER)
-  status                       UserStatus @default(ACTIVE)
+  gender                       Gender            @default(unset)
+  role                         UserRole          @default(USER)
+  status                       UserStatus        @default(ACTIVE)
   /// Timestamp of the last operation that invalidated every access token.
   /// This is the durable fallback when Redis revocation markers are unavailable.
   accessTokensRevokedAt        DateTime?
-  vipLevel                     Int        @default(0)
+  vipLevel                     Int               @default(0)
   vipExpiresAt                 DateTime?
-  creditScore                  Int        @default(100)
-  fancyNumber                  Boolean    @default(false)
+  creditScore                  Int               @default(100)
+  fancyNumber                  Boolean           @default(false)
   fancyNumberExpiresAt         DateTime?
-  fancyNumberPermanent         Boolean    @default(false)
-  iconPreferencesInitialized   Boolean    @default(false)
+  fancyNumberPermanent         Boolean           @default(false)
+  iconPreferencesInitialized   Boolean           @default(false)
   lastOnline                   DateTime?
   /// Set once the one-time friend-activity backfill has run for this user.
   activitiesBackfilledAt       DateTime?
   /// 收到的累计点赞总数（每人对其每天最多 +1），达阈值发放合作达人徽章。
-  receivedLikeCount            Int        @default(0)
-  createdAt                    DateTime   @default(now())
-  updatedAt                    DateTime   @updatedAt
+  receivedLikeCount            Int               @default(0)
+  createdAt                    DateTime          @default(now())
+  updatedAt                    DateTime          @updatedAt
 
   refreshTokens                     RefreshToken[]
   sessionScopeGenerations           SessionScopeGeneration[]
@@ -567,6 +572,10 @@ model UserAvatarFrameGrant {
 }
 
 model MembershipGrant {
+  /// Daily-plan units; historical and non-daily grants use one.
+  quantity               Int                     @default(1)
+  /// Purchase duration variant; null means the historical level-based plan.
+  planId                 String?
   id                     String                  @id @default(uuid())
   idempotencyKey         String                  @unique
   targetUserID           String
@@ -1814,6 +1823,9 @@ model SystemAnnouncement {
   id                 String    @id @default(uuid())
   idempotencyKey     String    @unique
   requestFingerprint String
+  title              String?
+  scrolling          Boolean   @default(false)
+  deletedAt          DateTime?
   operatorID         String
   content            String
   createdAt          DateTime  @default(now())
@@ -1827,20 +1839,21 @@ model SystemAnnouncement {
 }
 
 model NotificationPushOutbox {
-  id             String                       @id @default(uuid())
-  notificationID String                       @unique
-  status         NotificationPushOutboxStatus @default(PENDING)
-  leaseToken     String?
-  attempts       Int                          @default(0)
-  lastError      String?
-  nextAttemptAt  DateTime                     @default(now())
-  lockedAt       DateTime?
-  processedAt    DateTime?
+  id               String                       @id @default(uuid())
+  notificationID   String                       @unique
+  status           NotificationPushOutboxStatus @default(PENDING)
+  leaseToken       String?
+  attempts         Int                          @default(0)
+  lastError        String?
+  nextAttemptAt    DateTime                     @default(now())
+  lockedAt         DateTime?
+  completionReason String?
+  processedAt      DateTime?
   /// Immutable snapshot of the composed push payload (#88) — retries resend
   /// exactly what was originally composed instead of re-reading live rows.
-  payload        Json?
-  createdAt      DateTime                     @default(now())
-  updatedAt      DateTime                     @updatedAt
+  payload          Json?
+  createdAt        DateTime                     @default(now())
+  updatedAt        DateTime                     @updatedAt
 
   notification Notification               @relation(fields: [notificationID], references: [id], onDelete: Cascade)
   deliveries   NotificationPushDelivery[]
@@ -2335,6 +2348,8 @@ enum ChatMemberRole {
 /// userID 类字段一律不建 User 外键 —— 聊天行是高频写入的历史数据，
 /// 不随账号删除级联清除（保留群聊上下文；同 SensitiveWord.createdBy 先例）。
 model ChatConversation {
+  textEncryption         String               @default("PLAIN")
+  encryptionRoom         E2eeRoom?
   id                     String               @id @default(uuid())
   type                   ChatConversationType
   /// DIRECT 会话防重键：两个 userID 升序以 ':' 拼接；其余类型为 null。
@@ -2357,25 +2372,25 @@ model ChatConversation {
   /// 独立群聊头像（圈子群走 Circle.avatarUrl）；只接受本应用存储的 URL。
   avatarUrl              String?
   /// 独立群聊:普通成员能否拉好友进群（圈子群看 Circle.memberCanInvite）。
-  memberCanInvite Boolean @default(true)
+  memberCanInvite        Boolean              @default(true)
   /// 群二维码能否入群（两种群）；false 时签发群码与扫码入群一律拒绝。
-  qrJoinEnabled Boolean @default(true)
-  cardJoinEnabled Boolean @default(true)
-  joinApprovalRequired Boolean @default(true)
+  qrJoinEnabled          Boolean              @default(true)
+  cardJoinEnabled        Boolean              @default(true)
+  joinApprovalRequired   Boolean              @default(true)
   /// 普通成员能否从群里打开其他成员的资料（两种群;群主/管理员不受限）。
   /// DB 默认**关**:圈子成员目录原本只对圈主/管理员开放,漏写的行只能更严不能更松
   /// (蓝绿窗口里老二进制建的圈子会话也会落在这个默认上)。
   /// 独立群聊在 createGroupConversation 里显式写 true。
-  membersCanViewProfiles Boolean @default(false)
+  membersCanViewProfiles Boolean              @default(false)
   /// 普通成员能否看到群成员名单本身（两种群;群主/管理员不受限）。
   /// 与 membersCanViewProfiles 分开:看不到名单的人仍可能在聊天里点到某人的头像,
   /// 那一层由 membersCanViewProfiles 单独把关。默认同样是关,理由同上。
-  membersCanViewRoster Boolean @default(false)
+  membersCanViewRoster   Boolean              @default(false)
   /// 普通成员能否通过群加其他成员为好友（两种群;群主/管理员不受限）。
-  membersCanAddFriends Boolean @default(true)
-  /// 会话级阅后即焚秒数（S-01）：任一方设置双方生效；null=关。到期由 sweeper 真删。
+  membersCanAddFriends   Boolean              @default(true)
+  /// 旧共享焚毁字段，仅保留迁移兼容；当前策略存于 ChatMember。
   burnDurationSec        Int?
-  /// 本轮焚毁策略开启时刻；之前的消息不属于本轮焚毁范围。
+  /// 旧共享策略开启时刻，当前读取与清理不使用。
   burnStartedAt          DateTime?
   /// height 计数器（G-05）：最后已分配的 height。取号 = SELECT..FOR UPDATE 行锁下 +1；
   /// 迁移时必须回填成 MAX(height)，默认 0 会撞 (conversationID, height) 唯一约束。
@@ -2423,6 +2438,9 @@ model ChatConversation {
 /// 会话成员。成员行的存在即成员资格（发送/收取的授权来源）；
 /// pinned/muted 是每成员的会话偏好（原 OpenIM 会话属性）。
 model ChatMember {
+  /// 本人发送的新消息的焚毁时长；不影响其他成员。
+  burnDurationSec     Int?
+  burnStartedAt       DateTime?
   id                  String         @id @default(uuid())
   conversationID      String
   userID              String
@@ -2495,6 +2513,9 @@ model ChatGroupEvent {
 }
 
 model ChatMessage {
+  /// 发送时决定时长；单聊对方首次已读后固定期限，群聊仍从发送起算。
+  burnDurationSec Int?
+  burnExpiresAt   DateTime?
   id              String    @id @default(uuid())
   conversationID  String
   height          Int
@@ -2527,6 +2548,7 @@ model ChatMessage {
   createdAt       DateTime  @default(now())
 
   conversation       ChatConversation        @relation(fields: [conversationID], references: [id], onDelete: Cascade)
+  encryptionArchives E2eeArchive[]
   reactions          ChatMessageReaction[]
   mediaReferences    ChatMediaReference[]
   directAutoReplyJob ChatDirectAutoReplyJob? @relation("directAutoReplySource")
@@ -2724,4 +2746,207 @@ model GroupAdmissionDelivery {
 
   @@unique([admissionID, recipientID, event])
   @@index([deliveredAt, nextAttemptAt])
+}
+
+/// Public encryption identities only. Private material remains on devices.
+model E2eeDevice {
+  id                String           @id
+  userID            String
+  purpose           String
+  publicKey         String           @unique
+  label             String
+  status            String           @default("PENDING")
+  approvedByID      String?
+  approvalSignature String?
+  revokedAt         DateTime?
+  createdAt         DateTime         @default(now())
+  packages          E2eeKeyPackage[]
+  seats             E2eeRoomDevice[]
+
+  @@index([userID, purpose, status])
+}
+
+model E2eeKeyPackage {
+  id        String     @id
+  deviceID  String
+  encoded   String
+  signature String
+  claimedBy String?
+  createdAt DateTime   @default(now())
+  device    E2eeDevice @relation(fields: [deviceID], references: [id], onDelete: Cascade)
+
+  @@index([deviceID, claimedBy])
+}
+
+model E2eeRoom {
+  conversationID  String           @id
+  conversation    ChatConversation @relation(fields: [conversationID], references: [id], onDelete: Cascade)
+  managerDeviceID String
+  epoch           Int              @default(0)
+  createdAt       DateTime         @default(now())
+  devices         E2eeRoomDevice[]
+  events          E2eeEpochEvent[]
+}
+
+model E2eeRoomDevice {
+  conversationID String
+  deviceID       String
+  joinedEpoch    Int
+  removedEpoch   Int?
+  room           E2eeRoom   @relation(fields: [conversationID], references: [conversationID], onDelete: Cascade)
+  device         E2eeDevice @relation(fields: [deviceID], references: [id], onDelete: Cascade)
+
+  @@id([conversationID, deviceID])
+  @@index([deviceID, removedEpoch])
+}
+
+model E2eeEpochEvent {
+  id             String   @id
+  conversationID String
+  epoch          Int
+  packet         Json
+  requestHash    String
+  createdAt      DateTime @default(now())
+  room           E2eeRoom @relation(fields: [conversationID], references: [conversationID], onDelete: Cascade)
+
+  @@unique([conversationID, epoch])
+}
+
+/// Public recovery credential only; the secret stays on authorized devices/offline.
+model E2eeRecovery {
+  user      User          @relation(fields: [userID], references: [id], onDelete: Cascade)
+  id        String        @id
+  userID    String
+  purpose   String
+  publicKey String
+  createdAt DateTime      @default(now())
+  archives  E2eeArchive[]
+
+  @@unique([userID, purpose])
+}
+
+/// Per-account ciphertext archive, tied to the original message retention lifecycle.
+model E2eeArchive {
+  cursor     BigInt @unique @default(autoincrement())
+  id         String       @id
+  recoveryID String
+  messageID  String
+  ciphertext String
+  recovery   E2eeRecovery @relation(fields: [recoveryID], references: [id], onDelete: Cascade)
+  message    ChatMessage  @relation(fields: [messageID], references: [id], onDelete: Cascade)
+
+  @@unique([recoveryID, messageID])
+  @@index([recoveryID, cursor])
+  @@index([messageID])
+}
+
+model ConsoleEvent {
+  id         String   @id @default(uuid())
+  userID     String
+  name       String
+  source     String   @default("SERVER")
+  entityType String?
+  entityID   String?
+  platform   String?
+  appVersion String?
+  createdAt  DateTime @default(dbgenerated("(CURRENT_TIMESTAMP AT TIME ZONE 'UTC'::text)"))
+  user       User     @relation(fields: [userID], references: [id], onDelete: Cascade)
+
+  @@index([userID, createdAt, id])
+  @@index([name, createdAt])
+  @@index([createdAt])
+}
+
+model AppInstallation {
+  id         String   @id @default(uuid())
+  userID     String
+  deviceKey  String
+  platform   String
+  appVersion String
+  build      Int
+  channel    String   @default("stable")
+  lastSeenAt DateTime @default(dbgenerated("(CURRENT_TIMESTAMP AT TIME ZONE 'UTC'::text)"))
+  user       User     @relation(fields: [userID], references: [id], onDelete: Cascade)
+
+  @@unique([userID, deviceKey])
+  @@index([platform, channel, build])
+}
+
+model ConsoleApiKey {
+  id         String    @id @default(uuid())
+  userID     String
+  name       String
+  prefix     String
+  secretHash String    @unique
+  scopes     String[]
+  expiresAt  DateTime
+  revokedAt  DateTime?
+  lastUsedAt DateTime?
+  createdAt  DateTime  @default(dbgenerated("(CURRENT_TIMESTAMP AT TIME ZONE 'UTC'::text)"))
+  user       User      @relation(fields: [userID], references: [id], onDelete: Cascade)
+
+  @@index([userID, createdAt])
+}
+
+model ConsoleRelease {
+  id          String               @id @default(uuid())
+  platform    String
+  channel     String
+  version     String
+  build       Int
+  url         String
+  sha256      String
+  sizeBytes   Int
+  notes       String
+  withdrawnAt DateTime?
+  createdAt   DateTime             @default(dbgenerated("(CURRENT_TIMESTAMP AT TIME ZONE 'UTC'::text)"))
+  plans       ConsoleReleasePlan[]
+
+  @@unique([platform, channel, build])
+}
+
+model ConsoleReleasePlan {
+  id         String         @id @default(uuid())
+  releaseID  String
+  rollout    Int
+  minBuild   Int
+  maxBuild   Int
+  forceBelow Int
+  startsAt   DateTime
+  endsAt     DateTime
+  enabled    Boolean        @default(true)
+  version    Int            @default(1)
+  createdAt  DateTime       @default(dbgenerated("(CURRENT_TIMESTAMP AT TIME ZONE 'UTC'::text)"))
+  release    ConsoleRelease @relation(fields: [releaseID], references: [id], onDelete: Restrict)
+
+  @@index([enabled, startsAt, endsAt])
+}
+
+model ConsolePushSettings {
+  id        String   @id @default("global")
+  enabled   Boolean  @default(true)
+  version   Int      @default(1)
+  updatedAt DateTime @default(dbgenerated("(CURRENT_TIMESTAMP AT TIME ZONE 'UTC'::text)")) @updatedAt
+}
+
+model ConsoleCollectionState {
+  id        String   @id @default("global")
+  startedAt DateTime @default(dbgenerated("(CURRENT_TIMESTAMP AT TIME ZONE 'UTC'::text)"))
+}
+
+/// Administrator-only snapshots of burned messages. No relation/cascade into user history.
+model ChatBurnArchive {
+  id String @id
+  conversationID String
+  senderID String?
+  clientMessageId String?
+  height Int
+  type String
+  content Json
+  createdAt DateTime
+  burnExpiresAt DateTime
+  burnDurationSec Int?
+  retainUntil DateTime
+  @@index([conversationID, height])
+  @@index([retainUntil, id])
 }

@@ -1,8 +1,10 @@
+import { ChatService } from 'src/chat/chat.service';
 import { Test, TestingModule } from '@nestjs/testing';
 import * as notePurge from './note-purge';
 import {
   BadRequestException,
   ConflictException,
+  ForbiddenException,
   Logger,
   NotFoundException,
   ServiceUnavailableException,
@@ -99,6 +101,7 @@ describe('NoteService', () => {
     },
   };
 
+  const chatService = { requireVisibleMessage: jest.fn() };
   const uploadService = {
     uploadBuffer: jest.fn(),
     downloadObjectBuffer: jest.fn(),
@@ -114,6 +117,17 @@ describe('NoteService', () => {
 
   beforeEach(async () => {
     jest.clearAllMocks();
+    chatService.requireVisibleMessage.mockReset();
+    chatService.requireVisibleMessage.mockResolvedValue({
+      row: {
+        id: 'msg-abc',
+        conversationID: 'sg_123',
+        senderID: 'user-2',
+        type: 'note-card',
+        content: { noteId: 'note-src' },
+      },
+      conversation: { id: 'sg_123', type: 'GROUP', circleID: 'g-1' },
+    });
     // 收录链查来源（where.id.in）默认查到上架中的原笔记：现在「查过却查不到」
     // 等于原笔记已被永久删除（副本跟着不可分发），老用例没桩来源时不能被误判。
     // 关心来源状态的用例自己覆盖。
@@ -190,6 +204,7 @@ describe('NoteService', () => {
     const module: TestingModule = await Test.createTestingModule({
       providers: [
         NoteService,
+        { provide: ChatService, useValue: chatService },
         MembershipPolicyService,
         { provide: MembershipProgramService, useValue: membershipProgram },
         { provide: PrismaService, useValue: prisma },
@@ -2296,6 +2311,7 @@ describe('NoteService', () => {
         ),
       } as any,
       new MembershipPolicyService(prisma as any),
+      chatService as any,
       uploadService as any,
     );
 
@@ -2599,6 +2615,7 @@ describe('NoteService', () => {
         get: jest.fn(() => null),
       } as any,
       new MembershipPolicyService(prisma as any),
+      chatService as any,
       uploadService as any,
       realtime as any,
     );
@@ -2850,6 +2867,7 @@ describe('NoteService', () => {
         ),
       } as any,
       new MembershipPolicyService(prisma as any),
+      chatService as any,
     );
 
     const result = await serviceWithBase.createShareLink('user-1', {
@@ -2999,6 +3017,7 @@ describe('NoteService', () => {
         ),
       } as any,
       new MembershipPolicyService(isolatedPrisma as any),
+      chatService as any,
     );
 
     const rejection = await serviceWithoutBase
@@ -3076,6 +3095,7 @@ describe('NoteService', () => {
         get: jest.fn(() => 'http://10.0.0.195:9000'),
       } as any,
       new MembershipPolicyService(prisma as any),
+      chatService as any,
     );
 
     await expect(
@@ -3101,6 +3121,7 @@ describe('NoteService', () => {
         get: jest.fn(() => 'http://10.0.0.195:9000'),
       } as any,
       new MembershipPolicyService(prisma as any),
+      chatService as any,
     );
     prisma.note.create.mockResolvedValueOnce({ id: 'note-1' });
     prisma.note.update.mockResolvedValueOnce({
@@ -3147,6 +3168,7 @@ describe('NoteService', () => {
         ),
       } as any,
       new MembershipPolicyService(prisma as any),
+      chatService as any,
     );
     prisma.note.create.mockResolvedValueOnce({ id: 'note-1' });
     prisma.note.update.mockResolvedValueOnce({
@@ -3230,6 +3252,7 @@ describe('NoteService', () => {
         ),
       } as any,
       new MembershipPolicyService(prisma as any),
+      chatService as any,
     );
     prisma.note.create.mockResolvedValueOnce({ id: 'note-1' });
     prisma.note.update.mockResolvedValueOnce({
@@ -3898,6 +3921,62 @@ describe('NoteService', () => {
     ],
   };
 
+  it.each([
+    new NotFoundException('cleared or burned'),
+    new NotFoundException('deleted or revoked'),
+    new ForbiddenException('not a current member'),
+  ])(
+    'does not read private message snapshots or create a copy after chat denies access',
+    async (error) => {
+      prisma.note.findFirst.mockResolvedValueOnce(otherUsersNote);
+      chatService.requireVisibleMessage.mockRejectedValueOnce(error);
+      await expect(
+        service.collectNote('user-1', {
+          noteId: 'note-src',
+          source: collectSource,
+        }),
+      ).rejects.toBe(error);
+      expect(chatService.requireVisibleMessage).toHaveBeenCalledWith(
+        'user-1',
+        'msg-abc',
+      );
+      expect(prisma.note.create).not.toHaveBeenCalled();
+    },
+  );
+  it.each([
+    { conversationID: 'private-other' },
+    { type: 'text' },
+    {
+      content: {
+        noteId: 'other-note',
+        personalCardSnapshot: { id: 'user-2', name: 'private' },
+      },
+    },
+  ])(
+    'rejects a visible message that is not the requested note source: %j',
+    async (change) => {
+      prisma.note.findFirst.mockResolvedValueOnce(otherUsersNote);
+      chatService.requireVisibleMessage.mockResolvedValueOnce({
+        row: {
+          id: 'msg-abc',
+          conversationID: 'sg_123',
+          senderID: 'user-2',
+          type: 'note-card',
+          content: { noteId: 'note-src' },
+          ...change,
+        },
+        conversation: { id: 'sg_123', type: 'GROUP', circleID: 'g-1' },
+      });
+      await expect(
+        service.collectNote('user-1', {
+          noteId: 'note-src',
+          source: collectSource,
+        }),
+      ).rejects.toBeInstanceOf(NotFoundException);
+      expect(prisma.note.create).not.toHaveBeenCalled();
+    },
+  );
+
   it('collectNote snapshots another user note into my notes with source card', async () => {
     prisma.note.findFirst
       .mockResolvedValueOnce(otherUsersNote) // 源笔记可读
@@ -4330,6 +4409,16 @@ describe('NoteService', () => {
     );
 
     it('collectNote still allows a CLOSED source and copies its work status', async () => {
+      chatService.requireVisibleMessage.mockResolvedValueOnce({
+        row: {
+          id: 'msg-abc',
+          conversationID: 'sg_123',
+          senderID: 'user-2',
+          type: 'note-card',
+          content: { noteId: 'relay-copy' },
+        },
+        conversation: { id: 'sg_123', type: 'GROUP', circleID: 'g-1' },
+      });
       prisma.note.findFirst
         .mockResolvedValueOnce(relayCopy)
         .mockResolvedValueOnce(null);
@@ -4494,6 +4583,7 @@ describe('NoteService', () => {
         ),
       } as any,
       new MembershipPolicyService(prisma as any),
+      chatService as any,
       uploadService as any,
     );
     mockCollectWrites();
@@ -4836,6 +4926,7 @@ describe('NoteService', () => {
         isolatedPrisma as any,
         { get: jest.fn(() => null) } as any,
         new MembershipPolicyService(isolatedPrisma as any),
+        chatService as any,
       );
       prisma.noteShareLink.findUnique.mockResolvedValueOnce(null as never);
 
@@ -5100,6 +5191,7 @@ describe('NoteService', () => {
           ),
         } as any,
         new MembershipPolicyService(prisma as any),
+        chatService as any,
       );
 
       const result = await serviceWithBase.listShareLinks('user-1', {});
@@ -5826,6 +5918,7 @@ describe('NoteService', () => {
       const module: TestingModule = await Test.createTestingModule({
         providers: [
           NoteService,
+          { provide: ChatService, useValue: chatService },
           MembershipPolicyService,
           { provide: MembershipProgramService, useValue: membershipProgram },
           { provide: PrismaService, useValue: prisma },

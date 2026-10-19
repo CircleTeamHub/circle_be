@@ -52,6 +52,16 @@ describe('RealtimeService', () => {
     },
   };
 
+  it('invalidates badge cache and sends a content-free announcement refresh event', async () => {
+    const broadcast = jest.spyOn(service, 'broadcast').mockImplementation();
+    await service.broadcastAnnouncementChanged('user-a');
+    expect(redis.invalidateVersionedKey).toHaveBeenCalled();
+    expect(broadcast).toHaveBeenCalledWith('user-a', {
+      type: 'system.announcement.changed',
+      payload: { changedAt: expect.any(String) },
+    });
+  });
+
   beforeEach(async () => {
     jest.clearAllMocks();
     redis.isEnabled.mockReturnValue(true);

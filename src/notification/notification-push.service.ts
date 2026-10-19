@@ -166,7 +166,10 @@ export class NotificationPushService {
           notification.fromTrace?.excerpt ||
           this.fallbackBody(notification.type);
     return {
-      title: notification.type === 'SYSTEM' ? '系统通知' : actor,
+      title:
+        notification.type === 'SYSTEM'
+          ? notification.title || '系统通知'
+          : actor,
       body: truncateUtf8(body, MAX_PUSH_BODY_BYTES),
       data: {
         notificationId: notification.id,

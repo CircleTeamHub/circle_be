@@ -8,6 +8,8 @@ export const CHAT_EVENTS = {
   send: 'chat:send',
   /** 双向:客户端上报已读水位(带 ack);服务端广播成员已读推进 */
   read: 'chat:read',
+  /** Server expiry update; fetch the revision stream. */
+  burnStarted: 'chat:burn_started',
   /** 双向:正在输入 */
   typing: 'chat:typing',
   /** 服务端 → 客户端:新消息 */
@@ -84,6 +86,7 @@ export const conversationRoom = (conversationId: string): string =>
  * 同理(目前没有生产者,但语义属同一类,先按服务端专属收口,免得日后接线时漏掉)。
  */
 export const CLIENT_MESSAGE_TYPES = [
+  'encrypted-text',
   'text',
   'quote',
   'image',
