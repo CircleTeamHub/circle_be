@@ -26,4 +26,26 @@ describe('membership DTOs', () => {
     expect(levelErrors(4)).toHaveLength(0);
     expect(levelErrors(5).length).toBeGreaterThan(0);
   });
+  it('accepts only the explicitly supported daily plan selector', () => {
+    const payload = {
+      targetLevel: 1,
+      idempotencyKey: '3fa85f64-5717-4562-b3fc-2c963f66afa6',
+    };
+    expect(
+      validateSync(
+        plainToInstance(CreateMembershipGrantDto, {
+          ...payload,
+          planId: 'daily',
+        }),
+      ),
+    ).toHaveLength(0);
+    expect(
+      validateSync(
+        plainToInstance(CreateMembershipGrantDto, {
+          ...payload,
+          planId: 'unlimited',
+        }),
+      ).some((e) => e.property === 'planId'),
+    ).toBe(true);
+  });
 });

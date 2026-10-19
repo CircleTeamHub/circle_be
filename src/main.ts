@@ -6,6 +6,7 @@ import { getStartupErrorAggregation } from './startup-instrumentation';
 import { flushWithDeadline } from './logging/error-aggregation.service';
 import 'module-alias/register';
 import { NestFactory } from '@nestjs/core';
+import type { NestExpressApplication } from '@nestjs/platform-express';
 import { DocumentBuilder, SwaggerModule } from '@nestjs/swagger';
 import { AppModule } from './app.module';
 import { setupApp } from './setup';
@@ -34,49 +35,13 @@ export function resolveAppPort(value: unknown): number {
   });
 }
 
-type CorsOriginCallback = (err: Error | null, allow?: boolean) => void;
+import { resolveCorsOriginChecker } from './config/cors-origin';
+export { resolveCorsOriginChecker } from './config/cors-origin';
 
-// Dev/test: also allow localhost/loopback on any port. Avoid `cors: true`
-// (reflect-any-origin) which lets any page on the LAN ride the user's
-// credentials.
-const DEV_ORIGIN_PATTERNS: RegExp[] = [
-  // Fixed allowlist regexes for local/dev CORS origins.
-  // eslint-disable-next-line security/detect-unsafe-regex
-  /^https?:\/\/localhost(:\d+)?$/,
-  // eslint-disable-next-line security/detect-unsafe-regex
-  /^https?:\/\/127\.0\.0\.1(:\d+)?$/,
-  // eslint-disable-next-line security/detect-unsafe-regex
-  /^https?:\/\/\[::1\](:\d+)?$/,
-  // eslint-disable-next-line security/detect-unsafe-regex
-  /^https?:\/\/10\.\d+\.\d+\.\d+(:\d+)?$/,
-  // eslint-disable-next-line security/detect-unsafe-regex
-  /^https?:\/\/192\.168\.\d+\.\d+(:\d+)?$/,
-];
-
-export function resolveCorsOriginChecker(
-  env: NodeJS.ProcessEnv = process.env,
-): (origin: string | undefined, callback: CorsOriginCallback) => void {
-  // Every env read below happens per request, not at factory time. This factory
-  // runs from buildNestFactoryOptions() — i.e. while evaluating the arguments to
-  // NestFactory.create(), before ConfigModule has loaded `.env.<NODE_ENV>` into
-  // process.env. Reading eagerly froze the allowlist as empty in production,
-  // which silently blocks every browser origin.
-  return (origin, callback) => {
-    // Same-origin / curl / mobile webviews have no Origin header — allow.
-    if (!origin) return callback(null, true);
-
-    const allowedOrigins = (env.ALLOWED_ORIGINS ?? '')
-      .split(',')
-      .map((o) => o.trim())
-      .filter(Boolean);
-    if (allowedOrigins.includes(origin)) return callback(null, true);
-
-    const isProduction = env.NODE_ENV === 'production';
-    if (!isProduction && DEV_ORIGIN_PATTERNS.some((re) => re.test(origin))) {
-      return callback(null, true);
-    }
-    return callback(new Error(`CORS blocked: ${origin}`), false);
-  };
+export function configureHttpBodyParser(
+  app: Pick<NestExpressApplication, 'useBodyParser'>,
+) {
+  app.useBodyParser('json', { limit: '2mb' });
 }
 
 export function buildNestFactoryOptions() {
@@ -248,7 +213,11 @@ async function bootstrap() {
   const config = getServerConfig();
   const isProduction = process.env.NODE_ENV === 'production';
 
-  const app = await NestFactory.create(AppModule, buildNestFactoryOptions());
+  const app = await NestFactory.create<NestExpressApplication>(
+    AppModule,
+    buildNestFactoryOptions(),
+  );
+  configureHttpBodyParser(app);
   const errorAggregation = setupApp(app);
 
   if (!isProduction) {

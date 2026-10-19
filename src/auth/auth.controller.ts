@@ -1,3 +1,4 @@
+import { AnonymousAccess } from 'src/guards/anonymous-access.decorator';
 import { UserThrottlerGuard } from 'src/guards/user-throttler.guard';
 import {
   Body,
@@ -109,6 +110,7 @@ export class AuthController {
     return null;
   }
 
+  @AnonymousAccess('Account registration')
   @Post('register')
   @ApiOperation({ summary: 'Register a new user' })
   @ApiBody({ type: RegisterDto })
@@ -125,6 +127,7 @@ export class AuthController {
     return this.authService.register(dto, getSessionContext(req));
   }
 
+  @AnonymousAccess('Password login')
   @Post('login')
   @ApiOperation({ summary: 'Login with email or user ID and password' })
   @ApiBody({ type: LoginDto })
@@ -141,6 +144,7 @@ export class AuthController {
     return this.authService.login(dto, getSessionContext(req));
   }
 
+  @AnonymousAccess('One-time trusted-device code')
   @Post('login-challenges/:challengeId/verify')
   @UseGuards(ThrottlerGuard)
   @Throttle({ default: { limit: 10, ttl: 60_000 } })
@@ -162,6 +166,7 @@ export class AuthController {
     );
   }
 
+  @AnonymousAccess('Login challenge and security code')
   @Post('login-challenges/:challengeId/security-code')
   @UseGuards(ThrottlerGuard)
   @Throttle({ default: { limit: 10, ttl: 60_000 } })
@@ -183,6 +188,7 @@ export class AuthController {
     );
   }
 
+  @AnonymousAccess('Device-bound login challenge')
   @Post('login-challenges/:challengeId/resend')
   @UseGuards(ThrottlerGuard)
   @Throttle({ default: { limit: 10, ttl: 60_000 } })
@@ -198,6 +204,7 @@ export class AuthController {
     );
   }
 
+  @AnonymousAccess('Device-bound login challenge')
   @Get('login-challenges/:challengeId/status')
   // 状态每几秒就变，绝不能被任何一层缓存。
   @Header('Cache-Control', 'no-store')
@@ -262,6 +269,7 @@ export class AuthController {
     );
   }
 
+  @AnonymousAccess('Admin password login')
   @Post('admin/login')
   @UseGuards(ThrottlerGuard)
   @Throttle({ default: { limit: 10, ttl: 60_000 } })
@@ -283,6 +291,7 @@ export class AuthController {
     return this.authService.adminLogin(dto, getSessionContext(req));
   }
 
+  @AnonymousAccess('Refresh token credential')
   @Post('refresh')
   @ApiOperation({ summary: 'Refresh an access token' })
   @ApiBody({ type: RefreshTokenDto })
@@ -299,6 +308,7 @@ export class AuthController {
     return this.authService.refresh(dto.refreshToken, getSessionContext(req));
   }
 
+  @AnonymousAccess('Admin refresh token credential')
   @Post('admin/refresh')
   @ApiOperation({ summary: 'Refresh an admin web access token' })
   @ApiBody({ type: RefreshTokenDto })
@@ -318,6 +328,7 @@ export class AuthController {
     );
   }
 
+  @AnonymousAccess('Refresh token revocation')
   @Post('logout')
   @ApiOperation({ summary: 'Logout and revoke a refresh token' })
   @ApiBody({ type: RefreshTokenDto })
@@ -405,6 +416,7 @@ export class AuthController {
     );
   }
 
+  @AnonymousAccess('Password recovery request')
   @Post('password/reset-request')
   @UseGuards(ThrottlerGuard)
   @Throttle({ default: { limit: 5, ttl: 60_000 } })
@@ -417,6 +429,7 @@ export class AuthController {
     return this.authService.requestPasswordReset(dto.email);
   }
 
+  @AnonymousAccess('Password recovery code')
   @Post('password/reset')
   @UseGuards(ThrottlerGuard)
   @Throttle({ default: { limit: 10, ttl: 60_000 } })

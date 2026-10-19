@@ -7,6 +7,11 @@ import {
   Body,
   Controller,
   Headers,
+  Get,
+  Delete,
+  Patch,
+  Param,
+  ParseUUIDPipe,
   Post,
   Req,
   UseGuards,
@@ -23,6 +28,8 @@ import { AdminGuard } from 'src/guards/admin.guard';
 import { JwtGuard } from 'src/guards/jwt.guard';
 import { UserThrottlerGuard } from 'src/guards/user-throttler.guard';
 import {
+  AnnouncementScrollingDto,
+  EditSystemAnnouncementDto,
   PublishSystemAnnouncementDto,
   PublishSystemAnnouncementResponseDto,
 } from './notification.dto';
@@ -52,6 +59,38 @@ function requireIdempotencyKey(value: string | undefined): string {
 @RequireAdminPermission('CONTENT_MANAGE')
 export class NotificationAdminController {
   constructor(private readonly notificationService: NotificationService) {}
+
+  @Get()
+  list() {
+    return this.notificationService.adminAnnouncements();
+  }
+
+  @Patch(':id')
+  edit(
+    @Req() req: RequestWithUser,
+    @Param('id', ParseUUIDPipe) id: string,
+    @Body() dto: EditSystemAnnouncementDto,
+  ) {
+    return this.notificationService.editAnnouncement(req.user.userId, id, dto);
+  }
+
+  @Delete(':id')
+  remove(@Req() req: RequestWithUser, @Param('id', ParseUUIDPipe) id: string) {
+    return this.notificationService.deleteAnnouncement(req.user.userId, id);
+  }
+
+  @Patch(':id/scrolling')
+  setScrolling(
+    @Req() req: RequestWithUser,
+    @Param('id', ParseUUIDPipe) id: string,
+    @Body() dto: AnnouncementScrollingDto,
+  ) {
+    return this.notificationService.setAnnouncementScrolling(
+      req.user.userId,
+      id,
+      dto.scrolling,
+    );
+  }
 
   @Post()
   @UseGuards(UserThrottlerGuard)

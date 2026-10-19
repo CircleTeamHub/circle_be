@@ -40,6 +40,8 @@ type ReplayableGrant = Prisma.MembershipGrantGetPayload<{
 }>;
 
 type CanonicalGrantInput = {
+  quantity: number;
+  planId: string;
   targetLevel: MembershipLevel;
   idempotencyKey: string;
   note: string | null;
@@ -147,7 +149,11 @@ export class MembershipAdminService {
             target,
             transactionNow,
           );
-          if (input.targetLevel <= previous.level) {
+          if (
+            input.targetLevel < previous.level ||
+            (input.targetLevel === previous.level &&
+              (input.planId !== 'daily' || target.vipExpiresAt === null))
+          ) {
             throw new ConflictException({
               message: 'Target membership level must be higher',
               errorCode: MembershipErrorCode.LevelNotHigher,
@@ -155,12 +161,22 @@ export class MembershipAdminService {
           }
 
           const targetTier = MEMBERSHIP_CATALOG[input.targetLevel];
-          const newExpiresAt = targetTier.lifetime
-            ? null
-            : addUtcCalendarMonths(
-                this.expiryBase(target, previous.level, transactionNow),
-                targetTier.durationMonths,
-              );
+          const newExpiresAt =
+            input.planId === 'daily'
+              ? new Date(
+                  this.expiryBase(
+                    target,
+                    previous.level,
+                    transactionNow,
+                  ).getTime() +
+                    input.quantity * 24 * 60 * 60 * 1000,
+                )
+              : targetTier.lifetime
+                ? null
+                : addUtcCalendarMonths(
+                    this.expiryBase(target, previous.level, transactionNow),
+                    targetTier.durationMonths,
+                  );
           const previouslyIssued = target.membershipBenefitGrants.map(
             (benefit) => benefit.type,
           );
@@ -169,6 +185,8 @@ export class MembershipAdminService {
           const grant = await tx.membershipGrant.create({
             data: {
               idempotencyKey: input.idempotencyKey,
+              planId: input.planId,
+              quantity: input.quantity,
               targetUserID: targetUserId,
               operatorUserID: operatorUserId,
               previousLevel: target.vipLevel,
@@ -251,7 +269,11 @@ export class MembershipAdminService {
         result: 'success',
         entityType: 'user',
         entityId: targetUserId,
-        metadata: { targetLevel: input.targetLevel },
+        metadata: {
+          targetLevel: input.targetLevel,
+          planId: input.planId,
+          quantity: input.quantity,
+        },
       });
     }
     return transactionResult.response;
@@ -270,7 +292,26 @@ export class MembershipAdminService {
         errorCode: MembershipErrorCode.InvalidLevel,
       });
     }
+    if (
+      dto.planId !== undefined &&
+      (dto.planId !== 'daily' || dto.targetLevel !== 1)
+    ) {
+      throw new BadRequestException('每日会员只能授予白银权益');
+    }
+    const quantity = dto.quantity === undefined ? 1 : dto.quantity;
+    if (
+      !Number.isInteger(quantity) ||
+      quantity < 1 ||
+      quantity > 30 ||
+      (dto.planId !== 'daily' && quantity !== 1)
+    ) {
+      throw new BadRequestException(
+        '每日会员数量须为1至30的整数；其他方案数量只能为1',
+      );
+    }
     return {
+      quantity,
+      planId: dto.planId ?? MEMBERSHIP_CATALOG[dto.targetLevel].key,
       targetLevel: dto.targetLevel as MembershipLevel,
       idempotencyKey: dto.idempotencyKey,
       note: dto.note?.trim() || null,
@@ -303,6 +344,9 @@ export class MembershipAdminService {
       grant.operatorUserID !== operatorUserId ||
       grant.targetUserID !== targetUserId ||
       grant.newLevel !== input.targetLevel ||
+      (grant.planId ?? MEMBERSHIP_CATALOG[grant.newLevel]?.key) !==
+        input.planId ||
+      (grant.quantity ?? 1) !== input.quantity ||
       grant.note !== input.note
     ) {
       throw new ConflictException({
@@ -328,6 +372,8 @@ export class MembershipAdminService {
       replayed,
       grant: {
         id: grant.id,
+        planId: grant.planId ?? MEMBERSHIP_CATALOG[grant.newLevel].key,
+        quantity: grant.quantity ?? 1,
         idempotencyKey: grant.idempotencyKey,
         targetUserId: grant.targetUserID,
         operatorUserId: grant.operatorUserID,

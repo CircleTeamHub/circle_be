@@ -99,11 +99,15 @@ describe('group settings batch-2 migration', () => {
     }
     const schema = read(resolve(process.cwd(), 'prisma/schema.prisma'));
     expect(schema).toMatch(/notice\s+String\?/);
-    expect(schema).toMatch(/memberCanInvite Boolean @default\(true\)/);
-    expect(schema).toMatch(/qrJoinEnabled Boolean @default\(true\)/);
-    expect(schema).toMatch(/membersCanViewProfiles Boolean @default\(false\)/);
-    expect(schema).toMatch(/membersCanAddFriends Boolean @default\(true\)/);
-    expect(schema).toMatch(/membersCanViewRoster Boolean @default\(false\)/);
+    expect(schema).toMatch(/memberCanInvite\s+Boolean\s+@default\(true\)/);
+    expect(schema).toMatch(/qrJoinEnabled\s+Boolean\s+@default\(true\)/);
+    expect(schema).toMatch(
+      /membersCanViewProfiles\s+Boolean\s+@default\(false\)/,
+    );
+    expect(schema).toMatch(/membersCanAddFriends\s+Boolean\s+@default\(true\)/);
+    expect(schema).toMatch(
+      /membersCanViewRoster\s+Boolean\s+@default\(false\)/,
+    );
     expect(schema).toMatch(/remark\s+String\?/);
   });
 });

@@ -23,7 +23,11 @@ describe('AdminCommunityService', () => {
       callback(tx),
     ),
     circle: { findMany: jest.fn(), count: jest.fn() },
-    chatConversation: { findMany: jest.fn().mockResolvedValue([]) },
+    chatConversation: {
+      findMany: jest.fn().mockResolvedValue([]),
+      count: jest.fn(),
+    },
+    user: { findMany: jest.fn() },
     adminGroupOperation: { findMany: jest.fn() },
   };
   let service: AdminCommunityService;
@@ -534,8 +538,11 @@ describe('AdminCommunityService', () => {
     expect(tx.adminGroupOperation.create).not.toHaveBeenCalled();
   });
 
-  it('lists circles as groups with mute state from the chat conversation', async () => {
-    prisma.circle.count.mockResolvedValue(1);
+  it('lists persisted groups with mute state and separate moderation IDs', async () => {
+    prisma.chatConversation.count.mockResolvedValue(1);
+    prisma.user.findMany.mockResolvedValue([
+      { id: 'owner-1', nickname: 'Alice', accountId: 'alice' },
+    ]);
     prisma.circle.findMany.mockResolvedValue([
       {
         id: 'circle-1',
@@ -547,7 +554,14 @@ describe('AdminCommunityService', () => {
       },
     ]);
     prisma.chatConversation.findMany.mockResolvedValue([
-      { circleID: 'circle-1', muteAllAt: new Date() },
+      {
+        id: 'actual-chat',
+        circleID: 'circle-1',
+        name: null,
+        ownerID: null,
+        muteAllAt: new Date(),
+        _count: { members: 10 },
+      },
     ]);
     prisma.adminGroupOperation.findMany.mockResolvedValue([
       {
@@ -573,11 +587,8 @@ describe('AdminCommunityService', () => {
       linkedCircle: { id: 'circle-1', name: '摄影圈' },
       pendingOperation: { id: 'operation-1', type: 'MUTE' },
     });
-    // 管理台群列表不渲染头像,faceUrl 只在类型里声明 —— 不再下发也不再查 avatarUrl。
-    expect(result.items[0]).not.toHaveProperty('faceUrl');
-    expect(prisma.circle.findMany.mock.calls[0][0].select).not.toHaveProperty(
-      'avatarUrl',
-    );
+    expect(result.items[0].conversationId).toBe('actual-chat');
+    expect(result.items[0].memberCount).toBe(10);
   });
 
   // GET /admin/community/operations/:id 管理台从不调用 —— 圈子/群列表自带

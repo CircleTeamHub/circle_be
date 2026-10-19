@@ -1,0 +1,368 @@
+import {
+  BadRequestException,
+  Injectable,
+  NotFoundException,
+} from '@nestjs/common';
+import { Prisma } from 'src/generated/prisma';
+import { PrismaService } from 'src/prisma/prisma.service';
+import { createHash } from 'crypto';
+import { CronExpression } from '@nestjs/schedule';
+import { TrackedCron } from 'src/metrics/tracked-cron.decorator';
+import { olderThan, paged } from './console-operations.service';
+import { FAILED_AUDIT_WHERE } from 'src/admin-operations/audit-record-kind';
+import { diagnosticContext } from './diagnostic-context';
+import type { AppOpenDto, ConsoleQuery, DiagnosticQuery } from './console.dto';
+
+@Injectable()
+export class ConsoleInsightsService {
+  constructor(private readonly prisma: PrismaService) {}
+
+  async appOpen(
+    userID: string,
+    device: string | undefined,
+    dto: AppOpenDto,
+    sessionID?: string,
+  ) {
+    if (!device || device.length < 16 || device.length > 200)
+      throw new BadRequestException('需要有效设备标识');
+    const deviceKey = createHash('sha256').update(device).digest('hex');
+    const session = sessionID
+      ? await this.prisma.refreshToken.findUnique({
+          where: { id: sessionID },
+          select: {
+            userId: true,
+            audience: true,
+            deviceKey: true,
+            revokedAt: true,
+            expiredAt: true,
+          },
+        })
+      : null;
+    if (
+      !session ||
+      session.userId !== userID ||
+      session.audience !== 'APP' ||
+      session.deviceKey !== deviceKey ||
+      session.revokedAt ||
+      session.expiredAt <= new Date()
+    )
+      throw new BadRequestException('需要当前设备绑定的 App 会话');
+    return this.prisma.$transaction(async (tx) => {
+      await tx.$queryRaw`SELECT id FROM "User" WHERE id=${userID} FOR UPDATE`;
+      const previous = await tx.appInstallation.findUnique({
+        where: { userID_deviceKey: { userID, deviceKey } },
+        select: { lastSeenAt: true },
+      });
+      if (
+        !previous &&
+        (await tx.appInstallation.count({ where: { userID } })) >= 64
+      )
+        throw new BadRequestException('设备登记数量已达上限');
+      await tx.appInstallation.upsert({
+        where: { userID_deviceKey: { userID, deviceKey } },
+        create: {
+          userID,
+          deviceKey,
+          platform: dto.platform,
+          appVersion: dto.appVersion,
+          build: dto.build,
+          channel: dto.channel,
+        },
+        update: {
+          platform: dto.platform,
+          appVersion: dto.appVersion,
+          build: dto.build,
+          channel: dto.channel,
+          lastSeenAt: new Date(),
+        },
+      });
+      // Authenticated callers cannot manufacture unbounded activity or installation rows.
+      if (
+        await tx.consoleEvent.findFirst({
+          where: {
+            userID,
+            name: 'APP_OPEN',
+            createdAt: {
+              gte: new Date(Math.floor(Date.now() / 300000) * 300000),
+            },
+          },
+          select: { id: true },
+        })
+      )
+        return { recorded: true };
+      // IDs are bound to the account; retries neither overwrite another event nor count twice.
+      const id = createHash('sha256')
+        .update(`${userID}:${dto.eventID}`)
+        .digest('hex');
+      await tx.consoleEvent.upsert({
+        where: { id },
+        create: {
+          id,
+          userID,
+          name: 'APP_OPEN',
+          source: 'APP',
+          platform: dto.platform,
+          appVersion: dto.appVersion,
+        },
+        update: {},
+      });
+      return { recorded: true };
+    });
+  }
+
+  async timeline(userID: string, query: ConsoleQuery) {
+    if (
+      !(await this.prisma.user.findUnique({
+        where: { id: userID },
+        select: { id: true },
+      }))
+    )
+      throw new NotFoundException('用户不存在');
+    const rows = await this.prisma.consoleEvent.findMany({
+      where: {
+        userID,
+        ...olderThan(query.cursor),
+        ...(query.name ? { name: query.name } : {}),
+      },
+      orderBy: [{ createdAt: 'desc' }, { id: 'desc' }],
+      take: query.limit + 1,
+    });
+    const [sessions, devices, installation] = query.cursor
+      ? [[], [], []]
+      : await Promise.all([
+          this.prisma.refreshToken.findMany({
+            where: { userId: userID },
+            select: {
+              id: true,
+              audience: true,
+              deviceName: true,
+              createdAt: true,
+              lastUsedAt: true,
+              revokedAt: true,
+              expiredAt: true,
+            },
+            orderBy: { createdAt: 'desc' },
+            take: 20,
+          }),
+          this.prisma.trustedDevice.findMany({
+            where: { userId: userID },
+            select: {
+              id: true,
+              deviceName: true,
+              lastSeenAt: true,
+              revokedAt: true,
+            },
+            orderBy: { lastSeenAt: 'desc' },
+            take: 20,
+          }),
+          this.prisma.appInstallation.findMany({
+            where: { userID },
+            select: {
+              id: true,
+              platform: true,
+              appVersion: true,
+              build: true,
+              channel: true,
+              lastSeenAt: true,
+            },
+            orderBy: { lastSeenAt: 'desc' },
+            take: 20,
+          }),
+        ]);
+    return {
+      ...paged(rows, query.limit),
+      sessions,
+      devices,
+      installations: installation,
+      collectionStartedAt: (
+        await this.prisma.consoleCollectionState.findUniqueOrThrow({
+          where: { id: 'global' },
+        })
+      ).startedAt,
+    };
+  }
+
+  private readonly insightCache = new Map<
+    number,
+    {
+      expiresAt: number;
+      data: Awaited<ReturnType<ConsoleInsightsService['computeAnalytics']>>;
+    }
+  >();
+  private readonly insightReads = new Map<
+    number,
+    Promise<Awaited<ReturnType<ConsoleInsightsService['computeAnalytics']>>>
+  >();
+  analytics(days: number) {
+    const cached = this.insightCache.get(days);
+    if (cached && cached.expiresAt > Date.now())
+      return Promise.resolve(cached.data);
+    const pending = this.insightReads.get(days);
+    if (pending) return pending;
+    const read = this.computeAnalytics(days)
+      .then((data) => {
+        this.insightCache.set(days, { expiresAt: Date.now() + 45000, data });
+        return data;
+      })
+      .finally(() => this.insightReads.delete(days));
+    this.insightReads.set(days, read);
+    return read;
+  }
+  private async computeAnalytics(days: number) {
+    const first = await this.prisma.consoleCollectionState.findUniqueOrThrow({
+      where: { id: 'global' },
+    });
+    const since = new Date(
+      Math.max(Date.now() - days * 86400_000, first.startedAt.getTime()),
+    );
+    const [daily, features, retention, funnel] = await Promise.all([
+      this.prisma.$queryRaw<
+        Array<{ day: string; users: number; events: number }>
+      >(Prisma.sql`
+        SELECT to_char("createdAt" AT TIME ZONE 'UTC' AT TIME ZONE 'Asia/Shanghai','YYYY-MM-DD') AS "day", COUNT(DISTINCT "userID")::int users, COUNT(*)::int events
+        FROM "ConsoleEvent" WHERE "createdAt">=${since} AND name IN ('APP_OPEN','MESSAGE_SENT','NOTE_CREATED','POST_CREATED','REPORT_CREATED') GROUP BY 1 ORDER BY 1`),
+      this.prisma.$queryRaw<
+        Array<{ name: string; source: string; users: number; events: number }>
+      >(Prisma.sql`
+        SELECT name,source,COUNT(DISTINCT "userID")::int users,COUNT(*)::int events FROM "ConsoleEvent" WHERE "createdAt">=${since} GROUP BY name,source ORDER BY events DESC LIMIT 50`),
+      this.prisma.$queryRaw<
+        Array<{ day: number; eligible: number; returned: number }>
+      >(Prisma.sql`
+        SELECT d."day",COUNT(*) FILTER (WHERE (u."createdAt" AT TIME ZONE 'UTC' AT TIME ZONE 'Asia/Shanghai')::date + d."day" < (now() AT TIME ZONE 'Asia/Shanghai')::date)::int eligible,
+          COUNT(*) FILTER (WHERE (u."createdAt" AT TIME ZONE 'UTC' AT TIME ZONE 'Asia/Shanghai')::date + d."day" < (now() AT TIME ZONE 'Asia/Shanghai')::date AND EXISTS (
+            SELECT 1 FROM "ConsoleEvent" e WHERE e."userID"=u.id AND e.name IN ('APP_OPEN','MESSAGE_SENT','NOTE_CREATED','POST_CREATED','REPORT_CREATED')
+              AND e."createdAt">=(((u."createdAt" AT TIME ZONE 'UTC' AT TIME ZONE 'Asia/Shanghai')::date+d."day")::timestamp AT TIME ZONE 'Asia/Shanghai' AT TIME ZONE 'UTC')
+              AND e."createdAt"<(((u."createdAt" AT TIME ZONE 'UTC' AT TIME ZONE 'Asia/Shanghai')::date+d."day"+1)::timestamp AT TIME ZONE 'Asia/Shanghai' AT TIME ZONE 'UTC')
+          ))::int returned
+        FROM "User" u CROSS JOIN (VALUES(1),(7),(30)) d("day") WHERE u."createdAt">=${since} GROUP BY d."day" ORDER BY d."day"`),
+      this.prisma.$queryRaw<
+        Array<{
+          registered: number;
+          opened: number;
+          joined: number;
+          messaged: number;
+        }>
+      >(Prisma.sql`
+        SELECT COUNT(*)::int registered,COUNT(o."at")::int opened,COUNT(g."at")::int joined,COUNT(m."at")::int messaged FROM "User" u
+        LEFT JOIN LATERAL (SELECT MIN("createdAt") AS "at" FROM "ConsoleEvent" WHERE "userID"=u.id AND name='APP_OPEN' AND "createdAt">=u."createdAt" AND "createdAt"<u."createdAt"+interval '7 days') o ON true
+        LEFT JOIN LATERAL (SELECT MIN("createdAt") AS "at" FROM "ConsoleEvent" WHERE "userID"=u.id AND name='GROUP_JOINED' AND "createdAt">=o."at" AND "createdAt"<u."createdAt"+interval '7 days') g ON true
+        LEFT JOIN LATERAL (SELECT MIN("createdAt") AS "at" FROM "ConsoleEvent" WHERE "userID"=u.id AND name='MESSAGE_SENT' AND "createdAt">=g."at" AND "createdAt"<u."createdAt"+interval '7 days') m ON true
+        WHERE u."createdAt">=${since}`),
+    ]);
+    return {
+      generatedAt: new Date(),
+      timezone: 'Asia/Shanghai',
+      days,
+      collectionStartedAt: first.startedAt,
+      daily,
+      features,
+      retention,
+      funnel: funnel[0],
+      definitions: {
+        active:
+          '所选自然日内 App 活跃、发消息、创建笔记、发布动态或主动举报的去重账号；被动通知与后台状态变化不计活跃',
+        retention: '注册后的第 N 个自然日发生行为；目标自然日未结束不进入分母',
+        funnel:
+          '注册 → App 活跃 → 加入圈子 → 发消息，严格按顺序且注册后 7 天内',
+        coverage: '历史埋点不回填；采集开始前的留存与漏斗无法还原',
+      },
+    };
+  }
+
+  async events(query: ConsoleQuery) {
+    return paged(
+      await this.prisma.consoleEvent.findMany({
+        where: {
+          ...olderThan(query.cursor),
+          ...(query.userID ? { userID: query.userID } : {}),
+          ...(query.name ? { name: query.name } : {}),
+        },
+        include: {
+          user: { select: { id: true, nickname: true, accountId: true } },
+        },
+        orderBy: [{ createdAt: 'desc' }, { id: 'desc' }],
+        take: query.limit + 1,
+      }),
+      query.limit,
+    );
+  }
+
+  async diagnostics(query: DiagnosticQuery) {
+    const page = paged(
+      await this.prisma.adminAuditLog.findMany({
+        where: {
+          AND: [FAILED_AUDIT_WHERE],
+          ...olderThan(query.cursor),
+          ...(query.requestID ? { requestId: query.requestID } : {}),
+          ...(query.userID ? { actorID: query.userID } : {}),
+        },
+        select: {
+          id: true,
+          actorID: true,
+          actorAccountId: true,
+          action: true,
+          entityType: true,
+          entityID: true,
+          reason: true,
+          requestId: true,
+          createdAt: true,
+          metadata: true,
+        },
+        orderBy: [{ createdAt: 'desc' }, { id: 'desc' }],
+        take: query.limit + 1,
+      }),
+      query.limit,
+    );
+    const actors = page.items.length
+      ? await this.prisma.user.findMany({
+          where: {
+            id: { in: [...new Set(page.items.map((row) => row.actorID))] },
+          },
+          select: { id: true, nickname: true, accountId: true },
+        })
+      : [];
+    const people = new Map(actors.map((actor) => [actor.id, actor]));
+    return {
+      ...page,
+      items: page.items.map(({ metadata, ...row }) => {
+        const status =
+          metadata && typeof metadata === 'object' && !Array.isArray(metadata)
+            ? metadata.status
+            : undefined;
+        return {
+          ...row,
+          actor: people.get(row.actorID) ?? null,
+          ...(row.action === 'console.request.failed'
+            ? diagnosticContext(metadata)
+            : { requestMethod: null, requestRoute: null, failureCause: null }),
+          // Expose an allowlisted context only; never return raw metadata or exception text.
+          failureStatus:
+            row.action === 'console.request.failed' &&
+            typeof status === 'number' &&
+            Number.isInteger(status) &&
+            status >= 400 &&
+            status <= 599
+              ? status
+              : null,
+        };
+      }),
+    };
+  }
+
+  @TrackedCron(CronExpression.EVERY_DAY_AT_4AM, 'console_event_retention')
+  async cleanEvents() {
+    // Bounded batches; a failed sweep leaves authoritative business data untouched.
+    const before = new Date(Date.now() - 180 * 86400_000);
+    for (let batch = 0; batch < 10; batch++) {
+      const rows = await this.prisma.consoleEvent.findMany({
+        where: { createdAt: { lt: before } },
+        select: { id: true },
+        take: 1000,
+      });
+      if (!rows.length) break;
+      await this.prisma.consoleEvent.deleteMany({
+        where: { id: { in: rows.map((r) => r.id) } },
+      });
+    }
+  }
+}

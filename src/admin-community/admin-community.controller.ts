@@ -49,6 +49,30 @@ export class AdminCommunityController {
     return this.community.listCircles(query);
   }
 
+  @Get('circles/:id')
+  @ApiOperation({ summary: '圈子完整详情（含 App 资料与管理状态）' })
+  circleDetail(@Param('id', ParseUUIDPipe) id: string) {
+    return this.community.circleDetail(id);
+  }
+
+  @Get('circles/:id/members')
+  @ApiOperation({ summary: '分页查看圈子成员及申请状态' })
+  circleMembers(
+    @Param('id', ParseUUIDPipe) id: string,
+    @Query() query: AdminCommunityListQueryDto,
+  ) {
+    return this.community.circleMembers(id, query);
+  }
+
+  @Get('circles/:id/posts')
+  @ApiOperation({ summary: '分页查看圈子全部动态（含关联发布）' })
+  circlePosts(
+    @Param('id', ParseUUIDPipe) id: string,
+    @Query() query: AdminCommunityListQueryDto,
+  ) {
+    return this.community.circlePosts(id, query);
+  }
+
   @Post('circles/:id/disable')
   @Throttle({ default: { limit: 10, ttl: 60_000 } })
   @ApiOperation({ summary: 'Disable a circle and mute its chat group' })
@@ -90,6 +114,30 @@ export class AdminCommunityController {
   @ApiOkResponse()
   listGroups(@Query() query: AdminCommunityListQueryDto) {
     return this.community.listGroups(query);
+  }
+
+  @Get('groups/:id')
+  @ApiOperation({ summary: '查看群聊完整资料' })
+  groupDetail(@Param('id', ParseUUIDPipe) id: string) {
+    return this.community.groupDetail(id);
+  }
+
+  @Get('groups/:id/members')
+  @ApiOperation({ summary: '查看群聊成员和离群记录' })
+  groupMembers(
+    @Param('id', ParseUUIDPipe) id: string,
+    @Query() query: AdminCommunityListQueryDto,
+  ) {
+    return this.community.groupMembers(id, query);
+  }
+
+  @Get('groups/:id/events')
+  @ApiOperation({ summary: '查看群日志' })
+  groupEvents(
+    @Param('id', ParseUUIDPipe) id: string,
+    @Query() query: AdminCommunityListQueryDto,
+  ) {
+    return this.community.groupEvents(id, query);
   }
 
   @Post('groups/:groupID/operations')

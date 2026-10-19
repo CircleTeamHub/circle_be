@@ -162,23 +162,9 @@ describe('ChatPushService', () => {
 
     expect(
       privacySettings.getSelfDestructPoliciesForUsers,
-    ).toHaveBeenCalledWith(['u-private', 'u-plain']);
-    const byToken = new Map(
-      push.sendMessages.mock.calls[0][0].map(
-        (entry: { token: string; payload: Record<string, unknown> }) => [
-          entry.token,
-          entry.payload,
-        ],
-      ),
-    );
-    expect(byToken.get('ExponentPushToken[a]')).toBeDefined();
-    const payloads = push.sendMessages.mock.calls.flatMap(
-      ([entries]: [Array<{ payload: Record<string, unknown> }>]) =>
-        entries.map((entry) => entry.payload),
-    );
-    expect(payloads).toEqual(
+    ).not.toHaveBeenCalled();
+    expect(sentPayloads()).toEqual(
       expect.arrayContaining([
-        expect.objectContaining({ body: '[阅后即焚消息]', ttl: 300 }),
         expect.objectContaining({ body: 'hello world', ttl: 86400 }),
       ]),
     );

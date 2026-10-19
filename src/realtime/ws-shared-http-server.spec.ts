@@ -112,6 +112,41 @@ describe('websocket upgrade coexistence (/realtime + /chat-ws)', () => {
     expect(result).toMatchObject({ ok: false });
   });
 
+  it('rejects realtime upgrades from unlisted origins before websocket admission', async () => {
+    const result = await handshake('/realtime', 'https://evil.example.test');
+    expect(result).toMatchObject({
+      ok: false,
+      error: expect.stringContaining('403'),
+    });
+  });
+
+  it('applies the explicit origin allowlist to realtime', async () => {
+    const previous = process.env.ALLOWED_ORIGINS;
+    process.env.ALLOWED_ORIGINS = 'https://web.example.test';
+    try {
+      expect(
+        await handshake('/realtime', 'https://web.example.test'),
+      ).toMatchObject({ ok: true });
+    } finally {
+      if (previous === undefined) delete process.env.ALLOWED_ORIGINS;
+      else process.env.ALLOWED_ORIGINS = previous;
+    }
+  });
+
+  it('rejects an upgrade when the pending authentication budget is full', async () => {
+    const spy = jest
+      .spyOn((gateway as any).admission, 'hasCapacity')
+      .mockReturnValue(false);
+    try {
+      expect(await handshake('/realtime')).toMatchObject({
+        ok: false,
+        error: expect.stringContaining('503'),
+      });
+    } finally {
+      spy.mockRestore();
+    }
+  });
+
   it('still serves the raw-ws /realtime upgrade', async () => {
     const result = await handshake('/realtime');
 

@@ -144,3 +144,37 @@ describe('ModerationAdminService (PR #120 review fixes)', () => {
     });
   });
 });
+
+describe('post report reporter identity', () => {
+  it('resolves reporters in a single query and handles missing historical users', async () => {
+    const user = {
+      id: 'user-1',
+      accountId: 'circle123',
+      nickname: '小明',
+      status: 'ACTIVE',
+    };
+    const prisma = {
+      circlePostReport: {
+        findMany: jest.fn().mockResolvedValue([
+          { id: 'report-1', reporterID: 'user-1' },
+          { id: 'report-2', reporterID: 'missing' },
+          { id: 'report-3', reporterID: 'user-1' },
+        ]),
+        count: jest.fn().mockResolvedValue(3),
+      },
+      user: { findMany: jest.fn().mockResolvedValue([user]) },
+    };
+    const service = new ModerationAdminService(prisma as never, {} as never);
+    const result = await service.listPostReports('PENDING');
+    expect(prisma.user.findMany).toHaveBeenCalledTimes(1);
+    expect(prisma.user.findMany).toHaveBeenCalledWith({
+      where: { id: { in: ['user-1', 'missing'] } },
+      select: { id: true, nickname: true, accountId: true, status: true },
+    });
+    expect(result.items.map((item) => item.reporter)).toEqual([
+      user,
+      null,
+      user,
+    ]);
+  });
+});

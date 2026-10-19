@@ -123,6 +123,7 @@ describe('note review regressions', () => {
       prisma as any,
       config as any,
       policy as any,
+      {} as any,
       upload as any,
       undefined,
       circleSync as any,

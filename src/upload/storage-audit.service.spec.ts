@@ -28,6 +28,7 @@ describe('StorageAuditService', () => {
       chatMessage: emptyRows(),
       supportRechargePaymentCode: emptyRows(),
       adminAdvertisement: emptyRows(),
+      consoleRelease: emptyRows(),
     };
     for (const [model, rows] of Object.entries(options.referenced ?? {})) {
       (prisma as Record<string, { findMany: jest.Mock }>)[model].findMany = jest

@@ -1,3 +1,4 @@
+import { AnonymousAccess } from 'src/guards/anonymous-access.decorator';
 import {
   BadRequestException,
   Body,
@@ -61,6 +62,7 @@ export class TempChatController {
   }
 
   // 公开端点：靠 link JWT + 限流保护。token 非法 → 404。
+  @AnonymousAccess('Signed invitation token')
   @Post('by-token/:token/meta')
   @Throttle({ default: { limit: 30, ttl: 60_000 } })
   @ApiOperation({ summary: '落地页：获取房间元信息' })
@@ -81,6 +83,7 @@ export class TempChatController {
     }
   }
 
+  @AnonymousAccess('Signed invitation token')
   @Post('by-token/:token/join')
   @Throttle({ default: { limit: 10, ttl: 60_000 } })
   @ApiOperation({ summary: '访客免注册加入' })
@@ -102,6 +105,7 @@ export class TempChatController {
   }
 
   // 访客历史(冷路径):Bearer 访客聊天凭证;实时走 /chat-ws 二形态握手。
+  @AnonymousAccess('TempChatGuestGuard')
   @Get('guest/messages')
   @UseGuards(TempChatGuestGuard)
   @Throttle({ default: { limit: 60, ttl: 60_000 } })
@@ -114,6 +118,7 @@ export class TempChatController {
   }
 
   // 访客成员目录(冷路径):访客页成员面板用,房主由 isHost 标出。
+  @AnonymousAccess('TempChatGuestGuard')
   @Get('guest/members')
   @UseGuards(TempChatGuestGuard)
   @Throttle({ default: { limit: 30, ttl: 60_000 } })
@@ -122,6 +127,7 @@ export class TempChatController {
     return this.service.listGuestMembers(req.tempChatGuest);
   }
 
+  @AnonymousAccess('TempChatGuestGuard')
   @Get('guest/messages/:messageId/note')
   @UseGuards(TempChatGuestGuard)
   @Throttle({ default: { limit: 60, ttl: 60_000 } })
@@ -135,6 +141,7 @@ export class TempChatController {
 
   // 访客发图片/视频:presign 归 chat 目录,key 以 guestId 命名空间(所有权可校验)。
   // 匿名访客使用独立的格式/单文件上限,次数限流之外再走累计字节配额。
+  @AnonymousAccess('TempChatGuestGuard')
   @Post('guest/upload-presign')
   @UseGuards(TempChatGuestGuard)
   @Throttle({ default: { limit: 10, ttl: 60_000 } })

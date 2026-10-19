@@ -88,6 +88,7 @@ function buildHarness({
       .fn()
       .mockResolvedValue(jobs.map((job: { id: string }) => ({ id: job.id }))),
     notificationPushOutbox: {
+      findFirst: jest.fn().mockResolvedValue({ id: 'active' }),
       findMany: jest.fn().mockResolvedValue(jobs),
       updateMany: jest.fn().mockResolvedValue({ count: 1 }),
     },
@@ -127,6 +128,30 @@ function buildHarness({
 }
 
 describe('NotificationPushOutboxProcessor (#88 per-token)', () => {
+  it('does not send an announcement cancelled after the job was claimed', async () => {
+    const { prisma, push, processor } = buildHarness({
+      jobs: [
+        {
+          id: 'job-1',
+          notificationID: 'notification-1',
+          attempts: 0,
+          payload: { title: 'T', body: 'B', data: {} },
+          notification: { ...notification, systemAnnouncementID: 'a' },
+        },
+      ],
+      pendingDeliveries: [{ id: 'delivery-1', token: 'tok-a' }],
+      outcomes: [],
+    });
+    prisma.notificationPushOutbox.findFirst.mockResolvedValue(null);
+    await processor.processPending();
+    expect(push.sendToTokens).not.toHaveBeenCalled();
+    expect(prisma.notificationPushDelivery.updateMany).toHaveBeenCalledWith(
+      expect.objectContaining({
+        data: { status: 'TERMINAL', lastError: 'ANNOUNCEMENT_DELETED' },
+      }),
+    );
+  });
+
   it('keeps an existing JPush delivery retryable when credentials are absent', async () => {
     const token = {
       token: 'jpush-device',
@@ -574,7 +599,10 @@ describe('圈子离线推送开关', () => {
     // 任务收尾成 COMPLETED —— 用户主动关的，不是失败，不该反复重试。
     expect(prisma.notificationPushOutbox.updateMany).toHaveBeenCalledWith(
       expect.objectContaining({
-        data: expect.objectContaining({ status: 'COMPLETED' }),
+        data: expect.objectContaining({
+          status: 'COMPLETED',
+          completionReason: 'CIRCLE_PUSH_DISABLED',
+        }),
       }),
     );
   });
@@ -700,5 +728,39 @@ describe('圈子离线推送开关', () => {
     await processor.processPending();
 
     expect(push.sendToTokens).not.toHaveBeenCalled();
+  });
+});
+
+describe('push completion evidence', () => {
+  it('records no active device instead of implying a device received the notification', async () => {
+    const { prisma, push, processor } = buildHarness({
+      jobs: [
+        {
+          id: 'job-no-device',
+          notificationID: notification.id,
+          status: 'PENDING',
+          attempts: 0,
+          payload: null,
+          notification,
+        },
+      ],
+      pendingDeliveries: [],
+      outcomes: [],
+      tokens: [],
+    });
+    await processor.processPending();
+    expect(push.sendToTokens).not.toHaveBeenCalled();
+    expect(prisma.notificationPushOutbox.updateMany).toHaveBeenCalledWith(
+      expect.objectContaining({
+        where: expect.objectContaining({
+          id: 'job-no-device',
+          status: 'PROCESSING',
+        }),
+        data: expect.objectContaining({
+          status: 'COMPLETED',
+          completionReason: 'NO_ACTIVE_DEVICE',
+        }),
+      }),
+    );
   });
 });

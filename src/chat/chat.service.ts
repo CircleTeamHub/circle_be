@@ -1,3 +1,4 @@
+import { assertEncryptedTextSend } from 'src/e2ee/e2ee-proof';
 import {
   BadRequestException,
   ConflictException,
@@ -57,19 +58,15 @@ import {
   MEDIA_MESSAGE_TYPES,
   SYNC_PAGE_MAX,
   READERS_PAGE_MAX,
-  RELAX_PURGE_BATCH,
-  RELAX_PURGE_BATCHES_MAX,
 } from './chat.constants';
 import { messagePreviewText } from './chat-message-preview';
 import {
   buildChatRetentionWindow,
   chatRetentionWhere,
-  effectiveBurnDurationForMessage,
   isChatMessageVisible,
   NO_VIEWER_RETENTION,
   type ChatBurnPolicy,
   type ChatRetentionWindow,
-  type ChatViewerPolicy,
 } from './chat-retention';
 import type {
   ChatConversationDto,
@@ -306,7 +303,7 @@ export class ChatService {
     }
     if (
       Buffer.byteLength(JSON.stringify(payload.content), 'utf8') >
-      MAX_CONTENT_BYTES
+      (payload.type === 'encrypted-text' ? 16_384 : MAX_CONTENT_BYTES)
     ) {
       throw new BadRequestException({
         message: '消息体超限',
@@ -719,6 +716,8 @@ export class ChatService {
         );
       }
     }
+    const senderPolicy =
+      await this.privacySettings.getSelfDestructPolicy(senderUserId);
     let effectivePayload = payload;
     let copiedKeys: string[] = [];
     try {
@@ -782,8 +781,10 @@ export class ChatService {
       const created = await this.prisma.$transaction(async (tx) => {
         // G-05:会话行锁替 advisory lock —— 同会话串行,跨会话零互扰
         // (hashtext 碰撞让无关会话互等的问题消失),也不再做 MAX(height) 聚合扫描。
-        const counter = await tx.$queryRaw<Array<{ nextHeight: number }>>`
-        SELECT "nextHeight" FROM "ChatConversation"
+        const counter = await tx.$queryRaw<
+          Array<{ nextHeight: number; textEncryption: string }>
+        >`
+        SELECT "nextHeight", "textEncryption" FROM "ChatConversation"
         WHERE "id" = ${effectivePayload.conversationId} FOR UPDATE`;
         if (counter.length === 0) {
           throw new NotFoundException({
@@ -815,6 +816,37 @@ export class ChatService {
           return { row: existing, reused: true };
         }
 
+        if (
+          counter[0].textEncryption === 'MLS_V1' ||
+          effectivePayload.type === 'encrypted-text'
+        ) {
+          await assertEncryptedTextSend(
+            tx,
+            senderUserId,
+            effectivePayload.conversationId,
+            effectivePayload.type,
+            effectivePayload.d,
+            effectivePayload.content,
+          );
+        }
+
+        const senderBurn = await tx.chatMember.findUnique({
+          where: {
+            conversationID_userID: {
+              conversationID: effectivePayload.conversationId,
+              userID: senderUserId,
+            },
+          },
+        });
+        const durations = [
+          senderBurn?.burnDurationSec ?? 0,
+          senderPolicy.sec,
+        ].filter((value) => value > 0);
+        const burnDurationSec =
+          conversation.type === 'TEMP' || durations.length === 0
+            ? null
+            : Math.min(...durations);
+        const createdAt = new Date();
         const height = counter[0].nextHeight + 1;
 
         const row = await tx.chatMessage.create({
@@ -827,6 +859,11 @@ export class ChatService {
             clientMessageId: effectivePayload.d,
             replyToID: replyToId,
             requestHash,
+            createdAt,
+            burnDurationSec,
+            burnExpiresAt: burnDurationSec
+              ? new Date(createdAt.getTime() + burnDurationSec * 1000)
+              : null,
           },
         });
         await this.media.attachNoteImportReferences(tx, row.id, noteImportKeys);
@@ -993,11 +1030,11 @@ export class ChatService {
       row.conversationID,
       userId,
     );
-    const viewer = await this.selfDestructWindow(userId);
+    const viewer = NO_VIEWER_RETENTION;
     const retention = buildChatRetentionWindow(conversation, viewer);
     if (
       row.height <= (member.clearedBeforeHeight ?? 0) ||
-      !isChatMessageVisible(row.createdAt, retention)
+      !isChatMessageVisible(row.createdAt, retention, row.burnExpiresAt)
     ) {
       throw this.messageNotFound();
     }
@@ -1015,10 +1052,7 @@ export class ChatService {
     userId: string,
     messageId: string,
   ): Promise<{ type: string; content: Record<string, unknown> }> {
-    const { row, conversation } = await this.requireVisibleMessage(
-      userId,
-      messageId,
-    );
+    const { row } = await this.requireVisibleMessage(userId, messageId);
     if (!MEDIA_MESSAGE_TYPES.includes(row.type)) {
       throw this.messageNotFound();
     }
@@ -1028,10 +1062,7 @@ export class ChatService {
     //
     // 自己发的除外。那是你自己的内容、key 本来就在你自己的命名空间里,你打开
     // 相册重发一次效果完全一样 —— 拦下来不保护任何人,只是让你多走一步。
-    const burnAppliesToMessage =
-      !!conversation.burnDurationSec &&
-      (!conversation.burnStartedAt ||
-        row.createdAt >= conversation.burnStartedAt);
+    const burnAppliesToMessage = (row.burnDurationSec ?? 0) > 0;
     if (burnAppliesToMessage && row.senderID !== userId) {
       throw new ForbiddenException({
         message: '阅后即焚会话中的消息不可转发',
@@ -1433,7 +1464,7 @@ export class ChatService {
     const directIds = memberships
       .filter((m) => m.conversation.type === 'DIRECT')
       .map((m) => m.conversationID);
-    const viewer = await this.selfDestructWindow(userId);
+    const viewer = NO_VIEWER_RETENTION;
     const retentionWindows = memberships.map((m) =>
       buildChatRetentionWindow(m.conversation, viewer),
     );
@@ -1500,6 +1531,7 @@ export class ChatService {
       return {
         id: m.conversationID,
         type: m.conversation.type,
+        textEncryption: m.conversation.textEncryption,
         peer: directPeers.info.get(m.conversationID) ?? null,
         circleId: m.conversation.circleID,
         circle: m.conversation.circleID
@@ -1534,8 +1566,8 @@ export class ChatService {
             : null,
           memberCounts.get(m.conversationID) ?? null,
         ),
-        burnDurationSec: m.conversation.burnDurationSec ?? null,
-        burnStartedAt: m.conversation.burnStartedAt?.toISOString() ?? null,
+        burnDurationSec: m.burnDurationSec ?? null,
+        burnStartedAt: m.burnStartedAt?.toISOString() ?? null,
         peerReadHeight: directPeers.readHeights.get(m.conversationID) ?? null,
         peerDeliveredHeight:
           directPeers.deliveredHeights.get(m.conversationID) ?? null,
@@ -2241,7 +2273,7 @@ export class ChatService {
       member.clearedBeforeHeight ?? 0,
       member.conversation.clearedBeforeHeight ?? 0,
     );
-    const viewer = await this.selfDestructWindow(userId);
+    const viewer = NO_VIEWER_RETENTION;
     const retention = buildChatRetentionWindow(member.conversation, viewer);
     const [lastMessages, unread, directPeers, tempChats] = await Promise.all([
       this.loadLastMessages([conversationId], [retention]),
@@ -2294,6 +2326,7 @@ export class ChatService {
     return {
       id: conversationId,
       type: member.conversation.type,
+      textEncryption: member.conversation.textEncryption,
       peer: directPeers.info.get(conversationId) ?? null,
       circleId: member.conversation.circleID,
       circle: member.conversation.circleID
@@ -2321,8 +2354,8 @@ export class ChatService {
           : null,
         memberCounts.get(conversationId) ?? null,
       ),
-      burnDurationSec: member.conversation.burnDurationSec ?? null,
-      burnStartedAt: member.conversation.burnStartedAt?.toISOString() ?? null,
+      burnDurationSec: member.burnDurationSec ?? null,
+      burnStartedAt: member.burnStartedAt?.toISOString() ?? null,
       peerReadHeight: directPeers.readHeights.get(conversationId) ?? null,
       peerDeliveredHeight:
         directPeers.deliveredHeights.get(conversationId) ?? null,
@@ -2422,41 +2455,6 @@ export class ChatService {
     );
   }
 
-  /**
-   * 查看者自己的全局阅后即焚截止时间。
-   *
-   * 这是每个用户对自己的设置(UserPrivacySetting.messageSelfDestructSec,默认
-   * 关闭):超过窗口的消息在**他自己的**客户端上不再出现。不是双方协商的会话级
-   * 焚毁,所以只按查看者过滤,不动库里的行。
-   *
-   * 档位与会话级焚毁共用 BURN_DURATION_CHOICES;此前这里存的是天数,于是同一个
-   * 功能在两个入口给出两张不同的档位表。
-   *
-   * cutoff 为 null 表示该用户关掉了它(0/未设置),不做任何过滤。
-   *
-   * startedAt 是开关的开启时间:早于它发出的消息不受这个窗口约束。缺了它,
-   * 打开开关的那一刻此前的全部历史就会一次性消失 —— 会话级焚毁的
-   * burnStartedAt 解决的是同一个问题,这里是查看者侧的对应物。
-   */
-  private async selfDestructWindow(userId: string): Promise<ChatViewerPolicy> {
-    const { sec, startedAt } =
-      await this.privacySettings.getSelfDestructPolicy(userId);
-    if (!sec) return NO_VIEWER_RETENTION;
-    const activatedAt = startedAt ? new Date(startedAt) : null;
-    // 开着窗口却没有边界,只可能来自还没写这一列的旧二进制(蓝绿/滚动发布期间
-    // 旧实例仍能改 messageSelfDestructSec)。把它当作「从头生效」正是本次要
-    // 消灭的回归 —— 一开开关,此前的历史全部消失。宁可这段窗口里不过滤:这是
-    // 查看者自己视图上的读过滤,失效只是他多看见自己的旧消息,不外泄给任何人;
-    // 反过来则是把证明不了发送时间的历史一次性抹掉。
-    if (!activatedAt || !Number.isFinite(activatedAt.getTime())) {
-      return NO_VIEWER_RETENTION;
-    }
-    return {
-      cutoff: new Date(Date.now() - sec * 1000),
-      startedAt: activatedAt,
-    };
-  }
-
   /** 历史分页:height 键集向前翻,页内升序返回。 */
   async getHistory(
     userId: string,
@@ -2464,7 +2462,7 @@ export class ChatService {
     beforeHeight?: number,
     limit: number = HISTORY_PAGE_DEFAULT,
     filters: HistoryFilters = {},
-    options: { applyViewerRetention?: boolean } = {},
+    _options: { applyViewerRetention?: boolean } = {},
   ): Promise<ChatHistoryPageDto> {
     const { conversation, member } = await this.requireMembershipSeat(
       conversationId,
@@ -2484,18 +2482,8 @@ export class ChatService {
       afterHeight ?? 0,
       member.clearedBeforeHeight ?? 0,
     );
-    // 自动销毁窗口:拆栈前由 chat-history.service 负责,自研栈落地时漏掉了 ——
-    // 设置在库里、UI 上也能改,但读取路径根本不看它,用户以为过期的消息其实
-    // 一直在。收在 where 里而不是取回来再 filter:后者会让分页数不准。
-    // 访客(临时房)没有 User 行,查隐私设置只会拿到 2 天的默认值 —— 而临时房
-    // 本身可以开 3 天甚至 7 天,于是活着的房间里超过 2 天的消息对访客凭空消失,
-    // 他还没有任何地方能改这个设置。访客的保留边界是房间寿命,不是用户偏好。
-    const viewer =
-      options.applyViewerRetention === false
-        ? NO_VIEWER_RETENTION
-        : await this.selfDestructWindow(userId);
-    // S-01 会话级焚毁:与查看者保留期取更严(更晚的截止时间)。sweeper 每分钟
-    // 真删,这里的过滤盖住「已到期、尚未被扫掉」的窗口。
+    // 读取只按各消息首次发送时确定的到期时间过滤，不应用查看者的设置。
+    const viewer = NO_VIEWER_RETENTION;
     const retention = buildChatRetentionWindow(conversation, viewer);
     const heightCondition: Prisma.IntFilter = {
       ...(heightFloor > 0 ? { gt: heightFloor } : {}),
@@ -2601,6 +2589,7 @@ export class ChatService {
         FROM "ChatMessage" AS m
         WHERE m."conversationID" = ${conversationId}
           AND m."deleted" = false
+          AND (m."burnExpiresAt" IS NULL OR m."burnExpiresAt" > NOW())
           AND m."type" IN ('text', 'quote')
           AND chat_text_bigrams(m."content" ->> 'text') @> chat_text_bigrams(${keyword})
           AND (m."content" ->> 'text') LIKE ${pattern} ESCAPE '\\'
@@ -2643,6 +2632,7 @@ export class ChatService {
       FROM "ChatMessage" AS m
       WHERE m."conversationID" = ANY(${conversationIds}::text[])
         AND m."deleted" = false
+          AND (m."burnExpiresAt" IS NULL OR m."burnExpiresAt" > NOW())
         AND m."type" IN ('text', 'quote')
         AND chat_text_bigrams(m."content" ->> 'text') @> chat_text_bigrams(${keyword})
         AND (m."content" ->> 'text') LIKE ${pattern} ESCAPE '\\'
@@ -2721,7 +2711,7 @@ export class ChatService {
     const floor = member.clearedBeforeHeight ?? 0;
     const retention = buildChatRetentionWindow(
       conversation,
-      await this.selfDestructWindow(userId),
+      NO_VIEWER_RETENTION,
     );
     const lowerBound = new Date(monthStart);
     const messageWhere: Prisma.ChatMessageWhereInput = {
@@ -2808,17 +2798,8 @@ export class ChatService {
     // 搜索必须和 getHistory 用同一把尺子:否则自动销毁窗口之外的消息
     // 在历史里看不到、一搜就出来了,等于开了后门。清空水位与会话焚毁同理 ——
     // 「清空聊天记录」之后原文一搜即出,这个功能就等于没做。
-    const viewer = await this.selfDestructWindow(userId);
-    const burning = await this.prisma.chatConversation.findMany({
-      where: {
-        id: { in: memberships.map((m) => m.conversationID) },
-        burnDurationSec: { not: null },
-      },
-      select: { id: true, burnDurationSec: true, burnStartedAt: true },
-    });
-    const burnById = new Map(burning.map((c) => [c.id, c]));
-    // 大多数会话既没清空过也没开焚毁 —— 那些合成一个 IN,只有带水位/焚毁的
-    // 才各自展开一支,OR 的分支数因此正比于「特殊会话数」而不是会话总数。
+    const viewer = NO_VIEWER_RETENTION;
+    // 只为清空过的会话展开水位；消息到期过滤在所有分支上统一施加。
     const plain: string[] = [];
     const scoped: Prisma.ChatMessageWhereInput[] = [];
     const heightFloors = new Map<string, number>();
@@ -2828,11 +2809,7 @@ export class ChatService {
         m.clearedBeforeHeight ?? 0,
         m.conversation.clearedBeforeHeight ?? 0,
       );
-      const policy = burnById.get(m.conversationID) ?? {
-        burnDurationSec: null,
-        burnStartedAt: null,
-      };
-      const retention = buildChatRetentionWindow(policy, viewer);
+      const retention = buildChatRetentionWindow({}, viewer);
       heightFloors.set(m.conversationID, floor);
       retentionWindows.set(m.conversationID, retention);
       if (floor <= 0 && !retention.burnCutoff) {
@@ -2905,7 +2882,7 @@ export class ChatService {
       this.toMessageDto(
         row,
         this.senderFor(row, senders, aliases),
-        burnById.get(row.conversationID) ?? null,
+        null,
         userId,
       ),
     );
@@ -2974,14 +2951,14 @@ export class ChatService {
       : throughRevision;
 
     const floor = member.clearedBeforeHeight;
-    const viewer = await this.selfDestructWindow(userId);
+    const viewer = NO_VIEWER_RETENTION;
     const retention = buildChatRetentionWindow(conversation, viewer);
     const tombstones = page.filter((row) => row.deleted && row.height > floor);
     const visible = page.filter(
       (row) =>
         !row.deleted &&
         row.height > floor &&
-        isChatMessageVisible(row.createdAt, retention),
+        isChatMessageVisible(row.createdAt, retention, row.burnExpiresAt),
     );
     const senders = await this.resolveSenders(
       visible
@@ -3204,7 +3181,7 @@ export class ChatService {
       mine?.clearedBeforeHeight ?? 0,
       conv.clearedBeforeHeight ?? 0,
     );
-    const viewer = await this.selfDestructWindow(userId);
+    const viewer = NO_VIEWER_RETENTION;
     const retention = buildChatRetentionWindow(conv, viewer);
     const [unread, lastMessage] = await Promise.all([
       mine
@@ -3246,8 +3223,8 @@ export class ChatService {
       silenced: false,
       silencedUntil: null,
       ...NON_GROUP_FACETS,
-      burnDurationSec: conv.burnDurationSec ?? null,
-      burnStartedAt: conv.burnStartedAt?.toISOString() ?? null,
+      burnDurationSec: mine?.burnDurationSec ?? null,
+      burnStartedAt: mine?.burnStartedAt?.toISOString() ?? null,
       peerReadHeight:
         conv.members.find((m) => m.userID === peerUserId)?.lastReadHeight ??
         null,
@@ -3429,18 +3406,13 @@ export class ChatService {
     messageId: string,
     requiredSenderId?: string,
   ): Promise<string> {
-    await this.requireMembership(conversationId, userId);
-    const row = await this.prisma.chatMessage.findFirst({
-      where: {
-        id: messageId,
-        conversationID: conversationId,
-        type: 'note-card',
-        deleted: false,
-        revokedAt: null,
-        ...(requiredSenderId ? { senderID: requiredSenderId } : {}),
-      },
-      select: { content: true },
-    });
+    const { row } = await this.requireVisibleMessage(userId, messageId);
+    if (
+      row.conversationID !== conversationId ||
+      row.type !== 'note-card' ||
+      (requiredSenderId && row.senderID !== requiredSenderId)
+    )
+      throw this.messageNotFound();
     const content = row?.content;
     const noteId =
       content && typeof content === 'object' && !Array.isArray(content)
@@ -3730,10 +3702,11 @@ export class ChatService {
           m."id", m."conversationID", m."height", m."senderID", m."type", m."content",
           m."clientMessageId", m."requestHash", m."replyToID", m."deleted",
           m."revokedAt", m."revokedBy", m."editedAt", m."deletedAt", m."revision",
-          m."createdAt"
+          m."createdAt", m."burnDurationSec", m."burnExpiresAt"
         FROM "ChatMessage" AS m
         WHERE m."conversationID" = w."conversationID"
           AND m."deleted" = false
+          AND (m."burnExpiresAt" IS NULL OR m."burnExpiresAt" > NOW())
           AND (
             w."viewerCutoff" IS NULL
             OR (w."viewerStartedAt" IS NOT NULL AND m."createdAt" < w."viewerStartedAt")
@@ -3799,6 +3772,7 @@ export class ChatService {
           WHERE m."conversationID" = w."conversationID"
             AND m."height" > w.floor
             AND m."deleted" = false
+          AND (m."burnExpiresAt" IS NULL OR m."burnExpiresAt" > NOW())
             -- 撤回的消息不计未读:对方发了又撤回,红点不该还挂着一条看不到内容的「新消息」。
             AND m."revokedAt" IS NULL
             AND (
@@ -3992,17 +3966,10 @@ export class ChatService {
   private toMessageDto(
     row: MessageRow,
     sender: ChatSenderInfo | null,
-    burnPolicy: ChatBurnPolicy | number | null,
+    _burnPolicy: ChatBurnPolicy | number | null,
     viewerId: string | null,
   ): ChatMessageDto {
-    const normalizedPolicy: ChatBurnPolicy =
-      typeof burnPolicy === 'number'
-        ? { burnDurationSec: burnPolicy }
-        : (burnPolicy ?? { burnDurationSec: null });
-    const burnDurationSec = effectiveBurnDurationForMessage(
-      normalizedPolicy,
-      row.createdAt,
-    );
+    const burnDurationSec = row.burnDurationSec ?? null;
     return {
       id: row.id,
       conversationId: row.conversationID,
@@ -4017,6 +3984,7 @@ export class ChatService {
       revision: row.revision,
       ...(row.editedAt ? { editedAt: row.editedAt.toISOString() } : {}),
       burnDurationSec,
+      burnExpiresAt: row.burnExpiresAt?.toISOString() ?? null,
       // d 只发给它的作者本人。字段保留(可空),不是省略:已装机 App 的协议
       // 校验允许 null d,且只对非 null 的键建本地索引。
       d:
@@ -4076,7 +4044,11 @@ export class ChatService {
         row.conversationID === message.conversationId &&
         row.height >
           (visibility.heightFloors?.get(message.conversationId) ?? 0) &&
-        (!retention || isChatMessageVisible(row.createdAt, retention));
+        isChatMessageVisible(
+          row.createdAt,
+          retention ?? buildChatRetentionWindow({}, NO_VIEWER_RETENTION),
+          row.burnExpiresAt,
+        );
       if (!visible || row.revokedAt !== null) {
         this.stripQuotedText(message);
       }
@@ -4455,6 +4427,17 @@ export class ChatService {
           errorCode: ChatErrorCode.MessageNotFound,
         });
       }
+      const encryption = await tx.chatConversation.findUnique({
+        where: { id: conversationId },
+        select: { textEncryption: true },
+      });
+      if (
+        encryption?.textEncryption === 'MLS_V1' ||
+        current.type === 'encrypted-text'
+      )
+        throw new BadRequestException(
+          'Send a new encrypted message instead of editing',
+        );
       const previous = (current.content ?? {}) as Record<string, unknown>;
       const history = Array.isArray(current.contentHistory)
         ? [...(current.contentHistory as unknown[])]
@@ -4628,14 +4611,7 @@ export class ChatService {
     }
   }
 
-  /**
-   * 读当前会话级阅后即焚档位(与 POST /burn 回执同形)。
-   *
-   * 已装机的 App 每次打开私聊都会 GET 这个路径 —— 深链/联系人入口可能先于会话
-   * 列表打开聊天页,靠它补齐档位。只回会话策略:对端的全局阅后即焚
-   * (UserPrivacySetting.messageSelfDestructSec)是他自己视图上的读过滤,
-   * 不是会话策略,既不影响本人能读到什么,也不该外露给会话另一方。
-   */
+  /** 只读取请求者自己的发送策略；其他成员的设置不覆盖这个值。 */
   async getBurnPolicy(
     userId: string,
     conversationId: string,
@@ -4643,20 +4619,14 @@ export class ChatService {
     burnDurationSec: number | null;
     burnStartedAt: string | null;
   }> {
-    const { conversation } = await this.requireMembershipSeat(
-      conversationId,
-      userId,
-    );
+    const { member } = await this.requireMembershipSeat(conversationId, userId);
     return {
-      burnDurationSec: conversation.burnDurationSec ?? null,
-      burnStartedAt: conversation.burnStartedAt?.toISOString() ?? null,
+      burnDurationSec: member.burnDurationSec ?? null,
+      burnStartedAt: member.burnStartedAt?.toISOString() ?? null,
     };
   }
 
-  /**
-   * S-01 会话级阅后即焚:任一方(DIRECT)或圈主/管理员(GROUP)设置,双方生效。
-   * 变更留系统消息痕迹;真删由每分钟 sweeper 执行,读路径过滤盖住间隙。
-   */
+  /** Each member controls only the expiry stamped onto their own new messages. */
   async setBurnDuration(
     userId: string,
     conversationId: string,
@@ -4665,75 +4635,47 @@ export class ChatService {
     burnDurationSec: number | null;
     burnStartedAt: string | null;
   }> {
-    const { conversation, member } = await this.requireMembershipSeat(
+    const { conversation } = await this.requireMembershipSeat(
       conversationId,
       userId,
     );
-    if (conversation.type === 'TEMP') {
-      // 访客的保留边界是房间寿命,不是会话设置。
+    if (conversation.type === 'TEMP')
       throw new BadRequestException({
         message: '临时聊天不支持阅后即焚',
         errorCode: ChatErrorCode.InvalidPayload,
       });
-    }
-    if (conversation.type === 'GROUP') {
-      // 圈子群:圈主/管理员;独立群聊:群主或管理员(角色在座位行上)。
-      const authorized = conversation.circleID
-        ? await this.isCircleModerator(conversation, userId)
-        : isGroupManager(standaloneGroupRole(conversation.ownerID, member));
-      if (!authorized) {
-        throw new ForbiddenException({
-          message: '仅群主或管理员可设置',
-          errorCode: GroupErrorCode.ManagerOnly,
-        });
-      }
-    }
-    // 单聊拉黑之后座位仍在,不复查的话被拉黑的一方可以把会话设成 30 秒焚毁,
-    // 隔一分钟 sweeper 就替他把对方的整段历史真删了 —— 一个连消息都发不出去的
-    // 人,不该有销毁对方数据的能力。
     await this.assertDirectMutationAllowed(conversation, userId);
     const normalized =
       seconds !== null && Number.isInteger(seconds) && seconds > 0
         ? seconds
         : null;
-    const nextStartedAt = normalized
-      ? (conversation.burnStartedAt ?? new Date())
-      : null;
-    // 放宽/关闭之前,先把旧策略下**已经到期**的消息落成真删。
-    // 读路径的过滤是按「当前 burnDurationSec」算的,一旦放宽,那些已经过期、
-    // 只是还没轮到 sweeper 的消息会连同签名的媒体 URL 一起重新可读 ——
-    // 用户以为烧掉的东西又回来了。
-    await this.tombstoneExpiredBeforeRelax(
-      conversationId,
-      conversation.burnDurationSec,
-      conversation.burnStartedAt,
-      normalized,
-    );
-    // 微信/Signal 式留痕:开关变化必须双方可见,防「对方偷偷开了焚毁」。
-    //
-    // 设置与痕迹必须在**同一个事务**里。上一版只是把 emit 从 fire-and-forget
-    // 改成 await —— 没用:emit 内部就把失败吞成 warn 了,await 一个从不失败的
-    // 调用,等于什么都没做。破坏性的保留策略照样能在无人知晓的情况下生效。
     const { updated, notice } = await this.prisma.$transaction(async (tx) => {
-      const row = await tx.chatConversation.update({
-        where: { id: conversationId },
+      // Match send's conversation-first lock order so a message gets one committed policy.
+      await tx.$queryRaw`SELECT "id" FROM "ChatConversation" WHERE "id" = ${conversationId} FOR UPDATE`;
+      const updated = await tx.chatMember.update({
+        where: {
+          conversationID_userID: {
+            conversationID: conversationId,
+            userID: userId,
+          },
+        },
         data: {
           burnDurationSec: normalized,
-          burnStartedAt: nextStartedAt,
+          burnStartedAt: normalized ? new Date() : null,
         },
       });
-      const dto = await this.systemMessage.insertSystemMessageInTx(
+      const notice = await this.systemMessage.insertSystemMessageInTx(
         tx,
         conversationId,
         {
           kind: 'burn-changed',
+          userId,
           seconds: normalized ?? 0,
-          burnStartedAt: nextStartedAt?.toISOString() ?? null,
+          burnStartedAt: updated.burnStartedAt?.toISOString() ?? null,
         },
       );
-      return { updated: row, notice: dto };
+      return { updated, notice };
     });
-    // 广播放在提交之后:事务回滚了却已经播出去,客户端会显示一条并不存在的提示。
     try {
       await this.systemMessage.broadcastSystemMessage(notice);
     } catch (error) {
@@ -4745,86 +4687,6 @@ export class ChatService {
       burnDurationSec: updated.burnDurationSec ?? null,
       burnStartedAt: updated.burnStartedAt?.toISOString() ?? null,
     };
-  }
-
-  /**
-   * 焚毁时长放宽/关闭前的兜底真删:按**旧**时长算出的过期消息立刻落成
-   * deleted,免得放宽之后它们从读路径的过滤里溜回来。
-   * 收紧(新时长更短)不需要处理 —— 新截止只会更晚,sweeper 下一轮就到。
-   */
-  private async tombstoneExpiredBeforeRelax(
-    conversationId: string,
-    previousSeconds: number | null,
-    previousStartedAt: Date | null,
-    nextSeconds: number | null,
-  ): Promise<void> {
-    if (!previousSeconds || previousSeconds <= 0) return;
-    if (nextSeconds !== null && nextSeconds <= previousSeconds) return;
-    const cutoff = new Date(Date.now() - previousSeconds * 1000);
-    // 分批。刚开了 30 秒焚毁又立刻关掉的长会话,积压可能是整段历史:
-    // 一次 findMany 会把每一行的完整 JSON content 都拉进内存,后面再跟一条
-    // 巨大的 IN 更新 —— 内存、查询参数上限、接口超时三样一起顶上来。
-    for (let round = 0; round < RELAX_PURGE_BATCHES_MAX; round += 1) {
-      const expired = await this.prisma.chatMessage.findMany({
-        where: {
-          conversationID: conversationId,
-          deleted: false,
-          createdAt: {
-            ...(previousStartedAt ? { gte: previousStartedAt } : {}),
-            lt: cutoff,
-          },
-        },
-        select: { id: true, type: true, content: true },
-        take: RELAX_PURGE_BATCH,
-      });
-      if (expired.length === 0) return;
-      const messageIds = expired.map((row) => row.id);
-      const mediaKeys = expired.flatMap((row) => this.collectMediaKeys(row));
-      const noteImportKeys = expired.flatMap((row) =>
-        this.collectNoteImportMediaKeys(row),
-      );
-      const burned = await this.prisma.$transaction(async (tx) => {
-        // 会话行锁先拿(触发器要更新会话计数器;先锁消息行会与编辑/回应交叉死锁)。
-        await tx.$queryRaw`
-          SELECT "id" FROM "ChatConversation"
-          WHERE "id" = ${conversationId} FOR UPDATE`;
-        // RETURNING 带回触发器刚分配的 revision,随焚毁通知下发。
-        const tombstones = await tx.chatMessage.updateManyAndReturn({
-          where: { id: { in: messageIds } },
-          // contentHistory 一并清空:编辑过的消息,历次旧正文都还完整躺在这里,
-          // 只清 content 等于「烧掉的只是最后一版」。
-          data: {
-            deleted: true,
-            deletedAt: new Date(),
-            content: {},
-            contentHistory: [] as Prisma.InputJsonValue,
-          },
-          select: { id: true, revision: true },
-        });
-        await this.media.queueDeletions(tx, mediaKeys);
-        await this.media.releaseNoteImportReferences(
-          tx,
-          messageIds,
-          noteImportKeys,
-        );
-        return tombstones;
-      });
-      // 墓碑提交后通知在座成员(与 sweeper 同一条通道):读路径不会再放它们回来,
-      // 但对端设备上的本地副本得靠这条通知才删得掉。emitBurnedMessages 自己兜住失败。
-      await this.broadcast.emitBurnedMessages(conversationId, burned);
-      if (mediaKeys.length > 0) void this.media.deleteObjects(mediaKeys);
-      if (noteImportKeys.length > 0) {
-        void this.media.drainPendingDeletions();
-      }
-      if (expired.length < RELAX_PURGE_BATCH) return;
-    }
-    // 批次上限也没清完(异常量级的积压):设置**不放宽**,让读路径继续按旧
-    // 截止过滤,剩下的交给每分钟 sweeper。宁可晚点放宽,也不能让已经烧掉的
-    // 内容重新可读。
-    throw new BadRequestException({
-      message: '历史清理中,请稍后再试',
-      errorCode: ChatErrorCode.RateLimited,
-    });
   }
 
   /**

@@ -240,7 +240,11 @@ describe('NotificationService', () => {
   it('publishes an admin system announcement to active users with push outbox rows and unread broadcasts', async () => {
     prisma.systemAnnouncement.upsert.mockResolvedValue({
       id: 'announcement-1',
-      requestFingerprint: 'admin-1:Maintenance starts at 22:00.',
+      requestFingerprint: JSON.stringify([
+        'admin-1',
+        'Maintenance notice',
+        'Maintenance starts at 22:00.',
+      ]),
       createdAt: new Date('2026-07-29T12:00:00.000Z'),
       auditRecordedAt: null,
     });
@@ -258,6 +262,7 @@ describe('NotificationService', () => {
       (service.publishSystemAnnouncement as any)(
         'admin-1',
         {
+          title: 'Maintenance notice',
           content: 'Maintenance starts at 22:00.',
         },
         'announcement-request-1',
@@ -268,6 +273,11 @@ describe('NotificationService', () => {
       ),
     ).resolves.toEqual({ createdCount: 2 });
 
+    expect(prisma.systemAnnouncement.upsert).toHaveBeenCalledWith(
+      expect.objectContaining({
+        create: expect.objectContaining({ title: 'Maintenance notice' }),
+      }),
+    );
     expect(prisma.user.findMany).toHaveBeenCalledWith({
       where: {
         status: 'ACTIVE',
@@ -956,6 +966,7 @@ describe('NotificationService', () => {
       expect(result[0]).toEqual({
         id: 'n1',
         type: 'TRACE_COMMENT',
+        title: null,
         content: 'nice',
         read: false,
         createdAt: '2026-06-05T00:00:00.000Z',
@@ -1561,5 +1572,290 @@ describe('NotificationService', () => {
         }),
       );
     });
+  });
+});
+
+describe('scrolling announcements', () => {
+  it('updates the selection and writes its audit within the same transaction', async () => {
+    const tx = {
+      $queryRaw: jest.fn(),
+      systemAnnouncement: {
+        findFirst: jest
+          .fn()
+          .mockResolvedValue({ id: 'a', fanoutCompletedAt: new Date() }),
+        update: jest.fn().mockResolvedValue({ id: 'a', scrolling: false }),
+      },
+    };
+    const prisma = {
+      notification: {
+        findMany: jest
+          .fn()
+          .mockResolvedValue([{ id: 'n-a', toUserID: 'user-a' }]),
+      },
+      $transaction: jest.fn(async (fn: any) => fn(tx)),
+    };
+    const audit = { recordStrict: jest.fn() };
+    const realtime = { broadcastAnnouncementChanged: jest.fn() };
+    const service = new NotificationService(
+      prisma as any,
+      realtime as any,
+      undefined,
+      audit as any,
+    );
+    expect(await service.setAnnouncementScrolling('admin', 'a', false)).toEqual(
+      { id: 'a', scrolling: false },
+    );
+    expect(realtime.broadcastAnnouncementChanged).toHaveBeenCalledWith(
+      'user-a',
+    );
+    expect(audit.recordStrict).toHaveBeenCalledWith(
+      tx,
+      expect.objectContaining({
+        actorID: 'admin',
+        entityID: 'a',
+        after: { scrolling: false },
+      }),
+    );
+    expect(tx.systemAnnouncement.update).toHaveBeenCalledWith(
+      expect.objectContaining({
+        where: { id: 'a' },
+        data: { scrolling: false },
+      }),
+    );
+  });
+  it('replaces the previous selection under the same transaction lock', async () => {
+    const tx = {
+      $queryRaw: jest.fn(),
+      systemAnnouncement: {
+        findMany: jest.fn().mockResolvedValue([{ id: 'old' }]),
+        findFirst: jest
+          .fn()
+          .mockResolvedValue({ id: 'new', fanoutCompletedAt: new Date() }),
+        updateMany: jest.fn(),
+        update: jest.fn().mockResolvedValue({ id: 'new', scrolling: true }),
+      },
+    };
+    const prisma = {
+      notification: {
+        findMany: jest.fn().mockResolvedValue([
+          { id: 'n-old', toUserID: 'old-recipient' },
+          { id: 'n-new', toUserID: 'new-recipient' },
+        ]),
+      },
+      $transaction: jest.fn(async (fn: any) => fn(tx)),
+    };
+    const realtime = { broadcastAnnouncementChanged: jest.fn() };
+    const service = new NotificationService(
+      prisma as any,
+      realtime as any,
+      undefined,
+      { recordStrict: jest.fn() } as any,
+    );
+    await service.setAnnouncementScrolling('admin', 'new', true);
+    expect(tx.$queryRaw).toHaveBeenCalledTimes(1);
+    expect(prisma.notification.findMany).toHaveBeenCalledWith(
+      expect.objectContaining({
+        where: { systemAnnouncementID: { in: ['new', 'old'] } },
+      }),
+    );
+    expect(realtime.broadcastAnnouncementChanged).toHaveBeenCalledWith(
+      'old-recipient',
+    );
+    expect(realtime.broadcastAnnouncementChanged).toHaveBeenCalledWith(
+      'new-recipient',
+    );
+    expect(tx.systemAnnouncement.updateMany).toHaveBeenCalledWith({
+      where: { scrolling: true, id: { not: 'new' } },
+      data: { scrolling: false },
+    });
+    expect(
+      tx.systemAnnouncement.updateMany.mock.invocationCallOrder[0],
+    ).toBeLessThan(tx.systemAnnouncement.update.mock.invocationCallOrder[0]);
+  });
+  it('returns the recipient notification ID for the shared detail page', async () => {
+    const row = {
+      id: 'announcement-id',
+      title: 'Title',
+      content: 'Body',
+      createdAt: new Date(),
+      notifications: [{ id: 'recipient-notification' }],
+    };
+    const service = new NotificationService(
+      {
+        systemAnnouncement: { findMany: jest.fn().mockResolvedValue([row]) },
+      } as any,
+      {} as any,
+    );
+    expect(await service.scrollingAnnouncements('user-a')).toEqual({
+      items: [
+        expect.objectContaining({ notificationID: 'recipient-notification' }),
+      ],
+    });
+  });
+  it('returns only selected, published announcements delivered to this user', async () => {
+    const prisma = {
+      systemAnnouncement: { findMany: jest.fn().mockResolvedValue([]) },
+    };
+    const service = new NotificationService(
+      prisma as any,
+      {} as any,
+      {} as any,
+    );
+    expect(await service.scrollingAnnouncements('user-a')).toEqual({
+      items: [],
+    });
+    expect(prisma.systemAnnouncement.findMany).toHaveBeenCalledWith(
+      expect.objectContaining({
+        where: {
+          scrolling: true,
+          deletedAt: null,
+          fanoutCompletedAt: { not: null },
+          notifications: { some: { toUserID: 'user-a', deleted: false } },
+        },
+        take: 1,
+        orderBy: [{ createdAt: 'desc' }, { id: 'desc' }],
+      }),
+    );
+  });
+});
+
+describe('profile notification details ownership', () => {
+  it('scopes full content to the current recipient and excludes deleted or non-profile notifications', async () => {
+    const prisma = {
+      notification: {
+        findFirst: jest.fn().mockResolvedValue({
+          id: 'n',
+          type: 'SYSTEM',
+          content: 'full body',
+          createdAt: new Date(),
+          read: false,
+        }),
+      },
+    };
+    const service = new NotificationService(prisma as any, {} as any);
+    expect(await service.profileNotificationDetail('user-a', 'n')).toEqual(
+      expect.objectContaining({ content: 'full body' }),
+    );
+    expect(prisma.notification.findFirst).toHaveBeenCalledWith(
+      expect.objectContaining({
+        where: expect.objectContaining({
+          id: 'n',
+          toUserID: 'user-a',
+          deleted: false,
+          type: expect.objectContaining({ in: expect.any(Array) }),
+        }),
+      }),
+    );
+  });
+  it('does not return another user notification', async () => {
+    const service = new NotificationService(
+      { notification: { findFirst: jest.fn().mockResolvedValue(null) } } as any,
+      {} as any,
+    );
+    await expect(
+      service.profileNotificationDetail('user-b', 'n'),
+    ).rejects.toMatchObject({ status: 404 });
+  });
+});
+
+describe('editing and deleting announcements', () => {
+  function harness(row: unknown = { id: 'a', fanoutCompletedAt: new Date() }) {
+    const tx = {
+      $queryRaw: jest.fn(),
+      systemAnnouncement: {
+        findFirst: jest.fn().mockResolvedValue(row),
+        update: jest.fn().mockResolvedValue({ id: 'a' }),
+      },
+      notification: {
+        updateMany: jest.fn(),
+        findMany: jest.fn().mockResolvedValue([{ id: 'n', toUserID: 'u' }]),
+      },
+      notificationPushOutbox: { updateMany: jest.fn() },
+      notificationPushDelivery: { updateMany: jest.fn() },
+    };
+    const prisma = {
+      notification: tx.notification,
+      $transaction: jest.fn(async (fn: any) => fn(tx)),
+    };
+    const audit = { recordStrict: jest.fn() };
+    const realtime = { broadcastAnnouncementChanged: jest.fn() };
+    return {
+      tx,
+      audit,
+      realtime,
+      service: new NotificationService(
+        prisma as any,
+        realtime as any,
+        undefined,
+        audit as any,
+      ),
+    };
+  }
+  it('updates the title and all live recipient bodies without sending another push', async () => {
+    const { service, tx, audit, realtime } = harness();
+    await service.editAnnouncement('admin', 'a', {
+      title: 'New title',
+      content: 'New body',
+    });
+    expect(tx.systemAnnouncement.update).toHaveBeenCalledWith(
+      expect.objectContaining({
+        data: { title: 'New title', content: 'New body' },
+      }),
+    );
+    expect(tx.notification.updateMany).toHaveBeenCalledWith({
+      where: { systemAnnouncementID: 'a', deleted: false },
+      data: { content: 'New body' },
+    });
+    expect(tx.notificationPushOutbox.updateMany).toHaveBeenCalledWith(
+      expect.objectContaining({
+        where: {
+          notification: { systemAnnouncementID: 'a' },
+          status: { in: ['PENDING', 'FAILED'] },
+        },
+        data: { payload: Prisma.DbNull },
+      }),
+    );
+    expect(realtime.broadcastAnnouncementChanged).toHaveBeenCalledWith('u');
+    expect(audit.recordStrict).toHaveBeenCalledWith(
+      tx,
+      expect.objectContaining({ action: 'system_announcement_edit' }),
+    );
+  });
+  it('hides recipient notifications, stops scrolling and cancels unfinished pushes', async () => {
+    const { service, tx, audit, realtime } = harness();
+    expect(await service.deleteAnnouncement('admin', 'a')).toEqual({
+      deleted: true,
+    });
+    expect(realtime.broadcastAnnouncementChanged).toHaveBeenCalledWith('u');
+    expect(tx.systemAnnouncement.update).toHaveBeenCalledWith({
+      where: { id: 'a' },
+      data: { deletedAt: expect.any(Date), scrolling: false },
+    });
+    expect(tx.notification.updateMany).toHaveBeenCalledWith({
+      where: { systemAnnouncementID: 'a' },
+      data: { deleted: true },
+    });
+    expect(tx.notificationPushOutbox.updateMany).toHaveBeenCalledWith(
+      expect.objectContaining({
+        data: expect.objectContaining({
+          status: 'TERMINAL',
+          leaseToken: null,
+          completionReason: 'ANNOUNCEMENT_DELETED',
+        }),
+      }),
+    );
+    expect(audit.recordStrict).toHaveBeenCalledWith(
+      tx,
+      expect.objectContaining({ action: 'system_announcement_delete' }),
+    );
+  });
+  it('rejects deleted and still-publishing announcements before changing recipient data', async () => {
+    for (const row of [null, { id: 'a', fanoutCompletedAt: null }]) {
+      const { service, tx } = harness(row);
+      await expect(
+        service.deleteAnnouncement('admin', 'a'),
+      ).rejects.toBeDefined();
+      expect(tx.notification.updateMany).not.toHaveBeenCalled();
+    }
   });
 });

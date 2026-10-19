@@ -170,7 +170,7 @@ describe('ChatDirectAutoReplyProcessor', () => {
 
     expect(prisma.chatMember.findMany).toHaveBeenCalledWith({
       where: { conversationID: 'conv-1', leftAt: null },
-      select: { userID: true },
+      select: { userID: true, burnDurationSec: true },
     });
     expect(prisma.chatMessage.create).toHaveBeenCalledWith({
       data: {
@@ -180,6 +180,8 @@ describe('ChatDirectAutoReplyProcessor', () => {
         type: 'text',
         content: { text: '稍后回复', autoReply: true },
         clientMessageId: 'dm-auto:source-1:u2',
+        burnDurationSec: null,
+        burnExpiresAt: null,
         replyToID: null,
         createdAt,
       },

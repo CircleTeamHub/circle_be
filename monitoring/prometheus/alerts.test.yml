@@ -533,3 +533,170 @@ tests:
       - eval_time: 15m
         alertname: PublicProbeNotConfigured
         exp_alerts: []
+
+  # Gateway protection, sustained abuse, recovery and quiet traffic.
+  - name: 网关预算按进程告警且恢复后清除
+    interval: 1m
+    input_series:
+      - series: circle_gateway_capacity_used{job="circle-be",instance="blue",pool="chat_connections"}
+        values: 1700+0x10 0+0x20
+      - series: circle_gateway_capacity_limit{job="circle-be",instance="blue",pool="chat_connections"}
+        values: 2000+0x31
+      - series: circle_gateway_capacity_used{job="circle-be",instance="green",pool="chat_connections"}
+        values: 1000+0x10 0+0x20
+      - series: circle_gateway_capacity_limit{job="circle-be",instance="green",pool="chat_connections"}
+        values: 2000+0x31
+    alert_rule_test:
+      - eval_time: 1m
+        alertname: GatewayCapacityNearLimit
+        exp_alerts: []
+      - eval_time: 3m
+        alertname: GatewayCapacityNearLimit
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              job: circle-be
+              instance: blue
+              pool: chat_connections
+            exp_annotations:
+              summary: Gateway blue chat_connections budget above 80% for 2m
+      - eval_time: 15m
+        alertname: GatewayCapacityNearLimit
+        exp_alerts: []
+  - name: GatewayCapacityRejecting 持续异常触发且恢复后清除
+    interval: 1m
+    input_series:
+      - series: circle_gateway_rejections_total{instance="blue",pool="http",reason="capacity"}
+        values: 0+120x15 1800+0x20
+    alert_rule_test:
+      - eval_time: 1m
+        alertname: GatewayCapacityRejecting
+        exp_alerts: []
+      - eval_time: 10m
+        alertname: GatewayCapacityRejecting
+        exp_alerts:
+          - exp_labels:
+              severity: critical
+              instance: blue
+              pool: http
+            exp_annotations:
+              summary: Gateway blue http rejects more than 1 request or connection per second for 2m
+      - eval_time: 25m
+        alertname: GatewayCapacityRejecting
+        exp_alerts: []
+  - name: GatewayAuthTimeoutSpike 持续异常触发且恢复后清除
+    interval: 1m
+    input_series:
+      - series: circle_gateway_rejections_total{instance="blue",pool="realtime_pending",reason="auth_timeout"}
+        values: 0+360x15 5400+0x20
+    alert_rule_test:
+      - eval_time: 1m
+        alertname: GatewayAuthTimeoutSpike
+        exp_alerts: []
+      - eval_time: 10m
+        alertname: GatewayAuthTimeoutSpike
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              instance: blue
+              pool: realtime_pending
+            exp_annotations:
+              summary: Gateway blue realtime_pending authentication timeouts exceed 5/s for 5m
+      - eval_time: 25m
+        alertname: GatewayAuthTimeoutSpike
+        exp_alerts: []
+  - name: ApiAuthFailureSpike 持续异常触发且恢复后清除
+    interval: 1m
+    input_series:
+      - series: http_requests_total{job="circle-be",status_code="401"}
+        values: 0+660x15 9900+0x20
+    alert_rule_test:
+      - eval_time: 1m
+        alertname: ApiAuthFailureSpike
+        exp_alerts: []
+      - eval_time: 10m
+        alertname: ApiAuthFailureSpike
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+            exp_annotations:
+              summary: API 401/403 responses exceed 10/s for 5m; investigate abuse or a client authentication regression
+      - eval_time: 25m
+        alertname: ApiAuthFailureSpike
+        exp_alerts: []
+  - name: ApiRateLimitSpike 持续异常触发且恢复后清除
+    interval: 1m
+    input_series:
+      - series: http_requests_total{job="circle-be",status_code="429"}
+        values: 0+360x15 5400+0x20
+    alert_rule_test:
+      - eval_time: 1m
+        alertname: ApiRateLimitSpike
+        exp_alerts: []
+      - eval_time: 10m
+        alertname: ApiRateLimitSpike
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+            exp_annotations:
+              summary: API rate-limited responses exceed 5/s for 5m; check shared NAT and abusive clients
+      - eval_time: 25m
+        alertname: ApiRateLimitSpike
+        exp_alerts: []
+  - name: ChatAuthFailureSpike 持续异常触发且恢复后清除
+    interval: 1m
+    input_series:
+      - series: chat_auth_failures_total{reason="invalid_token"}
+        values: 0+360x15 5400+0x20
+    alert_rule_test:
+      - eval_time: 1m
+        alertname: ChatAuthFailureSpike
+        exp_alerts: []
+      - eval_time: 10m
+        alertname: ChatAuthFailureSpike
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+            exp_annotations:
+              summary: Chat authentication failures exceed 5/s for 5m; investigate abuse or a client authentication regression
+      - eval_time: 25m
+        alertname: ChatAuthFailureSpike
+        exp_alerts: []
+  - name: 正常流量和短暂超预算不告警
+    interval: 1m
+    input_series:
+      - series: circle_gateway_capacity_used{instance="blue",pool="http"}
+        values: 0 120 0+0x18
+      - series: circle_gateway_capacity_limit{instance="blue",pool="http"}
+        values: 128+0x20
+      - series: circle_gateway_rejections_total{instance="blue",pool="http",reason="capacity"}
+        values: 0+1x20
+      - series: http_requests_total{job="circle-be",status_code="401"}
+        values: 0+1x20
+      - series: http_requests_total{job="other-service",status_code="401"}
+        values: 0+1000x20
+      - series: http_requests_total{job="circle-be",status_code="429"}
+        values: 0+1x20
+      - series: chat_auth_failures_total{reason="invalid_token"}
+        values: 0+1x20
+      - series: circle_gateway_rejections_total{instance="blue",pool="chat_pending",reason="auth_timeout"}
+        values: 0+1x20
+    alert_rule_test:
+      - eval_time: 15m
+        alertname: GatewayCapacityNearLimit
+        exp_alerts: []
+      - eval_time: 15m
+        alertname: GatewayCapacityRejecting
+        exp_alerts: []
+      - eval_time: 15m
+        alertname: GatewayAuthTimeoutSpike
+        exp_alerts: []
+      - eval_time: 15m
+        alertname: ApiAuthFailureSpike
+        exp_alerts: []
+      - eval_time: 15m
+        alertname: ApiRateLimitSpike
+        exp_alerts: []
+      - eval_time: 15m
+        alertname: ChatAuthFailureSpike
+        exp_alerts: []
