@@ -228,7 +228,8 @@ describe('setupApp', () => {
       ([path]) => path === '/metrics',
     );
     const handler = metricsCall?.[1] as
-      ((req: unknown, res: unknown) => Promise<void>) | undefined;
+      | ((req: unknown, res: unknown) => Promise<void>)
+      | undefined;
     const response = {
       setHeader: jest.fn(),
       end: jest.fn(),
@@ -271,7 +272,8 @@ describe('setupApp', () => {
         ([path]) => path === '/metrics',
       );
       const handler = metricsCall?.[1] as
-        ((req: unknown, res: unknown) => Promise<void>) | undefined;
+        | ((req: unknown, res: unknown) => Promise<void>)
+        | undefined;
       const response = {
         setHeader: jest.fn(),
         end: jest.fn(),

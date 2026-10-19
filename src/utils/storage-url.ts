@@ -2,7 +2,10 @@ import { BadRequestException } from '@nestjs/common';
 import type { ConfigService } from '@nestjs/config';
 
 export type ObjectStoreStatus =
-  'ok' | 'policy-unconfirmed' | 'external-unverified' | 'disabled';
+  | 'ok'
+  | 'policy-unconfirmed'
+  | 'external-unverified'
+  | 'disabled';
 
 function stripTrailingSlashes(value: string): string {
   let end = value.length;

@@ -29,7 +29,10 @@ const unscopedSecurityLoggedErrors = new WeakSet<object>();
  * `session_revoked_token_used`.
  */
 export type AuthFailureReason =
-  'token_missing' | 'token_expired' | 'token_not_active' | 'token_invalid';
+  | 'token_missing'
+  | 'token_expired'
+  | 'token_not_active'
+  | 'token_invalid';
 
 const ROUTINE_AUTH_FAILURES: ReadonlySet<AuthFailureReason> =
   new Set<AuthFailureReason>(['token_missing', 'token_expired']);

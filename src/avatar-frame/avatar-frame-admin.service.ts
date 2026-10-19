@@ -400,7 +400,8 @@ export class AvatarFrameAdminService {
     targetUserId?: string,
   ): Promise<void> {
     const ids = [...new Set([operatorUserId, targetUserId].filter(Boolean))] as
-      [string] | [string, string];
+      | [string]
+      | [string, string];
     const users = await tx.user.findMany({
       where: { id: { in: ids } },
       select: { id: true },

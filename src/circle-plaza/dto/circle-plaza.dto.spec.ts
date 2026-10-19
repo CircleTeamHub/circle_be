@@ -118,7 +118,8 @@ describe('VIP restriction fields advertise the 0..4 cap in OpenAPI metadata', ()
   // @nestjs/swagger 把 @ApiProperty 选项存在 'swagger/apiModelProperties' 元数据键下。
   const apiMeta = (proto: object, prop: string): Record<string, unknown> =>
     (Reflect.getMetadata('swagger/apiModelProperties', proto, prop) as
-      Record<string, unknown> | undefined) ?? {};
+      | Record<string, unknown>
+      | undefined) ?? {};
 
   it('CreatePlazaPostDto vip/signup restrictions expose minimum 0 and maximum 4', () => {
     for (const prop of ['vipRestriction', 'signupVipRestriction']) {
