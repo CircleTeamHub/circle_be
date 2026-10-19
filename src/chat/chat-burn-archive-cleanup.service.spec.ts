@@ -35,6 +35,7 @@ describe('180-day burn archive cleanup', () => {
     ]);
     prisma.chatBurnArchive.findUnique.mockResolvedValue({
       id: 'm1',
+      type: 'image',
       retainUntil: new Date(0),
       content: { key: 'chat/u1/a.jpg' },
     });
@@ -46,6 +47,21 @@ describe('180-day burn archive cleanup', () => {
     expect(prisma.chatBurnArchive.delete).toHaveBeenCalledWith({
       where: { id: 'm1' },
     });
+  });
+  it('does not schedule hidden object keys in a non-media archive for deletion', async () => {
+    prisma.chatBurnArchive.findUnique.mockResolvedValue({
+      id: 'm1',
+      type: 'text',
+      retainUntil: new Date(0),
+      content: { key: 'chat/other/private.jpg' },
+    });
+    await service.sweep();
+    expect(media.queueDeletions).toHaveBeenCalledWith(prisma, [], 'm1');
+    expect(media.releaseNoteImportReferences).toHaveBeenCalledWith(
+      prisma,
+      ['m1'],
+      [],
+    );
   });
   it('records a held-lease invocation as skipped rather than refreshing success', async () => {
     redis.tryAcquireLease.mockResolvedValue(null);

@@ -8,7 +8,10 @@ import {
   TrackedCron,
 } from 'src/metrics/tracked-cron.decorator';
 import { ChatMediaService } from './chat-media.service';
-import { CHAT_NOTE_IMPORT_SEGMENT } from './chat.constants';
+import {
+  CHAT_MEDIA_KEY_FIELDS,
+  CHAT_NOTE_IMPORT_SEGMENT,
+} from './chat.constants';
 
 @Injectable()
 export class ChatBurnArchiveCleanupService {
@@ -40,8 +43,8 @@ export class ChatBurnArchiveCleanupService {
             });
             if (!row || row.retainUntil.getTime() > Date.now()) return;
             const content = row.content as Record<string, unknown>;
-            const keys = ['key', 'thumbKey', 'coverKey']
-              .map((field) => content[field])
+            const keys = (CHAT_MEDIA_KEY_FIELDS[row.type] ?? [])
+              .map((field) => content[field.key])
               .filter((key): key is string => typeof key === 'string');
             const imports = keys.filter((key) =>
               key.includes(`/${CHAT_NOTE_IMPORT_SEGMENT}`),
