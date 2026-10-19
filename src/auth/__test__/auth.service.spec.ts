@@ -1326,6 +1326,7 @@ describe('AuthService', () => {
     expect(mockDeviceTrust.releaseRecoveryClaim).toHaveBeenCalledWith(
       'challenge-r',
     );
+    expect(mockDeviceTrust.trust).not.toHaveBeenCalled();
   });
 
   it('requesting recovery answers with the waiting deadline', async () => {

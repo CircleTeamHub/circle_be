@@ -429,7 +429,6 @@ export class AuthService {
         errorCode: AuthErrorCode.LoginChallengeInvalid,
       });
     }
-    await this.deviceTrust.trust(user.id, deviceKey, sessionContext);
     this.prisma.user
       .update({ where: { id: user.id }, data: { lastOnline: new Date() } })
       .catch((err) =>
@@ -446,6 +445,9 @@ export class AuthService {
     await this.refreshTokenService.revokeOtherSessions(user.id, sessionId);
     await this.deviceTrust.revokeOtherDevices(user.id, deviceKey);
     await this.deviceTrust.invalidateChallenges(user.id);
+    // Only enroll trust after every cleanup step succeeds. A retry must still
+    // enter the recovery path if revocation or challenge invalidation fails.
+    await this.deviceTrust.trust(user.id, deviceKey, sessionContext);
     this.deviceTrust.logRecoveryCompleted(user.id, challengeId);
     logBusinessEvent(this.logger, {
       enabled: this.loggingConfig.businessLogOn,
