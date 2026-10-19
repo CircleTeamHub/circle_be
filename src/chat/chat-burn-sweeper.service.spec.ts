@@ -686,13 +686,22 @@ describe('ChatBurnSweeperService', () => {
   it('keeps archived media and note-import reference pins instead of deleting them at user expiry', async () => {
     prisma.chatConversation.findMany.mockResolvedValue([{ id: 'conv-1' }]);
     const content = { key: 'chat/u1/photo.jpg', thumbKey: 'chat/u1/thumb.jpg' };
-    prisma.chatMessage.findMany.mockResolvedValueOnce([{ id: 'retained', type: 'image', content }]);
-    prisma.chatBurnArchive.findMany.mockResolvedValue([{ id: 'retained', content }]);
+    prisma.chatMessage.findMany.mockResolvedValueOnce([
+      { id: 'retained', type: 'image', content },
+    ]);
+    prisma.chatBurnArchive.findMany.mockResolvedValue([
+      { id: 'retained', content },
+    ]);
     await service.sweep();
     expect(media.queueDeletions).toHaveBeenCalledWith(prisma, []);
     expect(media.deleteObjects).not.toHaveBeenCalled();
-    expect(media.releaseNoteImportReferences).toHaveBeenCalledWith(prisma, [], []);
-    expect(broadcast.emitBurnedMessages).toHaveBeenCalledWith('conv-1', [{ id: 'retained', revision: 1 }]);
+    expect(media.releaseNoteImportReferences).toHaveBeenCalledWith(
+      prisma,
+      [],
+      [],
+    );
+    expect(broadcast.emitBurnedMessages).toHaveBeenCalledWith('conv-1', [
+      { id: 'retained', revision: 1 },
+    ]);
   });
-
 });

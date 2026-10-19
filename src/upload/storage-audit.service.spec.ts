@@ -445,10 +445,19 @@ describe('StorageAuditService', () => {
   });
   it('does not report 180-day archive attachments as orphaned user media', async () => {
     const { service } = harness({
-      objects: { 'chat/': [{ key: 'chat/u1/retained.jpg', size: 10, lastModified: old }] },
-      referenced: { chatBurnArchive: [{ id: 'burned', type: 'image', content: { key: 'chat/u1/retained.jpg' } }] },
+      objects: {
+        'chat/': [{ key: 'chat/u1/retained.jpg', size: 10, lastModified: old }],
+      },
+      referenced: {
+        chatBurnArchive: [
+          {
+            id: 'burned',
+            type: 'image',
+            content: { key: 'chat/u1/retained.jpg' },
+          },
+        ],
+      },
     });
     expect(await service.audit(now)).toMatchObject({ orphanCount: 0 });
   });
-
 });

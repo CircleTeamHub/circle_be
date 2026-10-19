@@ -16,14 +16,12 @@ describe('burned encrypted message authorization', () => {
       },
       chatMessage: { findFirst: jest.fn().mockResolvedValue(null) },
       chatBurnArchive: {
-        findFirst: jest
-          .fn()
-          .mockResolvedValue({
-            id: 'm1',
-            height: 1,
-            retainUntil: new Date(Date.now() + 86400_000),
-            content: { envelope },
-          }),
+        findFirst: jest.fn().mockResolvedValue({
+          id: 'm1',
+          height: 1,
+          retainUntil: new Date(Date.now() + 86400_000),
+          content: { envelope },
+        }),
       },
       user: {
         findUnique: jest
