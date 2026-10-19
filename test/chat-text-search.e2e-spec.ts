@@ -64,16 +64,22 @@ describePostgres('Chat text search e2e', () => {
   const texts = (
     conversationId: string,
     senderId: string,
-    entries: Array<{ height: number; text: string; createdAt?: Date }>,
+    entries: Array<{
+      height: number;
+      text: string;
+      createdAt?: Date;
+      burnExpiresAt?: Date;
+    }>,
   ) =>
     prisma.chatMessage.createMany({
-      data: entries.map(({ height, text, createdAt }) => ({
+      data: entries.map(({ height, text, createdAt, burnExpiresAt }) => ({
         conversationID: conversationId,
         height,
         senderID: senderId,
         type: 'text',
         content: { text },
         ...(createdAt ? { createdAt } : {}),
+        ...(burnExpiresAt ? { burnExpiresAt } : {}),
       })),
     });
 
@@ -150,6 +156,7 @@ describePostgres('Chat text search e2e', () => {
       {
         height: 2,
         text: '暗号 已过期',
+        burnExpiresAt: new Date(now - 9 * 60_000),
         createdAt: new Date(now - 10 * 60_000),
       },
     ]);
@@ -190,6 +197,7 @@ describePostgres('Chat text search e2e', () => {
       ...Array.from({ length: 250 }, (_, i) => ({
         height: i + 2,
         text: `关键词 过期 ${i}`,
+        burnExpiresAt: new Date(now - 49 * 60_000 + i * 1000),
         createdAt: new Date(now - 50 * 60_000 + i * 1000),
       })),
     ]);

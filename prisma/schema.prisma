@@ -2821,6 +2821,7 @@ model E2eeRecovery {
 
 /// Per-account ciphertext archive, tied to the original message retention lifecycle.
 model E2eeArchive {
+  cursor     BigInt @unique @default(autoincrement())
   id         String       @id
   recoveryID String
   messageID  String
@@ -2829,7 +2830,7 @@ model E2eeArchive {
   message    ChatMessage  @relation(fields: [messageID], references: [id], onDelete: Cascade)
 
   @@unique([recoveryID, messageID])
-  @@index([recoveryID, id])
+  @@index([recoveryID, cursor])
   @@index([messageID])
 }
 

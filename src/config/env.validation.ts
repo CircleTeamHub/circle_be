@@ -179,8 +179,11 @@ export function createEnvValidationSchema(
     E2EE_TEXT_ENABLED: Joi.string().valid('true', 'false').default('false'),
     E2EE_AUDIT_ROOT_PUBLIC_KEY: Joi.string()
       .pattern(/^[A-Za-z0-9+/]{43}=$/)
-      .allow('')
-      .optional(),
+      .when('E2EE_TEXT_ENABLED', {
+        is: 'true',
+        then: Joi.required(),
+        otherwise: Joi.allow('').optional(),
+      }),
     LOG_ON: Joi.boolean(),
     // File logging stays opt-in for existing deployments. When enabled, Alloy
     // tails these JSON files, so malformed values must fail boot instead of

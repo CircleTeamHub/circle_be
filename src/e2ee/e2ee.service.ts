@@ -162,7 +162,7 @@ export class E2eeService {
     return this.db.$transaction(async (tx) => {
       await this.account(tx, userID, purpose);
       return tx.e2eeDevice.findMany({
-        where: { userID, purpose },
+        where: { userID, purpose, status: { not: 'REVOKED' } },
         select: publicDevice,
         orderBy: { createdAt: 'asc' },
         take: 32,
@@ -314,7 +314,20 @@ export class E2eeService {
           status: 'ACTIVE',
           OR: [
             { purpose: 'APP', userID: { in: members.map((m) => m.userID) } },
-            { purpose: 'AUDIT' },
+            {
+              purpose: 'AUDIT',
+              user: {
+                status: 'ACTIVE',
+                role: 'ADMIN',
+                adminAccess: {
+                  role: {
+                    in: Object.keys(ADMIN_ROLE_PERMISSIONS).filter((role) =>
+                      ADMIN_ROLE_PERMISSIONS[role].includes('IM_READ'),
+                    ),
+                  },
+                },
+              },
+            },
           ],
         },
         select: {
@@ -401,10 +414,6 @@ export class E2eeService {
           managerDeviceID: actor.id,
           devices: { create: { deviceID: actor.id, joinedEpoch: 0 } },
         },
-      });
-      await tx.e2eeKeyPackage.updateMany({
-        where: { deviceID: actor.id, claimedBy: null },
-        data: { claimedBy: conversationID },
       });
       // Irreversible downgrade barrier. Sending stays blocked until audit and peers join.
       await tx.chatConversation.update({
@@ -975,9 +984,21 @@ export class E2eeService {
         where: { userID_purpose: { userID, purpose } },
       });
       if (recovery?.id !== dto.recoveryId) throw new ForbiddenException();
+      const after = dto.after.startsWith('v1:')
+        ? BigInt(dto.after.slice(3))
+        : dto.after
+          ? (
+              await tx.e2eeArchive.findFirst({
+                where: { recoveryID: recovery.id, id: dto.after },
+                select: { cursor: true },
+              })
+            )?.cursor
+          : BigInt(0);
+      if (after === undefined)
+        throw new BadRequestException('Invalid archive cursor');
       const rows = await tx.e2eeArchive.findMany({
-        where: { recoveryID: recovery.id, id: { gt: dto.after } },
-        orderBy: { id: 'asc' },
+        where: { recoveryID: recovery.id, cursor: { gt: after } },
+        orderBy: { cursor: 'asc' },
         take: 20,
         include: { message: { select: { content: true } } },
       });
@@ -1005,7 +1026,10 @@ export class E2eeService {
       }
       return {
         items,
-        next: rows.length === 20 ? rows[rows.length - 1].id : null,
+        next:
+          rows.length === 20
+            ? `v1:${rows[rows.length - 1].cursor.toString().padStart(20, '0')}`
+            : null,
       };
     });
   }

@@ -2,8 +2,7 @@ import type { Prisma } from 'src/generated/prisma';
 
 /** 两个「按成员」的独立群策略:普通成员能否看他人资料 / 能否互加好友。 */
 export type StandaloneGroupMemberPolicy =
-  | 'membersCanViewProfiles'
-  | 'membersCanAddFriends';
+  'membersCanViewProfiles' | 'membersCanAddFriends';
 
 /** 判定只读这三张表;事务里传 tx,其余地方传 PrismaService 都行。 */
 export type StandaloneGroupPolicyGateClient = Pick<

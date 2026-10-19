@@ -34,7 +34,9 @@ export class NotificationController {
   constructor(private readonly notificationService: NotificationService) {}
 
   @Get('announcements/scrolling')
-  @ApiOperation({ summary: 'Selected scrolling announcements for the current user' })
+  @ApiOperation({
+    summary: 'Selected scrolling announcements for the current user',
+  })
   scrollingAnnouncements(@Req() req: RequestWithUser) {
     return this.notificationService.scrollingAnnouncements(req.user.userId);
   }
@@ -88,9 +90,17 @@ export class NotificationController {
   }
 
   @Get('profile/:id/detail')
-  @ApiOperation({ summary: 'Read the current user profile notification in full' })
-  profileDetail(@Param('id', ParseUUIDPipe) id: string, @Req() req: RequestWithUser) {
-    return this.notificationService.profileNotificationDetail(req.user.userId, id);
+  @ApiOperation({
+    summary: 'Read the current user profile notification in full',
+  })
+  profileDetail(
+    @Param('id', ParseUUIDPipe) id: string,
+    @Req() req: RequestWithUser,
+  ) {
+    return this.notificationService.profileNotificationDetail(
+      req.user.userId,
+      id,
+    );
   }
 
   @Get('profile/list')

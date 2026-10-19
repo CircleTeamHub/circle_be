@@ -1146,24 +1146,22 @@ export class TraceService {
           c.userID === trace.fromID ||
           friendIdSet.has(c.userID),
       )
-      .map(
-        (c: any): TraceCommentDto => ({
-          id: c.id,
-          content: c.content,
-          images: c.images ?? [],
-          media: buildImageMedia(c.images ?? [], this.imageTransformTemplate),
-          user: { id: c.user.id, nickname: c.user.nickname },
-          // `id` MUST be the parent COMMENT id — the client threads replies by
-          // looking it up in a comment-id map. Using c.replyTo.user.id here made
-          // every reply look like its own root → flat, unthreaded comment list.
-          replyTo:
-            c.replyTo && c.replyTo.user
-              ? { id: c.replyTo.id, nickname: c.replyTo.user.nickname }
-              : null,
-          ignoredMentionCount: 0,
-          createdAt: c.createdAt.toISOString(),
-        }),
-      );
+      .map((c: any): TraceCommentDto => ({
+        id: c.id,
+        content: c.content,
+        images: c.images ?? [],
+        media: buildImageMedia(c.images ?? [], this.imageTransformTemplate),
+        user: { id: c.user.id, nickname: c.user.nickname },
+        // `id` MUST be the parent COMMENT id — the client threads replies by
+        // looking it up in a comment-id map. Using c.replyTo.user.id here made
+        // every reply look like its own root → flat, unthreaded comment list.
+        replyTo:
+          c.replyTo && c.replyTo.user
+            ? { id: c.replyTo.id, nickname: c.replyTo.user.nickname }
+            : null,
+        ignoredMentionCount: 0,
+        createdAt: c.createdAt.toISOString(),
+      }));
 
     // Authoritative — not derived from the truncated likeStats preview.
     const isLikedByMe = likedTraceIds.has(trace.id);

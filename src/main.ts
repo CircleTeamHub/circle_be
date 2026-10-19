@@ -6,6 +6,7 @@ import { getStartupErrorAggregation } from './startup-instrumentation';
 import { flushWithDeadline } from './logging/error-aggregation.service';
 import 'module-alias/register';
 import { NestFactory } from '@nestjs/core';
+import type { NestExpressApplication } from '@nestjs/platform-express';
 import { DocumentBuilder, SwaggerModule } from '@nestjs/swagger';
 import { AppModule } from './app.module';
 import { setupApp } from './setup';
@@ -206,7 +207,11 @@ async function bootstrap() {
   const config = getServerConfig();
   const isProduction = process.env.NODE_ENV === 'production';
 
-  const app = await NestFactory.create(AppModule, buildNestFactoryOptions());
+  const app = await NestFactory.create<NestExpressApplication>(
+    AppModule,
+    buildNestFactoryOptions(),
+  );
+  app.useBodyParser('json', { limit: '2mb' });
   const errorAggregation = setupApp(app);
 
   if (!isProduction) {

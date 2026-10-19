@@ -612,6 +612,13 @@ export class NotificationService {
         where: { systemAnnouncementID: id, deleted: false },
         data: { content: dto.content },
       });
+      await tx.notificationPushOutbox.updateMany({
+        where: {
+          notification: { systemAnnouncementID: id },
+          status: { in: ['PENDING', 'FAILED'] },
+        },
+        data: { payload: Prisma.DbNull },
+      });
       await this.auditService.recordStrict(tx, {
         actorID,
         action: 'system_announcement_edit',

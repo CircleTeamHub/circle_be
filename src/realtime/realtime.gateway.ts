@@ -81,7 +81,12 @@ type VerifiedToken = {
 export class RealtimeGateway implements OnModuleDestroy {
   private readonly logger = new Logger(RealtimeGateway.name);
   private server: WebSocketServer | null = null;
-  private readonly admission = new SocketAdmission(2000, 128, 10_000, 'realtime');
+  private readonly admission = new SocketAdmission(
+    2000,
+    128,
+    10_000,
+    'realtime',
+  );
   /** noServer 模式下自己挂/自己摘 'upgrade' 监听,两个引用都要留着。 */
   private httpServer: Server | null = null;
   private upgradeHandler: UpgradeHandler | null = null;

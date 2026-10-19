@@ -64,8 +64,7 @@ export type LoginChallengeView = {
 };
 
 export type LoginDecision =
-  | { kind: 'trusted' }
-  | { kind: 'challenge'; challenge: LoginChallengeView };
+  { kind: 'trusted' } | { kind: 'challenge'; challenge: LoginChallengeView };
 
 export type PendingLoginChallenge = {
   id: string;
@@ -78,11 +77,7 @@ export type PendingLoginChallenge = {
 };
 
 export type LoginChallengePublicStatus =
-  | 'PENDING'
-  | 'APPROVED'
-  | 'REJECTED'
-  | 'EXPIRED'
-  | 'CONSUMED';
+  'PENDING' | 'APPROVED' | 'REJECTED' | 'EXPIRED' | 'CONSUMED';
 
 @Injectable()
 export class DeviceTrustService {

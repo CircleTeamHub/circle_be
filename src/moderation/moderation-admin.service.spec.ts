@@ -147,7 +147,12 @@ describe('ModerationAdminService (PR #120 review fixes)', () => {
 
 describe('post report reporter identity', () => {
   it('resolves reporters in a single query and handles missing historical users', async () => {
-    const user = { id: 'user-1', accountId: 'circle123', nickname: '小明', status: 'ACTIVE' };
+    const user = {
+      id: 'user-1',
+      accountId: 'circle123',
+      nickname: '小明',
+      status: 'ACTIVE',
+    };
     const prisma = {
       circlePostReport: {
         findMany: jest.fn().mockResolvedValue([
@@ -166,6 +171,10 @@ describe('post report reporter identity', () => {
       where: { id: { in: ['user-1', 'missing'] } },
       select: { id: true, nickname: true, accountId: true, status: true },
     });
-    expect(result.items.map((item) => item.reporter)).toEqual([user, null, user]);
+    expect(result.items.map((item) => item.reporter)).toEqual([
+      user,
+      null,
+      user,
+    ]);
   });
 });

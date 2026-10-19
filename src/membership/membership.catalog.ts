@@ -1,17 +1,9 @@
 export type MembershipLevel = 0 | 1 | 2 | 3 | 4;
 export type MembershipTierKey =
-  | 'regular'
-  | 'silver'
-  | 'gold'
-  | 'diamond'
-  | 'super';
+  'regular' | 'silver' | 'gold' | 'diamond' | 'super';
 export type MembershipQuotaDisplay = `${number}` | '999+' | 'unlimited';
 export type MembershipNameColor =
-  | 'default'
-  | 'silver'
-  | 'gold'
-  | 'rainbow'
-  | 'exclusive-shimmer';
+  'default' | 'silver' | 'gold' | 'rainbow' | 'exclusive-shimmer';
 export type MembershipBadge = 'silver' | 'gold' | 'diamond' | 'super-lifetime';
 export type FancyNumberVoucher = 'standard' | 'premium';
 

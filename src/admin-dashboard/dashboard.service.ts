@@ -11,8 +11,7 @@ import {
 import { resolveDashboardPeriod } from './dashboard-period';
 
 type SectionResult<T> =
-  | { status: 'ok'; data: T }
-  | { status: 'error'; data: null };
+  { status: 'ok'; data: T } | { status: 'error'; data: null };
 
 type DashboardResponse = {
   range: DashboardRange;
