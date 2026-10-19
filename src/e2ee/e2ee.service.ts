@@ -907,6 +907,7 @@ export class E2eeService {
       const archivedIds = new Set(archived.map((item) => item.messageID));
       return {
         items: items.map(({ messageID, ...item }) => ({
+          messageID,
           ...item,
           archived: archivedIds.has(messageID),
         })),
@@ -1000,7 +1001,9 @@ export class E2eeService {
         where: { recoveryID: recovery.id, cursor: { gt: after } },
         orderBy: { cursor: 'asc' },
         take: 20,
-        include: { message: { select: { content: true } } },
+        include: {
+          message: { select: { content: true, burnExpiresAt: true } },
+        },
       });
       const items = [];
       for (const row of rows) {
@@ -1018,6 +1021,11 @@ export class E2eeService {
         )
           items.push({
             id: row.id,
+            messageID: row.messageID,
+            expiresAt:
+              (
+                row.message as { burnExpiresAt?: Date }
+              ).burnExpiresAt?.toISOString() ?? null,
             ref: this.ref(content.envelope),
             ciphertext: row.ciphertext,
             content: row.message.content,
