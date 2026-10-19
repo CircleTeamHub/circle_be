@@ -59,11 +59,15 @@ export const CHAT_PUSH_COALESCE_MS = 1_000;
 function deliveryOptions(
   message: ChatMessageDto,
   mention: boolean,
+  conversationType: string,
 ): Pick<
   ExpoPushPayload,
   'priority' | 'channelId' | 'tag' | 'threadId' | 'ttl'
 > {
-  const burnSeconds = message.burnDurationSec ?? 0;
+  const burnSeconds =
+    conversationType === 'DIRECT' && !message.burnExpiresAt
+      ? 0
+      : (message.burnDurationSec ?? 0);
   return {
     priority: 'high',
     channelId: CHAT_PUSH_CHANNEL_ID,
@@ -247,7 +251,7 @@ export class ChatPushService implements OnModuleDestroy {
     for (const { message, mention, recipients } of groups.values()) {
       const payload = {
         ...(await this.composePayload(message, conversation)),
-        ...deliveryOptions(message, mention),
+        ...deliveryOptions(message, mention, conversation.type),
       };
       await this.sendToRecipients(
         message,
@@ -368,10 +372,14 @@ export class ChatPushService implements OnModuleDestroy {
                   : message.sender?.nickname
                     ? `${message.sender.nickname}: ${BURN_PREVIEW}`
                     : BURN_PREVIEW,
-              ttl: Math.min(
-                payload.ttl ?? CHAT_PUSH_TTL_SECONDS,
-                senderBurnSeconds,
-              ),
+              ttl:
+                payload.data['conversationType'] === 'private' &&
+                !message.burnExpiresAt
+                  ? (payload.ttl ?? CHAT_PUSH_TTL_SECONDS)
+                  : Math.min(
+                      payload.ttl ?? CHAT_PUSH_TTL_SECONDS,
+                      senderBurnSeconds,
+                    ),
             };
       const perUser =
         badge !== undefined ? { ...privacyPayload, badge } : privacyPayload;

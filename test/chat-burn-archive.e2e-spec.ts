@@ -204,6 +204,25 @@ integration(
       );
       expect((await db.query(sql, [[key], 'm1'])).rows).toEqual([]);
     });
+    it('archives logically expired content before a later recall clears its body', async () => {
+      await db.query(
+        `INSERT INTO "E2eeRecovery" VALUES ('app','APP','reader'),('audit','AUDIT','admin'); INSERT INTO "E2eeArchive" VALUES ('app-copy','m1','app'),('audit-copy','m1','audit'); UPDATE "ChatMessage" SET "burnExpiresAt"=NOW()-INTERVAL '1 second' WHERE id='m1'; UPDATE "ChatMessage" SET content='{}',"revokedAt"=NOW() WHERE id='m1'`,
+      );
+      expect(
+        (
+          await db.query(
+            'SELECT content FROM "ChatBurnArchive" WHERE id=\'m1\'',
+          )
+        ).rows[0].content,
+      ).toEqual({ text: 'private' });
+      expect((await db.query('SELECT id FROM "E2eeArchive"')).rows).toEqual([
+        { id: 'audit-copy' },
+      ]);
+      await db.query(`UPDATE "ChatMessage" SET deleted=true WHERE id='m1'`);
+      expect((await db.query('SELECT id FROM "ChatBurnArchive"')).rows).toEqual(
+        [{ id: 'm1' }],
+      );
+    });
     it('rolls archive creation back together with a failed burn transaction', async () => {
       await db.query('BEGIN');
       await burn();

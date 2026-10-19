@@ -258,6 +258,9 @@ jobs:
       - name: E2E Tests
         run: npm run test:e2e
 
+      - name: Burn archive PostgreSQL regressions
+        run: BURN_ARCHIVE_TEST_DATABASE_URL="$DATABASE_URL" npx jest --config test/jest-postgres.json --runInBand
+
       - name: Job Duration
         if: always()
         run: |
