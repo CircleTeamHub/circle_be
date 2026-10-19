@@ -6,6 +6,7 @@ describe('ChatBurnSweeperService', () => {
   const prisma = {
     $transaction: jest.fn(),
     $queryRaw: jest.fn(),
+    chatBurnArchive: { findMany: jest.fn() },
     chatConversation: { findMany: jest.fn(), findUnique: jest.fn() },
     chatMessage: { findMany: jest.fn(), updateManyAndReturn: jest.fn() },
   };
@@ -43,6 +44,7 @@ describe('ChatBurnSweeperService', () => {
 
   beforeEach(() => {
     jest.resetAllMocks();
+    prisma.chatBurnArchive.findMany.mockResolvedValue([]);
     // RETURNING 带回触发器分配的序号:按 id 顺序编号。
     prisma.chatMessage.updateManyAndReturn.mockImplementation(
       (args: { where: { id: { in: string[] } } }) =>
@@ -260,10 +262,11 @@ describe('ChatBurnSweeperService', () => {
       select: { id: true, revision: true },
     });
     // 只软删不删对象 = 焚毁只焚了个寂寞。
-    expect(media.deleteObjects).toHaveBeenCalledWith([
+    expect(media.queueDeletions).toHaveBeenCalledWith(prisma, [
       'chat/u1/a.jpg',
       'chat/u1/a.t.jpg',
     ]);
+    expect(media.drainPendingDeletions).toHaveBeenCalled();
   });
 
   describe('with several instances', () => {
@@ -545,7 +548,7 @@ describe('ChatBurnSweeperService', () => {
       ['m1'],
       [shared],
     );
-    expect(media.deleteObjects).toHaveBeenCalledWith([owned]);
+    expect(media.drainPendingDeletions).toHaveBeenCalled();
     expect(media.queueDeletions).toHaveBeenCalledWith(prisma, [owned]);
   });
 
@@ -680,5 +683,44 @@ describe('ChatBurnSweeperService', () => {
     expect(broadcast.emitBurnedMessages).toHaveBeenLastCalledWith('conv-2', [
       { id: 'm2', revision: 1 },
     ]);
+  });
+  it('keeps archived media and note-import reference pins instead of deleting them at user expiry', async () => {
+    prisma.chatConversation.findMany.mockResolvedValue([{ id: 'conv-1' }]);
+    const content = { key: 'chat/u1/photo.jpg', thumbKey: 'chat/u1/thumb.jpg' };
+    prisma.chatMessage.findMany.mockResolvedValueOnce([
+      { id: 'retained', type: 'image', content },
+    ]);
+    prisma.chatBurnArchive.findMany.mockResolvedValue([
+      { id: 'retained', content },
+    ]);
+    await service.sweep();
+    expect(media.queueDeletions).toHaveBeenCalledWith(prisma, []);
+    expect(media.deleteObjects).not.toHaveBeenCalled();
+    expect(media.releaseNoteImportReferences).toHaveBeenCalledWith(
+      prisma,
+      [],
+      [],
+    );
+    expect(broadcast.emitBurnedMessages).toHaveBeenCalledWith('conv-1', [
+      { id: 'retained', revision: 1 },
+    ]);
+  });
+  it('a duplicate sweep with no returned tombstones cannot delete the first sweeper retained media', async () => {
+    prisma.chatMessage.findMany.mockResolvedValue([
+      {
+        id: 'already-burned',
+        type: 'image',
+        content: { key: 'chat/u1/retained.jpg' },
+      },
+    ]);
+    prisma.chatMessage.updateManyAndReturn.mockResolvedValue([]);
+    await (service as any).sweepConversation('c1', { isCurrent: () => true });
+    expect(media.queueDeletions).toHaveBeenCalledWith(prisma, []);
+    expect(media.deleteObjects).not.toHaveBeenCalled();
+    expect(media.releaseNoteImportReferences).toHaveBeenCalledWith(
+      prisma,
+      [],
+      [],
+    );
   });
 });

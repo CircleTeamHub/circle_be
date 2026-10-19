@@ -135,13 +135,16 @@ describePostgres('Note storage quota concurrency e2e', () => {
         title: `Existing ${index}`,
       })),
     });
+    const token = accessToken(user);
+
     const conversation = await prisma.chatConversation.create({
       data: {
         type: 'DIRECT',
+        nextHeight: 1,
         members: { create: [{ userID: user.id }, { userID: sourceOwner.id }] },
       },
     });
-    const sharedMessage = await prisma.chatMessage.create({
+    const sourceMessage = await prisma.chatMessage.create({
       data: {
         conversationID: conversation.id,
         height: 1,
@@ -150,7 +153,6 @@ describePostgres('Note storage quota concurrency e2e', () => {
         content: { noteId: source.id },
       },
     });
-    const token = accessToken(user);
 
     await expectOneQuotaWinner(user.id, [
       createRequest(token, 'Parallel create'),
@@ -162,7 +164,7 @@ describePostgres('Note storage quota concurrency e2e', () => {
           source: {
             conversationType: 'private',
             conversationID: conversation.id,
-            clientMsgID: sharedMessage.id,
+            clientMsgID: sourceMessage.id,
             sender: { id: sourceOwner.id, name: sourceOwner.nickname },
           },
         }),

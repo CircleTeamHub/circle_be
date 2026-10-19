@@ -6,7 +6,10 @@ function fixture() {
     e2eeRecovery: {
       findUnique: jest.fn().mockResolvedValue({ id: 'recovery' }),
     },
-    e2eeArchive: { findMany: jest.fn().mockResolvedValue([]) },
+    e2eeArchive: {
+      findMany: jest.fn().mockResolvedValue([]),
+      delete: jest.fn(),
+    },
   };
   const service = new E2eeService(
     { $transaction: (work) => work(tx) } as any,
@@ -62,4 +65,49 @@ it('continues archive reads after a lower-hash message is inserted', async () =>
     }),
   );
   expect(next.items[0].ciphertext).toBe('new');
+});
+
+it('a demoted audit reader cannot erase retained recovery ciphertext', async () => {
+  const { service, tx } = fixture();
+  tx.e2eeArchive.findMany.mockResolvedValue([
+    {
+      id: 'retained',
+      cursor: BigInt(1),
+      messageID: 'm1',
+      ciphertext: 'secret',
+      message: { content: { envelope: { clientMessageId: 'd1' } } },
+    },
+  ] as any);
+  jest.mocked((service as any).visibleArchiveMessage).mockResolvedValue(null);
+  const result = await service.readArchive('demoted-admin', 'AUDIT', {
+    recoveryId: 'recovery',
+    after: '',
+  } as any);
+  expect(result.items).toEqual([]);
+  expect(tx.e2eeArchive.delete).not.toHaveBeenCalled();
+});
+
+it('uses the authorized retention deadline for recovered audit ciphertext', async () => {
+  const { service, tx } = fixture();
+  const retainUntil = new Date(Date.now() + 86400_000);
+  tx.e2eeArchive.findMany.mockResolvedValue([
+    {
+      id: 'retained',
+      cursor: BigInt(1),
+      messageID: 'm1',
+      ciphertext: 'secret',
+      message: {
+        burnExpiresAt: new Date(0),
+        content: { envelope: { clientMessageId: 'd1' } },
+      },
+    },
+  ] as any);
+  jest
+    .mocked((service as any).visibleArchiveMessage)
+    .mockResolvedValue({ burnExpiresAt: retainUntil });
+  const result = await service.readArchive('admin', 'AUDIT', {
+    recoveryId: 'recovery',
+    after: '',
+  } as any);
+  expect(result.items[0].expiresAt).toBe(retainUntil.toISOString());
 });

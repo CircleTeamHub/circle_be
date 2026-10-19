@@ -853,8 +853,46 @@ export class E2eeService {
       },
       include: { conversation: true },
     });
-    if (!message || message.height <= message.conversation.clearedBeforeHeight)
-      return null;
+    let visible =
+      message && message.height > message.conversation.clearedBeforeHeight
+        ? {
+            id: message.id,
+            content: message.content,
+            burnExpiresAt: message.burnExpiresAt,
+            height: message.height,
+          }
+        : null;
+    if (!visible && purpose === 'AUDIT') {
+      // archiveActor already holds the account/grant locks. A separate privilege
+      // is required for burned content, even with a valid audit device proof.
+      const actor = await tx.user.findUnique({
+        where: { id: userID },
+        select: { adminAccess: { select: { role: true } } },
+      });
+      if (
+        (ADMIN_ROLE_PERMISSIONS[actor?.adminAccess?.role ?? ''] ?? []).includes(
+          'IM_ARCHIVE_READ',
+        )
+      ) {
+        const retained = await tx.chatBurnArchive.findFirst({
+          where: {
+            conversationID: ref.conversationId,
+            senderID: sender.userID,
+            clientMessageId: ref.clientMessageId,
+            type: 'encrypted-text',
+            retainUntil: { gt: new Date() },
+          },
+        });
+        if (retained)
+          visible = {
+            id: retained.id,
+            content: retained.content,
+            burnExpiresAt: retained.retainUntil,
+            height: retained.height,
+          };
+      }
+    }
+    if (!visible) return null;
     if (purpose === 'APP') {
       await tx.$queryRaw`SELECT "id" FROM "ChatMember" WHERE "conversationID"=${ref.conversationId} AND "userID"=${userID} FOR SHARE`;
       const member = await tx.chatMember.findUnique({
@@ -865,15 +903,15 @@ export class E2eeService {
       if (
         !member ||
         member.leftAt ||
-        message.height <= member.clearedBeforeHeight
+        visible.height <= member.clearedBeforeHeight
       )
         return null;
     }
-    const content = message.content as {
+    const content = visible.content as {
       envelope?: { senderDeviceId?: string };
     };
     if (content?.envelope?.senderDeviceId !== ref.senderDeviceId) return null;
-    return message;
+    return visible;
   }
   async resolveArchive(
     userID: string,
@@ -956,7 +994,11 @@ export class E2eeService {
           where: { id: m.id },
           select: { deleted: true, revokedAt: true },
         });
-        if (!current || current.deleted || current.revokedAt) continue;
+        if (
+          !current ||
+          (purpose === 'APP' && (current.deleted || current.revokedAt))
+        )
+          continue;
         await tx.e2eeArchive.upsert({
           where: {
             recoveryID_messageID: { recoveryID: recovery.id, messageID: m.id },
@@ -1010,30 +1052,34 @@ export class E2eeService {
       });
       const items = [];
       for (const row of rows) {
-        const content = row.message.content as {
-          envelope?: EncryptionMessageRefDto;
-        };
-        if (
-          content.envelope &&
-          (await this.visibleArchiveMessage(
-            tx,
-            userID,
-            purpose,
-            content.envelope,
-          ))
-        )
+        const retained =
+          purpose === 'AUDIT' &&
+          !(row.message.content as { envelope?: unknown })?.envelope
+            ? await tx.chatBurnArchive.findUnique({
+                where: { id: row.messageID },
+              })
+            : null;
+        const body = retained?.content ?? row.message.content;
+        const content = body as { envelope?: EncryptionMessageRefDto };
+        const visible = content.envelope
+          ? await this.visibleArchiveMessage(
+              tx,
+              userID,
+              purpose,
+              content.envelope,
+            )
+          : null;
+        if (visible)
           items.push({
             id: row.id,
             messageID: row.messageID,
-            expiresAt:
-              (
-                row.message as { burnExpiresAt?: Date }
-              ).burnExpiresAt?.toISOString() ?? null,
-            ref: this.ref(content.envelope),
+            expiresAt: visible.burnExpiresAt?.toISOString() ?? null,
+            ref: this.ref(content.envelope!),
             ciphertext: row.ciphertext,
-            content: row.message.content,
+            content: body,
           });
-        else await tx.e2eeArchive.delete({ where: { id: row.id } });
+        // Visibility can fail because the caller lost a permission. Retention
+        // triggers and cleanup own deletion; an unauthorized read never does.
       }
       return {
         items,

@@ -236,6 +236,7 @@ export const DYNAMIC_ROUTE_TEMPLATES = [
   '/api/v1/admin/im/conversations/:id/members',
   '/api/v1/admin/im/conversations/:id/members/:userId/actions',
   '/api/v1/admin/im/conversations/:id/messages/query',
+  '/api/v1/admin/im/conversations/:id/archives/query',
   '/api/v1/admin/operations/campaign-invites/:id',
   '/api/v1/admin/memberships/users/:id/grants',
   '/api/v1/admin/avatar-frames/grants/:grantId/revoke',

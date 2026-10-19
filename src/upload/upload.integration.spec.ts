@@ -1,3 +1,5 @@
+import { ChatMediaService } from '../chat/chat-media.service';
+import type { ChatMessageDto } from '../chat/chat.types';
 import { UploadService } from './upload.service';
 
 const endpoint = process.env.MINIO_TEST_URL;
@@ -63,4 +65,70 @@ describeMinio('UploadService real MinIO integration', () => {
     });
     expect(tampered.status).toBe(403);
   });
+  it('expires the original user grant at burn time while keeping the audit attachment stored', async () => {
+    const body = Buffer.from('retained-audit-attachment');
+    const upload = await service.presign(
+      'retained.png',
+      'image/png',
+      body.length,
+      'chat',
+      'integration-user',
+    );
+    expect(
+      (
+        await fetch(upload.uploadUrl, {
+          method: 'PUT',
+          headers: upload.requiredHeaders,
+          body,
+        })
+      ).status,
+    ).toBe(200);
+    const deadline = new Date(Date.now() + 4000);
+    const row = {
+      id: 'burn-message',
+      deleted: false,
+      revokedAt: null,
+      burnDurationSec: 60,
+      burnExpiresAt: deadline,
+    };
+    const tx = {
+      $queryRaw: async () => [],
+      chatMessage: { findMany: async () => [row] },
+    };
+    const media = new ChatMediaService(service, {
+      $transaction: async (fn) => fn(tx),
+    } as never);
+    try {
+      const message: ChatMessageDto = {
+        height: 1,
+        revision: 1,
+        sender: null,
+        replyToId: null,
+        d: null,
+        createdAt: new Date().toISOString(),
+        id: row.id,
+        conversationId: 'conversation',
+        type: 'image',
+        content: { key: upload.key },
+        burnDurationSec: 60,
+        burnExpiresAt: deadline.toISOString(),
+      };
+      await media.attachMediaUrls([message]);
+      const userUrl = message.content.url as string;
+      expect((await fetch(userUrl)).status).toBe(200);
+      await new Promise((resolve) =>
+        setTimeout(
+          resolve,
+          Math.max(0, deadline.getTime() - Date.now() + 1200),
+        ),
+      );
+      row.deleted = true;
+      expect((await fetch(userUrl)).status).toBe(403);
+      // Retention keeps the bytes; expiration comes from the user grant, not deletion.
+      const auditGrant = await service.createPresignedGetUrl(upload.key, 30);
+      expect((await fetch(auditGrant.url)).status).toBe(200);
+    } finally {
+      media.onModuleDestroy();
+    }
+  }, 20000);
 });

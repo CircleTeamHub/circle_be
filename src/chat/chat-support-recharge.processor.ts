@@ -1,3 +1,4 @@
+import { startReadBurnTimers } from './read-burn-timers';
 import { Injectable, Logger } from '@nestjs/common';
 import { CronExpression } from '@nestjs/schedule';
 import { randomUUID } from 'node:crypto';
@@ -295,15 +296,34 @@ export class ChatSupportRechargeProcessor {
     message: IncomingMessage,
     agentUserID: string,
   ): Promise<void> {
-    const updated = await this.prisma.chatMember.updateMany({
-      where: {
-        conversationID: message.conversationID,
-        userID: agentUserID,
-        leftAt: null,
-        lastReadHeight: { lt: message.height },
-      },
-      data: { lastReadHeight: message.height },
+    const { updated, revision } = await this.prisma.$transaction(async (tx) => {
+      await tx.$queryRaw`SELECT "id" FROM "ChatConversation" WHERE "id"=${message.conversationID} FOR UPDATE`;
+      const revision = await startReadBurnTimers(
+        tx,
+        message.conversationID,
+        agentUserID,
+        message.height,
+      );
+      const updated = await tx.chatMember.updateMany({
+        where: {
+          conversationID: message.conversationID,
+          userID: agentUserID,
+          leftAt: null,
+          lastReadHeight: { lt: message.height },
+        },
+        data: { lastReadHeight: message.height },
+      });
+      return { updated, revision };
     });
+    if (revision) {
+      try {
+        await this.broadcast.emitBurnStarted(message.conversationID, revision);
+      } catch (error) {
+        this.logger.warn(
+          `support burn-start delivery failed: ${error instanceof Error ? error.name : 'unknown error'}`,
+        );
+      }
+    }
     if (updated.count > 0) {
       this.broadcast.emitRead({
         conversationId: message.conversationID,

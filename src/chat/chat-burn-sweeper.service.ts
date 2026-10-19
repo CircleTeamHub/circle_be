@@ -18,11 +18,10 @@ import {
 } from './chat.constants';
 
 /**
- * S-01 会话级阅后即焚的真删器:每分钟扫描开了焚毁的会话,把超龄消息软删
- * (deleted=true + content 清空,height 坐标保留)并删除对象存储里的媒体
- * —— 只软删不删对象等于焚毁只焚了个寂寞。
+ * 每分钟为到期消息提交用户端焚毁墓碑并清空正文。数据库触发器先生成
+ * 180天管理员归档；有归档的附件和笔记导入引用交给归档到期清理任务释放。
  *
- * 读路径同时按 burnDurationSec 过滤,盖住「已到期、尚未被扫掉」的 ≤1min 间隙,
+ * 读路径同时按 burnExpiresAt 过滤,盖住「已到期、尚未被扫掉」的 ≤1min 间隙,
  * 所以这里晚一拍无碍;单轮批量有上限,防止长会话首开焚毁时一口气删爆。
  */
 const SWEEP_BATCH = 500;
@@ -191,21 +190,9 @@ export class ChatBurnSweeperService {
         take: SWEEP_BATCH,
       });
       if (rows.length === 0) return;
-      const allMediaKeys = rows
-        .filter((row) => MEDIA_MESSAGE_TYPES.includes(row.type))
-        .flatMap((row) => {
-          const content = (row.content ?? {}) as Record<string, unknown>;
-          return ['key', 'thumbKey']
-            .map((field) => content[field])
-            .filter((v): v is string => typeof v === 'string' && v.length > 0);
-        });
       const messageIds = rows.map((row) => row.id);
-      const noteImportKeys = allMediaKeys.filter((key) =>
-        key.includes(`/${CHAT_NOTE_IMPORT_SEGMENT}`),
-      );
-      const ownedMediaKeys = allMediaKeys.filter(
-        (key) => !key.includes(`/${CHAT_NOTE_IMPORT_SEGMENT}`),
-      );
+      let noteImportKeys: string[] = [];
+      let ownedMediaKeys: string[] = [];
       if (!lease.isCurrent()) return;
       const burned = await this.prisma.$transaction(async (tx) => {
         // 会话行锁先拿:消息行上的触发器要更新会话计数器。先锁一批消息行再等会话行,
@@ -234,10 +221,46 @@ export class ChatBurnSweeperService {
           },
           select: { id: true, revision: true },
         });
+        const burnedIds = new Set(tombstones.map((row) => row.id));
+        const allMediaKeys = rows
+          .filter(
+            (row) =>
+              burnedIds.has(row.id) && MEDIA_MESSAGE_TYPES.includes(row.type),
+          )
+          .flatMap((row) => {
+            const content = (row.content ?? {}) as Record<string, unknown>;
+            return ['key', 'thumbKey', 'coverKey']
+              .map((field) => content[field])
+              .filter((key): key is string => typeof key === 'string');
+          });
+        ownedMediaKeys = allMediaKeys.filter(
+          (key) => !key.includes(`/${CHAT_NOTE_IMPORT_SEGMENT}`),
+        );
+        noteImportKeys = allMediaKeys.filter((key) =>
+          key.includes(`/${CHAT_NOTE_IMPORT_SEGMENT}`),
+        );
+        const retained = await tx.chatBurnArchive.findMany({
+          where: {
+            id: { in: tombstones.map((row) => row.id) },
+            retainUntil: { gt: new Date() },
+          },
+          select: { id: true, content: true },
+        });
+        const retainedIds = new Set(retained.map((row) => row.id));
+        const retainedKeys = new Set(
+          retained.flatMap((row) => {
+            const content = row.content as Record<string, unknown>;
+            return ['key', 'thumbKey', 'coverKey']
+              .map((field) => content[field])
+              .filter((key): key is string => typeof key === 'string');
+          }),
+        );
+        ownedMediaKeys = ownedMediaKeys.filter((key) => !retainedKeys.has(key));
+        noteImportKeys = noteImportKeys.filter((key) => !retainedKeys.has(key));
         await this.media.queueDeletions(tx, ownedMediaKeys);
         await this.media.releaseNoteImportReferences(
           tx,
-          messageIds,
+          tombstones.map((row) => row.id).filter((id) => !retainedIds.has(id)),
           noteImportKeys,
         );
         return tombstones;
@@ -245,11 +268,7 @@ export class ChatBurnSweeperService {
       if (burned === null) return;
       // 墓碑已提交才通知:事务回滚了却已经播出去,对端会删掉服务端其实还留着的消息。
       await this.announceBurned(conversationId, burned);
-      if (ownedMediaKeys.length > 0) {
-        // deleteObjects 内部逐 key 尽力而为;失败只留孤儿对象,不中断焚毁。
-        void this.media.deleteObjects(ownedMediaKeys);
-      }
-      if (noteImportKeys.length > 0) {
+      if (ownedMediaKeys.length > 0 || noteImportKeys.length > 0) {
         void this.media.drainPendingDeletions();
       }
       this.logger.log(

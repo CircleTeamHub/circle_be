@@ -165,6 +165,22 @@ describe('ChatDirectAutoReplyProcessor', () => {
     });
   });
 
+  it('leaves burn-enabled automatic direct replies pending the peer first read', async () => {
+    prisma.userPrivacySetting.findUnique.mockResolvedValue({
+      directMessageAutoReplyEnabled: true,
+      directMessageAutoReplyText: '稍后回复',
+      messageSelfDestructSec: 60,
+    });
+    await processor.processMessage('source-1');
+    expect(prisma.chatMessage.create).toHaveBeenCalledWith(
+      expect.objectContaining({
+        data: expect.objectContaining({
+          burnDurationSec: 60,
+          burnExpiresAt: null,
+        }),
+      }),
+    );
+  });
   it('uses current active members to send a trimmed deterministic reply as the peer', async () => {
     await processor.processMessage('source-1');
 

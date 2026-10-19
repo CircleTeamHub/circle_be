@@ -159,6 +159,7 @@ describePostgres('Chat conversation list queries e2e', () => {
           senderID: bob.id,
           type: 'text',
           content: { text: 'expired' },
+          burnDurationSec: 60,
           burnExpiresAt: new Date(now - 9 * 60_000),
           createdAt: new Date(now - 10 * 60_000),
         },

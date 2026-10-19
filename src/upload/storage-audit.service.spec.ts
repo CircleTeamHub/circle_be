@@ -26,6 +26,7 @@ describe('StorageAuditService', () => {
       traceComment: emptyRows(),
       circlePost: emptyRows(),
       chatMessage: emptyRows(),
+      chatBurnArchive: emptyRows(),
       supportRechargePaymentCode: emptyRows(),
       adminAdvertisement: emptyRows(),
       consoleRelease: emptyRows(),
@@ -441,5 +442,22 @@ describe('StorageAuditService', () => {
     // 第二页起必须带游标,否则会一直重复取第一页。
     expect(second.cursor).toEqual({ id: 'u-00999' });
     expect(second.skip).toBe(1);
+  });
+  it('does not report 180-day archive attachments as orphaned user media', async () => {
+    const { service } = harness({
+      objects: {
+        'chat/': [{ key: 'chat/u1/retained.jpg', size: 10, lastModified: old }],
+      },
+      referenced: {
+        chatBurnArchive: [
+          {
+            id: 'burned',
+            type: 'image',
+            content: { key: 'chat/u1/retained.jpg' },
+          },
+        ],
+      },
+    });
+    expect(await service.audit(now)).toMatchObject({ orphanCount: 0 });
   });
 });

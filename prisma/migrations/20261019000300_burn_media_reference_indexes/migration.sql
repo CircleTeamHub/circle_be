@@ -1,0 +1,4 @@
+CREATE INDEX CONCURRENTLY IF NOT EXISTS "ChatMessage_media_key_idx" ON "ChatMessage" ((content->>'key')) WHERE "deleted" = false AND type IN ('image','video','voice','file') AND (content->>'key') IS NOT NULL;
+CREATE INDEX CONCURRENTLY IF NOT EXISTS "ChatMessage_media_thumbKey_idx" ON "ChatMessage" ((content->>'thumbKey')) WHERE "deleted" = false AND type IN ('image','video') AND (content->>'thumbKey') IS NOT NULL;
+CREATE INDEX CONCURRENTLY IF NOT EXISTS "ChatBurnArchive_media_key_idx" ON "ChatBurnArchive" ((content->>'key')) WHERE type IN ('image','video','voice','file') AND (content->>'key') IS NOT NULL;
+CREATE INDEX CONCURRENTLY IF NOT EXISTS "ChatBurnArchive_media_thumbKey_idx" ON "ChatBurnArchive" ((content->>'thumbKey')) WHERE type IN ('image','video') AND (content->>'thumbKey') IS NOT NULL;

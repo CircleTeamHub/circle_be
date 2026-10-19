@@ -69,6 +69,7 @@ describe('ChatService', () => {
   const sensitiveWords = { check: jest.fn() };
   const circleSync = { ensureCircleConversation: jest.fn() };
   const media = {
+    lockOwnedKeysForSend: jest.fn().mockResolvedValue(undefined),
     attachMediaUrls: jest.fn().mockResolvedValue(undefined),
     copyForForward: jest.fn(),
     deleteObjects: jest.fn().mockResolvedValue(undefined),
@@ -94,6 +95,7 @@ describe('ChatService', () => {
     emitHistoryCleared: jest.fn(),
     emitHistoryClearedToUser: jest.fn(),
     emitBurnedMessages: jest.fn().mockResolvedValue(undefined),
+    emitBurnStarted: jest.fn().mockResolvedValue(undefined),
     emitConversationChange: jest.fn(),
   };
   const groupEvents = {
@@ -1748,6 +1750,41 @@ describe('ChatService', () => {
         conversationType: 'GROUP',
       });
       expect(prisma.chatMember.updateMany).not.toHaveBeenCalled();
+    });
+
+    it('starts read timers atomically and publishes only a committed revision', async () => {
+      prisma.chatMember.findUnique.mockResolvedValue(seatAt(9, 'DIRECT'));
+      prisma.chatMember.updateMany.mockResolvedValue({ count: 1 });
+      prisma.$queryRaw
+        .mockResolvedValueOnce([])
+        .mockResolvedValueOnce([{ revision: 17 }]);
+      await service.markRead('u1', 'conv-1', 5);
+      const sql = prisma.$queryRaw.mock.calls[1][0].join(' ');
+      expect(sql).toContain('"burnExpiresAt" IS NULL');
+      expect(sql).toContain('m."senderID" <>');
+      expect(sql).toContain('INTERVAL');
+      expect(broadcast.emitBurnStarted).toHaveBeenCalledWith('conv-1', 17);
+      expect(prisma.$transaction).toHaveBeenCalledTimes(1);
+    });
+
+    it('does not publish a timer when the transaction fails', async () => {
+      prisma.chatMember.findUnique.mockResolvedValue(seatAt(9, 'DIRECT'));
+      prisma.$transaction.mockRejectedValueOnce(new Error('rollback'));
+      await expect(service.markRead('u1', 'conv-1', 5)).rejects.toThrow(
+        'rollback',
+      );
+      expect(broadcast.emitBurnStarted).not.toHaveBeenCalled();
+    });
+
+    it('rechecks membership under the conversation lock', async () => {
+      prisma.chatMember.findUnique
+        .mockResolvedValueOnce(seatAt(9, 'DIRECT'))
+        .mockResolvedValueOnce(null);
+      await expect(service.markRead('u1', 'conv-1', 5)).rejects.toThrow(
+        ForbiddenException,
+      );
+      expect(prisma.chatMember.updateMany).not.toHaveBeenCalled();
+      expect(broadcast.emitBurnStarted).not.toHaveBeenCalled();
     });
 
     it('rejects non-integer heights', async () => {
@@ -3675,11 +3712,8 @@ describe('ChatService', () => {
           }),
         }),
       );
-      // 撤回即焚:对象存储里的媒体一并删,只清 DB 等于没撤。
-      expect(media.deleteObjects).toHaveBeenCalledWith([
-        'chat/u1/a.jpg',
-        'chat/u1/a.t.jpg',
-      ]);
+      // The durable deletion worker rechecks shared archive references.
+      expect(media.drainPendingDeletions).toHaveBeenCalled();
       expect(media.queueDeletions).toHaveBeenCalledWith(prisma, [
         'chat/u1/a.jpg',
         'chat/u1/a.t.jpg',
@@ -3923,6 +3957,24 @@ describe('ChatService', () => {
   });
 
   describe('editMessage(G-07 消息编辑)', () => {
+    it('rejects an edit after the fixed burn deadline even inside the edit window', async () => {
+      prisma.chatMember.findUnique.mockResolvedValue(membership());
+      prisma.chatMessage.findUnique.mockResolvedValue({
+        id: 'm1',
+        conversationID: 'conv-1',
+        senderID: 'u1',
+        type: 'text',
+        createdAt: new Date(),
+        deleted: false,
+        revokedAt: null,
+        burnExpiresAt: new Date(Date.now() - 1),
+      });
+      await expect(
+        service.editMessage('u1', 'conv-1', 'm1', { text: 'replacement' }),
+      ).rejects.toThrow(NotFoundException);
+      expect(prisma.chatMessage.updateMany).not.toHaveBeenCalled();
+    });
+
     const editableRow = (overrides: Record<string, unknown> = {}) => ({
       id: 'm1',
       conversationID: 'conv-1',
@@ -4534,9 +4586,7 @@ describe('ChatService', () => {
       const a = await service.sendMessage('u1', sendPayload());
       const b = await service.sendMessage('u2', sendPayload({ d: 'b-send' }));
       expect(a.message.burnDurationSec).toBe(60);
-      expect(
-        Date.parse(a.message.burnExpiresAt!) - Date.parse(a.message.createdAt),
-      ).toBe(60_000);
+      expect(a.message.burnExpiresAt).toBeNull();
       expect(b.message.burnDurationSec).toBeNull();
       expect(b.message.burnExpiresAt).toBeNull();
     });
@@ -4766,6 +4816,8 @@ describe('ChatService', () => {
             nextHeight: 50,
           },
         ])
+        .mockResolvedValueOnce([{ revision: 0 }])
+        .mockResolvedValueOnce([{ revision: 0 }])
         .mockResolvedValueOnce([
           {
             id: 'conv-1',
@@ -4774,7 +4826,9 @@ describe('ChatService', () => {
             ownerID: null,
             nextHeight: 60,
           },
-        ]);
+        ])
+        .mockResolvedValueOnce([{ revision: 0 }])
+        .mockResolvedValueOnce([{ revision: 0 }]);
       prisma.chatMember.findUnique.mockResolvedValue(
         membership({
           conversation: {
@@ -6065,6 +6119,26 @@ describe('ChatService', () => {
   });
 
   describe('清空即已读要广播', () => {
+    it('starts incoming direct burn timers before advancing the personal clear floor', async () => {
+      prisma.$queryRaw.mockImplementation(async (parts) =>
+        parts.join(' ').includes('WITH started')
+          ? [{ revision: 31 }]
+          : [{ id: 'conv-1', type: 'DIRECT', nextHeight: 9 }],
+      );
+      prisma.chatMember.findUnique.mockResolvedValue(membership());
+      prisma.chatMember.updateMany.mockResolvedValue({ count: 1 });
+      prisma.chatMember.updateManyAndReturn.mockResolvedValue([
+        { userID: 'u1' },
+      ]);
+      await service.clearHistory('u1', 'conv-1');
+      expect(prisma.$queryRaw.mock.calls[1][0].join(' ')).toContain(
+        '"burnExpiresAt" IS NULL',
+      );
+      expect(prisma.$queryRaw.mock.invocationCallOrder[1]).toBeLessThan(
+        prisma.chatMember.updateMany.mock.invocationCallOrder[0],
+      );
+      expect(broadcast.emitBurnStarted).toHaveBeenCalledWith('conv-1', 31);
+    });
     it('emits the same read event markRead would', async () => {
       prisma.chatMember.findUnique.mockResolvedValue(membership());
       prisma.chatMessage.aggregate.mockResolvedValue({ _max: { height: 9 } });

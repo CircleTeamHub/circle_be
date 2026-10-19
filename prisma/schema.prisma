@@ -2507,7 +2507,7 @@ model ChatGroupEvent {
 }
 
 model ChatMessage {
-  /// 发送者在首次发送时决定的时长及到期时间，后续改设置不修改已发送消息。
+  /// 发送时决定时长；单聊对方首次已读后固定期限，群聊仍从发送起算。
   burnDurationSec Int?
   burnExpiresAt   DateTime?
   id              String    @id @default(uuid())
@@ -2926,4 +2926,21 @@ model ConsolePushSettings {
 model ConsoleCollectionState {
   id        String   @id @default("global")
   startedAt DateTime @default(dbgenerated("(CURRENT_TIMESTAMP AT TIME ZONE 'UTC'::text)"))
+}
+
+/// Administrator-only snapshots of burned messages. No relation/cascade into user history.
+model ChatBurnArchive {
+  id String @id
+  conversationID String
+  senderID String?
+  clientMessageId String?
+  height Int
+  type String
+  content Json
+  createdAt DateTime
+  burnExpiresAt DateTime
+  burnDurationSec Int?
+  retainUntil DateTime
+  @@index([conversationID, height])
+  @@index([retainUntil, id])
 }
