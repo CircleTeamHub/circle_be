@@ -17,6 +17,14 @@ cd "$(dirname "$0")/.."
 DEPLOY_USER_NAME="$(id -un)"
 DEPLOY_PRIMARY_GID="$(id -g "$DEPLOY_USER_NAME")"
 
+# 没配 SMTP 时生产环境发不出任何邮件（找回密码的验证码、受信任设备全丢时的邮箱找回）。
+# 授权码是密钥，脚本不代填，只提醒。
+warn_missing_smtp() {
+  if ! grep -Eq '^SMTP_HOST=.+' .env.production; then
+    echo "⚠️  未配置 SMTP：找回密码的验证码邮件发不出去。在 .env.production 里补上 SMTP_HOST / SMTP_PORT / SMTP_SECURE / SMTP_USER / SMTP_PASS / MAIL_FROM（163 邮箱 + 授权码即可，写法见 .env.production.example）后重启后端。" >&2
+  fi
+}
+
 user_has_gid() {
   case " $(id -G "$DEPLOY_USER_NAME") " in
     *" $1 "*) return 0 ;;
@@ -297,6 +305,7 @@ if [ -f .env.production ]; then
   clear_file_acl .env.production
   chmod 640 .env.production
   echo "✅ 已保留现有配置并补齐 Redis 配置"
+  warn_missing_smtp
   if [ -e "$metrics_sync_marker" ]; then
     echo "⚠️  METRICS_AUTH_TOKEN 尚未同步。启动后端前必须运行：bash monitoring/sync-metrics-token.sh，并重新创建 Prometheus。" >&2
   fi
@@ -358,6 +367,15 @@ MINIO_PUBLIC_URL=https://$API_DOMAIN
 OBJECT_STORAGE_REGION=us-east-1
 OBJECT_STORAGE_FORCE_PATH_STYLE=true
 OBJECT_STORAGE_MANAGE_BUCKET=true
+# ── 邮件投递：找回密码的验证码靠它。设了 SMTP_HOST 就必须同时配 SMTP_USER/SMTP_PASS。
+# 163 / QQ 邮箱：网页版设置里开启 SMTP 服务，SMTP_PASS 填「授权码」（不是登录密码），
+# MAIL_FROM 的地址必须与 SMTP_USER 一致。465=隐式 TLS；用 587 时设 SMTP_SECURE=false。
+# SMTP_HOST=smtp.163.com
+# SMTP_PORT=465
+# SMTP_SECURE=true
+# SMTP_USER=example@163.com
+# SMTP_PASS=__SMTP_AUTH_CODE__
+# MAIL_FROM="WindNote <example@163.com>"
 EOF
 
 chmod 600 .env.tmp
@@ -368,3 +386,4 @@ mv .env.production.tmp .env.production
 echo "✅ 已生成 .env 与 .env.production (PUBLIC_IP=$PUBLIC_IP)"
 echo "   ALLOWED_ORIGINS 已设置为 https://$ADMIN_DOMAIN,https://$WEB_DOMAIN"
 echo "   LiveKit(阶段6)配置稍后再追加到 .env.production"
+warn_missing_smtp
