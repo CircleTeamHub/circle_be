@@ -94,6 +94,7 @@ describe('ChatService', () => {
     emitHistoryCleared: jest.fn(),
     emitHistoryClearedToUser: jest.fn(),
     emitBurnedMessages: jest.fn().mockResolvedValue(undefined),
+    emitBurnStarted: jest.fn().mockResolvedValue(undefined),
     emitConversationChange: jest.fn(),
   };
   const groupEvents = {
@@ -1748,6 +1749,41 @@ describe('ChatService', () => {
         conversationType: 'GROUP',
       });
       expect(prisma.chatMember.updateMany).not.toHaveBeenCalled();
+    });
+
+    it('starts read timers atomically and publishes only a committed revision', async () => {
+      prisma.chatMember.findUnique.mockResolvedValue(seatAt(9, 'DIRECT'));
+      prisma.chatMember.updateMany.mockResolvedValue({ count: 1 });
+      prisma.$queryRaw
+        .mockResolvedValueOnce([])
+        .mockResolvedValueOnce([{ revision: 17 }]);
+      await service.markRead('u1', 'conv-1', 5);
+      const sql = prisma.$queryRaw.mock.calls[1][0].join(' ');
+      expect(sql).toContain('"burnExpiresAt" IS NULL');
+      expect(sql).toContain('m."senderID" <>');
+      expect(sql).toContain('INTERVAL');
+      expect(broadcast.emitBurnStarted).toHaveBeenCalledWith('conv-1', 17);
+      expect(prisma.$transaction).toHaveBeenCalledTimes(1);
+    });
+
+    it('does not publish a timer when the transaction fails', async () => {
+      prisma.chatMember.findUnique.mockResolvedValue(seatAt(9, 'DIRECT'));
+      prisma.$transaction.mockRejectedValueOnce(new Error('rollback'));
+      await expect(service.markRead('u1', 'conv-1', 5)).rejects.toThrow(
+        'rollback',
+      );
+      expect(broadcast.emitBurnStarted).not.toHaveBeenCalled();
+    });
+
+    it('rechecks membership under the conversation lock', async () => {
+      prisma.chatMember.findUnique
+        .mockResolvedValueOnce(seatAt(9, 'DIRECT'))
+        .mockResolvedValueOnce(null);
+      await expect(service.markRead('u1', 'conv-1', 5)).rejects.toThrow(
+        ForbiddenException,
+      );
+      expect(prisma.chatMember.updateMany).not.toHaveBeenCalled();
+      expect(broadcast.emitBurnStarted).not.toHaveBeenCalled();
     });
 
     it('rejects non-integer heights', async () => {
@@ -4534,9 +4570,7 @@ describe('ChatService', () => {
       const a = await service.sendMessage('u1', sendPayload());
       const b = await service.sendMessage('u2', sendPayload({ d: 'b-send' }));
       expect(a.message.burnDurationSec).toBe(60);
-      expect(
-        Date.parse(a.message.burnExpiresAt!) - Date.parse(a.message.createdAt),
-      ).toBe(60_000);
+      expect(a.message.burnExpiresAt).toBeNull();
       expect(b.message.burnDurationSec).toBeNull();
       expect(b.message.burnExpiresAt).toBeNull();
     });

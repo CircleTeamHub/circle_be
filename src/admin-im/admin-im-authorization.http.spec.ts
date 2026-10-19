@@ -48,6 +48,7 @@ describe('admin chat content HTTP access', () => {
     user: { findUnique: jest.fn(() => actor) },
     chatConversation: { findUnique: jest.fn() },
     chatMessage: { findMany: messages },
+    chatBurnArchive: { findMany: jest.fn() },
     adminAuditLog: { create: audit },
     $queryRaw: jest.fn(),
   };
@@ -117,6 +118,7 @@ describe('admin chat content HTTP access', () => {
       },
     ]);
     audit.mockResolvedValue({});
+    prisma.chatBurnArchive.findMany.mockResolvedValue([]);
   });
 
   it('requires authentication before querying content', async () => {
@@ -242,6 +244,30 @@ describe('admin chat content HTTP access', () => {
     );
     expect(JSON.stringify(messages.mock.calls[0][0].where.AND)).toContain(
       'burnExpiresAt',
+    );
+  });
+  it('denies archive history to ordinary IM readers at the HTTP guard', async () => {
+    await request(app.getHttpServer())
+      .post(`/admin/im/conversations/${conversationID}/archives/query`)
+      .auth(token(), { type: 'bearer' })
+      .send({ reason: 'review' })
+      .expect(403);
+    expect(prisma.chatBurnArchive.findMany).not.toHaveBeenCalled();
+  });
+  it('uses the separate audited archive route for super administrators', async () => {
+    actor.adminAccess.role = 'SUPER_ADMIN';
+    const response = await request(app.getHttpServer())
+      .post(`/admin/im/conversations/${conversationID}/archives/query`)
+      .auth(token(), { type: 'bearer' })
+      .send({ reason: 'review' })
+      .expect(201);
+    expect(response.headers['cache-control']).toBe('no-store');
+    expect(prisma.chatBurnArchive.findMany).toHaveBeenCalled();
+    expect(messages).not.toHaveBeenCalled();
+    expect(audit).toHaveBeenCalledWith(
+      expect.objectContaining({
+        data: expect.objectContaining({ action: 'IM_BURN_ARCHIVE_READ' }),
+      }),
     );
   });
 });

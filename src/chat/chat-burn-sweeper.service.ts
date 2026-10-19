@@ -18,11 +18,10 @@ import {
 } from './chat.constants';
 
 /**
- * S-01 会话级阅后即焚的真删器:每分钟扫描开了焚毁的会话,把超龄消息软删
- * (deleted=true + content 清空,height 坐标保留)并删除对象存储里的媒体
- * —— 只软删不删对象等于焚毁只焚了个寂寞。
+ * 每分钟为到期消息提交用户端焚毁墓碑并清空正文。数据库触发器先生成
+ * 180天管理员归档；有归档的附件和笔记导入引用交给归档到期清理任务释放。
  *
- * 读路径同时按 burnDurationSec 过滤,盖住「已到期、尚未被扫掉」的 ≤1min 间隙,
+ * 读路径同时按 burnExpiresAt 过滤,盖住「已到期、尚未被扫掉」的 ≤1min 间隙,
  * 所以这里晚一拍无碍;单轮批量有上限,防止长会话首开焚毁时一口气删爆。
  */
 const SWEEP_BATCH = 500;
@@ -200,10 +199,10 @@ export class ChatBurnSweeperService {
             .filter((v): v is string => typeof v === 'string' && v.length > 0);
         });
       const messageIds = rows.map((row) => row.id);
-      const noteImportKeys = allMediaKeys.filter((key) =>
+      let noteImportKeys = allMediaKeys.filter((key) =>
         key.includes(`/${CHAT_NOTE_IMPORT_SEGMENT}`),
       );
-      const ownedMediaKeys = allMediaKeys.filter(
+      let ownedMediaKeys = allMediaKeys.filter(
         (key) => !key.includes(`/${CHAT_NOTE_IMPORT_SEGMENT}`),
       );
       if (!lease.isCurrent()) return;
@@ -234,10 +233,28 @@ export class ChatBurnSweeperService {
           },
           select: { id: true, revision: true },
         });
+        const retained = await tx.chatBurnArchive.findMany({
+          where: {
+            id: { in: tombstones.map((row) => row.id) },
+            retainUntil: { gt: new Date() },
+          },
+          select: { id: true, content: true },
+        });
+        const retainedIds = new Set(retained.map((row) => row.id));
+        const retainedKeys = new Set(
+          retained.flatMap((row) => {
+            const content = row.content as Record<string, unknown>;
+            return ['key', 'thumbKey', 'coverKey']
+              .map((field) => content[field])
+              .filter((key): key is string => typeof key === 'string');
+          }),
+        );
+        ownedMediaKeys = ownedMediaKeys.filter((key) => !retainedKeys.has(key));
+        noteImportKeys = noteImportKeys.filter((key) => !retainedKeys.has(key));
         await this.media.queueDeletions(tx, ownedMediaKeys);
         await this.media.releaseNoteImportReferences(
           tx,
-          messageIds,
+          messageIds.filter((id) => !retainedIds.has(id)),
           noteImportKeys,
         );
         return tombstones;

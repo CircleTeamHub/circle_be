@@ -861,9 +861,10 @@ export class ChatService {
             requestHash,
             createdAt,
             burnDurationSec,
-            burnExpiresAt: burnDurationSec
-              ? new Date(createdAt.getTime() + burnDurationSec * 1000)
-              : null,
+            burnExpiresAt:
+              burnDurationSec && conversation.type !== 'DIRECT'
+                ? new Date(createdAt.getTime() + burnDurationSec * 1000)
+                : null,
           },
         });
         await this.media.attachNoteImportReferences(tx, row.id, noteImportKeys);
@@ -1209,16 +1210,82 @@ export class ChatService {
         conversationType: conversation.type,
       };
     }
-    const updated = await this.prisma.chatMember.updateMany({
-      where: {
-        conversationID: conversationId,
-        userID: userId,
-        lastReadHeight: { lt: clamped },
-      },
-      data: { lastReadHeight: clamped },
+    // Group timing remains unchanged; only direct chats move to read-based expiry.
+    if (conversation.type !== 'DIRECT') {
+      const updated = await this.prisma.chatMember.updateMany({
+        where: {
+          conversationID: conversationId,
+          userID: userId,
+          lastReadHeight: { lt: clamped },
+        },
+        data: { lastReadHeight: clamped },
+      });
+      return {
+        advanced: updated.count > 0,
+        height: clamped,
+        conversationType: conversation.type,
+      };
+    }
+    const result = await this.prisma.$transaction(async (tx) => {
+      // Match send/clear/burn lock ordering, and serialize concurrent readers.
+      await tx.$queryRaw`SELECT "id" FROM "ChatConversation"
+        WHERE "id" = ${conversationId} FOR UPDATE`;
+      const seat = await tx.chatMember.findUnique({
+        where: {
+          conversationID_userID: {
+            conversationID: conversationId,
+            userID: userId,
+          },
+        },
+      });
+      if (!seat || seat.leftAt) {
+        throw new ForbiddenException({
+          message: '不在该会话中',
+          errorCode: ChatErrorCode.NotMember,
+        });
+      }
+      const updated = await tx.chatMember.updateMany({
+        where: {
+          conversationID: conversationId,
+          userID: userId,
+          leftAt: null,
+          lastReadHeight: { lt: clamped },
+        },
+        data: { lastReadHeight: clamped },
+      });
+      // Exclude the author and history preceding this reader's membership.
+      // IS NULL makes repeated receipts and multiple devices unable to restart
+      // a timer. Evaluate even on a repeated watermark, to recover a missed ack.
+      const started = await tx.$queryRaw<Array<{ revision: number }>>`
+        WITH started AS (UPDATE "ChatMessage" m
+        SET "burnExpiresAt" = clock_timestamp() + m."burnDurationSec" * INTERVAL '1 second'
+        WHERE m."conversationID" = ${conversationId}
+          AND m."height" <= ${clamped}
+          AND m."height" > ${Math.max(seat.clearedBeforeHeight ?? 0, conversation.clearedBeforeHeight)}
+          AND m."senderID" <> ${userId}
+          AND m."createdAt" >= ${seat.joinedAt}
+          AND m."burnDurationSec" > 0 AND m."burnExpiresAt" IS NULL
+          AND m."deleted" = false AND m."revokedAt" IS NULL
+        RETURNING m."revision")
+        SELECT COALESCE(MAX("revision"), 0)::integer AS revision FROM started`;
+      return {
+        advanced: updated.count > 0,
+        revision: Math.max(0, ...started.map((row) => row.revision)),
+      };
     });
+    if (result.revision > 0) {
+      // Content-free invalidation; clients fetch the durable revision stream.
+      // A failed live broadcast is repaired by the next snapshot/reconnect.
+      try {
+        await this.broadcast.emitBurnStarted(conversationId, result.revision);
+      } catch (error) {
+        this.logger.warn(
+          `burn-start broadcast failed: ${error instanceof Error ? error.name : 'unknown error'}`,
+        );
+      }
+    }
     return {
-      advanced: updated.count > 0,
+      advanced: result.advanced,
       height: clamped,
       conversationType: conversation.type,
     };

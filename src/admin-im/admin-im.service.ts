@@ -120,7 +120,12 @@ export class AdminImService {
         'Only self-hosted persisted sessions. OpenIM server history is not integrated.',
     };
   }
-  async messages(actorID: string, id: string, q: ImMessageQueryDto) {
+  async messages(
+    actorID: string,
+    id: string,
+    q: ImMessageQueryDto,
+    archive = false,
+  ) {
     if (q.from && q.to && new Date(q.from) > new Date(q.to))
       throw new BadRequestException('Invalid date range');
     const result = await this.prisma.$transaction(async (tx) => {
@@ -141,7 +146,7 @@ export class AdminImService {
         actor.status !== 'ACTIVE' ||
         !actor.adminAccess ||
         !(ADMIN_ROLE_PERMISSIONS[actor.adminAccess.role] ?? []).includes(
-          'IM_READ',
+          archive ? 'IM_ARCHIVE_READ' : 'IM_READ',
         )
       ) {
         throw new ForbiddenException('无权限查看聊天记录');
@@ -189,24 +194,54 @@ export class AdminImService {
             : []),
         ],
       };
-      const rows = await tx.chatMessage.findMany({
-        where,
-        orderBy: { height: 'desc' },
-        take: q.limit + 1,
-        select: {
-          id: true,
-          height: true,
-          senderID: true,
-          type: true,
-          content: true,
-          createdAt: true,
-        },
-      });
+      const rows = archive
+        ? (
+            await tx.chatBurnArchive.findMany({
+              where: {
+                conversationID: id,
+                retainUntil: { gt: new Date() },
+                ...(q.cursor ? { height: { lt: q.cursor } } : {}),
+                ...(q.senderId ? { senderID: q.senderId } : {}),
+                ...(q.from || q.to
+                  ? {
+                      createdAt: {
+                        ...(q.from ? { gte: new Date(q.from) } : {}),
+                        ...(q.to ? { lte: new Date(q.to) } : {}),
+                      },
+                    }
+                  : {}),
+                ...(q.text
+                  ? {
+                      type: 'text',
+                      content: { path: ['text'], string_contains: q.text },
+                    }
+                  : {}),
+              },
+              orderBy: { height: 'desc' },
+              take: q.limit + 1,
+            })
+          ).map((row) => ({ ...row, burnExpiresAt: row.retainUntil }))
+        : await tx.chatMessage.findMany({
+            where,
+            orderBy: { height: 'desc' },
+            take: q.limit + 1,
+            select: {
+              id: true,
+              height: true,
+              senderID: true,
+              type: true,
+              content: true,
+              createdAt: true,
+              burnExpiresAt: true,
+              burnDurationSec: true,
+            },
+          });
+      const observedAt = Date.now();
       // Never record message bodies or text filters (which themselves may contain private content).
       await tx.adminAuditLog.create({
         data: {
           actorID,
-          action: 'IM_MESSAGES_READ',
+          action: archive ? 'IM_BURN_ARCHIVE_READ' : 'IM_MESSAGES_READ',
           entityType: 'ChatConversation',
           entityID: id,
           reason: q.reason,
@@ -225,6 +260,7 @@ export class AdminImService {
         rows: rows.slice(0, q.limit),
         hasMore: rows.length > q.limit,
         conversation,
+        observedAt,
       };
     });
     const items = result.rows.map((r) => ({
@@ -235,15 +271,15 @@ export class AdminImService {
       mediaExpiresAt: null as string | null,
       revision: 0,
       d: null,
+      // A pending read has no expiry yet. Limit this audited display lease to
+      // one burn window from the snapshot, so a later read cannot leave an
+      // already-open admin page displaying content past its eventual expiry.
+      // The administrator can explicitly re-query if it is still unread.
       visibleUntil:
-        result.conversation.burnDurationSec &&
-        (!result.conversation.burnStartedAt ||
-          r.createdAt >= result.conversation.burnStartedAt)
-          ? new Date(
-              r.createdAt.getTime() +
-                result.conversation.burnDurationSec * 1000,
-            ).toISOString()
-          : null,
+        r.burnExpiresAt?.toISOString() ??
+        (r.burnDurationSec
+          ? new Date(result.observedAt + r.burnDurationSec * 1000).toISOString()
+          : null),
       height: r.height,
       senderId: r.senderID,
       type: r.type,
@@ -291,7 +327,7 @@ export class AdminImService {
       nextCursor: result.hasMore
         ? (items[items.length - 1]?.height ?? null)
         : null,
-      source: 'SELF_HOSTED',
+      source: archive ? 'BURN_ARCHIVE' : 'SELF_HOSTED',
     };
   }
   private content(

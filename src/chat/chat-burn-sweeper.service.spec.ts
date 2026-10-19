@@ -6,6 +6,7 @@ describe('ChatBurnSweeperService', () => {
   const prisma = {
     $transaction: jest.fn(),
     $queryRaw: jest.fn(),
+    chatBurnArchive: { findMany: jest.fn() },
     chatConversation: { findMany: jest.fn(), findUnique: jest.fn() },
     chatMessage: { findMany: jest.fn(), updateManyAndReturn: jest.fn() },
   };
@@ -43,6 +44,7 @@ describe('ChatBurnSweeperService', () => {
 
   beforeEach(() => {
     jest.resetAllMocks();
+    prisma.chatBurnArchive.findMany.mockResolvedValue([]);
     // RETURNING 带回触发器分配的序号:按 id 顺序编号。
     prisma.chatMessage.updateManyAndReturn.mockImplementation(
       (args: { where: { id: { in: string[] } } }) =>
@@ -681,4 +683,16 @@ describe('ChatBurnSweeperService', () => {
       { id: 'm2', revision: 1 },
     ]);
   });
+  it('keeps archived media and note-import reference pins instead of deleting them at user expiry', async () => {
+    prisma.chatConversation.findMany.mockResolvedValue([{ id: 'conv-1' }]);
+    const content = { key: 'chat/u1/photo.jpg', thumbKey: 'chat/u1/thumb.jpg' };
+    prisma.chatMessage.findMany.mockResolvedValueOnce([{ id: 'retained', type: 'image', content }]);
+    prisma.chatBurnArchive.findMany.mockResolvedValue([{ id: 'retained', content }]);
+    await service.sweep();
+    expect(media.queueDeletions).toHaveBeenCalledWith(prisma, []);
+    expect(media.deleteObjects).not.toHaveBeenCalled();
+    expect(media.releaseNoteImportReferences).toHaveBeenCalledWith(prisma, [], []);
+    expect(broadcast.emitBurnedMessages).toHaveBeenCalledWith('conv-1', [{ id: 'retained', revision: 1 }]);
+  });
+
 });
