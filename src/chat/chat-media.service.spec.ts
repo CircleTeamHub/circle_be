@@ -32,6 +32,7 @@ describe('ChatMediaService', () => {
     $transaction: jest.fn(),
     $queryRaw: jest.fn(),
     chatMessage: { findMany: jest.fn() },
+    chatBurnArchive: { findMany: jest.fn() },
     chatMediaDeletion: {
       createMany: jest.fn(),
       upsert: jest.fn(),
@@ -56,6 +57,7 @@ describe('ChatMediaService', () => {
   beforeEach(() => {
     jest.clearAllMocks();
     prisma.chatMessage.findMany.mockResolvedValue([]);
+    prisma.chatBurnArchive.findMany.mockResolvedValue([]);
     prisma.chatMediaDeletion.findFirst.mockResolvedValue(null);
     uploadService.createPresignedGetUrl.mockImplementation((key: string) =>
       Promise.resolve({ url: `https://signed/${key}`, expiresAt: new Date() }),
@@ -208,6 +210,18 @@ describe('ChatMediaService', () => {
     expect(prisma.chatMediaDeletion.delete).toHaveBeenCalledWith({
       where: { id: row.id },
     });
+  });
+  it('preserves a note-import reference after an expired recall created an audit archive', async () => {
+    prisma.chatBurnArchive.findMany.mockResolvedValue([
+      { id: 'expired-message' },
+    ]);
+    await service.releaseNoteImportReferences(
+      prisma as never,
+      ['expired-message'],
+      ['chat/u1/note-import/a.jpg'],
+    );
+    expect(prisma.chatMediaReference.deleteMany).not.toHaveBeenCalled();
+    expect(prisma.chatMediaDeletion.upsert).not.toHaveBeenCalled();
   });
   it('blocks media reuse once archive cleanup queued physical deletion', async () => {
     prisma.chatMediaDeletion.findFirst.mockResolvedValue({ id: 'pending' });

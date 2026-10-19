@@ -10,7 +10,7 @@ CREATE INDEX "ChatBurnArchive_retainUntil_id_idx" ON "ChatBurnArchive" ("retainU
 -- Capture the locked, current content before redaction. No network IO in the transaction.
 CREATE FUNCTION archive_burned_chat_message() RETURNS trigger LANGUAGE plpgsql AS $$
 BEGIN
- IF NOT OLD."deleted" AND (NEW."deleted" OR NEW."revokedAt" IS NOT NULL) AND OLD."revokedAt" IS NULL
+ IF NOT OLD."deleted" AND (NEW."deleted" OR NEW."revokedAt" IS NOT NULL OR NEW."content" IS DISTINCT FROM OLD."content") AND OLD."revokedAt" IS NULL
     AND OLD."burnExpiresAt" <= clock_timestamp()
     AND OLD."burnExpiresAt" + INTERVAL '180 days' > clock_timestamp() THEN
   INSERT INTO "ChatBurnArchive" ("id", "conversationID", "senderID", "clientMessageId", "height", "type", "content", "createdAt", "burnExpiresAt", "burnDurationSec", "retainUntil")
@@ -19,7 +19,7 @@ BEGIN
  END IF;
  RETURN NEW;
 END $$;
-CREATE TRIGGER archive_burned_chat_message BEFORE UPDATE OF "deleted", "revokedAt" ON "ChatMessage"
+CREATE TRIGGER archive_burned_chat_message BEFORE UPDATE OF "deleted", "revokedAt", "content" ON "ChatMessage"
  FOR EACH ROW EXECUTE FUNCTION archive_burned_chat_message();
 -- User recovery copies still disappear; authorized audit copies follow the archive TTL.
 CREATE OR REPLACE FUNCTION purge_e2ee_message_archive() RETURNS trigger LANGUAGE plpgsql AS $$

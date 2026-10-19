@@ -3957,6 +3957,24 @@ describe('ChatService', () => {
   });
 
   describe('editMessage(G-07 消息编辑)', () => {
+    it('rejects an edit after the fixed burn deadline even inside the edit window', async () => {
+      prisma.chatMember.findUnique.mockResolvedValue(membership());
+      prisma.chatMessage.findUnique.mockResolvedValue({
+        id: 'm1',
+        conversationID: 'conv-1',
+        senderID: 'u1',
+        type: 'text',
+        createdAt: new Date(),
+        deleted: false,
+        revokedAt: null,
+        burnExpiresAt: new Date(Date.now() - 1),
+      });
+      await expect(
+        service.editMessage('u1', 'conv-1', 'm1', { text: 'replacement' }),
+      ).rejects.toThrow(NotFoundException);
+      expect(prisma.chatMessage.updateMany).not.toHaveBeenCalled();
+    });
+
     const editableRow = (overrides: Record<string, unknown> = {}) => ({
       id: 'm1',
       conversationID: 'conv-1',

@@ -195,14 +195,76 @@ integration(
       await db.query(
         `INSERT INTO "ChatBurnArchive" SELECT 'm2',"conversationID","senderID","clientMessageId",2,type,content,"createdAt","burnExpiresAt","burnDurationSec","retainUntil"+INTERVAL '1 day' FROM "ChatBurnArchive" WHERE id='m1'`,
       );
-      expect((await db.query(sql, [[key], 'm1'])).rows).toEqual([]);
+      expect(
+        (
+          await db.query(sql, [
+            [key],
+            ['image', 'video', 'voice', 'file'],
+            ['image', 'video'],
+            'm1',
+            ['image', 'video', 'voice', 'file'],
+            ['image', 'video'],
+          ])
+        ).rows,
+      ).toEqual([]);
       await db.query(`DELETE FROM "ChatBurnArchive" WHERE id='m2'`);
-      expect((await db.query(sql, [[key], 'm1'])).rows).toEqual([{ key }]);
+      expect(
+        (
+          await db.query(sql, [
+            [key],
+            ['image', 'video', 'voice', 'file'],
+            ['image', 'video'],
+            'm1',
+            ['image', 'video', 'voice', 'file'],
+            ['image', 'video'],
+          ])
+        ).rows,
+      ).toEqual([{ key }]);
       await db.query(
-        `INSERT INTO "ChatMessage" (id,"conversationID",height,content) VALUES ('live','c1',2,jsonb_build_object('key',$1::text))`,
+        `INSERT INTO "ChatMessage" (id,"conversationID",height,type,content) VALUES ('live','c1',2,'image',jsonb_build_object('key',$1::text))`,
         [key],
       );
-      expect((await db.query(sql, [[key], 'm1'])).rows).toEqual([]);
+      expect(
+        (
+          await db.query(sql, [
+            [key],
+            ['image', 'video', 'voice', 'file'],
+            ['image', 'video'],
+            'm1',
+            ['image', 'video', 'voice', 'file'],
+            ['image', 'video'],
+          ])
+        ).rows,
+      ).toEqual([]);
+      await db.query(`UPDATE "ChatMessage" SET type='text' WHERE id='live'`);
+      expect(
+        (
+          await db.query(sql, [
+            [key],
+            ['image', 'video', 'voice', 'file'],
+            ['image', 'video'],
+            'm1',
+            ['image', 'video', 'voice', 'file'],
+            ['image', 'video'],
+          ])
+        ).rows,
+      ).toEqual([{ key }]);
+      await db.query(
+        `UPDATE "ChatMessage" SET type='file',content=jsonb_build_object('thumbKey',$1::text) WHERE id='live'`,
+        [key],
+      );
+      expect(
+        (
+          await db.query(sql, [
+            [key],
+            ['image', 'video', 'voice', 'file'],
+            ['image', 'video'],
+            'm1',
+            ['image', 'video', 'voice', 'file'],
+            ['image', 'video'],
+          ])
+        ).rows,
+      ).toEqual([{ key }]);
     });
     it('archives logically expired content before a later recall clears its body', async () => {
       await db.query(
@@ -222,6 +284,19 @@ integration(
       expect((await db.query('SELECT id FROM "ChatBurnArchive"')).rows).toEqual(
         [{ id: 'm1' }],
       );
+    });
+    it('freezes the deadline content before a late edit and preserves it through sweep', async () => {
+      await db.query(
+        `UPDATE "ChatMessage" SET "burnExpiresAt"=NOW()-INTERVAL '1 second' WHERE id='m1'; UPDATE "ChatMessage" SET content='{"text":"changed"}', "editedAt"=NOW() WHERE id='m1'`,
+      );
+      await burn();
+      expect(
+        (
+          await db.query(
+            'SELECT content FROM "ChatBurnArchive" WHERE id=\'m1\'',
+          )
+        ).rows[0].content,
+      ).toEqual({ text: 'private' });
     });
     it('rolls archive creation back together with a failed burn transaction', async () => {
       await db.query('BEGIN');

@@ -134,6 +134,13 @@ export class ChatMediaService implements OnModuleDestroy {
     const noteKeys = this.noteImportKeys(keys);
     if (noteKeys.length === 0 || messageIds.length === 0) return;
     await this.lockNoteImportKeys(tx, noteKeys);
+    const retained = await tx.chatBurnArchive.findMany({
+      where: { id: { in: messageIds }, retainUntil: { gt: new Date() } },
+      select: { id: true },
+    });
+    const retainedIds = new Set(retained.map((row) => row.id));
+    messageIds = messageIds.filter((id) => !retainedIds.has(id));
+    if (!messageIds.length) return;
     await tx.chatMediaReference.deleteMany({
       where: {
         messageID: { in: messageIds },
@@ -285,15 +292,21 @@ export class ChatMediaService implements OnModuleDestroy {
     if (!owned.length) return [];
     for (const key of owned)
       await tx.$queryRaw`SELECT pg_advisory_xact_lock(hashtext(${key}))`;
+    const primaryTypes = Object.keys(CHAT_MEDIA_KEY_FIELDS).filter((type) =>
+      CHAT_MEDIA_KEY_FIELDS[type].some((field) => field.key === 'key'),
+    );
+    const thumbTypes = Object.keys(CHAT_MEDIA_KEY_FIELDS).filter((type) =>
+      CHAT_MEDIA_KEY_FIELDS[type].some((field) => field.key === 'thumbKey'),
+    );
     const rows = await tx.$queryRaw<Array<{ key: string }>>`
       SELECT wanted.key FROM unnest(${owned}::text[]) AS wanted(key)
       WHERE NOT EXISTS (
         SELECT 1 FROM "ChatMessage" m WHERE m."deleted" = false AND m."revokedAt" IS NULL
-        AND (m.content->>'key' = wanted.key OR m.content->>'thumbKey' = wanted.key OR m.content->>'coverKey' = wanted.key)
+        AND ((m.type = ANY(${primaryTypes}::text[]) AND m.content->>'key' = wanted.key) OR (m.type = ANY(${thumbTypes}::text[]) AND m.content->>'thumbKey' = wanted.key))
       ) AND NOT EXISTS (
         SELECT 1 FROM "ChatBurnArchive" a WHERE a.id <> ${archiveId}
         AND a."retainUntil" > clock_timestamp()
-        AND (a.content->>'key' = wanted.key OR a.content->>'thumbKey' = wanted.key OR a.content->>'coverKey' = wanted.key)
+        AND ((a.type = ANY(${primaryTypes}::text[]) AND a.content->>'key' = wanted.key) OR (a.type = ANY(${thumbTypes}::text[]) AND a.content->>'thumbKey' = wanted.key))
       )`;
     return rows.map((row) => row.key);
   }

@@ -4426,7 +4426,8 @@ export class ChatService {
       !row ||
       row.conversationID !== conversationId ||
       row.deleted ||
-      row.revokedAt
+      row.revokedAt ||
+      (row.burnExpiresAt && row.burnExpiresAt.getTime() <= Date.now())
     ) {
       throw new NotFoundException({
         message: '消息不存在',
@@ -4484,7 +4485,8 @@ export class ChatService {
         !current ||
         current.conversationID !== conversationId ||
         current.deleted ||
-        current.revokedAt
+        current.revokedAt ||
+        (current.burnExpiresAt && current.burnExpiresAt.getTime() <= Date.now())
       ) {
         throw new NotFoundException({
           message: '消息不存在',
