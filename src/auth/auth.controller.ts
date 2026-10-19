@@ -204,6 +204,25 @@ export class AuthController {
     );
   }
 
+  @AnonymousAccess('Device-bound login challenge and recovery waiting period')
+  @Post('login-challenges/:challengeId/recovery')
+  @UseGuards(ThrottlerGuard)
+  @Throttle({ default: { limit: 10, ttl: 60_000 } })
+  @ApiOperation({
+    summary:
+      'New device: no trusted device available — request recovery after a waiting period',
+  })
+  @ApiHeader({ name: 'x-device-id', required: true })
+  requestLoginRecovery(
+    @Param('challengeId', ParseUUIDPipe) challengeId: string,
+    @Req() req: Request,
+  ) {
+    return this.authService.requestLoginRecovery(
+      challengeId,
+      getSessionContext(req).deviceKey ?? null,
+    );
+  }
+
   @AnonymousAccess('Device-bound login challenge')
   @Get('login-challenges/:challengeId/status')
   // 状态每几秒就变，绝不能被任何一层缓存。

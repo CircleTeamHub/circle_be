@@ -185,7 +185,7 @@ export class AdminInviteService {
           for (let attempt = 0; attempt < 30; attempt += 1) {
             const code = generateInviteCode();
             const identifierValue = code.toLowerCase();
-            await tx.$queryRaw`SELECT pg_advisory_xact_lock(hashtextextended(${identifierValue}, 0))`;
+            await tx.$executeRaw`SELECT pg_advisory_xact_lock(hashtextextended(${identifierValue}, 0))`;
             if (
               await tx.accountIdentifier.findUnique({
                 where: { value: identifierValue },

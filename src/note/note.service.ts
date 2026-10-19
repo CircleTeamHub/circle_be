@@ -3830,7 +3830,7 @@ export class NoteService {
             await this.prisma.$transaction(async (tx) => {
               // 与删除 worker 共用同一把 key 锁。若过期 reservation 正被清理,
               // 先等它结束再续租并复制；否则「刚复制完」的对象可能被旧 worker 删掉。
-              await tx.$queryRaw`SELECT pg_advisory_xact_lock(hashtext(${destKey}))`;
+              await tx.$executeRaw`SELECT pg_advisory_xact_lock(hashtext(${destKey}))`;
               // 锁只覆盖 worker 的认领事务,不覆盖它随后在事务外做的对象删除。
               // 认领行带着「删除中」标记和一段未到期租约:此刻复用这行、开始复制,
               // 飞行中的删除就可能把刚复制好的对象删掉。所以直接拒绝,让客户端

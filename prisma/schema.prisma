@@ -997,11 +997,17 @@ model LoginChallenge {
   expiresAt     DateTime
   decidedAt     DateTime?
   createdAt     DateTime             @default(now())
+  /// 找回：受信任设备全都用不了时，新设备申请等待期后自动登录。申请后 expiresAt
+  /// 延长到「可完成时间 + 完成窗口」，期间受信任设备照常能批准 / 拒绝。
+  recoveryRequestedAt DateTime?
+  /// 到点后在同一台设备上用密码登录即完成找回。
+  recoveryAvailableAt DateTime?
   user          User                 @relation(fields: [userId], references: [id], onDelete: Cascade)
 
   @@index([userId, createdAt])
   @@index([userId, deviceKey, status])
   @@index([createdAt])
+  @@index([expiresAt])
 }
 
 // ─── Social ───────────────────────────────────────────────────────────────────

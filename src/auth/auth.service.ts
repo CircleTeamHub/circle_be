@@ -365,6 +365,20 @@ export class AuthService {
         });
         return this.deviceVerificationResponse(decision.challenge);
       }
+      if (decision.kind === 'recovered') {
+        try {
+          return await this.completeRecoveryLogin(
+            current,
+            decision.challengeId,
+            sessionContext ?? {},
+          );
+        } catch (error) {
+          // 领取已提交、后续步骤中途失败：退回「可领取」，让重试从头完整执行一遍。
+          // 否则要么白等 24 小时重来，要么新设备已被信任却没撤掉丢失设备的信任和会话。
+          await this.deviceTrust.releaseRecoveryClaim(decision.challengeId);
+          throw error;
+        }
+      }
       return this.finishLogin(current, sessionContext);
     });
   }
@@ -376,8 +390,74 @@ export class AuthService {
         id: challenge.id,
         expiresAt: challenge.expiresAt,
         securityCodeAvailable: challenge.securityCodeAvailable,
+        recoveryAvailableAt: challenge.recoveryAvailableAt,
       },
     };
+  }
+
+  /** 新设备：受信任设备全都用不了时申请找回（等待期后在这台设备上用密码登录即可）。 */
+  async requestLoginRecovery(challengeId: string, deviceKey: string | null) {
+    const challenge = await this.deviceTrust.requestRecovery(
+      challengeId,
+      deviceKey,
+    );
+    return this.deviceVerificationResponse(challenge);
+  }
+
+  /**
+   * 找回等待期已过、这次密码登录来自申请找回的那台设备（调用方已持有账号锁）。
+   * 这台设备成为唯一的受信任设备：先发 token，再撤销其他会话（多半在丢了的手机上）、
+   * 其他设备的信任和其余进行中的验证单。先发后撤：撤销会写吊销边界，同一毫秒内
+   * 签发的新 token 会被误判为已吊销。
+   */
+  private async completeRecoveryLogin(
+    user: {
+      id: string;
+      accountId: string;
+      role: string;
+      nickname: string;
+      avatarUrl: string | null;
+      singleDeviceLoginEnabled: boolean;
+    },
+    challengeId: string,
+    sessionContext: SessionContext,
+  ) {
+    const deviceKey = sessionContext.deviceKey;
+    if (!deviceKey) {
+      throw new ForbiddenException({
+        message: '登录验证请求无效，请重新登录',
+        errorCode: AuthErrorCode.LoginChallengeInvalid,
+      });
+    }
+    this.prisma.user
+      .update({ where: { id: user.id }, data: { lastOnline: new Date() } })
+      .catch((err) =>
+        this.logger.warn(
+          `lastOnline update failed for ${user.id}: ${err?.message}`,
+        ),
+      );
+    const { sessionId, ...tokens } = await this.issueTokensWithSession(
+      user.id,
+      user.accountId,
+      user.role,
+      sessionContext,
+    );
+    await this.refreshTokenService.revokeOtherSessions(user.id, sessionId);
+    await this.deviceTrust.revokeOtherDevices(user.id, deviceKey);
+    await this.deviceTrust.invalidateChallenges(user.id);
+    // Only enroll trust after every cleanup step succeeds. A retry must still
+    // enter the recovery path if revocation or challenge invalidation fails.
+    await this.deviceTrust.trust(user.id, deviceKey, sessionContext);
+    this.deviceTrust.logRecoveryCompleted(user.id, challengeId);
+    logBusinessEvent(this.logger, {
+      enabled: this.loggingConfig.businessLogOn,
+      businessEvent: 'auth_login_recovered',
+      actorId: user.id,
+      result: 'success',
+      entityType: 'login_challenge',
+      entityId: challengeId,
+    });
+    return tokens;
   }
 
   /** 新设备：受信任设备批准后输入验证码，通过即记为受信任并发 token。 */
@@ -833,6 +913,25 @@ export class AuthService {
         ...sessionContext,
         deviceName: sessionContext?.deviceName ?? deviceName,
       });
+      // 受信任设备还在正常使用：别的设备发起的找回申请取消（本人能直接批准）。
+      // 尽力而为：此时 refresh token 已经轮换，这里抛错会让客户端拿不到新 token、
+      // 重试被当成 token 复用而整族吊销。下一次续签 / 登录会再取消一次。
+      if (deviceKey) {
+        try {
+          if (await this.deviceTrust.isTrusted(user.id, deviceKey)) {
+            await this.deviceTrust.cancelRecoveriesForActiveDevice(
+              user.id,
+              deviceKey,
+            );
+          }
+        } catch (error) {
+          this.logger.warn(
+            `cancel recoveries on refresh failed for ${user.id}: ${
+              error instanceof Error ? error.message : String(error)
+            }`,
+          );
+        }
+      }
       return { accessToken, refreshToken: newRefreshToken };
     });
   }
@@ -1673,6 +1772,27 @@ export class AuthService {
       expectedPasswordHash?: string;
     },
   ) {
+    const { accessToken, refreshToken } = await this.issueTokensWithSession(
+      userId,
+      accountId,
+      role,
+      sessionContext,
+      options,
+    );
+    return { accessToken, refreshToken };
+  }
+
+  /** 同 issueTokens，另外带回新会话 id（不进响应体，只给需要「撤销其他会话」的调用方）。 */
+  private async issueTokensWithSession(
+    userId: string,
+    accountId: string,
+    role: string,
+    sessionContext?: SessionContext,
+    options?: {
+      audience?: RefreshTokenAudience;
+      expectedPasswordHash?: string;
+    },
+  ) {
     const audience = options?.audience ?? 'APP';
     let createSession: Promise<{ token: string; sessionId: string }>;
     if (audience === 'APP') {
@@ -1719,7 +1839,7 @@ export class AuthService {
       audience,
     );
     await this.refreshTokenService.assertSessionActive(userId, sessionId);
-    return { accessToken, refreshToken };
+    return { accessToken, refreshToken, sessionId };
   }
 
   private async signAccessToken(

@@ -39,6 +39,16 @@ export const LOGIN_CHALLENGE_RETENTION_MS = 24 * 60 * 60 * 1000;
  * 错误计数——那样只知道密码的人就能把本人手机的应用锁锁住。
  */
 export const LOGIN_CHALLENGE_SECURITY_CODE_DAILY_FAILURES = 10;
+/**
+ * 找回等待期：受信任设备全都用不了（唯一的手机重装 / 丢失 / 恢复出厂）时，新设备申请后
+ * 要等这么久，期间所有受信任设备都会收到提醒并能拒绝。只知道密码的人也能申请，所以
+ * 这段时间就是本人发现并拒绝的窗口——不能太短。
+ */
+export const LOGIN_RECOVERY_DELAY_MS = 24 * 60 * 60 * 1000;
+/** 等待期结束后，在同一台设备上用密码登录完成找回的期限。 */
+export const LOGIN_RECOVERY_COMPLETION_WINDOW_MS = 7 * 24 * 60 * 60 * 1000;
+/** 同一账号同时进行中的找回申请上限（别人抢先占满会挡住本人，所以不设成 1）。 */
+export const LOGIN_RECOVERY_MAX_ACTIVE = 3;
 
 // 客户端设备 ID：安全存储里的随机串（UUID / base64url）。只收这个字符集，
 // 不合规就当没带 —— 它会被哈希后入库，不做任何拼接。
@@ -61,11 +71,15 @@ export type LoginChallengeView = {
   id: string;
   expiresAt: Date;
   securityCodeAvailable: boolean;
+  /** 已申请找回时的可完成时间；没申请为 null。 */
+  recoveryAvailableAt: Date | null;
 };
 
 export type LoginDecision =
   | { kind: 'trusted' }
-  | { kind: 'challenge'; challenge: LoginChallengeView };
+  | { kind: 'challenge'; challenge: LoginChallengeView }
+  /** 找回等待期已过：验证单已被领取（CONSUMED），调用方完成找回并发 token。 */
+  | { kind: 'recovered'; challengeId: string };
 
 export type PendingLoginChallenge = {
   id: string;
@@ -75,6 +89,7 @@ export type PendingLoginChallenge = {
   createdAt: Date;
   expiresAt: Date;
   status: 'PENDING' | 'APPROVED';
+  recoveryAvailableAt: Date | null;
 };
 
 export type LoginChallengePublicStatus =
@@ -113,6 +128,8 @@ export class DeviceTrustService {
       });
       if (existing && !existing.revokedAt) {
         await this.touch(user.id, deviceKey, context, now);
+        // 受信任设备能登录 = 本人设备就在手边，能直接批准，进行中的找回一律取消。
+        await this.cancelRecoveriesForActiveDevice(user.id, deviceKey);
         return { kind: 'trusted' };
       }
     }
@@ -129,6 +146,10 @@ export class DeviceTrustService {
         errorCode: AuthErrorCode.DeviceIdRequired,
       });
     }
+
+    // 找回等待期已过：这次密码登录就是完成找回的那一步（密码刚核对过）。
+    const recovered = await this.claimMaturedRecovery(user.id, deviceKey, now);
+    if (recovered) return { kind: 'recovered', challengeId: recovered };
 
     const securityCodeAvailable = Boolean(user.loginSecurityCodeHash);
 
@@ -150,6 +171,7 @@ export class DeviceTrustService {
         deviceName: true,
         expiresAt: true,
         codeExpiresAt: true,
+        recoveryAvailableAt: true,
       },
     });
     if (reusable) {
@@ -160,6 +182,7 @@ export class DeviceTrustService {
           id: reusable.id,
           expiresAt: reusable.expiresAt,
           securityCodeAvailable,
+          recoveryAvailableAt: reusable.recoveryAvailableAt,
         },
       };
     }
@@ -167,7 +190,11 @@ export class DeviceTrustService {
     const challenge = await this.createChallenge(user.id, deviceKey, context);
     return {
       kind: 'challenge',
-      challenge: { ...challenge, securityCodeAvailable },
+      challenge: {
+        ...challenge,
+        securityCodeAvailable,
+        recoveryAvailableAt: null,
+      },
     };
   }
 
@@ -180,7 +207,8 @@ export class DeviceTrustService {
     return withDatabaseWorkBudget(this.prisma, () =>
       this.prisma.$transaction(
         async (tx) => {
-          await tx.$queryRaw`SELECT pg_advisory_xact_lock(hashtextextended(${`auth_session:${owner.userId}`}, 0))`;
+          // $executeRaw：pg_advisory_xact_lock 返回 void，$queryRaw 反序列化不了（P2010 → 500）。
+          await tx.$executeRaw`SELECT pg_advisory_xact_lock(hashtextextended(${`auth_session:${owner.userId}`}, 0))`;
           return this.resendLocked(challengeId, deviceKey);
         },
         { maxWait: 10000, timeout: 30000 },
@@ -205,6 +233,7 @@ export class DeviceTrustService {
         id: previous.id,
         expiresAt: previous.expiresAt,
         securityCodeAvailable: await this.hasSecurityCode(previous.userId),
+        recoveryAvailableAt: previous.recoveryAvailableAt,
       };
     }
     const challenge = await this.createChallenge(
@@ -219,7 +248,223 @@ export class DeviceTrustService {
     return {
       ...challenge,
       securityCodeAvailable: await this.hasSecurityCode(previous.userId),
+      recoveryAvailableAt: null,
     };
+  }
+
+  /**
+   * 新设备：账号下的受信任设备全都用不了时申请找回。等待期后在同一台设备上用密码
+   * 登录即可完成；期间所有受信任设备收到提醒并能拒绝，改密 / 全部退出等也会取消。
+   * 重复申请幂等（返回原来的可完成时间）。
+   */
+  async requestRecovery(
+    challengeId: string,
+    deviceKey: string | null,
+  ): Promise<LoginChallengeView> {
+    const owner = await this.findForDevice(challengeId, deviceKey);
+    return withDatabaseWorkBudget(this.prisma, () =>
+      this.prisma.$transaction(
+        async (tx) => {
+          // $executeRaw：pg_advisory_xact_lock 返回 void，$queryRaw 反序列化不了（P2010 → 500）。
+          await tx.$executeRaw`SELECT pg_advisory_xact_lock(hashtextextended(${`auth_session:${owner.userId}`}, 0))`;
+          return this.requestRecoveryLocked(challengeId, deviceKey);
+        },
+        { maxWait: 10000, timeout: 30000 },
+      ),
+    );
+  }
+
+  private async requestRecoveryLocked(
+    challengeId: string,
+    deviceKey: string | null,
+  ): Promise<LoginChallengeView> {
+    const challenge = await this.findForDevice(challengeId, deviceKey);
+    const now = new Date();
+    const status = this.publicStatus(challenge, now);
+    if (status === 'REJECTED') this.throwRejected();
+    if (status === 'CONSUMED') this.throwInvalid();
+    if (challenge.attempts >= LOGIN_CHALLENGE_MAX_ATTEMPTS) this.throwLocked();
+    if (status === 'EXPIRED') this.throwExpired();
+    const securityCodeAvailable = await this.hasSecurityCode(challenge.userId);
+    if (challenge.recoveryAvailableAt) {
+      return {
+        id: challenge.id,
+        expiresAt: challenge.expiresAt,
+        securityCodeAvailable,
+        recoveryAvailableAt: challenge.recoveryAvailableAt,
+      };
+    }
+
+    const active = await this.prisma.loginChallenge.count({
+      where: {
+        userId: challenge.userId,
+        recoveryAvailableAt: { not: null },
+        status: {
+          in: [LoginChallengeStatus.PENDING, LoginChallengeStatus.APPROVED],
+        },
+        expiresAt: { gt: now },
+      },
+    });
+    if (active >= LOGIN_RECOVERY_MAX_ACTIVE) {
+      this.logSecurity('login_recovery_limited', challenge.userId, { active });
+      throw new HttpException(
+        {
+          message: '找回申请过多，请等现有申请处理完后再试',
+          errorCode: AuthErrorCode.LoginRecoveryLimited,
+        },
+        HttpStatus.TOO_MANY_REQUESTS,
+      );
+    }
+
+    const recoveryAvailableAt = new Date(
+      now.getTime() + LOGIN_RECOVERY_DELAY_MS,
+    );
+    const expiresAt = new Date(
+      recoveryAvailableAt.getTime() + LOGIN_RECOVERY_COMPLETION_WINDOW_MS,
+    );
+    const updated = await this.prisma.loginChallenge.updateMany({
+      where: {
+        id: challenge.id,
+        status: {
+          in: [LoginChallengeStatus.PENDING, LoginChallengeStatus.APPROVED],
+        },
+        recoveryAvailableAt: null,
+        expiresAt: { gt: now },
+        attempts: { lt: LOGIN_CHALLENGE_MAX_ATTEMPTS },
+      },
+      data: { recoveryRequestedAt: now, recoveryAvailableAt, expiresAt },
+    });
+    if (updated.count !== 1) this.throwExpired();
+
+    this.logSecurity('login_recovery_requested', challenge.userId, {
+      challengeId: challenge.id,
+    });
+    // 让受信任设备弹出「是否是你本人」（列表里带可完成时间，能看出是找回申请）。
+    this.realtime.broadcast(challenge.userId, {
+      type: 'auth.login.challenge.created',
+      payload: { challengeId: challenge.id, changedAt: now.toISOString() },
+    });
+    void this.pushToUser(
+      challenge.userId,
+      {
+        title: '有设备在申请找回你的账号',
+        body: `${challenge.deviceName ?? '一台新设备'} 申请在 24 小时后登录你的账号。如果不是你本人，请立即拒绝并修改密码。`,
+        data: { type: 'auth.login.challenge', challengeId: challenge.id },
+      },
+      Math.floor(LOGIN_RECOVERY_DELAY_MS / 1000),
+    );
+    return {
+      id: challenge.id,
+      expiresAt,
+      securityCodeAvailable,
+      recoveryAvailableAt,
+    };
+  }
+
+  /**
+   * 等待期已过的找回申请：条件更新领取为 CONSUMED（与并发的拒绝 / 作废二选一），
+   * 领到返回验证单 id，由调用方在同一把账号锁里完成找回。
+   */
+  private async claimMaturedRecovery(
+    userId: string,
+    deviceKey: string,
+    now: Date,
+  ): Promise<string | null> {
+    const matured = await this.prisma.loginChallenge.findFirst({
+      where: {
+        userId,
+        deviceKey,
+        status: {
+          in: [LoginChallengeStatus.PENDING, LoginChallengeStatus.APPROVED],
+        },
+        recoveryAvailableAt: { lte: now },
+        expiresAt: { gt: now },
+        attempts: { lt: LOGIN_CHALLENGE_MAX_ATTEMPTS },
+      },
+      orderBy: { recoveryAvailableAt: 'asc' },
+      select: { id: true },
+    });
+    if (!matured) return null;
+    const claimed = await this.prisma.loginChallenge.updateMany({
+      where: {
+        id: matured.id,
+        status: {
+          in: [LoginChallengeStatus.PENDING, LoginChallengeStatus.APPROVED],
+        },
+        recoveryAvailableAt: { lte: now },
+        expiresAt: { gt: now },
+      },
+      data: {
+        status: LoginChallengeStatus.CONSUMED,
+        codeHash: null,
+        codeExpiresAt: null,
+        decidedAt: now,
+      },
+    });
+    return claimed.count === 1 ? matured.id : null;
+  }
+
+  /**
+   * 受信任设备在用（登录 / 续签）：本人能直接批准，别的设备发起的找回一律取消。
+   * 只知道密码的人发起找回后，只要本人的手机还在正常使用，就不会等到期自动登录。
+   */
+  async cancelRecoveriesForActiveDevice(
+    userId: string,
+    activeDeviceKey: string,
+  ): Promise<void> {
+    const cancelled = await this.prisma.loginChallenge.updateManyAndReturn({
+      where: {
+        userId,
+        deviceKey: { not: activeDeviceKey },
+        recoveryAvailableAt: { not: null },
+        status: {
+          in: [LoginChallengeStatus.PENDING, LoginChallengeStatus.APPROVED],
+        },
+      },
+      data: {
+        status: LoginChallengeStatus.REJECTED,
+        codeHash: null,
+        codeExpiresAt: null,
+        decidedAt: new Date(),
+      },
+      select: { id: true },
+    });
+    for (const { id } of cancelled) {
+      this.broadcastResolved(userId, id, 'REJECTED');
+    }
+    if (cancelled.length > 0) {
+      this.logSecurity('login_recoveries_cancelled_by_trusted_device', userId, {
+        count: cancelled.length,
+      });
+    }
+  }
+
+  /**
+   * 找回完成中途失败时调用：把刚领取（CONSUMED）的找回退回 PENDING，重试可以再次领取。
+   * 只认找回单（recoveryAvailableAt 非空），不会把普通验证单「复活」。尽力而为。
+   */
+  async releaseRecoveryClaim(challengeId: string): Promise<void> {
+    try {
+      await this.prisma.loginChallenge.updateMany({
+        where: {
+          id: challengeId,
+          status: LoginChallengeStatus.CONSUMED,
+          recoveryAvailableAt: { not: null },
+        },
+        data: { status: LoginChallengeStatus.PENDING, decidedAt: null },
+      });
+    } catch (error) {
+      this.logger.warn(
+        `release recovery claim failed for ${challengeId}: ${
+          error instanceof Error ? error.message : String(error)
+        }`,
+      );
+    }
+  }
+
+  /** 找回完成后的通知（只走实时通道：此时其他设备的信任和会话马上被撤销）。 */
+  logRecoveryCompleted(userId: string, challengeId: string) {
+    this.logSecurity('login_recovery_completed', userId, { challengeId });
   }
 
   /** 受信任设备上待处理的登录请求（App 回到前台时拉一次，防推送丢失）。 */
@@ -244,6 +489,7 @@ export class DeviceTrustService {
         userAgent: true,
         createdAt: true,
         expiresAt: true,
+        recoveryAvailableAt: true,
       },
     });
     return rows.map((row) => ({ ...row, status: 'PENDING' as const }));
@@ -335,12 +581,14 @@ export class DeviceTrustService {
     status: LoginChallengePublicStatus;
     expiresAt: Date;
     codeExpiresAt: Date | null;
+    recoveryAvailableAt: Date | null;
   }> {
     const challenge = await this.findForDevice(challengeId, deviceKey);
     return {
       status: this.publicStatus(challenge, new Date()),
       expiresAt: challenge.expiresAt,
       codeExpiresAt: challenge.codeExpiresAt,
+      recoveryAvailableAt: challenge.recoveryAvailableAt,
     };
   }
 
@@ -713,11 +961,13 @@ export class DeviceTrustService {
     });
     const now = new Date();
 
+    // 按过期时间清理：找回申请的有效期会延长到等待期之后，按创建时间清会在它
+    // 刚能完成时就把它删掉。
     void this.prisma.loginChallenge
       .deleteMany({
         where: {
           userId,
-          createdAt: {
+          expiresAt: {
             lt: new Date(now.getTime() - LOGIN_CHALLENGE_RETENTION_MS),
           },
         },
@@ -1008,6 +1258,7 @@ export class DeviceTrustService {
   private async pushToUser(
     userId: string,
     payload: { title: string; body: string; data: Record<string, unknown> },
+    ttlSeconds: number = Math.floor(LOGIN_CHALLENGE_DECISION_MS / 1000),
   ): Promise<void> {
     if (!this.push) return;
     try {
@@ -1020,7 +1271,7 @@ export class DeviceTrustService {
             await this.push!.sendToTokens(tokens, {
               ...payload,
               priority: 'high',
-              ttl: Math.floor(LOGIN_CHALLENGE_DECISION_MS / 1000),
+              ttl: ttlSeconds,
             });
           },
           { maxWait: 10000, timeout: 30000 },

@@ -107,6 +107,11 @@ describe('AuthService', () => {
     consumeAfterSecurityCode: jest.fn(() => Promise.resolve()),
     consumeWithCode: jest.fn(),
     completeVerifiedLogin: jest.fn(() => Promise.resolve()),
+    isTrusted: jest.fn(() => Promise.resolve(true)),
+    cancelRecoveriesForActiveDevice: jest.fn(() => Promise.resolve()),
+    requestRecovery: jest.fn(),
+    logRecoveryCompleted: jest.fn(),
+    releaseRecoveryClaim: jest.fn(() => Promise.resolve()),
   };
   const mockRefreshTokenService = {
     create: jest.fn(() =>
@@ -1335,6 +1340,117 @@ describe('AuthService', () => {
     expect(mockJwt.signAsync).not.toHaveBeenCalled();
   });
 
+  it('completes a matured recovery: trusts this device, issues tokens, then revokes everything else', async () => {
+    const passwordHash = await argon2.hash('password1');
+    users.push({
+      id: 'uuid-recover',
+      accountId: 'recover1',
+      email: 'recover@example.com',
+      passwordHash,
+      status: 'ACTIVE',
+      role: 'USER',
+      singleDeviceLoginEnabled: false,
+    });
+    mockDeviceTrust.evaluateLogin.mockResolvedValueOnce({
+      kind: 'recovered',
+      challengeId: 'challenge-r',
+    } as never);
+    const order: string[] = [];
+    mockRefreshTokenService.createAppSession.mockImplementationOnce(
+      async () => {
+        order.push('issue');
+        return { token: 'refresh-token', sessionId: 'session-new' };
+      },
+    );
+    mockRefreshTokenService.revokeOtherSessions.mockImplementationOnce(
+      async () => {
+        order.push('revoke-sessions');
+      },
+    );
+
+    const result = await service.login(
+      { identifier: 'recover@example.com', password: 'password1' } as any,
+      { deviceKey: 'reinstalled', deviceName: 'SM-F9360' },
+    );
+
+    expect(result).toEqual({
+      accessToken: 'access-token',
+      refreshToken: 'refresh-token',
+    });
+    expect(mockDeviceTrust.trust).toHaveBeenCalledWith(
+      'uuid-recover',
+      'reinstalled',
+      expect.objectContaining({ deviceKey: 'reinstalled' }),
+    );
+    // 先发后撤：撤销写的吊销边界不能盖住同一毫秒签发的新 token。
+    expect(order).toEqual(['issue', 'revoke-sessions']);
+    expect(mockRefreshTokenService.revokeOtherSessions).toHaveBeenCalledWith(
+      'uuid-recover',
+      'session-new',
+    );
+    expect(mockDeviceTrust.revokeOtherDevices).toHaveBeenCalledWith(
+      'uuid-recover',
+      'reinstalled',
+    );
+    expect(mockDeviceTrust.invalidateChallenges).toHaveBeenCalledWith(
+      'uuid-recover',
+    );
+  });
+
+  it('a failure midway through recovery hands the claim back so a retry runs it fully', async () => {
+    const passwordHash = await argon2.hash('password1');
+    users.push({
+      id: 'uuid-recover-fail',
+      accountId: 'recoverfail',
+      email: 'recover-fail@example.com',
+      passwordHash,
+      status: 'ACTIVE',
+      role: 'USER',
+      singleDeviceLoginEnabled: false,
+    });
+    mockDeviceTrust.evaluateLogin.mockResolvedValueOnce({
+      kind: 'recovered',
+      challengeId: 'challenge-r',
+    } as never);
+    mockDeviceTrust.revokeOtherDevices.mockRejectedValueOnce(
+      new Error('database unavailable') as never,
+    );
+
+    await expect(
+      service.login(
+        {
+          identifier: 'recover-fail@example.com',
+          password: 'password1',
+        } as any,
+        { deviceKey: 'reinstalled' },
+      ),
+    ).rejects.toThrow('database unavailable');
+    expect(mockDeviceTrust.releaseRecoveryClaim).toHaveBeenCalledWith(
+      'challenge-r',
+    );
+    expect(mockDeviceTrust.trust).not.toHaveBeenCalled();
+  });
+
+  it('requesting recovery answers with the waiting deadline', async () => {
+    const recoveryAvailableAt = new Date(Date.now() + 86_400_000);
+    mockDeviceTrust.requestRecovery.mockResolvedValueOnce({
+      id: 'challenge-r',
+      expiresAt: new Date(recoveryAvailableAt.getTime() + 1000),
+      securityCodeAvailable: false,
+      recoveryAvailableAt,
+    } as never);
+
+    await expect(
+      service.requestLoginRecovery('challenge-r', 'reinstalled'),
+    ).resolves.toEqual({
+      deviceVerificationRequired: true,
+      challenge: expect.objectContaining({
+        id: 'challenge-r',
+        recoveryAvailableAt,
+      }),
+    });
+  });
+
   it('never evaluates device trust when the password is wrong', async () => {
     const passwordHash = await argon2.hash('password1');
     users.push({
@@ -1586,6 +1702,81 @@ describe('AuthService', () => {
     expect(users[0].lastOnline.getTime()).toBeGreaterThanOrEqual(beforeRefresh);
     // A plain USER session is never revoked by the role gate below.
     expect(mockRefreshTokenService.revokeAll).not.toHaveBeenCalled();
+  });
+
+  it('a refresh from a trusted device cancels pending recovery requests', async () => {
+    users.push({
+      id: 'uuid-1',
+      accountId: 'testuser',
+      passwordHash: 'hash',
+      status: 'ACTIVE',
+      role: 'USER',
+      lastOnline: null,
+    });
+    mockRefreshTokenService.rotate.mockResolvedValueOnce({
+      token: 'new-refresh-token',
+      userId: 'uuid-1',
+      sessionId: 'session-2',
+      deviceKey: 'owner-phone',
+    } as never);
+
+    await service.refresh('refresh-token');
+
+    expect(mockDeviceTrust.isTrusted).toHaveBeenCalledWith(
+      'uuid-1',
+      'owner-phone',
+    );
+    expect(
+      mockDeviceTrust.cancelRecoveriesForActiveDevice,
+    ).toHaveBeenCalledWith('uuid-1', 'owner-phone');
+  });
+
+  it('a failing recovery cancellation never breaks the refresh (the token is already rotated)', async () => {
+    users.push({
+      id: 'uuid-1',
+      accountId: 'testuser',
+      passwordHash: 'hash',
+      status: 'ACTIVE',
+      role: 'USER',
+      lastOnline: null,
+    });
+    mockRefreshTokenService.rotate.mockResolvedValueOnce({
+      token: 'new-refresh-token',
+      userId: 'uuid-1',
+      sessionId: 'session-2',
+      deviceKey: 'owner-phone',
+    } as never);
+    mockDeviceTrust.cancelRecoveriesForActiveDevice.mockRejectedValueOnce(
+      new Error('database unavailable') as never,
+    );
+
+    await expect(service.refresh('refresh-token')).resolves.toEqual(
+      expect.objectContaining({ refreshToken: 'new-refresh-token' }),
+    );
+  });
+
+  it('a refresh from an untrusted session does not cancel recovery', async () => {
+    users.push({
+      id: 'uuid-1',
+      accountId: 'testuser',
+      passwordHash: 'hash',
+      status: 'ACTIVE',
+      role: 'USER',
+      lastOnline: null,
+    });
+    mockRefreshTokenService.rotate.mockResolvedValueOnce({
+      token: 'new-refresh-token',
+      userId: 'uuid-1',
+      sessionId: 'session-2',
+      deviceKey: 'revoked-phone',
+    } as never);
+    mockDeviceTrust.isTrusted.mockResolvedValueOnce(false as never);
+
+    await service.refresh('refresh-token');
+
+    expect(
+      mockDeviceTrust.cancelRecoveriesForActiveDevice,
+    ).not.toHaveBeenCalled();
   });
 
   it('refresh rejects ADMIN accounts on the APP audience and revokes their sessions', async () => {

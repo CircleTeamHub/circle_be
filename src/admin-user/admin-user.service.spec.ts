@@ -27,7 +27,8 @@ describe('AdminUserService', () => {
     listForTarget: jest.fn(),
   };
   const tx = {
-    $executeRaw: jest.fn(),
+    $queryRaw: jest.fn(),
+    $executeRaw: jest.fn().mockResolvedValue(0),
     adminAccess: { count: jest.fn() },
     user: {
       findUnique: jest.fn(),

@@ -261,6 +261,7 @@ export const DYNAMIC_ROUTE_TEMPLATES = [
   '/api/v1/admin/users/:id/sensitive-access',
   '/api/v1/admin/users/:id/status',
   '/api/v1/auth/login-challenges/:challengeId/approve',
+  '/api/v1/auth/login-challenges/:challengeId/recovery',
   '/api/v1/auth/login-challenges/:challengeId/reject',
   '/api/v1/auth/login-challenges/:challengeId/resend',
   '/api/v1/auth/login-challenges/:challengeId/security-code',
