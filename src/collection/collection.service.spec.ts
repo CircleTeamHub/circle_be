@@ -235,9 +235,13 @@ describe('CollectionService', () => {
   });
 
   // 与转发口径一致：自己的内容重发一次效果完全一样，拦下来不保护任何人。
-  it('still collects your own message from a burn conversation', async () => {
+  it('still collects your own message with row-owned burn expiry', async () => {
     chat.requireVisibleMessage.mockResolvedValue(
-      visible({ senderID: 'user-1' }, { burnDurationSec: 60 }),
+      visible({
+        senderID: 'user-1',
+        burnDurationSec: 60,
+        burnExpiresAt: new Date('2026-09-08T08:01:00.000Z'),
+      }),
     );
 
     await service.create('user-1', messageCollection('msg-1'));

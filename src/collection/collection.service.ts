@@ -120,10 +120,7 @@ export class CollectionService {
       return this.invalidMessageSource();
     }
 
-    const { row } = await this.requireVisibleMessage(
-      userId,
-      rawMessageId,
-    );
+    const { row } = await this.requireVisibleMessage(userId, rawMessageId);
 
     const isEphemeral =
       (row.burnDurationSec ?? 0) > 0 || row.burnExpiresAt != null;
