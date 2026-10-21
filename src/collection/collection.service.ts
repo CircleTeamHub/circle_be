@@ -120,15 +120,13 @@ export class CollectionService {
       return this.invalidMessageSource();
     }
 
-    const { row, conversation } = await this.requireVisibleMessage(
+    const { row } = await this.requireVisibleMessage(
       userId,
       rawMessageId,
     );
 
     const isEphemeral =
-      (row.burnDurationSec ?? 0) > 0 ||
-      row.burnExpiresAt != null ||
-      Boolean(conversation.burnDurationSec);
+      (row.burnDurationSec ?? 0) > 0 || row.burnExpiresAt != null;
     if (row.senderID !== userId && isEphemeral) {
       throw new ForbiddenException({
         message: '阅后即焚会话中的消息不可收藏',
