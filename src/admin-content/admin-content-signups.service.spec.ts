@@ -20,8 +20,13 @@ describe('admin post signup visibility', () => {
     });
     prisma.circlePost.findMany.mockResolvedValue([
       { id: 'post', _count: { signups: 3 } },
+      { id: 'post-without-reports', _count: { signups: 1 } },
     ]);
-    prisma.circlePost.count.mockResolvedValue(1);
+    prisma.circlePost.count.mockResolvedValue(2);
+    prisma.circlePostReport.groupBy.mockResolvedValue([
+      { postID: 'post', _count: { _all: 4 } },
+    ]);
+    prisma.circlePostReport.count.mockResolvedValue(4);
     prisma.circlePostSignup.findMany.mockResolvedValue([
       {
         id: 'signup',
@@ -31,18 +36,49 @@ describe('admin post signup visibility', () => {
     ]);
     prisma.circlePostSignup.count.mockResolvedValue(21);
   });
-  it('uses actual signup rows for content-list and detail counts without querying reports', async () => {
+  it('returns signup and batched report counts for content-list posts', async () => {
     expect(await service.list({ page: 1, limit: 20 })).toMatchObject({
-      items: [{ id: 'post', signupCount: 3 }],
+      items: [
+        { id: 'post', signupCount: 3, reportCount: 4 },
+        {
+          id: 'post-without-reports',
+          signupCount: 1,
+          reportCount: 0,
+        },
+      ],
     });
+    expect(prisma.circlePostReport.groupBy).toHaveBeenCalledTimes(1);
+    expect(prisma.circlePostReport.groupBy).toHaveBeenCalledWith({
+      by: ['postID'],
+      where: {
+        postID: { in: ['post', 'post-without-reports'] },
+      },
+      _count: { _all: true },
+    });
+    expect(prisma.circlePost.findMany.mock.calls[0][0].select._count).toEqual({
+      select: { signups: true },
+    });
+  });
+
+  it('returns signup and report counts for post detail', async () => {
     expect(await service.detail('post')).toEqual({
       id: 'post',
       signupCount: 3,
+      reportCount: 4,
     });
-    expect(prisma.circlePostReport.groupBy).not.toHaveBeenCalled();
-    expect(prisma.circlePostReport.count).not.toHaveBeenCalled();
-    expect(prisma.circlePost.findMany.mock.calls[0][0].select._count).toEqual({
-      select: { signups: true },
+    expect(prisma.circlePostReport.count).toHaveBeenCalledTimes(1);
+    expect(prisma.circlePostReport.count).toHaveBeenCalledWith({
+      where: { postID: 'post' },
+    });
+  });
+
+  it('returns zero reports for post detail when no reports exist', async () => {
+    prisma.circlePostReport.count.mockResolvedValue(0);
+
+    await expect(service.detail('post')).resolves.toEqual({
+      id: 'post',
+      signupCount: 3,
+      reportCount: 0,
     });
   });
   it('scopes and stably paginates the roster while returning only public user summary fields', async () => {
