@@ -180,8 +180,8 @@ export class E2eeService {
     return this.db.$transaction(async (tx) => {
       // Serialize device actions per account before taking device locks.
       await tx.$queryRaw`SELECT "id" FROM "User" WHERE "id" = ${userID} FOR UPDATE`;
-      // Stable lock order also handles two devices revoking each other.
-      await tx.$queryRaw`SELECT "id" FROM "E2eeDevice" WHERE "id" IN (${targetId}, ${dto.actorDeviceId}) ORDER BY "id" FOR UPDATE`;
+      // Stable lock order also handles concurrent actions from active devices.
+      await tx.$queryRaw`SELECT "id" FROM "E2eeDevice" WHERE "userID" = ${userID} AND "purpose" = ${purpose} AND "status" = 'ACTIVE' ORDER BY "id" FOR UPDATE`;
       const actor = await this.actor(tx, userID, purpose, dto.actorDeviceId);
       if (purpose === 'AUDIT') {
         const access = await tx.adminAccess.findUnique({

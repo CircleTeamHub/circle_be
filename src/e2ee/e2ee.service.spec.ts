@@ -41,7 +41,7 @@ function fixture({
       },
     ]),
   );
-  const queryLog: string[] = [];
+  const queryLog: Array<{ sql: string; values: unknown[] }> = [];
   const userLockTails = new Map<string, Promise<void>>();
   const tx = {
     e2eeDevice: {
@@ -88,7 +88,7 @@ function fixture({
               )
               .replace(/\s+/g, ' ')
               .trim();
-            queryLog.push(sql);
+            queryLog.push({ sql, values });
             if (sql.includes('FROM "User"') && sql.endsWith('FOR UPDATE')) {
               const userID = String(values[0]);
               const predecessor =
@@ -139,10 +139,16 @@ it('rejects revoking the only active device without recovery', async () => {
     }),
   ).rejects.toThrow(BadRequestException);
 
-  expect(queryLog[0]).toContain('FROM "User"');
-  expect(queryLog[0]).toContain('FOR UPDATE');
-  expect(queryLog[1]).toContain('FROM "E2eeDevice"');
-  expect(queryLog[1]).toContain('ORDER BY "id" FOR UPDATE');
+  expect(queryLog.slice(0, 2)).toEqual([
+    {
+      sql: 'SELECT "id" FROM "User" WHERE "id" = ? FOR UPDATE',
+      values: ['user'],
+    },
+    {
+      sql: 'SELECT "id" FROM "E2eeDevice" WHERE "userID" = ? AND "purpose" = ? AND "status" = \'ACTIVE\' ORDER BY "id" FOR UPDATE',
+      values: ['user', 'APP'],
+    },
+  ]);
   expect(tx.e2eeDevice.count).toHaveBeenCalledWith({
     where: { userID: 'user', purpose: 'APP', status: 'ACTIVE' },
   });
