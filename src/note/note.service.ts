@@ -2578,9 +2578,9 @@ export class NoteService {
 
   /**
    * A collected copy is a local editing surface, but its availability badge
-   * must follow the boss's source note. Resolve the short collect chain in one
-   * bounded set of queries so an intermediary cannot keep showing an old
-   * WORKING snapshot after the source was closed or unlisted.
+   * must follow the boss's source note. Resolve the canonical root directly;
+   * the bounded chain walk only supports legacy rows without a root key and
+   * fails closed if it cannot reach a source.
    */
   private async overlayCollectedSourceState(
     notes: NoteRow[],
@@ -2588,7 +2588,7 @@ export class NoteService {
     const initialIDs = [
       ...new Set(
         notes
-          .map((note) => note.collectedFromNoteID)
+          .map((note) => note.rootSourceNoteID ?? note.collectedFromNoteID)
           .filter(
             (id): id is string => typeof id === 'string' && id.length > 0,
           ),
@@ -2602,6 +2602,7 @@ export class NoteService {
       available: boolean;
       workStatus: NoteWorkStatus | null;
       collectedFromNoteID: string | null;
+      rootSourceNoteID: string | null;
     };
     const states = new Map<string, SourceState>();
     const queried = new Set<string>();
@@ -2619,10 +2620,11 @@ export class NoteService {
             available: true,
             workStatus: true,
             collectedFromNoteID: true,
+            rootSourceNoteID: true,
           },
         })) ?? [];
       frontier = rows
-        .map((row) => row.collectedFromNoteID)
+        .map((row) => row.rootSourceNoteID ?? row.collectedFromNoteID)
         .filter(
           (id): id is string => typeof id === 'string' && !queried.has(id),
         );
@@ -2633,25 +2635,30 @@ export class NoteService {
     // 但 collectedFromNoteID 是普通列、仍指着它。查过却查不到的来源只能是被硬删了，
     // 按 DELETED 处理：不能因为「找不到父级」就退回副本自己的 ACTIVE 状态，
     // 让第三方在原笔记删除后还能读、分享、导出、再收藏副本。
-    // 只认「查过」的 id：超出 8 层深度没查到的不算删除。
     const purgedSource = (id: string): SourceState => ({
       id,
       status: 'DELETED',
       available: false,
       workStatus: null,
       collectedFromNoteID: null,
+      rootSourceNoteID: null,
     });
     const rootState = (id: string): SourceState | null => {
       let current = states.get(id) ?? null;
       if (!current) return queried.has(id) ? purgedSource(id) : null;
       const seen = new Set<string>();
-      while (current.collectedFromNoteID && !seen.has(current.id)) {
+      while (
+        (current.rootSourceNoteID ?? current.collectedFromNoteID) &&
+        !seen.has(current.id)
+      ) {
+        const parentID =
+          current.rootSourceNoteID ?? current.collectedFromNoteID!;
         seen.add(current.id);
-        const parent = states.get(current.collectedFromNoteID);
+        const parent = states.get(parentID);
         if (!parent) {
-          return queried.has(current.collectedFromNoteID)
-            ? purgedSource(current.collectedFromNoteID)
-            : current;
+          // A missing parent is either hard-deleted or beyond the bounded
+          // legacy walk. Neither may fall back to a local ACTIVE snapshot.
+          return purgedSource(parentID);
         }
         current = parent;
       }
@@ -2660,7 +2667,9 @@ export class NoteService {
 
     return notes.map((note) => {
       if (!note.collectedFromNoteID) return note;
-      const source = rootState(note.collectedFromNoteID);
+      const source = rootState(
+        note.rootSourceNoteID ?? note.collectedFromNoteID,
+      );
       return source
         ? {
             ...note,

@@ -4471,6 +4471,49 @@ describe('NoteService', () => {
       ).rejects.toBeInstanceOf(NotFoundException);
     });
 
+    it.each([
+      ['canonical root id', 'boss-note'],
+      ['legacy null root id', null],
+    ])(
+      'blocks a copy deeper than the traversal cap with %s',
+      async (_label, rootSourceNoteID) => {
+        prisma.note.findFirst.mockResolvedValueOnce({
+          ...relayCopy,
+          id: 'deep-copy',
+          collectedFromNoteID: 'relay-9',
+          rootSourceNoteID,
+        });
+        prisma.note.findMany.mockImplementation(async (args: any) => {
+          const requestedID = args.where.id.in[0];
+          if (requestedID === 'boss-note') {
+            return [rootState({ status: 'UNLISTED' })];
+          }
+          const relay = /^relay-(\d+)$/.exec(requestedID);
+          if (!relay) return [];
+          const level = Number(relay[1]);
+          return [
+            {
+              id: requestedID,
+              status: 'ACTIVE',
+              available: true,
+              workStatus: null,
+              collectedFromNoteID:
+                level === 1 ? 'boss-note' : `relay-${level - 1}`,
+            },
+          ];
+        });
+
+        await expect(
+          service.getNote('user-1', 'deep-copy'),
+        ).rejects.toBeInstanceOf(NotFoundException);
+        if (rootSourceNoteID) {
+          expect(prisma.note.findMany).toHaveBeenCalledWith(
+            expect.objectContaining({ where: { id: { in: ['boss-note'] } } }),
+          );
+        }
+      },
+    );
+
     it('getNote keeps the copy readable for its own owner with the source state overlaid', async () => {
       prisma.note.findFirst.mockResolvedValueOnce(relayCopy);
       prisma.note.findMany.mockResolvedValue([
