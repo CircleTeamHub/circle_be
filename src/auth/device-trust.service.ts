@@ -10,7 +10,7 @@ import {
 } from '@nestjs/common';
 import { createHash, randomInt } from 'crypto';
 import * as argon2 from 'argon2';
-import { LoginChallengeStatus } from 'src/generated/prisma';
+import { LoginChallengeStatus, Prisma } from 'src/generated/prisma';
 import { PrismaService } from 'src/prisma/prisma.service';
 import { AuthErrorCode } from 'src/common/app-error-codes';
 import { RealtimeService } from 'src/realtime/realtime.service';
@@ -550,22 +550,34 @@ export class DeviceTrustService {
     approverDeviceKey: string | null,
     challengeId: string,
   ): Promise<void> {
-    await this.assertTrustedApprover(userId, approverDeviceKey);
-    const updated = await this.prisma.loginChallenge.updateMany({
-      where: {
-        id: challengeId,
-        userId,
-        status: {
-          in: [LoginChallengeStatus.PENDING, LoginChallengeStatus.APPROVED],
+    const accountLockKey = `auth_session:${userId}`;
+    const updated = await withDatabaseWorkBudget(this.prisma, () =>
+      this.prisma.$transaction(
+        async (tx) => {
+          await tx.$executeRaw`SELECT pg_advisory_xact_lock(hashtextextended(${accountLockKey}, 0))`;
+          await this.assertTrustedApprover(userId, approverDeviceKey, tx);
+          return tx.loginChallenge.updateMany({
+            where: {
+              id: challengeId,
+              userId,
+              status: {
+                in: [
+                  LoginChallengeStatus.PENDING,
+                  LoginChallengeStatus.APPROVED,
+                ],
+              },
+            },
+            data: {
+              status: LoginChallengeStatus.REJECTED,
+              codeHash: null,
+              codeExpiresAt: null,
+              decidedAt: new Date(),
+            },
+          });
         },
-      },
-      data: {
-        status: LoginChallengeStatus.REJECTED,
-        codeHash: null,
-        codeExpiresAt: null,
-        decidedAt: new Date(),
-      },
-    });
+        { maxWait: 10000, timeout: 30000 },
+      ),
+    );
     // 已被别的设备处理掉 / 已过期都按成功返回：结果一样是「这次登录进不来」。
     if (updated.count === 1) {
       this.logSecurity('login_challenge_rejected', userId, { challengeId });
@@ -877,9 +889,13 @@ export class DeviceTrustService {
     });
   }
 
-  async isTrusted(userId: string, deviceKey: string | null): Promise<boolean> {
+  async isTrusted(
+    userId: string,
+    deviceKey: string | null,
+    client: Pick<Prisma.TransactionClient, 'trustedDevice'> = this.prisma,
+  ): Promise<boolean> {
     if (!deviceKey) return false;
-    const row = await this.prisma.trustedDevice.findUnique({
+    const row = await client.trustedDevice.findUnique({
       where: { userId_deviceKey: { userId, deviceKey } },
       select: { revokedAt: true },
     });
@@ -1188,8 +1204,9 @@ export class DeviceTrustService {
   private async assertTrustedApprover(
     userId: string,
     approverDeviceKey: string | null,
+    client: Pick<Prisma.TransactionClient, 'trustedDevice'> = this.prisma,
   ): Promise<void> {
-    if (!(await this.isTrusted(userId, approverDeviceKey))) {
+    if (!(await this.isTrusted(userId, approverDeviceKey, client))) {
       throw new ForbiddenException({
         message: '当前设备不是受信任设备，无法处理登录请求',
         errorCode: AuthErrorCode.DeviceNotTrusted,
