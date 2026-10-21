@@ -39,6 +39,7 @@ function fakePrisma(
     ),
     notificationPushOutbox: delegate(overrides.notificationPushOutbox ?? empty),
     friendChatReplayOutbox: delegate(overrides.friendChatReplayOutbox ?? empty),
+    noteStatusFanoutOutbox: delegate(overrides.noteStatusFanoutOutbox ?? empty),
     coinGift: delegate(overrides.coinGift ?? empty),
     circleInvitationVerifier: delegate(
       overrides.circleInvitationVerifier ?? empty,
@@ -114,6 +115,26 @@ describe('collectOutboxDepths', () => {
     const replay = samples.find((s) => s.queue === 'friend_chat_replay');
     expect(replay?.pending).toBe(3);
     expect(replay?.dead).toBe(0);
+  });
+
+  it('tracks note fan-out backlog age from the latest queued mutation', async () => {
+    const prisma = fakePrisma({
+      noteStatusFanoutOutbox: { count: 2, oldest: TEN_MINUTES_AGO },
+    });
+
+    const samples = await collectOutboxDepths(prisma, NOW);
+
+    expect(
+      samples.find((sample) => sample.queue === 'note_status_fanout'),
+    ).toEqual({
+      queue: 'note_status_fanout',
+      pending: 2,
+      oldestAgeSeconds: 600,
+      dead: 0,
+    });
+    expect(prisma.noteStatusFanoutOutbox.aggregate).toHaveBeenCalledWith(
+      expect.objectContaining({ _min: { queuedAt: true } }),
+    );
   });
 
   it('lets one failing queue not blank out the others', async () => {
@@ -211,6 +232,7 @@ describe('collectOutboxDepths', () => {
       sessionRevocationOutbox: delegate(),
       notificationPushOutbox: delegate(),
       friendChatReplayOutbox: delegate(),
+      noteStatusFanoutOutbox: delegate(),
       coinGift: delegate(),
       circleInvitationVerifier: delegate(),
       chatDirectAutoReplyJob: delegate(),

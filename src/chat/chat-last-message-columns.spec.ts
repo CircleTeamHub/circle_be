@@ -13,8 +13,8 @@ import { Prisma } from 'src/generated/prisma';
  * SQL 里选上,要么在下面显式说明为什么不选。
  */
 describe('loadLastMessages raw SELECT', () => {
-  /** 刻意不选的列:contentHistory 是编辑前的原文,列表末条不该把它拖出来。 */
-  const NOT_SELECTED = new Set(['contentHistory']);
+  /** 刻意不选的列：编辑留痕和内部来源索引都不属于消息列表响应。 */
+  const NOT_SELECTED = new Set(['contentHistory', 'sourceNoteID']);
   const byName = (a: string, b: string): number => a.localeCompare(b);
 
   function selectedColumns(): string[] {

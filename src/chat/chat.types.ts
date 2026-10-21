@@ -13,7 +13,7 @@ import type { TEMP_CHAT_GUEST_TOKEN_KIND } from './chat.constants';
  * 查看者的座位(clearedBeforeHeight 已取座位/会话两侧的严者)。
  */
 export interface VisibleChatMessage {
-  row: Omit<ChatMessage, 'contentHistory'>;
+  row: Omit<ChatMessage, 'contentHistory' | 'sourceNoteID'>;
   conversation: ChatConversation;
   member: ChatMember;
 }
