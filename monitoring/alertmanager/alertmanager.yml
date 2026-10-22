@@ -79,6 +79,14 @@ inhibit_rules:
       - alertname = "TlsCertificateExpiringSoon"
     equal: ['instance']
 
+  # 同一块盘剩不到 5% 时只留 critical。理由同上：主机上不止一个挂载点，只比
+  # 告警名的话，一块盘的 critical 会静音另一块盘的 warning。
+  - source_matchers:
+      - alertname = "HostDiskNearlyFull"
+    target_matchers:
+      - alertname = "HostDiskFilling"
+    equal: ['instance', 'mountpoint']
+
   # 数据库挂了 → 所有依赖它的任务/队列都会积压，别再各报一遍。
   #
   # OutboxProbeStale 也在内：探测本身就是读 Postgres，库一挂**五个队列**的

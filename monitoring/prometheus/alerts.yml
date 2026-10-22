@@ -33,6 +33,29 @@ groups:
         annotations:
           summary: 'Backend event-loop lag p99 > 250ms for 5m (process is blocking)'
 
+      # 漏掉 .catch 的 promise 被进程级兜底接住（src/logging/unhandled-rejection-guard.ts），
+      # 进程不死，5xx / TargetDown 都看不到它。错误聚合默认关闭，那时这是唯一的叫醒
+      # 机制；具体是哪一处，看同一时刻日志里的 `[unhandledRejection]` 行。
+      #
+      # increase 而不是存量 > 0：计数器只增不减，按存量会在第一条之后永久 firing。
+      # 15 分钟内没有新增就自动消警。sum：蓝绿期间两个颜色各数各的。
+      #
+      # 第二段补 increase() 的盲点：它不把新序列的第一个样本当作从 0 起，新进程在
+      # 第一次被抓取之前就漏出的那条会被吃掉 —— 而启动阶段 Redis / DB 还没就绪，
+      # 恰恰最容易漏 .catch。15 分钟前还不存在的序列，现值本身就是新增。
+      - alert: UnhandledRejectionsOccurring
+        expr: |
+          sum(increase(circle_unhandled_rejections_total{job="circle-be"}[15m])) > 0
+            or
+          sum(
+            circle_unhandled_rejections_total{job="circle-be"}
+              unless circle_unhandled_rejections_total{job="circle-be"} offset 15m
+          ) > 0
+        labels:
+          severity: warning
+        annotations:
+          summary: 'Backend caught unhandled promise rejection(s) in the last 15m — a missing .catch; see [unhandledRejection] log lines'
+
       - alert: TargetDown
         expr: up == 0
         for: 2m
@@ -240,6 +263,71 @@ groups:
         annotations:
           summary: 'A settled coin gift permanently lost its transfer card — manual reconciliation required'
 
+  # 备份自检（deploy/backup/check.sh，每小时第 17 分钟）。结果由 check.sh 写成
+  # textfile，备份 overlay 里的 backup-metrics 导出（prometheus.prod.yml 的
+  # backup job）。在此之前它只写容器 stdout：备份坏了没有任何人会知道，直到
+  # 需要恢复的那一天。
+  - name: backups
+    rules:
+      # 每项检查一条（postgres_archive / backup_freshness / destination_bucket /
+      # minio_source），告警里直接看得出坏的是哪一环。
+      #
+      # 连续两次失败才报（70 分钟内全是 0）：gauge 一整小时保持上一次的结果，for
+      # 去不了抖，整点碰上一次离机 S3 抖动就会发一小时的 critical。代价是真故障晚
+      # 一小时多才叫；部署后第一次检查就失败时窗口里只有 0，5 分钟就响。修好后
+      # 下一次检查一通过就消警，急的话手动跑一次
+      # `docker compose ... run --rm backup run check`（它写的是同一个卷）。
+      #
+      # critical：WAL 归档停了 RPO 就在无限增长，归档失败时 pg_wal 还会一直堆到
+      # 撑满磁盘。
+      - alert: BackupCheckFailing
+        expr: max_over_time(circle_backup_check_success[70m]) == 0
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: 'Backup self-check {{ $labels.check }} is failing — see `docker compose logs backup`'
+
+      # 检查本身停了：调度器挂了，或 check.sh 在写指标之前就退出（比如缺环境变量）。
+      # textfile 还在，时间戳不再前进。3 小时 = 至少漏了两次。同一个容器还负责
+      # 每天的全量/差异备份和对象镜像，所以这也意味着它们大概率没在跑。
+      - alert: BackupCheckStale
+        expr: time() - circle_backup_check_last_run_timestamp_seconds > 3 * 3600
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: 'Backup self-check has not completed for 3h+ — the backup scheduler may be down'
+
+      # 生产上根本没有备份结果：备份 overlay 没叠上（docs/backups.md「Turning it
+      # on」），或者 check.sh 从没成功写出过指标。只在有 postgres-exporter 的环境里
+      # 判断 —— 那个 job 只存在于生产 overlay，开发机上这条不会响。
+      # for 2h：首次部署后，第一次检查最晚一小时后才跑。
+      - alert: BackupCheckNotReporting
+        expr: |
+          absent(circle_backup_check_last_run_timestamp_seconds)
+            and on() (up{job="postgres-exporter"} == 1)
+        for: 2h
+        labels:
+          severity: warning
+        annotations:
+          summary: 'No backup self-check results in production — backups are not deployed, or check.sh cannot write its metrics'
+
+      # 仓库里一份完成的备份都没有：check.sh 对此只警告、不导出 backup_freshness
+      # （刚启用时第一份还没跑，不算失败）。可要是全量从第一天起就一直失败（OOM、
+      # 超时），而 WAL 归档和桶都正常，上面三条都不会响 —— 只有 WAL、没有基础备份，
+      # 照样恢复不出来。差异备份每天都跑，没有全量时 pgBackRest 会把它升级成全量，
+      # 所以检查一直在正常完成、却 30 小时都拿不到 freshness 结果，就是这种情况。
+      - alert: BackupNeverCompleted
+        expr: |
+          absent(circle_backup_check_success{check="backup_freshness"})
+            and on() (time() - circle_backup_check_last_run_timestamp_seconds < 3 * 3600)
+        for: 30h
+        labels:
+          severity: warning
+        annotations:
+          summary: 'Backup checks run, but the repository still has no completed backup after 30h — the base backup job is failing'
+
   # 监控自身的存活证明。
   - name: meta
     rules:
@@ -408,6 +496,25 @@ groups:
         annotations:
           summary: 'Container {{ $labels.name }} is at >90% of its memory limit'
 
+      # 崩溃循环：restart: unless-stopped 会把挂掉的容器一遍遍拉起来，每次都短暂
+      # 存活，按抓取时刻看的 up / 健康检查常常是绿的。被 OOM killer 反复杀掉也一样。
+      #
+      # 不能用 changes(container_start_time_seconds)：cAdvisor 导出的是 docker inspect
+      # 的 Created（创建时间），同一个容器重启时不变。能用的是 cAdvisor 给重启过的
+      # 容器打的 restartcount 标签（container_label_restartcount，见 v0.52.1 的
+      # container/docker/handler.go）：每重启一次就换一条新序列。所以数 15 分钟里
+      # 同一个名字出现过几条序列，减 1 就是重启次数。发版重建容器只多一条，手工
+      # docker restart 一两次也不到阈值。
+      #
+      # 盲区：存活不到一个抓取间隔（15s）的那几次抓不到 —— 启动即崩的服务主要靠
+      # 各自的 Down / NoTarget / PublicEndpointDown 兜。
+      - alert: ContainerRestartLoop
+        expr: count by (name) (count_over_time(container_start_time_seconds{name!=""}[15m])) - 1 >= 3
+        labels:
+          severity: warning
+        annotations:
+          summary: 'Container {{ $labels.name }} restarted about {{ $value }} times in 15m (crash loop or OOM kills?)'
+
       # Containers without a configured limit do not trigger the rule above;
       # use host CPU as a fallback for runaway workloads.
       - alert: HostCpuSaturated
@@ -435,6 +542,21 @@ groups:
           severity: warning
         annotations:
           summary: 'Filesystem {{ $labels.mountpoint }} below 15% free'
+
+      # 剩 5% 时只差一次日志风暴或一次大迁移：Postgres 写不进 WAL 会直接停库，
+      # winston 的日志轮转也没有总量上限。选择器与上面那条完全相同。
+      # 两档用不同的告警名（文件末尾那条通用的同名抑制管不到），同一块盘的
+      # warning 由 alertmanager.yml 里按 instance + mountpoint 配对的抑制压掉。
+      - alert: HostDiskNearlyFull
+        expr: |
+          node_filesystem_avail_bytes{fstype=~"ext4|xfs|btrfs|zfs|ext3", mountpoint!~"/(boot|snap)(/.*)?"}
+            / node_filesystem_size_bytes{fstype=~"ext4|xfs|btrfs|zfs|ext3", mountpoint!~"/(boot|snap)(/.*)?"} < 0.05
+          and on(instance, mountpoint) node_filesystem_readonly == 0
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: 'Filesystem {{ $labels.mountpoint }} below 5% free — database and log writes are about to fail'
 
   # 数据库与缓存。指标名与标签均已对着 postgres-exporter v0.19.0 /
   # redis_exporter v1.83.0 的真实输出核对过。

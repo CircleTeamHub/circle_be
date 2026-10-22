@@ -37,6 +37,7 @@ import { redisMetrics } from './redis/redis.metrics';
 import { uploadMetrics } from './metrics/upload-metrics';
 import { chatMetrics } from './chat/chat-metrics';
 import { gatewayMetrics } from './metrics/gateway-metrics';
+import { processMetrics } from './metrics/process-metrics';
 import { installUnhandledRejectionGuard } from './logging/unhandled-rejection-guard';
 
 /** Strict limit for sensitive auth endpoints: 10 requests / 15 min per IP. */
@@ -421,6 +422,7 @@ export const setupApp = (app: INestApplication): ErrorAggregationProvider => {
         gatewayMetrics.registry,
         jobMetrics.registry,
         dbPoolMetrics.registry,
+        processMetrics.registry,
       ]),
       { authToken: metricsAuthToken },
     ),

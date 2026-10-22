@@ -59,6 +59,7 @@ jobs:
           bash test/gen-env-existing.spec.sh
           bash test/release-force-command.spec.sh
           bash test/sync-metrics-token.spec.sh
+          bash test/backup-check-metrics.spec.sh
           node --test test/prometheus-alerts.spec.mjs
           node --test test/monitoring-operations-dashboard.spec.mjs
 

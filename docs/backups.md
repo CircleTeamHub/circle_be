@@ -298,6 +298,23 @@ knowing exactly what a passing check proves.
 | Destination reachability | `mc ls` on the destination bucket | rotated/revoked `BACKUP_S3_*` |
 | **Source MinIO readability** | `mc ls` on the source bucket | rotated `BACKUP_MINIO_*`, which breaks every mirror run |
 
+**How a failure reaches someone.** Every run also writes its per-check results
+to a Prometheus textfile (`/var/lib/circle-backup/metrics/backup_check.prom`, on
+the `backup_metrics` volume). The overlay's `backup-metrics` service (a
+textfile-only node-exporter) exports it, and the production Prometheus finds it
+by name (`backup` job in `monitoring/prometheus/prometheus.prod.yml`) — nothing
+to configure on the monitoring side. Three alerts read it:
+
+| Alert | Fires when |
+|---|---|
+| `BackupCheckFailing` (critical) | a row above failed on two consecutive runs (or on the very first run after deployment); the `check` label says which. A single transient failure does not page |
+| `BackupCheckStale` (warning) | no check has completed for 3h — the scheduler is down, or `check.sh` exits before the end (e.g. missing env) |
+| `BackupCheckNotReporting` (warning) | production (postgres-exporter is up) has no backup results at all for 2h — the overlay is not deployed, or `check.sh` cannot write the textfile |
+| `BackupNeverCompleted` (warning) | checks keep running, but the repository has had no completed backup for 30h — the base backup job fails every night while WAL archiving still works, so nothing is actually restorable |
+
+A failing check keeps its gauge at 0 until the next hourly run. After fixing the
+cause, `docker compose ... run --rm backup run check` refreshes it immediately.
+
 **Not checked, by design:** object-mirror freshness. The mirror only creates
 objects when users upload, so "nothing new this hour" is indistinguishable from
 a broken mirror. The source-credential probe above is the closest proxy; the

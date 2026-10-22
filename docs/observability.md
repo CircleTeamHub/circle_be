@@ -31,6 +31,7 @@
 | pg 连接池           | 指标       | 排队等连接数、已建立/空闲/上限              | ✅（应用内，见下）        |
 | **redis-exporter**  | 指标       | 存活、内存占用、客户端数、被拒连接          | ✅（仅生产 overlay）      |
 | **blackbox-exporter** | 可达性   | 按用户的路径探测公网入口（DNS/TLS/Caddy/`/healthz`）、证书剩余天数 | ✅（仅生产 overlay）      |
+| backup-metrics      | 指标       | 备份每小时自检的逐项结果、最近一次完成时间 | ✅（仅备份 overlay，见 docs/backups.md） |
 | **外部心跳**        | 元监控     | 监控栈自身是否还活着                        | ✅ Watchdog → 外部服务    |
 | **PostHog** 等      | 业务分析   | 用户行为、漏斗、留存、转化                  | ❌ 未做                   |
 
@@ -105,8 +106,9 @@ pg 连接池排队、Postgres 连接与状态、Redis 内存与被拒连接）�
 
 ### 7. Alertmanager —— 告警路由（不产数据）
 
-Prometheus 规则越界 → 发给它 → 去重 / 聚合 / 静默 / 路由。当前规则文件有 40 条规则，覆盖
-接口 RED、聊天容量、主机与容器、定时任务与 outbox、连接池与数据存储、公网探测、监控组件自身故障。
+Prometheus 规则越界 → 发给它 → 去重 / 聚合 / 静默 / 路由。当前规则文件有 53 条规则，覆盖
+接口 RED、漏网的 promise rejection、聊天容量、主机与容器（含磁盘两档、崩溃循环）、定时任务与 outbox、
+备份自检、连接池与数据存储、公网探测、监控组件自身故障。
 
 出口按 severity 分级：`critical` → Discord（10s 聚合 / 1h 重提），`warning` → Discord
 （30s / 4h），`Watchdog` → **外部**心跳服务。另有抑制规则，避免一次故障被报成

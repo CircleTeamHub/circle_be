@@ -100,6 +100,197 @@ describe('installUnhandledRejectionGuard', () => {
     expect(() => emitRejection(new Error('boom'))).not.toThrow();
   });
 
+  // 错误聚合默认关闭（LOG_AGGREGATION_PROVIDER=none），那时上报是 no-op：
+  // 只靠上报的话，生产上一条漏网的 rejection 不留任何痕迹。日志与计数器
+  // 不依赖 Sentry，是这条路径上唯一保底的信号。
+  describe('上报关闭或失败时仍留下日志与计数', () => {
+    function rejectionAtOneSite(): Error {
+      return new Error('private prose');
+    }
+
+    function errorAt(site: number): Error {
+      const error = new Error('private prose');
+      error.stack = `Error: private prose\n    at fn (/app/dist/site${site}.js:${site}:1)`;
+      return error;
+    }
+
+    // 断言失败时也必须还原：外层 beforeEach 的 resetAllMocks 只清实现、不还原，
+    // 漏还原的 Date.now 会返回 undefined，把后面的用例一起带坏。
+    let clock: jest.SpyInstance<number, []> | undefined;
+    afterEach(() => {
+      clock?.mockRestore();
+      clock = undefined;
+    });
+    function freezeClockAt(ms: number): jest.SpyInstance<number, []> {
+      clock = jest.spyOn(Date, 'now').mockReturnValue(ms);
+      return clock;
+    }
+
+    it('每次 rejection 都计数，并写一行不含错误正文的日志', () => {
+      const logRejection = jest.fn();
+      const countRejection = jest.fn();
+      uninstall = installUnhandledRejectionGuard({
+        logRejection,
+        countRejection,
+      });
+
+      emitRejection(rejectionAtOneSite());
+
+      expect(countRejection).toHaveBeenCalledTimes(1);
+      expect(logRejection).toHaveBeenCalledTimes(1);
+      expect(logRejection).toHaveBeenCalledWith(
+        expect.stringMatching(
+          /^\[unhandledRejection\] errorName=Error source=at .*:\d+:\d+; suppressedSinceLast=0; continuing\.$/,
+        ),
+      );
+      expect(JSON.stringify(logRejection.mock.calls)).not.toContain(
+        'private prose',
+      );
+    });
+
+    it('上报抛错时照样计数和写日志', () => {
+      reportMock.mockImplementation(() => {
+        throw new Error('reporter exploded');
+      });
+      const logRejection = jest.fn();
+      const countRejection = jest.fn();
+      uninstall = installUnhandledRejectionGuard({
+        logRejection,
+        countRejection,
+      });
+
+      expect(() => emitRejection(rejectionAtOneSite())).not.toThrow();
+      expect(countRejection).toHaveBeenCalledTimes(1);
+      expect(logRejection).toHaveBeenCalledTimes(1);
+    });
+
+    it('计数或日志本身抛错也不能变成新的崩溃源，且互不影响', () => {
+      const logRejection = jest.fn(() => {
+        throw new Error('stderr gone');
+      });
+      const countRejection = jest.fn(() => {
+        throw new Error('registry gone');
+      });
+      uninstall = installUnhandledRejectionGuard({
+        logRejection,
+        countRejection,
+      });
+
+      expect(() => emitRejection(rejectionAtOneSite())).not.toThrow();
+      expect(logRejection).toHaveBeenCalledTimes(1);
+      expect(reportMock).toHaveBeenCalledTimes(1);
+    });
+
+    it('非 Error 的 rejection 只记类型，不记取值', () => {
+      const logRejection = jest.fn();
+      uninstall = installUnhandledRejectionGuard({
+        logRejection,
+        countRejection: jest.fn(),
+      });
+
+      emitRejection('token=super-secret');
+
+      expect(logRejection).toHaveBeenCalledWith(
+        '[unhandledRejection] errorName=Unknown; suppressedSinceLast=0; continuing.',
+      );
+    });
+
+    it('同一处的 rejection 风暴：全部计数，但每个位置每分钟只写一行', () => {
+      const now = freezeClockAt(1_000_000);
+      const logRejection = jest.fn();
+      const countRejection = jest.fn();
+      uninstall = installUnhandledRejectionGuard({
+        logRejection,
+        countRejection,
+      });
+
+      for (let i = 0; i < 5; i++) emitRejection(errorAt(7));
+      expect(countRejection).toHaveBeenCalledTimes(5);
+      expect(logRejection).toHaveBeenCalledTimes(1);
+
+      now.mockReturnValue(1_000_000 + 60_000);
+      emitRejection(errorAt(7));
+      expect(logRejection).toHaveBeenCalledTimes(2);
+      expect(logRejection.mock.calls[1][0]).toContain('suppressedSinceLast=4');
+    });
+
+    it('不同位置各自记一行；位置种类有上限，超出的并进同一个溢出桶', () => {
+      const logRejection = jest.fn();
+      uninstall = installUnhandledRejectionGuard({
+        logRejection,
+        countRejection: jest.fn(),
+      });
+
+      for (let site = 1; site <= 150; site++) emitRejection(errorAt(site));
+
+      // 100 个不同位置各一行，其余 50 个只为溢出桶写第一行。
+      expect(logRejection).toHaveBeenCalledTimes(101);
+      expect(logRejection.mock.calls[0][0]).toContain('source=at site1.js:1:1');
+      expect(logRejection.mock.calls[100][0]).toContain(
+        'source=other (signature limit reached)',
+      );
+    });
+
+    it('表满时先腾出窗口外的旧位置，长寿进程里的新位置不会永远落进溢出桶', () => {
+      const now = freezeClockAt(1_000_000);
+      const logRejection = jest.fn();
+      uninstall = installUnhandledRejectionGuard({
+        logRejection,
+        countRejection: jest.fn(),
+      });
+
+      for (let site = 1; site <= 100; site++) emitRejection(errorAt(site));
+      now.mockReturnValue(1_000_000 + 60_000);
+      emitRejection(errorAt(101));
+
+      expect(logRejection).toHaveBeenCalledTimes(101);
+      expect(logRejection.mock.calls[100][0]).toContain(
+        'source=at site101.js:101:1',
+      );
+    });
+
+    it('库代码里的同一帧被不同业务调用点触发时，按调用链区分并记下调用方', () => {
+      // Prisma / ioredis 的 rejection 第一帧在 node_modules 里，只看第一帧的话
+      // 所有调用点共用一个签名、一分钟只剩一行，也定位不到漏 .catch 的地方。
+      const fromCaller = (caller: string): Error => {
+        const error = new Error('private prose');
+        error.stack =
+          'Error: private prose\n' +
+          '    at Object.request (/app/node_modules/@prisma/client/runtime/library.js:121:7315)\n' +
+          `    at async ${caller}`;
+        return error;
+      };
+      const logRejection = jest.fn();
+      uninstall = installUnhandledRejectionGuard({
+        logRejection,
+        countRejection: jest.fn(),
+      });
+
+      emitRejection(
+        fromCaller('NoteService.save (/app/dist/note.service.js:40:5)'),
+      );
+      emitRejection(
+        fromCaller('ChatService.send (/app/dist/chat.service.js:88:3)'),
+      );
+
+      expect(logRejection).toHaveBeenCalledTimes(2);
+      expect(logRejection.mock.calls[0][0]).toContain(
+        'source=at library.js:121:7315 <- at note.service.js:40:5;',
+      );
+      expect(logRejection.mock.calls[1][0]).toContain('chat.service.js:88:3');
+    });
+
+    it('重新安装会重置去重状态', () => {
+      const logRejection = jest.fn();
+      const sinks = { logRejection, countRejection: jest.fn() };
+      installUnhandledRejectionGuard(sinks)();
+      uninstall = installUnhandledRejectionGuard(sinks);
+
+      emitRejection(rejectionAtOneSite());
+      expect(logRejection).toHaveBeenCalledTimes(1);
+    });
+  });
+
   it('captures an uncaught exception once, safely diagnoses, flushes, and exits nonzero', async () => {
     const logError = jest.fn();
     const exit = jest.fn();
