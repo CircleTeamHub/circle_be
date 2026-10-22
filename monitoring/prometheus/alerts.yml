@@ -142,10 +142,11 @@ groups:
 
   # 定时任务与 outbox 队列 —— 「什么都没发生」这一类故障。
   #
-  # 这一组补的是此前完全无信号的盲区：Sentry 的 captureError 只在
-  # ErrorLoggingInterceptor 里被调用，即只覆盖 HTTP 5xx；而 4 个 outbox 处理器
-  # 都自己 catch 异常、写进行上的 lastError 然后继续，异常永远不逃出去。队列
-  # 堵死时 RED 大盘一切正常、Sentry 一片安静。
+  # 这一组补的是错误监控天然看不见的盲区：outbox 处理器都自己 catch 异常、写进
+  # 行上的 lastError 然后继续，异常永远不逃出去；调度器停了更是什么都不发生。
+  # 错误聚合默认关闭，就算打开也只收到显式上报的那几处。队列堵死时 RED 大盘
+  # 一切正常、Sentry 一片安静。覆盖 @TrackedCron 与 @TrackedInterval 的全部任务、
+  # OUTBOX_QUEUES 的全部队列。
   - name: jobs
     rules:
       # 阈值不写死：每分钟任务和每天 4 点的任务共用这一条规则，各自的预期周期
@@ -155,10 +156,14 @@ groups:
       # max by (exported_job)：蓝绿发布期间两个颜色同时在跑，只要有一个实例把活干了就
       # 不该响。心跳在进程启动时就播种（不是等第一次成功），所以新容器不会
       # 立刻误报，一个从开机起就没跑过的任务也不会因为序列不存在而逃过告警。
+      #
+      # 阈值下限 120 秒：@TrackedInterval 的任务 5～10 秒一跑，3 × 周期只有 15～30
+      # 秒，而抓取和求值都是 15 秒一次 —— 正常运转时求值看到的心跳也会滞后十几
+      # 秒，没有下限就会周期性地连响几小时。现有定时任务最短 1 分钟，不受影响。
       - alert: CronJobStalled
         expr: |
           time() - max by (exported_job) (circle_cron_last_success_timestamp_seconds)
-            > 3 * max by (exported_job) (circle_cron_interval_seconds)
+            > clamp_min(3 * max by (exported_job) (circle_cron_interval_seconds), 120)
         for: 5m
         labels:
           severity: warning
@@ -327,6 +332,43 @@ groups:
           severity: warning
         annotations:
           summary: 'Backup checks run, but the repository still has no completed backup after 30h — the base backup job is failing'
+
+  # 外部投递通道（src/metrics/delivery-metrics.ts）。两条通道失败时业务代码只写
+  # external_call_failed 日志：推送凭证过期、JPush 没配 key、SMTP 被限流时，此前
+  # 指标和告警一片安静。两条都带最小样本量，低流量时一两次失败不叫人。
+  - name: deliveries
+    rules:
+      # 按 provider 分开算：Expo 和 JPush 的凭证、配额、故障互不相干。分子只算
+      # retryable / rejected；dead_token（卸载 App、注册 ID 失效）是正常流失，
+      # 算进去的话一批老设备就能把失败率拉过阈值。
+      - alert: PushDeliveryFailing
+        expr: |
+          (
+            sum by (provider) (rate(circle_push_deliveries_total{job="circle-be",result=~"retryable|rejected"}[15m]))
+              / sum by (provider) (rate(circle_push_deliveries_total{job="circle-be"}[15m]))
+          ) > 0.2
+          and sum by (provider) (increase(circle_push_deliveries_total{job="circle-be"}[15m])) >= 20
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: 'Over 20% of {{ $labels.provider }} push deliveries are failing — credentials, quota or provider outage?'
+
+      # 验证码邮件发不出去 = 没人能注册、也没人能用验证码登录。unavailable 是
+      # 生产上根本没配 SMTP（UnconfiguredMailer），同样算失败。中继型 SMTP 对错误
+      # 收件人是事后退信而不是当场拒收，所以这里的失败基本都是通道本身的问题。
+      - alert: EmailCodeSendFailing
+        expr: |
+          sum(increase(circle_email_code_sends_total{job="circle-be",result=~"failure|unavailable"}[15m])) >= 3
+          and (
+            sum(rate(circle_email_code_sends_total{job="circle-be",result=~"failure|unavailable"}[15m]))
+              / sum(rate(circle_email_code_sends_total{job="circle-be"}[15m]))
+          ) > 0.5
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: 'Most verification-code emails are failing — users cannot register or sign in by email code'
 
   # 监控自身的存活证明。
   - name: meta

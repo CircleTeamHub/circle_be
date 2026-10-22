@@ -5,6 +5,7 @@ import {
   OUTBOX_QUEUES,
   type OutboxDepthSource,
 } from './outbox-depth.service';
+import { GROUP_ADMISSION_DELIVERY_MAX_ATTEMPTS } from '../chat/group-admission.service';
 
 const NOW = new Date('2026-08-11T12:00:00.000Z');
 const TEN_MINUTES_AGO = new Date(NOW.getTime() - 10 * 60_000);
@@ -46,8 +47,66 @@ function fakePrisma(
     chatDirectAutoReplyJob: delegate(overrides.chatDirectAutoReplyJob ?? empty),
     supportRechargeJob: delegate(overrides.supportRechargeJob ?? empty),
     refreshToken: delegate(overrides.refreshToken ?? empty),
+    adminGroupOperation: delegate(overrides.adminGroupOperation ?? empty),
+    groupAdmissionDelivery: delegate(overrides.groupAdmissionDelivery ?? empty),
   };
 }
+
+// 两个 @Interval 处理器的队列此前不在积压/死信监控里。待处理与死信的定义
+// 必须与各自处理器的领取条件逐字一致，否则指标会和实际行为分叉。
+describe('interval-processor queues', () => {
+  const spec = (name: string) => {
+    const queue = OUTBOX_QUEUES.find((candidate) => candidate.name === name);
+    expect(queue).toBeDefined();
+    return queue!;
+  };
+
+  it('tracks admin group operations: PENDING/PROCESSING pending, FAILED terminal', () => {
+    expect(spec('admin_group_operation')).toEqual({
+      name: 'admin_group_operation',
+      model: 'adminGroupOperation',
+      pendingWhere: { status: { in: ['PENDING', 'PROCESSING'] } },
+      deadWhere: { status: 'FAILED' },
+    });
+  });
+
+  it('tracks group admission deliveries against the flush retry limit', () => {
+    expect(spec('group_admission_delivery')).toEqual({
+      name: 'group_admission_delivery',
+      model: 'groupAdmissionDelivery',
+      pendingWhere: {
+        deliveredAt: null,
+        attempts: { lt: GROUP_ADMISSION_DELIVERY_MAX_ATTEMPTS },
+      },
+      deadWhere: {
+        deliveredAt: null,
+        attempts: { gte: GROUP_ADMISSION_DELIVERY_MAX_ATTEMPTS },
+      },
+    });
+    expect(GROUP_ADMISSION_DELIVERY_MAX_ATTEMPTS).toBe(8);
+  });
+
+  it('reports their depth and dead letters like every other queue', async () => {
+    const samples = await collectOutboxDepths(
+      fakePrisma({
+        groupAdmissionDelivery: {
+          count: 2,
+          oldest: new Date(NOW.getTime() - 120_000),
+          dead: 1,
+        },
+      }),
+      NOW,
+    );
+    expect(
+      samples.find((sample) => sample.queue === 'group_admission_delivery'),
+    ).toEqual({
+      queue: 'group_admission_delivery',
+      pending: 2,
+      oldestAgeSeconds: 120,
+      dead: 1,
+    });
+  });
+});
 
 describe('collectOutboxDepths', () => {
   it('reports every known queue on every pass', async () => {
@@ -216,6 +275,8 @@ describe('collectOutboxDepths', () => {
       chatDirectAutoReplyJob: delegate(),
       supportRechargeJob: delegate(),
       refreshToken: delegate(),
+      adminGroupOperation: delegate(),
+      groupAdmissionDelivery: delegate(),
     } as unknown as OutboxDepthSource;
 
     const samples = await collectOutboxDepths(prisma, NOW);

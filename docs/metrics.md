@@ -70,6 +70,15 @@ public; everything else stays internal.)
 | `circle_outbox_last_probe_timestamp_seconds`                         | gauge           | `queue`                          | Freshness of that queue's reading — goes stale when its probe keeps failing |
 | `circle_db_pool_waiting`                                             | gauge           | —                                | Requests queued for a pg connection — the pool, not Postgres, is the bottleneck |
 | `circle_db_pool_total` / `circle_db_pool_idle` / `circle_db_pool_max` | gauge          | —                                | pg pool occupancy against its configured `DATABASE_POOL_MAX`       |
+| `circle_unhandled_rejections_total`                                  | counter         | —                                | Promise rejections caught by the process guard (a missing `.catch`); the matching `[unhandledRejection]` log line names the call chain |
+| `circle_push_deliveries_total`                                       | counter         | `provider`, `result`             | Per-token push outcome: `sent` / `retryable` / `dead_token` (normal churn, not a failure) / `rejected`. Expo receipt-stage failures are counted again — expired APNs/FCM credentials only show up there |
+| `circle_email_code_sends_total`                                      | counter         | `result`                         | Verification-code emails: `success` / `failure` / `unavailable` (no mailer configured) |
+
+`circle_cron_*` covers `@TrackedInterval` jobs too (`admin_group_operation`,
+`group_admission_delivery`); `circle_cron_interval_seconds` is then the interval
+in seconds. Backup self-check results (`circle_backup_check_*`) are **not** on
+this endpoint — the backup overlay's `backup-metrics` exporter serves them (see
+docs/backups.md).
 
 `business_events_total` increments automatically whenever a business event is
 logged (`src/logging/business-event.logger.ts`), independent of `BUSINESS_LOG_ON`

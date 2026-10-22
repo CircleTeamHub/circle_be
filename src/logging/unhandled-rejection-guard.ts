@@ -5,6 +5,7 @@ import {
   reportOperationalError,
 } from './error-aggregation.service';
 import { sanitizeLogValue } from './log-sanitizer';
+import { writeFatalLogLine } from './fatal-log-file';
 
 /**
  * 进程级兜底：未捕获的 promise rejection 上报后继续跑，不再终止进程。
@@ -20,12 +21,15 @@ import { sanitizeLogValue } from './log-sanitizer';
  * 日志 —— 这两样不依赖 Sentry，是生产上保底的信号。
  *
  * rejection 上报后继续运行；uncaughtException 则由同一所有者上报、限时刷新并
- * 非零退出。禁用 SDK 自带的两个进程监听器可避免重复事件和原始错误写入 stderr。
+ * 非零退出，退出前那行脱敏诊断同时写 stderr 和采集目录里的
+ * application-fatal.log（见 fatal-log-file.ts）。禁用 SDK 自带的两个进程监听器
+ * 可避免重复事件和原始错误写入 stderr。
  */
 let installed: (() => void) | null = null;
 
 interface GuardSinks {
   logError(message: string): void;
+  logFatalToFile(message: string): void;
   exit(code: number): void;
   logRejection(message: string): void;
   countRejection(): void;
@@ -37,6 +41,9 @@ const rejectionLogger = new Logger('UnhandledRejection');
 
 const processSinks: GuardSinks = {
   logError: (message) => console.error(message),
+  logFatalToFile: (message) => {
+    writeFatalLogLine(message);
+  },
   exit: (code) => process.exit(code),
   logRejection: (message) => rejectionLogger.error(message),
   countRejection: () => processMetrics.recordUnhandledRejection(),
@@ -152,12 +159,16 @@ export function installUnhandledRejectionGuard(
     } catch {
       // Reporting must not prevent the fatal flush/exit path.
     } finally {
+      const message = `[fatal] Uncaught exception; ${safeDiagnostic(error)}; exiting.`;
       try {
-        sinks.logError(
-          `[fatal] Uncaught exception; ${safeDiagnostic(error)}; exiting.`,
-        );
+        sinks.logError(message);
       } catch {
         // The process must still terminate if stderr is unavailable.
+      }
+      try {
+        sinks.logFatalToFile(message);
+      } catch {
+        // Neither may a full disk or an unwritable log directory.
       }
       void flushErrorAggregation(2000)
         .catch(() => false)

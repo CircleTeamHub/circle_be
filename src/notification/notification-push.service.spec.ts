@@ -1,5 +1,6 @@
 import { PrismaService } from 'src/prisma/prisma.service';
 import { NotificationPushService } from './notification-push.service';
+import { deliveryMetrics } from 'src/metrics/delivery-metrics';
 
 jest.mock('src/logging/error-aggregation.service', () => ({
   reportOperationalError: jest.fn(),
@@ -308,6 +309,63 @@ describe('NotificationPushService (#88 per-token delivery)', () => {
 
       const [, init] = fetchMock.mock.calls[0] as [string, { body: string }];
       expect(JSON.parse(init.body).options.apns_production).toBe(true);
+    });
+
+    it('counts every outcome by provider, keeping dead tokens apart from failures', async () => {
+      // 失效 token（卸载 App）是正常流失，不能算进推送失败率；凭证/限流/
+      // 未配置这类可重试错误和消息级终态才是。
+      const record = jest.spyOn(deliveryMetrics, 'recordPushDelivery');
+      fetchMock.mockResolvedValue({
+        ok: true,
+        json: async () => ({
+          data: [
+            { status: 'ok', id: 'ticket-1' },
+            { status: 'error', details: { error: 'DeviceNotRegistered' } },
+            { status: 'error', details: { error: 'MessageTooBig' } },
+          ],
+        }),
+      });
+      prisma.devicePushToken.updateMany.mockResolvedValue({ count: 1 });
+
+      await service.sendMessages([
+        { token: 'tok-a', projectId: null, payload },
+        { token: 'tok-b', projectId: null, payload },
+        { token: 'tok-c', projectId: null, payload },
+        {
+          token: '1a0018970a9d4f4f8f1',
+          provider: 'jpush',
+          platform: 'android',
+          projectId: null,
+          payload,
+        },
+      ]);
+
+      expect(record.mock.calls).toEqual([
+        ['expo', 'sent'],
+        ['expo', 'dead_token'],
+        ['expo', 'rejected'],
+        ['jpush', 'retryable'],
+      ]);
+      record.mockRestore();
+    });
+
+    it('still returns outcomes when recording metrics throws', async () => {
+      const record = jest
+        .spyOn(deliveryMetrics, 'recordPushDelivery')
+        .mockImplementation(() => {
+          throw new Error('registry gone');
+        });
+      fetchMock.mockResolvedValue({
+        ok: true,
+        json: async () => ({ data: [{ status: 'ok', id: 'ticket-1' }] }),
+      });
+
+      await expect(
+        service.sendToTokens([{ token: 'tok-a', projectId: null }], payload),
+      ).resolves.toEqual([
+        { token: 'tok-a', status: 'SENT', ticketId: 'ticket-1' },
+      ]);
+      record.mockRestore();
     });
 
     it('keeps JPush deliveries retryable when server credentials are absent', async () => {
@@ -649,6 +707,37 @@ describe('NotificationPushService (#88 per-token delivery)', () => {
         where: { id: 'o3', status: 'COMPLETED' },
         data: { status: 'PENDING', nextAttemptAt: now },
       });
+    });
+
+    // APNs/FCM 凭证坏掉（InvalidCredentials）、限流这类错误主要出现在异步回执里，
+    // 同步 ticket 是 ok：只计 ticket 的话 Expo 失败率接近 0，PushDeliveryFailing
+    // 对凭证失效完全看不见。回执阶段的失败按同一套结果再计一次。
+    it('counts receipt-stage failures, which is where expired credentials show up', async () => {
+      const record = jest.spyOn(deliveryMetrics, 'recordPushDelivery');
+      prisma.notificationPushDelivery.findMany.mockResolvedValue([
+        { id: 'd1', ticketID: 't1', token: 'tok-a', outboxID: 'o1', sentAt },
+        { id: 'd2', ticketID: 't2', token: 'tok-b', outboxID: 'o2', sentAt },
+        { id: 'd3', ticketID: 't3', token: 'tok-c', outboxID: 'o3', sentAt },
+      ]);
+      fetchMock.mockResolvedValue({
+        ok: true,
+        json: async () => ({
+          data: {
+            t1: { status: 'ok' },
+            t2: { status: 'error', details: { error: 'DeviceNotRegistered' } },
+            t3: { status: 'error', details: { error: 'InvalidCredentials' } },
+          },
+        }),
+      });
+
+      await service.pollReceipts(now);
+
+      // ok 回执不再计：那条在 ticket 阶段已经记过 sent。
+      expect(record.mock.calls).toEqual([
+        ['expo', 'dead_token'],
+        ['expo', 'retryable'],
+      ]);
+      record.mockRestore();
     });
 
     it('marks a completed outbox terminal after its last receipt settles with an exhausted failure', async () => {

@@ -444,3 +444,30 @@ test('backup alerts cover a failing check, a stopped check and no backups at all
     assert.match(BACKUP_CHECK, new RegExp(`record ${check} [01]`));
   }
 });
+
+test('delivery alerts measure real channel failures with a minimum volume', () => {
+  assert.deepEqual(alertNamesInGroup('deliveries'), [
+    'PushDeliveryFailing',
+    'EmailCodeSendFailing',
+  ]);
+  const push = alertExpr('PushDeliveryFailing');
+  // 失效 token 是正常流失：进分子的话一批老设备就能把失败率拉过阈值。
+  assert.match(push, /result=~"retryable\|rejected"/);
+  assert.doesNotMatch(push, /dead_token/);
+  // 两个 provider 的凭证/配额互不相干，必须分开算。
+  assert.match(push, /sum by \(provider\) \(increase\(circle_push_deliveries_total\{job="circle-be"\}\[15m\]\)\) >= 20/);
+  const email = alertExpr('EmailCodeSendFailing');
+  // 生产上没配 SMTP 时 mailer 直接不可用，同样意味着没人能收到验证码。
+  assert.match(email, /result=~"failure\|unavailable"/);
+  assert.match(email, /\[15m\]\)\) >= 3/);
+  assert.match(email, /severity: critical/);
+});
+
+test('CronJobStalled never judges a heartbeat finer than scrape and evaluation can see', () => {
+  // 5～10 秒一跑的 @TrackedInterval 任务，3 × 周期只有 15～30 秒，而抓取和求值都是
+  // 15 秒一次：没有下限的话，正常运转的任务会周期性地连响几小时。
+  assert.match(
+    alertExpr('CronJobStalled'),
+    /> clamp_min\(3 \* max by \(exported_job\) \(circle_cron_interval_seconds\), 120\)/,
+  );
+});

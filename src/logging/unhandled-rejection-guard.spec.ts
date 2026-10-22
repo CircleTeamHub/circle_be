@@ -325,4 +325,52 @@ describe('installUnhandledRejectionGuard', () => {
     await new Promise((resolve) => setImmediate(resolve));
     expect(exit).toHaveBeenCalledWith(1);
   });
+
+  // stderr 进不了 winston 的文件，也就进不了 Loki；异步的 winston transport
+  // 又会被紧接着的 exit 截断。崩溃前的最后一行同步落进采集目录。
+  it('writes the same sanitized fatal line to the collected log file before exiting', async () => {
+    const logError = jest.fn();
+    const logFatalToFile = jest.fn();
+    const exit = jest.fn(() => {
+      expect(logFatalToFile).toHaveBeenCalledTimes(1);
+    });
+    uninstall = installUnhandledRejectionGuard({
+      logError,
+      logFatalToFile,
+      exit,
+    });
+
+    (process as NodeJS.EventEmitter).emit(
+      'uncaughtException',
+      new Error('private prose'),
+    );
+    await new Promise((resolve) => setImmediate(resolve));
+
+    expect(logFatalToFile).toHaveBeenCalledWith(logError.mock.calls[0][0]);
+    expect(JSON.stringify(logFatalToFile.mock.calls)).not.toContain(
+      'private prose',
+    );
+    expect(exit).toHaveBeenCalledWith(1);
+  });
+
+  it('still logs to stderr and exits when the fatal log file write throws', async () => {
+    const logError = jest.fn();
+    const exit = jest.fn();
+    uninstall = installUnhandledRejectionGuard({
+      logError,
+      logFatalToFile: () => {
+        throw new Error('disk full');
+      },
+      exit,
+    });
+
+    (process as NodeJS.EventEmitter).emit(
+      'uncaughtException',
+      new Error('boom'),
+    );
+    await new Promise((resolve) => setImmediate(resolve));
+
+    expect(logError).toHaveBeenCalledTimes(1);
+    expect(exit).toHaveBeenCalledWith(1);
+  });
 });

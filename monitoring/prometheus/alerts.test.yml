@@ -999,3 +999,147 @@ tests:
       - eval_time: 31h
         alertname: BackupNeverCompleted
         exp_alerts: []
+
+  # ── 外部投递通道 ────────────────────────────────────────────────────
+  - name: JPush 全部可重试失败时按 provider 报；Expo 的失效 token 不算失败
+    interval: 1m
+    input_series:
+      - series: circle_push_deliveries_total{job="circle-be",instance="circle-be-blue",provider="jpush",result="retryable"}
+        values: 0+60x40
+      - series: circle_push_deliveries_total{job="circle-be",instance="circle-be-blue",provider="jpush",result="sent"}
+        values: 0+0x40
+      - series: circle_push_deliveries_total{job="circle-be",instance="circle-be-blue",provider="expo",result="sent"}
+        values: 0+600x40
+      - series: circle_push_deliveries_total{job="circle-be",instance="circle-be-blue",provider="expo",result="dead_token"}
+        values: 0+600x40
+      - series: circle_push_deliveries_total{job="circle-be",instance="circle-be-blue",provider="expo",result="retryable"}
+        values: 0+0x40
+    alert_rule_test:
+      - eval_time: 25m
+        alertname: PushDeliveryFailing
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              provider: jpush
+            exp_annotations:
+              summary: Over 20% of jpush push deliveries are failing — credentials, quota or provider outage?
+
+  - name: 推送量太小时一两次失败不报
+    interval: 1m
+    input_series:
+      - series: circle_push_deliveries_total{job="circle-be",instance="circle-be-blue",provider="expo",result="retryable"}
+        values: 0x10 2+0x30
+      - series: circle_push_deliveries_total{job="circle-be",instance="circle-be-blue",provider="expo",result="sent"}
+        values: 0x10 3+0x30
+    alert_rule_test:
+      # 22m：跳变还在 15 分钟窗口里，且失败率超阈值已满 for 10m —— 只有
+      # 最小样本量挡着。
+      - eval_time: 22m
+        alertname: PushDeliveryFailing
+        exp_alerts: []
+
+  - name: 验证码邮件大多失败时 critical
+    interval: 1m
+    input_series:
+      - series: circle_email_code_sends_total{job="circle-be",instance="circle-be-blue",result="failure"}
+        values: 0+1x40
+      - series: circle_email_code_sends_total{job="circle-be",instance="circle-be-blue",result="success"}
+        values: 0+0x40
+      - series: circle_email_code_sends_total{job="circle-be",instance="circle-be-blue",result="unavailable"}
+        values: 0+0x40
+    alert_rule_test:
+      - eval_time: 20m
+        alertname: EmailCodeSendFailing
+        exp_alerts:
+          - exp_labels:
+              severity: critical
+            exp_annotations:
+              summary: Most verification-code emails are failing — users cannot register or sign in by email code
+
+  - name: 生产上没配 SMTP（unavailable）同样算失败
+    interval: 1m
+    input_series:
+      - series: circle_email_code_sends_total{job="circle-be",instance="circle-be-blue",result="unavailable"}
+        values: 0x5 4+0x30
+      - series: circle_email_code_sends_total{job="circle-be",instance="circle-be-blue",result="success"}
+        values: 0+0x35
+    alert_rule_test:
+      - eval_time: 15m
+        alertname: EmailCodeSendFailing
+        exp_alerts:
+          - exp_labels:
+              severity: critical
+            exp_annotations:
+              summary: Most verification-code emails are failing — users cannot register or sign in by email code
+
+  - name: 偶发一封失败不报（失败率 100%，但只有一封）
+    interval: 1m
+    input_series:
+      - series: circle_email_code_sends_total{job="circle-be",instance="circle-be-blue",result="failure"}
+        values: 0x10 1+0x30
+      - series: circle_email_code_sends_total{job="circle-be",instance="circle-be-blue",result="success"}
+        values: 0+0x40
+    alert_rule_test:
+      # 18m：那封失败还在窗口里，失败率已满 for 5m —— 只有最小失败数挡着。
+      - eval_time: 18m
+        alertname: EmailCodeSendFailing
+        exp_alerts: []
+
+  - name: 失败占少数时不报
+    interval: 1m
+    input_series:
+      - series: circle_email_code_sends_total{job="circle-be",instance="circle-be-green",result="failure"}
+        values: 0+1x40
+      - series: circle_email_code_sends_total{job="circle-be",instance="circle-be-green",result="success"}
+        values: 0+3x40
+    alert_rule_test:
+      - eval_time: 25m
+        alertname: EmailCodeSendFailing
+        exp_alerts: []
+
+  - name: 推送失败率 30% 就报，10% 不报
+    interval: 1m
+    input_series:
+      - series: circle_push_deliveries_total{job="circle-be",instance="circle-be-blue",provider="expo",result="retryable"}
+        values: 0+30x40
+      - series: circle_push_deliveries_total{job="circle-be",instance="circle-be-blue",provider="expo",result="sent"}
+        values: 0+70x40
+      - series: circle_push_deliveries_total{job="circle-be",instance="circle-be-blue",provider="jpush",result="rejected"}
+        values: 0+10x40
+      - series: circle_push_deliveries_total{job="circle-be",instance="circle-be-blue",provider="jpush",result="sent"}
+        values: 0+90x40
+    alert_rule_test:
+      - eval_time: 25m
+        alertname: PushDeliveryFailing
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              provider: expo
+            exp_annotations:
+              summary: Over 20% of expo push deliveries are failing — credentials, quota or provider outage?
+
+  # ── 间隔很短的任务：心跳阈值不能低于抓取与求值的粒度 ────────────────
+  # 5 秒一跑的任务，3 × 周期 = 15 秒，而抓取和求值都是 15 秒一次：正常运转时
+  # 求值看到的心跳也会滞后 12～18 秒。没有下限的话这条会周期性地连响几小时。
+  - name: 5 秒任务的正常心跳滞后不报 stalled；真停了才报
+    interval: 15s
+    input_series:
+      # 每次抓取时心跳都落后 18 秒（抓取相位最差的情况）。
+      - series: circle_cron_last_success_timestamp_seconds{job="circle-be",exported_job="admin_group_operation"}
+        values: -18+15x80
+      - series: circle_cron_interval_seconds{job="circle-be",exported_job="admin_group_operation"}
+        values: 5+0x80
+      # 另一个 10 秒任务从 t=0 起就停了。
+      - series: circle_cron_last_success_timestamp_seconds{job="circle-be",exported_job="group_admission_delivery"}
+        values: 0+0x80
+      - series: circle_cron_interval_seconds{job="circle-be",exported_job="group_admission_delivery"}
+        values: 10+0x80
+    alert_rule_test:
+      - eval_time: 19m
+        alertname: CronJobStalled
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              exported_job: group_admission_delivery
+            exp_annotations:
+              summary: Scheduled job group_admission_delivery has not succeeded in 3x its interval

@@ -1,7 +1,7 @@
 import { AsyncLocalStorage } from 'node:async_hooks';
 import { randomUUID } from 'node:crypto';
 import { Logger } from '@nestjs/common';
-import { Cron, CronExpression, CronOptions } from '@nestjs/schedule';
+import { Cron, CronExpression, CronOptions, Interval } from '@nestjs/schedule';
 import { jobMetrics, type JobMetrics, type JobRunResult } from './job-metrics';
 import { reportOperationalError } from '../logging/error-aggregation.service';
 import { runWithOperationContext } from '../logging/operation-context';
@@ -220,5 +220,36 @@ export function TrackedCron(
     // 先换掉 descriptor.value 再交给 Cron：调度器元数据必须落在包装函数上，
     // 否则 explorer 注册的是未记账的原函数。
     return Cron(expression, options)(target, propertyKey, descriptor);
+  };
+}
+
+/**
+ * `@Interval` 版的 TrackedCron：同样的运行记账、心跳播种和失败聚合，序列也是
+ * 同一组 circle_cron_*（job 名全局唯一，coverage spec 会查）。周期直接取毫秒
+ * 换算成秒，CronJobStalled 的「3 × 周期」阈值随之生效。
+ *
+ * 用 job 名作为 interval 的名字注册进 SchedulerRegistry，便于排障时按名查到。
+ * 有重入闸的处理器在挡回时要调 reportJobSkipped()，吞掉失败后正常返回时要调
+ * reportHandledJobFailure()，理由与定时任务完全相同。
+ */
+export function TrackedInterval(
+  milliseconds: number,
+  job: string,
+): MethodDecorator {
+  jobMetrics.registerJob(job, { intervalSeconds: milliseconds / 1000 });
+
+  return (
+    target: object,
+    propertyKey: string | symbol,
+    descriptor: PropertyDescriptor,
+  ) => {
+    const original = descriptor.value as (...args: unknown[]) => unknown;
+    descriptor.value = function trackedIntervalRun(
+      this: unknown,
+      ...args: unknown[]
+    ) {
+      return runTracked(jobMetrics, job, () => original.apply(this, args));
+    };
+    return Interval(job, milliseconds)(target, propertyKey, descriptor);
   };
 }

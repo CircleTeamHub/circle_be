@@ -272,6 +272,7 @@ and never the payload:
 | `livekit`   | `create_room`, `delete_room`                            | `LiveKitCallService`           |
 | `smtp`      | `send_verification_code`                                | `SmtpMailer`                   |
 | `expo_push` | `send`, `get_receipts`                                  | `NotificationPushService`      |
+| `jpush`     | `send`                                                  | `NotificationPushService`      |
 | `redis`     | `connect`                                               | `RedisService`                 |
 
 Persistent failures of these dependencies are also forwarded to error
