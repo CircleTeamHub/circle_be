@@ -362,7 +362,7 @@ test('the critical disk tier watches exactly the disks the warning tier does', (
   assert.equal(alertExprs('HostDiskFilling').length, 1);
   assert.match(
     ALERTMANAGER,
-    /alertname = "HostDiskNearlyFull"\n\s*target_matchers:\n\s*- alertname = "HostDiskFilling"\n\s*equal: \['instance', 'mountpoint'\]/,
+    /alertname = "HostDiskNearlyFull"\n\s*target_matchers:\n\s*- alertname =~ "HostDiskFilling\|HostDiskWillFillWithin24h"\n\s*equal: \['instance', 'mountpoint'\]/,
   );
 });
 
@@ -419,6 +419,7 @@ test('backup alerts cover a failing check, a stopped check and no backups at all
     'BackupCheckStale',
     'BackupCheckNotReporting',
     'BackupNeverCompleted',
+    'ReleaseOffsiteBackupFailed',
   ]);
   // 连续两次失败才报：gauge 一小时不变，for 去不了抖。
   assert.match(
@@ -449,6 +450,7 @@ test('delivery alerts measure real channel failures with a minimum volume', () =
   assert.deepEqual(alertNamesInGroup('deliveries'), [
     'PushDeliveryFailing',
     'EmailCodeSendFailing',
+    'DependencyRequestsFailing',
   ]);
   const push = alertExpr('PushDeliveryFailing');
   // 失效 token 是正常流失：进分子的话一批老设备就能把失败率拉过阈值。
@@ -470,4 +472,74 @@ test('CronJobStalled never judges a heartbeat finer than scrape and evaluation c
     alertExpr('CronJobStalled'),
     /> clamp_min\(3 \* max by \(exported_job\) \(circle_cron_interval_seconds\), 120\)/,
   );
+});
+
+const DISK_SELECTOR =
+  '{fstype=~"ext4|xfs|btrfs|zfs|ext3", mountpoint!~"/(boot|snap)(/.*)?"}';
+
+test('disk trend and inode alerts watch exactly the disks the space alerts do', () => {
+  // 少一个 fstype / readonly 排除，squashfs 就会让它们在装了 snap 的主机上常年响。
+  for (const name of [
+    'HostDiskWillFillWithin24h',
+    'HostInodesLow',
+    'HostInodesNearlyExhausted',
+  ]) {
+    const expr = alertExpr(name);
+    const selectors = [...expr.matchAll(/\{fstype=~[^}]*\}/g)].map((m) => m[0]);
+    assert.ok(selectors.length >= 2, `${name} has no filesystem selector`);
+    for (const selector of selectors) assert.equal(selector, DISK_SELECTOR, name);
+    assert.match(expr, /and on\(instance, mountpoint\) node_filesystem_readonly == 0/);
+  }
+  // 趋势只看已经不太空的盘：空盘上一次大文件写入也会让斜率短暂为负。
+  assert.match(alertExpr('HostDiskWillFillWithin24h'), /predict_linear\(node_filesystem_avail_bytes\{[^}]*\}\[6h\], 24 \* 3600\) < 0/);
+  assert.match(alertExpr('HostDiskWillFillWithin24h'), /< 0\.4/);
+  // btrfs/zfs 报告 inode 总数为 0。
+  for (const name of ['HostInodesLow', 'HostInodesNearlyExhausted']) {
+    assert.match(alertExpr(name), /\(node_filesystem_files\{[^}]*\} > 0\)/);
+  }
+  assert.match(
+    ALERTMANAGER,
+    /alertname = "HostInodesNearlyExhausted"\n\s*target_matchers:\n\s*- alertname = "HostInodesLow"\n\s*equal: \['instance', 'mountpoint'\]/,
+  );
+});
+
+test('an unreachable object store pages once and mutes only its own failure rate', () => {
+  const expr = alertExpr('ObjectStoreUnreachable');
+  // min：只要有一个在服务的实例连不上就响（与 RedisDown 同理）。
+  assert.match(expr, /min\(circle_object_store_up\) == 0/);
+  assert.match(expr, /severity: critical/);
+  // LiveKit 的失败与存储无关，必须照常报 —— 抑制只压 object_storage。
+  assert.match(
+    ALERTMANAGER,
+    /alertname = "ObjectStoreUnreachable"\n\s*target_matchers:\n\s*- alertname = "DependencyRequestsFailing"\n\s*- dependency = "object_storage"/,
+  );
+  const dependency = alertExpr('DependencyRequestsFailing');
+  // not_found（对象不存在）是正常结果，不进分子。
+  assert.equal([...dependency.matchAll(/result="failure"/g)].length, 2);
+  assert.doesNotMatch(dependency, /not_found/);
+  // 可达性探测的 HeadBucket 归 circle_object_store_up 管；分子分母都要排除，
+  // 否则每 15 分钟约 30 次探测成功会把服务端写入的失败稀释掉。
+  assert.equal([...dependency.matchAll(/operation!="HeadBucket"/g)].length, 3);
+});
+
+const OFFSITE_BACKUP = readText(join(ROOT, 'deploy/offsite-backup.sh'));
+
+test('the release-time off-host backup result lands in the volume backup-metrics exports', () => {
+  const dir = BACKUP_CHECK.match(/BACKUP_METRICS_DIR:-([^}]+)\}/)[1];
+  // 与 check.sh 写同一个目录 —— 卷挂在这里，backup-metrics 读的就是它。
+  assert.ok(OFFSITE_BACKUP.includes(`d=${dir};`), 'offsite metric written outside the backup_metrics volume');
+  assert.match(OFFSITE_BACKUP, /label=com\.docker\.compose\.service=backup/);
+  assert.match(OFFSITE_BACKUP, /circle_release_offsite_backup_success/);
+  assert.match(alertExpr('ReleaseOffsiteBackupFailed'), /circle_release_offsite_backup_success == 0/);
+});
+
+test('every service the backup overlay starts rotates its container logs', () => {
+  for (const service of ['backup', 'backup-metrics']) {
+    const block = BACKUP_COMPOSE.match(
+      new RegExp(`\n {2}${service}:\n([\\s\\S]*?)(?=\n {2}[a-z][a-z-]*:\n|\nvolumes:)`),
+    );
+    assert.ok(block, `service ${service} not found`);
+    assert.match(block[1], /logging: \*default-logging/, `${service} has no log rotation`);
+  }
+  assert.match(BACKUP_COMPOSE, /x-logging: &default-logging\n\s*driver: json-file\n\s*options:\n\s*max-size: '10m'\n\s*max-file: '3'/);
 });

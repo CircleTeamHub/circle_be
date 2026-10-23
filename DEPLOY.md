@@ -110,7 +110,9 @@ curl -i https://<API域名>/api/v1/auth/me
 - `GET /healthz` —— 存活:进程还在就返回 200,不查任何依赖。公网可访问,供外部
   uptime 监控使用。
 - `GET /readyz` —— 就绪:真查数据库(`SELECT 1`),连不上返回 503;Redis 状态只
-  上报不拦截(Redis 可选,故障时降级为单实例限流/实时)。compose 的 healthcheck
+  上报不拦截(Redis 可选,故障时降级为单实例限流/实时)。对象存储同样只上报:
+  `objectStoreReachable` 是一次真实的 HeadBucket(30 秒缓存、2 秒超时),连不上
+  由 `ObjectStoreUnreachable` 告警,而不是把整个集群摘掉。compose 的 healthcheck
   探的就是它,因此 `circle_be` 显示 healthy 才代表真的能服务。Caddy 对公网 404
   它,只能在容器内查:
 
@@ -471,7 +473,13 @@ apt 装的是 aws-cli v1(22.04 上是 1.22.34),已实测可用;官方安装器�
 - stderr 打一整块 `OFF-HOST BACKUP UPLOAD FAILED` 横幅;
 - stdout 写一行 GitHub Actions annotation,在 run 摘要页显示红色告警
   (**不会**让 job 变红,job 状态只看退出码);
-- 写状态文件 `~/circle_be_backups/.offsite-status`。
+- 写状态文件 `~/circle_be_backups/.offsite-status`;
+- 备份 overlay 在跑时,经 `docker exec` 把结果写成指标
+  (`circle_release_offsite_backup_success`)放进 `backup_metrics` 卷,失败时
+  `ReleaseOffsiteBackupFailed` 告警,直到下一次发版成功才消。overlay 没跑时会打一行
+  NOTE 说明「这次结果不会告警」。失败后若决定关掉发版异地备份(或已手动补传),
+  这条结果不会再被覆盖,要手动清掉:
+  `docker compose -f docker-compose.prod.yml -f docker-compose.backup.yml exec backup rm -f /var/lib/circle-backup/metrics/release_offsite.prom`
 
 例行检查(建议进值班清单):
 

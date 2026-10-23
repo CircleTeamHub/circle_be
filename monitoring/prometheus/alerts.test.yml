@@ -1143,3 +1143,195 @@ tests:
               exported_job: group_admission_delivery
             exp_annotations:
               summary: Scheduled job group_admission_delivery has not succeeded in 3x its interval
+
+  # ── 第三批：发版异地备份、依赖失败率、存储可达性、磁盘趋势、inode ─────
+  - name: 发版时的异地备份失败就报，下次成功后消警
+    interval: 1m
+    input_series:
+      - series: circle_release_offsite_backup_success{job="backup",instance="backup-metrics"}
+        values: 0x20 1x20
+    alert_rule_test:
+      - eval_time: 10m
+        alertname: ReleaseOffsiteBackupFailed
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              job: backup
+              instance: backup-metrics
+            exp_annotations:
+              summary: The last release-time off-host database backup failed — see ~/circle_be_backups/.offsite-status on the host
+      - eval_time: 30m
+        alertname: ReleaseOffsiteBackupFailed
+        exp_alerts: []
+
+  - name: 对象存储服务端读写大面积失败时按依赖报；not_found 和 LiveKit 偶发失败不报
+    interval: 1m
+    input_series:
+      - series: circle_dependency_requests_total{job="circle-be",instance="circle-be-blue",dependency="object_storage",operation="PutObject",result="failure"}
+        values: 0+2x40
+      - series: circle_dependency_requests_total{job="circle-be",instance="circle-be-blue",dependency="object_storage",operation="PutObject",result="success"}
+        values: 0+2x40
+      # 大量「对象不存在」是存储审计的正常结果，不能把失败率拉高。
+      - series: circle_dependency_requests_total{job="circle-be",instance="circle-be-blue",dependency="livekit",operation="create_room",result="not_found"}
+        values: 0+50x40
+      - series: circle_dependency_requests_total{job="circle-be",instance="circle-be-blue",dependency="livekit",operation="create_room",result="failure"}
+        values: 0x10 2+0x30
+      - series: circle_dependency_requests_total{job="circle-be",instance="circle-be-blue",dependency="livekit",operation="create_room",result="success"}
+        values: 0x10 2+0x30
+    alert_rule_test:
+      - eval_time: 25m
+        alertname: DependencyRequestsFailing
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              dependency: object_storage
+            exp_annotations:
+              summary: Over 20% of backend requests to object_storage are failing — credentials, bucket policy or an outage?
+
+  - name: 任一在服务的实例连不上对象存储就 critical
+    interval: 1m
+    input_series:
+      - series: circle_object_store_up{job="circle-be",instance="circle-be-blue"}
+        values: 1+0x20
+      - series: circle_object_store_up{job="circle-be",instance="circle-be-green"}
+        values: 0+0x20
+    alert_rule_test:
+      - eval_time: 3m
+        alertname: ObjectStoreUnreachable
+        exp_alerts: []
+      - eval_time: 10m
+        alertname: ObjectStoreUnreachable
+        exp_alerts:
+          - exp_labels:
+              severity: critical
+            exp_annotations:
+              summary: Object storage is unreachable — media uploads and reads are failing for every user
+
+  - name: 按当前写入速度 24 小时内会写满就报
+    interval: 1m
+    input_series:
+      # 剩 30%，每分钟少 1 —— 24 小时后远低于 0。
+      - series: node_filesystem_avail_bytes{instance="node-exporter:9100",mountpoint="/",fstype="ext4"}
+        values: 300-1x200
+      - series: node_filesystem_size_bytes{instance="node-exporter:9100",mountpoint="/",fstype="ext4"}
+        values: 1000+0x200
+      - series: node_filesystem_readonly{instance="node-exporter:9100",mountpoint="/",fstype="ext4"}
+        values: 0+0x200
+    alert_rule_test:
+      - eval_time: 50m
+        alertname: HostDiskWillFillWithin24h
+        exp_alerts: []
+      - eval_time: 2h
+        alertname: HostDiskWillFillWithin24h
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              instance: node-exporter:9100
+              mountpoint: /
+              fstype: ext4
+            exp_annotations:
+              summary: Filesystem / is on track to fill within 24h at the current write rate
+
+  - name: 平稳的盘、和下降中但还很空的盘都不报趋势
+    interval: 1m
+    input_series:
+      - series: node_filesystem_avail_bytes{instance="node-exporter:9100",mountpoint="/",fstype="ext4"}
+        values: 300+0x200
+      - series: node_filesystem_size_bytes{instance="node-exporter:9100",mountpoint="/",fstype="ext4"}
+        values: 1000+0x200
+      - series: node_filesystem_readonly{instance="node-exporter:9100",mountpoint="/",fstype="ext4"}
+        values: 0+0x200
+      # 剩 80% 还在降：一次大文件写入就能让斜率短暂为负，不值得叫人。
+      - series: node_filesystem_avail_bytes{instance="node-exporter:9100",mountpoint="/data",fstype="ext4"}
+        values: 800-1x200
+      - series: node_filesystem_size_bytes{instance="node-exporter:9100",mountpoint="/data",fstype="ext4"}
+        values: 1000+0x200
+      - series: node_filesystem_readonly{instance="node-exporter:9100",mountpoint="/data",fstype="ext4"}
+        values: 0+0x200
+    alert_rule_test:
+      - eval_time: 2h
+        alertname: HostDiskWillFillWithin24h
+        exp_alerts: []
+
+  - name: inode 剩 5% 只报 warning；剩 2% 两档都在 Prometheus 侧触发；btrfs 不算
+    interval: 1m
+    input_series:
+      - series: node_filesystem_files_free{instance="node-exporter:9100",mountpoint="/",fstype="ext4"}
+        values: 5+0x20
+      - series: node_filesystem_files{instance="node-exporter:9100",mountpoint="/",fstype="ext4"}
+        values: 100+0x20
+      - series: node_filesystem_readonly{instance="node-exporter:9100",mountpoint="/",fstype="ext4"}
+        values: 0+0x20
+      - series: node_filesystem_files_free{instance="node-exporter:9100",mountpoint="/var/lib/docker",fstype="xfs"}
+        values: 2+0x20
+      - series: node_filesystem_files{instance="node-exporter:9100",mountpoint="/var/lib/docker",fstype="xfs"}
+        values: 100+0x20
+      - series: node_filesystem_readonly{instance="node-exporter:9100",mountpoint="/var/lib/docker",fstype="xfs"}
+        values: 0+0x20
+      # btrfs 动态分配 inode，总数报 0。
+      - series: node_filesystem_files_free{instance="node-exporter:9100",mountpoint="/srv",fstype="btrfs"}
+        values: 0+0x20
+      - series: node_filesystem_files{instance="node-exporter:9100",mountpoint="/srv",fstype="btrfs"}
+        values: 0+0x20
+      - series: node_filesystem_readonly{instance="node-exporter:9100",mountpoint="/srv",fstype="btrfs"}
+        values: 0+0x20
+    alert_rule_test:
+      - eval_time: 15m
+        alertname: HostInodesLow
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              instance: node-exporter:9100
+              mountpoint: /
+              fstype: ext4
+            exp_annotations:
+              summary: Filesystem / has less than 10% of its inodes left
+          - exp_labels:
+              severity: warning
+              instance: node-exporter:9100
+              mountpoint: /var/lib/docker
+              fstype: xfs
+            exp_annotations:
+              summary: Filesystem /var/lib/docker has less than 10% of its inodes left
+      - eval_time: 15m
+        alertname: HostInodesNearlyExhausted
+        exp_alerts:
+          - exp_labels:
+              severity: critical
+              instance: node-exporter:9100
+              mountpoint: /var/lib/docker
+              fstype: xfs
+            exp_annotations:
+              summary: Filesystem /var/lib/docker is almost out of inodes — new files (logs, uploads, WAL) will fail to be created
+
+  - name: LiveKit 只失败两次（失败率 100%）不报 —— 最小失败数挡着
+    interval: 1m
+    input_series:
+      - series: circle_dependency_requests_total{job="circle-be",instance="circle-be-blue",dependency="livekit",operation="create_room",result="failure"}
+        values: 0x5 2+0x30
+      - series: circle_dependency_requests_total{job="circle-be",instance="circle-be-blue",dependency="livekit",operation="create_room",result="success"}
+        values: 0+0x35
+    alert_rule_test:
+      # 18m：两次失败还在窗口里，失败率已满 for 10m。
+      - eval_time: 18m
+        alertname: DependencyRequestsFailing
+        exp_alerts: []
+
+  - name: 可达性探测的 HeadBucket 不能把服务端写入失败的比例稀释掉
+    interval: 1m
+    input_series:
+      # /readyz 和抓取每分钟约 2 次 HeadBucket，全部成功。
+      - series: circle_dependency_requests_total{job="circle-be",instance="circle-be-blue",dependency="object_storage",operation="HeadBucket",result="success"}
+        values: 0+2x40
+      # 桶策略拒掉了服务端拷贝：15 分钟里只有 6 次，次次失败。
+      - series: circle_dependency_requests_total{job="circle-be",instance="circle-be-blue",dependency="object_storage",operation="CopyObject",result="failure"}
+        values: 0x5 6+0x35
+    alert_rule_test:
+      - eval_time: 18m
+        alertname: DependencyRequestsFailing
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              dependency: object_storage
+            exp_annotations:
+              summary: Over 20% of backend requests to object_storage are failing — credentials, bucket policy or an outage?

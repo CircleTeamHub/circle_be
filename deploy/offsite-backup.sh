@@ -55,6 +55,48 @@ offsite_cfg() {
   printf '%s\n' "$value"
 }
 
+# 把结果写成 Prometheus textfile,交给备份 overlay 的 backup-metrics 导出
+# (ReleaseOffsiteBackupFailed 读它)。横幅、annotation 和状态文件都要有人去看,
+# 这一份才会自己叫人。
+#   offsite_publish_metric ok|failed
+#
+# 经 docker exec 直接写进 backup 容器里的 backup_metrics 卷,而不是挂一个主机
+# 目录给 node-exporter:主机目录不存在时 Docker 会以 root 建出来,之后发版用户
+# 往 ~/circle_be_backups 写 pg_dump 就会失败 —— 告警没加上,反而把发版弄挂。
+# 只导出 0/1 和时间戳;失败详情可能带桶名、路径,留在状态文件里。
+#
+# 任何一步失败都只告警:它跑在 set -e 的发版脚本里,不能拖垮发版;exec 也套上
+# 超时(与上传那一步同一写法),容器卡住时发版不会被它挂住。
+offsite_publish_metric() {
+  local state="$1" value=0 cid
+  local -a runner=()
+  [ "$state" = ok ] && value=1
+  if command -v timeout >/dev/null 2>&1; then
+    runner=(timeout "${BACKUP_OFFSITE_METRIC_TIMEOUT_SECONDS:-30}")
+  fi
+  cid="$(docker ps -q \
+    --filter "label=com.docker.compose.project=${CIRCLE_BE_PROJECT_NAME:-circle-be}" \
+    --filter label=com.docker.compose.service=backup \
+    --filter status=running 2>/dev/null | head -n 1 || true)"
+  if [ -z "$cid" ]; then
+    echo "NOTE: the backup overlay is not running, so this off-host backup result only lives in .offsite-status and will not alert." >&2
+    return 0
+  fi
+  if ! {
+    printf '# HELP circle_release_offsite_backup_success 1 if the last release-time off-host database backup uploaded, else 0.\n'
+    printf '# TYPE circle_release_offsite_backup_success gauge\n'
+    printf 'circle_release_offsite_backup_success %s\n' "$value"
+    printf '# HELP circle_release_offsite_backup_timestamp_seconds Unix time of the last release-time off-host backup attempt.\n'
+    printf '# TYPE circle_release_offsite_backup_timestamp_seconds gauge\n'
+    printf 'circle_release_offsite_backup_timestamp_seconds %s\n' "$(date +%s)"
+  } | "${runner[@]}" docker exec -i "$cid" sh -c \
+    'd=/var/lib/circle-backup/metrics; t="$(mktemp "$d/.release_offsite.XXXXXX")" && cat >"$t" && chmod 0644 "$t" && mv -f "$t" "$d/release_offsite.prom"' \
+    >/dev/null 2>&1; then
+    echo "WARNING: could not publish the off-host backup result to the backup metrics volume; it only lives in .offsite-status." >&2
+  fi
+  return 0
+}
+
 # 记录结果并发出信号。
 #   offsite_report <备份目录> ok|failed <详情>
 #
@@ -64,6 +106,7 @@ offsite_report() {
   stamp="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
   # 留一份状态,让「上一次异地备份成功是什么时候」这个问题事后可查。
   printf '%s %s %s\n' "$state" "$stamp" "$detail" >"$dir/.offsite-status" 2>/dev/null || true
+  offsite_publish_metric "$state"
 
   if [ "$state" = ok ]; then
     echo "==> Off-host backup uploaded: $detail"
