@@ -394,6 +394,9 @@ cause, so one incident is not reported five different ways:
 - `CircleBeNoTarget` → suppresses 5xx / latency / event-loop / cron / outbox, and
   the public API probe (`PublicEndpointDown` with `component="api"`)
 - `PostgresDown` → suppresses cron / outbox / 5xx
+- `HostDiskNearlyFull` (<5% free, critical) → suppresses `HostDiskFilling`
+  (<15%, warning) for the **same disk only** (`equal: ['instance', 'mountpoint']`),
+  for the same reason as the certificate pair below.
 - `TlsCertificateExpiryImminent` → suppresses `TlsCertificateExpiringSoon` for the
   **same certificate only** (`equal: ['instance']`). The two tiers deliberately
   have different names: under the shared-name rule below, one domain's critical

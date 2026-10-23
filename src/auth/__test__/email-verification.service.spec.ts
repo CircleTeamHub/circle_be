@@ -13,6 +13,7 @@ import {
 import { PrismaService } from '../../prisma/prisma.service';
 import { MAILER } from '../mailer/mailer.interface';
 import { sanitizeLogValue } from '../../logging/log-sanitizer';
+import { deliveryMetrics } from '../../metrics/delivery-metrics';
 
 /**
  * production 下的固定码必须够长（见 PRODUCTION_BYPASS_CODE_MIN_LENGTH）：
@@ -197,6 +198,46 @@ describe('EmailVerificationService', () => {
     await service.requestCode('a@b.com', 'LOGIN');
     expect(codes).toHaveLength(1);
     expect(mailer.sendVerificationCode).toHaveBeenCalledTimes(2);
+  });
+
+  // 验证码邮件发不出去 = 没人能注册或用验证码登录，而此前只有日志。
+  // 失败率告警（EmailCodeSendFailing）读的是这个计数。
+  it('counts each verification-code send as success, failure or unavailable', async () => {
+    const record = jest.spyOn(deliveryMetrics, 'recordEmailCodeSend');
+    try {
+      usersByEmail.add('a@b.com');
+      await service.requestCode('a@b.com', 'LOGIN');
+      expect(record).toHaveBeenLastCalledWith('success');
+
+      mailer.sendVerificationCode.mockRejectedValueOnce(
+        new Error('454 relay refused'),
+      );
+      await expect(service.requestCode('c@b.com', 'REGISTER')).rejects.toThrow(
+        ServiceUnavailableException,
+      );
+      expect(record).toHaveBeenLastCalledWith('failure');
+
+      (mailer as any).isAvailable = jest.fn(() => false);
+      await expect(service.requestCode('d@b.com', 'LOGIN')).rejects.toThrow(
+        ServiceUnavailableException,
+      );
+      expect(record).toHaveBeenLastCalledWith('unavailable');
+      expect(record).toHaveBeenCalledTimes(3);
+    } finally {
+      delete (mailer as any).isAvailable;
+      record.mockRestore();
+    }
+  });
+
+  it('does not count anti-enumeration silent skips as sends', async () => {
+    const record = jest.spyOn(deliveryMetrics, 'recordEmailCodeSend');
+    try {
+      await service.requestCode('ghost@b.com', 'LOGIN');
+      expect(mailer.sendVerificationCode).not.toHaveBeenCalled();
+      expect(record).not.toHaveBeenCalled();
+    } finally {
+      record.mockRestore();
+    }
   });
 
   it('keeps the previously delivered code usable when a resend fails (round 2)', async () => {

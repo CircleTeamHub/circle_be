@@ -272,6 +272,7 @@ and never the payload:
 | `livekit`   | `create_room`, `delete_room`                            | `LiveKitCallService`           |
 | `smtp`      | `send_verification_code`                                | `SmtpMailer`                   |
 | `expo_push` | `send`, `get_receipts`                                  | `NotificationPushService`      |
+| `jpush`     | `send`                                                  | `NotificationPushService`      |
 | `redis`     | `connect`                                               | `RedisService`                 |
 
 Persistent failures of these dependencies are also forwarded to error
@@ -366,8 +367,15 @@ Loki collection is separate and does not use this exception-only interface.
   friend chat replay), the sensitive-word filter failing open, the private
   media bucket policy not applying, Expo / SMTP / Redis / LiveKit outages.
 - **Startup/process failures** have one application-owned capture boundary.
-  Unhandled rejections report with `handled: false` and continue running;
-  uncaught exceptions report with `handled: false`, emit a fixed stderr message,
+  Unhandled rejections report with `handled: false` and continue running.
+  Because reporting is a no-op while the provider is `none`, each one is also
+  counted (`circle_unhandled_rejections_total`, alert
+  `UnhandledRejectionsOccurring`) and logged through Winston as a sanitized
+  `[unhandledRejection] errorName=… source=at a.js:1:2 <- at b.js:3:4 …` line
+  (up to four `file:line:col` frames, so a rejection raised inside Prisma or
+  ioredis still names the calling service) — at most one per call chain per
+  minute (the next line for that chain carries `suppressedSinceLast=N`), so a
+  storm cannot fill the disk. Uncaught exceptions report with `handled: false`, emit a fixed stderr message,
   wait at most 2 seconds for flush, then exit 1. An independent referenced
   deadline also covers a provider that never settles. Bootstrap failures use
   the same bounded flush/exit policy. SDK default process listeners are disabled

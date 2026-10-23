@@ -348,3 +348,126 @@ test('a missing backend mutes the API probe it necessarily breaks, but not the a
     /alertname = "CircleBeNoTarget"\n\s*target_matchers:\n\s*- alertname = "PublicEndpointDown"\n\s*- component = "api"/,
   );
 });
+
+test('the critical disk tier watches exactly the disks the warning tier does', () => {
+  const warning = alertExpr('HostDiskFilling');
+  const critical = alertExpr('HostDiskNearlyFull');
+  // 选择器一字不差：critical 一档要是漏了 readonly/fstype 的排除，squashfs 会让它
+  // 在装了 snap 的主机上常年 critical。
+  const selector = (expr) => expr.match(/expr: \|\n([\s\S]*?)\n {8}for:/)[1].replace(/< 0\.\d+/, '');
+  assert.equal(selector(critical), selector(warning));
+  assert.match(critical, /< 0\.05/);
+  assert.match(critical, /severity: critical/);
+  // 不同告警名 + 按盘配对的专用抑制：一块盘的 critical 不能静音另一块盘的 warning。
+  assert.equal(alertExprs('HostDiskFilling').length, 1);
+  assert.match(
+    ALERTMANAGER,
+    /alertname = "HostDiskNearlyFull"\n\s*target_matchers:\n\s*- alertname = "HostDiskFilling"\n\s*equal: \['instance', 'mountpoint'\]/,
+  );
+});
+
+test('a crash loop counts restart series per container, not start-time changes', () => {
+  const expr = alertExpr('ContainerRestartLoop');
+  // cAdvisor 的 container_start_time_seconds 是创建时间，重启时不变 —— changes()
+  // 在它上面恒为 0。重启体现在 restartcount 标签上：每次一条新序列。
+  const query = expr.match(/expr: (.*)\n/)[1];
+  assert.doesNotMatch(query, /changes\(/);
+  assert.equal(
+    query,
+    'count by (name) (count_over_time(container_start_time_seconds{name!=""}[15m])) - 1 >= 3',
+  );
+});
+
+test('unhandled rejections alert on new arrivals, not on the standing count', () => {
+  const expr = alertExpr('UnhandledRejectionsOccurring');
+  assert.match(expr, /increase\(circle_unhandled_rejections_total\{job="circle-be"\}\[15m\]\)/);
+  // increase() 吃掉新序列的首个样本；冷启动漏出的那条靠这一段补。
+  assert.match(
+    expr,
+    /circle_unhandled_rejections_total\{job="circle-be"\}\n\s*unless circle_unhandled_rejections_total\{job="circle-be"\} offset 15m/,
+  );
+  assert.match(expr, /severity: warning/);
+});
+
+const BACKUP_CHECK = readText(join(ROOT, 'deploy/backup/check.sh'));
+const BACKUP_DOCKERFILE = readText(join(ROOT, 'docker/backup/Dockerfile'));
+const BACKUP_COMPOSE = readText(join(ROOT, 'docker-compose.backup.yml'));
+const MONITORING_PROD_COMPOSE = readText(join(ROOT, 'monitoring/docker-compose.prod.yml'));
+
+test('backup self-check results reach Prometheus through one consistent path', () => {
+  const dir = BACKUP_CHECK.match(/BACKUP_METRICS_DIR:-([^}]+)\}/)[1];
+  // 镜像里预建并归 postgres 所有：命名卷首次挂载时继承这个属主，uid 70 才写得进去。
+  assert.match(BACKUP_DOCKERFILE, new RegExp(`mkdir -p ${dir}\\b`));
+  assert.match(BACKUP_DOCKERFILE, new RegExp(`chown postgres:postgres ${dir}\\b`));
+  // backup 写、backup-metrics 读的是同一个卷。
+  assert.match(BACKUP_COMPOSE, new RegExp(`- backup_metrics:${dir}\\n`));
+  assert.match(BACKUP_COMPOSE, /- backup_metrics:\/textfile:ro/);
+  assert.match(BACKUP_COMPOSE, /--collector\.textfile\.directory=\/textfile/);
+  // Prometheus 按服务名发现它；名字对不上就是一个永远没有目标的 job。
+  assert.match(BACKUP_COMPOSE, /\n {2}backup-metrics:\n/);
+  assert.match(PROMETHEUS_PROD, /job_name: backup\n\s*dns_sd_configs:\n\s*- names: \['backup-metrics'\]\n\s*type: A\n\s*port: 9100/);
+  // 开发配置里没有它：开发机不跑备份 overlay。
+  assert.doesNotMatch(PROMETHEUS, /backup-metrics/);
+  // 与监控栈锁定的 node-exporter 同一版本。
+  const pinned = MONITORING_PROD_COMPOSE.match(/image: (prom\/node-exporter:v[\d.]+)/)[1];
+  assert.match(BACKUP_COMPOSE, new RegExp(`image: ${pinned.replace(/[.]/g, '\\.')}\\n`));
+});
+
+test('backup alerts cover a failing check, a stopped check and no backups at all', () => {
+  assert.deepEqual(alertNamesInGroup('backups'), [
+    'BackupCheckFailing',
+    'BackupCheckStale',
+    'BackupCheckNotReporting',
+    'BackupNeverCompleted',
+  ]);
+  // 连续两次失败才报：gauge 一小时不变，for 去不了抖。
+  assert.match(
+    alertExpr('BackupCheckFailing'),
+    /max_over_time\(circle_backup_check_success\[70m\]\) == 0/,
+  );
+  assert.match(
+    alertExpr('BackupNeverCompleted'),
+    /absent\(circle_backup_check_success\{check="backup_freshness"\}\)/,
+  );
+  assert.match(alertExpr('BackupCheckFailing'), /severity: critical/);
+  assert.match(alertExpr('BackupCheckFailing'), /\{\{ \$labels\.check \}\}/);
+  assert.match(
+    alertExpr('BackupCheckStale'),
+    /time\(\) - circle_backup_check_last_run_timestamp_seconds > 3 \* 3600/,
+  );
+  const notReporting = alertExpr('BackupCheckNotReporting');
+  assert.match(notReporting, /absent\(circle_backup_check_last_run_timestamp_seconds\)/);
+  // postgres-exporter 只在生产 overlay 里：少了这个前提，每台开发机上都会常年红。
+  assert.match(notReporting, /and on\(\) \(up\{job="postgres-exporter"\} == 1\)/);
+  // 每个检查名都必须是 check.sh 真的会写出来的。
+  for (const check of ['postgres_archive', 'backup_freshness', 'destination_bucket', 'minio_source']) {
+    assert.match(BACKUP_CHECK, new RegExp(`record ${check} [01]`));
+  }
+});
+
+test('delivery alerts measure real channel failures with a minimum volume', () => {
+  assert.deepEqual(alertNamesInGroup('deliveries'), [
+    'PushDeliveryFailing',
+    'EmailCodeSendFailing',
+  ]);
+  const push = alertExpr('PushDeliveryFailing');
+  // 失效 token 是正常流失：进分子的话一批老设备就能把失败率拉过阈值。
+  assert.match(push, /result=~"retryable\|rejected"/);
+  assert.doesNotMatch(push, /dead_token/);
+  // 两个 provider 的凭证/配额互不相干，必须分开算。
+  assert.match(push, /sum by \(provider\) \(increase\(circle_push_deliveries_total\{job="circle-be"\}\[15m\]\)\) >= 20/);
+  const email = alertExpr('EmailCodeSendFailing');
+  // 生产上没配 SMTP 时 mailer 直接不可用，同样意味着没人能收到验证码。
+  assert.match(email, /result=~"failure\|unavailable"/);
+  assert.match(email, /\[15m\]\)\) >= 3/);
+  assert.match(email, /severity: critical/);
+});
+
+test('CronJobStalled never judges a heartbeat finer than scrape and evaluation can see', () => {
+  // 5～10 秒一跑的 @TrackedInterval 任务，3 × 周期只有 15～30 秒，而抓取和求值都是
+  // 15 秒一次：没有下限的话，正常运转的任务会周期性地连响几小时。
+  assert.match(
+    alertExpr('CronJobStalled'),
+    /> clamp_min\(3 \* max by \(exported_job\) \(circle_cron_interval_seconds\), 120\)/,
+  );
+});

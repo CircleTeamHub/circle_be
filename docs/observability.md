@@ -31,6 +31,7 @@
 | pg 连接池           | 指标       | 排队等连接数、已建立/空闲/上限              | ✅（应用内，见下）        |
 | **redis-exporter**  | 指标       | 存活、内存占用、客户端数、被拒连接          | ✅（仅生产 overlay）      |
 | **blackbox-exporter** | 可达性   | 按用户的路径探测公网入口（DNS/TLS/Caddy/`/healthz`）、证书剩余天数 | ✅（仅生产 overlay）      |
+| backup-metrics      | 指标       | 备份每小时自检的逐项结果、最近一次完成时间 | ✅（仅备份 overlay，见 docs/backups.md） |
 | **外部心跳**        | 元监控     | 监控栈自身是否还活着                        | ✅ Watchdog → 外部服务    |
 | **PostHog** 等      | 业务分析   | 用户行为、漏斗、留存、转化                  | ❌ 未做                   |
 
@@ -105,8 +106,9 @@ pg 连接池排队、Postgres 连接与状态、Redis 内存与被拒连接）�
 
 ### 7. Alertmanager —— 告警路由（不产数据）
 
-Prometheus 规则越界 → 发给它 → 去重 / 聚合 / 静默 / 路由。当前规则文件有 40 条规则，覆盖
-接口 RED、聊天容量、主机与容器、定时任务与 outbox、连接池与数据存储、公网探测、监控组件自身故障。
+Prometheus 规则越界 → 发给它 → 去重 / 聚合 / 静默 / 路由。当前规则文件有 55 条规则，覆盖
+接口 RED、漏网的 promise rejection、聊天容量、主机与容器（含磁盘两档、崩溃循环）、定时任务与 outbox、
+备份自检、推送与验证码邮件的失败率、连接池与数据存储、公网探测、监控组件自身故障。
 
 出口按 severity 分级：`critical` → Discord（10s 聚合 / 1h 重提），`warning` → Discord
 （30s / 4h），`Watchdog` → **外部**心跳服务。另有抑制规则，避免一次故障被报成
@@ -144,9 +146,13 @@ Prometheus 规则越界 → 发给它 → 去重 / 聚合 / 静默 / 路由。�
 | `circle_outbox_dead{queue}`                   | 已放弃、不会再重试的行（死信）                      |
 | `circle_outbox_last_probe_timestamp_seconds{queue}` | 该队列读数的新鲜度 —— 探测一直失败时它会变陈旧 |
 
-五个队列：`session_revocation`、`notification_push`、`friend_chat_replay`、
-`gift_card`（`CoinGift` 上的虚拟队列）、`verification_card`
-（`CircleInvitationVerifier` 上的虚拟队列，与前者同构）。
+队列清单以 `src/metrics/outbox-depth.service.ts` 的 `OUTBOX_QUEUES` 为准，目前 10 个：
+`session_revocation`、`access_revocation`、`notification_push`、`friend_chat_replay`、
+`verification_card`（`CircleInvitationVerifier` 上的虚拟队列）、`chat_direct_auto_reply`、
+`chat_support_recharge`、`gift_card`（`CoinGift` 上的虚拟队列，与前者同构）、
+`admin_group_operation`、`group_admission_delivery`。最后两个由 `@TrackedInterval`
+处理器消费（`@Interval` 版的 `@TrackedCron`，心跳与运行记账完全相同；裸 `@Interval`
+和裸 `@Cron` 一样会被 `tracked-cron.coverage.spec.ts` 拦下）。
 
 四个关键设计，改动前务必先读懂：
 

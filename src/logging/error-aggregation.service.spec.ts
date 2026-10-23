@@ -647,7 +647,16 @@ describe('createSentryInitOptions', () => {
       },
     );
     expect(child.status).toBe(0);
-    expect(child.stderr).toBe('');
+    // stderr 上只允许兜底自己那一行脱敏日志：没有 Node/SDK 默认的原始错误
+    // 打印，也不带错误正文。
+    expect(child.stderr).not.toContain('private rejection prose');
+    expect(
+      child.stderr.split('\n').filter((line) => line.trim() !== ''),
+    ).toEqual([
+      expect.stringMatching(
+        /\[unhandledRejection\] errorName=Error source=at .*:\d+:\d+; suppressedSinceLast=0; continuing\./,
+      ),
+    ]);
     expect(child.stdout).toContain('TIMER_RAN');
     expect(child.stdout).not.toContain('private rejection prose');
     const eventEnvelopes = child.stdout

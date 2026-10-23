@@ -7,7 +7,11 @@ import {
   Logger,
   NotFoundException,
 } from '@nestjs/common';
-import { Interval } from '@nestjs/schedule';
+import {
+  reportHandledJobFailure,
+  reportJobSkipped,
+  TrackedInterval,
+} from '../metrics/tracked-cron.decorator';
 import { PrismaService } from 'src/prisma/prisma.service';
 import type { GroupAdmission, Prisma } from 'src/generated/prisma';
 import { NotificationService } from 'src/notification/notification.service';
@@ -21,6 +25,9 @@ import { normalizeUserIdAlias } from 'src/user/user-id-alias';
 const ACTIVE = ['INVITED', 'PENDING'];
 const TTL = 7 * 24 * 60 * 60 * 1000;
 const MAX_MEMBERS = 200;
+const DELIVERY_FLUSH_INTERVAL_MS = 10_000;
+/** 投递重试上限。outbox-depth 的积压/死信定义也引用它，两边不能分叉。 */
+export const GROUP_ADMISSION_DELIVERY_MAX_ATTEMPTS = 8;
 type Tx = Prisma.TransactionClient;
 type Group = {
   id: string;
@@ -840,15 +847,19 @@ export class GroupAdmissionService {
     });
     return { items, nextCursor: rows.length > 50 ? page[49].id : null };
   }
-  @Interval(10_000)
+  @TrackedInterval(DELIVERY_FLUSH_INTERVAL_MS, 'group_admission_delivery')
   async flush() {
-    if (this.delivering) return;
+    if (this.delivering) {
+      // 挡回的那次不能刷新心跳：一轮卡死之后每 10 秒的跳过都会被当成成功。
+      reportJobSkipped();
+      return;
+    }
     this.delivering = true;
     try {
       const jobs = await this.prisma.groupAdmissionDelivery.findMany({
         where: {
           deliveredAt: null,
-          attempts: { lt: 8 },
+          attempts: { lt: GROUP_ADMISSION_DELIVERY_MAX_ATTEMPTS },
           nextAttemptAt: { lte: new Date() },
         },
         orderBy: { createdAt: 'asc' },
@@ -993,7 +1004,11 @@ export class GroupAdmissionService {
             ),
           );
         } catch {
-          const terminal = job.attempts + 1 >= 8;
+          // 失败被改写成重试计数后这一轮照常返回：不报的话记成成功，一直
+          // 投递失败时 CronJobFailing 打不中。
+          reportHandledJobFailure();
+          const terminal =
+            job.attempts + 1 >= GROUP_ADMISSION_DELIVERY_MAX_ATTEMPTS;
           if (terminal)
             businessMetrics.recordEvent(
               'group_admission_delivery_exhausted',

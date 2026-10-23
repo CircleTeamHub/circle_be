@@ -33,6 +33,16 @@ describe('scheduled job coverage', () => {
     expect(offenders).toEqual([]);
   });
 
+  it('has no bare @Interval left — interval jobs need the same heartbeat', () => {
+    // admin_group_operation / group_admission_delivery 曾经是裸 @Interval：
+    // 停摆或一直失败都没有任何信号，队列也不在积压监控里。
+    const offenders = FILES.filter(({ source }) =>
+      /(^|[^a-zA-Z])@Interval\(/m.test(source),
+    ).map(({ path }) => path.slice(SRC.length + 1));
+
+    expect(offenders).toEqual([]);
+  });
+
   it('maps every cron expression actually used to an interval', () => {
     const used = new Set<string>();
     for (const { source } of FILES) {
@@ -56,7 +66,7 @@ describe('scheduled job coverage', () => {
     const names: string[] = [];
     let callSites = 0;
     for (const { source } of FILES) {
-      callSites += [...source.matchAll(/@TrackedCron\(/g)].length;
+      callSites += [...source.matchAll(/@Tracked(?:Cron|Interval)\(/g)].length;
       // 跨行匹配：prettier 会把参数较长的调用点拆成多行并加尾逗号，早先那版
       // 「一行内到右括号」的正则因此静默漏掉了两个任务 —— 漏掉的任务不会报错，
       // 只是不再被这条唯一性断言覆盖。
@@ -65,12 +75,18 @@ describe('scheduled job coverage', () => {
       )) {
         names.push(match[1]);
       }
+      // 间隔任务与定时任务共用 circle_cron_* 序列，名字也必须全局唯一。
+      for (const match of source.matchAll(
+        /@TrackedInterval\(\s*[A-Z0-9_.]+\s*,\s*'([^']+)'/g,
+      )) {
+        names.push(match[1]);
+      }
     }
 
     // 抽取数必须等于调用点数。相等才说明正则没有漏匹配 —— 用它替代写死的
     // 期望条数，新增任务时不用改这里，正则失配时又必红。
     expect(names.length).toBe(callSites);
-    expect(callSites).toBeGreaterThanOrEqual(18);
+    expect(callSites).toBeGreaterThanOrEqual(20);
     // 重名会让两个任务共用一条心跳序列：其中一个停了，另一个的成功还在刷新
     // 时间戳，告警永远不响。
     expect(new Set(names).size).toBe(names.length);

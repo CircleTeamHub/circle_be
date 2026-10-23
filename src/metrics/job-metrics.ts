@@ -65,10 +65,10 @@ const MAX_JOB_NAMES = 100;
 /**
  * 定时任务与 outbox 队列的可观测面。
  *
- * 这里补的是此前**完全没有信号**的一类故障：4 个 outbox 处理器都自己 catch 掉
- * 异常、把错误写进行上的 `lastError` 然后继续，异常永远不会逃出去 —— Sentry
- * 收不到事件（captureError 只在 ErrorLoggingInterceptor 里被调用，即只覆盖 HTTP
- * 5xx），Prometheus 也没有任何指标反映它。队列堵死时大盘上一切正常。
+ * 这里补的是错误监控天然看不见的一类故障：outbox 处理器都自己 catch 掉异常、
+ * 把错误写进行上的 `lastError` 然后继续，异常永远不会逃出去 —— 错误聚合收不到
+ * 事件（它默认关闭，打开后也只收显式上报的那几处），在此之前 Prometheus 也没有
+ * 任何指标反映它。队列堵死时大盘上一切正常。
  * notification-push-outbox 甚至专门设计了 TERMINAL 死信状态「让积压对运维可见」，
  * 但在此之前没有任何东西在看它。
  *
