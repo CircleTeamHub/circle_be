@@ -178,8 +178,10 @@ export class E2eeService {
   ) {
     this.enabled();
     return this.db.$transaction(async (tx) => {
-      // Stable lock order also handles two devices revoking each other.
-      await tx.$queryRaw`SELECT "id" FROM "E2eeDevice" WHERE "id" IN (${targetId}, ${dto.actorDeviceId}) ORDER BY "id" FOR UPDATE`;
+      // Serialize device actions per account before taking device locks.
+      await tx.$queryRaw`SELECT "id" FROM "User" WHERE "id" = ${userID} FOR UPDATE`;
+      // Stable lock order also handles concurrent actions from active devices.
+      await tx.$queryRaw`SELECT "id" FROM "E2eeDevice" WHERE "userID" = ${userID} AND "purpose" = ${purpose} AND "status" = 'ACTIVE' ORDER BY "id" FOR UPDATE`;
       const actor = await this.actor(tx, userID, purpose, dto.actorDeviceId);
       if (purpose === 'AUDIT') {
         const access = await tx.adminAccess.findUnique({
@@ -210,6 +212,22 @@ export class E2eeService {
         throw new ForbiddenException(
           'Revoked identities cannot be approved again',
         );
+      if (
+        action === 'revoke' &&
+        target.id === actor.id &&
+        target.status === 'ACTIVE' &&
+        (await tx.e2eeDevice.count({
+          where: { userID, purpose, status: 'ACTIVE' },
+        })) === 1
+      ) {
+        const recovery = await tx.e2eeRecovery.findUnique({
+          where: { userID_purpose: { userID, purpose } },
+        });
+        if (!recovery)
+          throw new BadRequestException(
+            'Cannot revoke the last active device without recovery',
+          );
+      }
       const result = await tx.e2eeDevice.update({
         where: { id: targetId },
         data:

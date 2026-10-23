@@ -210,17 +210,57 @@ function setup() {
       count: jest.fn(async () => liveSessions.count),
     },
   };
-  let serial = Promise.resolve();
-  const transactionScope = new AsyncLocalStorage<boolean>();
-  (prisma as any).$executeRaw = jest.fn();
-  (prisma as any).$queryRaw = jest.fn().mockResolvedValue([]);
-  (prisma as any).$transaction = jest.fn((fn) => {
+  type TransactionScope = {
+    locks: Set<string>;
+    releases: Array<() => void>;
+  };
+  const transactionScope = new AsyncLocalStorage<TransactionScope>();
+  const lockTails = new Map<string, Promise<void>>();
+  const acquireLock = async (key: string) => {
+    const scope = transactionScope.getStore();
+    if (!scope || scope.locks.has(key)) return;
+
+    const previous = lockTails.get(key) ?? Promise.resolve();
+    let release!: () => void;
+    const held = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const tail = previous.then(() => held);
+    lockTails.set(key, tail);
+    await previous;
+    scope.locks.add(key);
+    scope.releases.push(() => {
+      release();
+      if (lockTails.get(key) === tail) lockTails.delete(key);
+    });
+  };
+  (prisma as any).$executeRaw = jest.fn(
+    async (strings: TemplateStringsArray, ...values: unknown[]) => {
+      if (strings.join('?').includes('pg_advisory_xact_lock')) {
+        await acquireLock(`advisory:${String(values[0])}`);
+      }
+      return 0;
+    },
+  );
+  (prisma as any).$queryRaw = jest.fn(
+    async (strings: TemplateStringsArray, ...values: unknown[]) => {
+      if (/FROM "User"[\s\S]*FOR UPDATE/.test(strings.join('?'))) {
+        await acquireLock(`user:${String(values[0])}`);
+      }
+      return [];
+    },
+  );
+  (prisma as any).$transaction = jest.fn(async (fn) => {
     if (transactionScope.getStore()) return fn(prisma);
-    const next = serial.then(() =>
-      transactionScope.run(true, () => fn(prisma)),
-    );
-    serial = next.catch(() => undefined);
-    return next;
+    const scope: TransactionScope = { locks: new Set(), releases: [] };
+    return transactionScope.run(scope, async () => {
+      try {
+        return await fn(prisma);
+      } finally {
+        scope.releases.reverse();
+        scope.releases.forEach((release) => release());
+      }
+    });
   });
   const realtime = { broadcast: jest.fn() };
   const push = {
@@ -494,6 +534,75 @@ describe('DeviceTrustService approve / verify', () => {
     await expect(service.resend(challengeId, 'stranger')).rejects.toThrow(
       /拒绝/,
     );
+  });
+
+  it('rejects a recovery after a failed completion releases its claim', async () => {
+    const { service, prisma, challenges, challengeId } = await pending();
+    const db = prisma as any;
+    challenges[0].recoveryRequestedAt = new Date(Date.now() - 2000);
+    challenges[0].recoveryAvailableAt = new Date(Date.now() - 1000);
+    await new Promise((resolve) => setImmediate(resolve));
+
+    let claimed!: () => void;
+    const claimHeld = new Promise<void>((resolve) => {
+      claimed = resolve;
+    });
+    let releaseClaim!: () => void;
+    const canReleaseClaim = new Promise<void>((resolve) => {
+      releaseClaim = resolve;
+    });
+    const failedCompletion = db.$transaction(async (tx: any) => {
+      const accountLockKey = 'auth_session:u1';
+      await tx.$executeRaw`SELECT pg_advisory_xact_lock(hashtextextended(${accountLockKey}, 0))`;
+      challenges[0].status = 'CONSUMED';
+      claimed();
+      await canReleaseClaim;
+      challenges[0].status = 'PENDING';
+    });
+    await claimHeld;
+
+    const rejection = service.reject('u1', 'phone', challengeId);
+    await new Promise((resolve) => setImmediate(resolve));
+    releaseClaim();
+    await Promise.all([failedCompletion, rejection]);
+
+    expect(challenges[0].status).toBe('REJECTED');
+  });
+
+  it('reject takes the exact account advisory lock through the transaction client', async () => {
+    const { service, prisma, challengeId } = await pending();
+    const db = prisma as any;
+    await new Promise((resolve) => setImmediate(resolve));
+    const txExecuteRaw = jest.fn().mockResolvedValue(0);
+    const txQueryRaw = jest
+      .fn()
+      .mockRejectedValue(new Error('$queryRaw must not execute void locks'));
+    db.$executeRaw.mockClear();
+    db.$queryRaw.mockClear();
+    db.$transaction.mockClear();
+    db.$transaction.mockImplementationOnce(async (fn: (tx: any) => unknown) =>
+      fn({
+        ...prisma,
+        $executeRaw: txExecuteRaw,
+        $queryRaw: txQueryRaw,
+      }),
+    );
+
+    await service.reject('u1', 'phone', challengeId);
+
+    expect(db.$transaction).toHaveBeenCalledWith(expect.any(Function), {
+      maxWait: 10000,
+      timeout: 30000,
+    });
+    expect(txExecuteRaw).toHaveBeenCalledTimes(1);
+    const [strings, lockKey] = txExecuteRaw.mock.calls[0];
+    expect(strings.join('?')).toBe(
+      'SELECT pg_advisory_xact_lock(hashtextextended(?, 0))',
+    );
+    expect(lockKey).toBe('auth_session:u1');
+    expect(txQueryRaw).not.toHaveBeenCalled();
+    expect(db.$executeRaw).not.toHaveBeenCalled();
+    expect(db.$queryRaw).not.toHaveBeenCalled();
   });
 
   it('resend opens a fresh challenge only after the old one expired', async () => {
