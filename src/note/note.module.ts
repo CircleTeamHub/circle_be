@@ -8,11 +8,17 @@ import { NoteController } from './note.controller';
 import { NoteService } from './note.service';
 import { NoteShareLinkCleanup } from './note-share-link.cleanup';
 import { NoteRecycleBinCleanup } from './note-recycle-bin.cleanup';
+import { NoteStatusFanoutOutboxProcessor } from './note-status-fanout-outbox.processor';
 
 @Module({
   imports: [UploadModule, MembershipPolicyModule, RealtimeModule, ChatModule],
   controllers: [NoteController, NoteShareLinkPublicController],
-  providers: [NoteService, NoteShareLinkCleanup, NoteRecycleBinCleanup],
+  providers: [
+    NoteService,
+    NoteShareLinkCleanup,
+    NoteRecycleBinCleanup,
+    NoteStatusFanoutOutboxProcessor,
+  ],
   exports: [NoteService],
 })
 export class NoteModule {}

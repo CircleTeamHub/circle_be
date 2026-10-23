@@ -69,6 +69,9 @@ describe('NoteService', () => {
       updateMany: jest.fn(),
       deleteMany: jest.fn(),
     },
+    noteStatusFanoutOutbox: {
+      upsert: jest.fn(),
+    },
     noteGroup: {
       count: jest.fn(),
       findMany: jest.fn(),
@@ -2596,18 +2599,10 @@ describe('NoteService', () => {
     });
   });
 
-  it('broadcasts source status changes to the source owner and collected-copy owners', async () => {
+  it('atomically enqueues source status fan-out without scanning or broadcasting in the request', async () => {
     const realtime = {
-      safeBroadcastAll: jest.fn(async (fns: Array<() => unknown>) => {
-        await Promise.all(fns.map((fn) => fn()));
-      }),
+      safeBroadcastAll: jest.fn(),
       broadcastNoteSourceStatusChanged: jest.fn(),
-    };
-    (prisma as any).chatMessage = {
-      findMany: jest.fn().mockResolvedValue([{ conversationID: 'chat-1' }]),
-    };
-    (prisma as any).chatMember = {
-      findMany: jest.fn().mockResolvedValue([{ userID: 'chat-recipient' }]),
     };
     const configured = new NoteService(
       prisma as any,
@@ -2620,60 +2615,50 @@ describe('NoteService', () => {
       realtime as any,
     );
     prisma.note.findFirst.mockResolvedValueOnce({
-      id: 'source-note',
+      id: 'copy-note',
       ownerID: 'boss',
       status: 'ACTIVE',
-      collectedFromNoteID: null,
+      collectedFromNoteID: 'parent-note',
+      rootSourceNoteID: 'source-note',
     });
     prisma.note.update.mockResolvedValueOnce({
-      id: 'source-note',
+      id: 'copy-note',
       available: false,
     });
-    prisma.note.findMany
-      .mockResolvedValueOnce([
-        {
-          id: 'source-note',
+
+    await configured.setAvailable('boss', 'copy-note', false);
+
+    expect(prisma.$transaction).toHaveBeenCalledWith(expect.any(Function));
+    expect(prisma.note.update).toHaveBeenCalledWith(
+      expect.objectContaining({
+        where: {
+          id: 'copy-note',
           ownerID: 'boss',
-          status: 'ACTIVE',
-          available: false,
-          workStatus: 'CLOSED',
-          collectedFromNoteID: null,
+          status: { not: 'DELETED' },
         },
-      ])
-      .mockResolvedValueOnce([{ id: 'copy-note', ownerID: 'agent' }])
-      .mockResolvedValueOnce([]);
-
-    await configured.setAvailable('boss', 'source-note', false);
-
-    expect(realtime.broadcastNoteSourceStatusChanged).toHaveBeenCalledWith(
-      'boss',
-      expect.objectContaining({
-        sourceNoteId: 'source-note',
-        workStatus: 'CLOSED',
-        status: 'ACTIVE',
-        available: false,
       }),
     );
-    expect(realtime.broadcastNoteSourceStatusChanged).toHaveBeenCalledWith(
-      'agent',
-      expect.objectContaining({ sourceNoteId: 'source-note' }),
-    );
-    expect(realtime.broadcastNoteSourceStatusChanged).toHaveBeenCalledWith(
-      'chat-recipient',
-      expect.objectContaining({ sourceNoteId: 'source-note' }),
-    );
-    expect((prisma as any).chatMessage.findMany).toHaveBeenCalledWith(
-      expect.objectContaining({
-        where: expect.objectContaining({
-          OR: expect.arrayContaining([
-            { content: { path: ['sourceNoteId'], equals: 'source-note' } },
-            { content: { path: ['noteId'], equals: 'source-note' } },
-          ]),
-        }),
+    expect(prisma.noteStatusFanoutOutbox.upsert).toHaveBeenCalledWith({
+      where: { rootNoteID: 'source-note' },
+      create: expect.objectContaining({
+        rootNoteID: 'source-note',
+        status: 'PENDING',
+        stage: 'OWNERS',
       }),
-    );
-    delete (prisma as any).chatMessage;
-    delete (prisma as any).chatMember;
+      update: expect.objectContaining({
+        status: 'PENDING',
+        stage: 'OWNERS',
+        generation: { increment: 1 },
+        noteCursor: null,
+        chatConversationCursor: null,
+        chatUserCursor: null,
+        lockedAt: null,
+        leaseToken: null,
+      }),
+    });
+    expect(prisma.note.findMany).not.toHaveBeenCalled();
+    expect(realtime.safeBroadcastAll).not.toHaveBeenCalled();
+    expect(realtime.broadcastNoteSourceStatusChanged).not.toHaveBeenCalled();
   });
 
   it('updates note status for the owner only', async () => {
@@ -2697,6 +2682,29 @@ describe('NoteService', () => {
       id: 'note-1',
       status: 'UNLISTED',
     });
+    expect(prisma.noteStatusFanoutOutbox.upsert).toHaveBeenCalledWith(
+      expect.objectContaining({ where: { rootNoteID: 'note-1' } }),
+    );
+  });
+
+  it('atomically enqueues work-status changes for a source note', async () => {
+    prisma.note.findFirst.mockResolvedValueOnce({
+      id: 'source-note',
+      ownerID: 'boss',
+      collectedFromNoteID: null,
+      rootSourceNoteID: null,
+    });
+    prisma.note.update.mockResolvedValueOnce({
+      id: 'source-note',
+      workStatus: 'CLOSED',
+    });
+
+    await service.setWorkStatus('boss', 'source-note', 'CLOSED');
+
+    expect(prisma.$transaction).toHaveBeenCalledWith(expect.any(Function));
+    expect(prisma.noteStatusFanoutOutbox.upsert).toHaveBeenCalledWith(
+      expect.objectContaining({ where: { rootNoteID: 'source-note' } }),
+    );
   });
 
   it('soft deletes a note', async () => {
@@ -2718,6 +2726,9 @@ describe('NoteService', () => {
       select: expect.any(Object),
     });
     expect(prisma.note.count).not.toHaveBeenCalled();
+    expect(prisma.noteStatusFanoutOutbox.upsert).toHaveBeenCalledWith(
+      expect.objectContaining({ where: { rootNoteID: 'note-1' } }),
+    );
   });
 
   it('does not restore a soft-deleted note through the writable status path', async () => {
@@ -4006,6 +4017,7 @@ describe('NoteService', () => {
       ownerID: 'user-1',
       title: '分享的笔记',
       collectedFromNoteID: 'note-src',
+      rootSourceNoteID: 'note-src',
       imageCount: 1,
       videoCount: 1,
       mediaCount: 2,
@@ -4458,6 +4470,49 @@ describe('NoteService', () => {
         service.getNote('user-1', 'relay-copy'),
       ).rejects.toBeInstanceOf(NotFoundException);
     });
+
+    it.each([
+      ['canonical root id', 'boss-note'],
+      ['legacy null root id', null],
+    ])(
+      'blocks a copy deeper than the traversal cap with %s',
+      async (_label, rootSourceNoteID) => {
+        prisma.note.findFirst.mockResolvedValueOnce({
+          ...relayCopy,
+          id: 'deep-copy',
+          collectedFromNoteID: 'relay-9',
+          rootSourceNoteID,
+        });
+        prisma.note.findMany.mockImplementation(async (args: any) => {
+          const requestedID = args.where.id.in[0];
+          if (requestedID === 'boss-note') {
+            return [rootState({ status: 'UNLISTED' })];
+          }
+          const relay = /^relay-(\d+)$/.exec(requestedID);
+          if (!relay) return [];
+          const level = Number(relay[1]);
+          return [
+            {
+              id: requestedID,
+              status: 'ACTIVE',
+              available: true,
+              workStatus: null,
+              collectedFromNoteID:
+                level === 1 ? 'boss-note' : `relay-${level - 1}`,
+            },
+          ];
+        });
+
+        await expect(
+          service.getNote('user-1', 'deep-copy'),
+        ).rejects.toBeInstanceOf(NotFoundException);
+        if (rootSourceNoteID) {
+          expect(prisma.note.findMany).toHaveBeenCalledWith(
+            expect.objectContaining({ where: { id: { in: ['boss-note'] } } }),
+          );
+        }
+      },
+    );
 
     it('getNote keeps the copy readable for its own owner with the source state overlaid', async () => {
       prisma.note.findFirst.mockResolvedValueOnce(relayCopy);
@@ -6056,5 +6111,25 @@ describe('NoteService', () => {
         errorCode: 'NOTE_RESTORE_DUPLICATE',
       }),
     });
+  });
+
+  it('restores and enqueues the root fan-out in the same serializable transaction', async () => {
+    prisma.note.findFirst
+      .mockResolvedValueOnce({
+        id: 'deleted-copy',
+        collectedFromNoteID: 'parent-copy',
+        rootSourceNoteID: 'source-note',
+      })
+      .mockResolvedValueOnce(null);
+    prisma.note.updateMany.mockResolvedValueOnce({ count: 1 });
+
+    await service.restoreNote('user-1', 'deleted-copy');
+
+    expect(prisma.$transaction).toHaveBeenCalledWith(expect.any(Function), {
+      isolationLevel: 'Serializable',
+    });
+    expect(prisma.noteStatusFanoutOutbox.upsert).toHaveBeenCalledWith(
+      expect.objectContaining({ where: { rootNoteID: 'source-note' } }),
+    );
   });
 });
