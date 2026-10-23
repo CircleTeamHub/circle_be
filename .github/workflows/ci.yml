@@ -60,6 +60,7 @@ jobs:
           bash test/release-force-command.spec.sh
           bash test/sync-metrics-token.spec.sh
           bash test/backup-check-metrics.spec.sh
+          bash test/offsite-backup-metrics.spec.sh
           node --test test/prometheus-alerts.spec.mjs
           node --test test/monitoring-operations-dashboard.spec.mjs
 

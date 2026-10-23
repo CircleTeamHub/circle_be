@@ -64,6 +64,7 @@ describe('createReadinessHandler', () => {
       database: 'up',
       redis: 'up',
       objectStore: 'disabled',
+      objectStoreReachable: 'disabled',
     });
   });
 
@@ -84,6 +85,7 @@ describe('createReadinessHandler', () => {
       database: 'down',
       redis: 'up',
       objectStore: 'disabled',
+      objectStoreReachable: 'disabled',
     });
     // The probe body stays terse, so the cause has to reach the logs.
     expect(errorSpy).toHaveBeenCalledWith(
@@ -107,6 +109,7 @@ describe('createReadinessHandler', () => {
       database: 'up',
       redis: 'down',
       objectStore: 'disabled',
+      objectStoreReachable: 'disabled',
     });
   });
 
@@ -127,6 +130,7 @@ describe('createReadinessHandler', () => {
       database: 'up',
       redis: 'disabled',
       objectStore: 'disabled',
+      objectStoreReachable: 'disabled',
     });
   });
 
@@ -145,6 +149,7 @@ describe('createReadinessHandler', () => {
       database: 'up',
       redis: 'disabled',
       objectStore: 'disabled',
+      objectStoreReachable: 'disabled',
     });
   });
 });
@@ -209,6 +214,63 @@ describe('createReadinessHandler object store reporting', () => {
 
     expect(res.json).toHaveBeenCalledWith(
       expect.objectContaining({ objectStore: 'disabled' }),
+    );
+  });
+});
+
+describe('createReadinessHandler object store reachability', () => {
+  // 桶策略状态是启动时算好的缓存值，存储真挂了它照样是 ok。这里报告一次真实的
+  // 往返（带缓存与超时，见 UploadService.objectStoreReachable）。
+  function reachableStore(reachable: boolean | null): HealthObjectStore {
+    return {
+      objectStoreStatus: jest.fn(() => 'ok' as const),
+      objectStoreReachable: jest.fn(async () => reachable),
+    };
+  }
+
+  it.each([
+    [true, 'up'],
+    [false, 'down'],
+    [null, 'disabled'],
+  ] as const)('reports reachable=%s as %s', async (reachable, expected) => {
+    const res = buildResponse();
+
+    await createReadinessHandler({
+      database: buildDatabase(Promise.resolve([])),
+      redis: buildRedis(false),
+      objectStore: reachableStore(reachable),
+    })({} as never, res as never);
+
+    expect(res.json).toHaveBeenCalledWith(
+      expect.objectContaining({ objectStoreReachable: expected }),
+    );
+  });
+
+  it('does not gate readiness on an unreachable object store', async () => {
+    // 存储故障在每个副本上都一样：拿它判 not-ready 会把整个集群同时摘掉，聊天、
+    // 登录这些不依赖存储的功能也一起下线。报告 + ObjectStoreUnreachable 告警。
+    const res = buildResponse();
+
+    await createReadinessHandler({
+      database: buildDatabase(Promise.resolve([])),
+      redis: buildRedis(false),
+      objectStore: reachableStore(false),
+    })({} as never, res as never);
+
+    expect(res.status).toHaveBeenCalledWith(200);
+  });
+
+  it('reports disabled for a store that cannot probe reachability', async () => {
+    const res = buildResponse();
+
+    await createReadinessHandler({
+      database: buildDatabase(Promise.resolve([])),
+      redis: buildRedis(false),
+      objectStore: buildObjectStore('ok'),
+    })({} as never, res as never);
+
+    expect(res.json).toHaveBeenCalledWith(
+      expect.objectContaining({ objectStoreReachable: 'disabled' }),
     );
   });
 });

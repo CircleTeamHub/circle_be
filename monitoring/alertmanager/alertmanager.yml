@@ -79,13 +79,30 @@ inhibit_rules:
       - alertname = "TlsCertificateExpiringSoon"
     equal: ['instance']
 
-  # 同一块盘剩不到 5% 时只留 critical。理由同上：主机上不止一个挂载点，只比
-  # 告警名的话，一块盘的 critical 会静音另一块盘的 warning。
+  # 同一块盘剩不到 5% 时只留 critical（低档阈值和 24 小时趋势都是它的前兆）。
+  # 理由同上：主机上不止一个挂载点，只比告警名的话，一块盘的 critical 会静音
+  # 另一块盘的 warning。
   - source_matchers:
       - alertname = "HostDiskNearlyFull"
     target_matchers:
-      - alertname = "HostDiskFilling"
+      - alertname =~ "HostDiskFilling|HostDiskWillFillWithin24h"
     equal: ['instance', 'mountpoint']
+
+  # inode 两档，同盘配对，同理。
+  - source_matchers:
+      - alertname = "HostInodesNearlyExhausted"
+    target_matchers:
+      - alertname = "HostInodesLow"
+    equal: ['instance', 'mountpoint']
+
+  # 存储整个连不上时，服务端读写必然大面积失败 —— 同一件事不报两遍。只压
+  # object_storage：LiveKit 的失败与存储无关，必须照常报。
+  - source_matchers:
+      - alertname = "ObjectStoreUnreachable"
+    target_matchers:
+      - alertname = "DependencyRequestsFailing"
+      - dependency = "object_storage"
+    equal: []
 
   # 数据库挂了 → 所有依赖它的任务/队列都会积压，别再各报一遍。
   #

@@ -28,6 +28,8 @@ import { getSignedUrl } from '@aws-sdk/s3-request-presigner';
 import { randomUUID } from 'crypto';
 import { createLoggingConfig } from 'src/logging/logging.config';
 import { logExternalCallFailure } from 'src/logging/external-service.logger';
+import { instrumentObjectStorageClient } from './object-storage-metrics';
+import { createCachedProbe } from 'src/utils/cached-probe';
 import { logExternalCallSlow } from 'src/logging/performance-event.logger';
 import { reportOperationalError } from 'src/logging/error-aggregation.service';
 import { sanitizeLogValue } from 'src/logging/log-sanitizer';
@@ -291,6 +293,7 @@ export class UploadService implements OnModuleInit {
   private readonly deliveryUrlUnusable: boolean;
   private readonly enabled: boolean;
   private readonly production: boolean;
+  private reachabilityProbe: (() => Promise<boolean>) | null = null;
   private ready = false;
   // 与 `ready` 分开跟踪：ready 涵盖「桶存在 + 策略已应用」，而只有策略这一项关乎
   // 「私有笔记媒体是否真的私有」。见 objectStoreStatus()。
@@ -367,6 +370,9 @@ export class UploadService implements OnModuleInit {
       forcePathStyle,
       requestChecksumCalculation: 'WHEN_REQUIRED',
     });
+    // 服务端读写的成败计数（DependencyRequestsFailing）。publicClient 只用来
+    // 预签名、从不发请求，不需要。
+    instrumentObjectStorageClient(this.client);
 
     this.publicClient = new S3Client({
       endpoint: this.publicUrl,
@@ -974,5 +980,27 @@ export class UploadService implements OnModuleInit {
     if (!this.enabled) return 'disabled';
     if (!this.manageBucket) return 'external-unverified';
     return this.mediaPolicyApplied ? 'ok' : 'policy-unconfirmed';
+  }
+
+  /**
+   * 对象存储此刻是否可达：一次真实的 HeadBucket 往返（/readyz 与
+   * circle_object_store_up 用）。上面的 objectStoreStatus 是启动时算好的缓存值，
+   * 存储真挂了它照样是 ok。
+   *
+   * 结果缓存 30 秒、超时 2 秒，避免健康检查和抓取把云存储打成高频。未启用对象
+   * 存储时返回 null（不探测，也不该告警）。只报告、不参与就绪判断，理由同上。
+   */
+  objectStoreReachable(): Promise<boolean | null> {
+    if (!this.enabled) return Promise.resolve(null);
+    this.reachabilityProbe ??= createCachedProbe(
+      async (abortSignal) => {
+        await this.client.send(new HeadBucketCommand({ Bucket: this.bucket }), {
+          abortSignal,
+        });
+        return true;
+      },
+      { ttlMs: 30_000, timeoutMs: 2_000 },
+    );
+    return this.reachabilityProbe();
   }
 }
