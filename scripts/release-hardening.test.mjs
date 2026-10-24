@@ -96,7 +96,18 @@ test('Caddy emits privacy-safe access logs only for websocket handshakes', () =>
     apiBlock,
     /log_append @chat_ws traceId \{http\.vars\.connection_trace_id\}/,
   );
-  assert.equal(apiBlock.match(/\{http\.request\.uuid\}/g)?.length, 1);
+  // 请求 UUID 只用来生成两个 WebSocket 网关（/chat-ws、/realtime）的连接追踪 ID，
+  // 不出现在任何别的地方。
+  assert.deepEqual(
+    apiBlock
+      .split('\n')
+      .filter((line) => line.includes('{http.request.uuid}'))
+      .map((line) => line.trim()),
+    [
+      'vars @chat_ws connection_trace_id ws-{http.request.uuid}',
+      'vars @realtime_ws connection_trace_id ws-{http.request.uuid}',
+    ],
+  );
   // filter 编码器要求 wrap 一个底层编码器,并把字段过滤放进 fields 块;把过滤
   // 直接写在 format filter 下会被 caddy validate 拒绝,而 release-deploy.sh 每次
   // 切流前都跑 validate —— 语法错就是发布被卡死。正文还是纯文本比对,真正的
