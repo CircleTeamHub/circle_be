@@ -66,7 +66,10 @@ REST 与 socket ack 共用;敏感词命中 = `CHAT_SENSITIVE_WORD_BLOCKED`
 
 ## REST
 
-- `GET /api/v1/chat/conversations` — 会话列表(末条消息、未读数、DIRECT 对端)。
+- `GET /api/v1/chat/conversations?limit&cursor` — 会话列表(末条消息、未读数、DIRECT 对端),
+  响应体是数组。不带 `cursor`:置顶优先、再按末条消息时间倒序,截断只靠 `X-Has-More`;
+  带 `cursor`(空串 = 从头):按会话 id 升序键集翻页,还有下一页时响应头 `X-Next-Cursor`
+  给出下一次的 `cursor`。翻页途中来新消息不会漏行/重复。
 - `POST /api/v1/chat/conversations/direct` `{peerUserId}` — 取或建单聊
   (directKey = 两 userID 码位序拼接,唯一约束防并发重建;拉黑双向拒建)。
 - `GET /api/v1/chat/conversations/:id/messages?beforeHeight&limit` —

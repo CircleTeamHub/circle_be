@@ -1526,7 +1526,62 @@ export class ChatService {
     });
     const hasMore = rows.length > limit;
     const memberships = hasMore ? rows.slice(0, limit) : rows;
-    if (memberships.length === 0) return { conversations: [], hasMore };
+    return {
+      conversations: await this.buildConversationList(userId, memberships),
+      hasMore,
+    };
+  }
+
+  /**
+   * 会话列表的键集分页：按 conversationID 升序，只返回 id 严格大于 cursor 的会话
+   * （空串 = 从头开始）。
+   *
+   * 活跃度排序下不能用 offset 翻页：翻页间隙里来一条新消息就会把会话挪到别的页，
+   * 漏行或重复；id 不会变，键集按它走，中途怎么来消息都一个不落。顺序由客户端
+   * 自己按置顶 / 末条消息时间重排。成员过滤、limit 与每行 DTO 与旧模式完全一致。
+   *
+   * 索引：一个用户最多几千个座位，走 userID 打头的索引（含 leftAt/hiddenAt 条件的
+   * 部分索引）取出本人可见座位再按 id 排序即可，不需要新索引。
+   */
+  async listConversationsKeysetPage(
+    userId: string,
+    cursor: string,
+    limit: number = CONVERSATION_LIST_MAX,
+  ): Promise<{
+    conversations: ChatConversationDto[];
+    hasMore: boolean;
+    nextCursor: string | null;
+  }> {
+    const rows = await this.prisma.chatMember.findMany({
+      where: {
+        userID: userId,
+        leftAt: null,
+        hiddenAt: null,
+        ...(cursor === '' ? {} : { conversationID: { gt: cursor } }),
+      },
+      include: { conversation: true },
+      orderBy: { conversationID: 'asc' },
+      take: limit + 1,
+    });
+    const hasMore = rows.length > limit;
+    const memberships = hasMore ? rows.slice(0, limit) : rows;
+    const last = memberships[memberships.length - 1];
+    return {
+      conversations: await this.buildConversationList(userId, memberships),
+      hasMore,
+      nextCursor: hasMore && last ? last.conversationID : null,
+    };
+  }
+
+  /**
+   * 会话列表每一行的 DTO：对端信息 / 末条消息 / 未读数 / 群信息等按整页批量取，
+   * 查询次数不随会话数增长。旧的活跃度分页与键集分页共用这一条路径。
+   */
+  private async buildConversationList(
+    userId: string,
+    memberships: Array<ChatMember & { conversation: ChatConversation }>,
+  ): Promise<ChatConversationDto[]> {
+    if (memberships.length === 0) return [];
 
     const conversationIds = memberships.map((m) => m.conversationID);
     const directIds = memberships
@@ -1651,7 +1706,7 @@ export class ChatService {
         .map((c) => c.lastMessage)
         .filter((m): m is ChatMessageDto => m !== null),
     );
-    return { conversations: list, hasMore };
+    return list;
   }
 
   /**
