@@ -105,7 +105,8 @@ pg 连接池排队、Postgres 连接与状态、Redis 内存与被拒连接）�
 **「circle_be — Deliveries, Dependencies & Business」**（推送与验证码邮件的结果和失败率、对象存储与 LiveKit 请求及可达性、发版异地备份、业务事件、上传预签名、漏网 rejection）。
 
 开了日志 overlay 时，Loki 还按 `monitoring/loki/rules/fake/*.yml` 做日志告警（进程崩溃退出、
-error 日志突增、Caddy 反代失败与证书错误），与 Prometheus 告警走同一个 Alertmanager。
+error 日志突增、Caddy 反代失败与证书错误，以及安全事件：猜安全码、批量锁定、吊销令牌重放、
+伪造令牌突增），与 Prometheus 告警走同一个 Alertmanager。
 入口 `:3001`，密码取自 `monitoring/.env`（**没有默认值**，且只在数据卷首次启动时生效 —— 见 monitoring/README.md 的首启动坑）。
 
 ### 7. Alertmanager —— 告警路由（不产数据）

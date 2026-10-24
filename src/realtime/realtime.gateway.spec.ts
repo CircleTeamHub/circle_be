@@ -149,6 +149,7 @@ describe('RealtimeGateway failure logging privacy', () => {
       promotePendingClient: jest.fn().mockReturnValue(true),
       unregisterClient: jest.fn(),
       emitSnapshot: jest.fn().mockRejectedValue(failure),
+      wasClosedForRevocation: jest.fn().mockReturnValue(false),
     };
     const gateway = new RealtimeGateway(
       {
@@ -370,7 +371,13 @@ describe('RealtimeGateway session revocation', () => {
         code: 1011,
         reason: 'Internal error',
       });
-      expect(logError).toHaveBeenCalledWith('Realtime socket admission failed');
+      expect(logError).toHaveBeenCalledWith(
+        expect.objectContaining({
+          event: 'realtime_auth_rejected',
+          reason: 'error',
+          traceId: expect.stringMatching(/^ws-/),
+        }),
+      );
       expect(JSON.stringify(logError.mock.calls)).not.toContain('private-user');
       expect(JSON.stringify(logError.mock.calls)).not.toContain(
         'private-token',
