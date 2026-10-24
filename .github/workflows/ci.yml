@@ -398,6 +398,8 @@ jobs:
           tags: circle-caddy:ci
           cache-from: type=gha
           cache-to: type=gha,mode=max
+          # 运行阶段每次重建：缓存里的 apk upgrade 层会停在上次构建时的包版本。
+          no-cache-filters: runtime
 
       - name: Verify Caddy rate-limit module
         run: |

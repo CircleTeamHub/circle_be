@@ -109,6 +109,17 @@ test("the peer-address filter removes the client's IP and port from socket error
   );
 });
 
+test('CI rebuilds the Caddy runtime stage so Alpine fixes are not served from cache', () => {
+  // 基础镜像没更新时，带缓存的构建会沿用旧的 apk upgrade 层，已修好的系统包漏洞
+  // 照样让 Trivy 的 Caddy 扫描红（brotli-libs CVE-2026-111497 就是这样）。
+  assert.match(CADDY_DOCKERFILE, /^FROM caddy:2-alpine AS runtime\nRUN apk upgrade --no-cache$/m);
+  const build = read('.github/workflows/ci.yml').match(
+    /file: Dockerfile\.caddy\n([\s\S]*?)\n\n/,
+  );
+  assert.ok(build, 'no Caddy image build in ci.yml');
+  assert.match(build[1], /\n\s*no-cache-filters: runtime(\n|$)/);
+});
+
 test('the Caddy log directory is readable by the collector and lives in its own volume', () => {
   assert.match(CADDY_DOCKERFILE, /mkdir -p \/var\/log\/caddy/);
   assert.match(CADDY_DOCKERFILE, /chmod 0755 \/var\/log\/caddy/);
