@@ -314,6 +314,41 @@ tests:
         exp_alerts: []
 
   - interval: 1m
+    name: Loki 的日志告警发不到 Alertmanager 时触发并在窗口过期后恢复
+    input_series:
+      - series: 'loki_prometheus_notifications_errors_total{alertmanager="http://alertmanager:9093/api/v2/alerts",user="fake"}'
+        values: '0+0x2 1+0x30'
+      - series: 'loki_prometheus_notifications_dropped_total{alertmanager="http://alertmanager:9093/api/v2/alerts",user="fake"}'
+        values: '0+0x32'
+    alert_rule_test:
+      - eval_time: 10m
+        alertname: LokiRulerNotificationsFailing
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+            exp_annotations:
+              summary: 'Loki could not deliver log-based alerts to Alertmanager in the last 10m — is Alertmanager on the logs network?'
+      - eval_time: 20m
+        alertname: LokiRulerNotificationsFailing
+        exp_alerts: []
+
+  - interval: 1m
+    name: Loki 丢弃日志告警同样触发
+    input_series:
+      - series: 'loki_prometheus_notifications_errors_total{user="fake"}'
+        values: '0+0x20'
+      - series: 'loki_prometheus_notifications_dropped_total{user="fake"}'
+        values: '0+0x2 3+0x18'
+    alert_rule_test:
+      - eval_time: 10m
+        alertname: LokiRulerNotificationsFailing
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+            exp_annotations:
+              summary: 'Loki could not deliver log-based alerts to Alertmanager in the last 10m — is Alertmanager on the logs network?'
+
+  - interval: 1m
     name: Alloy 持续重试且目标健康时触发
     input_series:
       - series: 'loki_write_batch_retries_total{component_id="loki.write.local"}'

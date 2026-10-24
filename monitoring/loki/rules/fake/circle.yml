@@ -1,0 +1,52 @@
+# Loki 日志告警。指标里看不到、只出现在日志里的几类故障：
+# Loki 以单租户模式运行（auth_enabled: false），租户名固定是 fake —— 规则必须
+# 放在 rules/fake/ 下才会被加载。告警发给与 Prometheus 同一个 Alertmanager。
+groups:
+  - name: circle-logs
+    interval: 1m
+    rules:
+      # 进程因未捕获异常退出前写的那一行（src/logging/fatal-log-file.ts → 采集目录
+      # 里的 application-fatal.log）。重启后进程照常服务，指标上看不出来；单次
+      # 也值得一看，所以不设 for。
+      - alert: BackendFatalExit
+        expr: |
+          sum(count_over_time({service="circle-be"} |= "[fatal] Uncaught exception" [10m])) > 0
+        labels:
+          severity: warning
+        annotations:
+          summary: 'The backend exited on an uncaught exception in the last 10m — see the [fatal] line in Loki'
+
+      # 兜底：error 级日志突增。阈值按单机量级取，宁可迟报；具体是哪一类，在
+      # Grafana Explore 里按 `| json` 的 event / component 字段分组看。
+      # for 比窗口长：一阵突发只在 5m 窗口里待 5 分钟，撑不满 10 分钟的 for，
+      # 持续出错才会响。窗口比 for 长的话，一次突发就够了。
+      - alert: BackendErrorLogSpike
+        expr: |
+          sum(count_over_time({service="circle-be", level="error"} [5m])) > 50
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: 'Backend has kept writing more than 50 error-level log lines per 5m for 10m'
+
+      # Caddy 反代失败（上游连不上、读写中断）。只算 error 级：客户端自己断开
+      # 之类是 warn/debug，量大且与上游无关。蓝绿切换的一瞬间会有零星几条，窗口与
+      # for 的关系同上 —— 一次切换的突发撑不满 for。
+      - alert: CaddyProxyErrors
+        expr: |
+          sum(count_over_time({service="caddy", level="error"} | json | logger=~"http\\.log\\.error.*|http\\.handlers\\.reverse_proxy" [5m])) > 10
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: 'Caddy has kept failing to proxy more than 10 requests per 5m for 10m — is an upstream down or restarting?'
+
+      # 证书签发/续期出错。TlsCertificateExpiringSoon 要等到剩 14 天才响，这条在
+      # 续期第一次失败时就能看到原因（DNS、ACME 限流、80 端口被挡）。
+      - alert: CaddyCertificateErrors
+        expr: |
+          sum(count_over_time({service="caddy", level="error"} | json | logger=~"tls.*" [30m])) > 0
+        labels:
+          severity: warning
+        annotations:
+          summary: 'Caddy logged a TLS certificate error in the last 30m — renewal may be failing'

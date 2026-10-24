@@ -418,11 +418,13 @@ jobs:
             deploy/app-env-preflight.sh
             deploy/app-env-transaction.sh
             deploy/offsite-backup.sh
+            deploy/sync-ops-stacks.sh
             deploy/Caddyfile.admin
             monitoring/sync-metrics-token.sh
             monitoring/docker-compose.logs.yml
             monitoring/alloy/config.alloy
             monitoring/loki/config.yml
+            monitoring/loki/rules/fake/circle.yml
             monitoring/grafana/provisioning/datasources/loki.yml
             monitoring/grafana/provisioning/datasources/loki.yml.example
             monitoring/prometheus/logs-targets.yml

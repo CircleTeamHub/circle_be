@@ -52,10 +52,23 @@ sudo netfilter-persistent save   # 持久化,重启不丢
 
 ```bash
 rsync -az --delete \
-  --exclude node_modules --exclude dist --exclude .git \
+  --exclude node_modules --exclude dist --exclude .git --exclude .claude \
+  --exclude /logs --exclude /coverage --exclude /.release \
+  --include /.env.example --include '/.env.*.example' \
+  --exclude /.env --exclude '/.env.*' \
+  --exclude /monitoring/.env --exclude /monitoring/.env.exporters \
+  --exclude '/monitoring/alertmanager/*.url' \
+  --exclude /monitoring/prometheus/metrics_token \
+  --exclude '/monitoring/prometheus/probe-targets/*.yml' \
   -e "ssh -i ~/.ssh/circle_oracle" \
   ./ ubuntu@<公网IP>:~/circle_be/
 ```
+
+`--delete` 会删掉服务器上所有「仓库里没有」的文件，所以本机生成的配置必须排除：
+应用与备份凭证(`.env*`)、监控栈的 Grafana 密码与 exporter 连接串、Alertmanager
+webhook、Prometheus 抓取令牌与公网探测目标、发布状态目录 `.release` 和日志。反过来
+这也挡住了把本地开发用的 `.env` 传上去覆盖服务器那份。排除清单与发版 launcher
+(`deploy/release-launcher.sh`)的一致，`test/deploy-host-config.spec.mjs` 守着两边。
 
 ## 4. 生成配置并启动核心栈
 
@@ -174,6 +187,21 @@ flock 单飞锁 → 拉镜像 → pg_dump 备份(保留 7 份,~/circle_be_backup
 → 容器健康门禁(300s)→ validate 并原子 reload Caddy 到新色的唯一容器端点
   (`circle-be-blue` / `circle-be-green`)→ 走公网域名烟测
 → 通过:停/删旧色,完成;失败:代理切回旧色并清理新色,CI 标红
+→ 完成后:同步已经在跑的可选运维栈(deploy/sync-ops-stacks.sh)——备份 overlay
+  的 backup/backup-metrics,监控栈及日志 overlay,让新的告警规则、抑制、Loki/Alloy
+  配置随发布生效。只动从这棵树启动的栈里**正在跑**的服务(停掉的不拉起、新增的
+  不自动起),挂单文件配置的服务和 Alertmanager 强制重建;绝不碰 postgres,也不
+  强制重建 backup(两者共用 pgbackrest.conf,改它要择时一起重启);失败只告警。
+  以下情况跳过并提示:挂载源缺失、`monitoring/.env.exporters` 缺失(exporter 会以
+  空连接串重建)、日志 overlay 要的 caddy_logs 卷还没建、手动回滚(历史树叠了当前
+  工具,overlay 会留 `.release-tooling-overlay` 标记)。整个同步共用 300s 预算,备份
+  镜像构建最多用其中三分之一;会重建容器的一步至少要剩 60s 才开始,中途失败会把
+  停下的服务按新配置再拉起来。没能确认项目里每个容器都按同一组文件起来时不清孤儿。
+  **关闭**:`touch .release/skip-ops-sync`(自动发版的环境变量是固定的,环境变量
+  `RELEASE_SYNC_OPS_STACKS=0` 只对手动运行有效)。
+  **前提是服务器上的 launcher 已更新**(docs/release-hardening-runbook.md 的升级
+  步骤):旧 launcher 的 rsync 会删掉 `.env.backup` 与 monitoring 下的本机配置,
+  并把整棵树收成 go-rwx;同步脚本看不到新 launcher 的标记就整个跳过。
 ```
 
 Caddy 通过 `CIRCLE_BE_UPSTREAM` 明确选择在役颜色，并把选择原子写入
@@ -183,7 +211,10 @@ Caddy 通过 `CIRCLE_BE_UPSTREAM` 明确选择在役颜色，并把选择原子�
 为 JSON，SPA 的 `200 text/html` 不会被误判为成功。
 两色交接期间请求不会落到 502 —— 正常发版**零停机**。
 postgres/redis/minio/caddy/admin_web 属于开通期资产,发版**不碰**;
-`.env` / `.env.production` 被 rsync 排除并保护,不会被发版覆盖或删除。
+`.env*`(含 `.env.backup`)与 monitoring 下的本机配置(`.env`、`.env.exporters`、
+Alertmanager 的 `*.url`、`metrics_token`、`probe-targets/*.yml`)被 rsync 排除并保护,
+不会被发版覆盖或删除;发布文件恢复成 0755/0644,以非 root 运行的监控容器才读得到
+挂载的配置。
 
 **迁移兼容性要求**:蓝绿窗口内旧代码会短暂运行在新 schema 上,迁移必须向后兼容
 (expand/contract:先加列/表,删除留到后续版本)。确实不兼容时,手动触发 workflow
