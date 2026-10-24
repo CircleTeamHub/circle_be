@@ -96,9 +96,33 @@ fi
 
 # Only this rsync mutates the active release tree, and the lock remains held
 # until the target deployment script exits.
+#
+# Host-local configuration is never in a release, so --delete would remove it
+# on every deploy: the app and backup credentials (.env.*), the monitoring
+# stack's Grafana password and exporter connection strings, Alertmanager's
+# webhook URLs, Prometheus' scrape token and public probe targets (see each
+# directory's .gitignore). The tracked *.example templates still update.
+#
+# The force command stages releases go-rwx so nothing else on the host can read
+# or swap them mid-flight. The active tree must not inherit that: the monitoring
+# containers run as their own users and bind-mount their configuration from it.
+# --chmod restores the 0755/0644 a checkout has; excluded files keep their own
+# modes. The root itself goes back to private right after: the daemon resolves
+# bind-mount sources as root, so containers never need to traverse it, and
+# host-local secrets created with a default umask (monitoring/.env,
+# alertmanager/*.url are 0644 so their containers can read them) stay out of
+# reach of other local accounts.
 rsync -a --delete \
+  --chmod=Dgo+rx,Fgo+rX \
+  --include=/.env.example \
+  --include='/.env.*.example' \
   --exclude=/.env \
-  --exclude=/.env.production \
+  --exclude='/.env.*' \
+  --exclude=/monitoring/.env \
+  --exclude=/monitoring/.env.exporters \
+  --exclude='/monitoring/alertmanager/*.url' \
+  --exclude=/monitoring/prometheus/metrics_token \
+  --exclude='/monitoring/prometheus/probe-targets/*.yml' \
   --exclude=/.release \
   --exclude=.git \
   --exclude=node_modules \
@@ -106,8 +130,12 @@ rsync -a --delete \
   --exclude=logs \
   --exclude=coverage \
   "$STAGED_RELEASE/" "$DEPLOY_ROOT/"
+chmod go-rwx "$DEPLOY_ROOT"
 
 cd "$DEPLOY_ROOT"
+# deploy/sync-ops-stacks.sh only recreates the ops stacks when the tree was
+# synced this way; an older launcher deleted the files above.
+RELEASE_LAUNCHER_KEEPS_HOST_CONFIG=1 \
 RELEASE_LAUNCHER_ACTIVE=1 \
 RELEASE_STATE_DIR="$RELEASE_STATE_DIR" \
 RELEASE_SCHEMA_COMPATIBILITY="$TARGET_SCHEMA_COMPATIBILITY" \

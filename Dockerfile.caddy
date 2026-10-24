@@ -15,4 +15,7 @@ RUN xcaddy build \
 
 FROM caddy:2-alpine
 RUN apk upgrade --no-cache
+# 采集用日志副本的目录（Caddyfile 全局块的 log collected）。0755：caddy_logs 命名卷
+# 首次挂载时继承它，以非 root 运行的 Alloy 才进得去。
+RUN mkdir -p /var/log/caddy && chmod 0755 /var/log/caddy
 COPY --from=builder /usr/bin/caddy /usr/bin/caddy

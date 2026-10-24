@@ -3,8 +3,25 @@
 This adds local Loki + Grafana Alloy to the existing monitoring stack. It uses
 the backend's redacted JSON rolling files, which mirror application stdout,
 without granting a collector access to Docker's socket or host log directory.
-It does not collect Caddy/database logs, native stderr, or output before the
+It also collects the sanitized copy Caddy writes itself to the `caddy_logs`
+volume (`log collected` in `deploy/Caddyfile.admin`): runtime and upstream proxy
+errors, TLS issuance/renewal and `/chat-ws` handshakes, with the whole request
+URI (share-link, temp-chat and QR tokens sit in the path, not just the query),
+all request headers, IPs and ports removed before encoding. To see which route
+failed, use the backend's own lines, which carry the route template and
+`requestId`. The same streams also go to Caddy's stdout, sanitized the same way
+(`log collected_stdout`): a named Caddyfile logger removes its namespaces from
+the default log, so without that twin `docker compose logs caddy` would lose
+them. Site-wide access logs stay off.
+
+It does not collect database logs, native stderr, or output before the
 application logger starts. `docker compose logs` remains useful for those.
+Database logs are left out on purpose: PostgreSQL cannot write to stderr and a
+file at once, so collecting them means moving its output off `docker compose
+logs`, restarting the database, and a log directory whose wrong ownership stops
+it from starting; error `DETAIL` lines also carry row values. postgres-exporter
+(`PostgresDown`, connection and lock alerts) and the backend's slow-query events
+cover availability and performance instead.
 
 Blue and green each write a separate `/app/logs` named volume; Alloy reads both
 read-only. Container replacement preserves files and cannot make the colors
@@ -59,9 +76,13 @@ Do not point a test deployment at production volumes.
    In `monitoring/.env`, set `LOG_ENVIRONMENT=production` (one fixed value per
    environment) and, if the app uses a custom Compose project name,
    `CIRCLE_BE_PROJECT_NAME=PROJECT`. This must match the app's actual project,
-   not the monitoring project's name. Defaults are `circle-be_app_logs_blue`
-   and `circle-be_app_logs_green`. Inspect them with `docker volume inspect`
-   before enabling collection; Alloy deliberately fails if they do not exist.
+   not the monitoring project's name. Defaults are `circle-be_app_logs_blue`,
+   `circle-be_app_logs_green` and `circle-be_caddy_logs`. Inspect them with
+   `docker volume inspect` before enabling collection; Alloy deliberately fails
+   if they do not exist. `caddy_logs` only appears once Caddy has been recreated
+   from this revision's Compose file — releases never recreate Caddy, so do it
+   once by hand (`docker compose -f docker-compose.prod.yml up -d --no-deps caddy`,
+   after rebuilding its image if `Dockerfile.caddy` changed).
 4. Validate and enable the overlay. Prometheus must be included so Compose adds
    the private network and collector target mount to its existing container:
 
@@ -72,18 +93,44 @@ Do not point a test deployment at production volumes.
 
    docker compose --env-file monitoring/.env \
      -f monitoring/docker-compose.yml -f monitoring/docker-compose.prod.yml \
-     -f monitoring/docker-compose.logs.yml up -d --no-deps loki alloy grafana prometheus
+     -f monitoring/docker-compose.logs.yml up -d --no-deps loki alloy grafana prometheus alertmanager
    ```
 
-   Confirm Prometheus lists healthy `component="loki"` and `component="alloy"`
-   targets under the `logs-pipeline` job before treating collection as enabled.
+   Alertmanager must be in that list too: the overlay adds it to the internal
+   `logs` network, and Loki's ruler can reach it only there. Leave it out and
+   the log alerts below are never delivered (`LokiRulerNotificationsFailing`
+   fires). Confirm Prometheus lists healthy `component="loki"` and
+   `component="alloy"` targets under the `logs-pipeline` job before treating
+   collection as enabled.
 
-The overlay publishes no Loki/Alloy ports and connects only Grafana to their
-internal Docker network. Loki has no authentication of its own; never expose
+The overlay publishes no Loki/Alloy ports. Only Grafana, Prometheus and
+Alertmanager join their internal Docker network. Loki has no authentication of its own; never expose
 its API through Caddy or a public port without an authenticated gateway. Grafana
 stays on its existing loopback port and uses its existing login. Use the SSH
 tunnel described in the monitoring README. The datasource template is mounted
 as YAML only by this overlay, so metrics-only installs do not enable it.
+
+## Log alerts
+
+Loki's ruler evaluates `monitoring/loki/rules/fake/*.yml` every minute (the
+single-tenant mode's tenant is literally `fake`) and sends alerts to the same
+Alertmanager as Prometheus, so they follow the same severity routing and
+inhibition (`CircleBeNoTarget` and `PostgresDown` suppress
+`BackendErrorLogSpike`; `CaddyProxyErrors` stays on during a backend outage
+because it also covers the MinIO and admin_web upstreams). The spike alerts' `for` is longer than their window on purpose: a
+single burst, such as a blue/green switch, leaves the window before `for` is
+met, so only sustained errors fire. The overlay joins Alertmanager to the internal `logs` network
+rather than exposing Loki. Current rules:
+
+| Alert | Fires when |
+|---|---|
+| `BackendFatalExit` | a `[fatal] Uncaught exception` line (from `application-fatal.log`) in the last 10m |
+| `BackendErrorLogSpike` | more than 50 backend error-level lines per 5m, sustained for 10m |
+| `CaddyProxyErrors` | more than 10 error-level Caddy proxy/handler lines per 5m, sustained for 10m |
+| `CaddyCertificateErrors` | any Caddy TLS error in the last 30m — renewal is failing well before `TlsCertificateExpiringSoon` |
+
+After enabling the overlay, `curl -s loki:3100/loki/api/v1/rules` from a
+container on the `logs` network lists the loaded rules.
 
 ## Check ingestion and investigate an incident
 

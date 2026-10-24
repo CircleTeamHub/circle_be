@@ -31,6 +31,7 @@ set -euo pipefail
 [ "$(cat "$RELEASE_STATE_DIR/app-env-transaction/legacy-rollback")" = "legacy-env" ]
 printf '1\n' > "$RELEASE_STATE_DIR/minimum-schema-compatibility"
 printf 'new-start\n' >> "$START_LOG"
+printf 'keeps-host-config=%s\n' "${RELEASE_LAUNCHER_KEEPS_HOST_CONFIG:-}" > "$(dirname "$START_LOG")/new-env.log"
 NEW_RELEASE
 chmod +x "$STATE_DIR/incoming/new/deploy/release-deploy.sh"
 printf '1\n' > "$STATE_DIR/incoming/new/deploy/SCHEMA_COMPATIBILITY"
@@ -83,12 +84,71 @@ grep -q 'Staged runtime compatibility 0 is below required runtime contract 1' \
 [ "$(cat "$DEPLOY_ROOT/VERSION")" = "initial" ]
 [ ! -e "$START_LOG" ]
 
+# Host-local configuration that no release carries (each directory's
+# .gitignore). --delete must leave it alone, while tracked templates update.
+host_local_files=(
+  .env
+  .env.production
+  .env.backup
+  monitoring/.env
+  monitoring/.env.exporters
+  monitoring/alertmanager/discord.url
+  monitoring/alertmanager/heartbeat.url
+  monitoring/alertmanager/heartbeat-fail.url
+  monitoring/prometheus/metrics_token
+  monitoring/prometheus/probe-targets/public.yml
+)
+for file in "${host_local_files[@]}"; do
+  mkdir -p "$DEPLOY_ROOT/$(dirname "$file")"
+  printf 'host:%s\n' "$file" > "$DEPLOY_ROOT/$file"
+  chmod 600 "$DEPLOY_ROOT/$file"
+done
+printf 'stale\n' > "$DEPLOY_ROOT/.env.backup.example"
+printf 'gone\n' > "$DEPLOY_ROOT/removed-from-release.txt"
+new_stage="$STATE_DIR/incoming/new"
+mkdir -p "$new_stage/monitoring/prometheus/probe-targets" "$new_stage/monitoring/alertmanager"
+printf 'template\n' > "$new_stage/.env.backup.example"
+printf 'template\n' > "$new_stage/monitoring/prometheus/probe-targets/public.yml.example"
+printf 'template\n' > "$new_stage/monitoring/alertmanager/discord.url.example"
+printf 'groups: []\n' > "$new_stage/monitoring/prometheus/alerts.yml"
+# What the force command leaves behind (chmod -R go-rwx on the staged tree).
+chmod -R go-rwx "$new_stage"
+
 # The old deployment has completed upload/preflight and is paused before the
 # authoritative launcher lock. A newer irreversible release wins the lock and
 # records floor 1 before the old deployment resumes.
 run_launcher new 1
 [ "$(cat "$STATE_DIR/minimum-schema-compatibility")" = "1" ]
 [ "$(cat "$DEPLOY_ROOT/VERSION")" = "new" ]
+for file in "${host_local_files[@]}"; do
+  [ "$(cat "$DEPLOY_ROOT/$file")" = "host:$file" ] || {
+    echo "release rsync removed or replaced host-local $file" >&2
+    exit 1
+  }
+done
+[ "$(cat "$DEPLOY_ROOT/.env.backup.example")" = "template" ]
+[ -f "$DEPLOY_ROOT/monitoring/prometheus/probe-targets/public.yml.example" ]
+[ ! -e "$DEPLOY_ROOT/removed-from-release.txt" ]
+# deploy/sync-ops-stacks.sh recreates the ops stacks only behind this marker.
+grep -qx 'keeps-host-config=1' "$CASE_DIR/new-env.log"
+mode_of() { stat -c '%a' "$1" 2>/dev/null || stat -f '%Lp' "$1"; }
+# The tree root stays private: containers get their mounts through the daemon,
+# and host-local secrets made with a default umask must not be reachable.
+[ "$(mode_of "$DEPLOY_ROOT")" = "700" ] || { echo "release tree root is $(mode_of "$DEPLOY_ROOT"), not 700" >&2; exit 1; }
+if rsync --version 2>/dev/null | head -1 | grep -qi openrsync; then
+  # macOS ships openrsync, which accepts --chmod and ignores it. The server
+  # and CI run GNU rsync.
+  echo "SKIP release tree modes: openrsync ignores --chmod"
+else
+  # The monitoring containers run as their own users and bind-mount their
+  # configuration from this tree.
+  [ "$(mode_of "$DEPLOY_ROOT/monitoring/prometheus/alerts.yml")" = "644" ]
+  [ "$(mode_of "$DEPLOY_ROOT/monitoring/prometheus")" = "755" ]
+  [ "$(mode_of "$DEPLOY_ROOT/deploy/release-deploy.sh")" = "755" ]
+  # Excluded secrets keep the mode the operator gave them.
+  [ "$(mode_of "$DEPLOY_ROOT/.env.backup")" = "600" ]
+  [ "$(mode_of "$DEPLOY_ROOT/monitoring/prometheus/metrics_token")" = "600" ]
+fi
 [ "$(cat "$STATE_DIR/app-env-transaction/state")" = "staged" ]
 [ "$(cat "$STATE_DIR/app-env-transaction/legacy-rollback")" = "legacy-env" ]
 

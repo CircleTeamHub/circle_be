@@ -375,8 +375,10 @@ Loki collection is separate and does not use this exception-only interface.
   (up to four `file:line:col` frames, so a rejection raised inside Prisma or
   ioredis still names the calling service) — at most one per call chain per
   minute (the next line for that chain carries `suppressedSinceLast=N`), so a
-  storm cannot fill the disk. Uncaught exceptions report with `handled: false`, emit a fixed stderr message,
-  wait at most 2 seconds for flush, then exit 1. An independent referenced
+  storm cannot fill the disk. Uncaught exceptions report with `handled: false`, emit a fixed stderr message
+  and append the same sanitized line synchronously to `logs/application-fatal.log`
+  (collected by Alloy; `BackendFatalExit` alerts on it), wait at most 2 seconds
+  for flush, then exit 1. An independent referenced
   deadline also covers a provider that never settles. Bootstrap failures use
   the same bounded flush/exit policy. SDK default process listeners are disabled
   to avoid duplicate capture and raw exception output.
@@ -386,6 +388,15 @@ Loki collection is separate and does not use this exception-only interface.
   Account IDs are dropped; correlation IDs never enter fingerprints.
   Never request bodies, headers, cookies, or tokens — the Safe Logging Policy
   above applies.
+- **Correlating with logs**: every captured event carries the `requestId` tag —
+  the same value as the `requestId` field in the JSON logs and the client's
+  `X-Request-Id`. Copy it from the event into
+  `{service="circle-be"} | json | requestId="…"` in Grafana Explore, or the
+  other way round with Sentry's `requestId:` search.
+- **Readable stacks without uploads**: `source-map-support` is the first import
+  (`src/startup-instrumentation.ts`) and the image ships the `.js.map` files, so
+  captured stacks already point at the TypeScript sources and lines. Uploading
+  source maps to Sentry would only add the surrounding code lines.
 
 ### How to enable in production
 
