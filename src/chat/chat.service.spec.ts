@@ -3299,6 +3299,67 @@ describe('ChatService', () => {
         prisma.$queryRaw.mockResolvedValue([]);
       });
 
+      describe('single conversation (GET /chat/conversations/:id)', () => {
+        // 客户端收到会话元信息变更事件后只刷新这一个会话,用它替换列表里那一行 ——
+        // 形状必须和列表行逐字段一致,否则替换之后字段会丢。
+        beforeEach(() => {
+          prisma.chatMember.findUnique.mockImplementation((({
+            where,
+          }: {
+            where: {
+              conversationID_userID: { conversationID: string; userID: string };
+            };
+          }) =>
+            Promise.resolve(
+              table.find(
+                (row) =>
+                  row.conversationID ===
+                    where.conversationID_userID.conversationID &&
+                  row.userID === where.conversationID_userID.userID,
+              ) ?? null,
+            )) as never);
+        });
+
+        it('returns exactly the row the list returns for that conversation', async () => {
+          table = [
+            seat('1', { lastMessageAt: minutesAfterBase(1) }),
+            seat('2', { pinned: true, lastMessageAt: minutesAfterBase(2) }),
+          ];
+          const page = await service.listConversationsKeysetPage('u1', '', 10);
+          const row = page.conversations.find((c) => c.id === idOf('2'));
+
+          const single = await service.getConversation('u1', idOf('2'));
+
+          expect(single).toEqual(row);
+        });
+
+        it('rejects a conversation the user left, or never joined, as not a member', async () => {
+          table = [seat('1', { leftAt: minutesAfterBase(1) })];
+
+          await expect(
+            service.getConversation('u1', idOf('1')),
+          ).rejects.toMatchObject({
+            response: { errorCode: ChatErrorCode.NotMember },
+          });
+          await expect(
+            service.getConversation('u1', idOf('9')),
+          ).rejects.toBeInstanceOf(ForbiddenException);
+        });
+
+        it('treats a conversation hidden from the list as not found', async () => {
+          // 列表不返回隐藏的会话;单个接口也不能把它「复活」回客户端列表。
+          table = [seat('1', { hiddenAt: minutesAfterBase(1) })];
+
+          const attempt = service.getConversation('u1', idOf('1'));
+          await expect(attempt).rejects.toBeInstanceOf(NotFoundException);
+          await expect(
+            service.getConversation('u1', idOf('1')),
+          ).rejects.toMatchObject({
+            response: { errorCode: ChatErrorCode.ConversationNotFound },
+          });
+        });
+      });
+
       it('leaves the legacy activity-ordered query and page shape untouched', async () => {
         table = [
           seat('1', { lastMessageAt: minutesAfterBase(1) }),

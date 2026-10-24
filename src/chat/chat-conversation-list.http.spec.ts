@@ -1,5 +1,6 @@
 import {
   type ExecutionContext,
+  ForbiddenException,
   type INestApplication,
   type LoggerService,
   ValidationPipe,
@@ -7,6 +8,7 @@ import {
 import { HttpAdapterHost } from '@nestjs/core';
 import { Test } from '@nestjs/testing';
 import request from 'supertest';
+import { ChatErrorCode } from 'src/common/app-error-codes';
 import { AllExceptionFilter } from 'src/filters/all-exception.filter';
 import { AppAudienceGuard } from 'src/guards/app-audience.guard';
 import { JwtGuard } from 'src/guards/jwt.guard';
@@ -33,6 +35,7 @@ describe('GET /chat/conversations HTTP pipeline', () => {
   const chatService = {
     listConversationsPage: jest.fn(),
     listConversationsKeysetPage: jest.fn(),
+    getConversation: jest.fn(),
   };
   const logger: LoggerService = {
     log: jest.fn(),
@@ -172,6 +175,48 @@ describe('GET /chat/conversations HTTP pipeline', () => {
       code: 400,
       message: expect.stringContaining('cursor'),
       data: null,
+    });
+  });
+
+  describe('GET /chat/conversations/:id', () => {
+    // 会话元信息变更事件只刷新这一个会话,不再重拉整张列表。
+    const CONVERSATION_ID = '11111111-1111-4111-8111-111111111111';
+
+    it('returns the single conversation row for the viewer', async () => {
+      chatService.getConversation.mockResolvedValueOnce({ id: CONVERSATION_ID });
+
+      const response = await request(app.getHttpServer())
+        .get(`${ROUTE}/${CONVERSATION_ID}`)
+        .expect(200);
+
+      expect(response.body).toEqual({ id: CONVERSATION_ID });
+      expect(chatService.getConversation).toHaveBeenCalledWith(
+        'viewer-1',
+        CONVERSATION_ID,
+      );
+      expect(chatService.listConversationsPage).not.toHaveBeenCalled();
+    });
+
+    it('rejects a malformed id before reaching the service', async () => {
+      await request(app.getHttpServer())
+        .get(`${ROUTE}/not-a-conversation`)
+        .expect(400);
+      expect(chatService.getConversation).not.toHaveBeenCalled();
+    });
+
+    it('surfaces "not a member" with its stable error code', async () => {
+      chatService.getConversation.mockRejectedValueOnce(
+        new ForbiddenException({
+          message: '不是会话成员',
+          errorCode: ChatErrorCode.NotMember,
+        }),
+      );
+
+      const response = await request(app.getHttpServer())
+        .get(`${ROUTE}/${CONVERSATION_ID}`)
+        .expect(403);
+
+      expect(response.body.errorCode).toBe(ChatErrorCode.NotMember);
     });
   });
 });

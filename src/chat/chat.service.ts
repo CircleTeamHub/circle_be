@@ -1574,6 +1574,51 @@ export class ChatService {
   }
 
   /**
+   * 单个会话，与 GET /chat/conversations 的每一行逐字段同形(同一条组装路径)。
+   *
+   * 客户端收到会话元信息变更事件(置顶/免打扰/群公告/群主/角色/全员禁言…)后只刷新
+   * 这一个，而不是重拉整张列表 —— 群一多，一次全量就是几百 KB。
+   * 已退出或从未加入 → CHAT_NOT_MEMBER(403)；从列表里隐藏了 → CHAT_CONVERSATION_NOT_FOUND
+   * (404)，不能借这个接口把隐藏的会话「复活」回客户端列表。
+   */
+  async getConversation(
+    userId: string,
+    conversationId: string,
+  ): Promise<ChatConversationDto> {
+    const membership = await this.prisma.chatMember.findUnique({
+      where: {
+        conversationID_userID: {
+          conversationID: conversationId,
+          userID: userId,
+        },
+      },
+      include: { conversation: true },
+    });
+    if (!membership || membership.leftAt) {
+      throw new ForbiddenException({
+        message: '不是会话成员',
+        errorCode: ChatErrorCode.NotMember,
+      });
+    }
+    if (membership.hiddenAt) {
+      throw new NotFoundException({
+        message: '会话不存在',
+        errorCode: ChatErrorCode.ConversationNotFound,
+      });
+    }
+    const [conversation] = await this.buildConversationList(userId, [
+      membership,
+    ]);
+    if (!conversation) {
+      throw new NotFoundException({
+        message: '会话不存在',
+        errorCode: ChatErrorCode.ConversationNotFound,
+      });
+    }
+    return conversation;
+  }
+
+  /**
    * 会话列表每一行的 DTO：对端信息 / 末条消息 / 未读数 / 群信息等按整页批量取，
    * 查询次数不随会话数增长。旧的活跃度分页与键集分页共用这一条路径。
    */

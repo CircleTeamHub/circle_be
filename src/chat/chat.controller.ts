@@ -277,6 +277,20 @@ export class ChatController {
     );
   }
 
+  @Get('conversations/:id')
+  @Throttle({ default: { limit: 60, ttl: 60_000 } })
+  @ApiOperation({
+    summary: '单个会话(与会话列表每一行同形)',
+    description:
+      '客户端收到会话元信息变更事件后只刷新这一个会话,不必重拉整张列表。已退出或从未加入返回 403 CHAT_NOT_MEMBER;已从列表隐藏返回 404 CHAT_CONVERSATION_NOT_FOUND。',
+  })
+  getConversation(
+    @Req() req: RequestWithUser,
+    @Param('id', ParseUUIDPipe) conversationId: string,
+  ): Promise<ChatConversationDto> {
+    return this.chatService.getConversation(req.user.userId, conversationId);
+  }
+
   @Get('conversations/:id/members')
   @Throttle({ default: { limit: 30, ttl: 60_000 } })
   @ApiOperation({ summary: '会话成员目录(GROUP 附角色与禁言状态)' })
