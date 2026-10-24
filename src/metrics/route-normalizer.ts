@@ -273,6 +273,7 @@ export const DYNAMIC_ROUTE_TEMPLATES = [
   '/api/v1/calls/:callId/join-token',
   '/api/v1/calls/:callId/leave',
   '/api/v1/calls/:callId/reject',
+  '/api/v1/chat/conversations/:id',
   '/api/v1/chat/conversations/:id/avatar',
   '/api/v1/chat/conversations/:id/burn',
   '/api/v1/chat/conversations/:id/clear',
