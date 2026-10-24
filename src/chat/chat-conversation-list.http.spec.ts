@@ -183,7 +183,9 @@ describe('GET /chat/conversations HTTP pipeline', () => {
     const CONVERSATION_ID = '11111111-1111-4111-8111-111111111111';
 
     it('returns the single conversation row for the viewer', async () => {
-      chatService.getConversation.mockResolvedValueOnce({ id: CONVERSATION_ID });
+      chatService.getConversation.mockResolvedValueOnce({
+        id: CONVERSATION_ID,
+      });
 
       const response = await request(app.getHttpServer())
         .get(`${ROUTE}/${CONVERSATION_ID}`)
