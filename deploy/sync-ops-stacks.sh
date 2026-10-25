@@ -119,14 +119,18 @@ mutate() {
 
 LABEL_FORMAT='{{index .Config.Labels "com.docker.compose.project"}}|{{index .Config.Labels "com.docker.compose.project.config_files"}}|{{index .Config.Labels "com.docker.compose.project.working_dir"}}|{{index .Config.Labels "com.docker.compose.project.environment_file"}}'
 
-# 运行中、属于某个 compose 服务的全部容器。
+# 「在跑」= running 或 restarting。崩溃重启中的容器也要算：新发布往往正是修好了
+# 让它崩的那份配置，只认 running 的话，它恰恰永远等不到这次同步。
+ACTIVE=(--filter status=running --filter status=restarting)
+
+# 在跑、属于某个 compose 服务的全部容器。
 running_containers() {
-  bounded docker ps -q --filter "label=com.docker.compose.service=$1" --filter status=running 2>/dev/null || true
+  bounded docker ps -q --filter "label=com.docker.compose.service=$1" "${ACTIVE[@]}" 2>/dev/null || true
 }
 
-# 某个项目里正在跑的服务名，一行一个。
+# 某个项目里在跑的服务名，一行一个。
 running_services() {
-  bounded docker ps --filter "label=com.docker.compose.project=$1" --filter status=running \
+  bounded docker ps --filter "label=com.docker.compose.project=$1" "${ACTIVE[@]}" \
     --format '{{.Label "com.docker.compose.service"}}' 2>/dev/null | sort -u
 }
 
@@ -186,16 +190,19 @@ build_compose_args() {
   for file in "${STACK_FILES[@]}"; do COMPOSE_ARGS+=(-f "$file"); done
 }
 
-# 找到从这棵树启动的那个栈；找到返回 0。
-#   find_stack <服务名> <项目目录（相对仓库根）> <栈的名字（只用于提示）>
+# 找到从这棵树启动的那个栈；找到返回 0。锚点是一组服务里任何一个在跑的容器：
+# 只认某一个服务的话，它一停（或在崩溃重启），整个栈就被跳过了。
+#   find_stack "<服务名…>" <项目目录（相对仓库根）> <栈的名字（只用于提示）>
 LAST_FOREIGN_DIR=""
 find_stack() {
-  local service="$1" subdir="$2" label="$3" cid status
+  local services="$1" subdir="$2" label="$3" service cid status
   LAST_FOREIGN_DIR=""
-  for cid in $(running_containers "$service"); do
-    load_compose_args "$cid" "$subdir"
-    status=$?
-    [ "$status" -eq 0 ] && return 0
+  for service in $services; do
+    for cid in $(running_containers "$service"); do
+      load_compose_args "$cid" "$subdir"
+      status=$?
+      [ "$status" -eq 0 ] && return 0
+    done
   done
   if [ -n "$LAST_FOREIGN_DIR" ]; then
     warn "the $label runs from $LAST_FOREIGN_DIR, not from this release tree ($repo_logical$subdir); not syncing it"
@@ -300,28 +307,39 @@ ensure_running() {
     warn "${down[*]} of $STACK_PROJECT are DOWN — alerting may be broken; run docker compose ps and bring them up by hand"
 }
 
+BACKUP_SERVICES="backup backup-metrics"
+
 sync_backup() {
-  local -a targets=(backup backup-metrics)
-  find_stack backup "" "backup overlay" || return 0
+  local -a targets=()
+  find_stack "$BACKUP_SERVICES" "" "backup overlay" || return 0
   if ! compose_uses docker-compose.backup.yml; then
     warn "the backup container was not started with docker-compose.backup.yml; not syncing it"
     return 0
   fi
   load_config || { warn "docker compose could not load the backup overlay; not syncing it"; return 0; }
+  # 与监控栈同一条规则：只动在跑、且这次发布仍然定义的服务。运维刻意停掉的
+  # backup-metrics 不在每次发版时被拉起来，只剩它在跑时也照样同步。
+  mapfile -t targets < <(comm -12 \
+    <(running_services "$STACK_PROJECT" | grep -xF -e backup -e backup-metrics) \
+    <(defined_services | sort -u))
+  if [ "${#targets[@]}" -eq 0 ]; then
+    warn "neither backup service that runs is defined by this release; not syncing the backup overlay"
+    return 0
+  fi
   mounts_present "backup overlay" "${targets[@]}" || return 0
-  echo "==> Syncing the backup overlay to this release (backup, backup-metrics)"
+  echo "==> Syncing the backup overlay to this release (${targets[*]})"
   # 先单独构建：构建可以安全中断，重建容器不行。
-  if ! build_bounded docker compose "${COMPOSE_ARGS[@]}" build backup backup-metrics; then
+  if ! build_bounded docker compose "${COMPOSE_ARGS[@]}" build "${targets[@]}"; then
     warn "building the backup overlay failed or ran past $(( budget / 3 ))s; backup alerts keep the previous configuration"
     return 0
   fi
-  mutate docker compose "${COMPOSE_ARGS[@]}" up -d --no-deps backup backup-metrics
+  mutate docker compose "${COMPOSE_ARGS[@]}" up -d --no-deps "${targets[@]}"
   case $? in
     0) ;;
     "$NOT_STARTED") warn "the backup overlay keeps the previous configuration" ;;
     *)
       warn "syncing the backup overlay failed; backup alerts keep the previous configuration"
-      ensure_running backup backup-metrics
+      ensure_running "${targets[@]}"
       ;;
   esac
 }
@@ -360,10 +378,13 @@ optional_env_files_present() {
   return 0
 }
 
+# 带规则或配置、值得同步的那几个；node-exporter 之类单独在跑时没什么可同步的。
+MONITORING_ANCHORS="prometheus alertmanager loki alloy grafana blackbox-exporter"
+
 sync_monitoring() {
   local -a cids=() targets=() recreate=() up_args=(up -d --no-deps)
   local project files dir envs consistent=1 first="" service inspected=0
-  find_stack prometheus /monitoring "monitoring stack" || return 0
+  find_stack "$MONITORING_ANCHORS" /monitoring "monitoring stack" || return 0
 
   # --remove-orphans 删掉项目里「这些文件没定义」的服务。若有服务是带别的 overlay
   # 起来的，只用 prometheus 的文件集会把它们当孤儿删掉、或把它们的覆盖去掉；所以取
