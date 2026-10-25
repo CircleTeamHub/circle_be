@@ -191,6 +191,16 @@ rc="$(run_sync foreigncontainer STUB_SERVICES=prometheus=cid-p STUB_PROJECT_moni
 [ "$rc" = 0 ] || fail "foreign-container sync exited $rc"
 expect_line foreigncontainer "compose $mon_args up -d --no-deps prometheus" 'unioned or orphan-removed with a container from another tree'
 
+# ── Prometheus 停了、Alertmanager 还在跑：照样同步在跑的那些 ───────────────────
+rc="$(run_sync nopromethus STUB_SERVICES=alertmanager=cid-a STUB_PROJECT_monitoring=cid-a \
+  STUB_LABELS_cid_a="$mon_labels" STUB_RUNNING_monitoring=alertmanager STUB_COMPOSE_CONFIG="$CONFIG")"
+[ "$rc" = 0 ] || fail "prometheus-down sync exited $rc"
+expect_line nopromethus "compose $mon_args up -d --no-deps --remove-orphans alertmanager" \
+  'skipped the stack because prometheus was not the one running'
+# 崩溃重启中的容器也算在跑：新发布可能正是修好了让它崩的配置。
+grep -q -- '--filter status=running --filter status=restarting' "$(log_of nopromethus)" \
+  || fail 'restarting containers are not treated as running'
+
 # ── 带日志 overlay、卷已存在：挂单文件的 loki 也重建 ─────────────────────────
 rc="$(run_sync logs STUB_SERVICES=prometheus=cid-p STUB_LABELS_cid_p="monitoring|$logs_files|$mon|" \
   STUB_RUNNING_monitoring=prometheus,alertmanager,loki STUB_VOLUMES=circle-be_caddy_logs \
@@ -258,7 +268,7 @@ services:
   postgres:
     image: x"
 backup_args="-p circle-be -f $tree/docker-compose.prod.yml -f $tree/docker-compose.backup.yml"
-rc="$(run_sync backup STUB_SERVICES=backup=cid-b STUB_LABELS_cid_b="$backup_labels" STUB_COMPOSE_CONFIG="$backup_config")"
+rc="$(run_sync backup STUB_SERVICES=backup=cid-b STUB_RUNNING_circle_be=backup,backup-metrics STUB_LABELS_cid_b="$backup_labels" STUB_COMPOSE_CONFIG="$backup_config")"
 [ "$rc" = 0 ] || fail "backup sync exited $rc"
 expect_line backup "compose $backup_args build backup backup-metrics" 'backup image not built first'
 expect_line backup "compose $backup_args up -d --no-deps backup backup-metrics" 'backup overlay not synced'
@@ -266,17 +276,30 @@ if grep -E '^compose .* (up|build)' "$(log_of backup)" | grep -q postgres; then 
 if grep -q -- '--force-recreate' "$(log_of backup)"; then fail 'backup force-recreated (pgbackrest.conf is shared with postgres)'; fi
 
 mv "$tree/deploy/backup/pgbackrest.conf" "$tree/deploy/backup/pgbackrest.conf.bak"
-rc="$(run_sync backupnomount STUB_SERVICES=backup=cid-b STUB_LABELS_cid_b="$backup_labels" STUB_COMPOSE_CONFIG="$backup_config")"
+rc="$(run_sync backupnomount STUB_SERVICES=backup=cid-b STUB_RUNNING_circle_be=backup,backup-metrics STUB_LABELS_cid_b="$backup_labels" STUB_COMPOSE_CONFIG="$backup_config")"
 mv "$tree/deploy/backup/pgbackrest.conf.bak" "$tree/deploy/backup/pgbackrest.conf"
 [ "$rc" = 0 ] || fail "backup missing-mount sync exited $rc"
 if grep -qE '^compose .* (up|build)' "$(log_of backupnomount)"; then fail 'synced the backup overlay with pgbackrest.conf gone'; fi
 expect_err backupnomount 'pgbackrest.conf' 'missing backup mount not named'
 
+# ── 只有 backup 在跑：不把刻意停掉的 backup-metrics 拉起来 ─────────────────────
+rc="$(run_sync backuponly STUB_SERVICES=backup=cid-b STUB_RUNNING_circle_be=backup,postgres \
+  STUB_LABELS_cid_b="$backup_labels" STUB_COMPOSE_CONFIG="$backup_config")"
+[ "$rc" = 0 ] || fail "backup-only sync exited $rc"
+expect_line backuponly "compose $backup_args build backup" 'backup alone not built'
+expect_line backuponly "compose $backup_args up -d --no-deps backup" 'started backup-metrics, or touched postgres'
+
+# ── 只有 backup-metrics 在跑：照样同步它（锚点不只认 backup）────────────────────
+rc="$(run_sync metricsonly STUB_SERVICES=backup-metrics=cid-m STUB_RUNNING_circle_be=backup-metrics \
+  STUB_LABELS_cid_m="$backup_labels" STUB_COMPOSE_CONFIG="$backup_config")"
+[ "$rc" = 0 ] || fail "metrics-only sync exited $rc"
+expect_line metricsonly "compose $backup_args up -d --no-deps backup-metrics" 'skipped the overlay because backup itself was down'
+
 # ── 构建之后剩的时间不够一步：不再开始重建容器（timeout 不能在重建中途杀掉 compose）
 #    预算 15s，构建最多 5s、这里用了 3s；剩下约 12s，不到一步要的 14s。
 rc="$(run_sync slowbuild OPS_SYNC_TIMEOUT_SECONDS=15 OPS_SYNC_MIN_STEP_SECONDS=14 \
   STUB_COMPOSE_SLOW=' build ' STUB_SLOW_SECONDS=3 \
-  STUB_SERVICES=backup=cid-b STUB_LABELS_cid_b="$backup_labels" STUB_COMPOSE_CONFIG="$backup_config")"
+  STUB_SERVICES=backup=cid-b STUB_RUNNING_circle_be=backup,backup-metrics STUB_LABELS_cid_b="$backup_labels" STUB_COMPOSE_CONFIG="$backup_config")"
 [ "$rc" = 0 ] || fail "slow-build sync exited $rc"
 expect_line slowbuild "compose $backup_args build backup backup-metrics" 'build not attempted'
 expect_no_up slowbuild 'started a container recreate without enough budget left'
@@ -295,7 +318,7 @@ expect_err healunknown 'could not check' 'no warning about the unknown state'
 if command -v timeout >/dev/null 2>&1; then
   rc="$(run_sync buildcap OPS_SYNC_TIMEOUT_SECONDS=12 OPS_SYNC_MIN_STEP_SECONDS=3 \
     STUB_COMPOSE_SLOW=' build ' STUB_SLOW_SECONDS=30 \
-    STUB_SERVICES=backup=cid-b,prometheus=cid-p STUB_LABELS_cid_b="$backup_labels" STUB_LABELS_cid_p="$mon_labels" \
+    STUB_SERVICES=backup=cid-b,prometheus=cid-p STUB_RUNNING_circle_be=backup,backup-metrics STUB_LABELS_cid_b="$backup_labels" STUB_LABELS_cid_p="$mon_labels" \
     STUB_PROJECT_monitoring=cid-p STUB_RUNNING_monitoring=prometheus STUB_COMPOSE_CONFIG="$backup_config
 $(monitoring_config | sed -n '/^  alertmanager:/,$p')")"
   [ "$rc" = 0 ] || fail "build-cap sync exited $rc"
