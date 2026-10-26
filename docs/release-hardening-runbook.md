@@ -103,7 +103,7 @@ the matching release workflow. Releases do not replace the installed launcher, s
 a change to `deploy/release-launcher.sh` reaches the server only through this
 step — for example, keeping host-local configuration (`.env.backup`, the
 monitoring stack's `.env*`, `*.url`, `metrics_token`, probe targets) across
-releases and restoring 0755/0644 modes on the active tree. Until it is upgraded,
+releases and restoring 0755/0644 modes below the active tree while keeping its root 0700 throughout the transfer. Until it is upgraded,
 `deploy/sync-ops-stacks.sh` leaves the ops stacks alone. The older launcher
 deleted those files on every release, so after upgrading it, check that they
 still exist and recreate any that are gone before the next release —
