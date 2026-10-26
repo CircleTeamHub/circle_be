@@ -8,7 +8,28 @@
   "refresh": "30s",
   "time": { "from": "now-6h", "to": "now" },
   "templating": { "list": [] },
-  "annotations": { "list": [] },
+  "annotations": {
+    "list": [
+      {
+        "name": "发版",
+        "datasource": {
+          "type": "prometheus",
+          "uid": "prometheus"
+        },
+        "enable": true,
+        "iconColor": "orange",
+        "target": {
+          "refId": "Anno",
+          "expr": "max by (version, commit) (circle_build_info{job=\"circle-be\"}) unless max by (version, commit) (circle_build_info{job=\"circle-be\"} offset 5m)"
+        },
+        "step": "60s",
+        "titleFormat": "发版 {{version}}",
+        "textFormat": "commit {{commit}}",
+        "tagKeys": "version",
+        "useValueForTime": false
+      }
+    ]
+  },
   "panels": [
     {
       "id": 1,

@@ -6,17 +6,25 @@
 # replays WAL, and compares exact per-table row counts against the live
 # database. It NEVER touches the live cluster or the live data directory.
 #
-# Run it monthly, and after any change to the backup config:
+# The backup scheduler runs it weekly (BACKUP_CRON_DRILL, default Tuesday 19:30
+# UTC = Wednesday 03:30 in China). Run it by hand after any change to the backup
+# config:
 #   docker compose -f docker-compose.prod.yml -f docker-compose.backup.yml \
 #     run --rm backup run drill
 #
 # Exit code is the result: 0 = the backup restored and matched, non-zero = you
-# do not have a working backup, regardless of what the schedule logs say.
+# do not have a working backup, regardless of what the schedule logs say. Every
+# run that gets past the lock also writes Prometheus textfiles (see
+# write_drill_metrics) for the BackupRestoreDrill* alerts — before that, a drill
+# nobody remembered to run looked exactly like a drill that passed.
 #
-# On a busy database the live counts move forward while the drill runs, so a
-# table reading "live > restored" is expected drift, not a failure. What is
-# never OK is restored > live, or an empty table that has rows upstream — both
-# mean the restore is wrong, and both fail the drill.
+# The restore replays WAL up to the end of the archive, i.e. to within about
+# archive_timeout (60s) of "now". Row counts therefore drift BOTH ways while the
+# drill runs: writes since the restore point make live > restored, and the
+# retention sweepers deleting rows make restored > live. Neither is a failure.
+# What fails the drill is what a broken restore actually looks like: no
+# restore at all, a cluster that does not come up, a missing table, or a table
+# with a real amount of data (DRILL_EMPTY_TABLE_MIN_ROWS) that comes back empty.
 LOG_TAG=drill
 # shellcheck source=lib.sh
 . "$(dirname "$0")/lib.sh"
@@ -35,17 +43,36 @@ case "$DRILL_ROOT" in
   /|/var|/var/lib|/var/lib/postgresql|/var/lib/postgresql/data|/var/lib/postgresql/data/*|/etc|/etc/*|/opt|/opt/*)
     die "DRILL_ROOT='$DRILL_ROOT' is at or inside a system/live-data path — refusing to rm -rf it" ;;
 esac
-# Belt and braces: a PG_VERSION file means this is somebody's real cluster,
-# whatever the path looks like.
-for probe in "$DRILL_ROOT" "$DRILL_ROOT/data"; do
-  [ -f "$probe/PG_VERSION" ] && die "DRILL_ROOT='$DRILL_ROOT' contains a real PGDATA ($probe/PG_VERSION) — refusing to destroy it"
-done
 
 DRILL_DIR="$DRILL_ROOT/data"
 DRILL_SOCK="$DRILL_ROOT/sock"
+# Written into DRILL_ROOT the moment the drill creates it. A PG_VERSION next to
+# this marker is the drill's own restore left behind by a run that was killed
+# (container recreated by a release, OOM, host restart: the EXIT trap never ran);
+# a PG_VERSION without it is somebody's real cluster and is never touched.
+DRILL_MARKER="$DRILL_ROOT/.circle-restore-drill"
 DRILL_PORT=5433
 LIVE_DB="${BACKUP_PG_DATABASE:-circle}"
 LIVE_USER="${BACKUP_PG_USER:-circle}"
+LIVE_PGDATA="${DRILL_LIVE_PGDATA:-/var/lib/postgresql/data}"
+# The lock lives next to DRILL_ROOT, never inside it: the drill rm -rf's that.
+# /tmp is the backup_scratch volume, shared by the scheduler and by every
+# `run --rm backup run drill`, so the lock also excludes a manual drill that
+# overlaps the scheduled one (each would otherwise delete the other's restore).
+DRILL_LOCK="${DRILL_LOCK_FILE:-$(dirname "$DRILL_ROOT")/.drill.lock}"
+METRICS_DIR="${BACKUP_METRICS_DIR:-/var/lib/circle-backup/metrics}"
+# Space the restore may use, and what it must leave behind. The scratch volume
+# sits on the same disk as the live cluster: a drill that fills it takes
+# production Postgres down with it, so refuse up front rather than find out.
+# 20%: HostDiskFilling warns below 15%, so a drill that leaves 10% would page
+# every week while it runs.
+DRILL_MIN_FREE_PERCENT="${DRILL_MIN_FREE_PERCENT:-20}"
+DRILL_EMPTY_TABLE_MIN_ROWS="${DRILL_EMPTY_TABLE_MIN_ROWS:-1000}"
+# Replaying a week of WAL on a big database takes longer than pg_ctl's default.
+DRILL_START_TIMEOUT="${DRILL_START_TIMEOUT:-3600}"
+# The live count runs as one long transaction on a big database; naming it lets
+# PostgresLongTransaction leave it alone (and shows who it is in pg_stat_activity).
+export PGAPPNAME=circle-restore-drill
 
 # Exact counts for every base table in `public`. pg_stat_user_tables.n_live_tup
 # is an estimate and is reset by a restore, so it cannot be used to compare a
@@ -60,26 +87,152 @@ FROM (
   WHERE table_schema = 'public' AND table_type = 'BASE TABLE'
 ) t ORDER BY table_name;"
 
+# Only ever removes a DRILL_ROOT this run owns: one it created or one carrying
+# the marker. A refused DRILL_ROOT (a real PGDATA) is left exactly as it was.
+OWN_ROOT=0
 cleanup() {
+  [ "$OWN_ROOT" -eq 1 ] || return 0
   if [ -d "$DRILL_DIR" ] && pg_ctl -D "$DRILL_DIR" status >/dev/null 2>&1; then
     log "stopping scratch postgres"
     pg_ctl -D "$DRILL_DIR" -m immediate -w stop >/dev/null 2>&1 || true
   fi
   rm -rf "$DRILL_ROOT"
 }
-trap cleanup EXIT
+
+# Which step the drill is in; the metrics label a failure with it so the alert
+# says "restore failed" rather than just "drill failed".
+STAGE=preflight
+STARTED_AT="$(date +%s)"
+RESTORE_POINT_AGE=""
+# Set only by the lock-busy exit: the drill that holds the lock reports for both.
+SKIP_METRICS=0
+
+# Two files on purpose. backup_drill.prom is rewritten by every run;
+# backup_drill_last_success.prom only by a passing one, so a failing drill can
+# never move the "last proven restore" timestamp that BackupRestoreDrillStale
+# watches. Same atomic temp+rename as check.sh: node-exporter only reads *.prom.
+write_prom_file() {
+  local name="$1" body="$2" tmp
+  mkdir -p "$METRICS_DIR" 2>/dev/null || return 1
+  tmp="$(mktemp "$METRICS_DIR/.$name.XXXXXX" 2>/dev/null)" || return 1
+  if printf '%s' "$body" > "$tmp" && chmod 0644 "$tmp" && mv -f "$tmp" "$METRICS_DIR/$name.prom"; then
+    return 0
+  fi
+  rm -f "$tmp"
+  return 1
+}
+
+write_drill_metrics() {
+  local rc="$1" now ok stage body
+  now="$(date +%s)"
+  if [ "$rc" -eq 0 ]; then ok=1; stage=complete; else ok=0; stage="$STAGE"; fi
+  body="# HELP circle_backup_drill_success Result of the last restore drill (1 = passed); stage is where a failed drill stopped.
+# TYPE circle_backup_drill_success gauge
+circle_backup_drill_success{stage=\"$stage\"} $ok
+# HELP circle_backup_drill_last_run_timestamp_seconds Unix time the last restore drill finished.
+# TYPE circle_backup_drill_last_run_timestamp_seconds gauge
+circle_backup_drill_last_run_timestamp_seconds $now
+# HELP circle_backup_drill_duration_seconds Wall time of the last restore drill.
+# TYPE circle_backup_drill_duration_seconds gauge
+circle_backup_drill_duration_seconds $(( now - STARTED_AT ))
+"
+  if [ -n "$RESTORE_POINT_AGE" ]; then
+    body="$body# HELP circle_backup_drill_restore_point_age_seconds Age of the newest transaction the restored cluster contained when the drill read it.
+# TYPE circle_backup_drill_restore_point_age_seconds gauge
+circle_backup_drill_restore_point_age_seconds $RESTORE_POINT_AGE
+"
+  fi
+  write_prom_file backup_drill "$body" \
+    || warn "could not write drill metrics to $METRICS_DIR — the BackupRestoreDrill* alerts cannot see this run"
+  if [ "$ok" -eq 1 ]; then
+    write_prom_file backup_drill_last_success "# HELP circle_backup_drill_last_success_timestamp_seconds Unix time a restore drill last passed.
+# TYPE circle_backup_drill_last_success_timestamp_seconds gauge
+circle_backup_drill_last_success_timestamp_seconds $now
+" || warn "could not record the drill success timestamp in $METRICS_DIR"
+  fi
+}
+
+# Metrics first: under `set -e` a failing cleanup inside the trap would
+# otherwise skip them, and the run would vanish without a result.
+on_exit() {
+  local rc=$?
+  trap - EXIT
+  set +e
+  [ "$SKIP_METRICS" -eq 1 ] || write_drill_metrics "$rc"
+  cleanup
+  exit "$rc"
+}
+trap on_exit EXIT
+
+# Single-flight. A second drill exits 75 without touching the first one's files
+# or metrics — the run in progress reports for both. Every child that can
+# outlive this shell (the scratch postmaster) is started with fd 9 closed, so
+# an orphan never holds the lock.
+command -v flock >/dev/null 2>&1 || die "flock is not available — cannot guarantee a single drill at a time"
+mkdir -p "$(dirname "$DRILL_LOCK")"
+exec 9>"$DRILL_LOCK"
+if ! flock -n 9; then
+  SKIP_METRICS=1
+  warn "another restore drill holds $DRILL_LOCK — not starting a second one"
+  exit 75
+fi
 
 log "=== restore drill starting ==="
 
+# ── 0. scratch space ──────────────────────────────────────────────────────────
+if [ -e "$DRILL_MARKER" ]; then
+  OWN_ROOT=1
+  warn "removing the restore a previous, interrupted drill left in $DRILL_ROOT"
+  cleanup
+fi
+# Belt and braces: a PG_VERSION without the marker means this is somebody's
+# real cluster, whatever the path looks like.
+for probe in "$DRILL_ROOT" "$DRILL_ROOT/data"; do
+  [ -f "$probe/PG_VERSION" ] && die "DRILL_ROOT='$DRILL_ROOT' contains a real PGDATA ($probe/PG_VERSION) — refusing to destroy it. If it is a restore an older drill left behind, remove it by hand."
+done
+OWN_ROOT=1
+rm -rf "$DRILL_ROOT"
+mkdir -p "$DRILL_ROOT"
+: > "$DRILL_MARKER"
+
 # ── 1. live counts ────────────────────────────────────────────────────────────
+STAGE=live_counts
 log "reading live row counts"
 live="$(psql -h /var/run/postgresql -p 5432 -U "$LIVE_USER" -d "$LIVE_DB" \
           -At -c "$COUNT_SQL")" || die "cannot read live database"
 [ -n "$live" ] || die "live database has no tables in schema public — wrong target?"
 log "live has $(printf '%s\n' "$live" | wc -l | tr -d ' ') tables"
+# Where the newest segment archive_command has shipped starts (bytes). Replay
+# must get at least that far: a restore that quietly stops at the base backup
+# (archive-get failing, Postgres promoting anyway) passes every row count above
+# now that counts may drift both ways. Empty when nothing was archived yet.
+ARCHIVED_START="$(psql -h /var/run/postgresql -p 5432 -U "$LIVE_USER" -d "$LIVE_DB" -At -c "
+  SELECT (s.segment_number * pg_size_bytes(current_setting('wal_segment_size')))::bigint
+  FROM pg_stat_archiver a CROSS JOIN LATERAL pg_split_walfile_name(a.last_archived_wal) s
+  WHERE a.last_archived_wal ~ '^[0-9A-F]{24}\$'" 2>/dev/null || true)"
+case "$ARCHIVED_START" in ''|*[!0-9]*) ARCHIVED_START="" ;; esac
 
-# ── 2. restore latest into scratch ────────────────────────────────────────────
-rm -rf "$DRILL_ROOT"
+# ── 2. room for a second copy? ────────────────────────────────────────────────
+# The restore writes roughly the live PGDATA again (plus WAL being replayed).
+# du on a running cluster can trip over files that vanish mid-walk; the total
+# it prints is still good, so only its output is trusted, not its exit code.
+STAGE=space
+live_kb="$( { du -sk "$LIVE_PGDATA" 2>/dev/null || true; } | awk 'NR==1 {print $1}')"
+case "$live_kb" in ''|*[!0-9]*) die "cannot measure the live data directory $LIVE_PGDATA" ;; esac
+df_line="$( { df -Pk "$DRILL_ROOT" 2>/dev/null || true; } | awk 'NR==2 {print $2, $4}')"
+read -r fs_total_kb fs_avail_kb <<< "$df_line"
+for kb in "$fs_total_kb" "$fs_avail_kb"; do
+  case "$kb" in ''|*[!0-9]*) die "cannot read free space for $DRILL_ROOT" ;; esac
+done
+need_kb=$(( live_kb + live_kb / 10 + 1024 * 1024 ))
+reserve_kb=$(( fs_total_kb * DRILL_MIN_FREE_PERCENT / 100 ))
+log "restore needs ~$(( need_kb / 1024 ))MiB; $(( fs_avail_kb / 1024 ))MiB free, keeping $(( reserve_kb / 1024 ))MiB (${DRILL_MIN_FREE_PERCENT}%) untouched"
+if [ $(( fs_avail_kb - need_kb )) -lt "$reserve_kb" ]; then
+  die "not enough free disk for a second copy of the database next to the live one — free space or move backup_scratch before trusting this backup"
+fi
+
+# ── 3. restore latest into scratch ────────────────────────────────────────────
+STAGE=restore
 mkdir -p "$DRILL_DIR" "$DRILL_SOCK"
 chmod 700 "$DRILL_DIR"
 log "restoring latest backup into scratch dir $DRILL_DIR"
@@ -96,34 +249,58 @@ export_pgbackrest_env
 # Same footgun the pg_ctl comment below describes; it applies to every pipe that
 # is open when the postmaster starts, not just pg_ctl's own.
 RESTORE_LOG="$DRILL_ROOT/restore.log"
-if ! pgbackrest --stanza=circle --pg1-path="$DRILL_DIR" --delta --archive-mode=off \
-     restore >"$RESTORE_LOG" 2>&1; then
+# nice: the live cluster shares this host's CPU; the drill can afford to be slow.
+# One process (the conf allows two for backups): slower, and gentler on the
+# disk the live cluster is using.
+if ! nice -n 10 pgbackrest --stanza=circle --pg1-path="$DRILL_DIR" --delta --archive-mode=off \
+     --process-max=1 restore >"$RESTORE_LOG" 2>&1; then
   sed 's/^/  /' "$RESTORE_LOG" >&2 2>/dev/null || true
   die "pgbackrest restore failed — THERE IS NO WORKING BACKUP"
 fi
 sed 's/^/  /' "$RESTORE_LOG"
 
-# ── 3. start scratch postmaster, replay WAL ───────────────────────────────────
+# ── 4. start scratch postmaster, replay WAL ───────────────────────────────────
+STAGE=start
 log "starting scratch postgres on port $DRILL_PORT (replays WAL from the repo)"
 # -l redirects the SERVER's output to a file. Do NOT pipe pg_ctl into anything:
 # the postmaster it spawns inherits the pipe's write end and keeps it open for
 # its whole life, so `pg_ctl start | sed` hangs forever even though the server
 # came up fine.
-if ! pg_ctl -D "$DRILL_DIR" -w -t 300 -l "$DRILL_ROOT/postgres.log" \
-       -o "-p $DRILL_PORT -k $DRILL_SOCK -c listen_addresses='' -c archive_mode=off" \
-       start >/dev/null 2>&1; then
+#
+# hot_standby=off: with it on (the default) the server accepts connections as
+# soon as it is consistent, pg_ctl -w returns while WAL is still replaying, and
+# everything below would read a half-recovered cluster. Off, connections are
+# refused until recovery has finished and the cluster promoted. autovacuum=off
+# and nice: this copy is read twice and thrown away, and it shares the host
+# with production. 9>&-: the postmaster must not inherit the drill lock.
+if ! nice -n 10 pg_ctl -D "$DRILL_DIR" -w -t "$DRILL_START_TIMEOUT" -l "$DRILL_ROOT/postgres.log" \
+       -o "-p $DRILL_PORT -k $DRILL_SOCK -c listen_addresses='' -c archive_mode=off -c hot_standby=off -c autovacuum=off" \
+       start >/dev/null 2>&1 9>&-; then
   warn "scratch postgres failed to start — restore is not usable:"
   sed 's/^/  /' "$DRILL_ROOT/postgres.log" >&2 2>/dev/null || true
   exit 1
 fi
 log "scratch postgres is up and finished recovery"
 
-# ── 4. restored counts ────────────────────────────────────────────────────────
+# ── 5. restored counts ────────────────────────────────────────────────────────
+STAGE=query
 log "reading restored row counts"
 restored="$(psql -h "$DRILL_SOCK" -p "$DRILL_PORT" -U "$LIVE_USER" -d "$LIVE_DB" \
               -At -c "$COUNT_SQL")" || die "cannot query the restored cluster"
+# How recent the restored data is: the commit time of the last transaction WAL
+# replay applied. Informational (it is old on a database nobody wrote to);
+# whether WAL archiving keeps up is BackupCheckFailing's job.
+RESTORE_POINT_AGE="$(psql -h "$DRILL_SOCK" -p "$DRILL_PORT" -U "$LIVE_USER" -d "$LIVE_DB" \
+  -At -c "SELECT floor(extract(epoch FROM now() - pg_last_xact_replay_timestamp()))::bigint" 2>/dev/null || true)"
+case "$RESTORE_POINT_AGE" in ''|*[!0-9]*) RESTORE_POINT_AGE="" ;; esac
+[ -n "$RESTORE_POINT_AGE" ] && log "restored data reaches $(( RESTORE_POINT_AGE / 60 ))min before now"
+# How far WAL replay got (bytes). Stays fixed after promotion.
+REPLAYED_TO="$(psql -h "$DRILL_SOCK" -p "$DRILL_PORT" -U "$LIVE_USER" -d "$LIVE_DB" \
+  -At -c "SELECT (pg_last_wal_replay_lsn() - '0/0'::pg_lsn)::bigint" 2>/dev/null || true)"
+case "$REPLAYED_TO" in ''|*[!0-9]*) REPLAYED_TO="" ;; esac
 
-# ── 5. compare ────────────────────────────────────────────────────────────────
+# ── 6. compare ────────────────────────────────────────────────────────────────
+STAGE=compare
 log "=== comparison (table: live vs restored) ==="
 rc=0; matched=0; drifted=0
 while IFS='=' read -r table live_n; do
@@ -135,19 +312,31 @@ while IFS='=' read -r table live_n; do
   if [ "$live_n" -eq "$restored_n" ]; then
     matched=$((matched + 1))
     log "  ok       $table: $live_n"
-  elif [ "$restored_n" -gt "$live_n" ]; then
-    warn "  IMPOSSIBLE $table: live=$live_n restored=$restored_n — restore has rows live does not"
-    rc=1
-  elif [ "$restored_n" -eq 0 ] && [ "$live_n" -gt 0 ]; then
+  elif [ "$restored_n" -eq 0 ] && [ "$live_n" -ge "$DRILL_EMPTY_TABLE_MIN_ROWS" ]; then
     warn "  EMPTY    $table: live=$live_n restored=0 — table restored empty"
     rc=1
+  elif [ "$restored_n" -gt "$live_n" ]; then
+    drifted=$((drifted + 1))
+    log "  drift    $table: live=$live_n restored=$restored_n (rows deleted since the restore point)"
   else
     drifted=$((drifted + 1))
-    log "  drift    $table: live=$live_n restored=$restored_n (writes since backup)"
+    log "  drift    $table: live=$live_n restored=$restored_n (writes since the restore point)"
   fi
 done <<< "$live"
 
-log "=== drill result: ${matched} exact, ${drifted} drifted-forward ==="
+if [ -n "$ARCHIVED_START" ] && [ -n "$REPLAYED_TO" ]; then
+  if [ "$REPLAYED_TO" -lt "$ARCHIVED_START" ]; then
+    warn "  BEHIND   WAL replay stopped at byte $REPLAYED_TO, before the newest segment archived when the drill started ($ARCHIVED_START) — the restore is missing archived WAL"
+    rc=1
+  else
+    log "  ok       WAL replay reached the newest archived segment"
+  fi
+elif [ -n "$ARCHIVED_START" ]; then
+  warn "  could not read how far WAL replay got — the restore may be missing archived WAL"
+  rc=1
+fi
+
+log "=== drill result: ${matched} exact, ${drifted} drifted ==="
 if [ "$rc" -eq 0 ]; then
   log "DRILL PASSED — the off-host backup restores to a queryable, consistent cluster"
 else

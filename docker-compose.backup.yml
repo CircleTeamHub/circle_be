@@ -75,7 +75,10 @@ services:
     build:
       context: .
       dockerfile: docker/backup/Dockerfile
-    image: circle-backup:1
+    # 镜像里的脚本改了「能调度哪些任务」时必须升这个标签（2：新增 drill）。
+    # 旧镜像不认识新任务名，entrypoint 会直接退出、备份随之停掉；标签不存在时
+    # `docker compose up -d` 会自己先构建，手动部署漏了 --build 也不会配错。
+    image: circle-backup:2
     restart: unless-stopped
     logging: *default-logging
     # uid 70 = postgres. PGDATA is 0700 postgres:postgres, so pgbackrest has to
@@ -90,7 +93,11 @@ services:
       # restoring a differential needs full + 1 backup, an incremental needs
       # full + every incremental since. That is a direct RTO win — day-6 recovery
       # fetches 2 backup sets instead of 7 — for a modest storage cost.
-      BACKUP_JOBS: pg-full,pg-diff,minio,check
+      #
+      # drill：每周一次恢复演练（deploy/backup/drill.sh，默认北京时间周三 03:30，见
+      # BACKUP_CRON_DRILL），
+      # 结果写进 backup_metrics 卷，由 BackupRestoreDrill* 告警读取。
+      BACKUP_JOBS: pg-full,pg-diff,minio,check,drill
     volumes:
       # Read-WRITE, and it has to be. pgbackrest only READS these files to back
       # them up, but this same container is also the disaster-recovery tool:

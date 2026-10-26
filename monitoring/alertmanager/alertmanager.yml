@@ -58,7 +58,7 @@ inhibit_rules:
   - source_matchers:
       - alertname = "CircleBeNoTarget"
     target_matchers:
-      - alertname =~ "BackendHigh5xx|BackendHighLatencyP95|BackendEventLoopLag|CronJobStalled|CronJobFailing|OutboxBacklogStuck|SessionRevocationOutboxStuck|BackendErrorLogSpike"
+      - alertname =~ "BackendHigh5xx|BackendHighLatencyP95|BackendEventLoopLag|CronJobStalled|CronJobFailing|OutboxBacklogStuck|SessionRevocationOutboxStuck|BackendErrorLogSpike|SyntheticProbeFailing"
     # 这两条规则的标签集没有公共维度（不同 alertname、不同 severity），
     # 所以 equal 留空 —— 只要 source 在 firing 就抑制，不做标签配对。
     equal: []
@@ -100,6 +100,25 @@ inhibit_rules:
 
   # 存储整个连不上时，服务端读写必然大面积失败 —— 同一件事不报两遍。只压
   # object_storage：LiveKit 的失败与存储无关，必须照常报。
+  # 公网 API 入口探测失败时，合成探测必然跟着失败（同一条路径），只留入口那条。
+  - source_matchers:
+      - alertname = "PublicEndpointDown"
+      - component = "api"
+    target_matchers:
+      - alertname = "SyntheticProbeFailing"
+    equal: []
+  # 回卷两档，同库配对：库名不同的不互相静音。
+  - source_matchers:
+      - alertname = "PostgresXidWraparoundImminent"
+    target_matchers:
+      - alertname = "PostgresXidWraparoundRisk"
+    equal: ['datname']
+  # 演练一直失败时「太久没通过」必然随后也成立，只留说明了失败在哪一步的那条。
+  - source_matchers:
+      - alertname = "BackupRestoreDrillFailing"
+    target_matchers:
+      - alertname = "BackupRestoreDrillStale"
+    equal: []
   - source_matchers:
       - alertname = "ObjectStoreUnreachable"
     target_matchers:
@@ -120,7 +139,7 @@ inhibit_rules:
   - source_matchers:
       - alertname = "PostgresDown"
     target_matchers:
-      - alertname =~ "CronJobStalled|CronJobFailing|OutboxBacklogStuck|OutboxProbeStale|SessionRevocationOutboxStuck|BackendHigh5xx|BackendErrorLogSpike"
+      - alertname =~ "CronJobStalled|CronJobFailing|OutboxBacklogStuck|OutboxProbeStale|SessionRevocationOutboxStuck|BackendHigh5xx|BackendErrorLogSpike|SyntheticProbeFailing"
     equal: []
 
   # 同一件事已经以 critical 发出去了，就不要再发一遍 warning。

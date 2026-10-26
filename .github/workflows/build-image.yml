@@ -89,6 +89,9 @@ jobs:
           labels: |
             org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
             org.opencontainers.image.revision=${{ github.sha }}
+          # 进程内可读的提交号（circle_build_info）；镜像 label 进程读不到。
+          build-args: |
+            CIRCLE_BUILD_COMMIT=${{ github.sha }}
           # Single tagged manifest per version (no attestation children) so
           # cleanup-images.yml can prune versions safely.
           provenance: false
