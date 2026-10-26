@@ -59,7 +59,9 @@ import {
   MEDIA_MESSAGE_TYPES,
   SYNC_PAGE_MAX,
   READERS_PAGE_MAX,
+  UNREAD_COUNT_CAP,
 } from './chat.constants';
+import { recentTextMatchesQuery } from './chat-text-search.query';
 import { messagePreviewText } from './chat-message-preview';
 import {
   buildChatRetentionWindow,
@@ -206,12 +208,6 @@ export function conversationSyncRevision(conversation: {
 function receiptCeiling(conversation: { nextHeight: number }): number {
   return conversation.nextHeight ?? 0;
 }
-
-/**
- * 会话列表里单个会话的未读数最多数到这里。界面(会话行、消息 tab)超过 99 一律显示
- * 99+,数到 100 就足够判断;再往后数只是替大群逐行回表。
- */
-const UNREAD_COUNT_CAP = 100;
 
 /**
  * 关键词搜索每轮从二元组索引取多少条候选,再交给可见性过滤(清空水位、阅后即焚、
@@ -2916,11 +2912,18 @@ export class ChatService {
       round < TEXT_SEARCH_CANDIDATE_ROUNDS && matched.length < take;
       round += 1
     ) {
-      const candidates = await this.findTextMatchesByTime(
-        conversationIds,
-        trimmed,
-        before,
-      );
+      // 单字用不上 bigram 索引,只在每个会话最近一段里找(见 recentTextMatchesQuery)。
+      const candidates =
+        [...trimmed].length < 2
+          ? await this.prisma.$queryRaw<Array<{ id: string; createdAt: Date }>>(
+              recentTextMatchesQuery(
+                conversationIds,
+                likeContainsPattern(trimmed),
+                before,
+                TEXT_SEARCH_CANDIDATE_PAGE,
+              ),
+            )
+          : await this.findTextMatchesByTime(conversationIds, trimmed, before);
       if (candidates.length === 0) break;
       const visible = await this.prisma.chatMessage.findMany({
         where: {

@@ -14,6 +14,7 @@ import { mkdtempSync, writeFileSync } from 'fs';
 import { tmpdir } from 'os';
 import { join } from 'path';
 import PDFDocument from 'pdfkit';
+import { Prisma } from 'src/generated/prisma';
 import { PrismaService } from 'src/prisma/prisma.service';
 import {
   CHAT_MEDIA_DELETE_CLAIM_REASON,
@@ -85,6 +86,8 @@ describe('NoteService', () => {
     noteGroupMembership: {
       deleteMany: jest.fn(),
       createMany: jest.fn(),
+      // 分组计数单独按 groupID 聚合；默认没有成员。
+      groupBy: jest.fn().mockResolvedValue([]),
     },
     noteShareLink: {
       count: jest.fn(),
@@ -159,12 +162,17 @@ describe('NoteService', () => {
     });
     prisma.chatConversation.findMany.mockReset();
     prisma.chatConversation.findMany.mockResolvedValue([]);
+    prisma.noteGroupMembership.groupBy.mockReset();
+    prisma.noteGroupMembership.groupBy.mockResolvedValue([]);
     // 写笔记事务内复核群主（FOR SHARE 读会话）与 findUnique 桩读到同一行；
     // 其他原生查询维持默认空结果。
     prisma.$queryRaw.mockReset();
     prisma.$queryRaw.mockImplementation(
-      async (strings: TemplateStringsArray) => {
-        const sql = strings.join('?');
+      async (query: TemplateStringsArray | Prisma.Sql) => {
+        // 模板字面量调用拿到字符串数组；预先构造好的 Prisma.Sql 直接读 sql。
+        const sql = Array.isArray(query)
+          ? query.join('?')
+          : (query as Prisma.Sql).sql;
         // 编辑笔记在事务内锁读笔记行（FOR UPDATE），沿用 findFirst 桩的调用顺序。
         if (sql.includes('FROM "Note"')) {
           const note = await prisma.note.findFirst();
@@ -2596,84 +2604,175 @@ describe('NoteService', () => {
     });
   });
 
-  it('broadcasts source status changes to the source owner and collected-copy owners', async () => {
+  describe('source status broadcast', () => {
     const realtime = {
       safeBroadcastAll: jest.fn(async (fns: Array<() => unknown>) => {
         await Promise.all(fns.map((fn) => fn()));
       }),
       broadcastNoteSourceStatusChanged: jest.fn(),
     };
-    (prisma as any).chatMessage = {
-      findMany: jest.fn().mockResolvedValue([{ conversationID: 'chat-1' }]),
+    const isNoteCardQuery = (query: unknown): query is Prisma.Sql =>
+      !Array.isArray(query) &&
+      typeof (query as Prisma.Sql | undefined)?.sql === 'string' &&
+      (query as Prisma.Sql).sql.includes('FROM "ChatMessage"');
+    const noteCardQueries = (): Prisma.Sql[] =>
+      prisma.$queryRaw.mock.calls
+        .map(([query]) => query as unknown)
+        .filter(isNoteCardQuery);
+    /** 卡片接收人走 $queryRaw；其余原生查询沿用 beforeEach 的默认桩。 */
+    const stubNoteCardRows = (
+      rows: () => Promise<Array<{ conversationID: string | null }>>,
+    ) => {
+      const original = prisma.$queryRaw.getMockImplementation()!;
+      prisma.$queryRaw.mockImplementation(
+        async (
+          query: TemplateStringsArray | Prisma.Sql,
+          ...values: unknown[]
+        ) => (isNoteCardQuery(query) ? rows() : original(query, ...values)),
+      );
     };
-    (prisma as any).chatMember = {
-      findMany: jest.fn().mockResolvedValue([{ userID: 'chat-recipient' }]),
+    const configuredService = () =>
+      new NoteService(
+        prisma as any,
+        { get: jest.fn(() => null) } as any,
+        new MembershipPolicyService(prisma as any),
+        chatService as any,
+        uploadService as any,
+        realtime as any,
+      );
+    const stubSourceNote = (copies: Array<{ id: string; ownerID: string }>) => {
+      prisma.note.findFirst.mockResolvedValueOnce({
+        id: 'source-note',
+        ownerID: 'boss',
+        status: 'ACTIVE',
+        collectedFromNoteID: null,
+      });
+      prisma.note.update.mockResolvedValueOnce({
+        id: 'source-note',
+        available: false,
+      });
+      prisma.note.findMany
+        .mockResolvedValueOnce([
+          {
+            id: 'source-note',
+            ownerID: 'boss',
+            status: 'ACTIVE',
+            available: false,
+            workStatus: 'CLOSED',
+            collectedFromNoteID: null,
+          },
+        ])
+        .mockResolvedValueOnce(copies)
+        .mockResolvedValueOnce([]);
     };
-    const configured = new NoteService(
-      prisma as any,
-      {
-        get: jest.fn(() => null),
-      } as any,
-      new MembershipPolicyService(prisma as any),
-      chatService as any,
-      uploadService as any,
-      realtime as any,
-    );
-    prisma.note.findFirst.mockResolvedValueOnce({
-      id: 'source-note',
-      ownerID: 'boss',
-      status: 'ACTIVE',
-      collectedFromNoteID: null,
+
+    beforeEach(() => {
+      // 旧实现走 chatMessage.findMany 的 JSON path 过滤；留一个桩证明它不再被调用。
+      (prisma as any).chatMessage = { findMany: jest.fn() };
+      prisma.chatMember.findMany.mockResolvedValue([]);
     });
-    prisma.note.update.mockResolvedValueOnce({
-      id: 'source-note',
-      available: false,
+
+    afterEach(() => {
+      delete (prisma as any).chatMessage;
+      prisma.chatMember.findMany.mockReset();
+      prisma.chatMember.findMany.mockResolvedValue([]);
     });
-    prisma.note.findMany
-      .mockResolvedValueOnce([
-        {
-          id: 'source-note',
-          ownerID: 'boss',
+
+    it('broadcasts source status changes to the source owner and collected-copy owners', async () => {
+      stubNoteCardRows(async () => [
+        { conversationID: 'chat-1' },
+        { conversationID: null },
+      ]);
+      prisma.chatMember.findMany.mockResolvedValueOnce([
+        { userID: 'chat-recipient' },
+      ]);
+      stubSourceNote([{ id: 'copy-note', ownerID: 'agent' }]);
+
+      await configuredService().setAvailable('boss', 'source-note', false);
+
+      expect(realtime.broadcastNoteSourceStatusChanged).toHaveBeenCalledWith(
+        'boss',
+        expect.objectContaining({
+          sourceNoteId: 'source-note',
+          workStatus: 'CLOSED',
           status: 'ACTIVE',
           available: false,
-          workStatus: 'CLOSED',
-          collectedFromNoteID: null,
-        },
-      ])
-      .mockResolvedValueOnce([{ id: 'copy-note', ownerID: 'agent' }])
-      .mockResolvedValueOnce([]);
-
-    await configured.setAvailable('boss', 'source-note', false);
-
-    expect(realtime.broadcastNoteSourceStatusChanged).toHaveBeenCalledWith(
-      'boss',
-      expect.objectContaining({
-        sourceNoteId: 'source-note',
-        workStatus: 'CLOSED',
-        status: 'ACTIVE',
-        available: false,
-      }),
-    );
-    expect(realtime.broadcastNoteSourceStatusChanged).toHaveBeenCalledWith(
-      'agent',
-      expect.objectContaining({ sourceNoteId: 'source-note' }),
-    );
-    expect(realtime.broadcastNoteSourceStatusChanged).toHaveBeenCalledWith(
-      'chat-recipient',
-      expect.objectContaining({ sourceNoteId: 'source-note' }),
-    );
-    expect((prisma as any).chatMessage.findMany).toHaveBeenCalledWith(
-      expect.objectContaining({
-        where: expect.objectContaining({
-          OR: expect.arrayContaining([
-            { content: { path: ['sourceNoteId'], equals: 'source-note' } },
-            { content: { path: ['noteId'], equals: 'source-note' } },
-          ]),
         }),
-      }),
-    );
-    delete (prisma as any).chatMessage;
-    delete (prisma as any).chatMember;
+      );
+      expect(realtime.broadcastNoteSourceStatusChanged).toHaveBeenCalledWith(
+        'agent',
+        expect.objectContaining({ sourceNoteId: 'source-note' }),
+      );
+      expect(realtime.broadcastNoteSourceStatusChanged).toHaveBeenCalledWith(
+        'chat-recipient',
+        expect.objectContaining({ sourceNoteId: 'source-note' }),
+      );
+      expect(realtime.broadcastNoteSourceStatusChanged).toHaveBeenCalledTimes(
+        3,
+      );
+      // 卡片查询带上来源和全部副本的 id，每个指针键各一份数组参数。
+      const [query] = noteCardQueries();
+      expect(noteCardQueries()).toHaveLength(1);
+      expect(query.values).toEqual([
+        ['source-note', 'copy-note'],
+        ['source-note', 'copy-note'],
+      ]);
+      expect(query.sql).toContain(`("content" ->> 'sourceNoteId') = ANY(`);
+      expect(query.sql).toContain(`("content" ->> 'noteId') = ANY(`);
+      expect((prisma as any).chatMessage.findMany).not.toHaveBeenCalled();
+      // 空会话 id 被丢掉，只按真实会话查在群成员。
+      expect(prisma.chatMember.findMany).toHaveBeenCalledWith({
+        where: { conversationID: { in: ['chat-1'] }, leftAt: null },
+        select: { userID: true },
+      });
+    });
+
+    it('looks up every related note id in a single card query', async () => {
+      const copies = Array.from({ length: 150 }, (_, index) => ({
+        id: `copy-${index}`,
+        ownerID: `agent-${index}`,
+      }));
+      stubNoteCardRows(async () => []);
+      stubSourceNote(copies);
+
+      await configuredService().setAvailable('boss', 'source-note', false);
+
+      // = ANY(数组) 不受绑定参数个数限制，不再按 100 个一块串行扫表。
+      expect(noteCardQueries()).toHaveLength(1);
+      const [query] = noteCardQueries();
+      const expectedIds = ['source-note', ...copies.map((copy) => copy.id)];
+      expect(query.values).toEqual([expectedIds, expectedIds]);
+      expect(prisma.chatMember.findMany).not.toHaveBeenCalled();
+      expect(realtime.broadcastNoteSourceStatusChanged).toHaveBeenCalledTimes(
+        151,
+      );
+    });
+
+    it('still broadcasts to note owners when the card lookup fails', async () => {
+      stubNoteCardRows(() =>
+        Promise.reject(new Error('canceling statement due to timeout')),
+      );
+      stubSourceNote([{ id: 'copy-note', ownerID: 'agent' }]);
+      const warn = jest
+        .spyOn(Logger.prototype, 'warn')
+        .mockImplementation(() => undefined);
+
+      try {
+        await configuredService().setAvailable('boss', 'source-note', false);
+
+        expect(warn).toHaveBeenCalledWith(
+          'Note chat recipient lookup failed: canceling statement due to timeout',
+        );
+        expect(prisma.chatMember.findMany).not.toHaveBeenCalled();
+        expect(
+          realtime.broadcastNoteSourceStatusChanged.mock.calls.map(
+            ([userID]) => userID,
+          ),
+        ).toEqual(['boss', 'agent']);
+      } finally {
+        warn.mockRestore();
+      }
+    });
   });
 
   it('updates note status for the owner only', async () => {
@@ -2747,8 +2846,10 @@ describe('NoteService', () => {
         ownerID: 'user-1',
         name: '上海',
         sortOrder: 0,
-        _count: { memberships: 2 },
       },
+    ]);
+    prisma.noteGroupMembership.groupBy.mockResolvedValueOnce([
+      { groupID: 'group-1', _count: { _all: 2 } },
     ]);
 
     const created = await service.createGroup('user-1', { name: '上海' });
@@ -2756,6 +2857,51 @@ describe('NoteService', () => {
 
     expect(created).toMatchObject({ name: '上海' });
     expect(groups[0]).toMatchObject({ name: '上海', noteCount: 2 });
+  });
+
+  it('counts group notes with one groupBy scoped to the listed groups', async () => {
+    prisma.noteGroup.findMany.mockResolvedValueOnce([
+      { id: 'group-1', ownerID: 'user-1', name: '上海', sortOrder: 0 },
+      { id: 'group-2', ownerID: 'user-1', name: '北京', sortOrder: 1 },
+      { id: 'group-3', ownerID: 'user-1', name: '深圳', sortOrder: 2 },
+    ]);
+    prisma.noteGroupMembership.groupBy.mockResolvedValueOnce([
+      { groupID: 'group-3', _count: { _all: 4 } },
+      { groupID: 'group-1', _count: { _all: 2 } },
+    ]);
+
+    const groups = await service.listGroups('user-1');
+
+    // 计数不再挂在分组查询上：_count 关系子查询没有分组条件，会扫全站成员表。
+    const listArgs = prisma.noteGroup.findMany.mock.calls[0][0];
+    expect(listArgs).toEqual({
+      where: { ownerID: 'user-1', deletedAt: null },
+      orderBy: [{ sortOrder: 'asc' }, { createdAt: 'asc' }],
+      take: 500,
+    });
+    expect(prisma.noteGroupMembership.groupBy).toHaveBeenCalledTimes(1);
+    expect(prisma.noteGroupMembership.groupBy).toHaveBeenCalledWith({
+      by: ['groupID'],
+      where: {
+        groupID: { in: ['group-1', 'group-2', 'group-3'] },
+        note: { status: { not: 'DELETED' } },
+      },
+      _count: { _all: true },
+    });
+    // DTO 形状与顺序不变；没有成员的分组计 0。
+    expect(groups).toEqual([
+      { id: 'group-1', name: '上海', sortOrder: 0, noteCount: 2 },
+      { id: 'group-2', name: '北京', sortOrder: 1, noteCount: 0 },
+      { id: 'group-3', name: '深圳', sortOrder: 2, noteCount: 4 },
+    ]);
+  });
+
+  it('skips the count query when the owner has no groups', async () => {
+    prisma.noteGroup.findMany.mockResolvedValueOnce([]);
+
+    await expect(service.listGroups('user-1')).resolves.toEqual([]);
+
+    expect(prisma.noteGroupMembership.groupBy).not.toHaveBeenCalled();
   });
 
   it('forbids renaming another user group', async () => {
@@ -2800,8 +2946,10 @@ describe('NoteService', () => {
       ownerID: 'user-1',
       name: '上海',
       sortOrder: 0,
-      _count: { memberships: 1 },
     });
+    prisma.noteGroupMembership.groupBy.mockResolvedValueOnce([
+      { groupID: 'group-1', _count: { _all: 1 } },
+    ]);
 
     const result = await service.updateGroup('user-1', 'group-1', {
       name: '上海',
@@ -2809,7 +2957,52 @@ describe('NoteService', () => {
 
     // No second findFirst call for conflict because name is unchanged
     expect(prisma.noteGroup.findFirst).toHaveBeenCalledTimes(1);
-    expect(result).toMatchObject({ name: '上海' });
+    expect(prisma.noteGroup.update).toHaveBeenCalledWith({
+      where: { id: 'group-1' },
+      data: { name: '上海' },
+    });
+    expect(prisma.noteGroupMembership.groupBy).toHaveBeenCalledWith({
+      by: ['groupID'],
+      where: {
+        groupID: { in: ['group-1'] },
+        note: { status: { not: 'DELETED' } },
+      },
+      _count: { _all: true },
+    });
+    expect(result).toEqual({
+      id: 'group-1',
+      name: '上海',
+      sortOrder: 0,
+      noteCount: 1,
+    });
+  });
+
+  it('reports zero notes for a renamed group without members', async () => {
+    prisma.noteGroup.findFirst
+      .mockResolvedValueOnce({
+        id: 'group-1',
+        ownerID: 'user-1',
+        name: '上海',
+        deletedAt: null,
+      })
+      .mockResolvedValueOnce(null);
+    prisma.noteGroup.update.mockResolvedValueOnce({
+      id: 'group-1',
+      ownerID: 'user-1',
+      name: '杭州',
+      sortOrder: 3,
+    });
+
+    const result = await service.updateGroup('user-1', 'group-1', {
+      name: '杭州',
+    });
+
+    expect(result).toEqual({
+      id: 'group-1',
+      name: '杭州',
+      sortOrder: 3,
+      noteCount: 0,
+    });
   });
 
   it('deletes a group by clearing note ownership group references first', async () => {
@@ -3045,22 +3238,31 @@ describe('NoteService', () => {
       ownerID: 'user-1',
       name: '北京',
       sortOrder: 0,
-      _count: { memberships: 0 },
     });
     prisma.noteGroup.update.mockResolvedValueOnce({
       id: 'group-1',
       ownerID: 'user-1',
       name: '上海',
       sortOrder: 1,
-      _count: { memberships: 0 },
     });
     // listGroups call at the end of reorderGroups
     prisma.noteGroup.findMany.mockResolvedValueOnce([
-      { id: 'group-2', name: '北京', sortOrder: 0, _count: { memberships: 0 } },
-      { id: 'group-1', name: '上海', sortOrder: 1, _count: { memberships: 0 } },
+      { id: 'group-2', name: '北京', sortOrder: 0 },
+      { id: 'group-1', name: '上海', sortOrder: 1 },
+    ]);
+    prisma.noteGroupMembership.groupBy.mockResolvedValueOnce([
+      { groupID: 'group-1', _count: { _all: 3 } },
     ]);
 
-    await service.reorderGroups('user-1', ['group-2', 'group-1']);
+    const groups = await service.reorderGroups('user-1', [
+      'group-2',
+      'group-1',
+    ]);
+
+    expect(groups).toEqual([
+      { id: 'group-2', name: '北京', sortOrder: 0, noteCount: 0 },
+      { id: 'group-1', name: '上海', sortOrder: 1, noteCount: 3 },
+    ]);
 
     expect(prisma.noteGroup.update).toHaveBeenCalledWith(
       expect.objectContaining({

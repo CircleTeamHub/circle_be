@@ -7,6 +7,13 @@ import {
 } from 'src/generated/prisma';
 import { PrismaService } from 'src/prisma/prisma.service';
 import { SessionRevocationService } from './session-revocation.service';
+import {
+  readScopeGenerations,
+  readSessionVerificationLookup,
+  sessionVerificationQuery,
+  type ScopeGeneration,
+  type SessionVerificationLookup,
+} from './session-verification.query';
 
 /**
  * - `active`: the access token may be used;
@@ -55,6 +62,10 @@ function issuedAtMs(token: VerifiableToken): number | null {
     return token.iat * 1000;
   }
   return null;
+}
+
+function describeError(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
 }
 
 /**
@@ -111,43 +122,24 @@ export class SessionVerifier {
     const userId = token.sub;
     const sessionId = typeof token.sid === 'string' ? token.sid : null;
 
-    const lookup = await Promise.all([
-      this.prisma.user.findUnique({
-        where: { id: userId },
-        select: { status: true, accessTokensRevokedAt: true },
-      }),
-      sessionId
-        ? this.prisma.refreshToken.findUnique({
-            where: { id: sessionId },
-            select: {
-              userId: true,
-              revokedAt: true,
-              revocationReason: true,
-              accessRevokedAt: true,
-              familyId: true,
-              audience: true,
-              deviceKey: true,
-              accountGeneration: true,
-              audienceGeneration: true,
-              deviceGeneration: true,
-              familyGeneration: true,
-            },
-          })
-        : Promise.resolve(null),
-    ]).then(
-      (rows) => rows,
-      (error: unknown) => {
-        this.logger.warn(
-          `Session verification fallback lookup failed: ${
-            error instanceof Error ? error.message : String(error)
-          }`,
-        );
-        return null;
-      },
-    );
-    if (lookup === null) return { verdict: 'unavailable', identity: null };
+    // 用户、会话、generation 一条语句取齐(见 session-verification.query.ts):
+    // 每请求一次往返、一个池连接。下面的判定顺序与原来的两段查询逐条一致。
+    // 空串 sid 照旧不查会话行(原来是真值判断);判定里仍用原值,结论不变。
+    let lookup: SessionVerificationLookup;
+    try {
+      lookup = readSessionVerificationLookup(
+        await this.prisma.$queryRaw<unknown[]>(
+          sessionVerificationQuery(userId, sessionId || null),
+        ),
+      );
+    } catch (error: unknown) {
+      this.logger.warn(
+        `Session verification fallback lookup failed: ${describeError(error)}`,
+      );
+      return { verdict: 'unavailable', identity: null };
+    }
 
-    const [user, session] = lookup;
+    const { user, session } = lookup;
     if (user?.status !== UserStatus.ACTIVE) {
       return { verdict: 'revoked', identity: null };
     }
@@ -172,37 +164,15 @@ export class SessionVerifier {
       return { verdict: 'active', identity: null };
     }
 
-    const requestedScopes = [
-      { scope: SessionRevocationScope.ACCOUNT, scopeKey: '*' },
-      { scope: SessionRevocationScope.AUDIENCE, scopeKey: session.audience },
-      ...(session.deviceKey
-        ? [
-            {
-              scope: SessionRevocationScope.DEVICE,
-              scopeKey: session.deviceKey,
-            },
-          ]
-        : []),
-      { scope: SessionRevocationScope.FAMILY, scopeKey: session.familyId },
-    ];
-    const generations = await this.prisma.sessionScopeGeneration
-      .findMany({
-        where: { userId, OR: requestedScopes },
-        select: {
-          scope: true,
-          generation: true,
-          exemptFamilyId: true,
-        },
-      })
-      .catch((error: unknown) => {
-        this.logger.warn(
-          `Session generation lookup failed: ${
-            error instanceof Error ? error.message : String(error)
-          }`,
-        );
-        return null;
-      });
-    if (generations === null) {
+    // generation 随同一条语句回来,但和原来一样只在上面的检查都通过后才用;
+    // 收窄失败对应原来第二条查询失败的出口。
+    let generations: ScopeGeneration[];
+    try {
+      generations = readScopeGenerations(lookup.generations);
+    } catch (error: unknown) {
+      this.logger.warn(
+        `Session generation lookup failed: ${describeError(error)}`,
+      );
       return { verdict: 'unavailable', identity: null };
     }
 

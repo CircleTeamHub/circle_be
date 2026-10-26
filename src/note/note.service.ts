@@ -20,6 +20,7 @@ import { PrismaService } from 'src/prisma/prisma.service';
 import { MembershipPolicyService } from 'src/membership/membership-policy.service';
 import { RealtimeService } from 'src/realtime/realtime.service';
 import { purgeDeletedNote } from './note-purge';
+import { noteCardConversationsQuery } from './note-card-recipients.query';
 import {
   ChatCircleSyncService,
   DISABLED_ADMIN_STATES,
@@ -249,7 +250,6 @@ type NoteGroupRow = {
   id: string;
   name: string;
   sortOrder: number;
-  _count: { memberships: number };
 };
 
 const NOTE_INCLUDE = {
@@ -1221,35 +1221,17 @@ export class NoteService {
       // Chat cards are pointers, so a recipient may have seen the source note
       // without collecting it. Include active members of conversations that
       // still contain a live card; the payload has no private note content.
-      const chatMessage = (this.prisma as any).chatMessage;
       const chatMember = (this.prisma as any).chatMember;
-      if (chatMessage?.findMany && chatMember?.findMany) {
+      if (chatMember?.findMany) {
         try {
-          const messages: Array<{ conversationID?: unknown }> = [];
-          const relatedIDs = [...relatedNoteIDs];
-          for (let start = 0; start < relatedIDs.length; start += 100) {
-            const chunk = relatedIDs.slice(start, start + 100);
-            const pointerFilters = chunk.flatMap((id) => [
-              { content: { path: ['sourceNoteId'], equals: id } },
-              // Older cards predate sourceNoteId and use noteId as the source
-              // pointer. Keep their recipients live as well.
-              { content: { path: ['noteId'], equals: id } },
-            ]);
-            const batch = await chatMessage.findMany({
-              where: {
-                type: 'note-card',
-                deleted: false,
-                revokedAt: null,
-                OR: pointerFilters,
-              },
-              select: { conversationID: true },
-              distinct: ['conversationID'],
-            });
-            messages.push(...(batch as Array<{ conversationID?: unknown }>));
-          }
+          // 走 ChatMessage 上按来源指针键建的部分表达式索引（sourceNoteId 与老卡片
+          // 的 noteId 都查）。全部 id 进一个数组参数、一条语句，不再分块串行扫表。
+          const messages = await this.prisma.$queryRaw<
+            Array<{ conversationID?: unknown }>
+          >(noteCardConversationsQuery([...relatedNoteIDs]));
           const conversationIDs = [
             ...new Set(
-              (messages as Array<{ conversationID?: unknown }>)
+              messages
                 .map((message) => message.conversationID)
                 .filter(
                   (id): id is string => typeof id === 'string' && id.length > 0,
@@ -3160,13 +3142,39 @@ export class NoteService {
     );
   }
 
-  private mapGroup(group: NoteGroupRow): NoteGroupDto {
+  private mapGroup(group: NoteGroupRow, noteCount: number): NoteGroupDto {
     return {
       id: group.id,
       name: group.name,
       sortOrder: group.sortOrder,
-      noteCount: group._count.memberships,
+      noteCount,
     };
+  }
+
+  /**
+   * 分组 DTO 带上组内未删除笔记的条数。不能用 include._count：Prisma 把它编译成
+   * LEFT JOIN (SELECT "groupID", COUNT(*) ... GROUP BY "groupID")，子查询里没有任何
+   * 用户/分组条件，整张 NoteGroupMembership 连 Note 一起被扫。这里先拿分组，再按
+   * "groupID" IN (...) 聚合一次，只碰本人分组的成员行；没有成员的分组计 0。
+   */
+  private async mapGroupsWithNoteCounts(
+    groups: NoteGroupRow[],
+  ): Promise<NoteGroupDto[]> {
+    if (groups.length === 0) return [];
+    const counts = await this.prisma.noteGroupMembership.groupBy({
+      by: ['groupID'],
+      where: {
+        groupID: { in: groups.map((group) => group.id) },
+        note: { status: { not: 'DELETED' } },
+      },
+      _count: { _all: true },
+    });
+    const countByGroup = new Map(
+      counts.map((row) => [row.groupID, row._count._all]),
+    );
+    return groups.map((group) =>
+      this.mapGroup(group, countByGroup.get(group.id) ?? 0),
+    );
   }
 
   async createNote(
@@ -5497,24 +5505,11 @@ export class NoteService {
           ownerID,
           deletedAt: null,
         },
-        include: {
-          _count: {
-            select: {
-              memberships: {
-                where: {
-                  note: {
-                    status: { not: 'DELETED' },
-                  },
-                },
-              },
-            },
-          },
-        },
         orderBy: [{ sortOrder: 'asc' }, { createdAt: 'asc' }],
         take: 500, // #108：防爆护栏（分组数已有业务上限，这里兜异常数据）
       })) ?? [];
 
-    return groups.map((group) => this.mapGroup(group));
+    return this.mapGroupsWithNoteCounts(groups);
   }
 
   async createGroup(
@@ -5619,19 +5614,6 @@ export class NoteService {
         data: {
           name: normalizedName,
         },
-        include: {
-          _count: {
-            select: {
-              memberships: {
-                where: {
-                  note: {
-                    status: { not: 'DELETED' },
-                  },
-                },
-              },
-            },
-          },
-        },
       });
     } catch (error) {
       if (prismaErrorCode(error) === 'P2002') {
@@ -5643,7 +5625,8 @@ export class NoteService {
       throw error;
     }
 
-    return this.mapGroup(updated);
+    const [dto] = await this.mapGroupsWithNoteCounts([updated]);
+    return dto;
   }
 
   async deleteGroup(ownerID: string, groupId: string): Promise<void> {

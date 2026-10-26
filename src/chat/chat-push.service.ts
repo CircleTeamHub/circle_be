@@ -6,6 +6,7 @@ import {
   type TokenDeliveryOutcome,
 } from 'src/notification/notification-push.service';
 import { ChatBroadcastService } from './chat-broadcast.service';
+import { unreadBadgeQuery } from './chat-push-badge.query';
 import { CHAT_PUSH_CHANNEL_ID } from './chat.constants';
 import type { ChatMessageDto } from './chat.types';
 import { reportOperationalError } from 'src/logging/error-aggregation.service';
@@ -31,8 +32,25 @@ const BURN_PREVIEW = '[阅后即焚消息]';
  * 这是失控兜底而不是常规截断 —— 触顶会打 warn。
  */
 const PUSH_TARGET_CAP = 6000;
-/** 附带 badge 的最大扇出规模:超过则跳过逐人未读聚合(照常推送,只是无数字)。 */
+/** 附带 badge 的最大扇出规模(按全部收件人算):超过则跳过逐人未读聚合(照常推送,只是无数字)。 */
 const BADGE_TARGETS_MAX = 200;
+
+type TokensByUser = Map<
+  string,
+  Array<{ token: string; projectId: string | null }>
+>;
+
+/** 这个人这次真正要推的设备:去掉正开着 App 的那几台(消息已经实时送到上面了)。 */
+function deliverableTokens(
+  tokensByUser: TokensByUser,
+  foregroundTokens: Map<string, Set<string>>,
+  userId: string,
+): Array<{ token: string; projectId: string | null }> {
+  const onScreen = foregroundTokens.get(userId);
+  return (tokensByUser.get(userId) ?? []).filter(
+    (token) => !onScreen?.has(token.token),
+  );
+}
 
 /**
  * 同一会话的推送合并窗口。
@@ -242,11 +260,33 @@ export class ChatPushService implements OnModuleDestroy {
     if (groups.size === 0) return;
 
     const everyone = [...groups.values()].flatMap((group) => group.recipients);
-    // G-18:小规模扇出附 per-recipient 角标(iOS 杀后台也有数字)。大群跳过 ——
-    // 逐人聚合未读的代价与收益不成比;拿不到就不带 badge,推送照发。
+    // 收件人的 token 整个窗口一次查回、消息整批交给推送服务按 100 条一批发。原来是
+    // 每个收件人各查一次 token、各发一次 HTTPS:3000 人的群一条消息就是 3000 + 3000 次。
+    let tokensByUser: TokensByUser;
+    try {
+      tokensByUser = await this.push.listActiveTokensForUsers(everyone);
+    } catch (error) {
+      for (const { message, recipients } of groups.values()) {
+        this.logFanoutFailure(
+          message,
+          recipients.length,
+          recipients.length,
+          error,
+        );
+      }
+      return;
+    }
+    const deliverable = (userId: string) =>
+      deliverableTokens(tokensByUser, foregroundTokens, userId).length > 0;
+    // G-18:小规模扇出附 per-recipient 角标(iOS 杀后台也有数字)。大群照旧跳过 ——
+    // 门槛按全部收件人算,不能因为「能推到的人」少于上限就给大群多出一条每秒级的
+    // 聚合。门槛之内也只给这次真会收到推送的人算:正开着 App 的设备不推、没 token
+    // 的人推不到。拿不到就不带 badge,推送照发。
+    const reachable = everyone.filter(deliverable);
+    if (reachable.length === 0) return;
     const badges =
       everyone.length <= BADGE_TARGETS_MAX
-        ? await this.loadUnreadBadges(everyone)
+        ? await this.loadUnreadBadges(reachable)
         : new Map<string, number>();
     for (const { message, mention, recipients } of groups.values()) {
       const payload = {
@@ -259,6 +299,7 @@ export class ChatPushService implements OnModuleDestroy {
         payload,
         badges,
         foregroundTokens,
+        tokensByUser,
       );
     }
   }
@@ -338,24 +379,8 @@ export class ChatPushService implements OnModuleDestroy {
     payload: ExpoPushPayload,
     badges: Map<string, number>,
     foregroundTokens: Map<string, Set<string>>,
+    tokensByUser: TokensByUser,
   ): Promise<void> {
-    // 收件人的 token 一次查回、消息整批交给推送服务按 100 条一批发。原来是每个
-    // 收件人各查一次 token、各发一次 HTTPS:3000 人的群一条消息就是 3000 + 3000 次。
-    let tokensByUser: Map<
-      string,
-      Array<{ token: string; projectId: string | null }>
-    >;
-    try {
-      tokensByUser = await this.push.listActiveTokensForUsers(recipients);
-    } catch (error) {
-      this.logFanoutFailure(
-        message,
-        recipients.length,
-        recipients.length,
-        error,
-      );
-      return;
-    }
     const owners: string[] = [];
     const messages = recipients.flatMap((userId) => {
       const badge = badges.get(userId);
@@ -383,14 +408,12 @@ export class ChatPushService implements OnModuleDestroy {
             };
       const perUser =
         badge !== undefined ? { ...privacyPayload, badge } : privacyPayload;
-      // 这台设备正开着 App:不推(消息已经实时送到它上面了)。
-      const onScreen = foregroundTokens.get(userId);
-      return (tokensByUser.get(userId) ?? [])
-        .filter((token) => !onScreen?.has(token.token))
-        .map((token) => {
+      return deliverableTokens(tokensByUser, foregroundTokens, userId).map(
+        (token) => {
           owners.push(userId);
           return { ...token, payload: perUser };
-        });
+        },
+      );
     });
     if (messages.length === 0) return;
     const attempted = new Set(owners);
@@ -462,12 +485,7 @@ export class ChatPushService implements OnModuleDestroy {
     return seats;
   }
 
-  /**
-   * G-18:一条聚合查询算出这批收件人的全局未读总数(底数 = 已读与清空水位
-   * 的更高者,不计自己发的、已删的、已撤回的)。口径与 app 内角标一致:免打扰
-   * 会话不计 —— 否则每来一条推送,iOS 图标上的数字都比 app 里看得见的大。
-   * 失败返回空 map,推送不带 badge。
-   */
+  /** G-18:这批收件人的全局未读总数,口径与封顶见 unreadBadgeQuery。失败返回空 map,推送不带 badge。 */
   private async loadUnreadBadges(
     userIds: string[],
   ): Promise<Map<string, number>> {
@@ -475,24 +493,7 @@ export class ChatPushService implements OnModuleDestroy {
     try {
       const rows = await this.prisma.$queryRaw<
         Array<{ userID: string; count: bigint }>
-      >`
-        SELECT cm."userID", COUNT(*)::bigint AS count
-        FROM "ChatMember" cm
-        JOIN "ChatMessage" m ON m."conversationID" = cm."conversationID"
-        WHERE cm."userID" = ANY(${userIds}::text[])
-          AND cm."leftAt" IS NULL
-          -- 隐藏的会话不出现在 GET /chat/conversations 里,自然也不进 app 的
-          -- tab 未读数。这里不排掉的话,任何一条别的会话的推送都会把 iOS 角标
-          -- 顶到一个比 app 里看得见的总数更大的值,而且每来一条推送就复现一次。
-          AND cm."hiddenAt" IS NULL
-          AND cm."muted" = false
-          AND m."deleted" = false
-          AND (m."burnExpiresAt" IS NULL OR m."burnExpiresAt" > NOW())
-          AND m."revokedAt" IS NULL
-          AND m."height" > GREATEST(cm."lastReadHeight", cm."clearedBeforeHeight")
-          AND (m."senderID" IS NULL OR m."senderID" <> cm."userID")
-        GROUP BY cm."userID"
-      `;
+      >(unreadBadgeQuery(userIds));
       return new Map(rows.map((row) => [row.userID, Number(row.count)]));
     } catch (error) {
       this.logger.warn(

@@ -6,6 +6,8 @@ import {
 } from '@nestjs/common';
 import { ChatErrorCode } from 'src/common/app-error-codes';
 import { ChatService, conversationSyncRevision } from './chat.service';
+import { SINGLE_CHAR_SEARCH_WINDOW } from './chat-text-search.query';
+import type { Prisma } from 'src/generated/prisma';
 import { chatSendRequestHash } from './chat-send-request-hash';
 import type { ChatSendPayload } from './chat.types';
 
@@ -2792,6 +2794,49 @@ describe('ChatService', () => {
     it('returns empty for blank keywords without querying', async () => {
       await expect(service.searchAllMessages('u1', '  ')).resolves.toEqual([]);
       expect(prisma.chatMessage.findMany).not.toHaveBeenCalled();
+    });
+
+    // 单字的二元组集合是空的,`@> '{}'` 恒真、bigram 索引用不上:不设窗口就是把本人
+    // 所有会话的文本消息逐行解 jsonb 做 LIKE。单字只搜每个会话最近 N 条,两个字及以上
+    // 照旧走 bigram 索引搜全部历史。
+    const searchSql = (): string[] =>
+      prisma.$queryRaw.mock.calls.map((call: unknown[]) => {
+        const query = call[0] as TemplateStringsArray | Prisma.Sql;
+        return 'strings' in query ? query.strings.join('?') : query.join('?');
+      });
+
+    it.each(['我', ' 好 ', '😀'])(
+      "searches the single character %j only within each conversation's recent window",
+      async (keyword) => {
+        prisma.chatMember.findMany.mockResolvedValue([
+          {
+            conversationID: 'conv-1',
+            conversation: { clearedBeforeHeight: 0 },
+          },
+        ]);
+        prisma.$queryRaw.mockResolvedValue([]);
+
+        await service.searchAllMessages('u1', keyword);
+
+        const [sql] = searchSql();
+        expect(sql).toContain('CROSS JOIN LATERAL');
+        expect(sql).not.toContain('chat_text_bigrams');
+        const [query] = prisma.$queryRaw.mock.calls[0] as [Prisma.Sql];
+        expect(query.values).toContain(SINGLE_CHAR_SEARCH_WINDOW);
+      },
+    );
+
+    it('keeps two-character keywords on the bigram index over the full history', async () => {
+      prisma.chatMember.findMany.mockResolvedValue([
+        { conversationID: 'conv-1', conversation: { clearedBeforeHeight: 0 } },
+      ]);
+      prisma.$queryRaw.mockResolvedValue([]);
+
+      await service.searchAllMessages('u1', '你好');
+
+      const [sql] = searchSql();
+      expect(sql).toContain('chat_text_bigrams');
+      expect(sql).not.toContain('CROSS JOIN LATERAL');
     });
 
     // 搜索必须和 getHistory 用同一把尺子:自动销毁窗口之外的消息在历史里

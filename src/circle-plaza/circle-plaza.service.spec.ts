@@ -29,6 +29,7 @@ describe('CirclePlazaService', () => {
     circleMember: {
       findUnique: jest.fn(),
       findMany: jest.fn(),
+      groupBy: jest.fn(),
     },
     block: {
       findFirst: jest.fn(),
@@ -109,6 +110,14 @@ describe('CirclePlazaService', () => {
   beforeEach(async () => {
     jest.clearAllMocks();
     programEnabled = true;
+    // 发帖扇出取收件人走 groupBy(去重和 LIMIT 都在 SQL 里)。各用例按
+    // select.userID 给 findMany 分流的写法沿用:groupBy 默认转给同一个 mock。
+    prisma.circleMember.groupBy.mockImplementation((args: { where: unknown }) =>
+      prisma.circleMember.findMany({
+        where: args.where,
+        select: { userID: true },
+      }),
+    );
     realtime.broadcastNotificationCreated.mockReset();
     notificationService.createCirclePostSignupNotification.mockReset();
     notificationService.createCirclePostAutoEndedNotification.mockReset();
@@ -1349,7 +1358,10 @@ describe('CirclePlazaService', () => {
       fromUserId: 'user-1',
       recipientIds: ['member-2'],
     });
-    expect(prisma.circleMember.findMany).toHaveBeenCalledWith({
+    // 必须是 groupBy:Prisma 对 distinct + take 不生成 LIMIT(在内存里截断),
+    // 50 个圈子 × 3000 人会整批读回来;groupBy 编译成 GROUP BY ... LIMIT。
+    expect(prisma.circleMember.groupBy).toHaveBeenCalledWith({
+      by: ['userID'],
       where: {
         circleID: { in: ['circle-1'] },
         status: 'ACTIVE',
@@ -1359,11 +1371,12 @@ describe('CirclePlazaService', () => {
           blocksReceived: { none: { blockerID: 'user-1' } },
         },
       },
-      select: { userID: true },
-      distinct: ['userID'],
       orderBy: { userID: 'asc' },
       take: 501,
     });
+    expect(prisma.circleMember.findMany).not.toHaveBeenCalledWith(
+      expect.objectContaining({ distinct: expect.anything() }),
+    );
     expect(prisma.block.findMany).not.toHaveBeenCalled();
   });
 
