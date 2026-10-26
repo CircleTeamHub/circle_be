@@ -20,7 +20,10 @@ import { RedisService } from 'src/redis/redis.service';
 import { PrismaService } from 'src/prisma/prisma.service';
 import { ChatErrorCode, type AppErrorCode } from 'src/common/app-error-codes';
 import { reportOperationalError } from 'src/logging/error-aggregation.service';
-import { randomUUID } from 'node:crypto';
+import {
+  CONNECTION_TRACE_HEADER,
+  resolveConnectionTraceId,
+} from 'src/logging/connection-trace-id';
 import {
   CHAT_EVENTS,
   CHAT_RATE_LIMITS,
@@ -97,10 +100,7 @@ type EngineConnectionError = {
   context?: { status?: unknown };
 };
 
-const CONNECTION_TRACE_HEADER = 'x-connection-trace-id';
 const GUEST_CLIENT_TYPE_SET = new Set<string>(GUEST_CLIENT_MESSAGE_TYPES);
-const SAFE_CONNECTION_TRACE_ID =
-  /^ws-[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 const CHAT_AUTH_FAILURE_REASONS: ReadonlySet<ChatAuthFailureReason> = new Set([
   'missing_token',
   'invalid_token',
@@ -118,16 +118,6 @@ const CHAT_AUTH_FAILURE_REASONS: ReadonlySet<ChatAuthFailureReason> = new Set([
 
 function firstHeader(value: string | string[] | undefined): string | undefined {
   return Array.isArray(value) ? value[0] : value;
-}
-
-function safeConnectionTraceId(value: unknown): string | undefined {
-  return typeof value === 'string' && SAFE_CONNECTION_TRACE_ID.test(value)
-    ? value
-    : undefined;
-}
-
-function resolveConnectionTraceId(trustedProxyValue: unknown): string {
-  return safeConnectionTraceId(trustedProxyValue) ?? `ws-${randomUUID()}`;
 }
 
 function engineRejectionReason(code: unknown): ChatConnectionRejectionReason {

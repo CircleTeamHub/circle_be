@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { existsSync, readFileSync } from 'node:fs';
+import { existsSync, readdirSync, readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
 
@@ -120,6 +120,32 @@ test('CI rebuilds the Caddy runtime stage so Alpine fixes are not served from ca
   assert.match(build[1], /\n\s*no-cache-filters: runtime(\n|$)/);
 });
 
+test('only /chat-ws handshakes reach an access log on the API site', () => {
+  // 站点里写了 `log chat_ws` 就开了整站 access log：没被 log_name 认领的请求落到
+  // 默认 logger（stdout、不过滤），完整 URI（分享/临时聊天 token、对象存储签名）、
+  // 客户端 IP 和请求头都在里面。实测过：没有 log_skip 时每个请求（含 404）都会写。
+  const api = CADDYFILE.slice(CADDYFILE.indexOf('{$API_DOMAIN}'), CADDYFILE.indexOf('{$ADMIN_DOMAIN}'));
+  assert.match(api, /\n\tlog chat_ws \{/);
+  assert.match(api, /\n\t@not_chat_ws not path \/chat-ws \/chat-ws\/\*\n\tlog_skip @not_chat_ws\n/);
+  // 管理域没有 log 指令，它的请求本来就不进 access log。
+  const admin = CADDYFILE.slice(CADDYFILE.indexOf('{$ADMIN_DOMAIN}'));
+  assert.doesNotMatch(admin, /\n\tlog\b/);
+});
+
+test('both websocket gateways get their connection trace ID from Caddy', () => {
+  // header_up 无条件写 X-Connection-Trace-Id；变量没设的路径会把它置成空值，网关
+  // 只能另起一个 ID，和 Caddy 这侧对不上（/realtime 此前就是这样）。
+  assert.match(CADDYFILE, /@chat_ws path \/chat-ws \/chat-ws\/\*\n\tvars @chat_ws connection_trace_id ws-\{http\.request\.uuid\}/);
+  assert.match(CADDYFILE, /@realtime_ws path \/realtime\n\tvars @realtime_ws connection_trace_id ws-\{http\.request\.uuid\}/);
+  assert.match(CADDYFILE, /header_up X-Connection-Trace-Id \{http\.vars\.connection_trace_id\}/);
+  // access log 的范围不随之扩大。
+  assert.doesNotMatch(CADDYFILE, /log_name @realtime_ws/);
+  // 后端两个网关读的是同一个头、同一套校验。
+  for (const file of ['src/chat/chat.gateway.ts', 'src/realtime/realtime.gateway.ts']) {
+    assert.match(read(file), /from 'src\/logging\/connection-trace-id'/, `${file} has its own trace-ID parsing`);
+  }
+});
+
 test('the Caddy log directory is readable by the collector and lives in its own volume', () => {
   assert.match(CADDY_DOCKERFILE, /mkdir -p \/var\/log\/caddy/);
   assert.match(CADDY_DOCKERFILE, /chmod 0755 \/var\/log\/caddy/);
@@ -157,6 +183,10 @@ test('Loki evaluates log alert rules and sends them to Alertmanager', () => {
     'BackendErrorLogSpike',
     'CaddyProxyErrors',
     'CaddyCertificateErrors',
+    'SecurityCodeGuessing',
+    'SecurityCodeLockouts',
+    'RevokedSessionTokenReplay',
+    'InvalidTokenSpike',
   ]) {
     assert.match(rules, new RegExp(`- alert: ${name}\\n`), `${name} missing`);
   }
@@ -176,7 +206,7 @@ function lokiRule(rules, name) {
 test('log spike alerts need sustained errors, not one burst', () => {
   // 窗口比 for 长时，一阵突发会在窗口里待满 for，于是一次蓝绿切换就能响。
   const rules = read(RULES_PATH);
-  for (const name of ['BackendErrorLogSpike', 'CaddyProxyErrors']) {
+  for (const name of ['BackendErrorLogSpike', 'CaddyProxyErrors', 'SecurityCodeGuessing', 'InvalidTokenSpike']) {
     const rule = lokiRule(rules, name);
     assert.ok(rule.window && rule.for, `${name} needs a range window and a for`);
     assert.ok(rule.for > rule.window, `${name}: for (${rule.for}m) must exceed its window (${rule.window}m)`);
@@ -210,4 +240,39 @@ test('the manual logs-overlay enable command recreates Alertmanager onto the log
   for (const service of ['loki', 'alloy', 'grafana', 'prometheus', 'alertmanager']) {
     assert.ok(services.includes(service), `enable command misses ${service}`);
   }
+});
+
+function sourceFiles(dir) {
+  const files = [];
+  for (const entry of readdirSync(join(ROOT, dir), { withFileTypes: true })) {
+    const path = `${dir}/${entry.name}`;
+    if (entry.isDirectory()) files.push(...sourceFiles(path));
+    else if (entry.name.endsWith('.ts') && !entry.name.endsWith('.spec.ts')) files.push(path);
+  }
+  return files;
+}
+
+test('the security log rules match event names the backend actually emits', () => {
+  // 规则按字符串匹配事件名：代码里改个名字，告警就悄悄失效，什么都不会报错。
+  const rules = read(RULES_PATH);
+  const source = sourceFiles('src').map(read).join('\n');
+  const names = new Set();
+  for (const m of rules.matchAll(/securityEvent=~?"([^"]+)"/g)) {
+    for (const name of m[1].split('|')) names.add(name);
+  }
+  assert.ok(names.size >= 5, `expected the security rules, found ${[...names]}`);
+  for (const name of names) {
+    assert.ok(source.includes(`'${name}'`), `no backend code emits securityEvent ${name}`);
+  }
+  // 吊销令牌重放按会话、按用户去重：一次「登出所有设备」本身就有十几条原始事件。
+  const replay = lokiRule(rules, 'RevokedSessionTokenReplay').body;
+  assert.match(replay, /sum by \(metadata_sessionId\)/);
+  assert.match(replay, /count\(sum by \(userId\)/);
+  assert.ok(read('src/auth/auth.strategy.ts').includes('metadata: { sessionId: payload.sid'), 'session_revoked_token_used no longer carries metadata.sessionId');
+  // InvalidTokenSpike 读 metadata.authFailureReason（json 解析器展开成
+  // metadata_authFailureReason）。
+  assert.match(rules, /metadata_authFailureReason="token_invalid"/);
+  const filter = read('src/filters/all-exception.filter.ts');
+  assert.match(filter, /metadata: authFailureReason \? \{ authFailureReason \} : undefined/);
+  assert.ok(source.includes("'token_invalid'"), 'token_invalid is no longer an auth failure reason');
 });
