@@ -418,7 +418,7 @@ describe('runBootstrap', () => {
   });
 });
 
-describe('encryption JSON payload size', () => {
+describe('JSON payload size', () => {
   it('accepts contract-sized payloads and rejects bodies above the explicit bound', async () => {
     const app = await NestFactory.create(CorsProbeModule, {
       rawBody: true,

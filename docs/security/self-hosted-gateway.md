@@ -37,6 +37,4 @@ docker compose -f docker-compose.prod.yml -f docker-compose.release.yml config -
 
 生产 Caddy 镜像的语法与模块验证由现有 CI 和切流脚本执行。源站仍是单一入口；若以后在 Caddy 前加代理，必须同时更新可信代理与真实 IP 识别，只接受可信来源传入的转发头，并限制源站直连。
 
-端到端加密另见 [设计方案](end-to-end-encryption-plan.md)，当前仍是服务端可读的聊天协议。
-
 具体告警阈值、本地验证与服务器恢复后的执行顺序见 [发布检查单](gateway-release-checklist.md)。
