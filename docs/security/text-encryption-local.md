@@ -1,3 +1,5 @@
+> **2026-10-25 起已停用(第一阶段)。** 后端拒绝把会话改成加密模式、拒收新的 `encrypted-text`(错误码 `CHAT_TEXT_ENCRYPTION_DISABLED`),迁移 `20261025000000_text_encryption_off` 把已加密会话改回 `PLAIN`(可按 `E2eeRoom` 撤回,见迁移文件)。第二阶段确认没有真实用户依赖加密数据后,删除 `src/e2ee` 模块、七张 `E2ee*` 表和 `textEncryption` 列。下面是停用前的接入记录,本地启用步骤已不再适用。
+
 > 恢复与归档已经接入。最新流程、协议边界和真机证据见前端仓库 `docs/text-encryption-recovery.md`。本文保留上一阶段接入记录。
 
 # 文字加密：本地开发联调

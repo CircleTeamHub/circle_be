@@ -1,3 +1,4 @@
+import { ChatErrorCode } from 'src/common/app-error-codes';
 import { E2eeService } from './e2ee.service';
 
 function fixture() {
@@ -110,4 +111,24 @@ it('uses the authorized retention deadline for recovered audit ciphertext', asyn
     after: '',
   } as any);
   expect(result.items[0].expiresAt).toBe(retainUntil.toISOString());
+});
+
+it('refuses to switch any conversation to encrypted mode once text encryption is off', async () => {
+  // 第一阶段停用:不管部署开关开没开,都不能再把会话改成加密模式。
+  const db = { $transaction: jest.fn() };
+  const service = new E2eeService(
+    db as any,
+    {
+      get: () => 'true',
+    } as any,
+  );
+  await expect(
+    service.createRoom('owner', 'conversation', {
+      actorDeviceId: 'device',
+      signature: 'proof',
+    } as any),
+  ).rejects.toMatchObject({
+    response: { errorCode: ChatErrorCode.TextEncryptionDisabled },
+  });
+  expect(db.$transaction).not.toHaveBeenCalled();
 });

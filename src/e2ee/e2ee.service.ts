@@ -23,6 +23,7 @@ import {
   RegisterEncryptionDeviceDto,
 } from './e2ee.dto';
 import { requireAuditPermission, verifyDeviceProof } from './e2ee-proof';
+import { ChatErrorCode } from 'src/common/app-error-codes';
 
 type Tx = Prisma.TransactionClient;
 type Purpose = 'APP' | 'AUDIT';
@@ -48,6 +49,12 @@ export class E2eeService {
   private enabled() {
     if (this.config.get<string>('E2EE_TEXT_ENABLED') !== 'true')
       throw new ForbiddenException('Text encryption is not enabled');
+  }
+  private textEncryptionSwitchedOff(): never {
+    throw new ForbiddenException({
+      message: '文字加密已停用',
+      errorCode: ChatErrorCode.TextEncryptionDisabled,
+    });
   }
   private async account(tx: Tx, userID: string, purpose: Purpose) {
     await tx.$queryRaw`SELECT "id" FROM "User" WHERE "id" = ${userID} FOR SHARE`;
@@ -375,6 +382,9 @@ export class E2eeService {
     conversationID: string,
     dto: EncryptionDeviceActionDto,
   ) {
+    // 文字加密已停用(第一阶段):部署开关开着也不能再把会话改成加密模式。
+    // 下面的原实现原样留着,第二阶段随整个模块一起删;要撤回停用,删掉这一行即可。
+    this.textEncryptionSwitchedOff();
     this.enabled();
     return this.db.$transaction(async (tx) => {
       await tx.$queryRaw`SELECT "id" FROM "ChatConversation" WHERE "id" = ${conversationID} FOR UPDATE`;
