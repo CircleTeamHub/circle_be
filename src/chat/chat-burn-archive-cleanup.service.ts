@@ -1,9 +1,10 @@
-import { Injectable } from '@nestjs/common';
+import { Injectable, Logger } from '@nestjs/common';
 import { CronExpression } from '@nestjs/schedule';
 import { PrismaService } from 'src/prisma/prisma.service';
 import { RedisService } from 'src/redis/redis.service';
 import { JobLeaseContext, runWithJobLease } from 'src/redis/job-lease';
 import {
+  reportHandledJobFailure,
   reportJobSkipped,
   TrackedCron,
 } from 'src/metrics/tracked-cron.decorator';
@@ -19,8 +20,14 @@ const CLEANUP_SCAN_MAX = 200;
 /**
  * 一个事务最多清理的归档行数。整个事务都持有会话行锁,同会话的发消息要排队等它;
  * 同一批焚毁出来的归档 retainUntil 挨在一起,不封顶的话一个事务就是一整轮。
+ * 每行要十来次往返(附件引用、删除排队、笔记导入引用),行数再多就容易撞事务超时。
  */
-const CLEANUP_ROWS_PER_TX = 50;
+const CLEANUP_ROWS_PER_TX = 20;
+/**
+ * 批事务的超时:Prisma 交互事务默认 5 秒,等会话行锁和 advisory 锁的时间也算在内,
+ * 一批几百条语句很容易撞上,撞上就整批回滚。maxWait 限住等连接的时间。
+ */
+const CLEANUP_TX_OPTIONS = { timeout: 30_000, maxWait: 5_000 } as const;
 
 type DueArchive = { id: string; conversationID: string };
 type ArchiveRow = { id: string; type: string; content: Prisma.JsonValue };
@@ -60,6 +67,8 @@ function archiveMediaKeys(row: ArchiveRow): string[] {
 
 @Injectable()
 export class ChatBurnArchiveCleanupService {
+  private readonly logger = new Logger(ChatBurnArchiveCleanupService.name);
+
   constructor(
     private readonly prisma: PrismaService,
     private readonly media: ChatMediaService,
@@ -80,9 +89,7 @@ export class ChatBurnArchiveCleanupService {
         });
         for (const batch of groupByConversation(due)) {
           if (!lease.isCurrent()) return;
-          await this.prisma.$transaction((tx) =>
-            this.cleanupBatch(tx, batch.conversationID, batch.ids, lease),
-          );
+          await this.cleanupGroup(batch.conversationID, batch.ids, lease);
         }
       },
     );
@@ -91,6 +98,57 @@ export class ChatBurnArchiveCleanupService {
       return;
     }
     await this.media.drainPendingDeletions();
+  }
+
+  /**
+   * 一批失败(超时、某一行出错)只影响这一批:记一次失败,再退回逐行事务(原来的做法),
+   * 一行坏数据不拖住同批其它行,也不让异常抛出整轮、把后面的会话全跳过 —— 否则下一轮
+   * 按 retainUntil 扫到的还是这一批,清理队列就整体卡死。
+   */
+  private async cleanupGroup(
+    conversationID: string,
+    ids: string[],
+    lease: JobLeaseContext,
+  ): Promise<void> {
+    try {
+      await this.prisma.$transaction(
+        (tx) => this.cleanupBatch(tx, conversationID, ids, lease),
+        CLEANUP_TX_OPTIONS,
+      );
+      return;
+    } catch (error) {
+      this.logger.warn({
+        event: 'chat_burn_archive_batch_failed',
+        conversationID,
+        rows: ids.length,
+        error: error instanceof Error ? error.message : String(error),
+      });
+      reportHandledJobFailure();
+    }
+    let failedRows = 0;
+    let lastError: unknown;
+    for (const id of ids) {
+      if (!lease.isCurrent()) return;
+      try {
+        await this.prisma.$transaction(
+          (tx) => this.cleanupBatch(tx, conversationID, [id], lease),
+          CLEANUP_TX_OPTIONS,
+        );
+      } catch (error) {
+        failedRows += 1;
+        lastError = error;
+      }
+    }
+    if (failedRows > 0) {
+      // 一批只记一行:系统性故障时逐行都会失败,逐行打日志会刷屏。
+      this.logger.warn({
+        event: 'chat_burn_archive_rows_failed',
+        conversationID,
+        failedRows,
+        error:
+          lastError instanceof Error ? lastError.message : String(lastError),
+      });
+    }
   }
 
   /**

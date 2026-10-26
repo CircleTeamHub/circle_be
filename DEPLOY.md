@@ -271,6 +271,31 @@ launcher 会拒绝任何兼容级别低于 4 的 tag。
 登录 GHCR(隔离的 DOCKER_CONFIG,用完即删),镜像随后留在本地 Docker 缓存,
 重启和回滚不依赖注册表。
 
+### 迁移里的并发建索引(CONCURRENTLY):发版前后必查
+
+热表上的索引一律 `CREATE / DROP INDEX CONCURRENTLY`(不锁写),代价是中断后会留下
+**invalid 的残骸索引**,而 `CREATE INDEX ... IF NOT EXISTS` 会把残骸当成「已存在」跳过。
+
+- **每次发版后**:下面的查询必须为空,否则按下一条处理。
+
+  ```sql
+  SELECT indexrelid::regclass AS index FROM pg_index WHERE NOT indisvalid;
+  ```
+
+- **某个建索引迁移失败 / 留下 invalid 索引时**:先确认
+  `SELECT * FROM pg_stat_progress_create_index` 里没有还在跑的构建,再
+  `DROP INDEX CONCURRENTLY IF EXISTS "<那个新索引>";`,然后
+  `npx prisma migrate resolve --rolled-back <迁移名>` 并重新 `migrate deploy`。
+  不要对 invalid 索引执行 `--applied`。
+- **「先建后删」的成对迁移**:删旧索引的那一份跑之前,新索引必须 `indisvalid = true`;
+  否则停下按上一条处理 —— 让删除迁移跑过去,查询会直接退回全表扫描或排序。目前有:
+  - `20261026000200` 建 Friend 复合索引 → `0230` / `0240` 删单列索引;
+  - `20261026000100` 建通知列表与稀疏外键索引 → `0110` / `0120` / `0130` 删旧索引;
+  - `20261026000530` 建评论 `(traceID, createdAt)` → `0540` 删 `(traceID)`。
+- **换触发器的迁移**(`20261025000100`、`0150`)带 `lock_timeout = 5s`:撞上长事务等不到
+  表锁就整份回滚,`_prisma_migrations` 留下失败记录。处理:
+  `npx prisma migrate resolve --rolled-back <迁移名>`,避开长事务后重跑。
+
 ### 回滚 / 重放
 
 - **一键回滚**:Actions → Release → Run workflow,填写带有

@@ -3,6 +3,7 @@ import { CronExpression } from '@nestjs/schedule';
 import { TrackedCron } from '../metrics/tracked-cron.decorator';
 import { PrismaService } from 'src/prisma/prisma.service';
 import { Prisma } from 'src/generated/prisma';
+import { isRetryableTransactionError } from 'src/utils/prisma-tx';
 
 const SERIALIZATION_RETRIES = 3;
 
@@ -38,10 +39,13 @@ export class LikeReconciliationService {
         SELECT pg_try_advisory_xact_lock(hashtextextended('like-reconciliation-job', 0)) AS acquired
       `;
             if (!lock?.acquired) return 0;
-            const [consistencyLock] = await tx.$queryRaw<
-              Array<{ acquired: boolean }>
-            >`SELECT pg_try_advisory_xact_lock(hashtextextended('like-counter-reconciliation', 0)) AS acquired`;
-            if (!consistencyLock?.acquired) return 0;
+            // 点赞/取消点赞持有这把锁的共享锁,只持几毫秒。用 try-lock 的话,只要
+            // 04:00 有一笔点赞在途就整天跳过、而且和「没有漂移」分不出来;所以阻塞等锁,
+            // 5 秒等不到就报错(TrackedCron 记一次失败),拿到后恢复默认,不影响下面的 UPDATE。
+            await tx.$executeRaw`SET LOCAL lock_timeout = '5s'`;
+            // 返回 void:必须走 $executeRaw,$queryRaw 反序列化不了 void 列(真库 P2010)。
+            await tx.$executeRaw`SELECT pg_advisory_xact_lock(hashtextextended('like-counter-reconciliation', 0))`;
+            await tx.$executeRaw`SET LOCAL lock_timeout = DEFAULT`;
 
             // Single set-based update: recompute the true count per user (LEFT JOIN so
             // users with zero likes settle to 0) and write back only the drifted rows.
@@ -70,8 +74,9 @@ export class LikeReconciliationService {
           },
         );
       } catch (error) {
+        // 原生查询的序列化失败报 P2010,不是 P2034,统一走 isRetryableTransactionError。
         if (
-          (error as { code?: string }).code === 'P2034' &&
+          isRetryableTransactionError(error) &&
           attempt < SERIALIZATION_RETRIES - 1
         ) {
           continue;

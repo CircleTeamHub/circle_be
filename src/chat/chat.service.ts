@@ -61,7 +61,12 @@ import {
   READERS_PAGE_MAX,
 } from './chat.constants';
 import { recentTextMatchesQuery } from './chat-text-search.query';
-import { allWithConcurrency } from './concurrency-limit';
+import { allWithConcurrency } from 'src/utils/concurrency-limit';
+import {
+  historyPageArgs,
+  historyPageWhere,
+  MESSAGE_READ_OMIT,
+} from './chat-history-page.query';
 import {
   lastMessagesQuery,
   unreadCountsQuery,
@@ -192,7 +197,6 @@ function senderSeatRefs(
       : [],
   );
 }
-const MESSAGE_READ_OMIT = { contentHistory: true } as const;
 
 /**
  * 会话变更序号流的水位:已分配出去的最高 revision,<= 它的变更都已提交。
@@ -2562,22 +2566,13 @@ export class ChatService {
     // 读取只按各消息首次发送时确定的到期时间过滤，不应用查看者的设置。
     const viewer = NO_VIEWER_RETENTION;
     const retention = buildChatRetentionWindow(conversation, viewer);
-    const heightCondition: Prisma.IntFilter = {
-      ...(heightFloor > 0 ? { gt: heightFloor } : {}),
-      ...(beforeHeight !== undefined ? { lt: beforeHeight } : {}),
-    };
-    const where: Prisma.ChatMessageWhereInput = {
-      conversationID: conversationId,
-      deleted: false,
-      ...(Object.keys(heightCondition).length > 0
-        ? { height: heightCondition }
-        : {}),
-      ...this.buildHistoryFilterWhere(filters),
-    };
-    // 必须用 AND 追加,不能并进同一层 —— 按日期过滤同样写 createdAt,
-    // 平铺展开会被它整个盖掉:客户端只要带上 date 参数就能翻出销毁窗口
-    // 之外的消息,等于给这个设置留了个后门。
-    Object.assign(where, chatRetentionWhere(retention));
+    const where = historyPageWhere({
+      conversationId,
+      heightFloor,
+      beforeHeight,
+      filters,
+      retention,
+    });
     const rows = filters.keyword
       ? await this.findHistoryKeywordRows({
           conversationId,
@@ -2588,13 +2583,9 @@ export class ChatService {
           beforeHeight,
           take,
         })
-      : await this.prisma.chatMessage.findMany({
-          where,
-          omit: MESSAGE_READ_OMIT,
-          // 增量补拉从缺口低端往高处追;向旧翻页照旧取最近一段再反转。
-          orderBy: { height: ascendingPull ? 'asc' : 'desc' },
-          take,
-        });
+      : await this.prisma.chatMessage.findMany(
+          historyPageArgs(where, ascendingPull, take),
+        );
     const senderIds = rows
       .map((r) => r.senderID)
       .filter((id): id is string => id !== null);
@@ -2727,29 +2718,6 @@ export class ChatService {
    * [00:00, 24:00) 的 UTC 区间。keyword 不在这里:它先走二元组索引取候选
    * (findHistoryKeywordRows),这里的条件再套在候选上。
    */
-  private buildHistoryFilterWhere(
-    filters: HistoryFilters,
-  ): Prisma.ChatMessageWhereInput {
-    const where: Prisma.ChatMessageWhereInput = {};
-    if (filters.types?.length) {
-      where.type = { in: filters.types };
-    }
-    if (filters.date) {
-      const tzOffset = filters.tzOffsetMinutes ?? 0;
-      const tzEndOffset = filters.tzEndOffsetMinutes ?? tzOffset;
-      const utcStart = Date.parse(`${filters.date}T00:00:00Z`);
-      const start = utcStart + tzOffset * 60_000;
-      const end = utcStart + 24 * 60 * 60 * 1000 + tzEndOffset * 60_000;
-      if (Number.isFinite(start)) {
-        where.createdAt = {
-          gte: new Date(start),
-          lt: new Date(end),
-        };
-      }
-    }
-    return where;
-  }
-
   /**
    * 某月内有聊天记录的日期集合('YYYY-MM-DD',按客户端时区归日),
    * 按日期日历给有记录的天上色用。时区规则见 messageDayWindows,逐天的存在性查询见

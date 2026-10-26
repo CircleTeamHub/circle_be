@@ -6,6 +6,12 @@ import {
 } from 'src/chat/chat-conversation-summary.query';
 import { UNREAD_COUNT_CAP } from 'src/chat/chat.constants';
 import {
+  historyPageArgs,
+  historyPageWhere,
+} from 'src/chat/chat-history-page.query';
+import type { HistoryFilters } from 'src/chat/chat.types';
+import { capturePrisma, captureQueries } from './prisma-sql-capture';
+import {
   describePostgres,
   explainPlan,
   type IsolatedSchema,
@@ -18,47 +24,38 @@ import {
  * 「图片 / 视频 / 文件」页签按 (conversationID, type, height) 直接取,不沿整个会话
  * 倒扫再回表判断 type。
  *
- * HISTORY_SQL 是 Prisma 7 为 chat.service.ts getHistory 的
- *   chatMessage.findMany({
- *     where: { conversationID, deleted: false, [height: { lt }], [type: { in: types }],
- *              AND: [{ OR: [{ burnExpiresAt: null }, { burnExpiresAt: { gt: now } }] }] },
- *     omit: { contentHistory: true }, orderBy: { height: 'desc' }, take,
- *   })
- * 编译出的语句形状(离线编译:假 driver adapter 记录 SQL,去掉 "public". 前缀)。
+ * 历史页的 SQL 现场生成:用 getHistory 自己的 historyPageWhere / historyPageArgs,
+ * 交给只记录不执行的 Prisma 客户端(prisma-sql-capture),拿到 Prisma 7 实际编译出的
+ * 语句和参数再来真库执行、EXPLAIN。源码里 where 改了,这里跟着变。
  * 末条与未读两条原生 SQL 直接用 src 里的构造器。
  */
-const HISTORY_COLUMNS = `"ChatMessage"."id", "ChatMessage"."burnDurationSec", "ChatMessage"."burnExpiresAt",
-  "ChatMessage"."conversationID", "ChatMessage"."height", "ChatMessage"."senderID", "ChatMessage"."type",
-  "ChatMessage"."content", "ChatMessage"."clientMessageId", "ChatMessage"."requestHash",
-  "ChatMessage"."replyToID", "ChatMessage"."deleted", "ChatMessage"."deletedAt", "ChatMessage"."revokedAt",
-  "ChatMessage"."revokedBy", "ChatMessage"."editedAt", "ChatMessage"."revision", "ChatMessage"."createdAt"`;
-
-/** types=[image]、带向旧翻页游标:$1 会话 $2 false $3 height< $4 type $5 now $6 take $7 offset。 */
-const HISTORY_ONE_TYPE_SQL = `SELECT ${HISTORY_COLUMNS} FROM "ChatMessage"
-  WHERE ("ChatMessage"."conversationID" = $1 AND "ChatMessage"."deleted" = $2
-    AND "ChatMessage"."height" < $3 AND "ChatMessage"."type" IN ($4)
-    AND ("ChatMessage"."burnExpiresAt" IS NULL OR "ChatMessage"."burnExpiresAt" > $5))
-  ORDER BY "ChatMessage"."height" DESC LIMIT $6 OFFSET $7`;
-
-/** types=[video, file] 首页:$1 会话 $2 false $3 $4 type $5 now $6 take $7 offset。 */
-const HISTORY_TWO_TYPES_SQL = `SELECT ${HISTORY_COLUMNS} FROM "ChatMessage"
-  WHERE ("ChatMessage"."conversationID" = $1 AND "ChatMessage"."deleted" = $2
-    AND "ChatMessage"."type" IN ($3,$4)
-    AND ("ChatMessage"."burnExpiresAt" IS NULL OR "ChatMessage"."burnExpiresAt" > $5))
-  ORDER BY "ChatMessage"."height" DESC LIMIT $6 OFFSET $7`;
-
-/** 不按类型过滤的首页:$1 会话 $2 false $3 now $4 take $5 offset。 */
-const HISTORY_PLAIN_SQL = `SELECT ${HISTORY_COLUMNS} FROM "ChatMessage"
-  WHERE ("ChatMessage"."conversationID" = $1 AND "ChatMessage"."deleted" = $2
-    AND ("ChatMessage"."burnExpiresAt" IS NULL OR "ChatMessage"."burnExpiresAt" > $3))
-  ORDER BY "ChatMessage"."height" DESC LIMIT $4 OFFSET $5`;
-
 const MIGRATION = '20261026000300_chat_message_live_height_indexes';
 const NO_WINDOW = {
   viewerCutoff: null,
   viewerStartedAt: null,
   burnStartedAt: null,
   burnCutoff: null,
+};
+
+const capture = capturePrisma();
+/** getHistory 不带关键词时发出的那条 findMany(向旧翻页,newest first)。 */
+const historySql = async (
+  conversationId: string,
+  filters: HistoryFilters,
+  take: number,
+  beforeHeight?: number,
+) => {
+  const where = historyPageWhere({
+    conversationId,
+    heightFloor: 0,
+    beforeHeight,
+    filters,
+    retention: NO_WINDOW,
+  });
+  const [query] = await captureQueries(capture.queries, () =>
+    capture.prisma.chatMessage.findMany(historyPageArgs(where, false, take)),
+  );
+  return query;
 };
 /** big 的消息条数:最后 TOMBSTONE_TAIL 条全是焚毁墓碑,中间还夹着三成墓碑。 */
 const BIG = 30_000;
@@ -140,15 +137,8 @@ describePostgres('chat history live indexes (PostgreSQL)', () => {
 
   describe('results', () => {
     it('pages the image tab newest first, skipping tombstones', async () => {
-      const rows = await history(HISTORY_ONE_TYPE_SQL, [
-        'big',
-        false,
-        BIG,
-        'image',
-        new Date(),
-        5,
-        0,
-      ]);
+      const q = await historySql('big', { types: ['image'] }, 5, BIG);
+      const rows = await history(q.sql, q.args);
       const expected = Array.from({ length: BIG }, (_, i) => BIG - i)
         .filter((h) => h % 97 === 0 && h <= BIG - TOMBSTONE_TAIL && h % 10 >= 3)
         .slice(0, 5);
@@ -160,15 +150,8 @@ describePostgres('chat history live indexes (PostgreSQL)', () => {
     });
 
     it('pages a multi-type tab newest first, skipping tombstones', async () => {
-      const rows = await history(HISTORY_TWO_TYPES_SQL, [
-        'big',
-        false,
-        'video',
-        'file',
-        new Date(),
-        50,
-        0,
-      ]);
+      const q = await historySql('big', { types: ['video', 'file'] }, 50);
+      const rows = await history(q.sql, q.args);
       const expected = Array.from({ length: BIG }, (_, i) => BIG - i)
         .filter(
           (h) =>
@@ -230,15 +213,8 @@ describePostgres('chat history live indexes (PostgreSQL)', () => {
   // 不关顺序扫描:规划器拿着 ANALYZE 的统计信息自己挑。
   describe('plans', () => {
     it('reads one-type history pages from the (conversationID, type, height) live index', async () => {
-      const plan = await explainPlan(s.db, HISTORY_ONE_TYPE_SQL, [
-        'big',
-        false,
-        BIG,
-        'image',
-        new Date(),
-        50,
-        0,
-      ]);
+      const q = await historySql('big', { types: ['image'] }, 50, BIG);
+      const plan = await explainPlan(s.db, q.sql, q.args);
 
       expect(plan).toContain('ChatMessage_live_conversation_type_height_idx');
       expect(plan).not.toContain('Seq Scan');
@@ -248,28 +224,16 @@ describePostgres('chat history live indexes (PostgreSQL)', () => {
     // 规划器宁可沿 height 倒扫过滤(那也只扫几页就够一页)—— 这里是匹配稀疏、
     // 原来要把整个会话扫完的情形。
     it('reads sparse multi-type history pages from the same live index', async () => {
-      const plan = await explainPlan(s.db, HISTORY_TWO_TYPES_SQL, [
-        'big',
-        false,
-        'video',
-        'file',
-        new Date(),
-        50,
-        0,
-      ]);
+      const q = await historySql('big', { types: ['video', 'file'] }, 50);
+      const plan = await explainPlan(s.db, q.sql, q.args);
 
       expect(plan).toContain('ChatMessage_live_conversation_type_height_idx');
       expect(plan).not.toContain('Seq Scan');
     });
 
     it('reads plain history pages from the live (conversationID, height) index', async () => {
-      const plan = await explainPlan(s.db, HISTORY_PLAIN_SQL, [
-        'big',
-        false,
-        new Date(),
-        50,
-        0,
-      ]);
+      const q = await historySql('big', {}, 50);
+      const plan = await explainPlan(s.db, q.sql, q.args);
 
       expect(plan).toContain('ChatMessage_live_conversation_height_idx');
       expect(plan).not.toContain('Seq Scan');

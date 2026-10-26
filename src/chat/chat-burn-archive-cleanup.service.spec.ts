@@ -23,6 +23,13 @@ describe('180-day burn archive cleanup', () => {
     releaseLease: jest.fn(),
   };
   const service = new ChatBurnArchiveCleanupService(prisma, media, redis);
+  const warn = jest
+    .spyOn(
+      (service as unknown as { logger: { warn: (...args: unknown[]) => void } })
+        .logger,
+      'warn',
+    )
+    .mockImplementation(() => undefined);
   /** 到期扫描(事务外)之后,每个事务在会话行锁下按 id 重读这一批。 */
   const due = (rows: Array<{ id: string; conversationID: string }>) =>
     prisma.chatBurnArchive.findMany.mockImplementation(
@@ -123,9 +130,63 @@ describe('180-day burn archive cleanup', () => {
     expect(media.queueDeletions).not.toHaveBeenCalled();
   });
   it('keeps the snapshot recoverable when durable media cleanup cannot be scheduled', async () => {
-    media.queueDeletions.mockRejectedValueOnce(new Error('queue unavailable'));
-    await expect(service.sweep()).rejects.toThrow('queue unavailable');
+    media.queueDeletions.mockRejectedValue(new Error('queue unavailable'));
+    // 失败按批隔离、记一次失败,不再让整轮抛错;快照照样不删,下一轮重试。
+    await expect(service.sweep()).resolves.toBeUndefined();
     expect(prisma.chatBurnArchive.delete).not.toHaveBeenCalled();
+    expect(warn).toHaveBeenCalledWith(
+      expect.objectContaining({ event: 'chat_burn_archive_batch_failed' }),
+    );
+  });
+
+  // 一个事务处理一批行、每行十来次往返:默认 5 秒的交互事务超时很容易撞上,
+  // 撞上就整批回滚。显式给足时间,并限制等连接的时间。
+  it('gives batch transactions an explicit timeout instead of the 5s default', async () => {
+    await service.sweep();
+
+    expect(prisma.$transaction).toHaveBeenCalledWith(expect.any(Function), {
+      timeout: 30_000,
+      maxWait: 5_000,
+    });
+  });
+
+  // 一批失败(超时、某一行出错)不能让整轮中止:原来异常一路抛出,后面的会话全被跳过,
+  // 下一轮扫到的还是这一批,队列整体卡死。现在失败批退回逐行,后面的会话照常处理。
+  it('isolates a failing batch: falls back to per-row and keeps going', async () => {
+    due([
+      { id: 'bad', conversationID: 'c1' },
+      { id: 'ok1', conversationID: 'c1' },
+      { id: 'later', conversationID: 'c2' },
+    ]);
+    media.queueDeletions.mockImplementation(
+      async (_tx: unknown, _keys: string[], archiveID: string) => {
+        if (archiveID === 'bad') throw new Error('broken row');
+      },
+    );
+
+    await expect(service.sweep()).resolves.toBeUndefined();
+
+    const deleted = prisma.chatBurnArchive.delete.mock.calls.map(
+      ([args]: [{ where: { id: string } }]) => args.where.id,
+    );
+    // 批事务里 ok1 已被删一次(随批回滚),逐行重试时再删一次;以最终逐行结果为准。
+    expect(deleted).toContain('later');
+    expect(deleted.filter((id: string) => id === 'ok1').length).toBeGreaterThan(
+      0,
+    );
+    expect(deleted).not.toContain('bad');
+    expect(warn).toHaveBeenCalledWith(
+      expect.objectContaining({
+        event: 'chat_burn_archive_batch_failed',
+        conversationID: 'c1',
+      }),
+    );
+    expect(warn).toHaveBeenCalledWith(
+      expect.objectContaining({
+        event: 'chat_burn_archive_rows_failed',
+        failedRows: 1,
+      }),
+    );
   });
 
   // 原来每行一个事务、每行锁一次会话行:一轮 200 行就是 200 次 BEGIN/锁/COMMIT。
@@ -166,8 +227,8 @@ describe('180-day burn archive cleanup', () => {
 
     await service.sweep();
 
-    expect(prisma.$transaction).toHaveBeenCalledTimes(2);
-    expect(lockedConversations()).toEqual(['c1', 'c1']);
+    expect(prisma.$transaction).toHaveBeenCalledTimes(3);
+    expect(lockedConversations()).toEqual(['c1', 'c1', 'c1']);
     expect(prisma.chatBurnArchive.delete).toHaveBeenCalledTimes(60);
   });
 
