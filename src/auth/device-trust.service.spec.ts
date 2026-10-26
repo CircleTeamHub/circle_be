@@ -26,6 +26,7 @@ import {
   LOGIN_CHALLENGE_SECURITY_CODE_DAILY_FAILURES,
   LOGIN_RECOVERY_DELAY_MS,
   LOGIN_RECOVERY_MAX_ACTIVE,
+  LOGIN_ALERT_SHUTDOWN_GRACE_MS,
 } from './device-trust.service';
 
 type Trusted = {
@@ -996,5 +997,164 @@ describe('DeviceTrustService recovery (no trusted device available)', () => {
         recoveryAvailableAt: view.recoveryAvailableAt,
       }),
     ]);
+  });
+});
+
+describe('DeviceTrustService login-alert pushes', () => {
+  const payload = { title: 't', body: 'b', data: { type: 'test' } };
+  const flush = () => new Promise((r) => setImmediate(r));
+
+  /** Counts transactions still open, so a test can see where the provider was called. */
+  function trackOpenTransactions(prisma: any) {
+    const state = { open: 0 };
+    const original = prisma.$transaction;
+    prisma.$transaction = jest.fn(async (fn: any, options: any) => {
+      state.open++;
+      try {
+        return await original(fn, options);
+      } finally {
+        state.open--;
+      }
+    });
+    return state;
+  }
+
+  function deferred() {
+    let resolve!: () => void;
+    const promise = new Promise<[]>((r) => {
+      resolve = () => r([]);
+    });
+    return { promise, resolve };
+  }
+
+  it('reads tokens under the account lock but calls the provider after the transaction', async () => {
+    // The provider call can take seconds. Holding the account lock and a pool
+    // connection for it stalls the user's login and refresh, and a shutdown
+    // that has to wait for the transaction to end.
+    const { service, prisma, push } = setup();
+    const tx = trackOpenTransactions(prisma);
+    const openAtSend: number[] = [];
+    push.sendToTokens.mockImplementation(async () => {
+      openAtSend.push(tx.open);
+      return [];
+    });
+    await (service as any).pushToUser('u1', payload);
+    expect((prisma as any).$executeRaw).toHaveBeenCalled();
+    expect(push.listLoginAlertTokens).toHaveBeenCalledWith('u1', prisma);
+    expect(openAtSend).toEqual([0]);
+  });
+
+  it('does not call the provider when no device may receive the alert', async () => {
+    const { service, push } = setup();
+    push.listLoginAlertTokens.mockResolvedValueOnce([]);
+    await (service as any).pushToUser('u1', payload);
+    expect(push.sendToTokens).not.toHaveBeenCalled();
+  });
+
+  type Ctx = ReturnType<typeof setup>;
+  /**
+   * The three background login alerts. `prepare` runs with sends resolving at
+   * once (it may itself send alerts); only the alert `trigger` starts hangs.
+   */
+  const alertSites: Array<
+    [
+      string,
+      (ctx: Ctx) => Promise<unknown>,
+      (ctx: Ctx, state: any) => Promise<unknown>,
+    ]
+  > = [
+    [
+      'a login challenge',
+      async ({ trust }) => trust('known'),
+      ({ service }) =>
+        service.evaluateLogin(user, {
+          deviceKey: 'stranger',
+          deviceName: 'Pixel 9',
+          ip: '1.2.3.4',
+        }),
+    ],
+    [
+      'a recovery request',
+      async ({ service, trust }) => {
+        trust('old-install');
+        const decision = await service.evaluateLogin(user, {
+          deviceKey: 'reinstalled',
+          deviceName: 'SM-F9360',
+        });
+        if (decision.kind !== 'challenge')
+          throw new Error('expected challenge');
+        return decision.challenge.id;
+      },
+      ({ service }, challengeId) =>
+        service.requestRecovery(challengeId, 'reinstalled'),
+    ],
+    [
+      'a newly added device',
+      async () => undefined,
+      ({ service }) =>
+        service.completeVerifiedLogin('u1', 'challenge-1', 'new-device', {
+          deviceName: 'iPad',
+        } as never),
+    ],
+  ];
+
+  it.each(alertSites)(
+    'shutdown waits for the alert sent for %s',
+    async (_site, prepare, trigger) => {
+      const ctx = setup();
+      const state = await prepare(ctx);
+      await flush();
+      const send = deferred();
+      ctx.push.sendToTokens.mockReset().mockReturnValue(send.promise);
+      await trigger(ctx, state);
+      await flush();
+      expect(ctx.push.sendToTokens).toHaveBeenCalledTimes(1);
+      let closed = false;
+      const closing = ctx.service.onModuleDestroy().then(() => {
+        closed = true;
+      });
+      await flush();
+      expect(closed).toBe(false);
+      send.resolve();
+      await closing;
+      expect(closed).toBe(true);
+    },
+  );
+
+  it('shutdown gives up on an alert that outlives the grace period', async () => {
+    jest.useFakeTimers({ doNotFake: ['setImmediate', 'nextTick'] });
+    try {
+      const { service, push } = setup();
+      push.sendToTokens.mockReturnValue(new Promise(() => undefined));
+      const warn = jest
+        .spyOn((service as any).logger, 'warn')
+        .mockImplementation(() => undefined);
+      (service as any).dispatchPush('u1', payload);
+      await flush();
+      expect(push.sendToTokens).toHaveBeenCalledTimes(1);
+      let closed = false;
+      const closing = service.onModuleDestroy().then(() => {
+        closed = true;
+      });
+      await jest.advanceTimersByTimeAsync(LOGIN_ALERT_SHUTDOWN_GRACE_MS - 1);
+      expect(closed).toBe(false);
+      await jest.advanceTimersByTimeAsync(1);
+      await closing;
+      expect(closed).toBe(true);
+      expect(warn).toHaveBeenCalledWith(
+        expect.stringContaining('1 login alert push'),
+      );
+    } finally {
+      jest.useRealTimers();
+    }
+  });
+
+  it('starts no new login alerts once shutdown has begun', async () => {
+    const { service, push } = setup();
+    await service.onModuleDestroy();
+    (service as any).dispatchPush('u1', payload);
+    await flush();
+    expect(push.listLoginAlertTokens).not.toHaveBeenCalled();
+    expect(push.sendToTokens).not.toHaveBeenCalled();
   });
 });
