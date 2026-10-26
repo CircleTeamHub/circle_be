@@ -24,6 +24,23 @@ exit 0
 FLOCK
 chmod +x "$CASE_DIR/bin/flock"
 
+# Wraps the real rsync to record the modes of both roots when the transfer
+# starts, and to simulate a failed transfer (FAIL_RSYNC=1).
+REAL_RSYNC="$(command -v rsync)"
+cat > "$CASE_DIR/bin/rsync" <<RSYNC
+#!/usr/bin/env bash
+# openrsync (macOS) runs its receiving side as \`rsync --server\` through PATH.
+case " \$* " in *" --server "*) exec "$REAL_RSYNC" "\$@" ;; esac
+mode() { stat -c '%a' "\$1" 2>/dev/null || stat -f '%Lp' "\$1"; }
+src="\${@: -2:1}"
+dst="\${@: -1}"
+case " \$* " in *" --chmod"*) chmod_flag=yes ;; *) chmod_flag=no ;; esac
+printf 'src=%s dst=%s chmod=%s\n' "\$(mode "\$src")" "\$(mode "\$dst")" "\$chmod_flag" >> "$CASE_DIR/rsync.log"
+[ "\${FAIL_RSYNC:-0}" != 1 ] || exit 23
+exec "$REAL_RSYNC" "\$@"
+RSYNC
+chmod +x "$CASE_DIR/bin/rsync"
+
 cat > "$STATE_DIR/incoming/new/deploy/release-deploy.sh" <<'NEW_RELEASE'
 #!/usr/bin/env bash
 set -euo pipefail
@@ -111,8 +128,16 @@ printf 'template\n' > "$new_stage/.env.backup.example"
 printf 'template\n' > "$new_stage/monitoring/prometheus/probe-targets/public.yml.example"
 printf 'template\n' > "$new_stage/monitoring/alertmanager/discord.url.example"
 printf 'groups: []\n' > "$new_stage/monitoring/prometheus/alerts.yml"
+# A second staged release whose transfer fails part-way.
+cp -R "$new_stage" "$STATE_DIR/incoming/failing"
+printf 'failing\n' > "$STATE_DIR/incoming/failing/VERSION"
 # What the force command leaves behind (chmod -R go-rwx on the staged tree).
-chmod -R go-rwx "$new_stage"
+chmod -R go-rwx "$new_stage" "$STATE_DIR/incoming/failing"
+# A stage copied in by hand for an offline release (DEPLOY.md) can leave its
+# root open; rsync would copy that mode onto the live root.
+chmod 755 "$new_stage"
+# The tree root starts out the way a checkout or the old launcher left it.
+chmod 755 "$DEPLOY_ROOT"
 
 # The old deployment has completed upload/preflight and is paused before the
 # authoritative launcher lock. A newer irreversible release wins the lock and
@@ -135,20 +160,31 @@ mode_of() { stat -c '%a' "$1" 2>/dev/null || stat -f '%Lp' "$1"; }
 # The tree root stays private: containers get their mounts through the daemon,
 # and host-local secrets made with a default umask must not be reachable.
 [ "$(mode_of "$DEPLOY_ROOT")" = "700" ] || { echo "release tree root is $(mode_of "$DEPLOY_ROOT"), not 700" >&2; exit 1; }
-if rsync --version 2>/dev/null | head -1 | grep -qi openrsync; then
-  # macOS ships openrsync, which accepts --chmod and ignores it. The server
-  # and CI run GNU rsync.
-  echo "SKIP release tree modes: openrsync ignores --chmod"
-else
-  # The monitoring containers run as their own users and bind-mount their
-  # configuration from this tree.
-  [ "$(mode_of "$DEPLOY_ROOT/monitoring/prometheus/alerts.yml")" = "644" ]
-  [ "$(mode_of "$DEPLOY_ROOT/monitoring/prometheus")" = "755" ]
-  [ "$(mode_of "$DEPLOY_ROOT/deploy/release-deploy.sh")" = "755" ]
-  # Excluded secrets keep the mode the operator gave them.
-  [ "$(mode_of "$DEPLOY_ROOT/.env.backup")" = "600" ]
-  [ "$(mode_of "$DEPLOY_ROOT/monitoring/prometheus/metrics_token")" = "600" ]
+# The root was already private when the transfer started, and the source root
+# rsync copies its mode from was too: no window where the preserved secrets
+# below it are reachable. No --chmod, which would open the root as well.
+[ "$(cat "$CASE_DIR/rsync.log")" = "src=700 dst=700 chmod=no" ] || {
+  echo "unexpected roots at transfer start: $(cat "$CASE_DIR/rsync.log")" >&2
+  exit 1
+}
+# The monitoring containers run as their own users and bind-mount their
+# configuration from this tree.
+[ "$(mode_of "$DEPLOY_ROOT/monitoring/prometheus/alerts.yml")" = "644" ]
+[ "$(mode_of "$DEPLOY_ROOT/monitoring/prometheus")" = "755" ]
+[ "$(mode_of "$DEPLOY_ROOT/deploy/release-deploy.sh")" = "755" ]
+# Excluded secrets keep the mode the operator gave them.
+[ "$(mode_of "$DEPLOY_ROOT/.env.backup")" = "600" ]
+[ "$(mode_of "$DEPLOY_ROOT/monitoring/prometheus/metrics_token")" = "600" ]
+
+# A transfer that fails part-way leaves the root as private as before.
+export FAIL_RSYNC=1
+if run_launcher failing 1 >"$CASE_DIR/failing.log" 2>&1; then
+  echo "a failed transfer unexpectedly activated" >&2
+  exit 1
 fi
+unset FAIL_RSYNC
+[ "$(mode_of "$DEPLOY_ROOT")" = "700" ] || { echo "root is $(mode_of "$DEPLOY_ROOT") after a failed transfer" >&2; exit 1; }
+[ "$(cat "$DEPLOY_ROOT/VERSION")" = "new" ]
 [ "$(cat "$STATE_DIR/app-env-transaction/state")" = "staged" ]
 [ "$(cat "$STATE_DIR/app-env-transaction/legacy-rollback")" = "legacy-env" ]
 

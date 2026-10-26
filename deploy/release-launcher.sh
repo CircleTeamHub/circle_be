@@ -106,14 +106,20 @@ fi
 # The force command stages releases go-rwx so nothing else on the host can read
 # or swap them mid-flight. The active tree must not inherit that: the monitoring
 # containers run as their own users and bind-mount their configuration from it.
-# --chmod restores the 0755/0644 a checkout has; excluded files keep their own
-# modes. The root itself goes back to private right after: the daemon resolves
-# bind-mount sources as root, so containers never need to traverse it, and
-# host-local secrets created with a default umask (monitoring/.env,
-# alertmanager/*.url are 0644 so their containers can read them) stay out of
-# reach of other local accounts.
+# So the staged copy's contents get the 0755/0644 a checkout has — it still sits
+# in .release/incoming, which only the deployment account can enter — while its
+# root stays 0700. rsync copies the source root's mode onto $DEPLOY_ROOT, and
+# the root must stay private before, during and after the transfer, including
+# when the transfer fails: the daemon resolves bind-mount sources as root, so
+# containers never need to traverse it, and host-local secrets created with a
+# default umask (monitoring/.env, alertmanager/*.url are 0644 so their
+# containers can read them) stay out of reach of other local accounts. (An
+# rsync --chmod would apply to the root as well and open it for the whole
+# transfer.) Excluded files keep their own modes.
+chmod go-rwx "$DEPLOY_ROOT"
+find "$STAGED_RELEASE" -mindepth 1 \( -type d -exec chmod go+rx {} + \) -o \( -type f -exec chmod go+rX {} + \)
+chmod go-rwx "$STAGED_RELEASE"
 rsync -a --delete \
-  --chmod=Dgo+rx,Fgo+rX \
   --include=/.env.example \
   --include='/.env.*.example' \
   --exclude=/.env \
@@ -130,7 +136,6 @@ rsync -a --delete \
   --exclude=logs \
   --exclude=coverage \
   "$STAGED_RELEASE/" "$DEPLOY_ROOT/"
-chmod go-rwx "$DEPLOY_ROOT"
 
 cd "$DEPLOY_ROOT"
 # deploy/sync-ops-stacks.sh only recreates the ops stacks when the tree was

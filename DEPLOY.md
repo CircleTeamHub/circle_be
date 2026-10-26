@@ -214,7 +214,8 @@ postgres/redis/minio/caddy/admin_web 属于开通期资产,发版**不碰**;
 `.env*`(含 `.env.backup`)与 monitoring 下的本机配置(`.env`、`.env.exporters`、
 Alertmanager 的 `*.url`、`metrics_token`、`probe-targets/*.yml`)被 rsync 排除并保护,
 不会被发版覆盖或删除;发布文件恢复成 0755/0644,以非 root 运行的监控容器才读得到
-挂载的配置。
+挂载的配置;部署根目录本身在整个同步过程中(包括同步失败时)始终是 0700,
+本机其他账号碰不到按默认 umask 建出来的本机密钥。
 
 **迁移兼容性要求**:蓝绿窗口内旧代码会短暂运行在新 schema 上,迁移必须向后兼容
 (expand/contract:先加列/表,删除留到后续版本)。确实不兼容时,手动触发 workflow

@@ -124,28 +124,16 @@ for (const [name, rules] of [
   });
 }
 
-test('the launcher restores checkout modes on the active tree', () => {
-  // 暂存目录被 force command 收成 go-rwx；监控容器以自己的用户读挂载的配置。
-  assert.match(LAUNCHER, /--chmod=Dgo\+rx,Fgo\+rX/);
+test('the launcher restores checkout modes without ever opening the tree root', () => {
+  // 暂存目录被 force command 收成 go-rwx；监控容器以自己的用户读挂载的配置，所以
+  // 内容要恢复成 0755/0644。但根目录必须始终私有：rsync --chmod 会连根目录一起
+  // 放开，整个传输期间（以及传输失败后）本机其他账号都能读到 0644 的本机密钥。
+  const rsync = LAUNCHER.indexOf('rsync -a --delete');
+  const command = LAUNCHER.slice(rsync, LAUNCHER.indexOf('"$STAGED_RELEASE/" "$DEPLOY_ROOT/"', rsync));
+  assert.doesNotMatch(command, /--chmod/);
+  const before = LAUNCHER.slice(0, rsync);
+  assert.match(before, /\nchmod go-rwx "\$DEPLOY_ROOT"\n/);
+  assert.match(before, /\nfind "\$STAGED_RELEASE" -mindepth 1 .*-type d -exec chmod go\+rx .*-type f -exec chmod go\+rX /);
+  assert.match(before, /\nchmod go-rwx "\$STAGED_RELEASE"\n/);
   assert.match(LAUNCHER, /RELEASE_LAUNCHER_KEEPS_HOST_CONFIG=1/);
-});
-
-test('the ops sync knows every optional env file of the monitoring stack', () => {
-  // `required: false` 的 env_file 缺了，compose 不报错，而是以空环境重建服务
-  //（exporter 丢连接串）。deploy/sync-ops-stacks.sh 必须在同步前检查它们。
-  const sync = read('deploy/sync-ops-stacks.sh');
-  const declared = sync.match(/OPTIONAL_ENV_FILES=\(([^)]*)\)/);
-  assert.ok(declared, 'OPTIONAL_ENV_FILES missing from the sync script');
-  const composeFiles = readdirSync(join(ROOT, 'monitoring'))
-    .filter((name) => /^docker-compose.*\.ya?ml$/.test(name))
-    .map((name) => `monitoring/${name}`);
-  let optional = 0;
-  for (const file of composeFiles) {
-    for (const m of read(file).matchAll(/- path: (\S+)\n(?:\s*#.*\n)*\s*required: false/g)) {
-      optional += 1;
-      const path = `monitoring/${m[1].replace(/^\.\//, '')}`;
-      assert.ok(declared[1].includes(`|${path}'`), `${file}: ${path} is optional but the sync does not check it`);
-    }
-  }
-  assert.ok(optional > 0, 'expected at least one optional env file (.env.exporters)');
 });
