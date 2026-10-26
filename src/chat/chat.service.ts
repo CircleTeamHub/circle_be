@@ -303,7 +303,7 @@ export class ChatService {
     }
     if (
       Buffer.byteLength(JSON.stringify(payload.content), 'utf8') >
-      (payload.type === 'encrypted-text' ? 16_384 : MAX_CONTENT_BYTES)
+      MAX_CONTENT_BYTES
     ) {
       throw new BadRequestException({
         message: '消息体超限',
@@ -812,15 +812,6 @@ export class ChatService {
         if (existing) {
           this.assertSameSendRequest(existing, requestHash);
           return { row: existing, reused: true };
-        }
-
-        // 文字加密已停用:新的密文一律拒收,会话上的 textEncryption 也不再限制明文。
-        // 放在幂等查重之后 —— 停用前已经落库的那条,同一个 d 重放照旧返回。
-        if (effectivePayload.type === 'encrypted-text') {
-          throw new BadRequestException({
-            message: '文字加密已停用',
-            errorCode: ChatErrorCode.TextEncryptionDisabled,
-          });
         }
 
         await this.media.lockOwnedKeysForSend(
@@ -1691,7 +1682,6 @@ export class ChatService {
       return {
         id: m.conversationID,
         type: m.conversation.type,
-        textEncryption: m.conversation.textEncryption,
         peer: directPeers.info.get(m.conversationID) ?? null,
         circleId: m.conversation.circleID,
         circle: m.conversation.circleID
@@ -2486,7 +2476,6 @@ export class ChatService {
     return {
       id: conversationId,
       type: member.conversation.type,
-      textEncryption: member.conversation.textEncryption,
       peer: directPeers.info.get(conversationId) ?? null,
       circleId: member.conversation.circleID,
       circle: member.conversation.circleID
@@ -4585,17 +4574,6 @@ export class ChatService {
           errorCode: ChatErrorCode.MessageNotFound,
         });
       }
-      const encryption = await tx.chatConversation.findUnique({
-        where: { id: conversationId },
-        select: { textEncryption: true },
-      });
-      if (
-        encryption?.textEncryption === 'MLS_V1' ||
-        current.type === 'encrypted-text'
-      )
-        throw new BadRequestException(
-          'Send a new encrypted message instead of editing',
-        );
       const previous = (current.content ?? {}) as Record<string, unknown>;
       const history = Array.isArray(current.contentHistory)
         ? [...(current.contentHistory as unknown[])]

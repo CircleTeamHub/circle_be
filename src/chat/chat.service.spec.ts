@@ -1434,62 +1434,44 @@ describe('ChatService', () => {
       );
     });
 
-    describe('文字加密已停用', () => {
-      const encryptedPayload = () =>
-        sendPayload({
-          type: 'encrypted-text',
-          content: {
-            envelope: { ciphertext: 'opaque', clientMessageId: 'client-msg-1' },
-            signature: 'proof',
-          },
-        });
+    // 文字加密已整体下线:encrypted-text 不再是可发送类型,和任何未知类型走同一条
+    // validateSendPayload 拒绝路径(InvalidPayload),在碰数据库之前就被拦下,
+    // 不再有专用错误码。
+    it('rejects the retired encrypted-text type exactly like an unknown type', async () => {
+      const rejection = async (type: string) => {
+        const error = await service
+          .sendMessage(
+            'u1',
+            sendPayload({
+              type,
+              content: {
+                envelope: {
+                  ciphertext: 'opaque',
+                  clientMessageId: 'client-msg-1',
+                },
+                signature: 'proof',
+              },
+            }),
+          )
+          .then(
+            () => null,
+            (caught: unknown) => caught,
+          );
+        expect(error).toBeInstanceOf(BadRequestException);
+        return (error as BadRequestException).getResponse();
+      };
 
-      it('refuses new encrypted-text messages with a dedicated error code', async () => {
-        prisma.chatMember.findUnique.mockResolvedValue(membership());
-        prisma.chatMessage.findUnique.mockResolvedValue(null);
-
-        await expect(
-          service.sendMessage('u1', encryptedPayload()),
-        ).rejects.toMatchObject({
-          response: { errorCode: ChatErrorCode.TextEncryptionDisabled },
-        });
-        // 被拒的发送不取号、不落库。
-        expect(prisma.chatMessage.create).not.toHaveBeenCalled();
-        expect(prisma.chatConversation.update).not.toHaveBeenCalled();
+      expect(await rejection('encrypted-text')).toEqual({
+        message: '不支持的消息类型: encrypted-text',
+        errorCode: ChatErrorCode.InvalidPayload,
       });
-
-      it('still returns an encrypted message that was stored before the switch-off', async () => {
-        // 停用前已经落库、ack 丢了:同一个 d 的重放照旧返回库里那条,不报错。
-        const stored = {
-          ...createdRow,
-          type: 'encrypted-text',
-          content: encryptedPayload().content,
-          requestHash: chatSendRequestHash(encryptedPayload()),
-        };
-        prisma.chatMember.findUnique.mockResolvedValue(membership());
-        prisma.chatMessage.findUnique.mockResolvedValue(stored);
-
-        const result = await service.sendMessage('u1', encryptedPayload());
-
-        expect(result.reused).toBe(true);
-        expect(prisma.chatMessage.create).not.toHaveBeenCalled();
+      expect(await rejection('not-a-message-type')).toEqual({
+        message: '不支持的消息类型: not-a-message-type',
+        errorCode: ChatErrorCode.InvalidPayload,
       });
-
-      it('accepts plain text in a conversation still marked as encrypted', async () => {
-        // 迁移把 MLS_V1 改回 PLAIN;万一有漏网的,也不能让这个会话彻底发不出消息。
-        prisma.$queryRaw.mockResolvedValue([
-          { nextHeight: 3, textEncryption: 'MLS_V1' },
-        ]);
-        prisma.chatMember.findUnique.mockResolvedValue(membership());
-        prisma.chatMessage.findUnique.mockResolvedValue(null);
-        prisma.chatMessage.create.mockResolvedValue(createdRow);
-        prisma.chatConversation.update.mockResolvedValue({});
-
-        const result = await service.sendMessage('u1', sendPayload());
-
-        expect(result.reused).toBe(false);
-        expect(prisma.chatMessage.create).toHaveBeenCalledTimes(1);
-      });
+      expect(prisma.chatMember.findUnique).not.toHaveBeenCalled();
+      expect(prisma.$transaction).not.toHaveBeenCalled();
+      expect(prisma.chatMessage.create).not.toHaveBeenCalled();
     });
 
     it('rejects senders that are not members', async () => {
