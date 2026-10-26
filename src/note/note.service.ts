@@ -1112,14 +1112,18 @@ export class NoteService {
     return group;
   }
 
-  private async requireOwnedNote(ownerID: string, noteId: string) {
+  private async findOwnedNoteOrThrow<S extends Prisma.NoteSelect>(
+    ownerID: string,
+    noteId: string,
+    select: S,
+  ): Promise<Prisma.NoteGetPayload<{ select: S }>> {
     const note = await this.prisma.note.findFirst({
       where: {
         id: noteId,
         ownerID,
         status: { not: 'DELETED' },
       },
-      include: NOTE_INCLUDE,
+      select,
     });
 
     if (!note) {
@@ -1129,12 +1133,25 @@ export class NoteService {
       });
     }
 
-    return note;
+    return note as Prisma.NoteGetPayload<{ select: S }>;
+  }
+
+  /**
+   * 归属校验：笔记是调用者的、且不在回收站，否则 404。调用方都只要这个结论（写入
+   * 本身再带 ownerID + status 守卫防 TOCTOU），所以只取 id —— 不要再 include
+   * NOTE_INCLUDE：正文、contentJson、sections、全部 media 与分组成员共四条查询，
+   * 读完就丢。
+   */
+  private async requireOwnedNote(ownerID: string, noteId: string) {
+    return this.findOwnedNoteOrThrow(ownerID, noteId, { id: true });
   }
 
   /** 群设置里的来源关联和开工/打烊状态只属于老板的来源笔记。 */
   private async requireOwnedSourceNote(ownerID: string, noteId: string) {
-    const note = await this.requireOwnedNote(ownerID, noteId);
+    const note = await this.findOwnedNoteOrThrow(ownerID, noteId, {
+      id: true,
+      collectedFromNoteID: true,
+    });
     if (note.collectedFromNoteID) {
       throw new ForbiddenException(
         'Only a source note can be managed from its group',

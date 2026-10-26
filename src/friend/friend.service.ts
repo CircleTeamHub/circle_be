@@ -25,6 +25,7 @@ import { NotificationService } from 'src/notification/notification.service';
 import { createLoggingConfig } from 'src/logging/logging.config';
 import { logBusinessEvent } from 'src/logging/business-event.logger';
 import { PrivacySettingsService } from 'src/privacy/privacy-settings.service';
+import type { PrivacySettingsDto } from 'src/privacy/privacy-settings.dto';
 import {
   FriendProfileDto,
   FriendActivityDto,
@@ -33,7 +34,10 @@ import {
   FriendStatusDto,
   ReportFriendDto,
 } from './dto/friend.dto';
-import { AvatarFrameService } from 'src/avatar-frame/avatar-frame.service';
+import {
+  AvatarFrameService,
+  PUBLIC_APPEARANCE_USER_SELECT,
+} from 'src/avatar-frame/avatar-frame.service';
 import { isBlockedByStandaloneGroupPolicy } from 'src/chat/standalone-group-policy-gate';
 
 // Members (paid) get 5 000, regular users get 1 000.
@@ -91,6 +95,23 @@ const FRIEND_PROFILE_SELECT = {
   avatarUrl: true,
 } as const;
 
+// 好友列表的 user 查询顺带取会员 / 头像框列,交给
+// AvatarFrameService.resolvePublicAppearancesForUsers,同一批用户不再读第二遍。
+// 响应只挑 FRIEND_PROFILE_SELECT 那四列(见 toFriendProfiles)。
+const FRIEND_LIST_USER_SELECT = {
+  ...PUBLIC_APPEARANCE_USER_SELECT,
+  ...FRIEND_PROFILE_SELECT,
+} as const;
+
+// 好友列表里 Friend 行只读去重、备注与 friendsSince 用到的列。
+const FRIEND_LIST_RECORD_SELECT = {
+  userID: true,
+  friendID: true,
+  updatedAt: true,
+  remarkA: true,
+  remarkB: true,
+} as const;
+
 // Friend tags go out as { id, name, color } — ownerID is always the caller and
 // createdAt is never read.
 const FRIEND_TAG_SELECT = {
@@ -117,6 +138,8 @@ type FriendListRecord = {
   userID: string;
   friendID: string;
   updatedAt: Date;
+  remarkA: string | null;
+  remarkB: string | null;
 };
 
 const FRIEND_ACTIVITY_INCLUDE = {
@@ -137,8 +160,16 @@ function getCounterpartyId(
   return record.userID === userId ? record.friendID : record.userID;
 }
 
+const byUpdatedAtDesc = (left: FriendListRecord, right: FriendListRecord) =>
+  right.updatedAt.getTime() - left.updatedAt.getTime();
+
+/**
+ * 每个对方只留 updatedAt 最新的一行。不排序:结果按各对方首次出现的顺序 ——
+ * 输入已按 updatedAt 降序时(listFriends 的库内排序),首次出现的就是最新行,
+ * 输出自然也是降序;没有库内排序的调用方自己先排。
+ */
 function latestFriendRecordsByCounterparty<T extends FriendListRecord>(
-  records: T[],
+  records: readonly T[],
   userId: string,
 ): T[] {
   const byCounterparty = new Map<string, T>();
@@ -154,9 +185,7 @@ function latestFriendRecordsByCounterparty<T extends FriendListRecord>(
     }
   }
 
-  return Array.from(byCounterparty.values()).sort(
-    (left, right) => right.updatedAt.getTime() - left.updatedAt.getTime(),
-  );
+  return Array.from(byCounterparty.values());
 }
 
 // 只有 http(s) 项才需要钉源；对象 key（reports/xxx.png）不是 URL，原样放行。
@@ -261,13 +290,14 @@ export class FriendService {
     const viaVerifiedQr = extras?.qrToken
       ? await this.isValidUserQrToken(extras.qrToken, targetId)
       : false;
-    const qrDoorOpen =
-      viaVerifiedQr &&
-      (await this.privacySettings.getSettings(targetId)).addMeByQrCode;
+    // 名片码、陌生人消息、发现路径三处判定读的是对方同一行隐私设置:读一次复用。
+    // 陌生人消息这一项等价于 canReceiveStrangerMessage(targetId, false)
+    //(非好友时就是 allowStrangerMessages)。
+    const targetSettings = await this.privacySettings.getSettings(targetId);
+    const qrDoorOpen = viaVerifiedQr && targetSettings.addMeByQrCode;
 
     const canReceiveStrangerMessage =
-      qrDoorOpen ||
-      (await this.privacySettings.canReceiveStrangerMessage(targetId, false));
+      qrDoorOpen || targetSettings.allowStrangerMessages;
     if (!canReceiveStrangerMessage) {
       throw new ForbiddenException({
         message: 'This user does not allow stranger messages',
@@ -276,7 +306,7 @@ export class FriendService {
     }
 
     if (!qrDoorOpen) {
-      await this.assertDiscoverableBy(senderId, targetId);
+      await this.assertDiscoverableBy(senderId, targetId, targetSettings);
     }
 
     // Enforce friend limit for the sender
@@ -456,6 +486,8 @@ export class FriendService {
           errorCode: FriendErrorCode.RequestAlreadyHandled,
         });
       }
+      // 守卫式条件写只写这一次;后面用到的 id / friendID / message 在撤回时
+      // 不变,直接用锁内读到的 locked,不再 update 同一行把同样的数据写第二遍。
       const updatedRows = await tx.friend.updateMany({
         where: { id: requestId, userID: senderId, state: FriendState.PENDING },
         data: { state: FriendState.WITHDRAWN },
@@ -466,10 +498,6 @@ export class FriendService {
           errorCode: FriendErrorCode.RequestAlreadyHandled,
         });
       }
-      const updated = await tx.friend.update({
-        where: { id: requestId },
-        data: { state: FriendState.WITHDRAWN },
-      });
 
       // A withdrawn request can never be accepted, so its staged tag links
       // are dead weight — drop them instead of leaving orphan rows.
@@ -479,12 +507,12 @@ export class FriendService {
 
       await this.createFriendActivities(tx, [
         {
-          requestId: updated.id,
-          viewerId: updated.friendID,
+          requestId: locked.id,
+          viewerId: locked.friendID,
           actorId: senderId,
           counterpartyId: senderId,
           type: FRIEND_ACTIVITY_TYPE.REQUEST_WITHDRAWN_BY_OTHER,
-          messageSnapshot: updated.message ?? null,
+          messageSnapshot: locked.message ?? null,
         },
       ]);
     });
@@ -611,10 +639,9 @@ export class FriendService {
           errorCode: FriendErrorCode.RequestAlreadyHandled,
         });
       }
-      const nextRequest = await tx.friend.update({
-        where: { id: requestId },
-        data,
-      });
+      // 守卫式条件写只写这一次。下面只读 id / userID / message,通过或拒绝都
+      // 不会改它们,直接用锁内读到的行,不再 update 同一行把 data 写第二遍。
+      const nextRequest = recordForTransition;
 
       if (decision === FriendState.ACCEPTED) {
         await this.promotePendingFriendTags(tx, nextRequest);
@@ -887,22 +914,39 @@ export class FriendService {
         OR: [{ userID: userId }, { friendID: userId }],
         state: FriendState.ACCEPTED,
       },
+      select: FRIEND_LIST_RECORD_SELECT,
+      // 唯一的一次排序:Prisma 带 take 时没有 orderBy 也会补 ORDER BY id,
+      // 不如直接按 updatedAt 排,护栏截断时留下的也是最近的好友。去重保序,
+      // 不再在 JS 里重排。
       orderBy: { updatedAt: 'desc' },
       // 护栏对齐实际业务上限（FRIEND_LIMIT_MEMBER）：低于它会静默吞掉合法好友。
       take: FRIEND_LIMIT_MEMBER,
     });
 
-    const uniqueRecords = latestFriendRecordsByCounterparty(records, userId);
-    const friendIds = uniqueRecords.map((r) => getCounterpartyId(r, userId));
+    return this.toFriendProfiles(
+      latestFriendRecordsByCounterparty(records, userId),
+      userId,
+    );
+  }
+
+  /**
+   * 已去重、已排好序的好友关系行 → 好友资料。资料列与会员 / 头像框列一次查完,
+   * 只下发 ACTIVE 用户;输出顺序跟随 records。
+   */
+  private async toFriendProfiles(
+    records: readonly FriendListRecord[],
+    userId: string,
+  ): Promise<FriendProfileDto[]> {
+    const friendIds = records.map((r) => getCounterpartyId(r, userId));
     const users = await this.prisma.user.findMany({
       where: { id: { in: friendIds }, status: 'ACTIVE' },
-      select: FRIEND_PROFILE_SELECT,
+      select: FRIEND_LIST_USER_SELECT,
     });
     const appearances =
-      await this.avatarFrames.resolvePublicAppearances(friendIds);
+      await this.avatarFrames.resolvePublicAppearancesForUsers(users);
     const userMap = new Map(users.map((u) => [u.id, u]));
 
-    return uniqueRecords
+    return records
       .map((r) => {
         const fid = getCounterpartyId(r, userId);
         const u = userMap.get(fid);
@@ -910,7 +954,10 @@ export class FriendService {
         // 当前用户视角的备注：作为 userID 一侧读 remarkA，作为 friendID 一侧读 remarkB。
         const remark = r.userID === userId ? r.remarkA : r.remarkB;
         return {
-          ...u,
+          id: u.id,
+          accountId: u.accountId,
+          nickname: u.nickname,
+          avatarUrl: u.avatarUrl,
           avatarFrameAppearance: appearances.get(fid)?.avatarFrame ?? null,
           friendsSince: r.updatedAt,
           remark,
@@ -1458,49 +1505,15 @@ export class FriendService {
     const links = await this.prisma.friendTagOnFriend.findMany({
       where: { ownerID: userId, tagID: tagId },
       // 只取去重、备注与 friendsSince 真正读到的列。
-      select: {
-        friendship: {
-          select: {
-            userID: true,
-            friendID: true,
-            updatedAt: true,
-            remarkA: true,
-            remarkB: true,
-          },
-        },
-      },
+      select: { friendship: { select: FRIEND_LIST_RECORD_SELECT } },
     });
 
-    const uniqueLinks = latestFriendRecordsByCounterparty(
-      links.map((link) => link.friendship),
+    // 这里没有库内排序,先按 updatedAt 降序排好,去重后的顺序与好友列表一致。
+    const sorted = links.map((link) => link.friendship).sort(byUpdatedAtDesc);
+    return this.toFriendProfiles(
+      latestFriendRecordsByCounterparty(sorted, userId),
       userId,
     );
-    const friendUserIds = uniqueLinks.map((friendship) =>
-      getCounterpartyId(friendship, userId),
-    );
-
-    const users = await this.prisma.user.findMany({
-      where: { id: { in: friendUserIds }, status: 'ACTIVE' },
-      select: FRIEND_PROFILE_SELECT,
-    });
-    const appearances =
-      await this.avatarFrames.resolvePublicAppearances(friendUserIds);
-    const userMap = new Map(users.map((u) => [u.id, u]));
-
-    return uniqueLinks
-      .map((f) => {
-        const fid = getCounterpartyId(f, userId);
-        const u = userMap.get(fid);
-        if (!u) return null;
-        const remark = f.userID === userId ? f.remarkA : f.remarkB;
-        return {
-          ...u,
-          avatarFrameAppearance: appearances.get(fid)?.avatarFrame ?? null,
-          friendsSince: f.updatedAt,
-          remark,
-        } as FriendProfileDto;
-      })
-      .filter((x): x is FriendProfileDto => x !== null);
   }
 
   private async createFriendActivities(
@@ -2059,8 +2072,8 @@ export class FriendService {
   private async assertDiscoverableBy(
     senderId: string,
     targetId: string,
+    settings: Pick<PrivacySettingsDto, 'addMeByAccount' | 'addMeByGroup'>,
   ): Promise<void> {
-    const settings = await this.privacySettings.getSettings(targetId);
     if (settings.addMeByAccount) return;
     if (settings.addMeByGroup && (await this.sharesCircle(senderId, targetId)))
       return;

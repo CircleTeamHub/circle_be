@@ -17,6 +17,12 @@ import {
   runAdminOperation,
   writeOperationAudit,
 } from './admin-operation-request';
+import {
+  buildCampaignSearchCountQuery,
+  buildCampaignSearchPageQuery,
+  buildReferralSearchCountQuery,
+  buildReferralSearchPageQuery,
+} from './admin-invite-search.query';
 
 const USER_SUMMARY = {
   id: true,
@@ -24,6 +30,25 @@ const USER_SUMMARY = {
   nickname: true,
   status: true,
 } as const;
+
+const REFERRAL_LIST_SELECT = {
+  id: true,
+  status: true,
+  inviterReward: true,
+  inviteeReward: true,
+  createdAt: true,
+  rewardedAt: true,
+  eligibleAt: true,
+  failureReason: true,
+  inviter: { select: USER_SUMMARY },
+  invitee: { select: USER_SUMMARY },
+} as const;
+
+/** 按 UNION 查询给出的页内顺序排列回查结果;两次查询之间消失的行跳过。 */
+function inPageOrder<T extends { id: string }>(ids: string[], rows: T[]): T[] {
+  const byId = new Map(rows.map((row) => [row.id, row]));
+  return ids.flatMap((id) => byId.get(id) ?? []);
+}
 
 @Injectable()
 export class AdminInviteService {
@@ -76,22 +101,36 @@ export class AdminInviteService {
   }
 
   async campaigns(query: AdminPageQuery) {
-    const where = query.search
-      ? {
-          OR: [
-            { code: { contains: query.search, mode: 'insensitive' as const } },
-            { name: { contains: query.search, mode: 'insensitive' as const } },
-            {
-              owner: {
-                accountId: {
-                  contains: query.search,
-                  mode: 'insensitive' as const,
-                },
-              },
-            },
-          ],
-        }
-      : {};
+    // 关键词搜索:原 OR 里的发起人关系条件编译成跨 LEFT JOIN 的 OR,用不上 trigram
+    // 索引;改成 UNION 查询取页内 id 和 total(口径一致,见 admin-invite-search.query.ts)。
+    if (query.search) {
+      const [page, counted] = await this.prisma.$transaction([
+        this.prisma.$queryRaw<Array<{ id: string }>>(
+          buildCampaignSearchPageQuery({
+            search: query.search,
+            limit: query.limit,
+            offset: (query.page - 1) * query.limit,
+          }),
+        ),
+        this.prisma.$queryRaw<Array<{ total: number }>>(
+          buildCampaignSearchCountQuery({ search: query.search }),
+        ),
+      ]);
+      const ids = page.map((row) => row.id);
+      const rows = ids.length
+        ? await this.prisma.campaignInvite.findMany({
+            where: { id: { in: ids } },
+            include: { owner: { select: USER_SUMMARY } },
+          })
+        : [];
+      return {
+        items: inPageOrder(ids, rows),
+        total: counted[0]?.total ?? 0,
+        page: query.page,
+        limit: query.limit,
+      };
+    }
+    const where = {};
     const [items, total] = await this.prisma.$transaction([
       this.prisma.campaignInvite.findMany({
         where,
@@ -106,49 +145,51 @@ export class AdminInviteService {
   }
 
   async referrals(query: ReferralQuery) {
+    // 关键词搜索:原 OR 里的邀请人/被邀请人关系条件编译成跨 LEFT JOIN 的 OR,用不上
+    // trigram 索引;改成 UNION 查询取页内 id 和 total(口径一致,见
+    // admin-invite-search.query.ts),status / campaignID 照旧是 AND 条件。
+    if (query.search) {
+      const filter = {
+        search: query.search,
+        status: query.status,
+        campaignID: query.campaignID,
+      };
+      const [page, counted] = await this.prisma.$transaction([
+        this.prisma.$queryRaw<Array<{ id: string }>>(
+          buildReferralSearchPageQuery({
+            ...filter,
+            limit: query.limit,
+            offset: (query.page - 1) * query.limit,
+          }),
+        ),
+        this.prisma.$queryRaw<Array<{ total: number }>>(
+          buildReferralSearchCountQuery(filter),
+        ),
+      ]);
+      const ids = page.map((row) => row.id);
+      const rows = ids.length
+        ? await this.prisma.referral.findMany({
+            where: { id: { in: ids } },
+            select: REFERRAL_LIST_SELECT,
+          })
+        : [];
+      return {
+        items: inPageOrder(ids, rows),
+        total: counted[0]?.total ?? 0,
+        page: query.page,
+        limit: query.limit,
+      };
+    }
     const where = {
       ...(query.status ? { status: query.status } : {}),
       ...(query.campaignID
         ? { invitee: { campaignInviteUse: { campaignID: query.campaignID } } }
         : {}),
-      ...(query.search
-        ? {
-            OR: [
-              {
-                inviter: {
-                  accountId: {
-                    contains: query.search,
-                    mode: 'insensitive' as const,
-                  },
-                },
-              },
-              {
-                invitee: {
-                  accountId: {
-                    contains: query.search,
-                    mode: 'insensitive' as const,
-                  },
-                },
-              },
-            ],
-          }
-        : {}),
     };
     const [items, total] = await this.prisma.$transaction([
       this.prisma.referral.findMany({
         where,
-        select: {
-          id: true,
-          status: true,
-          inviterReward: true,
-          inviteeReward: true,
-          createdAt: true,
-          rewardedAt: true,
-          eligibleAt: true,
-          failureReason: true,
-          inviter: { select: USER_SUMMARY },
-          invitee: { select: USER_SUMMARY },
-        },
+        select: REFERRAL_LIST_SELECT,
         orderBy: [{ createdAt: 'desc' }, { id: 'desc' }],
         skip: (query.page - 1) * query.limit,
         take: query.limit,

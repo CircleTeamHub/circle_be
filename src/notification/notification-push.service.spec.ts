@@ -682,17 +682,20 @@ describe('NotificationPushService (#88 per-token delivery)', () => {
       const processed = await service.pollReceipts(now);
 
       expect(processed).toBe(3);
-      expect(prisma.notificationPushDelivery.update).toHaveBeenCalledWith({
-        where: { id: 'd1' },
-        data: expect.objectContaining({ status: 'CONFIRMED' }),
+      expect(prisma.notificationPushDelivery.updateMany).toHaveBeenCalledWith({
+        where: { id: { in: ['d1'] } },
+        data: { status: 'CONFIRMED', receiptCheckedAt: now, lastError: null },
       });
-      expect(prisma.notificationPushDelivery.update).toHaveBeenCalledWith({
-        where: { id: 'd2' },
-        data: expect.objectContaining({
+      expect(prisma.notificationPushDelivery.updateMany).toHaveBeenCalledWith({
+        where: { id: { in: ['d2'] } },
+        data: {
           status: 'TERMINAL',
+          receiptCheckedAt: now,
           lastError: 'DeviceNotRegistered',
-        }),
+        },
       });
+      // 逐行 update 只剩可重试那一条（它要和 outbox 重开同事务）。
+      expect(prisma.notificationPushDelivery.update).toHaveBeenCalledTimes(1);
       expect(prisma.devicePushToken.updateMany).toHaveBeenCalledWith({
         where: { token: { in: ['tok-b'] } },
         data: { disabledAt: expect.any(Date) },
@@ -707,6 +710,103 @@ describe('NotificationPushService (#88 per-token delivery)', () => {
         where: { id: 'o3', status: 'COMPLETED' },
         data: { status: 'PENDING', nextAttemptAt: now },
       });
+    });
+
+    it('settles ok and terminal receipts with one updateMany each, keeping retryable rows transactional', async () => {
+      const deliveries = Array.from({ length: 6 }, (_, index) => ({
+        id: `d${index}`,
+        ticketID: `t${index}`,
+        token: `tok-${index}`,
+        outboxID: `o${index}`,
+        sentAt,
+      }));
+      prisma.notificationPushDelivery.findMany.mockResolvedValue(deliveries);
+      fetchMock.mockResolvedValue({
+        ok: true,
+        json: async () => ({
+          data: {
+            t0: { status: 'ok' },
+            t1: { status: 'ok' },
+            t2: { status: 'ok' },
+            t3: { status: 'error', details: { error: 'DeviceNotRegistered' } },
+            t4: { status: 'error', details: { error: 'DeviceNotRegistered' } },
+            t5: { status: 'error', details: { error: 'ExpoServerError' } },
+          },
+        }),
+      });
+      prisma.notificationPushDelivery.groupBy
+        .mockResolvedValueOnce([])
+        .mockResolvedValueOnce([{ outboxID: 'o0' }]);
+      const order: string[] = [];
+      prisma.notificationPushDelivery.updateMany.mockImplementation(
+        async ({ data }: any) => {
+          order.push(`delivery:${data.status}`);
+          return { count: 1 };
+        },
+      );
+      prisma.notificationPushDelivery.update.mockImplementation(
+        async ({ data }: any) => {
+          order.push(`delivery-row:${data.status}`);
+          return {};
+        },
+      );
+      prisma.notificationPushOutbox.updateMany.mockImplementation(
+        async ({ data }: any) => {
+          order.push(`outbox:${data.status}`);
+          return { count: 1 };
+        },
+      );
+
+      const processed = await service.pollReceipts(now);
+
+      expect(processed).toBe(6);
+      expect(prisma.notificationPushDelivery.updateMany.mock.calls).toEqual([
+        [
+          {
+            where: { id: { in: ['d0', 'd1', 'd2'] } },
+            data: {
+              status: 'CONFIRMED',
+              receiptCheckedAt: now,
+              lastError: null,
+            },
+          },
+        ],
+        [
+          {
+            where: { id: { in: ['d3', 'd4'] } },
+            data: {
+              status: 'TERMINAL',
+              receiptCheckedAt: now,
+              lastError: 'DeviceNotRegistered',
+            },
+          },
+        ],
+      ]);
+      // 可重试那条仍是「行改 FAILED + outbox 拉回 PENDING」同一个事务。
+      expect(prisma.$transaction).toHaveBeenCalledTimes(1);
+      expect(prisma.notificationPushDelivery.update).toHaveBeenCalledTimes(1);
+      expect(prisma.notificationPushDelivery.update).toHaveBeenCalledWith({
+        where: { id: 'd5' },
+        data: {
+          status: 'FAILED',
+          receiptCheckedAt: now,
+          lastError: 'ExpoServerError',
+        },
+      });
+      expect(prisma.devicePushToken.updateMany).toHaveBeenCalledWith({
+        where: { token: { in: ['tok-3', 'tok-4'] } },
+        data: { disabledAt: expect.any(Date) },
+      });
+      // 行状态必须先落库，outbox 的终结判定（看还有没有 SENT）才读得到它们。
+      expect(order.indexOf('outbox:TERMINAL')).toBe(order.length - 1);
+      expect(order).toEqual(
+        expect.arrayContaining([
+          'delivery-row:FAILED',
+          'outbox:PENDING',
+          'delivery:CONFIRMED',
+          'delivery:TERMINAL',
+        ]),
+      );
     });
 
     // APNs/FCM 凭证坏掉（InvalidCredentials）、限流这类错误主要出现在异步回执里，
@@ -915,6 +1015,7 @@ describe('NotificationPushService (#88 per-token delivery)', () => {
 
       expect(processed).toBe(0);
       expect(prisma.notificationPushDelivery.update).not.toHaveBeenCalled();
+      expect(prisma.notificationPushDelivery.updateMany).not.toHaveBeenCalled();
     });
   });
 

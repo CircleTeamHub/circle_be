@@ -56,6 +56,9 @@ export class UserController {
   // 不经隐私开关也不写 AdminAuditLog，留着就是一条绕过脱敏与审计的后门。
 
   @Get('search/account')
+  // 账号号码是唯一能换出 userID 的入口:按账号限流 30 次/分钟,挡按号段批量枚举。
+  @UseGuards(UserThrottlerGuard)
+  @Throttle({ default: { limit: 30, ttl: 60_000 } })
   @Serialize(PublicUserDto)
   @ApiOperation({
     summary: 'Search a user by exact accountId for friend adding',

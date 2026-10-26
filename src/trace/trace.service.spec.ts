@@ -15,6 +15,13 @@ import {
   decodeTraceCursor,
 } from './trace.service';
 import { AvatarFrameService } from 'src/avatar-frame/avatar-frame.service';
+import { Prisma } from 'src/generated/prisma';
+import {
+  TraceCommentPreviewRow,
+  TraceLikePreviewRow,
+  traceCommentPreviewQuery,
+  traceLikePreviewQuery,
+} from './trace-preview.query';
 
 /** Minimal Trace row in the shape `getFeed`'s include produces. */
 function makeTraceRow(id: string, createdAt: Date) {
@@ -31,6 +38,39 @@ function makeTraceRow(id: string, createdAt: Date) {
     comments: [],
   };
 }
+
+/** 预览查询（原生 SQL）返回的一行点赞。 */
+function likeRow(traceID: string, userID: string): TraceLikePreviewRow {
+  return { traceID, userID, userNickname: `nick-${userID}` };
+}
+
+/** 预览查询（原生 SQL）返回的一行评论（最新在前）。 */
+function commentRow(
+  traceID: string,
+  id: string,
+  userID: string,
+  extra: Partial<TraceCommentPreviewRow> = {},
+): TraceCommentPreviewRow {
+  return {
+    id,
+    traceID,
+    userID,
+    content: `content-${id}`,
+    images: [],
+    createdAt: new Date('2026-06-08T01:00:00.000Z'),
+    userNickname: `nick-${userID}`,
+    replyToID: null,
+    replyToNickname: null,
+    ...extra,
+  };
+}
+
+const isLikePreview = (query: unknown) =>
+  typeof (query as Prisma.Sql | undefined)?.sql === 'string' &&
+  (query as Prisma.Sql).sql.includes('"traceLikeStat"');
+const isCommentPreview = (query: unknown) =>
+  typeof (query as Prisma.Sql | undefined)?.sql === 'string' &&
+  (query as Prisma.Sql).sql.includes('FROM "TraceComment" AS tc');
 
 describe('TraceService', () => {
   let service: TraceService;
@@ -64,9 +104,21 @@ describe('TraceService', () => {
     user: {
       findMany: jest.fn(),
     },
+    $queryRaw: jest.fn(),
     $transaction: jest.fn(async (input: any) =>
       Array.isArray(input) ? Promise.all(input) : input(prisma),
     ),
+  };
+  /** 点赞 / 评论预览走两条原生 SQL；按查询种类分流各自的结果行。 */
+  const stubPreviews = (
+    likes: TraceLikePreviewRow[],
+    comments: TraceCommentPreviewRow[],
+  ) => {
+    prisma.$queryRaw.mockImplementation(async (query: unknown) => {
+      if (isLikePreview(query)) return likes;
+      if (isCommentPreview(query)) return comments;
+      throw new Error('unexpected raw query');
+    });
   };
   const notificationService = {
     createTraceCommentNotifications: jest.fn(() => Promise.resolve([])),
@@ -115,6 +167,10 @@ describe('TraceService', () => {
     notificationService.createTraceLikeNotification.mockReset();
     avatarFrames.resolvePublicAppearances.mockReset();
     avatarFrames.resolvePublicAppearances.mockResolvedValue(new Map());
+    prisma.$queryRaw.mockReset();
+    prisma.$queryRaw.mockResolvedValue([]);
+    prisma.friend.findMany.mockReset();
+    prisma.friend.findMany.mockResolvedValue([]);
 
     const module: TestingModule = await Test.createTestingModule({
       providers: [
@@ -174,20 +230,11 @@ describe('TraceService', () => {
       replyCount: 1,
       createdAt: new Date('2026-06-08T00:00:00.000Z'),
       from: { id: 'author-1', nickname: 'Author', avatarUrl: null },
-      likeStats: [
-        { userID: 'viewer-1', user: { id: 'viewer-1', nickname: 'Viewer' } },
-      ],
-      comments: [
-        {
-          id: 'comment-1',
-          content: 'nice',
-          userID: 'author-1',
-          createdAt: new Date('2026-06-08T01:00:00.000Z'),
-          user: { id: 'author-1', nickname: 'Author' },
-          replyTo: null,
-        },
-      ],
     });
+    stubPreviews(
+      [likeRow('trace-1', 'viewer-1')],
+      [commentRow('trace-1', 'comment-1', 'author-1', { content: 'nice' })],
+    );
     prisma.friend.findMany.mockResolvedValue([
       { userID: 'viewer-1', friendID: 'author-1' },
     ]);
@@ -230,7 +277,17 @@ describe('TraceService', () => {
     expect(avatarFrames.resolvePublicAppearances).toHaveBeenCalledWith([
       'author-1',
     ]);
-    expect(result.comments).toHaveLength(1);
+    expect(result.comments).toEqual([
+      expect.objectContaining({
+        id: 'comment-1',
+        content: 'nice',
+        user: { id: 'author-1', nickname: 'nick-author-1' },
+        replyTo: null,
+      }),
+    ]);
+    expect(result.likedFriends).toEqual([
+      { id: 'viewer-1', nickname: 'nick-viewer-1' },
+    ]);
   });
 
   it('getTraceById resolves the author membership across an expiry boundary', async () => {
@@ -305,8 +362,17 @@ describe('TraceService', () => {
 
     await service.getTraceById('viewer-1', 'trace-1');
 
+    // 详情的评论上限比 feed 预览高，但同样是 SQL 里每条动态的 LIMIT，不再是嵌套
+    // include 的 take（Prisma 7 对嵌套 take 不生成 LIMIT，热门动态会整串读出来）。
     const detailQuery = prisma.trace.findFirst.mock.calls[1][0];
-    expect(detailQuery.include.comments.take).toBe(100);
+    expect(detailQuery.include).not.toHaveProperty('comments');
+    expect(detailQuery.include).not.toHaveProperty('likeStats');
+    expect(prisma.$queryRaw).toHaveBeenCalledWith(
+      traceCommentPreviewQuery(['trace-1'], 100),
+    );
+    expect(prisma.$queryRaw).toHaveBeenCalledWith(
+      traceLikePreviewQuery(['trace-1'], 20),
+    );
   });
 
   it('getTraceById selects only the replied-to id and nickname and still threads replies', async () => {
@@ -321,18 +387,16 @@ describe('TraceService', () => {
       replyCount: 1,
       createdAt: new Date('2026-06-08T00:00:00.000Z'),
       from: { id: 'author-1', nickname: 'Author', avatarUrl: null },
-      likeStats: [],
-      comments: [
-        {
-          id: 'comment-2',
-          content: 'thanks',
-          userID: 'author-1',
-          createdAt: new Date('2026-06-08T02:00:00.000Z'),
-          user: { id: 'author-1', nickname: 'Author' },
-          replyTo: { id: 'comment-1', user: { nickname: 'Viewer' } },
-        },
-      ],
     });
+    stubPreviews(
+      [],
+      [
+        commentRow('trace-1', 'comment-2', 'author-1', {
+          replyToID: 'comment-1',
+          replyToNickname: 'Viewer',
+        }),
+      ],
+    );
     prisma.friend.findMany.mockResolvedValue([
       { userID: 'viewer-1', friendID: 'author-1' },
     ]);
@@ -340,10 +404,14 @@ describe('TraceService', () => {
 
     const result = await service.getTraceById('viewer-1', 'trace-1');
 
-    const detailQuery = prisma.trace.findFirst.mock.calls[1][0];
-    expect(detailQuery.include.comments.include.replyTo).toEqual({
-      select: { id: true, user: { select: { nickname: true } } },
-    });
+    // 预览 SQL 只为 replyTo 取父评论 id 与被回复人昵称（不是整条父评论）。
+    const [commentQuery] = prisma.$queryRaw.mock.calls
+      .map(([query]) => query as Prisma.Sql)
+      .filter(isCommentPreview);
+    expect(commentQuery.sql).toContain('parent."id" AS "replyToID"');
+    expect(commentQuery.sql).toContain(
+      'parent_author."nickname" AS "replyToNickname"',
+    );
     // 客户端按父评论 id 串楼，这个 id 必须仍是被回复的那条评论。
     expect(result.comments[0].replyTo).toEqual({
       id: 'comment-1',
@@ -394,6 +462,228 @@ describe('TraceService', () => {
     await expect(service.getTraceById('viewer-1', 'trace-1')).rejects.toThrow(
       NotFoundException,
     );
+  });
+
+  // 点赞 / 评论 / 详情此前为判断「作者是不是 viewer 的好友」把 viewer 的已接受好友
+  // 整表读出来（最多 5000 行），再加一条 chat-only 查询。现在是对这一个作者的单点查询，
+  // 一条语句同时给出「是不是好友」和「作者是否只授予了 CHAT_ONLY」。可见性规则不变。
+  describe('single-author friendship check (like / comment / detail)', () => {
+    const PAIR_QUERY = {
+      where: {
+        state: 'ACCEPTED',
+        OR: [
+          { userID: 'author-1', friendID: 'viewer-1' },
+          { userID: 'viewer-1', friendID: 'author-1' },
+        ],
+      },
+      select: {
+        userID: true,
+        friendID: true,
+        permissionA: true,
+        permissionB: true,
+      },
+    };
+    const trace = (visibility: string, fromID = 'author-1') => ({
+      id: 'trace-1',
+      fromID,
+      deleted: false,
+      visibility,
+      likeCount: 0,
+    });
+    const friendship = (
+      permissions: { permissionA?: string; permissionB?: string } = {},
+      viewerIsUserID = true,
+    ) => ({
+      userID: viewerIsUserID ? 'viewer-1' : 'author-1',
+      friendID: viewerIsUserID ? 'author-1' : 'viewer-1',
+      permissionA: permissions.permissionA ?? 'FULL',
+      permissionB: permissions.permissionB ?? 'FULL',
+    });
+    /** 走到点赞事务之前就停：只看可见性闸门的结果。 */
+    const gate = () => service.toggleLike('viewer-1', 'trace-1');
+
+    beforeEach(() => {
+      prisma.$transaction.mockImplementation(async () => {
+        throw new Error('past the gate');
+      });
+    });
+
+    afterEach(() => {
+      // 换回 harness 的默认实现，别把「过闸即抛」漏给后面的用例。
+      prisma.$transaction.mockImplementation(async (input: any) =>
+        Array.isArray(input) ? Promise.all(input) : input(prisma),
+      );
+    });
+
+    it('queries only the viewer–author pair, never the whole friend list', async () => {
+      prisma.trace.findFirst.mockResolvedValue(trace('FRIENDS_ONLY'));
+      prisma.friend.findMany.mockResolvedValue([friendship()]);
+
+      await expect(gate()).rejects.toThrow('past the gate');
+
+      expect(prisma.friend.findMany).toHaveBeenCalledTimes(1);
+      expect(prisma.friend.findMany).toHaveBeenCalledWith(PAIR_QUERY);
+      expect(privacySettings.canViewMoments).toHaveBeenCalledWith(
+        'author-1',
+        false,
+        true,
+      );
+    });
+
+    it('lets the author through without any friendship lookup', async () => {
+      prisma.trace.findFirst.mockResolvedValue(trace('PRIVATE', 'viewer-1'));
+
+      await expect(gate()).rejects.toThrow('past the gate');
+
+      expect(prisma.friend.findMany).not.toHaveBeenCalled();
+      expect(privacySettings.canViewMoments).not.toHaveBeenCalled();
+    });
+
+    it.each([
+      [
+        'the author is userID (permissionA)',
+        { permissionA: 'CHAT_ONLY' },
+        false,
+      ],
+      [
+        'the author is friendID (permissionB)',
+        { permissionB: 'CHAT_ONLY' },
+        true,
+      ],
+    ])(
+      'hides the moment as not found when %s granted only CHAT_ONLY',
+      async (_, permissions, viewerIsUserID) => {
+        prisma.trace.findFirst.mockResolvedValue(trace('PUBLIC'));
+        prisma.friend.findMany.mockResolvedValue([
+          friendship(permissions, viewerIsUserID),
+        ]);
+
+        await expect(gate()).rejects.toThrow(NotFoundException);
+        expect(privacySettings.canViewMoments).not.toHaveBeenCalled();
+      },
+    );
+
+    it("ignores the viewer's own CHAT_ONLY grant to the author", async () => {
+      // viewer 给作者设了 CHAT_ONLY，挡的是作者看 viewer，不挡 viewer 看作者。
+      prisma.trace.findFirst.mockResolvedValue(trace('FRIENDS_ONLY'));
+      prisma.friend.findMany.mockResolvedValue([
+        friendship({ permissionA: 'CHAT_ONLY' }, true),
+      ]);
+
+      await expect(gate()).rejects.toThrow('past the gate');
+    });
+
+    it('treats any CHAT_ONLY row of a duplicated friendship as chat-only', async () => {
+      prisma.trace.findFirst.mockResolvedValue(trace('FRIENDS_ONLY'));
+      prisma.friend.findMany.mockResolvedValue([
+        friendship(),
+        friendship({ permissionA: 'CHAT_ONLY' }, false),
+      ]);
+
+      await expect(gate()).rejects.toThrow(NotFoundException);
+    });
+
+    it('forbids a FRIENDS_ONLY moment to a non-friend', async () => {
+      prisma.trace.findFirst.mockResolvedValue(trace('FRIENDS_ONLY'));
+      prisma.friend.findMany.mockResolvedValue([]);
+
+      await expect(gate()).rejects.toThrow(ForbiddenException);
+      expect(privacySettings.canViewMoments).toHaveBeenCalledWith(
+        'author-1',
+        false,
+        false,
+      );
+    });
+
+    it('opens a PUBLIC moment to a non-friend the author allows', async () => {
+      prisma.trace.findFirst.mockResolvedValue(trace('PUBLIC'));
+      prisma.friend.findMany.mockResolvedValue([]);
+
+      await expect(gate()).rejects.toThrow('past the gate');
+      expect(privacySettings.canViewMoments).toHaveBeenCalledWith(
+        'author-1',
+        false,
+        false,
+      );
+    });
+
+    it('forbids a PUBLIC moment when the author hides moments from friends', async () => {
+      prisma.trace.findFirst.mockResolvedValue(trace('PUBLIC'));
+      prisma.friend.findMany.mockResolvedValue([friendship()]);
+      privacySettings.canViewMoments.mockResolvedValue(false);
+
+      await expect(gate()).rejects.toThrow(ForbiddenException);
+      expect(privacySettings.canViewMoments).toHaveBeenCalledWith(
+        'author-1',
+        false,
+        true,
+      );
+    });
+
+    it('forbids a PRIVATE moment even to a friend, judged as a non-friend', async () => {
+      prisma.trace.findFirst.mockResolvedValue(trace('PRIVATE'));
+      prisma.friend.findMany.mockResolvedValue([friendship()]);
+
+      await expect(gate()).rejects.toThrow(ForbiddenException);
+      // 与旧实现一致：PRIVATE 不查好友列表，按非好友去问作者设置。
+      expect(privacySettings.canViewMoments).toHaveBeenCalledWith(
+        'author-1',
+        false,
+        false,
+      );
+    });
+
+    it('addComment goes through the same single-pair gate', async () => {
+      prisma.trace.findFirst.mockResolvedValue(trace('FRIENDS_ONLY'));
+      prisma.friend.findMany.mockResolvedValue([]);
+
+      await expect(
+        service.addComment('viewer-1', 'trace-1', { content: 'hi' }),
+      ).rejects.toThrow(ForbiddenException);
+      expect(prisma.friend.findMany).toHaveBeenCalledWith(PAIR_QUERY);
+    });
+
+    it('getTraceById checks friendship only for the people in the previews', async () => {
+      prisma.trace.findFirst.mockResolvedValue({
+        ...trace('FRIENDS_ONLY'),
+        content: 'hello',
+        images: [],
+        replyCount: 2,
+        createdAt: new Date('2026-06-08T00:00:00.000Z'),
+        from: { id: 'author-1', nickname: 'Author', avatarUrl: null },
+      });
+      prisma.traceLikeStat.findFirst.mockResolvedValue(null);
+      stubPreviews(
+        [likeRow('trace-1', 'mutual'), likeRow('trace-1', 'stranger')],
+        [
+          commentRow('trace-1', 'c-2', 'stranger'),
+          commentRow('trace-1', 'c-1', 'mutual'),
+        ],
+      );
+      prisma.friend.findMany
+        // 可见性闸门：viewer 与作者是好友。
+        .mockResolvedValueOnce([friendship()])
+        // 共同好友过滤：预览里只有 mutual 是 viewer 的好友。
+        .mockResolvedValueOnce([{ userID: 'mutual', friendID: 'viewer-1' }]);
+
+      const result = await service.getTraceById('viewer-1', 'trace-1');
+
+      expect(prisma.friend.findMany).toHaveBeenCalledTimes(2);
+      expect(prisma.friend.findMany).toHaveBeenLastCalledWith({
+        where: {
+          state: 'ACCEPTED',
+          OR: [
+            { userID: 'viewer-1', friendID: { in: ['mutual', 'stranger'] } },
+            { userID: { in: ['mutual', 'stranger'] }, friendID: 'viewer-1' },
+          ],
+        },
+        select: { userID: true, friendID: true },
+      });
+      expect(result.likedFriends).toEqual([
+        { id: 'mutual', nickname: 'nick-mutual' },
+      ]);
+      expect(result.comments.map((comment) => comment.id)).toEqual(['c-1']);
+    });
   });
 
   it('rejects replying to a comment from a different trace', async () => {
@@ -857,44 +1147,129 @@ describe('TraceService', () => {
     );
   });
 
-  it('caps embedded likes and comments in the feed query', async () => {
-    prisma.friend.findMany.mockResolvedValue([]);
-    prisma.trace.findMany.mockResolvedValue([]);
-    prisma.trace.count.mockResolvedValue(0);
-    prisma.traceLikeStat.findMany.mockResolvedValue([]);
-
-    await service.getFeed('viewer-1', { page: 1, limit: 20 });
-
-    expect(prisma.trace.findMany).toHaveBeenCalledWith(
-      expect.objectContaining({
-        include: expect.objectContaining({
-          likeStats: expect.objectContaining({
-            take: expect.any(Number),
-            orderBy: { updatedAt: 'desc' },
-          }),
-          comments: expect.objectContaining({
-            take: expect.any(Number),
-            orderBy: { createdAt: 'desc' },
-          }),
-        }),
-      }),
-    );
-  });
-
-  // 预览评论的 replyTo 此前 include 整条被回复的评论（content / images / 外键）再加
-  // user，映射只读 replyTo.id 与 replyTo.user.nickname。
-  it('selects only the replied-to comment id and author nickname in the feed', async () => {
-    prisma.friend.findMany.mockResolvedValue([]);
-    prisma.trace.findMany.mockResolvedValue([]);
-    prisma.trace.count.mockResolvedValue(0);
+  // 嵌套 include 的 likeStats / comments 带 take 时，Prisma 7 不生成 LIMIT：一页 feed
+  // 把每条动态的全部点赞、全部评论连同 user / replyTo 都读了出来。预览改成两条原生 SQL，
+  // 每条动态在 SQL 里各取前 20 条。
+  it('loads like and comment previews with a per-trace LIMIT instead of nested includes', async () => {
+    prisma.friend.findMany.mockResolvedValue([
+      { userID: 'viewer-1', friendID: 'friend-1' },
+    ]);
+    prisma.trace.findMany.mockResolvedValue([
+      makeTraceRow('trace-1', new Date('2026-06-08T00:00:00.000Z')),
+      makeTraceRow('trace-2', new Date('2026-06-07T00:00:00.000Z')),
+    ]);
+    prisma.trace.count.mockResolvedValue(2);
     prisma.traceLikeStat.findMany.mockResolvedValue([]);
 
     await service.getFeed('viewer-1', { page: 1, limit: 20 });
 
     const [feedQuery] = prisma.trace.findMany.mock.calls[0];
-    expect(feedQuery.include.comments.include.replyTo).toEqual({
-      select: { id: true, user: { select: { nickname: true } } },
+    expect(feedQuery.include).not.toHaveProperty('likeStats');
+    expect(feedQuery.include).not.toHaveProperty('comments');
+    expect(prisma.$queryRaw).toHaveBeenCalledTimes(2);
+    expect(prisma.$queryRaw).toHaveBeenCalledWith(
+      traceLikePreviewQuery(['trace-1', 'trace-2'], 20),
+    );
+    expect(prisma.$queryRaw).toHaveBeenCalledWith(
+      traceCommentPreviewQuery(['trace-1', 'trace-2'], 20),
+    );
+  });
+
+  it('skips the preview queries when the page is empty', async () => {
+    prisma.trace.findMany.mockResolvedValue([]);
+    prisma.trace.count.mockResolvedValue(0);
+    prisma.traceLikeStat.findMany.mockResolvedValue([]);
+
+    await service.getFeed('viewer-1', { page: 1, limit: 20 });
+
+    expect(prisma.$queryRaw).not.toHaveBeenCalled();
+  });
+
+  it('maps preview rows onto each trace with the mutual-friend filter and oldest-first comments', async () => {
+    prisma.friend.findMany.mockResolvedValue([
+      { userID: 'viewer-1', friendID: 'friend-1' },
+      { userID: 'friend-2', friendID: 'viewer-1' },
+    ]);
+    prisma.trace.findMany.mockResolvedValue([
+      makeTraceRow('trace-1', new Date('2026-06-08T00:00:00.000Z')),
+      makeTraceRow('trace-2', new Date('2026-06-07T00:00:00.000Z')),
+    ]);
+    prisma.trace.count.mockResolvedValue(2);
+    prisma.traceLikeStat.findMany.mockResolvedValue([]);
+    stubPreviews(
+      [
+        likeRow('trace-1', 'friend-2'),
+        // 陌生人（不是 viewer 的好友，也不是作者/本人）的赞不展示 —— 微信朋友圈口径。
+        likeRow('trace-1', 'stranger'),
+        likeRow('trace-1', 'viewer-1'),
+        likeRow('trace-2', 'friend-1'),
+      ],
+      [
+        // SQL 按 createdAt 倒序给出；DTO 里是旧 → 新。
+        commentRow('trace-1', 'c-3', 'friend-1', {
+          createdAt: new Date('2026-06-08T03:00:00.000Z'),
+          replyToID: 'c-1',
+          replyToNickname: 'nick-friend-2',
+        }),
+        commentRow('trace-1', 'c-2', 'stranger', {
+          createdAt: new Date('2026-06-08T02:00:00.000Z'),
+        }),
+        commentRow('trace-1', 'c-1', 'friend-2', {
+          createdAt: new Date('2026-06-08T01:00:00.000Z'),
+          images: ['https://cdn.example/a.jpg'],
+        }),
+      ],
+    );
+
+    const result = await service.getFeed('viewer-1', { page: 1, limit: 20 });
+
+    const [first, second] = result.items;
+    expect(first.likedFriends).toEqual([
+      { id: 'friend-2', nickname: 'nick-friend-2' },
+      { id: 'viewer-1', nickname: 'nick-viewer-1' },
+    ]);
+    expect(first.comments.map((comment) => comment.id)).toEqual(['c-1', 'c-3']);
+    expect(first.comments[0]).toEqual(
+      expect.objectContaining({
+        id: 'c-1',
+        content: 'content-c-1',
+        images: ['https://cdn.example/a.jpg'],
+        user: { id: 'friend-2', nickname: 'nick-friend-2' },
+        replyTo: null,
+        ignoredMentionCount: 0,
+        createdAt: '2026-06-08T01:00:00.000Z',
+      }),
+    );
+    // replyTo.id 是父评论 id（客户端按它串楼），nickname 是被回复人。
+    expect(first.comments[1].replyTo).toEqual({
+      id: 'c-1',
+      nickname: 'nick-friend-2',
     });
+    expect(second.likedFriends).toEqual([
+      { id: 'friend-1', nickname: 'nick-friend-1' },
+    ]);
+    expect(second.comments).toEqual([]);
+  });
+
+  it('drops replyTo when the parent comment row is gone', async () => {
+    prisma.trace.findMany.mockResolvedValue([
+      makeTraceRow('trace-1', new Date('2026-06-08T00:00:00.000Z')),
+    ]);
+    prisma.trace.count.mockResolvedValue(1);
+    prisma.traceLikeStat.findMany.mockResolvedValue([]);
+    stubPreviews(
+      [],
+      [
+        commentRow('trace-1', 'c-1', 'viewer-1', {
+          replyToID: null,
+          replyToNickname: null,
+        }),
+      ],
+    );
+
+    const result = await service.getFeed('viewer-1', { page: 1, limit: 20 });
+
+    expect(result.items[0].comments[0].replyTo).toBeNull();
   });
 
   // getAcceptedFriendIds 每个 feed 页都要跑，此前不设上限。按好友业务上限（会员 5000，
@@ -1023,6 +1398,165 @@ describe('TraceService', () => {
 
     expect(result.items).toEqual([]);
     expect(prisma.trace.findMany).not.toHaveBeenCalled();
+  });
+
+  // 相册（authorId）只看一个作者：此前同样把 viewer 的全部好友（最多 5000）读出来、
+  // 对整个好友集合跑隐私过滤，只为判断这一个作者可不可见。
+  describe('album visibility without loading the friend list', () => {
+    const albumQuery = { page: 1, limit: 20, authorId: 'friend-1' };
+    const bulkFriendScope = expect.objectContaining({ take: 5000 });
+
+    beforeEach(() => {
+      prisma.trace.count.mockResolvedValue(0);
+      prisma.traceLikeStat.findMany.mockResolvedValue([]);
+    });
+
+    it("checks only the viewer–author pair and that author's settings", async () => {
+      prisma.friend.findMany.mockResolvedValue([
+        {
+          userID: 'viewer-1',
+          friendID: 'friend-1',
+          permissionA: 'FULL',
+          permissionB: 'FULL',
+        },
+      ]);
+      prisma.trace.findMany.mockResolvedValue([]);
+
+      await service.getFeed('viewer-1', albumQuery);
+
+      expect(prisma.friend.findMany).not.toHaveBeenCalledWith(bulkFriendScope);
+      expect(prisma.friend.findMany).toHaveBeenCalledWith({
+        where: {
+          state: 'ACCEPTED',
+          OR: [
+            { userID: 'friend-1', friendID: 'viewer-1' },
+            { userID: 'viewer-1', friendID: 'friend-1' },
+          ],
+        },
+        select: {
+          userID: true,
+          friendID: true,
+          permissionA: true,
+          permissionB: true,
+        },
+      });
+      expect(privacySettings.getSettingsMany).toHaveBeenCalledWith([
+        'friend-1',
+      ]);
+      expect(prisma.trace.findMany).toHaveBeenCalledWith(
+        expect.objectContaining({
+          where: expect.objectContaining({ fromID: 'friend-1' }),
+        }),
+      );
+    });
+
+    it.each([
+      ['PRIVATE', false],
+      ['FRIENDS_ONLY', true],
+      ['ALL', true],
+    ])(
+      "applies the author's momentsVisibility=%s to a friend (visible=%s)",
+      async (momentsVisibility, visible) => {
+        prisma.friend.findMany.mockResolvedValue([
+          {
+            userID: 'friend-1',
+            friendID: 'viewer-1',
+            permissionA: 'FULL',
+            permissionB: 'FULL',
+          },
+        ]);
+        privacySettings.getSettingsMany.mockResolvedValue(
+          new Map([['friend-1', { momentsVisibility }]]),
+        );
+        prisma.trace.findMany.mockResolvedValue([]);
+
+        const result = await service.getFeed('viewer-1', albumQuery);
+
+        expect(prisma.trace.findMany).toHaveBeenCalledTimes(visible ? 1 : 0);
+        expect(result.total).toBe(0);
+      },
+    );
+
+    it("keeps a non-friend's album empty even when the author shows moments to everyone", async () => {
+      prisma.friend.findMany.mockResolvedValue([]);
+      privacySettings.getSettingsMany.mockResolvedValue(
+        new Map([['friend-1', { momentsVisibility: 'ALL' }]]),
+      );
+
+      const result = await service.getFeed('viewer-1', albumQuery);
+
+      expect(result.items).toEqual([]);
+      expect(prisma.trace.findMany).not.toHaveBeenCalled();
+    });
+
+    it("opens the viewer's own album without any friendship lookup for the gate", async () => {
+      prisma.trace.findMany.mockResolvedValue([]);
+
+      await service.getFeed('viewer-1', {
+        ...albumQuery,
+        authorId: 'viewer-1',
+      });
+
+      expect(prisma.friend.findMany).not.toHaveBeenCalled();
+      expect(prisma.trace.findMany).toHaveBeenCalledWith(
+        expect.objectContaining({
+          where: expect.objectContaining({ fromID: 'viewer-1' }),
+        }),
+      );
+    });
+
+    it("filters album likes and comments by a friendship lookup over the page's people only", async () => {
+      prisma.friend.findMany
+        // 相册闸门：viewer 与作者 friend-1 是好友。
+        .mockResolvedValueOnce([
+          {
+            userID: 'viewer-1',
+            friendID: 'friend-1',
+            permissionA: 'FULL',
+            permissionB: 'FULL',
+          },
+        ])
+        // 共同好友过滤：这一页的点赞 / 评论人里只有 mutual 是 viewer 的好友。
+        .mockResolvedValueOnce([{ userID: 'viewer-1', friendID: 'mutual' }]);
+      prisma.trace.findMany.mockResolvedValue([
+        makeTraceRow('trace-1', new Date('2026-06-08T00:00:00.000Z')),
+      ]);
+      prisma.trace.count.mockResolvedValue(1);
+      stubPreviews(
+        [likeRow('trace-1', 'mutual'), likeRow('trace-1', 'stranger')],
+        [
+          commentRow('trace-1', 'c-1', 'stranger'),
+          commentRow('trace-1', 'c-0', 'friend-1'),
+        ],
+      );
+
+      const result = await service.getFeed('viewer-1', albumQuery);
+
+      expect(prisma.friend.findMany).toHaveBeenCalledTimes(2);
+      expect(prisma.friend.findMany).toHaveBeenLastCalledWith({
+        where: {
+          state: 'ACCEPTED',
+          OR: [
+            {
+              userID: 'viewer-1',
+              friendID: { in: ['mutual', 'stranger', 'friend-1'] },
+            },
+            {
+              userID: { in: ['mutual', 'stranger', 'friend-1'] },
+              friendID: 'viewer-1',
+            },
+          ],
+        },
+        select: { userID: true, friendID: true },
+      });
+      expect(result.items[0].likedFriends).toEqual([
+        { id: 'mutual', nickname: 'nick-mutual' },
+      ]);
+      // 作者本人的评论总是可见。
+      expect(result.items[0].comments.map((comment) => comment.id)).toEqual([
+        'c-0',
+      ]);
+    });
   });
 
   it('excludes a friend who hides their moments from the feed scope (batched privacy check)', async () => {

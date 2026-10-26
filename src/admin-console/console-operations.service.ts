@@ -14,6 +14,10 @@ import {
   writeOperationAudit,
 } from 'src/admin-operations/admin-operation-request';
 import { OUTBOX_QUEUES } from 'src/metrics/outbox-depth.service';
+import {
+  ADMIN_FANOUT_MAX_CONCURRENT_QUERIES,
+  createConcurrencyLimiter,
+} from 'src/utils/concurrency-limit';
 import { diagnosticCategory } from './console-policy';
 import type {
   ConsoleQuery,
@@ -68,46 +72,73 @@ const QUEUES = {
 
 @Injectable()
 export class ConsoleOperationsService {
+  /**
+   * 任务总览一次约 20 条查询(每个队列 pending 聚合 + 死信计数,再加群操作统计)。
+   * 以前全部同时打到 10 个连接的池上;现在整个实例最多占 3 个,理由同
+   * OUTBOX_PROBE_MAX_CONCURRENT_QUERIES 的注释。
+   *
+   * 不直接读 OutboxDepthService 的每分钟样本:口径不一致 —— 样本没有死信态的
+   * 队列记 0(这里回 null)、只有最老待办的秒数(这里回时刻)、最多陈旧 60 秒,
+   * 也不含群操作统计。
+   */
+  private readonly limitQueries = createConcurrencyLimiter(
+    ADMIN_FANOUT_MAX_CONCURRENT_QUERIES,
+  );
+
   constructor(
     private readonly prisma: PrismaService,
     private readonly config: ConfigService,
   ) {}
 
   async taskOverview() {
+    const now = new Date();
+    const limit = this.limitQueries;
     const source = this.prisma as unknown as Record<
       string,
       {
         aggregate: (arg: unknown) => Promise<{
           _count: { _all: number };
-          _min: { createdAt: Date | null };
+          _min: Record<string, Date | null>;
         }>;
         count: (arg: unknown) => Promise<number>;
       }
     >;
     const items = await Promise.all(
       OUTBOX_QUEUES.map(async (queue) => {
+        // 与 collectOutboxDepths 同一口径:随时间变化的 pendingWhere(access_revocation)
+        // 先求值 —— 原样把函数交给 Prisma 会被拒绝序列化,整个总览接口 500;最老待办按
+        // 队列声明的列算。
+        const oldestField = queue.oldestField ?? 'createdAt';
+        const pendingWhere =
+          typeof queue.pendingWhere === 'function'
+            ? queue.pendingWhere(now)
+            : queue.pendingWhere;
         const [pending, dead] = await Promise.all([
-          source[queue.model].aggregate({
-            where: queue.pendingWhere,
-            _count: { _all: true },
-            _min: { createdAt: true },
-          }),
+          limit(() =>
+            source[queue.model].aggregate({
+              where: pendingWhere,
+              _count: { _all: true },
+              _min: { [oldestField]: true },
+            }),
+          ),
           queue.deadWhere
-            ? source[queue.model].count({ where: queue.deadWhere })
+            ? limit(() => source[queue.model].count({ where: queue.deadWhere }))
             : Promise.resolve(null),
         ]);
         return {
           kind: queue.name,
           pending: pending._count._all,
           dead,
-          oldestAt: pending._min.createdAt,
+          oldestAt: pending._min[oldestField] ?? null,
         };
       }),
     );
-    const group = await this.prisma.adminGroupOperation.groupBy({
-      by: ['status'],
-      _count: true,
-    });
+    const group = await limit(() =>
+      this.prisma.adminGroupOperation.groupBy({
+        by: ['status'],
+        _count: true,
+      }),
+    );
     return { generatedAt: new Date(), items, groupOperations: group };
   }
 

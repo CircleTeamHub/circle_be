@@ -1,5 +1,9 @@
 import { Injectable, Logger } from '@nestjs/common';
 import { RedisService } from 'src/redis/redis.service';
+import {
+  ADMIN_FANOUT_MAX_CONCURRENT_QUERIES,
+  createConcurrencyLimiter,
+} from 'src/utils/concurrency-limit';
 import { DashboardRange } from './dashboard.dto';
 import {
   DashboardCommerceMetrics,
@@ -42,6 +46,11 @@ export class DashboardService {
     { expiresAt: number; value: DashboardResponse }
   >();
   private readonly inFlight = new Map<string, Promise<DashboardResponse>>();
+  /** 一次刷新约 20 条查询;整个实例的看板查询共用这一个上限(不同 range 的
+   * 刷新也是),最多占池里 3 个连接。 */
+  private readonly limitQueries = createConcurrencyLimiter(
+    ADMIN_FANOUT_MAX_CONCURRENT_QUERIES,
+  );
 
   constructor(
     private readonly users: DashboardUserMetrics,
@@ -93,12 +102,13 @@ export class DashboardService {
     cacheKey: string,
   ): Promise<DashboardResponse> {
     const period = resolveDashboardPeriod(range, now);
+    const limit = this.limitQueries;
     const results = await Promise.allSettled([
-      this.users.getMetrics(period),
-      this.community.getMetrics(period),
-      this.commerce.getMetrics(period),
-      this.moderation.getMetrics(period),
-      this.system.getMetrics(),
+      this.users.getMetrics(period, limit),
+      this.community.getMetrics(period, limit),
+      this.commerce.getMetrics(period, limit),
+      this.moderation.getMetrics(period, limit),
+      this.system.getMetrics(limit),
     ]);
     const sectionNames = [
       'users',

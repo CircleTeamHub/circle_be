@@ -2581,6 +2581,88 @@ describe('NoteService', () => {
     });
   });
 
+  // 归属校验只决定「是不是你的、还在不在」,此前却 include NOTE_INCLUDE(正文、
+  // contentJson、sections、全部 media、分组成员 —— 四条查询)再整个丢掉。
+  describe('ownership checks read only what they decide on', () => {
+    const OWNED_NOTE_LOOKUP = {
+      where: { id: 'note-1', ownerID: 'user-1', status: { not: 'DELETED' } },
+      select: { id: true },
+    };
+
+    it.each([
+      ['setPinned', (s: NoteService) => s.setPinned('user-1', 'note-1', true)],
+      ['setRemark', (s: NoteService) => s.setRemark('user-1', 'note-1', 'x')],
+      [
+        'setAvailable',
+        (s: NoteService) => s.setAvailable('user-1', 'note-1', false),
+      ],
+      [
+        'setStatus',
+        (s: NoteService) => s.setStatus('user-1', 'note-1', 'UNLISTED'),
+      ],
+      ['deleteNote', (s: NoteService) => s.deleteNote('user-1', 'note-1')],
+    ])('%s checks ownership with an id-only select', async (_, run) => {
+      prisma.note.findFirst.mockResolvedValueOnce({ id: 'note-1' });
+      prisma.note.update.mockResolvedValueOnce({ id: 'note-1' });
+
+      await run(service);
+
+      expect(prisma.note.findFirst).toHaveBeenCalledWith(OWNED_NOTE_LOOKUP);
+    });
+
+    it.each([
+      [
+        'setPinned',
+        (s: NoteService) => s.setPinned('intruder', 'note-1', true),
+      ],
+      ['deleteNote', (s: NoteService) => s.deleteNote('intruder', 'note-1')],
+    ])('%s still 404s for a note the caller does not own', async (_, run) => {
+      prisma.note.findFirst.mockResolvedValueOnce(null);
+
+      await expect(run(service)).rejects.toThrow(NotFoundException);
+      expect(prisma.note.update).not.toHaveBeenCalled();
+    });
+
+    it('source-note checks also read collectedFromNoteID and nothing else', async () => {
+      prisma.note.findFirst.mockResolvedValueOnce({
+        id: 'note-1',
+        collectedFromNoteID: null,
+      });
+      prisma.note.update.mockResolvedValueOnce({
+        id: 'note-1',
+        workStatus: 'WORKING',
+      });
+
+      await service.setWorkStatus('user-1', 'note-1', 'WORKING');
+
+      expect(prisma.note.findFirst).toHaveBeenCalledWith({
+        where: OWNED_NOTE_LOOKUP.where,
+        select: { id: true, collectedFromNoteID: true },
+      });
+    });
+
+    it('source-note checks still reject a collected copy', async () => {
+      prisma.note.findFirst.mockResolvedValueOnce({
+        id: 'note-1',
+        collectedFromNoteID: 'source-note',
+      });
+
+      await expect(
+        service.setWorkStatus('user-1', 'note-1', 'WORKING'),
+      ).rejects.toThrow(ForbiddenException);
+      await expect(
+        (async () => {
+          prisma.note.findFirst.mockResolvedValueOnce({
+            id: 'note-1',
+            collectedFromNoteID: 'source-note',
+          });
+          return service.setSourceConversation('user-1', 'note-1', null);
+        })(),
+      ).rejects.toThrow(ForbiddenException);
+      expect(prisma.note.update).not.toHaveBeenCalled();
+    });
+  });
+
   it('toggles note availability for the owner only', async () => {
     prisma.note.findFirst.mockResolvedValueOnce({
       id: 'note-1',

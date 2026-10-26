@@ -25,12 +25,21 @@ import { RedisService } from 'src/redis/redis.service';
  * Runs every ten minutes in bounded batches. Notification / FriendActivity
  * retention is intentionally left out — pruning user-visible history is a
  * product decision, not housekeeping.
+ *
+ * 同一轮还顺带清过期的登录验证单(LoginChallenge)和邮箱验证码
+ * (EmailVerificationCode,过期满一天即删)。
  */
 @Injectable()
 export class RefreshTokenCleanup {
   private static readonly REVOKED_RETENTION_DAYS = 30;
   private static readonly BATCH_SIZE = 1000;
   private static readonly MAX_BATCHES_PER_RUN = 20;
+  /**
+   * 邮箱验证码过期满这么久才删。码 10 分钟过期,verifyCode 只认 (email, purpose)
+   * 的最新一行、发码冷却只看 60 秒内的最新一行;所有码 TTL 相同,过期满一天的行
+   * 比任何还能用的码都旧,删掉不改变这两处判定。留一天余量方便排查投诉。
+   */
+  private static readonly EMAIL_CODE_RETENTION_MS = 24 * 60 * 60 * 1000;
   private readonly logger = new Logger(RefreshTokenCleanup.name);
   private running = false;
 
@@ -163,6 +172,11 @@ export class RefreshTokenCleanup {
       }
       if (challengeCount)
         this.logger.log(`Pruned ${challengeCount} expired login challenges`);
+      const emailCodeCount = await this.pruneExpiredEmailCodes(now, lease);
+      if (emailCodeCount)
+        this.logger.log(
+          `Pruned ${emailCodeCount} expired email verification codes`,
+        );
       if (capped) {
         this.logger.warn({
           event: 'refresh_token_cleanup_capped',
@@ -187,5 +201,57 @@ export class RefreshTokenCleanup {
       // 但要记成失败：不上报的话包装器会把这一轮算成成功，心跳照常前进。
       reportHandledJobFailure();
     }
+  }
+
+  /**
+   * 分批删过期满 EMAIL_CODE_RETENTION_MS 的邮箱验证码,返回删除行数。按 expiresAt
+   * 取批:EmailVerificationCode_expiresAt_idx 同时给出范围与顺序,每批只读 BATCH_SIZE
+   * 个索引项,首次上线时的历史积压也不用排序。失败抛给 sweepOnce 统一上报。
+   */
+  private async pruneExpiredEmailCodes(
+    now: Date,
+    lease: JobLeaseContext,
+  ): Promise<number> {
+    const cutoff = new Date(
+      now.getTime() - RefreshTokenCleanup.EMAIL_CODE_RETENTION_MS,
+    );
+    let deletedCount = 0;
+    for (
+      let batch = 0;
+      batch < RefreshTokenCleanup.MAX_BATCHES_PER_RUN;
+      batch += 1
+    ) {
+      if (!lease.isCurrent()) {
+        reportJobSkipped();
+        break;
+      }
+      const candidates = await this.prisma.emailVerificationCode.findMany({
+        where: { expiresAt: { lt: cutoff } },
+        select: { id: true },
+        orderBy: { expiresAt: 'asc' },
+        take: RefreshTokenCleanup.BATCH_SIZE,
+      });
+      if (candidates.length === 0) break;
+      if (!lease.isCurrent()) {
+        reportJobSkipped();
+        break;
+      }
+      const deleted = await this.prisma.emailVerificationCode.deleteMany({
+        where: {
+          expiresAt: { lt: cutoff },
+          id: { in: candidates.map(({ id }) => id) },
+        },
+      });
+      deletedCount += deleted.count;
+      if (candidates.length < RefreshTokenCleanup.BATCH_SIZE) break;
+      if (batch === RefreshTokenCleanup.MAX_BATCHES_PER_RUN - 1) {
+        this.logger.warn({
+          event: 'email_code_cleanup_capped',
+          deletedCount,
+          nextRunInMinutes: 10,
+        });
+      }
+    }
+    return deletedCount;
   }
 }

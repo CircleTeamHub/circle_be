@@ -7,11 +7,17 @@ describe('RefreshTokenCleanup', () => {
   const findMany = jest.fn();
   const challengeDeleteMany = jest.fn();
   const challengeFindMany = jest.fn();
+  const emailCodeDeleteMany = jest.fn();
+  const emailCodeFindMany = jest.fn();
   const prisma = {
     refreshToken: { findMany, deleteMany },
     loginChallenge: {
       deleteMany: challengeDeleteMany,
       findMany: challengeFindMany,
+    },
+    emailVerificationCode: {
+      deleteMany: emailCodeDeleteMany,
+      findMany: emailCodeFindMany,
     },
   } as never;
   const redis = {
@@ -26,6 +32,8 @@ describe('RefreshTokenCleanup', () => {
     findMany.mockResolvedValue([]);
     challengeDeleteMany.mockResolvedValue({ count: 0 });
     challengeFindMany.mockResolvedValue([]);
+    emailCodeDeleteMany.mockResolvedValue({ count: 0 });
+    emailCodeFindMany.mockResolvedValue([]);
     redis.tryAcquireLease.mockResolvedValue(undefined);
     redis.renewLease.mockResolvedValue(true);
   });
@@ -245,5 +253,77 @@ describe('RefreshTokenCleanup', () => {
         id: { in: ['old'] },
       },
     });
+  });
+
+  // EmailVerificationCode 此前没有任何清理任务,只增不减。码 10 分钟过期、只认
+  // (email, purpose) 的最新一行;过期满一天的行既不能再验证,也早已不是任何
+  // 有效码的「更新的一行」,删掉不改变 verifyCode / 发码冷却的判定。
+  it('prunes email verification codes a day past their expiry in indexed batches', async () => {
+    const now = new Date('2026-10-14T12:00:00.000Z');
+    const cutoff = new Date('2026-10-13T12:00:00.000Z');
+    emailCodeFindMany.mockResolvedValueOnce([
+      { id: 'code-1' },
+      { id: 'code-2' },
+    ]);
+    emailCodeDeleteMany.mockResolvedValueOnce({ count: 2 });
+
+    await cleanup.sweep(now);
+
+    // 按 expiresAt 排序取批:新索引 EmailVerificationCode_expiresAt_idx 同时给出
+    // 范围与顺序,每批只读 1000 个索引项,积压再多也不用排序。
+    expect(emailCodeFindMany).toHaveBeenCalledWith({
+      where: { expiresAt: { lt: cutoff } },
+      select: { id: true },
+      orderBy: { expiresAt: 'asc' },
+      take: 1000,
+    });
+    expect(emailCodeDeleteMany).toHaveBeenCalledWith({
+      where: { expiresAt: { lt: cutoff }, id: { in: ['code-1', 'code-2'] } },
+    });
+    expect(emailCodeFindMany).toHaveBeenCalledTimes(1);
+  });
+
+  it('caps email code deletion at twenty batches per run', async () => {
+    emailCodeFindMany.mockResolvedValue(
+      Array.from({ length: 1000 }, (_, i) => ({ id: `e-${i}` })),
+    );
+    emailCodeDeleteMany.mockResolvedValue({ count: 1000 });
+    const warn = jest.spyOn(Logger.prototype, 'warn').mockImplementation();
+    try {
+      await cleanup.sweep(new Date());
+      expect(emailCodeFindMany).toHaveBeenCalledTimes(20);
+      expect(emailCodeDeleteMany).toHaveBeenCalledTimes(20);
+      expect(warn).toHaveBeenCalledWith(
+        expect.objectContaining({
+          event: 'email_code_cleanup_capped',
+          deletedCount: 20_000,
+        }),
+      );
+    } finally {
+      warn.mockRestore();
+    }
+  });
+
+  it('does not delete selected email codes after the lease is lost', async () => {
+    jest.useFakeTimers();
+    redis.tryAcquireLease.mockResolvedValue('owner');
+    redis.renewLease.mockResolvedValue(false);
+    let finish!: (value: unknown[]) => void;
+    emailCodeFindMany.mockImplementationOnce(
+      () =>
+        new Promise((resolve) => {
+          finish = resolve;
+        }),
+    );
+    const running = cleanup.sweep();
+    try {
+      await jest.advanceTimersByTimeAsync(21_000);
+      finish([{ id: 'old' }]);
+      await running;
+      expect(emailCodeDeleteMany).not.toHaveBeenCalled();
+    } finally {
+      await running;
+      jest.useRealTimers();
+    }
   });
 });

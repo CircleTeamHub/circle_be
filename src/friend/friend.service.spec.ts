@@ -3,7 +3,6 @@ import { ConfigService } from '@nestjs/config';
 import {
   BadRequestException,
   ConflictException,
-  ForbiddenException,
   NotFoundException,
 } from '@nestjs/common';
 import { plainToInstance } from 'class-transformer';
@@ -18,7 +17,10 @@ import { CreditService } from 'src/credit/credit.service';
 import { SendFriendRequestDto } from './dto/friend.dto';
 import { FriendController } from './friend.controller';
 import { FriendService } from './friend.service';
-import { AvatarFrameService } from 'src/avatar-frame/avatar-frame.service';
+import {
+  AvatarFrameService,
+  PUBLIC_APPEARANCE_USER_SELECT,
+} from 'src/avatar-frame/avatar-frame.service';
 
 describe('FriendService', () => {
   let service: FriendService;
@@ -98,6 +100,8 @@ describe('FriendService', () => {
       findUnique: jest.fn(),
       findFirst: jest.fn().mockResolvedValue(null),
     },
+    // 扫名片码加好友:sendRequest 验 token 用。
+    qrToken: { findUnique: jest.fn() },
     $executeRaw: jest.fn(),
     $transaction: jest.fn((operations: any) =>
       typeof operations === 'function'
@@ -131,6 +135,7 @@ describe('FriendService', () => {
   };
   const avatarFrames = {
     resolvePublicAppearances: jest.fn(),
+    resolvePublicAppearancesForUsers: jest.fn(),
   };
   // 举报证据的本站存储前缀:path-style 默认桶 circle → http://10.0.0.195:9000/circle
   const config = {
@@ -160,6 +165,7 @@ describe('FriendService', () => {
     // 默认 addMeByAccount=true —— 与 DEFAULT_PRIVACY_SETTINGS 一致，既有用例
     // 不该因为新增的发现路径校验而改变行为。
     privacySettings.getSettings.mockResolvedValue({
+      allowStrangerMessages: true,
       addMeByAccount: true,
       addMeByPhone: false,
       addMeByQrCode: true,
@@ -173,6 +179,8 @@ describe('FriendService', () => {
     creditService.broadcastCreditProfileChanged.mockResolvedValue(undefined);
     avatarFrames.resolvePublicAppearances.mockReset();
     avatarFrames.resolvePublicAppearances.mockResolvedValue(new Map());
+    avatarFrames.resolvePublicAppearancesForUsers.mockReset();
+    avatarFrames.resolvePublicAppearancesForUsers.mockResolvedValue(new Map());
 
     prisma.$transaction.mockImplementation((operations: any) =>
       typeof operations === 'function'
@@ -210,37 +218,75 @@ describe('FriendService', () => {
     expect(prisma.$transaction).not.toHaveBeenCalled();
   });
 
-  // 好友与好友关系都已经查出来了,不该因为这条**附加**的隐私查询失败就让整个
-  // 列表请求挂掉;退到「都不显示最近在线」是隐私安全的那一侧。
   // 好友列表只下发客户端真正读的列:gender / avatarFrame(旧纯 URL,已被
   // avatarFrameAppearance 取代)/ lastOnline 在 circle-im 里只被 normalizer 透传、
   // 没有页面读取 —— lastOnline 还要为它额外查一次「显示在线时间」隐私开关。
+  // Friend 行只取去重、备注与 friendsSince 读到的五列;会员 / 头像框需要的列并进
+  // 同一次 user 查询,不再由 AvatarFrameService 把这批用户再读一遍。
+  const FRIEND_LIST_COLUMNS = {
+    userID: true,
+    friendID: true,
+    updatedAt: true,
+    remarkA: true,
+    remarkB: true,
+  };
+  const FRIEND_LIST_USER_SELECT = {
+    ...PUBLIC_APPEARANCE_USER_SELECT,
+    id: true,
+    accountId: true,
+    nickname: true,
+    avatarUrl: true,
+  };
+  /** user 查询返回的整行:资料四列 + 会员 / 头像框列(不该漏进响应)。 */
+  const friendUserRow = (id: string, accountId: string, nickname: string) => ({
+    id,
+    accountId,
+    nickname,
+    avatarUrl: null,
+    vipLevel: 3,
+    vipExpiresAt: new Date('2099-01-01T00:00:00.000Z'),
+    selectedAvatarFrameID: null,
+    selectedAvatarFrameExpiresAt: null,
+    selectedAvatarFrame: null,
+  });
+
   it('lists friends with only the client-read profile columns and no presence-privacy lookup', async () => {
     const when = new Date('2026-07-24T07:59:51.066Z');
     prisma.friend.findMany.mockResolvedValue([
       {
-        id: 'friendship-1',
         userID: 'user-1',
         friendID: 'user-2',
-        state: FriendState.ACCEPTED,
         updatedAt: when,
         remarkA: 'bob remark',
         remarkB: null,
       },
     ]);
-    prisma.user.findMany.mockResolvedValue([
-      { id: 'user-2', accountId: 'bob02', nickname: 'Bob', avatarUrl: null },
-    ]);
-    avatarFrames.resolvePublicAppearances.mockResolvedValue(new Map());
+    const bob = friendUserRow('user-2', 'bob02', 'Bob');
+    prisma.user.findMany.mockResolvedValue([bob]);
 
     const friends = await service.listFriends('user-1');
 
+    expect(prisma.friend.findMany).toHaveBeenCalledWith({
+      where: {
+        OR: [{ userID: 'user-1' }, { friendID: 'user-1' }],
+        state: FriendState.ACCEPTED,
+      },
+      select: FRIEND_LIST_COLUMNS,
+      orderBy: { updatedAt: 'desc' },
+      take: 5_000,
+    });
+    expect(prisma.user.findMany).toHaveBeenCalledTimes(1);
     expect(prisma.user.findMany).toHaveBeenCalledWith({
       where: { id: { in: ['user-2'] }, status: 'ACTIVE' },
-      select: { id: true, accountId: true, nickname: true, avatarUrl: true },
+      select: FRIEND_LIST_USER_SELECT,
     });
+    expect(avatarFrames.resolvePublicAppearances).not.toHaveBeenCalled();
+    expect(avatarFrames.resolvePublicAppearancesForUsers).toHaveBeenCalledWith([
+      bob,
+    ]);
     expect(privacySettings.getSettingsForUsers).not.toHaveBeenCalled();
-    expect(friends).toEqual([
+    // 输出 DTO 与改动前逐字段相同:会员 / 头像框原始列不外泄。
+    expect(friends).toStrictEqual([
       {
         id: 'user-2',
         accountId: 'bob02',
@@ -271,33 +317,23 @@ describe('FriendService', () => {
         },
       },
     ]);
-    prisma.user.findMany.mockResolvedValue([
-      { id: 'user-2', accountId: 'bob02', nickname: 'Bob', avatarUrl: null },
-    ]);
-    avatarFrames.resolvePublicAppearances.mockResolvedValue(new Map());
+    const bob = friendUserRow('user-2', 'bob02', 'Bob');
+    prisma.user.findMany.mockResolvedValue([bob]);
 
     const friends = await service.listFriendsByTag('user-1', 'tag-1');
 
     expect(prisma.friendTagOnFriend.findMany).toHaveBeenCalledWith({
       where: { ownerID: 'user-1', tagID: 'tag-1' },
-      select: {
-        friendship: {
-          select: {
-            userID: true,
-            friendID: true,
-            updatedAt: true,
-            remarkA: true,
-            remarkB: true,
-          },
-        },
-      },
+      select: { friendship: { select: FRIEND_LIST_COLUMNS } },
     });
+    expect(prisma.user.findMany).toHaveBeenCalledTimes(1);
     expect(prisma.user.findMany).toHaveBeenCalledWith({
       where: { id: { in: ['user-2'] }, status: 'ACTIVE' },
-      select: { id: true, accountId: true, nickname: true, avatarUrl: true },
+      select: FRIEND_LIST_USER_SELECT,
     });
+    expect(avatarFrames.resolvePublicAppearances).not.toHaveBeenCalled();
     expect(privacySettings.getSettingsForUsers).not.toHaveBeenCalled();
-    expect(friends).toEqual([
+    expect(friends).toStrictEqual([
       {
         id: 'user-2',
         accountId: 'bob02',
@@ -314,35 +350,26 @@ describe('FriendService', () => {
   it('deduplicates accepted friendship rows by friend user in the friend list', async () => {
     const newer = new Date('2026-07-24T07:59:51.066Z');
     const older = new Date('2026-06-26T08:06:52.906Z');
+    // 库里按 updatedAt 降序给出(listFriends 的 orderBy)。
     prisma.friend.findMany.mockResolvedValue([
       {
-        id: 'friendship-new',
         userID: 'user-1',
         friendID: 'user-2',
-        state: FriendState.ACCEPTED,
         updatedAt: newer,
         remarkA: 'new remark',
         remarkB: null,
       },
       {
-        id: 'friendship-old',
         userID: 'user-1',
         friendID: 'user-2',
-        state: FriendState.ACCEPTED,
         updatedAt: older,
         remarkA: 'old remark',
         remarkB: null,
       },
     ]);
-    prisma.user.findMany.mockResolvedValue([
-      {
-        id: 'user-2',
-        accountId: 'bob02',
-        nickname: 'Bob',
-        avatarUrl: null,
-      },
-    ]);
-    avatarFrames.resolvePublicAppearances.mockResolvedValue(
+    const bob = friendUserRow('user-2', 'bob02', 'Bob');
+    prisma.user.findMany.mockResolvedValue([bob]);
+    avatarFrames.resolvePublicAppearancesForUsers.mockResolvedValue(
       new Map([
         [
           'user-2',
@@ -361,29 +388,117 @@ describe('FriendService', () => {
 
     const friends = await service.listFriends('user-1');
 
-    expect(friends).toEqual([
-      expect.objectContaining({
+    expect(friends).toStrictEqual([
+      {
         id: 'user-2',
         accountId: 'bob02',
-        friendsSince: newer,
-        remark: 'new remark',
+        nickname: 'Bob',
+        avatarUrl: null,
         avatarFrameAppearance: {
           id: 'frame-1',
           key: 'admin-gift',
           name: 'Gift frame',
           imageUrl: null,
         },
-      }),
+        friendsSince: newer,
+        remark: 'new remark',
+      },
     ]);
-    expect(avatarFrames.resolvePublicAppearances).toHaveBeenCalledTimes(1);
-    expect(avatarFrames.resolvePublicAppearances).toHaveBeenCalledWith([
-      'user-2',
+    expect(avatarFrames.resolvePublicAppearancesForUsers).toHaveBeenCalledTimes(
+      1,
+    );
+    expect(avatarFrames.resolvePublicAppearancesForUsers).toHaveBeenCalledWith([
+      bob,
     ]);
     expect(prisma.user.findMany).toHaveBeenCalledWith(
       expect.objectContaining({
         where: { id: { in: ['user-2'] }, status: 'ACTIVE' },
       }),
     );
+  });
+
+  // 排序只做一次:listFriends 用库里的 updatedAt 降序(Prisma 带 take 时本来就要排),
+  // 去重保持首次出现的顺序;标签列表没有库内排序,由 JS 排。两条路径输出都按
+  // friendsSince 降序,且不受 user 查询返回顺序影响。
+  it('keeps the friend list in friendsSince-desc order with a single sort', async () => {
+    const t = (iso: string) => new Date(iso);
+    prisma.friend.findMany.mockResolvedValue([
+      {
+        userID: 'user-3',
+        friendID: 'user-1',
+        updatedAt: t('2026-09-03T00:00:00.000Z'),
+        remarkA: null,
+        remarkB: 'carol',
+      },
+      {
+        userID: 'user-1',
+        friendID: 'user-2',
+        updatedAt: t('2026-09-02T00:00:00.000Z'),
+        remarkA: 'bob',
+        remarkB: null,
+      },
+      {
+        userID: 'user-1',
+        friendID: 'user-3',
+        updatedAt: t('2026-09-01T12:00:00.000Z'),
+        remarkA: 'carol-old',
+        remarkB: null,
+      },
+      {
+        userID: 'user-4',
+        friendID: 'user-1',
+        updatedAt: t('2026-09-01T00:00:00.000Z'),
+        remarkA: null,
+        remarkB: 'dave',
+      },
+    ]);
+    prisma.user.findMany.mockResolvedValue([
+      friendUserRow('user-4', 'dave04', 'Dave'),
+      friendUserRow('user-2', 'bob02', 'Bob'),
+      friendUserRow('user-3', 'carol03', 'Carol'),
+    ]);
+
+    const friends = await service.listFriends('user-1');
+
+    expect(friends.map((f) => [f.id, f.remark])).toEqual([
+      ['user-3', 'carol'],
+      ['user-2', 'bob'],
+      ['user-4', 'dave'],
+    ]);
+  });
+
+  it('sorts the tag list by friendsSince desc even though the links come unordered', async () => {
+    const t = (iso: string) => new Date(iso);
+    prisma.friendTag.findUnique.mockResolvedValue({
+      id: 'tag-1',
+      ownerID: 'user-1',
+    });
+    prisma.friendTagOnFriend.findMany.mockResolvedValue(
+      [
+        ['user-2', '2026-09-01T00:00:00.000Z', 'bob-old'],
+        ['user-3', '2026-09-03T00:00:00.000Z', 'carol'],
+        ['user-2', '2026-09-02T00:00:00.000Z', 'bob'],
+      ].map(([friendID, updatedAt, remarkA]) => ({
+        friendship: {
+          userID: 'user-1',
+          friendID,
+          updatedAt: t(updatedAt),
+          remarkA,
+          remarkB: null,
+        },
+      })),
+    );
+    prisma.user.findMany.mockResolvedValue([
+      friendUserRow('user-2', 'bob02', 'Bob'),
+      friendUserRow('user-3', 'carol03', 'Carol'),
+    ]);
+
+    const friends = await service.listFriendsByTag('user-1', 'tag-1');
+
+    expect(friends.map((f) => [f.id, f.remark])).toEqual([
+      ['user-3', 'carol'],
+      ['user-2', 'bob'],
+    ]);
   });
 
   it('refuses a request routed through a group that forbids member friend requests', async () => {
@@ -829,14 +944,93 @@ describe('FriendService', () => {
     });
     prisma.block.findFirst.mockResolvedValue(null);
     prisma.friend.count.mockResolvedValue(0);
-    privacySettings.canReceiveStrangerMessage.mockResolvedValue(false);
+    privacySettings.getSettings.mockResolvedValue({
+      allowStrangerMessages: false,
+      addMeByAccount: true,
+      addMeByPhone: false,
+      addMeByQrCode: true,
+      addMeByGroup: true,
+    });
 
     await expect(
       service.sendRequest('user-1', 'user-2', 'hello'),
-    ).rejects.toThrow(ForbiddenException);
+    ).rejects.toMatchObject({
+      response: expect.objectContaining({
+        errorCode: FriendErrorCode.StrangerMsgNotAllowed,
+      }),
+    });
 
     expect(prisma.friend.create).not.toHaveBeenCalled();
     expect(prisma.friendActivity.createMany).not.toHaveBeenCalled();
+  });
+
+  // 陌生人消息、名片码、发现路径三处判定读的是同一行隐私设置:一次请求只读一次。
+  it('reads the target privacy settings once per friend request', async () => {
+    prisma.user.findUnique.mockResolvedValue({
+      id: 'user-2',
+      status: 'ACTIVE',
+      role: 'USER',
+    });
+    prisma.block.findFirst.mockResolvedValue(null);
+    prisma.friend.count.mockResolvedValue(0);
+    prisma.friend.findFirst.mockResolvedValue(null);
+    prisma.friend.create.mockResolvedValue({ id: 'request-1' });
+    // 码是真的,但对方关了「可通过名片码添加」—— 走回陌生人消息 + 发现路径两道判定。
+    prisma.qrToken.findUnique.mockResolvedValue({
+      type: 'USER',
+      targetID: 'user-2',
+      revokedAt: null,
+      expiresAt: null,
+    });
+    privacySettings.getSettings.mockResolvedValue({
+      allowStrangerMessages: true,
+      addMeByAccount: true,
+      addMeByPhone: false,
+      addMeByQrCode: false,
+      addMeByGroup: false,
+    });
+
+    await service.sendRequest('user-1', 'user-2', 'hello', undefined, [], {
+      qrToken: 'qr-1',
+    });
+
+    expect(prisma.friend.create).toHaveBeenCalled();
+    expect(privacySettings.getSettings).toHaveBeenCalledTimes(1);
+    expect(privacySettings.getSettings).toHaveBeenCalledWith('user-2');
+    expect(privacySettings.canReceiveStrangerMessage).not.toHaveBeenCalled();
+  });
+
+  it('lets a verified QR code through when the target keeps the QR door open, reading settings once', async () => {
+    prisma.user.findUnique.mockResolvedValue({
+      id: 'user-2',
+      status: 'ACTIVE',
+      role: 'USER',
+    });
+    prisma.block.findFirst.mockResolvedValue(null);
+    prisma.friend.count.mockResolvedValue(0);
+    prisma.friend.findFirst.mockResolvedValue(null);
+    prisma.friend.create.mockResolvedValue({ id: 'request-1' });
+    prisma.qrToken.findUnique.mockResolvedValue({
+      type: 'USER',
+      targetID: 'user-2',
+      revokedAt: null,
+      expiresAt: null,
+    });
+    // 陌生人消息与其它发现路径都关着:递码本身就是邀请。
+    privacySettings.getSettings.mockResolvedValue({
+      allowStrangerMessages: false,
+      addMeByAccount: false,
+      addMeByPhone: false,
+      addMeByQrCode: true,
+      addMeByGroup: false,
+    });
+
+    await service.sendRequest('user-1', 'user-2', 'hello', undefined, [], {
+      qrToken: 'qr-1',
+    });
+
+    expect(prisma.friend.create).toHaveBeenCalled();
+    expect(privacySettings.getSettings).toHaveBeenCalledTimes(1);
   });
 
   // addMeByAccount / Phone / QrCode / Group 四个开关此前零 enforcement：库里有、
@@ -858,6 +1052,7 @@ describe('FriendService', () => {
     it('rejects the request when every discovery path the target allows is impossible', async () => {
       mockTarget();
       privacySettings.getSettings.mockResolvedValue({
+        allowStrangerMessages: true,
         addMeByAccount: false,
         addMeByPhone: true,
         addMeByQrCode: true,
@@ -880,6 +1075,7 @@ describe('FriendService', () => {
       prisma.friend.findFirst.mockResolvedValue(null);
       prisma.friend.create.mockResolvedValue({ id: 'request-1' });
       privacySettings.getSettings.mockResolvedValue({
+        allowStrangerMessages: true,
         addMeByAccount: true,
         addMeByPhone: false,
         addMeByQrCode: false,
@@ -897,6 +1093,7 @@ describe('FriendService', () => {
       prisma.friend.findFirst.mockResolvedValue(null);
       prisma.friend.create.mockResolvedValue({ id: 'request-1' });
       privacySettings.getSettings.mockResolvedValue({
+        allowStrangerMessages: true,
         addMeByAccount: false,
         addMeByPhone: false,
         addMeByQrCode: false,
@@ -912,6 +1109,7 @@ describe('FriendService', () => {
     it('rejects a group-only target when the two share no circle', async () => {
       mockTarget();
       privacySettings.getSettings.mockResolvedValue({
+        allowStrangerMessages: true,
         addMeByAccount: false,
         addMeByPhone: false,
         addMeByQrCode: false,
@@ -1842,20 +2040,19 @@ describe('FriendService', () => {
       state: FriendState.PENDING,
       message: 'hello',
     });
-    prisma.friend.update.mockResolvedValue({
-      id: 'request-1',
-      userID: 'user-1',
-      friendID: 'user-2',
-      state: 'WITHDRAWN',
-      message: 'hello',
-    });
 
     await service.cancelRequest('user-1', 'request-1');
 
-    expect(prisma.friend.update).toHaveBeenCalledWith({
-      where: { id: 'request-1' },
-      data: { state: 'WITHDRAWN' },
+    expect(prisma.friend.updateMany).toHaveBeenCalledWith({
+      where: {
+        id: 'request-1',
+        userID: 'user-1',
+        state: FriendState.PENDING,
+      },
+      data: { state: FriendState.WITHDRAWN },
     });
+    expect(prisma.friend.updateMany).toHaveBeenCalledTimes(1);
+    expect(prisma.friend.update).not.toHaveBeenCalled();
     expect(prisma.friendActivity.createMany).toHaveBeenCalledWith({
       data: [
         expect.objectContaining({
@@ -1891,13 +2088,6 @@ describe('FriendService', () => {
           message: 'hello',
         }),
         updateMany: jest.fn().mockResolvedValue({ count: 1 }),
-        update: jest.fn().mockResolvedValue({
-          id: 'request-1',
-          userID: 'user-1',
-          friendID: 'user-2',
-          state: FriendState.WITHDRAWN,
-          message: 'hello',
-        }),
       },
       pendingFriendTagOnRequest: {
         deleteMany: jest.fn(),
@@ -1914,10 +2104,15 @@ describe('FriendService', () => {
       'activity failed',
     );
 
-    expect(tx.friend.update).toHaveBeenCalledWith({
-      where: { id: 'request-1' },
+    expect(tx.friend.updateMany).toHaveBeenCalledWith({
+      where: {
+        id: 'request-1',
+        userID: 'user-1',
+        state: FriendState.PENDING,
+      },
       data: { state: FriendState.WITHDRAWN },
     });
+    expect(tx.friend.updateMany).toHaveBeenCalledTimes(1);
     expect(tx.friendActivity.createMany).toHaveBeenCalled();
     expect(prisma.friendActivity.createMany).not.toHaveBeenCalled();
   });
@@ -1944,28 +2139,26 @@ describe('FriendService', () => {
     prisma.pendingFriendTagOnRequest.findMany.mockResolvedValue([
       { ownerID: 'user-1', requestID: 'request-1', tagID: 'tag-1' },
     ]);
-    prisma.friend.update.mockResolvedValue({
-      id: 'request-1',
-      userID: 'user-1',
-      friendID: 'user-2',
-      state: FriendState.ACCEPTED,
-      message: 'hello',
-      pendingRemarkBySender: 'met at school',
-      remarkA: 'met at school',
-    });
     notificationService.createFriendRequestNotification.mockResolvedValue(
       notification,
     );
 
     await service.handleRequest('user-2', 'request-1', FriendState.ACCEPTED);
 
-    expect(prisma.friend.update).toHaveBeenCalledWith({
-      where: { id: 'request-1' },
+    expect(prisma.friend.updateMany).toHaveBeenCalledTimes(1);
+    expect(prisma.friend.updateMany).toHaveBeenCalledWith({
+      where: {
+        id: 'request-1',
+        friendID: 'user-2',
+        state: FriendState.PENDING,
+      },
       data: expect.objectContaining({
         state: FriendState.ACCEPTED,
         remarkA: 'met at school',
       }),
     });
+    // 守卫写一次就够:同一行不再在同一事务里用 update 把同样的数据再写一遍。
+    expect(prisma.friend.update).not.toHaveBeenCalled();
     expect(prisma.friendTagOnFriend.createMany).toHaveBeenCalledWith({
       data: [
         {
@@ -2009,12 +2202,6 @@ describe('FriendService', () => {
     prisma.friend.count.mockResolvedValue(0);
     prisma.friendTag.findMany.mockResolvedValue([]);
     prisma.pendingFriendTagOnRequest.findMany.mockResolvedValue([]);
-    prisma.friend.update.mockResolvedValue({
-      id: 'request-1',
-      userID: 'user-1',
-      friendID: 'user-2',
-      state: FriendState.ACCEPTED,
-    });
     notificationService.createFriendRequestNotification.mockResolvedValue({
       id: 'notification-1',
       type: NotificationType.FRIEND_REQUEST_ACCEPTED,
@@ -2022,8 +2209,13 @@ describe('FriendService', () => {
 
     await service.handleRequest('user-2', 'request-1', FriendState.ACCEPTED);
 
-    expect(prisma.friend.update).toHaveBeenCalledWith({
-      where: { id: 'request-1' },
+    expect(prisma.friend.updateMany).toHaveBeenCalledTimes(1);
+    expect(prisma.friend.updateMany).toHaveBeenCalledWith({
+      where: {
+        id: 'request-1',
+        friendID: 'user-2',
+        state: FriendState.PENDING,
+      },
       data: expect.objectContaining({
         state: FriendState.ACCEPTED,
         remarkA: 'met at school',
@@ -2045,13 +2237,6 @@ describe('FriendService', () => {
     prisma.user.findUnique.mockResolvedValue({ status: 'ACTIVE' });
     prisma.friend.count.mockResolvedValue(0);
     prisma.pendingFriendTagOnRequest.findMany.mockResolvedValue([]);
-    prisma.friend.update.mockResolvedValue({
-      id: 'request-1',
-      userID: 'user-1',
-      friendID: 'user-2',
-      state: FriendState.ACCEPTED,
-      message: 'hello',
-    });
     notificationService.createFriendRequestNotification.mockRejectedValue(
       new Error('notification unavailable'),
     );
@@ -2113,13 +2298,6 @@ describe('FriendService', () => {
     });
     prisma.friend.count.mockResolvedValue(0);
     prisma.pendingFriendTagOnRequest.findMany.mockResolvedValue([]);
-    prisma.friend.update.mockResolvedValue({
-      id: 'request-1',
-      userID: 'user-1',
-      friendID: 'user-2',
-      state: FriendState.ACCEPTED,
-      message: '你好',
-    });
     prisma.friendRequestMessage.findMany.mockResolvedValue([
       { senderId: 'user-1', content: '你好' },
       { senderId: 'user-2', content: '你也好' },
@@ -2170,13 +2348,6 @@ describe('FriendService', () => {
     });
     prisma.friend.count.mockResolvedValue(0);
     prisma.pendingFriendTagOnRequest.findMany.mockResolvedValue([]);
-    prisma.friend.update.mockResolvedValue({
-      id: 'request-1',
-      userID: 'user-1',
-      friendID: 'user-2',
-      state: FriendState.ACCEPTED,
-      message: '',
-    });
 
     await expect(
       service.handleRequest('user-2', 'request-1', FriendState.ACCEPTED),
@@ -2226,15 +2397,6 @@ describe('FriendService', () => {
           pendingRemarkBySender: 'met at school',
         }),
         updateMany: jest.fn().mockResolvedValue({ count: 1 }),
-        update: jest.fn().mockResolvedValue({
-          id: 'request-1',
-          userID: 'user-1',
-          friendID: 'user-2',
-          state: FriendState.ACCEPTED,
-          message: 'hello',
-          pendingRemarkBySender: 'met at school',
-          remarkA: 'met at school',
-        }),
       },
       friendTag: {
         findMany: jest.fn().mockResolvedValue([{ id: 'tag-1' }]),
@@ -2262,8 +2424,13 @@ describe('FriendService', () => {
       service.handleRequest('user-2', 'request-1', FriendState.ACCEPTED),
     ).rejects.toThrow('activity failed');
 
-    expect(tx.friend.update).toHaveBeenCalledWith({
-      where: { id: 'request-1' },
+    expect(tx.friend.updateMany).toHaveBeenCalledTimes(1);
+    expect(tx.friend.updateMany).toHaveBeenCalledWith({
+      where: {
+        id: 'request-1',
+        friendID: 'user-2',
+        state: FriendState.PENDING,
+      },
       data: expect.objectContaining({
         state: FriendState.ACCEPTED,
         remarkA: 'met at school',
@@ -2308,13 +2475,6 @@ describe('FriendService', () => {
           message: 'hello',
         }),
         updateMany: jest.fn().mockResolvedValue({ count: 1 }),
-        update: jest.fn().mockResolvedValue({
-          id: 'request-1',
-          userID: 'user-1',
-          friendID: 'user-2',
-          state: FriendState.REJECTED,
-          message: 'hello',
-        }),
       },
       pendingFriendTagOnRequest: {
         deleteMany: jest.fn(),
@@ -2331,8 +2491,13 @@ describe('FriendService', () => {
       service.handleRequest('user-2', 'request-1', FriendState.REJECTED),
     ).rejects.toThrow('activity failed');
 
-    expect(tx.friend.update).toHaveBeenCalledWith({
-      where: { id: 'request-1' },
+    expect(tx.friend.updateMany).toHaveBeenCalledTimes(1);
+    expect(tx.friend.updateMany).toHaveBeenCalledWith({
+      where: {
+        id: 'request-1',
+        friendID: 'user-2',
+        state: FriendState.PENDING,
+      },
       data: { state: FriendState.REJECTED },
     });
     expect(tx.friendActivity.createMany).toHaveBeenCalled();
@@ -2352,22 +2517,19 @@ describe('FriendService', () => {
       message: 'hello',
       pendingRemarkBySender: 'met at school',
     });
-    prisma.friend.update.mockResolvedValue({
-      id: 'request-1',
-      userID: 'user-1',
-      friendID: 'user-2',
-      state: FriendState.REJECTED,
-      message: 'hello',
-      pendingRemarkBySender: 'met at school',
-    });
     notificationService.createFriendRequestNotification.mockResolvedValue(
       notification,
     );
 
     await service.handleRequest('user-2', 'request-1', FriendState.REJECTED);
 
-    expect(prisma.friend.update).toHaveBeenCalledWith({
-      where: { id: 'request-1' },
+    expect(prisma.friend.updateMany).toHaveBeenCalledTimes(1);
+    expect(prisma.friend.updateMany).toHaveBeenCalledWith({
+      where: {
+        id: 'request-1',
+        friendID: 'user-2',
+        state: FriendState.PENDING,
+      },
       data: { state: FriendState.REJECTED },
     });
     expect(prisma.friendTagOnFriend.createMany).not.toHaveBeenCalled();

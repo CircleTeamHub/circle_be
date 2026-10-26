@@ -511,6 +511,27 @@ describe('ChatBurnSweeperService', () => {
     expect(prisma.chatMessage.findMany).not.toHaveBeenCalled();
   });
 
+  // 每分钟这一次扫描靠 ChatMessage_burn_due_idx (burnExpiresAt) WHERE deleted = false
+  // AND burnExpiresAt IS NOT NULL 按范围取到期消息(迁移 20261026000310,真库见
+  // test/postgres/chat-burn-due.pg-spec.ts)。谁改了这里的过滤条件,部分索引会静默
+  // 失效,别的测试没有任何信号。
+  it('finds due conversations with the filter the burn-due index covers', async () => {
+    prisma.chatConversation.findMany.mockResolvedValue([]);
+
+    await service.sweep();
+
+    expect(prisma.chatConversation.findMany).toHaveBeenCalledWith({
+      where: {
+        messages: {
+          some: { deleted: false, burnExpiresAt: { lte: expect.any(Date) } },
+        },
+      },
+      select: { id: true },
+      orderBy: { id: 'asc' },
+      take: 200,
+    });
+  });
+
   it('queries only expired author-stamped messages; unstamped peer messages are excluded', async () => {
     const burnStartedAt = new Date('2026-09-14T10:00:00.000Z');
     prisma.chatConversation.findMany.mockResolvedValue([

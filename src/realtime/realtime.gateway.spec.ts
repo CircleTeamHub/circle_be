@@ -93,6 +93,8 @@ function createPrismaStub() {
     friendActivity: { count: jest.fn().mockResolvedValue(0) },
     circlePostSignup: { count: jest.fn().mockResolvedValue(0) },
     notification: { count: jest.fn().mockResolvedValue(0) },
+    // 徽标快照里通知四个域来自一条 GROUP BY type（loadUnreadNotificationsByDomain）。
+    $queryRaw: jest.fn().mockResolvedValue([]),
     user: { findUnique: jest.fn().mockResolvedValue(null) },
     userDisplayIcon: { findFirst: jest.fn().mockResolvedValue(null) },
   };

@@ -4,7 +4,10 @@ import {
   NotFoundException,
 } from '@nestjs/common';
 import { AvatarFrameErrorCode } from 'src/common/app-error-codes';
-import { AvatarFrameService } from './avatar-frame.service';
+import {
+  AvatarFrameService,
+  PUBLIC_APPEARANCE_USER_SELECT,
+} from './avatar-frame.service';
 
 describe('AvatarFrameService', () => {
   const now = new Date('2027-07-29T12:00:00.000Z');
@@ -178,11 +181,97 @@ describe('AvatarFrameService', () => {
         ]),
       );
       expect(prisma.user.findMany).toHaveBeenCalledTimes(1);
-      expect(prisma.user.findMany).toHaveBeenCalledWith(
-        expect.objectContaining({
-          where: { id: { in: ['user-active', 'user-expired'] } },
-        }),
+      expect(prisma.user.findMany).toHaveBeenCalledWith({
+        where: { id: { in: ['user-active', 'user-expired'] } },
+        select: PUBLIC_APPEARANCE_USER_SELECT,
+      });
+    });
+
+    // 好友列表等调用方自己已经要查同一批用户:把 PUBLIC_APPEARANCE_USER_SELECT
+    // 并进那次查询、再把行交给这里,同一批用户就不用再读第二遍。
+    it('resolves caller-loaded user rows without reading the users again', async () => {
+      const result = await service.resolvePublicAppearancesForUsers(
+        [
+          {
+            ...user({
+              id: 'user-active',
+              vipLevel: 3,
+              vipExpiresAt: new Date('2027-08-01T00:00:00.000Z'),
+              selectedAvatarFrameID: diamondId,
+              selectedAvatarFrameExpiresAt: new Date(
+                '2027-08-01T00:00:00.000Z',
+              ),
+            }),
+            selectedAvatarFrame: asset(diamondId, 3),
+          },
+          {
+            ...user({
+              id: 'user-expired',
+              vipLevel: 3,
+              vipExpiresAt: new Date('2027-07-29T11:59:59.999Z'),
+            }),
+            selectedAvatarFrame: null,
+          },
+        ],
+        now,
       );
+
+      expect(prisma.user.findMany).not.toHaveBeenCalled();
+      expect(result).toEqual(
+        new Map([
+          [
+            'user-active',
+            {
+              vipLevel: 3,
+              avatarFrame: {
+                id: diamondId,
+                key: 'membership-diamond',
+                name: 'Diamond frame',
+                imageUrl: null,
+              },
+            },
+          ],
+          ['user-expired', { vipLevel: 0, avatarFrame: null }],
+        ]),
+      );
+    });
+
+    it('still checks admin grants for caller-loaded rows', async () => {
+      prisma.userAvatarFrameGrant.findMany.mockResolvedValue([
+        {
+          id: 'grant-1',
+          userID: 'user-granted',
+          frameID: superId,
+          expiresAt: null,
+          revokedAt: null,
+        },
+      ]);
+
+      const result = await service.resolvePublicAppearancesForUsers(
+        [
+          {
+            ...user({
+              id: 'user-granted',
+              selectedAvatarFrameID: superId,
+            }),
+            selectedAvatarFrame: asset(superId, null),
+          },
+        ],
+        now,
+      );
+
+      expect(prisma.user.findMany).not.toHaveBeenCalled();
+      expect(prisma.userAvatarFrameGrant.findMany).toHaveBeenCalledTimes(1);
+      expect(result.get('user-granted')?.avatarFrame).toMatchObject({
+        id: superId,
+      });
+    });
+
+    it('short-circuits an empty caller-loaded batch', async () => {
+      await expect(
+        service.resolvePublicAppearancesForUsers([], now),
+      ).resolves.toEqual(new Map());
+      expect(prisma.userAvatarFrameGrant.findMany).not.toHaveBeenCalled();
     });
 
     it('short-circuits an empty appearance batch', async () => {

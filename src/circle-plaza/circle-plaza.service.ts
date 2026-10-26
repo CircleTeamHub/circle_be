@@ -593,17 +593,17 @@ export class CirclePlazaService {
 
     // Keyset fetches one extra row to decide `hasMore` without a count();
     // offset still returns an accurate `total` for the legacy page-number UI.
-    const [rows, total] = await Promise.all([
-      this.prisma.circlePost.findMany({
-        where,
-        include: PLAZA_POST_INCLUDE,
-        orderBy: [{ createdAt: 'desc' }, { id: 'desc' }],
-        ...(useKeyset ? { take: limit + 1 } : { skip, take: limit }),
-      }),
-      useKeyset
-        ? Promise.resolve<number | null>(null)
-        : this.prisma.circlePost.count({ where }),
-    ]);
+    // 两条查询串行：并发的话每个 offset 请求同时占两条池连接，而 count 要把可见
+    // 范围内的帖子数一遍，是慢的那条 —— 高峰期整池会被这一个接口吃掉一半。
+    const rows = await this.prisma.circlePost.findMany({
+      where,
+      include: PLAZA_POST_INCLUDE,
+      orderBy: [{ createdAt: 'desc' }, { id: 'desc' }],
+      ...(useKeyset ? { take: limit + 1 } : { skip, take: limit }),
+    });
+    const total: number | null = useKeyset
+      ? null
+      : await this.prisma.circlePost.count({ where });
 
     const hasMore = useKeyset
       ? rows.length > limit

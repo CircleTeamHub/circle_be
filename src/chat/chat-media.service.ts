@@ -274,13 +274,9 @@ export class ChatMediaService implements OnModuleDestroy {
       throw new BadRequestException('Media deletion is already scheduled');
   }
 
-  /** All senders use the same key locks, so a new reference cannot race this check. */
-  async unreferencedArchiveMedia(
-    tx: Prisma.TransactionClient,
-    keys: string[],
-    archiveId: string,
-  ): Promise<string[]> {
-    const owned = [
+  /** 本仓库自己持有、可以物理删除的附件 key(去重、排序 = 加锁顺序)。 */
+  private ownedArchiveKeys(keys: string[]): string[] {
+    return [
       ...new Set(
         keys.filter(
           (key) =>
@@ -289,9 +285,40 @@ export class ChatMediaService implements OnModuleDestroy {
         ),
       ),
     ].sort();
-    if (!owned.length) return [];
+  }
+
+  private async lockOwnedArchiveKeys(
+    tx: Prisma.TransactionClient,
+    owned: string[],
+  ): Promise<void> {
     for (const key of owned)
       await tx.$queryRaw`SELECT pg_advisory_xact_lock(hashtext(${key}))::text`;
+  }
+
+  /**
+   * 一个事务里清理多条归档之前,按全局一致的顺序一次拿齐整批 key 的 advisory 锁:
+   * 先自有附件 key(排序),再笔记导入 key(排序) —— 与焚毁清扫一个事务里
+   * queueDeletions → releaseNoteImportReferences 的顺序一致。逐行调用
+   * unreferencedArchiveMedia / releaseNoteImportReferences 时每行各自加锁,跨行的
+   * 先后不再有序,和别的事务交叉就可能死锁;advisory 锁可重入,之后逐行再拿是空操作。
+   */
+  async lockArchiveKeys(
+    tx: Prisma.TransactionClient,
+    keys: string[],
+  ): Promise<void> {
+    await this.lockOwnedArchiveKeys(tx, this.ownedArchiveKeys(keys));
+    await this.lockNoteImportKeys(tx, keys);
+  }
+
+  /** All senders use the same key locks, so a new reference cannot race this check. */
+  async unreferencedArchiveMedia(
+    tx: Prisma.TransactionClient,
+    keys: string[],
+    archiveId: string,
+  ): Promise<string[]> {
+    const owned = this.ownedArchiveKeys(keys);
+    if (!owned.length) return [];
+    await this.lockOwnedArchiveKeys(tx, owned);
     const primaryTypes = Object.keys(CHAT_MEDIA_KEY_FIELDS).filter((type) =>
       CHAT_MEDIA_KEY_FIELDS[type].some((field) => field.key === 'key'),
     );

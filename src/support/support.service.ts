@@ -8,6 +8,7 @@ import { AdminUserAuditService } from 'src/admin-user/admin-user-audit.service';
 import { createHash } from 'node:crypto';
 import { Prisma } from 'src/generated/prisma';
 import { PrismaService } from 'src/prisma/prisma.service';
+import { TtlCache } from 'src/utils/ttl-cache';
 
 // 覆盖式写入的串行化锁。整表只有一份配置,所以固定一个 key 就够。
 const SUPPORT_AGENTS_LOCK_KEY = 'support-agents-replace';
@@ -121,8 +122,20 @@ export function supportAgentsRevision(
   return createHash('sha256').update(canonical).digest('hex').slice(0, 32);
 }
 
+/**
+ * GET /support/config 每次 App 启动都拉、所有人结果相同,进程内缓存 30 秒。
+ * 本进程的 replaceAgents 提交后立即清缓存;别的实例的写入、客服账号被封/改昵称
+ * 最多晚 30 秒可见。
+ */
+export const SUPPORT_CONFIG_CACHE_TTL_MS = 30_000;
+
 @Injectable()
 export class SupportService {
+  private readonly configCache = new TtlCache<SupportConfigDto>({
+    ttlMs: SUPPORT_CONFIG_CACHE_TTL_MS,
+    maxEntries: 1,
+  });
+
   constructor(
     private readonly prisma: PrismaService,
     private readonly audit: AdminUserAuditService,
@@ -135,7 +148,11 @@ export class SupportService {
    * getOrCreateDirectConversation 以 PeerNotFound 拒绝,又回到了 imAdmin 时代
    * 「渲染成功、点击失败」的老毛病。
    */
-  async getConfig(): Promise<SupportConfigDto> {
+  getConfig(): Promise<SupportConfigDto> {
+    return this.configCache.getOrLoad('config', () => this.loadConfig());
+  }
+
+  private async loadConfig(): Promise<SupportConfigDto> {
     const rows = await this.prisma.supportAgent.findMany({
       where: { enabled: true, user: { status: 'ACTIVE' } },
       orderBy: [
@@ -206,7 +223,7 @@ export class SupportService {
 
     const desired = normalize(input);
 
-    await this.prisma.$transaction(
+    const replacing = this.prisma.$transaction(
       async (tx) => {
         // 两个管理员同时提交时,默认隔离级别下双方都会读到同一份 before 快照,
         // 各自只删自己快照里、payload 外的行 —— 最终落库的是两份 payload 的并集,
@@ -296,6 +313,8 @@ export class SupportService {
       // 默认 5s 兜不住满额 payload 的逐行 update,见常量上的推算。
       { timeout: REPLACE_TRANSACTION_TIMEOUT_MS },
     );
+    // 提交(或结果不明的失败)之后立刻丢掉 App 侧的配置缓存。
+    await replacing.finally(() => this.configCache.clear());
 
     return this.listForAdminWithRevision();
   }

@@ -10,7 +10,13 @@ import { CircleMemberLockService } from 'src/circle/circle-member-lock';
 import { ChatCircleSyncService } from 'src/chat/chat-circle-sync.service';
 import { ChatService } from 'src/chat/chat.service';
 import { ChatSystemMessageService } from 'src/chat/chat-system-message.service';
+import { Prisma } from 'src/generated/prisma';
 import { CircleInvitationService } from './circle-invitation.service';
+import {
+  approvedInvitationsToReconcileQuery,
+  pendingConsentDeliveriesQuery,
+} from './circle-invitation-cron.query';
+import { eligibleVerifierIdsQuery } from './eligible-verifiers.query';
 
 // 卡片签发已从请求路径脱钩(不能让聊天投递挡住 add-verifier 的响应),
 // 所以断言之前要把这一拍排空。
@@ -326,8 +332,10 @@ describe('CircleInvitationService', () => {
 
   it('stops selecting consent deliveries after the final failed attempt', async () => {
     let attempts = 7;
-    prisma.circleInvitation.findMany.mockImplementation(async ({ where }) =>
-      attempts < where.consentNoticeAttempts.lt
+    // 批次查询走原生 SQL（部分索引要求 status / 布尔条件是字面量），这里按真库的
+    // 口径模拟「attempts < 上限」才会被选中。
+    prisma.$queryRaw.mockImplementation(async (query: Prisma.Sql) =>
+      attempts < (query.values[0] as number)
         ? [{ id: 'failed', consentNoticeAttempts: attempts }]
         : [],
     );
@@ -342,11 +350,10 @@ describe('CircleInvitationService', () => {
     await service.deliverPendingConsentInvitations();
     expect(attempts).toBe(8);
     expect(deliver).toHaveBeenCalledTimes(1);
-    expect(prisma.circleInvitation.findMany).toHaveBeenCalledWith(
-      expect.objectContaining({
-        where: expect.objectContaining({ consentNoticeAttempts: { lt: 8 } }),
-      }),
+    expect(prisma.$queryRaw).toHaveBeenCalledWith(
+      pendingConsentDeliveriesQuery({ maxAttempts: 8, limit: 50 }),
     );
+    expect(prisma.circleInvitation.findMany).not.toHaveBeenCalled();
     deliver.mockRestore();
   });
 
@@ -626,8 +633,10 @@ describe('CircleInvitationService', () => {
 
     await expect(service.reconcileApprovedInvitations()).resolves.toBe(0);
 
-    expect(prisma.$queryRaw).toHaveBeenCalled();
-    const query = prisma.$queryRaw.mock.calls[0][0].join(' ');
+    expect(prisma.$queryRaw).toHaveBeenCalledWith(
+      approvedInvitationsToReconcileQuery(),
+    );
+    const query = (prisma.$queryRaw.mock.calls[0][0] as Prisma.Sql).sql;
     expect(query).toContain('"approvedCount" >= "requiredCount"');
     expect(query).toContain('LIMIT 100');
     expect(prisma.circleInvitation.findMany).not.toHaveBeenCalled();
@@ -1800,26 +1809,39 @@ describe('CircleInvitationService', () => {
 
     it('returns active circle members who are also friends', async () => {
       arrangeInvitation();
-      prisma.circleMember.findMany.mockResolvedValue([
+      // 交集(本圈 ACTIVE 成员 ∩ 申请人好友)在一条 SQL 里算完,按入圈先后返回。
+      prisma.$queryRaw.mockResolvedValueOnce([
         member('friend-member'),
-        member('stranger-member'),
+        member('friend-member-2'),
       ]);
-      prisma.friend.findMany.mockResolvedValue([
-        { userID: 'applicant-1', friendID: 'friend-member' },
-        // 反向存储的好友行也算,friend 表一对只有一行。
-        { userID: 'friend-elsewhere', friendID: 'applicant-1' },
+      prisma.user.findMany.mockResolvedValue([
+        profile('friend-member-2'),
+        profile('friend-member'),
       ]);
-      prisma.user.findMany.mockResolvedValue([profile('friend-member')]);
 
       const result = await service.getEligibleVerifiers('applicant-1', 'inv-1');
 
+      // 已占席的(含 REJECTED —— addVerifier 的 AlreadyVerifier 不看状态)
+      // 和申请人自己都不该再出现在候选里。
+      expect(prisma.$queryRaw).toHaveBeenCalledTimes(1);
+      expect(prisma.$queryRaw).toHaveBeenCalledWith(
+        eligibleVerifierIdsQuery({
+          circleId: 'circle-1',
+          callerId: 'applicant-1',
+          excludedUserIds: ['inviter-1', 'verifier-rejected', 'applicant-1'],
+        }),
+      );
+      // 不再把全圈成员(最多 3000)拉进内存,再拿两个 3000 项的 IN 去查好友。
+      expect(prisma.circleMember.findMany).not.toHaveBeenCalled();
+      expect(prisma.friend.findMany).not.toHaveBeenCalled();
       // 只为交集付 hydration,不是把全圈成员的资料先拉一遍再过滤。
       expect(prisma.user.findMany).toHaveBeenCalledWith(
         expect.objectContaining({
-          where: { id: { in: ['friend-member'] } },
+          where: { id: { in: ['friend-member', 'friend-member-2'] } },
         }),
       );
 
+      // 顺序跟 SQL 的入圈先后走,不跟 hydration 的返回顺序。
       expect(result).toEqual([
         {
           id: 'friend-member',
@@ -1827,30 +1849,23 @@ describe('CircleInvitationService', () => {
           avatarUrl: null,
           accountId: 'acct-friend-member',
         },
+        {
+          id: 'friend-member-2',
+          nickname: 'nick-friend-member-2',
+          avatarUrl: null,
+          accountId: 'acct-friend-member-2',
+        },
       ]);
-      // 已占席的(含 REJECTED —— addVerifier 的 AlreadyVerifier 不看状态)
-      // 和申请人自己都不该再出现在候选里。
-      expect(prisma.circleMember.findMany).toHaveBeenCalledWith(
-        expect.objectContaining({
-          where: expect.objectContaining({
-            circleID: 'circle-1',
-            status: 'ACTIVE',
-            userID: {
-              notIn: ['inviter-1', 'verifier-rejected', 'applicant-1'],
-            },
-          }),
-        }),
-      );
     });
 
-    it('returns an empty list without querying friends when no member is left', async () => {
+    it('returns an empty list without hydrating anyone when no friend is a member', async () => {
       arrangeInvitation();
-      prisma.circleMember.findMany.mockResolvedValue([]);
+      prisma.$queryRaw.mockResolvedValueOnce([]);
 
       await expect(
         service.getEligibleVerifiers('applicant-1', 'inv-1'),
       ).resolves.toEqual([]);
-      expect(prisma.friend.findMany).not.toHaveBeenCalled();
+      expect(prisma.user.findMany).not.toHaveBeenCalled();
     });
 
     it('returns an empty list once every slot is filled', async () => {
@@ -1862,7 +1877,7 @@ describe('CircleInvitationService', () => {
       await expect(
         service.getEligibleVerifiers('applicant-1', 'inv-1'),
       ).resolves.toEqual([]);
-      expect(prisma.circleMember.findMany).not.toHaveBeenCalled();
+      expect(prisma.$queryRaw).not.toHaveBeenCalled();
     });
 
     it('rejects a caller who is not the applicant', async () => {
@@ -1873,7 +1888,7 @@ describe('CircleInvitationService', () => {
       ).rejects.toMatchObject({
         response: { errorCode: CircleInvitationErrorCode.ApplicantOnly },
       });
-      expect(prisma.circleMember.findMany).not.toHaveBeenCalled();
+      expect(prisma.$queryRaw).not.toHaveBeenCalled();
     });
 
     it('rejects a settled invitation', async () => {
@@ -1884,7 +1899,7 @@ describe('CircleInvitationService', () => {
       ).rejects.toMatchObject({
         response: { errorCode: CircleInvitationErrorCode.NotPending },
       });
-      expect(prisma.circleMember.findMany).not.toHaveBeenCalled();
+      expect(prisma.$queryRaw).not.toHaveBeenCalled();
     });
   });
   // ─── 宣传期招新策略:requiredVerifierCount 快照 + memberCanInvite 闸 ────────

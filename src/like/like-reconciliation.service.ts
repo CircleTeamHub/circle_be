@@ -22,7 +22,13 @@ export class LikeReconciliationService {
 
   constructor(private readonly prisma: PrismaService) {}
 
-  @TrackedCron(CronExpression.EVERY_HOUR, 'like_reconciliation')
+  // 一天一次，放在用户时区的凌晨低峰：整表重算期间持有 like-counter-reconciliation
+  // 独占锁，所有点赞/取消点赞都要等它，而它只修「点赞人被硬删」这一种漂移。
+  // 此前误配成每小时，与上面的 daily 说明不一致。容器 TZ=UTC，所以显式按
+  // Asia/Shanghai 取凌晨 4 点（UTC 04:00 是北京时间正午）。
+  @TrackedCron(CronExpression.EVERY_DAY_AT_4AM, 'like_reconciliation', {
+    timeZone: 'Asia/Shanghai',
+  })
   async reconcileReceivedLikeCounts(): Promise<number> {
     for (let attempt = 0; attempt < SERIALIZATION_RETRIES; attempt += 1) {
       try {

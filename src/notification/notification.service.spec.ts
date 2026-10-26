@@ -13,9 +13,34 @@ import {
 import {
   decodeNotificationCursor,
   encodeNotificationCursor,
+  NOTIFICATION_REALTIME_BASE_SELECT,
+  type NotificationRealtimeBaseRow,
 } from './notification.dto';
 import { NotificationPushService } from './notification-push.service';
 import { AdminAuditService } from 'src/moderation/admin-audit.service';
+
+/** 实时 DTO 回填用的 Notification 本表行（关系另由 loader 按外键查）。 */
+function baseRow(
+  overrides: Partial<NotificationRealtimeBaseRow> &
+    Pick<NotificationRealtimeBaseRow, 'id' | 'type'>,
+): NotificationRealtimeBaseRow {
+  return {
+    content: '',
+    read: false,
+    createdAt: new Date('2026-07-05T00:00:00Z'),
+    toUserID: 'user-1',
+    fromUserID: 'user-1',
+    fromTraceID: null,
+    fromReplyID: null,
+    fromCircleID: null,
+    fromCirclePostID: null,
+    fromInvitationID: null,
+    fromGroupAdmissionID: null,
+    fromFriendRequestID: null,
+    systemAnnouncementID: null,
+    ...overrides,
+  };
+}
 
 describe('NotificationService', () => {
   let service: NotificationService;
@@ -53,14 +78,36 @@ describe('NotificationService', () => {
       upsert: jest.fn(),
       updateMany: jest.fn(),
       findUniqueOrThrow: jest.fn(),
+      findMany: jest.fn(),
     },
+    // 实时 DTO 的关系表：loader 只在外键非空时才查。
+    trace: { findMany: jest.fn() },
+    traceComment: { findMany: jest.fn() },
+    circle: { findMany: jest.fn() },
+    circlePost: { findMany: jest.fn() },
+    circleInvitation: { findMany: jest.fn() },
+    groupAdmission: { findMany: jest.fn() },
     $queryRaw: jest.fn(),
-    $transaction: jest.fn(async (operation: any) =>
-      typeof operation === 'function'
-        ? operation(prisma)
-        : Promise.all(operation),
-    ),
+    // inTransaction 让用例能断言「关系是在事务提交之后才读的」。
+    inTransaction: false,
+    $transaction: jest.fn(async (operation: any) => {
+      if (typeof operation !== 'function') return Promise.all(operation);
+      prisma.inTransaction = true;
+      try {
+        return await operation(prisma);
+      } finally {
+        prisma.inTransaction = false;
+      }
+    }),
   };
+  const RELATION_TABLES = [
+    prisma.trace,
+    prisma.traceComment,
+    prisma.circle,
+    prisma.circlePost,
+    prisma.circleInvitation,
+    prisma.groupAdmission,
+  ];
 
   const realtimeService = {
     broadcastInteractionUnread: jest.fn(),
@@ -96,6 +143,13 @@ describe('NotificationService', () => {
     ) as jest.Mock[]) {
       nested.mockReset();
     }
+    for (const table of RELATION_TABLES) {
+      table.findMany.mockReset();
+      table.findMany.mockResolvedValue([]);
+    }
+    prisma.user.findMany.mockResolvedValue([]);
+    prisma.systemAnnouncement.findMany.mockResolvedValue([]);
+    prisma.inTransaction = false;
     pushService.sendNotification.mockReset();
     pushService.isJPushConfigured.mockReset();
     auditService.record.mockReset();
@@ -117,19 +171,15 @@ describe('NotificationService', () => {
     service = module.get(NotificationService);
   });
 
-  it('builds discover/profile unread summary from notification domains', async () => {
-    // 按 where.type.in 分派，而不是靠调用顺序 —— 四个 count 是并发发出的。
-    prisma.notification.count.mockImplementation(({ where }: any) => {
-      const types = where.type.in as string[];
-      if (types.includes('SYSTEM')) return Promise.resolve(1);
-      if (
-        types.includes('TRACE_LIKE') &&
-        types.includes('CIRCLE_POST_PUBLISHED')
-      )
-        return Promise.resolve(2);
-      if (types.includes('TRACE_LIKE')) return Promise.resolve(1);
-      return Promise.resolve(1);
-    });
+  it('builds discover/profile unread summary from one grouped unread query', async () => {
+    // 一条 GROUP BY type 取回各类型未读数，域的求和在 JS 里做。
+    prisma.$queryRaw.mockResolvedValueOnce([
+      { type: 'TRACE_LIKE', count: 1 },
+      { type: 'CIRCLE_POST_PUBLISHED', count: 1 },
+      { type: 'SYSTEM', count: 1 },
+      // 报名通知不属于任何铃铛域，哪个数都不计。
+      { type: 'CIRCLE_POST_SIGNUP_CREATED', count: 5 },
+    ]);
 
     await expect(service.getUnreadSummary('user-1')).resolves.toEqual({
       discoverUnread: 2,
@@ -138,20 +188,19 @@ describe('NotificationService', () => {
       profileUnread: 1,
       totalUnread: 3,
     });
+    expect(prisma.$queryRaw).toHaveBeenCalledTimes(1);
+    const query = prisma.$queryRaw.mock.calls[0][0] as {
+      sql: string;
+      values: unknown[];
+    };
+    expect(query.sql).toContain('GROUP BY n."type"');
+    expect(query.values).toEqual(['user-1']);
+    expect(prisma.notification.count).not.toHaveBeenCalled();
   });
 
-  it('scopes the unread summary domains to disjoint notification types', async () => {
-    const seen: string[][] = [];
-    prisma.notification.count.mockImplementation(({ where }: any) => {
-      seen.push(where.type.in as string[]);
-      return Promise.resolve(0);
-    });
-
-    await service.getUnreadSummary('user-1');
-
-    const [, momentTypes, circleTypes] = seen;
-    expect(momentTypes).toEqual([...MOMENT_NOTIFICATION_TYPES]);
-    expect(circleTypes).toEqual([...CIRCLE_NOTIFICATION_TYPES]);
+  it('keeps the bell domains disjoint', () => {
+    const momentTypes = [...MOMENT_NOTIFICATION_TYPES] as string[];
+    const circleTypes = [...CIRCLE_NOTIFICATION_TYPES] as string[];
     // 朋友圈铃铛不得收圈子事件，圈子铃铛不得收朋友圈事件。
     expect(momentTypes.filter((type) => circleTypes.includes(type))).toEqual(
       [],
@@ -162,25 +211,23 @@ describe('NotificationService', () => {
   });
 
   it('getNotifications scopes rows to one bell domain when asked', async () => {
-    prisma.notification.findMany.mockResolvedValue([]);
+    prisma.$queryRaw.mockResolvedValue([]);
 
     await service.getNotifications('user-1', 1, 'moments');
-    expect(prisma.notification.findMany).toHaveBeenCalledWith(
-      expect.objectContaining({
-        where: expect.objectContaining({
-          type: { in: [...MOMENT_NOTIFICATION_TYPES] },
-        }),
-      }),
-    );
+    expect(prisma.$queryRaw.mock.calls[0][0].values).toEqual([
+      'user-1',
+      ...MOMENT_NOTIFICATION_TYPES,
+      20,
+    ]);
 
     await service.getNotifications('user-1', 1, 'circle');
-    expect(prisma.notification.findMany).toHaveBeenLastCalledWith(
-      expect.objectContaining({
-        where: expect.objectContaining({
-          type: { in: [...CIRCLE_NOTIFICATION_TYPES] },
-        }),
-      }),
-    );
+    expect(prisma.$queryRaw.mock.calls[1][0].values).toEqual([
+      'user-1',
+      ...CIRCLE_NOTIFICATION_TYPES,
+      20,
+    ]);
+    // 空页不回填。
+    expect(prisma.notification.findMany).not.toHaveBeenCalled();
   });
 
   it('markAllNotificationsRead only clears the requested domain', async () => {
@@ -934,35 +981,59 @@ describe('NotificationService', () => {
     });
 
     it('getNotifications maps fromUser/fromTrace/fromReply and paginates', async () => {
+      prisma.$queryRaw.mockResolvedValue([
+        { id: 'n1', createdAt: new Date('2026-06-05T00:00:00Z') },
+      ]);
       prisma.notification.findMany.mockResolvedValue([
-        {
+        baseRow({
           id: 'n1',
           type: 'TRACE_COMMENT',
           content: 'nice',
-          read: false,
           createdAt: new Date('2026-06-05T00:00:00Z'),
-          fromUser: { id: 'u2', nickname: 'B', avatarUrl: null },
-          fromTrace: { id: 't1', content: 'my trace body', images: ['img1'] },
-          fromReply: { id: 'r1', content: 'reply body' },
-        },
+          fromUserID: 'u2',
+          fromTraceID: 't1',
+          fromReplyID: 'r1',
+        }),
+      ]);
+      prisma.user.findMany.mockResolvedValue([
+        { id: 'u2', nickname: 'B', avatarUrl: null },
+      ]);
+      prisma.trace.findMany.mockResolvedValue([
+        { id: 't1', content: 'my trace body', images: ['img1'] },
+      ]);
+      prisma.traceComment.findMany.mockResolvedValue([
+        { id: 'r1', content: 'reply body' },
       ]);
 
       const result = await service.getNotifications('user-1', 1);
 
-      expect(prisma.notification.findMany).toHaveBeenCalledWith(
-        expect.objectContaining({
-          where: {
-            toUserID: 'user-1',
-            deleted: false,
-            type: {
-              in: [...DISCOVER_NOTIFICATION_TYPES],
-            },
-          },
-          skip: 0,
-          take: 20,
-          orderBy: [{ createdAt: 'desc' }, { id: 'desc' }],
-        }),
-      );
+      // 第一页：只扫 id（索引自己回答），不带 OFFSET。
+      const scan = prisma.$queryRaw.mock.calls[0][0];
+      expect(scan.values).toEqual([
+        'user-1',
+        ...DISCOVER_NOTIFICATION_TYPES,
+        20,
+      ]);
+      expect(scan.sql).not.toContain('OFFSET');
+      expect(prisma.notification.findMany).toHaveBeenCalledWith({
+        where: {
+          id: { in: ['n1'] },
+          toUserID: 'user-1',
+          deleted: false,
+          type: { in: [...DISCOVER_NOTIFICATION_TYPES] },
+        },
+        select: NOTIFICATION_REALTIME_BASE_SELECT,
+      });
+      // 这一页只引用了用户 / 动态 / 回复：其余关系表一条都不查。
+      for (const table of [
+        prisma.circle,
+        prisma.circlePost,
+        prisma.circleInvitation,
+        prisma.groupAdmission,
+      ]) {
+        expect(table.findMany).not.toHaveBeenCalled();
+      }
+      expect(prisma.systemAnnouncement.findMany).not.toHaveBeenCalled();
       expect(result[0]).toEqual({
         id: 'n1',
         type: 'TRACE_COMMENT',
@@ -988,64 +1059,57 @@ describe('NotificationService', () => {
     });
 
     it('getProfileNotifications returns only profile-domain system rows', async () => {
+      prisma.$queryRaw.mockResolvedValue([
+        { id: 'sys-1', createdAt: new Date('2026-07-05T00:00:00Z') },
+      ]);
       prisma.notification.findMany.mockResolvedValue([
-        {
+        baseRow({
           id: 'sys-1',
           type: 'SYSTEM',
           content: '积分已到账 10',
-          read: false,
-          createdAt: new Date('2026-07-05T00:00:00Z'),
-          fromUser: { id: 'user-1', nickname: 'Me', avatarUrl: null },
-          fromTrace: null,
-          fromReply: null,
-          fromCircle: null,
-          fromCirclePost: null,
-          fromInvitation: null,
-        },
+        }),
+      ]);
+      prisma.user.findMany.mockResolvedValue([
+        { id: 'user-1', nickname: 'Me', avatarUrl: null },
       ]);
 
       const result = await service.getProfileNotifications('user-1', 2);
 
-      expect(prisma.notification.findMany).toHaveBeenCalledWith(
-        expect.objectContaining({
-          where: {
-            toUserID: 'user-1',
-            deleted: false,
-            type: { in: ['SYSTEM'] },
-          },
-          skip: 20,
-          take: 20,
-          orderBy: [{ createdAt: 'desc' }, { id: 'desc' }],
-        }),
-      );
+      const scan = prisma.$queryRaw.mock.calls[0][0];
+      expect(scan.values).toEqual(['user-1', 'SYSTEM', 20, 20]);
+      expect(scan.sql).toContain('OFFSET');
+      expect(prisma.notification.findMany).toHaveBeenCalledWith({
+        where: {
+          id: { in: ['sys-1'] },
+          toUserID: 'user-1',
+          deleted: false,
+          type: { in: ['SYSTEM'] },
+        },
+        select: NOTIFICATION_REALTIME_BASE_SELECT,
+      });
       expect(result[0]).toEqual(
         expect.objectContaining({
           id: 'sys-1',
           type: 'SYSTEM',
           content: '积分已到账 10',
+          fromUser: { id: 'user-1', nickname: 'Me', avatarUrl: null },
         }),
       );
     });
 
     it('uses keyset pagination and returns an opaque next cursor', async () => {
-      const rows = Array.from({ length: 21 }, (_, index) => ({
-        id: `system-${index}`,
-        type: 'SYSTEM',
-        content: `system ${index}`,
-        read: false,
-        createdAt: new Date(Date.UTC(2026, 6, 21 - index)),
-        fromUser: null,
-        fromTrace: null,
-        fromReply: null,
-        fromCircle: null,
-        fromCirclePost: null,
-        fromInvitation: null,
-        fromFriendRequest: null,
-      }));
+      const rows = Array.from({ length: 21 }, (_, index) =>
+        baseRow({
+          id: `system-${index}`,
+          type: 'SYSTEM',
+          content: `system ${index}`,
+          createdAt: new Date(Date.UTC(2026, 6, 21 - index)),
+        }),
+      );
       prisma.$queryRaw.mockResolvedValue(
         rows.map(({ id, createdAt }) => ({ id, createdAt })),
       );
-      prisma.notification.findMany.mockResolvedValue(rows);
+      prisma.notification.findMany.mockResolvedValue(rows.slice(0, 20));
       const cursor = encodeNotificationCursor({
         createdAt: '2026-08-01T00:00:00.000Z',
         id: 'after-system-0',
@@ -1057,19 +1121,31 @@ describe('NotificationService', () => {
       );
 
       expect(prisma.$queryRaw).toHaveBeenCalledTimes(1);
-      const cursorQuery = prisma.$queryRaw.mock.calls[0][0] as { sql: string };
+      const cursorQuery = prisma.$queryRaw.mock.calls[0][0] as {
+        sql: string;
+        values: unknown[];
+      };
       expect(cursorQuery.sql).toContain('(n."createdAt", n."id") <');
-      expect(prisma.notification.findMany).toHaveBeenCalledWith(
-        expect.objectContaining({
-          where: {
-            id: { in: rows.slice(0, 20).map(({ id }) => id) },
-            toUserID: 'user-1',
-            deleted: false,
-            type: { in: ['SYSTEM'] },
-          },
-        }),
-      );
+      expect(cursorQuery.values).toEqual([
+        'user-1',
+        'SYSTEM',
+        new Date('2026-08-01T00:00:00.000Z'),
+        'after-system-0',
+        21,
+      ]);
+      expect(prisma.notification.findMany).toHaveBeenCalledWith({
+        where: {
+          id: { in: rows.slice(0, 20).map(({ id }) => id) },
+          toUserID: 'user-1',
+          deleted: false,
+          type: { in: ['SYSTEM'] },
+        },
+        select: NOTIFICATION_REALTIME_BASE_SELECT,
+      });
       expect(result.items).toHaveLength(20);
+      expect(result.items.map((item) => item.id)).toEqual(
+        rows.slice(0, 20).map(({ id }) => id),
+      );
       expect(result.nextCursor).toBeTruthy();
       expect(decodeNotificationCursor(result.nextCursor!)).toEqual({
         createdAt: '2026-07-02T00:00:00.000Z',
@@ -1078,20 +1154,13 @@ describe('NotificationService', () => {
     });
 
     it('does not emit the lookahead row when a scanned page row disappears', async () => {
-      const rows = Array.from({ length: 21 }, (_, index) => ({
-        id: `system-${index}`,
-        type: 'SYSTEM',
-        content: '',
-        read: false,
-        createdAt: new Date(Date.UTC(2026, 6, 21 - index)),
-        fromUser: null,
-        fromTrace: null,
-        fromReply: null,
-        fromCircle: null,
-        fromCirclePost: null,
-        fromInvitation: null,
-        fromFriendRequest: null,
-      }));
+      const rows = Array.from({ length: 21 }, (_, index) =>
+        baseRow({
+          id: `system-${index}`,
+          type: 'SYSTEM',
+          createdAt: new Date(Date.UTC(2026, 6, 21 - index)),
+        }),
+      );
       prisma.$queryRaw.mockResolvedValue(
         rows.map(({ id, createdAt }) => ({ id, createdAt })),
       );
@@ -1144,73 +1213,121 @@ describe('NotificationService', () => {
       await expect(
         service.getProfileNotificationsByCursor('user-1', 'not-a-cursor'),
       ).rejects.toBeInstanceOf(BadRequestException);
+      expect(prisma.$queryRaw).not.toHaveBeenCalled();
       expect(prisma.notification.findMany).not.toHaveBeenCalled();
     });
 
     it('starts cursor pagination with a bounded first-page query', async () => {
-      prisma.notification.findMany.mockResolvedValue([]);
+      prisma.$queryRaw.mockResolvedValue([]);
 
       await expect(service.getNotificationsByCursor('user-1')).resolves.toEqual(
         { items: [], nextCursor: null },
       );
 
-      expect(prisma.notification.findMany).toHaveBeenCalledWith(
-        expect.objectContaining({
-          where: expect.objectContaining({
-            toUserID: 'user-1',
-            deleted: false,
-          }),
-          orderBy: [{ createdAt: 'desc' }, { id: 'desc' }],
-          take: 21,
-        }),
-      );
-      expect(prisma.notification.findMany.mock.calls[0][0]).not.toHaveProperty(
-        'skip',
-      );
+      const scan = prisma.$queryRaw.mock.calls[0][0];
+      expect(scan.values).toEqual([
+        'user-1',
+        ...DISCOVER_NOTIFICATION_TYPES,
+        21,
+      ]);
+      expect(scan.sql).not.toContain('OFFSET');
+      expect(scan.sql).not.toContain('(n."createdAt", n."id") <');
+      expect(prisma.notification.findMany).not.toHaveBeenCalled();
     });
 
     it('enqueues durable push delivery after creating a friend request notification', async () => {
-      prisma.notification.create.mockResolvedValue({
-        id: 'friend-n1',
-        type: NotificationType.FRIEND_REQUEST_RECEIVED,
-        content: 'hello',
-        read: false,
-        createdAt: new Date('2026-07-05T00:00:00Z'),
-        fromUser: { id: 'from-1', nickname: 'Aki', avatarUrl: null },
-        fromTrace: null,
-        fromReply: null,
-        fromCircle: null,
-        fromCirclePost: null,
-        fromInvitation: null,
-      });
+      prisma.notification.create.mockResolvedValue(
+        baseRow({
+          id: 'friend-n1',
+          type: NotificationType.FRIEND_REQUEST_RECEIVED,
+          content: 'hello',
+          toUserID: 'to-1',
+          fromUserID: 'from-1',
+          fromFriendRequestID: 'request-1',
+        }),
+      );
+      prisma.user.findMany.mockResolvedValue([
+        { id: 'from-1', nickname: 'Aki', avatarUrl: null },
+      ]);
 
       const result = await service.createFriendRequestNotification({
         type: NotificationType.FRIEND_REQUEST_RECEIVED,
         toUserId: 'to-1',
         fromUserId: 'from-1',
         content: 'hello',
+        requestId: 'request-1',
       });
 
       expect(prisma.notificationPushOutbox.create).toHaveBeenCalledWith({
         data: { notificationID: 'friend-n1' },
       });
-      expect(result).toEqual(expect.objectContaining({ id: 'friend-n1' }));
+      expect(result).toEqual(
+        expect.objectContaining({
+          id: 'friend-n1',
+          fromUser: { id: 'from-1', nickname: 'Aki', avatarUrl: null },
+          requestId: 'request-1',
+        }),
+      );
+    });
+
+    it('only creates inside the transaction and reads relations after it commits', async () => {
+      const seenInTransaction: boolean[] = [];
+      prisma.notification.create.mockImplementation(async () => {
+        seenInTransaction.push(prisma.inTransaction);
+        return baseRow({
+          id: 'like-n1',
+          type: NotificationType.TRACE_LIKE,
+          toUserID: 'author-1',
+          fromUserID: 'viewer-1',
+          fromTraceID: 'trace-1',
+        });
+      });
+      prisma.notification.findFirst.mockResolvedValue(null);
+      prisma.user.findMany.mockImplementation(async () => {
+        seenInTransaction.push(prisma.inTransaction);
+        return [{ id: 'viewer-1', nickname: 'V', avatarUrl: null }];
+      });
+      prisma.trace.findMany.mockImplementation(async () => {
+        seenInTransaction.push(prisma.inTransaction);
+        return [{ id: 'trace-1', content: 'trace body', images: [] }];
+      });
+
+      const result = await service.createTraceLikeNotification({
+        actorId: 'viewer-1',
+        traceId: 'trace-1',
+        traceOwnerId: 'author-1',
+      });
+
+      // create 在事务里，用户 / 动态两条关系查询都在提交之后。
+      expect(seenInTransaction).toEqual([true, false, false]);
+      expect(prisma.notification.create).toHaveBeenCalledWith({
+        data: {
+          toUserID: 'author-1',
+          fromUserID: 'viewer-1',
+          type: NotificationType.TRACE_LIKE,
+          fromTraceID: 'trace-1',
+          content: '',
+        },
+        select: NOTIFICATION_REALTIME_BASE_SELECT,
+      });
+      expect(result).toEqual(
+        expect.objectContaining({
+          id: 'like-n1',
+          fromUser: { id: 'viewer-1', nickname: 'V', avatarUrl: null },
+          fromTrace: { id: 'trace-1', excerpt: 'trace body', firstImage: null },
+        }),
+      );
     });
 
     it('fails the notification transaction when durable push enqueue fails', async () => {
-      prisma.notification.create.mockResolvedValue({
-        id: 'friend-n2',
-        type: NotificationType.FRIEND_REQUEST_RECEIVED,
-        content: 'hello',
-        read: false,
-        createdAt: new Date('2026-07-05T00:00:00Z'),
-        fromUser: { id: 'from-1', nickname: 'Aki', avatarUrl: null },
-        fromTrace: null,
-        fromReply: null,
-        fromCircle: null,
-        fromCirclePost: null,
-        fromInvitation: null,
-      });
+      prisma.notification.create.mockResolvedValue(
+        baseRow({
+          id: 'friend-n2',
+          type: NotificationType.FRIEND_REQUEST_RECEIVED,
+          content: 'hello',
+          fromUserID: 'from-1',
+        }),
+      );
       prisma.notificationPushOutbox.create.mockRejectedValue(
         new Error('outbox unavailable'),
       );
@@ -1223,24 +1340,28 @@ describe('NotificationService', () => {
           content: 'hello',
         }),
       ).rejects.toThrow('outbox unavailable');
+      expect(prisma.user.findMany).not.toHaveBeenCalled();
     });
 
     it('creates circle invitation notifications through the shared notification path', async () => {
-      prisma.notification.create.mockResolvedValue({
-        id: 'circle-inv-n1',
-        type: NotificationType.CIRCLE_VERIFICATION_REQUESTED,
-        content: '',
-        read: false,
-        createdAt: new Date('2026-07-05T00:00:00Z'),
-        fromUser: { id: 'from-1', nickname: 'Aki', avatarUrl: null },
-        fromTrace: null,
-        fromReply: null,
-        fromCircle: { id: 'circle-1', name: 'Circle' },
-        fromCirclePost: null,
-        fromInvitation: { id: 'inv-1', status: 'PENDING' },
-      });
+      prisma.notification.create.mockResolvedValue(
+        baseRow({
+          id: 'circle-inv-n1',
+          type: NotificationType.CIRCLE_VERIFICATION_REQUESTED,
+          toUserID: 'to-1',
+          fromUserID: 'from-1',
+          fromCircleID: 'circle-1',
+          fromInvitationID: 'inv-1',
+        }),
+      );
+      prisma.circle.findMany.mockResolvedValue([
+        { id: 'circle-1', name: 'Circle' },
+      ]);
+      prisma.circleInvitation.findMany.mockResolvedValue([
+        { id: 'inv-1', status: 'PENDING' },
+      ]);
 
-      await service.createCircleInvitationNotification({
+      const result = await service.createCircleInvitationNotification({
         toUserID: 'to-1',
         fromUserID: 'from-1',
         type: NotificationType.CIRCLE_VERIFICATION_REQUESTED,
@@ -1257,9 +1378,15 @@ describe('NotificationService', () => {
           fromInvitationID: 'inv-1',
           content: '',
         },
-        include: expect.any(Object),
+        select: NOTIFICATION_REALTIME_BASE_SELECT,
       });
       expect(prisma.notificationPushOutbox.create).toHaveBeenCalled();
+      expect(result).toEqual(
+        expect.objectContaining({
+          fromCircle: { id: 'circle-1', name: 'Circle' },
+          fromInvitation: { id: 'inv-1', status: 'PENDING' },
+        }),
+      );
     });
 
     it('markNotificationRead broadcasts interaction unread for discover-domain rows', async () => {
@@ -1323,22 +1450,24 @@ describe('NotificationService', () => {
     });
 
     it('creates auto-ended circle post notifications for the author with post routing data', async () => {
-      prisma.notification.create.mockResolvedValue({
-        id: 'n-auto',
-        type: NotificationType.CIRCLE_POST_AUTO_ENDED,
-        content: '',
-        read: false,
-        createdAt: new Date('2026-06-29T12:00:00Z'),
-        fromUser: { id: 'author-1', nickname: 'Host', avatarUrl: null },
-        fromTrace: null,
-        fromReply: null,
-        fromCircle: null,
-        fromCirclePost: {
-          id: 'post-1',
-          content: 'Board game night',
-          images: [],
-        },
-        fromInvitation: null,
+      const seenInTransaction: boolean[] = [];
+      prisma.notification.create.mockImplementation(async () => {
+        seenInTransaction.push(prisma.inTransaction);
+        return baseRow({
+          id: 'n-auto',
+          type: NotificationType.CIRCLE_POST_AUTO_ENDED,
+          createdAt: new Date('2026-06-29T12:00:00Z'),
+          toUserID: 'author-1',
+          fromUserID: 'author-1',
+          fromCirclePostID: 'post-1',
+        });
+      });
+      prisma.user.findMany.mockResolvedValue([
+        { id: 'author-1', nickname: 'Host', avatarUrl: null },
+      ]);
+      prisma.circlePost.findMany.mockImplementation(async () => {
+        seenInTransaction.push(prisma.inTransaction);
+        return [{ id: 'post-1', content: 'Board game night', images: [] }];
       });
 
       const result = await service.createCirclePostAutoEndedNotification({
@@ -1354,12 +1483,14 @@ describe('NotificationService', () => {
           fromCirclePostID: 'post-1',
           content: '',
         },
-        include: expect.any(Object),
+        select: NOTIFICATION_REALTIME_BASE_SELECT,
       });
+      expect(seenInTransaction).toEqual([true, false]);
       expect(result).toEqual(
         expect.objectContaining({
           id: 'n-auto',
           type: NotificationType.CIRCLE_POST_AUTO_ENDED,
+          fromUser: { id: 'author-1', nickname: 'Host', avatarUrl: null },
           fromCirclePost: {
             id: 'post-1',
             excerpt: 'Board game night',
@@ -1370,32 +1501,35 @@ describe('NotificationService', () => {
     });
 
     it('creates published-post notifications and push outbox rows in the supplied transaction', async () => {
-      const baseRow = {
-        type: NotificationType.CIRCLE_POST_PUBLISHED,
-        content: '',
-        read: false,
-        createdAt: new Date('2026-06-29T12:00:00Z'),
-        fromUser: { id: 'author-1', nickname: 'Host', avatarUrl: null },
-        fromTrace: null,
-        fromReply: null,
-        fromCircle: null,
-        fromCirclePost: { id: 'post-1', content: 'hi', images: [] },
-        fromInvitation: null,
-        fromFriendRequest: null,
-      };
+      const created = ['member-2', 'member-3'].map((toUserID, index) =>
+        baseRow({
+          id: `n${index + 2}`,
+          type: NotificationType.CIRCLE_POST_PUBLISHED,
+          createdAt: new Date('2026-06-29T12:00:00Z'),
+          toUserID,
+          fromUserID: 'author-1',
+          fromCirclePostID: 'post-1',
+        }),
+      );
       const tx = {
         notification: {
-          createManyAndReturn: jest.fn().mockResolvedValue([
-            { id: 'n2', toUserID: 'member-2' },
-            { id: 'n3', toUserID: 'member-3' },
-          ]),
-          findMany: jest.fn().mockResolvedValue([
-            { ...baseRow, id: 'n2', toUserID: 'member-2' },
-            { ...baseRow, id: 'n3', toUserID: 'member-3' },
-          ]),
+          createManyAndReturn: jest.fn().mockResolvedValue(created),
+          findMany: jest.fn(),
         },
         notificationPushOutbox: {
           createMany: jest.fn().mockResolvedValue({ count: 2 }),
+        },
+        user: {
+          findMany: jest
+            .fn()
+            .mockResolvedValue([
+              { id: 'author-1', nickname: 'Host', avatarUrl: null },
+            ]),
+        },
+        circlePost: {
+          findMany: jest
+            .fn()
+            .mockResolvedValue([{ id: 'post-1', content: 'hi', images: [] }]),
         },
       } as unknown as Prisma.TransactionClient;
 
@@ -1422,19 +1556,29 @@ describe('NotificationService', () => {
             content: '',
           },
         ],
-        select: { id: true, toUserID: true },
+        select: NOTIFICATION_REALTIME_BASE_SELECT,
       });
       expect(tx.notificationPushOutbox.createMany).toHaveBeenCalledWith({
         data: [{ notificationID: 'n2' }, { notificationID: 'n3' }],
       });
-      expect(tx.notification.findMany).toHaveBeenCalledWith({
-        where: { id: { in: ['n2', 'n3'] } },
-        include: expect.any(Object),
-      });
+      // INSERT ... RETURNING 已经带回本表列，不再整批回读；关系只查作者和帖子各一次。
+      expect(tx.notification.findMany).not.toHaveBeenCalled();
+      expect(tx.user.findMany).toHaveBeenCalledTimes(1);
+      expect(tx.circlePost.findMany).toHaveBeenCalledTimes(1);
       expect(pushService.sendNotification).not.toHaveBeenCalled();
-      expect(result.map(({ toUserId }) => toUserId)).toEqual([
-        'member-2',
-        'member-3',
+      expect(result).toEqual([
+        {
+          toUserId: 'member-2',
+          notification: expect.objectContaining({
+            id: 'n2',
+            fromUser: { id: 'author-1', nickname: 'Host', avatarUrl: null },
+            fromCirclePost: { id: 'post-1', excerpt: 'hi', firstImage: null },
+          }),
+        },
+        {
+          toUserId: 'member-3',
+          notification: expect.objectContaining({ id: 'n3' }),
+        },
       ]);
     });
 
@@ -1442,14 +1586,21 @@ describe('NotificationService', () => {
       const outboxError = new Error('outbox unavailable');
       const tx = {
         notification: {
-          createManyAndReturn: jest
-            .fn()
-            .mockResolvedValue([{ id: 'n2', toUserID: 'member-2' }]),
-          findMany: jest.fn(),
+          createManyAndReturn: jest.fn().mockResolvedValue([
+            baseRow({
+              id: 'n2',
+              type: NotificationType.CIRCLE_POST_PUBLISHED,
+              toUserID: 'member-2',
+              fromUserID: 'author-1',
+              fromCirclePostID: 'post-1',
+            }),
+          ]),
         },
         notificationPushOutbox: {
           createMany: jest.fn().mockRejectedValue(outboxError),
         },
+        user: { findMany: jest.fn() },
+        circlePost: { findMany: jest.fn() },
       } as unknown as Prisma.TransactionClient;
 
       await expect(
@@ -1459,8 +1610,79 @@ describe('NotificationService', () => {
           recipientIds: ['member-2'],
         }),
       ).rejects.toBe(outboxError);
-      expect(tx.notification.findMany).not.toHaveBeenCalled();
+      expect(tx.user.findMany).not.toHaveBeenCalled();
       expect(pushService.sendNotification).not.toHaveBeenCalled();
+    });
+
+    it('fans out trace comment notifications in precedence order and reads relations after commit', async () => {
+      const seenInTransaction: boolean[] = [];
+      const inserted = [
+        baseRow({
+          id: 'n-owner',
+          type: NotificationType.TRACE_COMMENT,
+          content: 'hey',
+          toUserID: 'owner',
+          fromUserID: 'actor',
+          fromTraceID: 'trace-1',
+          fromReplyID: 'comment-1',
+        }),
+        baseRow({
+          id: 'n-reply',
+          type: NotificationType.COMMENT_REPLY,
+          content: 'hey',
+          toUserID: 'replied',
+          fromUserID: 'actor',
+          fromTraceID: 'trace-1',
+          fromReplyID: 'comment-1',
+        }),
+      ];
+      prisma.notification.createManyAndReturn.mockImplementation(async () => {
+        seenInTransaction.push(prisma.inTransaction);
+        return inserted;
+      });
+      prisma.notificationPushOutbox.createMany.mockResolvedValue({ count: 2 });
+      prisma.user.findMany.mockImplementation(async () => {
+        seenInTransaction.push(prisma.inTransaction);
+        return [{ id: 'actor', nickname: 'A', avatarUrl: null }];
+      });
+      prisma.trace.findMany.mockResolvedValue([
+        { id: 'trace-1', content: 'trace', images: [] },
+      ]);
+      prisma.traceComment.findMany.mockResolvedValue([
+        { id: 'comment-1', content: 'hey' },
+      ]);
+
+      const result = await service.createTraceCommentNotifications({
+        actorId: 'actor',
+        traceId: 'trace-1',
+        commentId: 'comment-1',
+        traceOwnerId: 'owner',
+        replyToCommentId: 'parent-1',
+        replyToUserId: 'replied',
+        content: 'hey',
+      });
+
+      expect(prisma.notification.createManyAndReturn).toHaveBeenCalledWith(
+        expect.objectContaining({ select: NOTIFICATION_REALTIME_BASE_SELECT }),
+      );
+      expect(prisma.notificationPushOutbox.createMany).toHaveBeenCalledWith({
+        data: [{ notificationID: 'n-owner' }, { notificationID: 'n-reply' }],
+      });
+      expect(prisma.notification.findMany).not.toHaveBeenCalled();
+      expect(seenInTransaction).toEqual([true, false]);
+      expect(result).toEqual([
+        {
+          targetUserId: 'owner',
+          notification: expect.objectContaining({
+            id: 'n-owner',
+            fromReply: { id: 'comment-1', content: 'hey' },
+          }),
+        },
+        {
+          targetUserId: 'replied',
+          notification: expect.objectContaining({ id: 'n-reply' }),
+        },
+      ]);
     });
 
     it('markAllNotificationsRead returns count', async () => {
@@ -1723,29 +1945,43 @@ describe('profile notification details ownership', () => {
   it('scopes full content to the current recipient and excludes deleted or non-profile notifications', async () => {
     const prisma = {
       notification: {
-        findFirst: jest.fn().mockResolvedValue({
-          id: 'n',
-          type: 'SYSTEM',
-          content: 'full body',
-          createdAt: new Date(),
-          read: false,
-        }),
+        findFirst: jest.fn().mockResolvedValue(
+          baseRow({
+            id: 'n',
+            type: 'SYSTEM',
+            content: 'full body',
+            toUserID: 'user-a',
+            fromUserID: 'user-a',
+            systemAnnouncementID: 'a-1',
+          }),
+        ),
+      },
+      user: {
+        findMany: jest
+          .fn()
+          .mockResolvedValue([
+            { id: 'user-a', nickname: 'A', avatarUrl: null },
+          ]),
+      },
+      systemAnnouncement: {
+        findMany: jest
+          .fn()
+          .mockResolvedValue([{ id: 'a-1', title: '公告标题' }]),
       },
     };
     const service = new NotificationService(prisma as any, {} as any);
     expect(await service.profileNotificationDetail('user-a', 'n')).toEqual(
-      expect.objectContaining({ content: 'full body' }),
+      expect.objectContaining({ content: 'full body', title: '公告标题' }),
     );
-    expect(prisma.notification.findFirst).toHaveBeenCalledWith(
-      expect.objectContaining({
-        where: expect.objectContaining({
-          id: 'n',
-          toUserID: 'user-a',
-          deleted: false,
-          type: expect.objectContaining({ in: expect.any(Array) }),
-        }),
+    expect(prisma.notification.findFirst).toHaveBeenCalledWith({
+      where: expect.objectContaining({
+        id: 'n',
+        toUserID: 'user-a',
+        deleted: false,
+        type: expect.objectContaining({ in: expect.any(Array) }),
       }),
-    );
+      select: NOTIFICATION_REALTIME_BASE_SELECT,
+    });
   });
   it('does not return another user notification', async () => {
     const service = new NotificationService(

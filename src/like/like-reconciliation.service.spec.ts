@@ -1,4 +1,22 @@
+import { CronExpression } from '@nestjs/schedule';
+import { SCHEDULE_CRON_OPTIONS } from '@nestjs/schedule/dist/schedule.constants';
 import { LikeReconciliationService } from './like-reconciliation.service';
+
+// 对账是全表重算,期间持有 like-counter-reconciliation 独占锁,所有点赞都要等它。
+// 只用来修「点赞人被硬删、级联删行不减计数」这一种漂移,一天一次足够;
+// 此前误配成每小时,和类注释的 daily 不一致。
+describe('LikeReconciliationService schedule', () => {
+  it('runs once a day in the East Asia small hours, not every hour', () => {
+    const options = Reflect.getMetadata(
+      SCHEDULE_CRON_OPTIONS,
+      LikeReconciliationService.prototype.reconcileReceivedLikeCounts,
+    ) as { cronTime: string; timeZone?: string };
+
+    expect(options.cronTime).toBe(CronExpression.EVERY_DAY_AT_4AM);
+    // 容器 TZ=UTC,UTC 04:00 是北京时间正午;按用户时区落在凌晨 4 点。
+    expect(options.timeZone).toBe('Asia/Shanghai');
+  });
+});
 
 describe('LikeReconciliationService', () => {
   const prisma = {

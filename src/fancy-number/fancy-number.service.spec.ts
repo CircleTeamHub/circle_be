@@ -878,10 +878,16 @@ describe('FancyNumberService', () => {
   it('continues the expiry sweep after a full batch of failing leases', async () => {
     const failing = Array.from({ length: 100 }, (_, index) => ({
       id: `failed-${String(index).padStart(3, '0')}`,
+      expiresAt: new Date('2026-01-30T00:00:00.000Z'),
     }));
     tx.fancyNumberLease.findMany
       .mockResolvedValueOnce(failing)
-      .mockResolvedValueOnce([{ id: 'valid-after-failures' }])
+      .mockResolvedValueOnce([
+        {
+          id: 'valid-after-failures',
+          expiresAt: new Date('2026-01-30T00:00:00.000Z'),
+        },
+      ])
       .mockResolvedValueOnce([]);
     const expireSpy = jest
       .spyOn(service, 'expireLease')
@@ -892,6 +898,65 @@ describe('FancyNumberService', () => {
 
     await expect(service.expireDue(now)).resolves.toBe(1);
     expect(expireSpy).toHaveBeenCalledWith('valid-after-failures', now);
+  });
+
+  // cursor + skip:1 配上可空的 expiresAt 排序时,Prisma 7 生成的 SQL 只有 OFFSET 1、
+  // 没有 LIMIT:每翻一页都把游标之后的全部到期租约读进内存再截 100 条。改成
+  // (expiresAt, id) 键集条件,LIMIT 回到 SQL 里。
+  it('pages the expiry sweep by an (expiresAt, id) keyset instead of a Prisma cursor', async () => {
+    const firstPage = Array.from({ length: 100 }, (_, index) => ({
+      id: `lease-${String(index).padStart(3, '0')}`,
+      expiresAt: new Date(
+        Date.UTC(2026, 0, 1) + Math.floor(index / 10) * 60_000,
+      ),
+    }));
+    const lastOfFirstPage = firstPage[99];
+    const secondPage = Array.from({ length: 100 }, (_, index) => ({
+      id: `late-${String(index).padStart(3, '0')}`,
+      expiresAt: new Date('2026-01-20T00:00:00.000Z'),
+    }));
+    tx.fancyNumberLease.findMany
+      .mockResolvedValueOnce(firstPage)
+      .mockResolvedValueOnce(secondPage)
+      .mockResolvedValueOnce([
+        { id: 'tail', expiresAt: new Date('2026-01-21T00:00:00.000Z') },
+      ]);
+    const expireSpy = jest
+      .spyOn(service, 'expireLease')
+      .mockResolvedValue(true);
+
+    await expect(service.expireDue(now)).resolves.toBe(201);
+
+    expect(expireSpy).toHaveBeenCalledTimes(201);
+    const calls = tx.fancyNumberLease.findMany.mock.calls.map(([args]) => args);
+    expect(calls).toHaveLength(3);
+    const due = { endedAt: null, permanentAt: null, expiresAt: { lte: now } };
+    for (const args of calls) {
+      // 不能再出现 cursor / skip:它们一出现,LIMIT 就从 SQL 里消失。
+      expect(args).not.toHaveProperty('cursor');
+      expect(args).not.toHaveProperty('skip');
+      expect(args.take).toBe(100);
+      expect(args.orderBy).toEqual([{ expiresAt: 'asc' }, { id: 'asc' }]);
+      expect(args.select).toEqual({ id: true, expiresAt: true });
+    }
+    expect(calls[0].where).toEqual(due);
+    expect(calls[1].where).toEqual({
+      ...due,
+      OR: [
+        { expiresAt: { gt: lastOfFirstPage.expiresAt } },
+        { expiresAt: lastOfFirstPage.expiresAt, id: { gt: 'lease-099' } },
+      ],
+    });
+    expect(calls[2].where).toEqual({
+      ...due,
+      OR: [
+        { expiresAt: { gt: new Date('2026-01-20T00:00:00.000Z') } },
+        {
+          expiresAt: new Date('2026-01-20T00:00:00.000Z'),
+          id: { gt: 'late-099' },
+        },
+      ],
+    });
   });
 
   it('restores the reserved account and releases an expired fancy number', async () => {
