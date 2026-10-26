@@ -56,6 +56,17 @@ describe('console event volume migration', () => {
     }
   });
 
+  it('records the first post-join message of a bucket so the funnel is not undercounted', () => {
+    // 漏斗最后一步要「入圈之后」的 MESSAGE_SENT;桶首条早于入圈时,入圈后那条不能被合并掉。
+    // 行为由 test/postgres/console-event-volume.pg-spec.ts 在真库里验证。
+    const body = functionBody(read(), 'circle_console_message_event');
+    expect(body).toMatch(/'MESSAGE_SENT:after-join:'/);
+    expect(body).toMatch(/j\.name = 'GROUP_JOINED'/);
+    expect(body).toMatch(
+      /j\."createdAt" > first_at AND j\."createdAt" <= NEW\."createdAt"/,
+    );
+  });
+
   it('collapses messages per sender per 5-minute bucket without reading the whole row', () => {
     const body = functionBody(read(), 'circle_console_message_event');
     expect(body).not.toMatch(/to_jsonb/);

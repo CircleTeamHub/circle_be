@@ -172,6 +172,49 @@ describePostgres('console event volume triggers', () => {
     ]);
   });
 
+  it('keeps evidence of a message sent after joining a circle inside the same bucket', async () => {
+    // 漏斗最后一步要「入圈之后」的 MESSAGE_SENT。同一桶里先发消息、再入圈、再发消息时,
+    // 桶首条早于入圈,入圈后那条不能被合并掉 —— 否则走完了漏斗的人被算漏。
+    const joinAt = '2026-10-25 12:01:00.000';
+    await insertMessage(db, 'before', 'u1', '2026-10-25 12:00:10.000');
+    await db.query(
+      `INSERT INTO "ConsoleEvent" (id, "userID", name, "createdAt")
+       VALUES ('join-u1', 'u1', 'GROUP_JOINED', $1::timestamp)`,
+      [joinAt],
+    );
+    await insertMessage(db, 'after-1', 'u1', '2026-10-25 12:02:00.000');
+    await insertMessage(db, 'after-2', 'u1', '2026-10-25 12:03:00.000');
+
+    const rows = await events('MESSAGE_SENT');
+    expect(rows.map((row) => [row.entityID, row.at])).toEqual([
+      ['before', '2026-10-25 12:00:10.000'],
+      ['after-1', '2026-10-25 12:02:00.000'],
+    ]);
+    expect(rows.every((row) => /^[a-f0-9]{64}$/.test(row.id))).toBe(true);
+    // 漏斗查询的判定:存在 createdAt >= 入圈时间的 MESSAGE_SENT。
+    const funnel = await db.query<{ n: number }>(
+      `SELECT count(*)::int AS n FROM "ConsoleEvent"
+       WHERE "userID" = 'u1' AND name = 'MESSAGE_SENT' AND "createdAt" >= $1::timestamp`,
+      [joinAt],
+    );
+    expect(funnel.rows[0].n).toBe(1);
+  });
+
+  it('does not add a post-join event when the join precedes the bucket or another user joined', async () => {
+    await db.query(
+      `INSERT INTO "ConsoleEvent" (id, "userID", name, "createdAt") VALUES
+       ('join-early', 'u1', 'GROUP_JOINED', '2026-10-25 12:00:05'),
+       ('join-other', 'u2', 'GROUP_JOINED', '2026-10-25 12:01:00')`,
+    );
+    await insertMessage(db, 'first', 'u1', '2026-10-25 12:00:10.000');
+    await insertMessage(db, 'second', 'u1', '2026-10-25 12:02:00.000');
+
+    // 入圈早于桶首条:桶首条本身就在入圈之后,漏斗已经满足,不必多记。
+    expect((await events('MESSAGE_SENT')).map((row) => row.entityID)).toEqual([
+      'first',
+    ]);
+  });
+
   it('buckets by the message timestamp regardless of the session TimeZone', async () => {
     await db.query(`SET TIME ZONE 'Asia/Shanghai'`);
     await insertMessage(db, 'z1', 'u1', '2026-10-25 12:00:00');
