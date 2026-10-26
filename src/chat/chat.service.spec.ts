@@ -1434,6 +1434,64 @@ describe('ChatService', () => {
       );
     });
 
+    describe('文字加密已停用', () => {
+      const encryptedPayload = () =>
+        sendPayload({
+          type: 'encrypted-text',
+          content: {
+            envelope: { ciphertext: 'opaque', clientMessageId: 'client-msg-1' },
+            signature: 'proof',
+          },
+        });
+
+      it('refuses new encrypted-text messages with a dedicated error code', async () => {
+        prisma.chatMember.findUnique.mockResolvedValue(membership());
+        prisma.chatMessage.findUnique.mockResolvedValue(null);
+
+        await expect(
+          service.sendMessage('u1', encryptedPayload()),
+        ).rejects.toMatchObject({
+          response: { errorCode: ChatErrorCode.TextEncryptionDisabled },
+        });
+        // 被拒的发送不取号、不落库。
+        expect(prisma.chatMessage.create).not.toHaveBeenCalled();
+        expect(prisma.chatConversation.update).not.toHaveBeenCalled();
+      });
+
+      it('still returns an encrypted message that was stored before the switch-off', async () => {
+        // 停用前已经落库、ack 丢了:同一个 d 的重放照旧返回库里那条,不报错。
+        const stored = {
+          ...createdRow,
+          type: 'encrypted-text',
+          content: encryptedPayload().content,
+          requestHash: chatSendRequestHash(encryptedPayload()),
+        };
+        prisma.chatMember.findUnique.mockResolvedValue(membership());
+        prisma.chatMessage.findUnique.mockResolvedValue(stored);
+
+        const result = await service.sendMessage('u1', encryptedPayload());
+
+        expect(result.reused).toBe(true);
+        expect(prisma.chatMessage.create).not.toHaveBeenCalled();
+      });
+
+      it('accepts plain text in a conversation still marked as encrypted', async () => {
+        // 迁移把 MLS_V1 改回 PLAIN;万一有漏网的,也不能让这个会话彻底发不出消息。
+        prisma.$queryRaw.mockResolvedValue([
+          { nextHeight: 3, textEncryption: 'MLS_V1' },
+        ]);
+        prisma.chatMember.findUnique.mockResolvedValue(membership());
+        prisma.chatMessage.findUnique.mockResolvedValue(null);
+        prisma.chatMessage.create.mockResolvedValue(createdRow);
+        prisma.chatConversation.update.mockResolvedValue({});
+
+        const result = await service.sendMessage('u1', sendPayload());
+
+        expect(result.reused).toBe(false);
+        expect(prisma.chatMessage.create).toHaveBeenCalledTimes(1);
+      });
+    });
+
     it('rejects senders that are not members', async () => {
       prisma.chatMember.findUnique.mockResolvedValue(null);
       await expect(service.sendMessage('u1', sendPayload())).rejects.toThrow(
