@@ -455,6 +455,20 @@ groups:
         annotations:
           summary: 'Alloy has continuously retried log delivery for at least 15m'
 
+      # Loki 的日志告警（monitoring/loki/rules/fake/*.yml）由 Loki 自己的 ruler 直接
+      # 发给 Alertmanager，不经过 Prometheus。Alertmanager 没加入 logs 网络、或拒收时，
+      # 这几条告警会一直发不出去，而 Loki 和 Alloy 的抓取照样健康。两个计数只在启用
+      # 了日志 overlay 时存在。
+      - alert: LokiRulerNotificationsFailing
+        expr: |
+          sum(increase(loki_prometheus_notifications_errors_total[10m])) > 0
+          or sum(increase(loki_prometheus_notifications_dropped_total[10m])) > 0
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: 'Loki could not deliver log-based alerts to Alertmanager in the last 10m — is Alertmanager on the logs network?'
+
       # 永远 firing，专门路由到**外部**心跳服务（healthchecks.io 等）。
       #
       # 整套监控栈和被监控对象在同一台机器上：机器宕机、磁盘写满、网络断开时，

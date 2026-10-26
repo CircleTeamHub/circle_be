@@ -921,6 +921,13 @@ if smoke; then
     compose rm -f "$live"
   fi
   echo "==> Release $RELEASE_TAG deployed: $standby is live on $CIRCLE_BE_IMAGE"
+  # 已经在跑的可选运维栈（备份 overlay、监控、日志）跟着这次发布的配置走：告警
+  # 规则、抑制、Loki/Alloy 配置随代码一起改，不同步就永远不会生效。尽力而为 ——
+  # 发版到这里已经完成，同步失败只告警（详见 deploy/sync-ops-stacks.sh）。
+  if [ -r deploy/sync-ops-stacks.sh ]; then
+    bash deploy/sync-ops-stacks.sh ||
+      echo "WARNING: syncing the optional ops stacks failed; see the messages above" >&2
+  fi
 else
   echo "==> Smoke test failed; rolling back to previous version" >&2
   compose logs --tail 100 "$standby" >&2 || true

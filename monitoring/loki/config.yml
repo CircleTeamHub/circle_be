@@ -60,5 +60,21 @@ limits_config:
 querier:
   max_concurrent: 2
 
+# 日志告警（monitoring/loki/rules/fake/*.yml）。发给同一个 Alertmanager，按
+# severity 路由、抑制，与 Prometheus 的告警同一条通道。
+ruler:
+  alertmanager_url: http://alertmanager:9093
+  enable_alertmanager_v2: true
+  enable_api: true
+  evaluation_interval: 1m
+  ring:
+    kvstore:
+      store: inmemory
+  rule_path: /loki/rules-temp
+  storage:
+    type: local
+    local:
+      directory: /etc/loki/rules
+
 analytics:
   reporting_enabled: false

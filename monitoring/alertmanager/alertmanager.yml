@@ -52,10 +52,13 @@ inhibit_rules:
     equal: []
 
   # 后端一个副本都不在 → 5xx/延迟/事件循环/定时任务全部是它的结果。
+  # CaddyProxyErrors 刻意不在里面：它也覆盖 MinIO（/circle/*）和 admin_web 这两个
+  # 上游，后端挂掉时它们的故障别处看不到（ObjectStoreUnreachable 是后端导出的）。
+  # 代价是后端故障时多一条 warning。
   - source_matchers:
       - alertname = "CircleBeNoTarget"
     target_matchers:
-      - alertname =~ "BackendHigh5xx|BackendHighLatencyP95|BackendEventLoopLag|CronJobStalled|CronJobFailing|OutboxBacklogStuck|SessionRevocationOutboxStuck"
+      - alertname =~ "BackendHigh5xx|BackendHighLatencyP95|BackendEventLoopLag|CronJobStalled|CronJobFailing|OutboxBacklogStuck|SessionRevocationOutboxStuck|BackendErrorLogSpike"
     # 这两条规则的标签集没有公共维度（不同 alertname、不同 severity），
     # 所以 equal 留空 —— 只要 source 在 firing 就抑制，不做标签配对。
     equal: []
@@ -117,7 +120,7 @@ inhibit_rules:
   - source_matchers:
       - alertname = "PostgresDown"
     target_matchers:
-      - alertname =~ "CronJobStalled|CronJobFailing|OutboxBacklogStuck|OutboxProbeStale|SessionRevocationOutboxStuck|BackendHigh5xx"
+      - alertname =~ "CronJobStalled|CronJobFailing|OutboxBacklogStuck|OutboxProbeStale|SessionRevocationOutboxStuck|BackendHigh5xx|BackendErrorLogSpike"
     equal: []
 
   # 同一件事已经以 critical 发出去了，就不要再发一遍 warning。
