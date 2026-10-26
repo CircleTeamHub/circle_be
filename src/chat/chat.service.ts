@@ -1,5 +1,4 @@
 import { startReadBurnTimers } from './read-burn-timers';
-import { assertEncryptedTextSend } from 'src/e2ee/e2ee-proof';
 import {
   BadRequestException,
   ConflictException,
@@ -782,10 +781,8 @@ export class ChatService {
       const created = await this.prisma.$transaction(async (tx) => {
         // G-05:会话行锁替 advisory lock —— 同会话串行,跨会话零互扰
         // (hashtext 碰撞让无关会话互等的问题消失),也不再做 MAX(height) 聚合扫描。
-        const counter = await tx.$queryRaw<
-          Array<{ nextHeight: number; textEncryption: string }>
-        >`
-        SELECT "nextHeight", "textEncryption" FROM "ChatConversation"
+        const counter = await tx.$queryRaw<Array<{ nextHeight: number }>>`
+        SELECT "nextHeight" FROM "ChatConversation"
         WHERE "id" = ${effectivePayload.conversationId} FOR UPDATE`;
         if (counter.length === 0) {
           throw new NotFoundException({
@@ -817,18 +814,13 @@ export class ChatService {
           return { row: existing, reused: true };
         }
 
-        if (
-          counter[0].textEncryption === 'MLS_V1' ||
-          effectivePayload.type === 'encrypted-text'
-        ) {
-          await assertEncryptedTextSend(
-            tx,
-            senderUserId,
-            effectivePayload.conversationId,
-            effectivePayload.type,
-            effectivePayload.d,
-            effectivePayload.content,
-          );
+        // 文字加密已停用:新的密文一律拒收,会话上的 textEncryption 也不再限制明文。
+        // 放在幂等查重之后 —— 停用前已经落库的那条,同一个 d 重放照旧返回。
+        if (effectivePayload.type === 'encrypted-text') {
+          throw new BadRequestException({
+            message: '文字加密已停用',
+            errorCode: ChatErrorCode.TextEncryptionDisabled,
+          });
         }
 
         await this.media.lockOwnedKeysForSend(
