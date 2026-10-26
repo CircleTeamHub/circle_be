@@ -66,7 +66,7 @@
     "livekit-server-sdk": "^2.15.4",
     "module-alias": "^2.2.2",
     "nest-winston": "^1.10.2",
-    "nodemailer": "^10.2.1",
+    "nodemailer": "~10.1.7",
     "passport": "^0.7.0",
     "passport-jwt": "^4.0.0",
     "pdfkit": "^0.19.1",

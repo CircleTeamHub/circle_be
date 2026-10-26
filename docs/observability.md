@@ -97,16 +97,21 @@
 
 ### 6. Grafana —— 可视化（不产数据）
 
-连 Prometheus 做大盘。配置自动 provision：Prometheus 数据源 + 三张大盘 ——
+连 Prometheus 做大盘。配置自动 provision：Prometheus 数据源 + 四张大盘 ——
 **「circle_be — RED」**（每路由请求速率 / 5xx 错误率 / p95 延迟 / 进程内存 / 聊天指标）
 和 **「circle_be — Jobs, Queues & Datastores」**（任务心跳滞后与失败率、outbox 积压/死信、
 pg 连接池排队、Postgres 连接与状态、Redis 内存与被拒连接），以及
-**「circle_be — Operations Overview」**（告警状态、抓取目标、告警投递失败、规则执行错误、入口/TLS、主机余量、可选 Alloy 重试与丢弃）。
+**「circle_be — Operations Overview」**（告警状态、抓取目标、告警投递失败、规则执行错误、入口/TLS、主机余量、可选 Alloy 重试与丢弃），以及
+**「circle_be — Deliveries, Dependencies & Business」**（推送与验证码邮件的结果和失败率、对象存储与 LiveKit 请求及可达性、发版异地备份、业务事件、上传预签名、漏网 rejection）。
+
+开了日志 overlay 时，Loki 还按 `monitoring/loki/rules/fake/*.yml` 做日志告警（进程崩溃退出、
+error 日志突增、Caddy 反代失败与证书错误，以及安全事件：猜安全码、批量锁定、吊销令牌重放、
+伪造令牌突增），与 Prometheus 告警走同一个 Alertmanager。
 入口 `:3001`，密码取自 `monitoring/.env`（**没有默认值**，且只在数据卷首次启动时生效 —— 见 monitoring/README.md 的首启动坑）。
 
 ### 7. Alertmanager —— 告警路由（不产数据）
 
-Prometheus 规则越界 → 发给它 → 去重 / 聚合 / 静默 / 路由。当前规则文件有 61 条规则，覆盖
+Prometheus 规则越界 → 发给它 → 去重 / 聚合 / 静默 / 路由。当前规则文件有 62 条规则，覆盖
 接口 RED、漏网的 promise rejection、聊天容量、主机与容器（含磁盘两档与 24 小时趋势、inode 两档、崩溃循环）、
 定时任务与 outbox、备份自检与发版时的异地备份、推送与验证码邮件的失败率、对象存储与 LiveKit 的失败率、
 对象存储可达性、连接池与数据存储、公网探测、监控组件自身故障。
