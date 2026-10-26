@@ -449,11 +449,20 @@ export class CircleService {
       // 招新策略的写与建单方的读串行化:成员锁两边不相交,不加这把的话
       // 「收严已返回成功」之后仍会有读到旧策略的担保单提交进来。
       await this.memberLock.lockPolicy(tx, circleId);
-      // Serialize with ChatCircleSyncService.ensureCircleConversation. The
-      // policy lock alone is different from the sync lock, so without this
-      // shared lock an ensure that already read ACTIVE could re-seat members
-      // after this transaction marks the circle deleted.
-      await tx.$executeRaw`SELECT pg_advisory_xact_lock(${CIRCLE_SYNC_LOCK_NAMESPACE}, hashtext(${circleId}))`;
+      // 这里**不**取座位对账锁 pg_advisory_xact_lock(CIRCLE_SYNC_LOCK_NAMESPACE, …)。
+      //
+      // 它是 166aaac「serialize dissolve with chat reconciliation」落错了函数的那一半
+      // (理由写的是「本事务把圈子标成 deleted 之后」,而 updateCircle 从不写
+      // deleted/adminState —— 对账只读这两列);解散那一半由 e395061 补进了
+      // dissolveCircle。留在这里只剩副作用:本事务开头已经 FOR UPDATE 了会话行,
+      // 对账则是先拿对账锁、再给新成员建座位(外键检查对同一会话行取 FOR KEY
+      // SHARE)—— 两边各持一把等另一把,改设置撞上入圈对账就是 40P01。
+      //
+      // 也不能把它挪到最前面:dissolveCircle 是「成员锁 → 策略锁 → 对账锁」,
+      // 本事务要拿圈主的成员锁,先持对账锁再等成员锁就与解散成环;而会话行锁
+      // 必须先于成员锁/策略锁(GroupService 改角色/踢人、ChatGroupSettingsService
+      // 改群策略都是「会话行 → 成员锁/策略锁」,发消息/清空/退群同口径),
+      // 也不能挪到后面。对账锁对本事务没有要保护的读写,不拿是唯一不成环的形状。
 
       const membership = await tx.circleMember.findUnique({
         where: { userID_circleID: { userID: userId, circleID: circleId } },

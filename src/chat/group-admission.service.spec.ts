@@ -58,7 +58,16 @@ function harness(approval = true) {
         .mockImplementation(
           () => [...seats.values()].filter((s) => !s.leftAt).length,
         ),
-      findMany: jest.fn().mockResolvedValue([{ userID: 'owner' }]),
+      // 批量邀请按 userID IN 读在座座位;审核人列表(reviewers)照旧只有群主。
+      findMany: jest
+        .fn()
+        .mockImplementation(({ where }: any) =>
+          where?.userID?.in
+            ? [...seats.values()]
+                .filter((s) => where.userID.in.includes(s.userID) && !s.leftAt)
+                .map((s) => ({ userID: s.userID }))
+            : [{ userID: 'owner' }],
+        ),
       upsert: jest.fn().mockImplementation(({ where, create, update }: any) => {
         const id = where.conversationID_userID.userID;
         const seat = seats.has(id) ? { ...seats.get(id), ...update } : create;
@@ -72,10 +81,37 @@ function harness(approval = true) {
           if (
             a.expiresAt <= new Date() &&
             ['INVITED', 'PENDING'].includes(a.status) &&
-            a.applicantID === where.applicantID
+            (where.applicantID?.in
+              ? where.applicantID.in.includes(a.applicantID)
+              : a.applicantID === where.applicantID)
           )
             Object.assign(a, data);
       }),
+      findMany: jest
+        .fn()
+        .mockImplementation(({ where }: any) =>
+          [...admissions.values()].filter(
+            (a) =>
+              a.conversationID === where.conversationID &&
+              where.applicantID.in.includes(a.applicantID) &&
+              where.status.in.includes(a.status),
+          ),
+        ),
+      createManyAndReturn: jest.fn().mockImplementation(({ data }: any) =>
+        data.map((row: any) => {
+          const a = {
+            id: `a${admissions.size}`,
+            createdAt: new Date(),
+            acceptedAt: null,
+            updatedAt: new Date(),
+            reason: '',
+            inviterID: null,
+            ...row,
+          };
+          admissions.set(a.id, a);
+          return { id: a.id, applicantID: a.applicantID };
+        }),
+      ),
       findFirst: jest
         .fn()
         .mockImplementation(
@@ -116,6 +152,13 @@ function harness(approval = true) {
     },
     groupAdmissionDelivery: {
       findMany: jest.fn().mockResolvedValue([]),
+      createMany: jest.fn().mockImplementation(({ data }: any) => {
+        for (const row of data) {
+          const key = `${row.admissionID}-${row.recipientID}-${row.event}`;
+          if (!deliveries.has(key)) deliveries.set(key, row);
+        }
+        return { count: data.length };
+      }),
       upsert: jest.fn().mockImplementation(({ create }: any) => {
         deliveries.set(
           `${create.admissionID}-${create.recipientID}-${create.event}`,

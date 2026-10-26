@@ -2,6 +2,13 @@ import { BadRequestException, ForbiddenException } from '@nestjs/common';
 import { createPublicKey, verify } from 'node:crypto';
 import type { Prisma } from 'src/generated/prisma';
 import { ADMIN_ROLE_PERMISSIONS } from 'src/admin-access/admin-permission.guard';
+import {
+  type AuditAdminRow,
+  encryptedSeatCountsQuery,
+  type EncryptedSeatCounts,
+  lockAuditAdminsQuery,
+  lockRoomDevicesQuery,
+} from './e2ee-lock.query';
 
 export function verifyDeviceProof(
   publicKey: string,
@@ -37,33 +44,61 @@ export function verifyDeviceProof(
   }
 }
 
+/**
+ * 审计管理员此刻仍有 IM_READ(账号 ADMIN + ACTIVE + 后台角色含 IM_READ)。
+ *
+ * User / AdminAccess 行的 FOR SHARE 是刻意的:降权、封禁、删管理员都是对这两行的
+ * 普通 UPDATE(FOR NO KEY UPDATE),与 FOR SHARE 冲突 —— 已提交的撤权之后,不能再有
+ * 加密给该管理员审计设备的消息或归档访问按旧权限放行。不能换成 FOR KEY SHARE
+ * (它不与普通 UPDATE 冲突)。原来每个审计设备三到四条语句(两次加锁、读权限及其
+ * include),同一个管理员的多台设备还重复加锁;现在全部管理员一条语句加锁并读回。
+ */
+export async function requireAuditPermissions(
+  tx: Prisma.TransactionClient,
+  userIDs: string[],
+) {
+  const ids = [...new Set(userIDs)];
+  if (!ids.length) return;
+  const admins = new Map(
+    (await tx.$queryRaw<AuditAdminRow[]>(lockAuditAdminsQuery(ids))).map(
+      (row) => [row.id, row],
+    ),
+  );
+  for (const id of ids) {
+    const admin = admins.get(id);
+    if (
+      admin?.role !== 'ADMIN' ||
+      admin.status !== 'ACTIVE' ||
+      !(ADMIN_ROLE_PERMISSIONS[admin.adminRole] ?? []).includes('IM_READ')
+    )
+      throw new ForbiddenException('Administrator read access revoked');
+  }
+}
+
 export async function requireAuditPermission(
   tx: Prisma.TransactionClient,
   userID: string,
 ) {
-  await tx.$queryRaw`SELECT "id" FROM "User" WHERE "id" = ${userID} FOR SHARE`;
-  await tx.$queryRaw`SELECT "userID" FROM "AdminAccess" WHERE "userID" = ${userID} FOR SHARE`;
-  const user = await tx.user.findUnique({
-    where: { id: userID },
-    select: {
-      role: true,
-      status: true,
-      adminAccess: { select: { role: true } },
-    },
-  });
-  if (
-    user?.role !== 'ADMIN' ||
-    user.status !== 'ACTIVE' ||
-    !(ADMIN_ROLE_PERMISSIONS[user.adminAccess?.role ?? ''] ?? []).includes(
-      'IM_READ',
-    )
-  )
-    throw new ForbiddenException('Administrator read access revoked');
+  await requireAuditPermissions(tx, [userID]);
 }
+
+type RoomDeviceRow = {
+  id: string;
+  userID: string;
+  purpose: string;
+  status: string;
+  publicKey: string;
+};
 
 // Called under the existing ChatConversation write lock. Device status locks
 // order a send against device revocation; a stale MLS membership blocks sends
 // until the manager commits removal and advances the epoch.
+//
+// 房间成员与 epoch 的变更(E2eeService 的 commit/移除)都先取同一把会话行
+// FOR UPDATE,所以锁下读到的房间设备集合与 epoch 是稳定的;设备状态与审计管理员
+// 权限不归这把锁管,靠下面的 FOR SHARE 与吊销/降权排出先后(刻意的安全不变式,
+// 保留)。原来锁内约 12 条语句:房间 + 设备 include 两层、设备 FOR SHARE 后再
+// 读一遍设备、每个审计设备三四条、三次 count;现在 4 条。
 export async function assertEncryptedTextSend(
   tx: Prisma.TransactionClient,
   userID: string,
@@ -116,18 +151,16 @@ export async function assertEncryptedTextSend(
     throw new BadRequestException('Invalid encrypted text envelope');
   const room = await tx.e2eeRoom.findUnique({
     where: { conversationID },
-    include: {
-      devices: { where: { removedEpoch: null }, include: { device: true } },
-    },
+    select: { epoch: true },
   });
   if (!room || String(room.epoch) !== e.epoch)
     throw new ForbiddenException(
       'Encryption epoch changed; synchronize before sending',
     );
-  await tx.$queryRaw`SELECT "id" FROM "E2eeDevice" WHERE "id" IN (SELECT "deviceID" FROM "E2eeRoomDevice" WHERE "conversationID" = ${conversationID} AND "removedEpoch" IS NULL) ORDER BY "id" FOR SHARE`;
-  const devices = await tx.e2eeDevice.findMany({
-    where: { id: { in: room.devices.map((seat) => seat.deviceID) } },
-  });
+  // 加锁与读设备合成一条:锁住的行读回的就是最新提交版本,不必锁完再读一遍。
+  const devices = await tx.$queryRaw<RoomDeviceRow[]>(
+    lockRoomDevicesQuery(conversationID),
+  );
   if (devices.some((device) => device.status !== 'ACTIVE'))
     throw new ForbiddenException('Remove revoked devices before sending');
   const sender = devices.find(
@@ -141,7 +174,10 @@ export async function assertEncryptedTextSend(
   const audits = devices.filter((device) => device.purpose === 'AUDIT');
   if (!audits.length)
     throw new ForbiddenException('An authorized audit device must be included');
-  for (const device of audits) await requireAuditPermission(tx, device.userID);
+  await requireAuditPermissions(
+    tx,
+    audits.map((device) => device.userID),
+  );
   const owners = [
     ...new Set(
       devices
@@ -149,15 +185,9 @@ export async function assertEncryptedTextSend(
         .map((device) => device.userID),
     ),
   ];
-  const seats = await tx.chatMember.count({
-    where: { conversationID, userID: { in: owners }, leftAt: null },
-  });
-  const allSeats = await tx.chatMember.count({
-    where: { conversationID, leftAt: null },
-  });
-  const activeOwners = await tx.user.count({
-    where: { id: { in: owners }, status: 'ACTIVE' },
-  });
+  const [{ seats, allSeats, activeOwners }] = await tx.$queryRaw<
+    EncryptedSeatCounts[]
+  >(encryptedSeatCountsQuery(conversationID, owners));
   if (
     seats !== owners.length ||
     allSeats !== owners.length ||

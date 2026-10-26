@@ -30,9 +30,18 @@ describe('ChatService standalone group conversations', () => {
       updateMany: jest.fn(),
     },
     groupAdmission: {
-      create: jest.fn().mockResolvedValue({ id: 'admission-1' }),
+      createManyAndReturn: jest.fn().mockImplementation(({ data }) =>
+        Promise.resolve(
+          data.map((row: { applicantID: string }) => ({
+            id: `admission-${row.applicantID}`,
+            applicantID: row.applicantID,
+          })),
+        ),
+      ),
     },
-    groupAdmissionDelivery: { create: jest.fn() },
+    groupAdmissionDelivery: {
+      createMany: jest.fn().mockResolvedValue({ count: 0 }),
+    },
     chatMessage: { aggregate: jest.fn() },
     user: { findMany: jest.fn(), findUnique: jest.fn(), count: jest.fn() },
     friend: { findMany: jest.fn() },
@@ -227,8 +236,27 @@ describe('ChatService standalone group conversations', () => {
     });
     // 三人各自入房 + 个人事件;建群提示只发一条 group-created,不逐人刷屏。
     expect(broadcast.joinUserToConversation).toHaveBeenCalledTimes(1);
-    expect(prisma.groupAdmission.create).toHaveBeenCalledTimes(2);
-    expect(prisma.groupAdmissionDelivery.create).toHaveBeenCalledTimes(2);
+    // 每位好友一条邀请 + 一条投递,批量写入(原来每人两次 INSERT)。
+    expect(prisma.groupAdmission.createManyAndReturn).toHaveBeenCalledTimes(1);
+    expect(prisma.groupAdmission.createManyAndReturn).toHaveBeenCalledWith({
+      data: ['f1', 'f2'].map((applicantID) => ({
+        conversationID: 'conv-1',
+        applicantID,
+        inviterID: 'owner-1',
+        kind: 'INVITE',
+        status: 'INVITED',
+        expiresAt: expect.any(Date),
+      })),
+      select: { id: true, applicantID: true },
+    });
+    expect(prisma.groupAdmissionDelivery.createMany).toHaveBeenCalledWith({
+      data: ['f1', 'f2'].map((recipientID) => ({
+        admissionID: `admission-${recipientID}`,
+        recipientID,
+        actorID: 'owner-1',
+        event: 'INVITED',
+      })),
+    });
     expect(broadcast.emitConversationChange).toHaveBeenCalledTimes(1);
     expect(systemMessage.emit).toHaveBeenCalledWith('conv-1', {
       kind: 'group-created',

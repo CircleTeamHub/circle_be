@@ -53,6 +53,51 @@ const DELETE_SWEEP_BATCH = 200;
 const DELETE_CLAIM_LEASE_MS = 5 * 60_000;
 const FORWARD_COPY_RESERVATION_MS = 15 * 60_000;
 
+const BURN_GRANT_SELECT = {
+  id: true,
+  deleted: true,
+  revokedAt: true,
+  burnExpiresAt: true,
+  burnDurationSec: true,
+} as const;
+
+type BurnGrantRow = {
+  id: string;
+  deleted: boolean;
+  revokedAt: Date | null;
+  burnExpiresAt: Date | null;
+  burnDurationSec: number | null;
+};
+
+/** 还没开始计时、首次已读会启动计时的消息(与 startReadBurnTimers 的条件一致)。 */
+function isPendingReadBurn(row: BurnGrantRow): boolean {
+  return (
+    !row.deleted &&
+    !row.revokedAt &&
+    !row.burnExpiresAt &&
+    (row.burnDurationSec ?? 0) > 0
+  );
+}
+
+/** 有效期 = min(常规两小时, 截止时间 - 现在);已焚毁/撤回或已到期的不给。 */
+function setBurnGrant(
+  grants: Map<string, { date: Date; ttl: number }>,
+  current: BurnGrantRow,
+  date: Date,
+): void {
+  if (current.deleted || current.revokedAt) return;
+  const deadline =
+    current.burnExpiresAt?.getTime() ??
+    (current.burnDurationSec
+      ? date.getTime() + current.burnDurationSec * 1000
+      : date.getTime());
+  const ttl = Math.min(
+    CHAT_MEDIA_URL_TTL_SECONDS,
+    Math.floor((deadline - date.getTime()) / 1000),
+  );
+  if (ttl > 0) grants.set(current.id, { date, ttl });
+}
+
 @Injectable()
 export class ChatMediaService implements OnModuleDestroy {
   private readonly logger = new Logger(ChatMediaService.name);
@@ -612,53 +657,69 @@ export class ChatMediaService implements OnModuleDestroy {
   }
 
   /**
-   * 就地把 dto.content 换成带签名 URL 的新对象(不改数据库行)。
-   * 存储未配置/签名失败时降级:保留 key、缺 url,前端按占位图处理 ——
-   * 读路径绝不因媒体签名把整页历史打挂。
+   * 焚毁媒体的签名有效期:封顶在消息的权威截止时间之前,已焚毁/撤回的不签。
+   *
+   * 锁只给**待读**的消息(burnDurationSec > 0 但还没开始计时):这类签名按「现在
+   * + 焚毁时长」给,若与首次已读并发、计时先一步启动,签名就会比真实截止时间活得久。
+   * 启动计时先取会话行 FOR UPDATE,这里对涉及的会话行 FOR SHARE,让计时排在签名
+   * 之后(889a6b9 加这把锁就是为此)。
+   *
+   * 已开始计时的消息截止时间写下就不再变(只有 startReadBurnTimers 从 NULL 写一次),
+   * 焚毁/撤回只会让它更早失效,而签名本来就封顶在截止时间之前 —— 不需要锁。原来只要
+   * 页面里有焚毁媒体(群里的焚毁消息落库即开始计时)就对最多 100 个会话行 FOR SHARE,
+   * 既与发送的 FOR UPDATE 互相阻塞,多个读者同时持有还要写 multixact。
    */
   private async burnMediaGrants(
     messages: ChatMessageDto[],
   ): Promise<Map<string, { date: Date; ttl: number }>> {
-    const pending = messages.filter(
+    const burning = messages.filter(
       (message) =>
         !!CHAT_MEDIA_KEY_FIELDS[message.type] &&
         !!(message.burnExpiresAt || message.burnDurationSec),
     );
-    if (!pending.length) return new Map();
-    return this.prisma.$transaction(async (tx) => {
-      const conversations = [
-        ...new Set(pending.map((message) => message.conversationId)),
-      ].sort();
+    const grants = new Map<string, { date: Date; ttl: number }>();
+    if (!burning.length) return grants;
+    // 待读(要锁)的消息 → 所在会话。DTO 上已开始计时的先无锁读权威行;库里若其实
+    // 还是待读(DTO 与库不一致),同样转去持锁那一步。
+    const lockFor = new Map<string, string>();
+    for (const message of burning) {
+      if (!message.burnExpiresAt)
+        lockFor.set(message.id, message.conversationId);
+    }
+    const started = burning.filter((message) => !!message.burnExpiresAt);
+    if (started.length) {
+      const rows = await this.prisma.chatMessage.findMany({
+        where: { id: { in: started.map((message) => message.id) } },
+        select: { ...BURN_GRANT_SELECT, conversationID: true },
+      });
+      const date = new Date();
+      for (const row of rows) {
+        if (isPendingReadBurn(row)) {
+          lockFor.set(row.id, row.conversationID);
+          continue;
+        }
+        setBurnGrant(grants, row, date);
+      }
+    }
+    if (!lockFor.size) return grants;
+    await this.prisma.$transaction(async (tx) => {
+      const conversations = [...new Set(lockFor.values())].sort();
       await tx.$queryRaw`SELECT "id" FROM "ChatConversation" WHERE "id" = ANY(${conversations}::text[]) ORDER BY "id" FOR SHARE`;
       const rows = await tx.chatMessage.findMany({
-        where: { id: { in: pending.map((message) => message.id) } },
-        select: {
-          id: true,
-          deleted: true,
-          revokedAt: true,
-          burnExpiresAt: true,
-          burnDurationSec: true,
-        },
+        where: { id: { in: [...lockFor.keys()] } },
+        select: BURN_GRANT_SELECT,
       });
-      const grants = new Map<string, { date: Date; ttl: number }>();
       const date = new Date();
-      for (const current of rows) {
-        if (current.deleted || current.revokedAt) continue;
-        const deadline =
-          current.burnExpiresAt?.getTime() ??
-          (current.burnDurationSec
-            ? date.getTime() + current.burnDurationSec * 1000
-            : date.getTime());
-        const ttl = Math.min(
-          CHAT_MEDIA_URL_TTL_SECONDS,
-          Math.floor((deadline - date.getTime()) / 1000),
-        );
-        if (ttl > 0) grants.set(current.id, { date, ttl });
-      }
-      return grants;
+      for (const row of rows) setBurnGrant(grants, row, date);
     });
+    return grants;
   }
 
+  /**
+   * 就地把 dto.content 换成带签名 URL 的新对象(不改数据库行)。
+   * 存储未配置/签名失败时降级:保留 key、缺 url,前端按占位图处理 ——
+   * 读路径绝不因媒体签名把整页历史打挂。
+   */
   async attachMediaUrls(messages: ChatMessageDto[]): Promise<void> {
     let burnGrants = new Map<string, { date: Date; ttl: number }>();
     try {

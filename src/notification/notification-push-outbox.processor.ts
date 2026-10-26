@@ -19,37 +19,10 @@ import {
 } from './notification-push.service';
 import { reportOperationalError } from 'src/logging/error-aggregation.service';
 import { sanitizeLogValue } from 'src/logging/log-sanitizer';
+import { pushOutboxFairBatchQuery } from './notification-push-outbox.query';
 
-const BATCH_SIZE = 100;
 const STALE_LOCK_MS = 10 * 60 * 1000;
 
-/**
- * 一次 tick 里，同一个发送者最多占多少个投递名额。
- *
- * 为什么需要这个：出队是 BATCH_SIZE 条/分钟，而一次发圈帖扇出上限 500 人
- * （CIRCLE_POST_PUBLISH_FANOUT_CAP），发帖接口限流是 40 次/15 分钟/IP —— 单个账号
- * 就能以约 1300 条/分钟往队列里灌，比出队快 13 倍。队列按 createdAt 升序取，于是
- * 正常推送（好友请求、评论回复、系统通知）全部排在洪水后面：脚本跑十分钟就能买到
- * 约两小时的全站推送黑屏。
- *
- * 公平调度只改「先发谁」，不提高发送速率 —— 对推送服务商的压力一点没变，因此不存在
- * 被上游限流或封禁的风险。攻击者仍会占满自己的配额，但吃不掉别人的。
- */
-const MAX_PER_SENDER_PER_TICK = 10;
-/**
- * 系统公告一轮的名额，独立于发送者配额。
- *
- * 公告扇出给每个活跃用户建一行，而这些行的 fromUserID 全是同一个管理员，落进
- * 发送者配额里就是「整条公告共用 10 条/轮」—— 10000 人的公告要发约 17 小时。
- * 但公告不是发送者洪水：每一行的收件人都不同，管理员也不是要防的那个角色，
- * 拿发送者配额去套它属于误伤。
- *
- * 所以公告改成**按公告 ID 分区**（同一管理员发的两条公告互不挤占），并给一份
- * 更宽的名额。上限仍然存在而不是完全豁免 —— 豁免的话一条大公告会吃满整批
- * BATCH_SIZE，把好友请求、评论回复挤到公告发完为止，等于把饿死方向调了个头。
- * 取 BATCH_SIZE 的一半：公告按 50 条/轮走，另外一半永远留给日常推送。
- */
-const SYSTEM_ANNOUNCEMENT_ROWS_PER_TICK = BATCH_SIZE / 2;
 /**
  * Push outbox 处理器（#88 重构后）。
  *
@@ -74,45 +47,11 @@ export class NotificationPushOutboxProcessor {
   async processPending(): Promise<number> {
     const now = new Date();
     const staleBefore = new Date(now.getTime() - STALE_LOCK_MS);
-    // 名额分配必须跨**整个**待发队列做,不能先按 createdAt 取一个窗口再在窗口里调度。
-    // 取窗口的话洪水本身就把窗口占满了:一个发送者灌 13000 条之后再来一条正常推送,
-    // 每一轮的候选窗口里都只有洪水发送者,公平调度每分钟只挪走 10 条 ——
-    // 那条正常推送要等约 22 小时,比改之前的纯 FIFO 还慢。
-    // 用 PARTITION BY 按发送者分组排名,每人每轮最多 MAX_PER_SENDER_PER_TICK 条,
-    // 再按名次(而不是时间)取前 BATCH_SIZE —— 名次相同的按时间,于是「每个人的第一条」
-    // 一定先于「任何人的第二条」,新来的发送者立刻能挤进这一轮。
-    const ranked = await this.prisma.$queryRaw<Array<{ id: string }>>`
-      WITH eligible AS (
-        SELECT
-          o."id",
-          o."createdAt",
-          (n."systemAnnouncementID" IS NOT NULL) AS is_announcement,
-          ROW_NUMBER() OVER (
-            PARTITION BY CASE
-              WHEN n."systemAnnouncementID" IS NOT NULL
-                THEN 'announcement:' || n."systemAnnouncementID"
-              ELSE 'sender:' || n."fromUserID"
-            END
-            ORDER BY o."createdAt" ASC, o."id" ASC
-          ) AS rn
-        FROM "NotificationPushOutbox" AS o
-        JOIN "Notification" AS n ON n."id" = o."notificationID"
-        WHERE EXISTS (SELECT 1 FROM "ConsolePushSettings" WHERE id='global' AND enabled)
-          AND ((o."status" = 'PENDING' AND o."nextAttemptAt" <= ${now})
-           OR (o."status" = 'FAILED' AND o."nextAttemptAt" <= ${now})
-           OR (o."status" = 'PROCESSING' AND o."lockedAt" < ${staleBefore}))
-      )
-      SELECT "id"
-      FROM eligible
-      -- 两个分支都是绑定参数,不显式转型的话 Postgres 推不出 CASE 的结果类型
-      -- (两侧都是 unknown),会直接报 could not determine data type。
-      WHERE rn <= CASE
-        WHEN is_announcement THEN ${SYSTEM_ANNOUNCEMENT_ROWS_PER_TICK}::int
-        ELSE ${MAX_PER_SENDER_PER_TICK}::int
-      END
-      ORDER BY rn ASC, "createdAt" ASC, "id" ASC
-      LIMIT ${BATCH_SIZE}
-    `;
+    // 公平分区与配额(每个公告 / 发送者每轮的名额、名次排序)全在这条查询里,
+    // 口径与形状见 notification-push-outbox.query.ts。这里只回 id,再按 id 水合。
+    const ranked = await this.prisma.$queryRaw<Array<{ id: string }>>(
+      pushOutboxFairBatchQuery({ now, staleBefore }),
+    );
     if (ranked.length === 0) return 0;
     const order = new Map(ranked.map((row, index) => [row.id, index]));
     // 只带 Notification 本表列：原来的 9 路 include 每轮并发占 9 个池连接，还把

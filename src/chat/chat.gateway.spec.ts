@@ -45,6 +45,11 @@ function fakeSocket(overrides: Record<string, unknown> = {}) {
   };
 }
 
+/** sendMessage 首次落库、什么任务都没入队时带回的值。 */
+const NOTHING_ENQUEUED = {
+  directAutoReplyJobId: null,
+  supportRechargeJobId: null,
+};
 describe('ChatGateway', () => {
   const jwtService = { verify: jest.fn(), decode: jest.fn() };
   const sessionVerifier = {
@@ -112,9 +117,11 @@ describe('ChatGateway', () => {
   };
   const supportRecharge = {
     processMessage: jest.fn().mockResolvedValue(undefined),
+    processEnqueuedJob: jest.fn().mockResolvedValue(undefined),
   };
   const directAutoReply = {
     processMessage: jest.fn().mockResolvedValue(undefined),
+    processEnqueuedJob: jest.fn().mockResolvedValue(undefined),
   };
   const metrics: jest.Mocked<ChatMetrics> = {
     registry: {} as ChatMetrics['registry'],
@@ -1614,6 +1621,7 @@ describe('ChatGateway', () => {
     it('acks persisted message and broadcasts once', async () => {
       chatService.sendMessage.mockResolvedValue({
         reused: false,
+        enqueuedJobs: NOTHING_ENQUEUED,
         message: { id: 'msg-1', conversationId: 'conv-1', height: 7, d: 'd1' },
       });
       const ack = jest.fn();
@@ -1640,6 +1648,10 @@ describe('ChatGateway', () => {
     it('keeps push and durable follow-up after authorized realtime delivery fails closed', async () => {
       chatService.sendMessage.mockResolvedValue({
         reused: false,
+        enqueuedJobs: {
+          directAutoReplyJobId: 'auto-job-1',
+          supportRechargeJobId: 'recharge-job-1',
+        },
         message: { id: 'msg-1', conversationId: 'conv-1', height: 7, d: 'd1' },
       });
       broadcast.emitMessage.mockRejectedValueOnce(
@@ -1660,16 +1672,87 @@ describe('ChatGateway', () => {
       expect(chatPush.onMessageBroadcast).toHaveBeenCalledWith(
         expect.objectContaining({ id: 'msg-1' }),
       );
+      expect(supportRecharge.processEnqueuedJob).toHaveBeenCalledWith(
+        'recharge-job-1',
+      );
+      expect(directAutoReply.processEnqueuedJob).toHaveBeenCalledWith(
+        'auto-job-1',
+      );
+      // 已知任务 id:不再按消息 id 各查一次任务表。
+      expect(supportRecharge.processMessage).not.toHaveBeenCalled();
+      expect(directAutoReply.processMessage).not.toHaveBeenCalled();
+    });
+
+    // 原来每条消息(含群消息)都无条件按消息 id 各查一次两张任务表。
+    it('kicks nothing when the send enqueued no job', async () => {
+      chatService.sendMessage.mockResolvedValue({
+        reused: false,
+        enqueuedJobs: NOTHING_ENQUEUED,
+        message: { id: 'msg-g', conversationId: 'grp', height: 3, d: 'd1' },
+      });
+      await gateway['handleSend'](
+        fakeSocket() as never,
+        'u1',
+        payload as never,
+        jest.fn(),
+      );
+      for (const processor of [supportRecharge, directAutoReply]) {
+        expect(processor.processMessage).not.toHaveBeenCalled();
+        expect(processor.processEnqueuedJob).not.toHaveBeenCalled();
+      }
+    });
+
+    it('kicks only the job that was actually enqueued', async () => {
+      chatService.sendMessage.mockResolvedValue({
+        reused: false,
+        enqueuedJobs: {
+          directAutoReplyJobId: null,
+          supportRechargeJobId: 'recharge-job-1',
+        },
+        message: { id: 'msg-1', conversationId: 'conv-1', height: 7, d: 'd1' },
+      });
+      await gateway['handleSend'](
+        fakeSocket() as never,
+        'u1',
+        payload as never,
+        jest.fn(),
+      );
+      expect(supportRecharge.processEnqueuedJob).toHaveBeenCalledWith(
+        'recharge-job-1',
+      );
+      expect(directAutoReply.processEnqueuedJob).not.toHaveBeenCalled();
+      expect(directAutoReply.processMessage).not.toHaveBeenCalled();
+    });
+
+    // 幂等重发不知道首次发送入了什么:按消息 id 兜底查一次,首次发送若恰好在
+    // 提交与 kick 之间宕机,重发能立刻补上。
+    it('falls back to a lookup by message id for a direct idempotent replay', async () => {
+      chatService.sendMessage.mockResolvedValue({
+        reused: true,
+        enqueuedJobs: null,
+        message: { id: 'msg-1', conversationId: 'conv-1', height: 7, d: 'd1' },
+      });
+      await gateway['handleSend'](
+        fakeSocket() as never,
+        'u1',
+        payload as never,
+        jest.fn(),
+      );
       expect(supportRecharge.processMessage).toHaveBeenCalledWith('msg-1');
       expect(directAutoReply.processMessage).toHaveBeenCalledWith('msg-1');
+      expect(supportRecharge.processEnqueuedJob).not.toHaveBeenCalled();
     });
 
     it('keeps the successful ack and redacts an immediate auto-reply kick failure', async () => {
       chatService.sendMessage.mockResolvedValue({
         reused: false,
+        enqueuedJobs: {
+          directAutoReplyJobId: 'auto-job-1',
+          supportRechargeJobId: null,
+        },
         message: { id: 'msg-1', conversationId: 'conv-1', height: 7, d: 'd1' },
       });
-      directAutoReply.processMessage.mockRejectedValueOnce(
+      directAutoReply.processEnqueuedJob.mockRejectedValueOnce(
         new Error('private message body for user u2'),
       );
       const warn = jest
@@ -1700,6 +1783,7 @@ describe('ChatGateway', () => {
     it('does not rebroadcast idempotent replays', async () => {
       chatService.sendMessage.mockResolvedValue({
         reused: true,
+        enqueuedJobs: null,
         message: { id: 'msg-1', conversationId: 'conv-1', height: 7, d: 'd1' },
       });
       const ack = jest.fn();
@@ -1804,6 +1888,7 @@ describe('ChatGateway', () => {
     it('rate limits per authenticated user with an explicit ack code', async () => {
       chatService.sendMessage.mockResolvedValue({
         reused: false,
+        enqueuedJobs: NOTHING_ENQUEUED,
         message: { id: 'm', conversationId: 'conv-1', height: 1, d: 'd' },
       });
       const socket = fakeSocket({ id: 'flooder' });
@@ -1829,6 +1914,7 @@ describe('ChatGateway', () => {
     it('keeps the budget across reconnects (a new socket does not reset it)', async () => {
       chatService.sendMessage.mockResolvedValue({
         reused: false,
+        enqueuedJobs: NOTHING_ENQUEUED,
         message: { id: 'm', conversationId: 'conv-1', height: 1, d: 'd' },
       });
       for (let i = 0; i < 20; i += 1) {
@@ -1858,6 +1944,7 @@ describe('ChatGateway', () => {
     it('survives a missing ack callback', async () => {
       chatService.sendMessage.mockResolvedValue({
         reused: false,
+        enqueuedJobs: NOTHING_ENQUEUED,
         message: { id: 'msg-1', conversationId: 'conv-1', height: 7, d: 'd1' },
       });
       await expect(
@@ -1899,6 +1986,7 @@ describe('ChatGateway', () => {
       it('still lets a guest send plain text', async () => {
         chatService.sendMessage.mockResolvedValue({
           reused: false,
+          enqueuedJobs: NOTHING_ENQUEUED,
           message: {
             id: 'msg-g',
             conversationId: 'conv-9',
@@ -1922,6 +2010,7 @@ describe('ChatGateway', () => {
       it('does not narrow the type list for an app member', async () => {
         chatService.sendMessage.mockResolvedValue({
           reused: false,
+          enqueuedJobs: NOTHING_ENQUEUED,
           message: {
             id: 'msg-m',
             conversationId: 'conv-1',

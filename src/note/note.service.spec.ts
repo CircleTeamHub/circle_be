@@ -105,6 +105,78 @@ describe('NoteService', () => {
   };
 
   const chatService = { requireVisibleMessage: jest.fn() };
+
+  const isPlainObject = (value: unknown): value is Record<string, any> =>
+    Boolean(value && typeof value === 'object' && !Array.isArray(value));
+  /**
+   * 列表摘要投影（note-summary.query.ts）在单测里的替身：从 note.findMany 桩返回过的
+   * 「整行」夹具按同一口径推出投影行，夹具仍是唯一的数据来源。真实 SQL 的口径由
+   * test/postgres/note-list-summary.pg-spec.ts 在真库上与原实现逐字段对照。
+   */
+  const summaryProjectionFromFixture = (id: string, row: any) => {
+    const sections = isPlainObject(row?.sections) ? row.sections : {};
+    const text = isPlainObject(sections.text) ? sections.text : {};
+    const items = (name: string): unknown[] | null => {
+      const section = sections[name];
+      return isPlainObject(section) && Array.isArray(section.items)
+        ? section.items
+        : null;
+    };
+    const blocks = Array.isArray(text.contentJson)
+      ? text.contentJson
+      : Array.isArray(row?.contentJson)
+        ? row.contentJson
+        : null;
+    const media: any[] = row?.media ?? [];
+    const images = [...media]
+      .filter((item) => item.type === 'IMAGE')
+      .sort((a, b) => a.sortOrder - b.sortOrder);
+    const chosen =
+      row?.coverMedia?.type === 'IMAGE'
+        ? (media.find((item) => item.id === row.coverMedia.id) ?? {
+            ...row.coverMedia,
+            objectKey: null,
+            noteID: null,
+          })
+        : null;
+    const cover = chosen ?? images[0] ?? null;
+    return {
+      id,
+      contentHead:
+        typeof row?.content === 'string'
+          ? Array.from(row.content as string)
+              .slice(0, 1024)
+              .join('')
+          : null,
+      sectionTextHasText:
+        typeof text.content === 'string' ? text.content.trim() !== '' : null,
+      hasJsonText: blocks ? blocks.some(isPlainObject) : false,
+      showcaseCount:
+        items('showcase')?.length ?? (items('media') ? 0 : images.length),
+      contactItems: items('contacts'),
+      groupItems: items('groups'),
+      hasLocation: isPlainObject(sections.location),
+      coverId: cover?.id ?? null,
+      coverType: cover?.type ?? null,
+      coverUrl: cover?.url ?? null,
+      coverObjectKey: cover?.objectKey ?? null,
+      coverNoteID: cover ? (cover.noteID === null ? null : id) : null,
+    };
+  };
+  const listFixture = async (id: string) => {
+    for (const result of prisma.note.findMany.mock.results) {
+      if (result.type !== 'return') continue;
+      const rows: unknown = await Promise.resolve(result.value).catch(
+        () => null,
+      );
+      if (!Array.isArray(rows)) continue;
+      const row = rows.find(
+        (candidate) => candidate?.id === id && 'title' in candidate,
+      );
+      if (row) return row;
+    }
+    return null;
+  };
   const uploadService = {
     uploadBuffer: jest.fn(),
     downloadObjectBuffer: jest.fn(),
@@ -173,6 +245,17 @@ describe('NoteService', () => {
         const sql = Array.isArray(query)
           ? query.join('?')
           : (query as Prisma.Sql).sql;
+        // 列表摘要投影：按这一页的 id 从夹具推出来。
+        if (sql.includes('jsonb_to_record')) {
+          const ids = (query as Prisma.Sql).values.find(
+            Array.isArray,
+          ) as string[];
+          return Promise.all(
+            ids.map(async (id) =>
+              summaryProjectionFromFixture(id, await listFixture(id)),
+            ),
+          );
+        }
         // 编辑笔记在事务内锁读笔记行（FOR UPDATE），沿用 findFirst 桩的调用顺序。
         if (sql.includes('FROM "Note"')) {
           const note = await prisma.note.findFirst();
@@ -1542,6 +1625,141 @@ describe('NoteService', () => {
 
     await expect(service.listNotes('user-1', {})).rejects.toMatchObject({
       status: 503,
+    });
+  });
+
+  // 列表摘要只取标量列，派生字段走 SQL 投影；摘要里唯一的媒体 url 是封面，只签它。
+  describe('list summaries without full rows', () => {
+    const mediaRow = (id: string, type: string, sortOrder: number) => ({
+      id,
+      type,
+      objectKey: `notes/user-1/${id}.jpg`,
+      url: `https://api.example.com/circle/notes/user-1/${id}.jpg`,
+      posterUrl:
+        type === 'VIDEO'
+          ? `https://api.example.com/circle/notes/user-1/${id}-poster.jpg`
+          : null,
+      sortOrder,
+    });
+    const richRow = {
+      ...listRow(0),
+      content: '正文',
+      media: [
+        mediaRow('img-0', 'IMAGE', 0),
+        mediaRow('vid-1', 'VIDEO', 1),
+        mediaRow('img-2', 'IMAGE', 2),
+      ],
+      sections: {
+        showcase: {
+          items: [
+            {
+              url: 'https://api.example.com/circle/notes/user-1/extra.jpg',
+              objectKey: 'notes/user-1/extra.jpg',
+            },
+          ],
+        },
+      },
+    };
+
+    it('selects only summary columns and signs only the cover', async () => {
+      prisma.note.findMany.mockResolvedValueOnce([richRow]);
+
+      const [item] = (await service.listNotes('user-1', {})).items;
+
+      const args = prisma.note.findMany.mock.calls[0][0];
+      expect(args.include).toBeUndefined();
+      for (const heavy of ['content', 'contentJson', 'sections', 'media']) {
+        expect(args.select).not.toHaveProperty(heavy);
+      }
+      expect(uploadService.createPresignedGetUrl).toHaveBeenCalledTimes(1);
+      expect(uploadService.createPresignedGetUrl.mock.calls[0][0]).toBe(
+        'notes/user-1/img-0.jpg',
+      );
+      expect(item.cover).toEqual({
+        id: 'img-0',
+        type: 'IMAGE',
+        url: expect.stringContaining(
+          'https://signed.example.com/notes/user-1/img-0.jpg',
+        ),
+      });
+      expect(item.showcaseCount).toBe(1);
+    });
+
+    it.each([
+      ['listDeletedNotes', () => service.listDeletedNotes('user-1')],
+      [
+        'resolveShareLink',
+        () => {
+          prisma.noteShareLink.findUnique.mockResolvedValueOnce({
+            ownerID: 'user-1',
+            token: 'tok',
+            title: 't',
+            status: null,
+            group: null,
+            groupID: null,
+            search: null,
+            noteIDs: [],
+            expiresAt: null,
+            revokedAt: null,
+          });
+          return service.resolveShareLink('tok');
+        },
+      ],
+    ])('%s uses the same summary-only select', async (_name, run) => {
+      prisma.note.findMany.mockResolvedValueOnce([richRow]);
+
+      await run();
+
+      const args = prisma.note.findMany.mock.calls[0][0];
+      expect(args.include).toBeUndefined();
+      expect(args.select).toEqual(
+        expect.objectContaining({ id: true, title: true, updatedAt: true }),
+      );
+      expect(args.select).not.toHaveProperty('content');
+      expect(uploadService.createPresignedGetUrl).toHaveBeenCalledTimes(1);
+    });
+
+    it('reads the full content only when the head cannot decide the preview', async () => {
+      const longHead = ' '.repeat(1024);
+      prisma.note.findMany.mockResolvedValueOnce([listRow(0), listRow(1)]);
+      prisma.$queryRaw.mockImplementationOnce(async () => [
+        {
+          ...summaryProjectionFromFixture('note-0', null),
+          contentHead: longHead,
+        },
+        {
+          ...summaryProjectionFromFixture('note-1', null),
+          contentHead: `${'字'.repeat(1024)}`,
+        },
+      ]);
+      prisma.note.findMany.mockResolvedValueOnce([
+        { id: 'note-0', content: `${longHead}${'\n'.repeat(10)}结尾的正文` },
+      ]);
+
+      const { items } = await service.listNotes('user-1', {});
+
+      expect(prisma.note.findMany).toHaveBeenCalledWith({
+        where: { id: { in: ['note-0'] } },
+        select: { id: true, content: true },
+      });
+      expect(items[0]).toMatchObject({
+        contentPreview: '结尾的正文',
+        hasText: true,
+      });
+      // 开头 1024 个字已经够定出预览：不补读，截到 120 个字加省略号。
+      expect(items[1].contentPreview).toBe(`${'字'.repeat(120)}...`);
+    });
+
+    it('drops a note that was purged between the page read and its projection', async () => {
+      prisma.note.findMany.mockResolvedValueOnce([listRow(0), listRow(1)]);
+      prisma.$queryRaw.mockImplementationOnce(async () => [
+        summaryProjectionFromFixture('note-1', null),
+      ]);
+
+      const { items, hasMore } = await service.listNotes('user-1', {});
+
+      expect(items.map((item) => item.id)).toEqual(['note-1']);
+      expect(hasMore).toBe(false);
     });
   });
 

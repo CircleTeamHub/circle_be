@@ -137,6 +137,69 @@ describe('ChatMediaService', () => {
       deadline.getTime(),
     );
   });
+  // 已开始计时的截止时间不会再变:不开事务、不对会话行 FOR SHARE(不再与发送的
+  // FOR UPDATE 互相阻塞),只读一次权威行。
+  it('signs started-timer media without a transaction or a conversation lock', async () => {
+    const deadline = new Date(Date.now() + 15_000);
+    prisma.chatMessage.findMany.mockResolvedValue([
+      {
+        id: 'm1',
+        conversationID: 'c1',
+        deleted: false,
+        revokedAt: null,
+        burnDurationSec: 60,
+        burnExpiresAt: deadline,
+      },
+    ]);
+    await service.attachMediaUrls([
+      dto({
+        type: 'image',
+        burnDurationSec: 60,
+        burnExpiresAt: deadline.toISOString(),
+        content: { key: 'chat/u1/a.jpg' },
+      }),
+    ]);
+    expect(prisma.$transaction).not.toHaveBeenCalled();
+    expect(prisma.$queryRaw).not.toHaveBeenCalled();
+    const [, ttl] = uploadService.createPresignedGetUrl.mock.calls[0];
+    expect(ttl).toBeLessThanOrEqual(15);
+  });
+  it('falls back to the locked check when the stored row is still pending read', async () => {
+    prisma.chatMessage.findMany
+      .mockResolvedValueOnce([
+        {
+          id: 'm1',
+          conversationID: 'c9',
+          deleted: false,
+          revokedAt: null,
+          burnDurationSec: 60,
+          burnExpiresAt: null,
+        },
+      ])
+      .mockResolvedValueOnce([
+        {
+          id: 'm1',
+          deleted: false,
+          revokedAt: null,
+          burnDurationSec: 60,
+          burnExpiresAt: null,
+        },
+      ]);
+    await service.attachMediaUrls([
+      dto({
+        type: 'image',
+        burnDurationSec: 60,
+        burnExpiresAt: new Date(Date.now() + 60_000).toISOString(),
+        content: { key: 'chat/u1/a.jpg' },
+      }),
+    ]);
+    expect(prisma.$transaction).toHaveBeenCalledTimes(1);
+    const [strings, conversations] = prisma.$queryRaw.mock.calls[0];
+    expect(strings.join(' ')).toContain('FOR SHARE');
+    expect(conversations).toEqual(['c9']);
+    const [, ttl] = uploadService.createPresignedGetUrl.mock.calls[0];
+    expect(ttl).toBe(60);
+  });
   it('strips a previously issued URL when the authoritative message already burned', async () => {
     prisma.chatMessage.findMany.mockResolvedValue([
       { id: 'm1', deleted: true },

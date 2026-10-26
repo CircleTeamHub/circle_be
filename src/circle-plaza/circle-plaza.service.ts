@@ -35,7 +35,6 @@ import {
   encodeFeedCursor,
   feedCursorWhere,
 } from 'src/utils/feed-cursor';
-import { runSerializableTransaction } from 'src/utils/prisma-tx';
 import {
   CreatePlazaPostDto,
   MyCirclePostDto,
@@ -381,12 +380,6 @@ export class CirclePlazaService {
           include: PLAZA_POST_INCLUDE,
         });
 
-        // 每个圈子的 postCount 都 +1。
-        await tx.circle.updateMany({
-          where: { id: { in: circleIds } },
-          data: { postCount: { increment: 1 } },
-        });
-
         const notifications =
           await this.notificationService.createCirclePostPublishedNotifications(
             tx,
@@ -396,6 +389,15 @@ export class CirclePlazaService {
               recipientIds: publishRecipientIds,
             },
           );
+
+        // 每个圈子的 postCount 都 +1。必须是事务里最后一条写:这条 UPDATE 给 Circle
+        // 行加的行锁要持有到提交,而入圈占座、改设置、别人发帖都要写这一行。排在
+        // 扇出(≤500 条通知 + ≤500 条推送 outbox)之前的话,整段扇出期间这一行都被占着。
+        // 建帖与关联表的外键检查只拿 FOR KEY SHARE,不挡别人更新圈子的普通列。
+        await tx.circle.updateMany({
+          where: { id: { in: circleIds } },
+          data: { postCount: { increment: 1 } },
+        });
 
         return { post: created, publishedNotifications: notifications };
       },
@@ -873,172 +875,150 @@ export class CirclePlazaService {
     userId: string,
     postId: string,
   ): Promise<{ signed: boolean; signupCount: number }> {
-    // 报名资格门槛（signup*Restriction）独立于帖子查看/互动门槛
-    // （vipRestriction 等）；后者由 checkCanInteract 管，此处只看 signup* 字段。
-    const post = await this.prisma.circlePost.findFirst({
-      where: {
-        ...this.activeUnexpiredPostWhere(),
-        id: postId,
-        circleLinks: { some: { circle: { deleted: false } } },
-      },
-      select: {
-        id: true,
-        authorID: true,
-        circleID: true,
-        signupVipRestriction: true,
-        signupCreditRestriction: true,
-        signupFancyRestriction: true,
-        circleLinks: {
-          where: { circle: this.memberCircleScope(userId) },
-          select: { id: true },
-          take: 1,
-        },
-      },
-    });
-    if (!post) {
-      throw new NotFoundException({
-        message: 'Post not found',
-        errorCode: PlazaErrorCode.PostNotFound,
-      });
-    }
-
-    // The author manages signups for their own post and never signs up for it.
-    if (post.authorID === userId) {
-      throw new ForbiddenException({
-        message: '不能给自己发布的帖子报名',
-        errorCode: PlazaErrorCode.SignupSelf,
-      });
-    }
-
-    // Fast-path pre-check; the unique constraint inside the transaction is the
-    // real guard against concurrent double-taps (see catch block below).
-    const existing = await this.prisma.circlePostSignup.findUnique({
-      where: { postID_userID: { postID: postId, userID: userId } },
-      select: { id: true },
-    });
-    if (existing) {
-      const current = await this.prisma.circlePost.findUnique({
-        where: { id: postId },
-        select: { signupCount: true },
-      });
-      return { signed: true, signupCount: current?.signupCount ?? 0 };
-    }
-
-    if (post.circleLinks.length === 0) {
-      throw new NotFoundException({
-        message: 'Post not found',
-        errorCode: PlazaErrorCode.PostNotFound,
-      });
-    }
-
-    // 报名资格校验（独立于帖子查看限制 vipRestriction，仅看 signup* 门槛）
-    const viewer = await this.prisma.user.findUnique({
-      where: { id: userId },
-      select: {
-        vipLevel: true,
-        vipExpiresAt: true,
-        creditScore: true,
-        fancyNumber: true,
-        fancyNumberExpiresAt: true,
-        fancyNumberPermanent: true,
-      },
-    });
-    const entitlementNow = new Date();
-    const viewerEntitlements: ViewerEntitlements | null = viewer
-      ? {
-          membershipLevel: (
-            await this.membershipPolicy.resolveEntitlement(
-              viewer,
-              this.prisma,
-              entitlementNow,
-            )
-          ).level,
-          creditScore: viewer.creditScore,
-          fancyNumber: resolveEffectiveFancyNumber(viewer, entitlementNow),
-        }
-      : null;
-    this.assertSignupMembership(viewerEntitlements);
-    if (!this.checkCanSignup(post, viewerEntitlements)) {
-      throw new ForbiddenException({
-        message: '您的等级不满足该帖子的报名要求',
-        errorCode: PlazaErrorCode.SignupIneligible,
-      });
-    }
-
-    let updated: { signupCount: number };
+    // 报名没有人数上限(CirclePost 上没有名额列),原来的 Serializable 防的不是超卖,
+    // 而是让「帖子仍可报名 + 本人仍可报名」的判断与写入在同一个快照里成立。代价是
+    // 热门帖上的并发报名全都写同一行 signupCount:快照早于彼此提交,后写的一律
+    // 40001,重试也一起撞。
+    //
+    // 现在整笔走读已提交,判断只读一次(原来事务外读一遍、事务内再读一遍);计数用
+    // 一条带帖子状态条件的原子自增收尾 —— 并发报名在这一行的行锁上排队,不再互相
+    // 回滚。帖子在报名途中被删除/结束/过期时,PostgreSQL 在拿到行锁后按最新版本
+    // 重算 WHERE,条件落空 → 整笔回滚(报名行一起撤掉),与原来「冲突 → 重试 →
+    // 读到已删除 → 404」结果相同。报名门槛(signup*Restriction)建帖后不可改,
+    // 不需要随行锁重判;成员身份照旧在事务内读,与退圈之间没有写-写交集,原来的
+    // Serializable 对它也只给出同样的串行顺序。
+    let result: {
+      created: boolean;
+      signupCount: number;
+      authorID: string;
+    };
     try {
-      updated = await runSerializableTransaction(this.prisma, async (tx) => {
-        const stillAuthorized = await tx.circlePost.findFirst({
-          where: {
-            ...this.activeUnexpiredPostWhere(),
-            id: postId,
-            circleLinks: {
-              some: { circle: this.memberCircleScope(userId) },
+      result = await this.prisma.$transaction(
+        async (tx) => {
+          const now = new Date();
+          // 报名资格门槛（signup*Restriction）独立于帖子查看/互动门槛
+          // （vipRestriction 等）；后者由 checkCanInteract 管，此处只看 signup* 字段。
+          const post = await tx.circlePost.findFirst({
+            where: {
+              ...this.activeUnexpiredPostWhere(now),
+              id: postId,
+              circleLinks: { some: { circle: { deleted: false } } },
             },
-          },
-          select: {
-            id: true,
-            signupVipRestriction: true,
-            signupCreditRestriction: true,
-            signupFancyRestriction: true,
-          },
-        });
-        if (!stillAuthorized) {
-          throw new NotFoundException({
-            message: 'Post not found',
-            errorCode: PlazaErrorCode.PostNotFound,
+            select: {
+              id: true,
+              authorID: true,
+              circleID: true,
+              signupCount: true,
+              signupVipRestriction: true,
+              signupCreditRestriction: true,
+              signupFancyRestriction: true,
+              circleLinks: {
+                where: { circle: this.memberCircleScope(userId) },
+                select: { id: true },
+                take: 1,
+              },
+            },
           });
-        }
+          if (!post) {
+            throw new NotFoundException({
+              message: 'Post not found',
+              errorCode: PlazaErrorCode.PostNotFound,
+            });
+          }
 
-        const authoritativeViewer = await tx.user.findUnique({
-          where: { id: userId },
-          select: {
-            vipLevel: true,
-            vipExpiresAt: true,
-            creditScore: true,
-            fancyNumber: true,
-            fancyNumberExpiresAt: true,
-            fancyNumberPermanent: true,
-          },
-        });
-        const authoritativeNow = new Date();
-        const authoritativeEntitlements: ViewerEntitlements | null =
-          authoritativeViewer
+          // The author manages signups for their own post and never signs up for it.
+          if (post.authorID === userId) {
+            throw new ForbiddenException({
+              message: '不能给自己发布的帖子报名',
+              errorCode: PlazaErrorCode.SignupSelf,
+            });
+          }
+
+          // Fast-path pre-check; the unique constraint below is the real guard
+          // against concurrent double-taps (see catch block below). 已报名在
+          // 成员校验之前返回:退圈后再点一次报名仍是幂等成功。
+          const existing = await tx.circlePostSignup.findUnique({
+            where: { postID_userID: { postID: postId, userID: userId } },
+            select: { id: true },
+          });
+          if (existing) {
+            return {
+              created: false,
+              signupCount: post.signupCount,
+              authorID: post.authorID,
+            };
+          }
+
+          if (post.circleLinks.length === 0) {
+            throw new NotFoundException({
+              message: 'Post not found',
+              errorCode: PlazaErrorCode.PostNotFound,
+            });
+          }
+
+          // 报名资格校验（独立于帖子查看限制 vipRestriction，仅看 signup* 门槛）。
+          // lockForWrite: 与会员计划开放串行,门槛判定不能落在过期的 rollout floor 上。
+          const viewer = await tx.user.findUnique({
+            where: { id: userId },
+            select: {
+              vipLevel: true,
+              vipExpiresAt: true,
+              creditScore: true,
+              fancyNumber: true,
+              fancyNumberExpiresAt: true,
+              fancyNumberPermanent: true,
+            },
+          });
+          const entitlementNow = new Date();
+          const viewerEntitlements: ViewerEntitlements | null = viewer
             ? {
                 membershipLevel: (
                   await this.membershipPolicy.resolveEntitlement(
-                    authoritativeViewer,
+                    viewer,
                     tx,
-                    authoritativeNow,
+                    entitlementNow,
                     { lockForWrite: true },
                   )
                 ).level,
-                creditScore: authoritativeViewer.creditScore,
+                creditScore: viewer.creditScore,
                 fancyNumber: resolveEffectiveFancyNumber(
-                  authoritativeViewer,
-                  authoritativeNow,
+                  viewer,
+                  entitlementNow,
                 ),
               }
             : null;
-        this.assertSignupMembership(authoritativeEntitlements);
-        if (!this.checkCanSignup(stillAuthorized, authoritativeEntitlements)) {
-          throw new ForbiddenException({
-            message: '您的等级不满足该帖子的报名要求',
-            errorCode: PlazaErrorCode.SignupIneligible,
-          });
-        }
+          this.assertSignupMembership(viewerEntitlements);
+          if (!this.checkCanSignup(post, viewerEntitlements)) {
+            throw new ForbiddenException({
+              message: '您的等级不满足该帖子的报名要求',
+              errorCode: PlazaErrorCode.SignupIneligible,
+            });
+          }
 
-        await tx.circlePostSignup.create({
-          data: { postID: postId, userID: userId },
-        });
-        // signupCount 是去规范化的软缓存；报名行的 COUNT(*) 才是真实来源。
-        const p = await tx.circlePost.update({
-          where: { id: postId },
-          data: { signupCount: { increment: 1 } },
-          select: { signupCount: true },
-        });
-        return p;
-      });
+          await tx.circlePostSignup.create({
+            data: { postID: postId, userID: userId },
+          });
+          // signupCount 是去规范化的软缓存；报名行的 COUNT(*) 才是真实来源。
+          // 条件与上面的可见性读同一个 now:行锁等到之后按最新版本重判。
+          const [counted] = await tx.circlePost.updateManyAndReturn({
+            where: { ...this.activeUnexpiredPostWhere(now), id: postId },
+            data: { signupCount: { increment: 1 } },
+            select: { signupCount: true },
+          });
+          if (!counted) {
+            throw new NotFoundException({
+              message: 'Post not found',
+              errorCode: PlazaErrorCode.PostNotFound,
+            });
+          }
+          return {
+            created: true,
+            signupCount: counted.signupCount,
+            authorID: post.authorID,
+          };
+        },
+        { isolationLevel: Prisma.TransactionIsolationLevel.ReadCommitted },
+      );
     } catch (error) {
       // Two concurrent requests can both pass the pre-check; the loser hits the
       // unique constraint (P2002). Treat it as "already signed up" and stay
@@ -1053,25 +1033,32 @@ export class CirclePlazaService {
       throw error;
     }
 
+    if (!result.created) {
+      return { signed: true, signupCount: result.signupCount };
+    }
+
     // Best-effort: the signup is persisted and idempotent on retry, so a
     // realtime failure must not turn this into a 500. Only the post author has a
     // signup-management badge to refresh (self-signup is rejected above).
     try {
-      await this.realtime.broadcastSignupUnread(post.authorID);
+      await this.realtime.broadcastSignupUnread(result.authorID);
       const notification =
         await this.notificationService.createCirclePostSignupNotification({
-          toUserId: post.authorID,
+          toUserId: result.authorID,
           fromUserId: userId,
           postId,
         });
       if (notification) {
-        await this.realtime.broadcastInteractionUnread(post.authorID);
-        this.realtime.broadcastNotificationCreated(post.authorID, notification);
+        await this.realtime.broadcastInteractionUnread(result.authorID);
+        this.realtime.broadcastNotificationCreated(
+          result.authorID,
+          notification,
+        );
       }
     } catch {
       // swallow: write is authoritative
     }
-    return { signed: true, signupCount: updated.signupCount };
+    return { signed: true, signupCount: result.signupCount };
   }
 
   private prismaErrorCode(error: unknown): string | undefined {

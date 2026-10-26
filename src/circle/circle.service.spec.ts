@@ -1700,6 +1700,27 @@ describe('CircleService', () => {
       expect(chatSystemMessage.insertSystemMessageInTx).not.toHaveBeenCalled();
     });
 
+    // 会话行锁在前、对账锁在后会与 ensureCircleConversation(对账锁 → 建座位时对
+    // 会话行取 FOR KEY SHARE)成环;updateCircle 不写 deleted/adminState,对账锁
+    // 对它没有要保护的东西(真库并发用例:test/postgres/circle-tx-update-sync)。
+    it('never takes the circle seat reconciliation lock', async () => {
+      prisma.circleMember.findUnique.mockResolvedValue({
+        role: 'OWNER',
+        status: 'ACTIVE',
+      });
+
+      await service.updateCircle('owner-1', 'circle-1', {
+        name: '不与对账成环',
+        memberCanInvite: false,
+      } as UpdateCircleDto);
+
+      const syncLocks = prisma.$executeRaw.mock.calls.filter(
+        (call: unknown[]) => call[1] === CIRCLE_SYNC_LOCK_NAMESPACE,
+      );
+      expect(syncLocks).toEqual([]);
+      expect(memberLock.lockPolicy).toHaveBeenCalledWith(prisma, 'circle-1');
+    });
+
     it('does not broadcast a system event when the transaction fails', async () => {
       prisma.circleMember.findUnique.mockResolvedValue({
         role: 'OWNER',

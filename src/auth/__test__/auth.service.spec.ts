@@ -107,7 +107,7 @@ describe('AuthService', () => {
     listDetachedDevices: jest.fn().mockResolvedValue([]),
     deviceKeyForRecord: jest.fn().mockResolvedValue(null),
     evaluateLogin: jest.fn(() => Promise.resolve({ kind: 'trusted' })),
-    trustOnRefresh: jest.fn(() => Promise.resolve()),
+    trustOnRefresh: jest.fn(() => Promise.resolve<boolean | null>(true)),
     revokeDevice: jest.fn(() => Promise.resolve()),
     revokeOtherDevices: jest.fn(() => Promise.resolve()),
     registerSecurityCodeFailure: jest.fn(() => Promise.resolve()),
@@ -122,6 +122,8 @@ describe('AuthService', () => {
     completeVerifiedLogin: jest.fn(() => Promise.resolve()),
     isTrusted: jest.fn(() => Promise.resolve(true)),
     cancelRecoveriesForActiveDevice: jest.fn(() => Promise.resolve()),
+    cancelRecoveries: jest.fn(() => Promise.resolve<string[]>([])),
+    announceCancelledRecoveries: jest.fn(),
     requestRecovery: jest.fn(),
     logRecoveryCompleted: jest.fn(),
     releaseRecoveryClaim: jest.fn(() => Promise.resolve()),
@@ -144,6 +146,26 @@ describe('AuthService', () => {
         sessionId: 'session-2',
       }),
     ),
+    // APP 续签在账号锁事务里轮换;第一个参数是那个事务的 client。
+    rotateInTransaction: jest.fn(() =>
+      Promise.resolve<any>({
+        kind: 'rotated',
+        token: 'new-refresh-token',
+        userId: 'uuid-1',
+        sessionId: 'session-2',
+        deviceKey: null,
+        deviceName: null,
+      }),
+    ),
+    rejectReplayedRotation: jest.fn(() =>
+      Promise.reject(
+        new UnauthorizedException(
+          'Refresh token reuse detected; token family revoked',
+        ),
+      ),
+    ),
+    revokeAllInTransaction: jest.fn(() => Promise.resolve()),
+    revokeAllAccessMarkers: jest.fn(() => Promise.resolve()),
     revoke: jest.fn(() => Promise.resolve()),
     listActiveSessions: jest.fn(() => Promise.resolve([])),
     revokeSession: jest.fn(() => Promise.resolve()),
@@ -179,6 +201,40 @@ describe('AuthService', () => {
   };
   const mockAvatarFrameService = {
     resolvePublicAppearances: jest.fn(() => Promise.resolve(new Map())),
+  };
+
+  /** 续签事务里发出的保存点语句(withSavepoint 用 Prisma.raw,advisory 锁是模板字符串)。 */
+  const savepointStatements = () =>
+    mockPrisma.$executeRaw.mock.calls
+      .map(([query]: any[]) => (query as { sql?: string })?.sql)
+      .filter((sql): sql is string => typeof sql === 'string');
+
+  const rotatedOn = (deviceKey: string) => ({
+    kind: 'rotated' as const,
+    token: 'new-refresh-token',
+    userId: 'uuid-1',
+    sessionId: 'session-2',
+    deviceKey,
+    deviceName: null,
+  });
+
+  /** 封禁 / ADMIN 分支:数据库吊销写进续签事务,Redis 标记在提交之后写。 */
+  const expectRevokedEverythingAfterCommit = () => {
+    expect(mockRefreshTokenService.revokeAllInTransaction).toHaveBeenCalledWith(
+      mockPrisma,
+      'uuid-1',
+    );
+    expect(mockRefreshTokenService.revokeAllAccessMarkers).toHaveBeenCalledWith(
+      'uuid-1',
+    );
+    expect(
+      mockRefreshTokenService.revokeAllInTransaction.mock
+        .invocationCallOrder[0],
+    ).toBeLessThan(
+      mockRefreshTokenService.revokeAllAccessMarkers.mock
+        .invocationCallOrder[0],
+    );
+    expect(mockRefreshTokenService.revokeAll).not.toHaveBeenCalled();
   };
 
   beforeEach(async () => {
@@ -377,16 +433,20 @@ describe('AuthService', () => {
     const pause = new Promise<void>((resolve) => {
       release = resolve;
     });
-    mockRefreshTokenService.rotate.mockImplementationOnce(async () => {
-      rotating();
-      await pause;
-      return {
-        token: 'new-refresh-token',
-        userId: 'uuid-1',
-        sessionId: 'session-2',
-        deviceKey: 'old-device',
-      } as any;
-    });
+    mockRefreshTokenService.rotateInTransaction.mockImplementationOnce(
+      async () => {
+        rotating();
+        await pause;
+        return {
+          kind: 'rotated',
+          token: 'new-refresh-token',
+          userId: 'uuid-1',
+          sessionId: 'session-2',
+          deviceKey: 'old-device',
+          deviceName: null,
+        };
+      },
+    );
     const original = mockPrisma.$transaction.getMockImplementation();
     let queue: Promise<unknown> = Promise.resolve();
     mockPrisma.$transaction.mockImplementation((operation: any) => {
@@ -889,10 +949,14 @@ describe('AuthService', () => {
         refreshToken: 'new-refresh-token',
       }),
     );
-    expect(mockRefreshTokenService.assertSessionActive).toHaveBeenCalledWith(
-      'uuid-1',
-      'session-2',
-    );
+    // 写在续签事务里:失败只回滚到它自己的保存点,事务照常提交。
+    expect(
+      mockRefreshTokenService.recordAccessTokenIssued,
+    ).toHaveBeenCalledWith('uuid-1', 'session-2', expect.any(Date), mockPrisma);
+    expect(savepointStatements()).toEqual([
+      'SAVEPOINT refresh_access_expiry',
+      'ROLLBACK TO SAVEPOINT refresh_access_expiry',
+    ]);
   });
 
   it('login revokes existing sessions first when single-device login is enabled', async () => {
@@ -1723,18 +1787,24 @@ describe('AuthService', () => {
       'access-token',
     );
     expect(result.refreshToken).toBe('new-refresh-token');
-    expect(mockRefreshTokenService.rotate).toHaveBeenCalledWith(
+    // 轮换在账号锁的那个事务里做(只占一个连接),owner 来自锁前的 ownerForToken。
+    expect(mockRefreshTokenService.rotateInTransaction).toHaveBeenCalledWith(
+      mockPrisma,
       'refresh-token',
+      'uuid-1',
       undefined,
       'APP',
     );
+    expect(mockRefreshTokenService.rotate).not.toHaveBeenCalled();
+    expect(mockPrisma.user.findUnique).toHaveBeenCalledWith({
+      where: { id: 'uuid-1' },
+      select: { id: true, accountId: true, role: true, status: true },
+    });
     expect(mockJwt.signAsync).toHaveBeenCalledWith(
       expect.objectContaining({ sub: 'uuid-1', sid: 'session-2', aud: 'APP' }),
     );
-    expect(mockRefreshTokenService.assertSessionActive).toHaveBeenCalledWith(
-      'uuid-1',
-      'session-2',
-    );
+    // 新会话行是同一事务里刚插入、未提交的,并发吊销看不见它:不再复查。
+    expect(mockRefreshTokenService.assertSessionActive).not.toHaveBeenCalled();
     expect(mockPrisma.user.updateMany).toHaveBeenCalledWith(
       LAST_ONLINE_THROTTLED_WRITE('uuid-1'),
     );
@@ -1753,22 +1823,69 @@ describe('AuthService', () => {
       role: 'USER',
       lastOnline: null,
     });
-    mockRefreshTokenService.rotate.mockResolvedValueOnce({
-      token: 'new-refresh-token',
-      userId: 'uuid-1',
-      sessionId: 'session-2',
-      deviceKey: 'owner-phone',
-    } as never);
+    mockRefreshTokenService.rotateInTransaction.mockResolvedValueOnce(
+      rotatedOn('owner-phone'),
+    );
+    mockDeviceTrust.cancelRecoveries.mockResolvedValueOnce(['recovery-1']);
+    let committed = false;
+    const original = mockPrisma.$transaction.getMockImplementation()!;
+    mockPrisma.$transaction.mockImplementationOnce(async (operation: any) => {
+      const result = await original(operation);
+      committed = true;
+      return result;
+    });
+    mockDeviceTrust.announceCancelledRecoveries.mockImplementationOnce(() => {
+      expect(committed).toBe(true);
+    });
+
+    await service.refresh('refresh-token');
+
+    expect(mockDeviceTrust.trustOnRefresh).toHaveBeenCalledWith(
+      'uuid-1',
+      'owner-phone',
+      expect.objectContaining({ deviceName: null }),
+      mockPrisma,
+    );
+    // 信任补记的结论直接复用,不再 isTrusted 读第二次。
+    expect(mockDeviceTrust.isTrusted).not.toHaveBeenCalled();
+    expect(mockDeviceTrust.cancelRecoveries).toHaveBeenCalledWith(
+      'uuid-1',
+      'owner-phone',
+      mockPrisma,
+    );
+    // 通知在事务提交之后才发。
+    expect(mockDeviceTrust.announceCancelledRecoveries).toHaveBeenCalledWith(
+      'uuid-1',
+      ['recovery-1'],
+    );
+  });
+
+  it('falls back to a separate trust check when the trust back-fill fails', async () => {
+    users.push({
+      id: 'uuid-1',
+      accountId: 'testuser',
+      passwordHash: 'hash',
+      status: 'ACTIVE',
+      role: 'USER',
+      lastOnline: null,
+    });
+    mockRefreshTokenService.rotateInTransaction.mockResolvedValueOnce(
+      rotatedOn('owner-phone'),
+    );
+    mockDeviceTrust.trustOnRefresh.mockResolvedValueOnce(null);
 
     await service.refresh('refresh-token');
 
     expect(mockDeviceTrust.isTrusted).toHaveBeenCalledWith(
       'uuid-1',
       'owner-phone',
+      mockPrisma,
     );
-    expect(
-      mockDeviceTrust.cancelRecoveriesForActiveDevice,
-    ).toHaveBeenCalledWith('uuid-1', 'owner-phone');
+    expect(mockDeviceTrust.cancelRecoveries).toHaveBeenCalledWith(
+      'uuid-1',
+      'owner-phone',
+      mockPrisma,
+    );
   });
 
   it('a failing recovery cancellation never breaks the refresh (the token is already rotated)', async () => {
@@ -1780,18 +1897,23 @@ describe('AuthService', () => {
       role: 'USER',
       lastOnline: null,
     });
-    mockRefreshTokenService.rotate.mockResolvedValueOnce({
-      token: 'new-refresh-token',
-      userId: 'uuid-1',
-      sessionId: 'session-2',
-      deviceKey: 'owner-phone',
-    } as never);
-    mockDeviceTrust.cancelRecoveriesForActiveDevice.mockRejectedValueOnce(
+    mockRefreshTokenService.rotateInTransaction.mockResolvedValueOnce(
+      rotatedOn('owner-phone'),
+    );
+    mockDeviceTrust.cancelRecoveries.mockRejectedValueOnce(
       new Error('database unavailable') as never,
     );
 
     await expect(service.refresh('refresh-token')).resolves.toEqual(
       expect.objectContaining({ refreshToken: 'new-refresh-token' }),
+    );
+    // 失败的语句只回滚到它自己的保存点,续签事务照常提交。
+    expect(savepointStatements()).toContain(
+      'ROLLBACK TO SAVEPOINT refresh_recovery_cancel',
+    );
+    expect(mockDeviceTrust.announceCancelledRecoveries).toHaveBeenCalledWith(
+      'uuid-1',
+      [],
     );
   });
 
@@ -1804,19 +1926,74 @@ describe('AuthService', () => {
       role: 'USER',
       lastOnline: null,
     });
-    mockRefreshTokenService.rotate.mockResolvedValueOnce({
-      token: 'new-refresh-token',
-      userId: 'uuid-1',
-      sessionId: 'session-2',
-      deviceKey: 'revoked-phone',
-    } as never);
-    mockDeviceTrust.isTrusted.mockResolvedValueOnce(false as never);
+    mockRefreshTokenService.rotateInTransaction.mockResolvedValueOnce(
+      rotatedOn('revoked-phone'),
+    );
+    mockDeviceTrust.trustOnRefresh.mockResolvedValueOnce(false);
 
     await service.refresh('refresh-token');
 
-    expect(
-      mockDeviceTrust.cancelRecoveriesForActiveDevice,
-    ).not.toHaveBeenCalled();
+    expect(mockDeviceTrust.isTrusted).not.toHaveBeenCalled();
+    expect(mockDeviceTrust.cancelRecoveries).not.toHaveBeenCalled();
+    expect(savepointStatements()).not.toContain(
+      'SAVEPOINT refresh_recovery_cancel',
+    );
+  });
+
+  it('a session without a bound device records no trust and cancels nothing', async () => {
+    users.push({
+      id: 'uuid-1',
+      accountId: 'testuser',
+      passwordHash: 'hash',
+      status: 'ACTIVE',
+      role: 'USER',
+      lastOnline: null,
+    });
+
+    await service.refresh('refresh-token');
+
+    expect(mockDeviceTrust.trustOnRefresh).toHaveBeenCalledWith(
+      'uuid-1',
+      null,
+      expect.any(Object),
+      mockPrisma,
+    );
+    expect(mockDeviceTrust.cancelRecoveries).not.toHaveBeenCalled();
+    expect(mockDeviceTrust.isTrusted).not.toHaveBeenCalled();
+  });
+
+  it('a replayed refresh token commits the family revocation, then rejects', async () => {
+    const replay = {
+      kind: 'reuse' as const,
+      userId: 'uuid-1',
+      sessionIds: ['s-1', 's-2'],
+    };
+    mockRefreshTokenService.rotateInTransaction.mockResolvedValueOnce(replay);
+    let committed = false;
+    const original = mockPrisma.$transaction.getMockImplementation()!;
+    mockPrisma.$transaction.mockImplementationOnce(async (operation: any) => {
+      const result = await original(operation);
+      committed = true;
+      return result;
+    });
+    mockRefreshTokenService.rejectReplayedRotation.mockImplementationOnce(
+      async () => {
+        // 整族吊销的写入随事务提交之后,才写 access 吊销标记并拒绝。
+        expect(committed).toBe(true);
+        throw new UnauthorizedException(
+          'Refresh token reuse detected; token family revoked',
+        );
+      },
+    );
+
+    await expect(service.refresh('refresh-token')).rejects.toThrow(
+      'Refresh token reuse detected; token family revoked',
+    );
+    expect(mockRefreshTokenService.rejectReplayedRotation).toHaveBeenCalledWith(
+      replay,
+    );
+    expect(mockPrisma.user.findUnique).not.toHaveBeenCalled();
+    expect(mockJwt.signAsync).not.toHaveBeenCalled();
   });
 
   it('refresh rejects ADMIN accounts on the APP audience and revokes their sessions', async () => {
@@ -1841,7 +2018,7 @@ describe('AuthService', () => {
       message: '邮箱、用户ID或密码错误',
       errorCode: AuthErrorCode.InvalidCredentials,
     });
-    expect(mockRefreshTokenService.revokeAll).toHaveBeenCalledWith('uuid-1');
+    expectRevokedEverythingAfterCommit();
     expect(mockJwt.signAsync).not.toHaveBeenCalled();
   });
 
@@ -2089,10 +2266,16 @@ describe('AuthService', () => {
       lastOnline: null,
     });
 
-    await expect(service.refresh('refresh-token')).rejects.toThrow(
-      ForbiddenException,
-    );
-    expect(mockRefreshTokenService.revokeAll).toHaveBeenCalledWith('uuid-1');
+    const error: unknown = await service
+      .refresh('refresh-token')
+      .catch((e: unknown) => e);
+    expect(error).toBeInstanceOf(ForbiddenException);
+    expect((error as ForbiddenException).getResponse()).toMatchObject({
+      message: '账号已被禁用',
+      errorCode: AuthErrorCode.AccountDisabled,
+    });
+    expectRevokedEverythingAfterCommit();
+    expect(mockJwt.signAsync).not.toHaveBeenCalled();
   });
 
   it('changePassword rejects when the old password is wrong', async () => {

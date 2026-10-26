@@ -68,6 +68,11 @@ import {
   MESSAGE_READ_OMIT,
 } from './chat-history-page.query';
 import {
+  advanceConversationAfterSendQuery,
+  lockConversationForSendQuery,
+  pendingReadBurnTimersQuery,
+} from './chat-send-lock.query';
+import {
   lastMessagesQuery,
   unreadCountsQuery,
 } from './chat-conversation-summary.query';
@@ -134,10 +139,57 @@ const NON_GROUP_FACETS: GroupFacets = {
   policies: null,
 };
 
+/** 本次发送与消息同事务入队的 durable 任务;没入队的为 null。 */
+export interface EnqueuedSendJobs {
+  directAutoReplyJobId: string | null;
+  supportRechargeJobId: string | null;
+}
+
 interface SendResult {
   message: ChatMessageDto;
   reused: boolean;
+  /**
+   * 首次落库时本次入队了哪些任务,网关只 kick 这些。null 只出现在 DIRECT 会话的
+   * 幂等复用:这次调用什么都没入队,首次发送入队的任务若当时没被 kick(进程恰好
+   * 退出),由网关按消息 id 兜底 kick 一次;定时扫描仍是最终兜底。
+   */
+  enqueuedJobs: EnqueuedSendJobs | null;
 }
+
+/** 锁外判定的入队资格:只决定要不要写任务,处理器在锁下仍会权威复查。 */
+interface SendJobPlan {
+  directAutoReply: boolean;
+  supportRecharge: boolean;
+}
+
+const NO_SEND_JOBS: SendJobPlan = Object.freeze({
+  directAutoReply: false,
+  supportRecharge: false,
+});
+
+const NOTHING_ENQUEUED: EnqueuedSendJobs = Object.freeze({
+  directAutoReplyJobId: null,
+  supportRechargeJobId: null,
+});
+
+/**
+ * 幂等复用的结果带什么任务信息:只有 DIRECT 会话可能入过队,不知道首次发送入了
+ * 什么,交给网关按消息 id 兜底(null);其余会话从来不入队。
+ */
+function reusedSendJobs(
+  conversation: Pick<ChatConversation, 'type'>,
+): EnqueuedSendJobs | null {
+  return conversation.type === 'DIRECT' ? null : NOTHING_ENQUEUED;
+}
+
+/** 锁内复查要读的会话列(lockConversationForSendQuery 从被锁的行读回)。 */
+type SendableConversation = Pick<
+  ChatConversation,
+  'type' | 'directKey' | 'circleID' | 'ownerID' | 'muteAllAt' | 'tempChatID'
+>;
+
+type LockedSendConversation = SendableConversation &
+  Pick<ChatConversation, 'nextHeight' | 'textEncryption'>;
 
 type ChatBurnPolicyInput = ChatBurnPolicy | number | null;
 
@@ -725,6 +777,7 @@ export class ChatService {
           senderUserId,
           true,
           conversation,
+          reusedSendJobs(conversation),
         );
       }
     }
@@ -770,9 +823,19 @@ export class ChatService {
       // 拿一条**别的会话**里的消息 UUID 当引用发出去 —— attachReplyTo 照单全收,
       // 把那条消息的发送者昵称、类型和文本摘要广播进当前房间。退群的人手里留着
       // 旧 UUID 同样能这么捞。放在事务外做:被引用消息不会换会话,没有 TOCTOU。
+      //
+      // 入队资格(对方开没开自动回复、对方是不是在岗的充值客服)只决定要不要写
+      // 任务行,不是鉴权:处理器在锁下会权威复查。原来在会话行锁里查,每条私聊
+      // 让锁多持有两次往返;挪到锁外。顺序查而不并发:发消息是最热的路径,并发
+      // 会让每条私聊瞬间占 3 个池连接(池默认 10 个),锁外多两次往返更划算。
       const replyToId = await this.resolveReplyTarget(
         effectivePayload.conversationId,
         effectivePayload.replyToId,
+      );
+      const jobPlan = await this.planSendJobs(
+        conversation,
+        senderUserId,
+        effectivePayload.type,
       );
 
       // 媒体消息落库前剥掉展示字段。这些字段是读路径的产物(ChatMediaService
@@ -793,11 +856,10 @@ export class ChatService {
       const created = await this.prisma.$transaction(async (tx) => {
         // G-05:会话行锁替 advisory lock —— 同会话串行,跨会话零互扰
         // (hashtext 碰撞让无关会话互等的问题消失),也不再做 MAX(height) 聚合扫描。
-        const counter = await tx.$queryRaw<
-          Array<{ nextHeight: number; textEncryption: string }>
-        >`
-        SELECT "nextHeight", "textEncryption" FROM "ChatConversation"
-        WHERE "id" = ${effectivePayload.conversationId} FOR UPDATE`;
+        // 锁行时顺带读回锁内复查要用的会话列,复查不再另查一次会话。
+        const counter = await tx.$queryRaw<LockedSendConversation[]>(
+          lockConversationForSendQuery(effectivePayload.conversationId),
+        );
         if (counter.length === 0) {
           throw new NotFoundException({
             message: '会话不存在',
@@ -808,10 +870,15 @@ export class ChatService {
         // 拉黑、管理台禁言、临时房到期都可能恰好落在这中间,消息照样写进去。
         // 行锁之后才是真正串行的位置,所以复查放在这里 —— 且在取号之前,
         // 被拒绝的发送不推进计数器,height 无空洞。
-        await this.assertStillSendable(
+        //
+        // 锁行读回了复查用到的全部列,会覆盖锁外那份;展开锁外的会话只是补齐
+        // 类型上其余不参与复查的字段。复查读到的座位顺带给下面的焚毁档位用 ——
+        // 原来锁里为它把同一行座位再读一次。
+        const senderSeat = await this.assertStillSendable(
           tx,
           effectivePayload.conversationId,
           senderUserId,
+          { ...conversation, ...counter[0] },
         );
 
         const existing = await tx.chatMessage.findUnique({
@@ -825,7 +892,7 @@ export class ChatService {
         });
         if (existing) {
           this.assertSameSendRequest(existing, requestHash);
-          return { row: existing, reused: true };
+          return { row: existing, reused: true, enqueuedJobs: null };
         }
 
         if (
@@ -848,16 +915,8 @@ export class ChatService {
           effectivePayload.content as Record<string, unknown>,
           copiedKeys,
         );
-        const senderBurn = await tx.chatMember.findUnique({
-          where: {
-            conversationID_userID: {
-              conversationID: effectivePayload.conversationId,
-              userID: senderUserId,
-            },
-          },
-        });
         const durations = [
-          senderBurn?.burnDurationSec ?? 0,
+          senderSeat.burnDurationSec ?? 0,
           senderPolicy.sec,
         ].filter((value) => value > 0);
         const burnDurationSec =
@@ -894,32 +953,17 @@ export class ChatService {
             throw new Error('Forward media reservation claim mismatch');
           }
         }
-        // 计数器前进与会话排序时间合并成一条 UPDATE(临界区少一次往返)。
-        await tx.chatConversation.update({
-          where: { id: effectivePayload.conversationId },
-          data: { nextHeight: height, lastMessageAt: row.createdAt },
-        });
-        await this.enqueueDirectAutoReplyInTx(
-          tx,
-          conversation,
-          senderUserId,
-          row,
+        // 计数器前进、会话排序时间、隐藏会话重新浮出(微信式语义)合成一条语句。
+        await tx.$executeRaw(
+          advanceConversationAfterSendQuery(
+            effectivePayload.conversationId,
+            height,
+            row.createdAt,
+            new Date(),
+          ),
         );
-        await this.enqueueRechargeAutomationInTx(
-          tx,
-          conversation,
-          senderUserId,
-          row,
-        );
-        // 新消息让所有成员的隐藏会话重新浮出(微信式语义)。
-        await tx.chatMember.updateMany({
-          where: {
-            conversationID: effectivePayload.conversationId,
-            hiddenAt: { not: null },
-          },
-          data: { hiddenAt: null },
-        });
-        return { row, reused: false };
+        const enqueuedJobs = await this.enqueueSendJobsInTx(tx, jobPlan, row);
+        return { row, reused: false, enqueuedJobs };
       });
 
       // 提交完成的那一刻就把复制出来的对象交割掉。继续留在 copiedKeys 里的话,
@@ -949,6 +993,7 @@ export class ChatService {
         senderUserId,
         created.reused,
         conversation,
+        created.reused ? reusedSendJobs(conversation) : created.enqueuedJobs,
       );
     } catch (error) {
       if (copiedKeys.length > 0) await this.media.deleteObjects(copiedKeys);
@@ -983,6 +1028,7 @@ export class ChatService {
     senderUserId: string,
     reused: boolean,
     burnPolicy: ChatBurnPolicyInput,
+    enqueuedJobs: EnqueuedSendJobs | null,
   ): Promise<SendResult> {
     let sender: ChatSenderInfo | null = null;
     try {
@@ -1014,7 +1060,7 @@ export class ChatService {
       );
     }
     await this.media.attachMediaUrls([message]);
-    return { message, reused };
+    return { message, reused, enqueuedJobs };
   }
 
   /**
@@ -1095,80 +1141,88 @@ export class ChatService {
     return { type: row.type, content: content as Record<string, unknown> };
   }
 
-  /** 每条首次落库的普通 DIRECT 客户端消息都在同一事务写一个唯一任务。 */
-  private async enqueueDirectAutoReplyInTx(
-    tx: Prisma.TransactionClient,
-    conversation: ChatConversation,
+  /**
+   * 两类 durable 任务的入队资格,在**会话行锁之外**判定:
+   *
+   * - 自动回复:只对 DIRECT。自动回复默认是关的,而此前每条私聊都无条件建一个 job:
+   *   发送事务里多一次 INSERT,提交后还要 kick 一次处理器,而处理器会取会话行锁、
+   *   两把关系锁和用户行锁,跑完才发现开关是关的。所以入队前先看一眼对方开没开。
+   * - 充值客服:只对 DIRECT 的 text/quote/image,对方是在岗的充值客服才入队。这里只做
+   *   资格判定,不匹配关键词、不发消息,避免把客服业务塞进聊天热路径。服务端自动
+   *   消息走 insertServerMessage,不经过这里,因此不会自触发。
+   *
+   * peer 从 directKey 推(不可变),不额外查会话成员。两次读都只是闸,不是权威判定:
+   * 开关/客服状态可能在入队与处理之间改变,处理器在锁下重查(见
+   * chat-direct-auto-reply.processor、chat-support-recharge.processor)。这里放过的
+   * 会被那边拦下;这里拦掉的是「发消息那一刻对方确实没开 / 不在岗」,本就不该处理。
+   * 原来这两次读在会话行锁里,每条私聊让锁多持有两次往返。
+   */
+  private async planSendJobs(
+    conversation: Pick<ChatConversation, 'type' | 'directKey'>,
     senderUserId: string,
-    message: Pick<ChatMessage, 'id'>,
-  ): Promise<void> {
-    if (conversation.type !== 'DIRECT') return;
-    // 自动回复默认是关的,而此前每条私聊都无条件建一个 job:发送事务里多一次
-    // INSERT,提交后还要 kick 一次处理器,而处理器会取会话行锁、两把关系锁和
-    // 用户行锁,跑完才发现开关是关的。抢的正是发消息要的那把会话行锁,一来一回
-    // 的快速对话会被自己的空转串起来;COMPLETED 的行还要留 7 天。
-    //
-    // 入队前先看一眼对方开没开。peer 从 directKey 推,不额外查会话成员 ——
-    // 与隔壁 enqueueRechargeAutomationInTx 同一手法。
-    const responderId = conversation.directKey
+    messageType: string,
+  ): Promise<SendJobPlan> {
+    if (conversation.type !== 'DIRECT') return NO_SEND_JOBS;
+    const peerUserId = conversation.directKey
       ?.split(':')
       .find((id) => id !== senderUserId);
-    if (!responderId) return;
-    const settings = await tx.userPrivacySetting.findUnique({
-      where: { userID: responderId },
+    if (!peerUserId) return NO_SEND_JOBS;
+    const rechargeEligibleType = ['text', 'quote', 'image'].includes(
+      messageType,
+    );
+    const settings = await this.prisma.userPrivacySetting.findUnique({
+      where: { userID: peerUserId },
       select: {
         directMessageAutoReplyEnabled: true,
         directMessageAutoReplyText: true,
       },
     });
-    // 这只是一道闸,不是权威判定:开关可能在入队与处理之间改变,所以处理器仍会
-    // 在锁下重查一遍(见 chat-direct-auto-reply.processor)。这里放过的会被那边
-    // 拦下;这里拦掉的是「发消息那一刻对方确实没开」,本就不该回复。
-    if (!settings?.directMessageAutoReplyEnabled) return;
-    if (!settings.directMessageAutoReplyText.trim()) return;
-    await tx.chatDirectAutoReplyJob.create({
-      data: { sourceMessageID: message.id },
-    });
+    const rechargeAgent = rechargeEligibleType
+      ? await this.prisma.supportAgent.findFirst({
+          where: {
+            category: 'recharge',
+            userID: peerUserId,
+            enabled: true,
+            user: { status: 'ACTIVE' },
+          },
+          select: { id: true },
+        })
+      : null;
+    return {
+      directAutoReply:
+        !!settings?.directMessageAutoReplyEnabled &&
+        !!settings.directMessageAutoReplyText.trim(),
+      supportRecharge: !!rechargeAgent,
+    };
   }
 
   /**
-   * 充值客服 durable inbox：与用户消息同事务写入。
-   *
-   * 这里只做资格判定和入队，不匹配关键词、不发消息，避免把客服业务塞进聊天热
-   * 路径。网关提交后即时 kick；若进程恰好在两者之间退出，定时处理器仍会从这张
-   * 表补消费。服务端自动消息走 insertServerMessage，不经过这里，因此不会自触发。
+   * 与用户消息同事务写入入队资格放行的任务(durable inbox)。网关提交后只 kick
+   * 这里真正写下的任务;若进程恰好在提交与 kick 之间退出,定时处理器仍会从表里
+   * 补消费。
    */
-  private async enqueueRechargeAutomationInTx(
+  private async enqueueSendJobsInTx(
     tx: Prisma.TransactionClient,
-    conversation: ChatConversation,
-    senderUserId: string,
-    message: Pick<ChatMessage, 'id' | 'type'>,
-  ): Promise<void> {
-    if (
-      conversation.type !== 'DIRECT' ||
-      !['text', 'quote', 'image'].includes(message.type)
-    ) {
-      return;
-    }
-    const peerUserId = conversation.directKey
-      ?.split(':')
-      .find((id) => id !== senderUserId);
-    if (!peerUserId) return;
-
-    const rechargeAgent = await tx.supportAgent.findFirst({
-      where: {
-        category: 'recharge',
-        userID: peerUserId,
-        enabled: true,
-        user: { status: 'ACTIVE' },
-      },
-      select: { id: true },
-    });
-    if (!rechargeAgent) return;
-
-    await tx.supportRechargeJob.create({
-      data: { sourceMessageID: message.id },
-    });
+    plan: SendJobPlan,
+    message: Pick<ChatMessage, 'id'>,
+  ): Promise<EnqueuedSendJobs> {
+    const directAutoReplyJobId = plan.directAutoReply
+      ? (
+          await tx.chatDirectAutoReplyJob.create({
+            data: { sourceMessageID: message.id },
+            select: { id: true },
+          })
+        ).id
+      : null;
+    const supportRechargeJobId = plan.supportRecharge
+      ? (
+          await tx.supportRechargeJob.create({
+            data: { sourceMessageID: message.id },
+            select: { id: true },
+          })
+        ).id
+      : null;
+    return { directAutoReplyJobId, supportRechargeJobId };
   }
 
   /**
@@ -1244,6 +1298,25 @@ export class ChatService {
         conversationType: conversation.type,
       };
     }
+    // 会话行锁只为启动阅后即焚计时而取(启动计时改消息行,取号触发器随之更新
+    // 会话行,必须与发送/清空/焚毁同一加锁顺序;多设备并发回执也在锁上串行)。
+    // 没有待启动的计时就不必取锁:原来每条单聊回执都 FOR UPDATE 会话行,一来
+    // 一回的快速对话里已读和发送互相排队。谓词与 startReadBurnTimers 相同,
+    // 这一组只减不增(见 pendingReadBurnTimersQuery),锁外判空与锁内判空等价。
+    const [pending] = await this.prisma.$queryRaw<Array<{ pending: boolean }>>(
+      pendingReadBurnTimersQuery(conversationId, userId, clamped),
+    );
+    if (!pending?.pending) {
+      return {
+        advanced: await this.advanceDirectReadWithoutTimers(
+          userId,
+          conversationId,
+          clamped,
+        ),
+        height: clamped,
+        conversationType: conversation.type,
+      };
+    }
     const result = await this.prisma.$transaction(async (tx) => {
       // Match send/clear/burn lock ordering, and serialize concurrent readers.
       await tx.$queryRaw`SELECT "id" FROM "ChatConversation"
@@ -1301,6 +1374,46 @@ export class ChatService {
       height: clamped,
       conversationType: conversation.type,
     };
+  }
+
+  /**
+   * 单聊已读的无锁分支:没有要启动的计时,只推进本人的已读水位。
+   *
+   * 与持锁分支结果一致:水位只前进(lastReadHeight < clamped)、离座的座位不写
+   * (leftAt 为空才写)。没写成时再看一眼座位 —— 座位没了 / 已离座要和持锁分支
+   * 一样报 NotMember,而不是悄悄回「未推进」。
+   */
+  private async advanceDirectReadWithoutTimers(
+    userId: string,
+    conversationId: string,
+    clamped: number,
+  ): Promise<boolean> {
+    const updated = await this.prisma.chatMember.updateMany({
+      where: {
+        conversationID: conversationId,
+        userID: userId,
+        leftAt: null,
+        lastReadHeight: { lt: clamped },
+      },
+      data: { lastReadHeight: clamped },
+    });
+    if (updated.count > 0) return true;
+    const seat = await this.prisma.chatMember.findUnique({
+      where: {
+        conversationID_userID: {
+          conversationID: conversationId,
+          userID: userId,
+        },
+      },
+      select: { leftAt: true },
+    });
+    if (!seat || seat.leftAt) {
+      throw new ForbiddenException({
+        message: '不在该会话中',
+        errorCode: ChatErrorCode.NotMember,
+      });
+    }
+    return false;
   }
 
   /**
@@ -1751,26 +1864,28 @@ export class ChatService {
         },
         select: { id: true },
       });
-      for (const applicantID of memberIds) {
-        const admission = await tx.groupAdmission.create({
-          data: {
-            conversationID: group.id,
-            applicantID,
-            inviterID: userId,
-            kind: 'INVITE',
-            status: 'INVITED',
-            expiresAt: new Date(Date.now() + 7 * 86400000),
-          },
-        });
-        await tx.groupAdmissionDelivery.create({
-          data: {
-            admissionID: admission.id,
-            recipientID: applicantID,
-            actorID: userId,
-            event: 'INVITED',
-          },
-        });
-      }
+      // 全新的群:没有座位、没有旧邀请要查,直接批量写。原来每人两次 INSERT
+      // (最多 199 人约 400 条),全程持有上面那组关系锁。
+      const expiresAt = new Date(Date.now() + 7 * 86400000);
+      const admissions = await tx.groupAdmission.createManyAndReturn({
+        data: memberIds.map((applicantID) => ({
+          conversationID: group.id,
+          applicantID,
+          inviterID: userId,
+          kind: 'INVITE',
+          status: 'INVITED',
+          expiresAt,
+        })),
+        select: { id: true, applicantID: true },
+      });
+      await tx.groupAdmissionDelivery.createMany({
+        data: admissions.map((admission) => ({
+          admissionID: admission.id,
+          recipientID: admission.applicantID,
+          actorID: userId,
+          event: 'INVITED',
+        })),
+      });
       return group;
     });
     await this.seatMembersIntoRoom(conversation.id, [userId]);
@@ -3559,28 +3674,36 @@ export class ChatService {
    * 「别人可以在这一瞬改掉」的 —— 被踢出圈子(座位置 leftAt)、被对方拉黑、
    * 管理台按下禁言、临时房到期。窗口虽短,但踢人/封禁这类操作的语义就是
    * 「立刻生效」,让一条消息在生效之后还能挤进去,是把安全边界做成了概率问题。
+   *
+   * locked:调用方锁行时已经从**被锁的那一行**读回了复查要用的会话列(发送路径),
+   * 就不再随座位 include 一次会话。返回复查读到的座位,调用方别再读第二遍。
    */
   private async assertStillSendable(
     tx: Prisma.TransactionClient,
     conversationId: string,
     senderUserId: string,
-  ): Promise<void> {
-    const seat = await tx.chatMember.findUnique({
-      where: {
-        conversationID_userID: {
-          conversationID: conversationId,
-          userID: senderUserId,
-        },
+    locked?: SendableConversation,
+  ): Promise<ChatMember> {
+    const where = {
+      conversationID_userID: {
+        conversationID: conversationId,
+        userID: senderUserId,
       },
-      include: { conversation: true },
-    });
+    };
+    const seat: (ChatMember & { conversation?: ChatConversation }) | null =
+      locked
+        ? await tx.chatMember.findUnique({ where })
+        : await tx.chatMember.findUnique({
+            where,
+            include: { conversation: true },
+          });
     if (!seat || seat.leftAt) {
       throw new ForbiddenException({
         message: '不是会话成员',
         errorCode: ChatErrorCode.NotMember,
       });
     }
-    const conversation = seat.conversation;
+    const conversation: SendableConversation = locked ?? seat.conversation!;
 
     // 逐人禁言与全员禁言都要在锁后复查:管理员按下禁言与这条消息落库之间
     // 是真实窗口,禁言的语义就是「立刻生效」。
@@ -3623,6 +3746,7 @@ export class ChatService {
         });
       }
     }
+    return seat;
   }
 
   private async assertNotBlockedBetween(

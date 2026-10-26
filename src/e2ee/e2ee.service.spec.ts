@@ -17,8 +17,17 @@ function fixture() {
   );
   jest.spyOn(service as any, 'account').mockResolvedValue(undefined);
   jest.spyOn(service as any, 'archiveActor').mockResolvedValue(undefined);
-  jest.spyOn(service as any, 'visibleArchiveMessage').mockResolvedValue({});
-  return { service, tx };
+  // 批量可见性:与 refs 对齐,每项给同一个结果;用例按需改 visibleResult。
+  let visibleResult: unknown = {};
+  jest
+    .spyOn(service as any, 'visibleArchiveMessages')
+    .mockImplementation((...args: unknown[]) =>
+      Promise.resolve((args[3] as unknown[]).map(() => visibleResult)),
+    );
+  const setVisible = (value: unknown) => {
+    visibleResult = value;
+  };
+  return { service, tx, setVisible };
 }
 
 it('lists current devices without letting revoked history consume their limit', async () => {
@@ -68,7 +77,7 @@ it('continues archive reads after a lower-hash message is inserted', async () =>
 });
 
 it('a demoted audit reader cannot erase retained recovery ciphertext', async () => {
-  const { service, tx } = fixture();
+  const { service, tx, setVisible } = fixture();
   tx.e2eeArchive.findMany.mockResolvedValue([
     {
       id: 'retained',
@@ -78,7 +87,7 @@ it('a demoted audit reader cannot erase retained recovery ciphertext', async () 
       message: { content: { envelope: { clientMessageId: 'd1' } } },
     },
   ] as any);
-  jest.mocked((service as any).visibleArchiveMessage).mockResolvedValue(null);
+  setVisible(null);
   const result = await service.readArchive('demoted-admin', 'AUDIT', {
     recoveryId: 'recovery',
     after: '',
@@ -88,7 +97,7 @@ it('a demoted audit reader cannot erase retained recovery ciphertext', async () 
 });
 
 it('uses the authorized retention deadline for recovered audit ciphertext', async () => {
-  const { service, tx } = fixture();
+  const { service, tx, setVisible } = fixture();
   const retainUntil = new Date(Date.now() + 86400_000);
   tx.e2eeArchive.findMany.mockResolvedValue([
     {
@@ -102,9 +111,7 @@ it('uses the authorized retention deadline for recovered audit ciphertext', asyn
       },
     },
   ] as any);
-  jest
-    .mocked((service as any).visibleArchiveMessage)
-    .mockResolvedValue({ burnExpiresAt: retainUntil });
+  setVisible({ burnExpiresAt: retainUntil });
   const result = await service.readArchive('admin', 'AUDIT', {
     recoveryId: 'recovery',
     after: '',

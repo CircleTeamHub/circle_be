@@ -23,9 +23,39 @@ import {
   RegisterEncryptionDeviceDto,
 } from './e2ee.dto';
 import { requireAuditPermission, verifyDeviceProof } from './e2ee-proof';
+import {
+  lockArchiveConversationsQuery,
+  lockArchiveSeatsQuery,
+  lockLiveArchiveMessagesQuery,
+} from './e2ee-lock.query';
 
 type Tx = Prisma.TransactionClient;
 type Purpose = 'APP' | 'AUDIT';
+type VisibleArchive = {
+  id: string;
+  content: Prisma.JsonValue;
+  burnExpiresAt: Date | null;
+  height: number;
+};
+type MessageTuple = {
+  conversationID: string;
+  senderID: string;
+  clientMessageId: string;
+};
+/** 去掉空位与重复的 (会话, 发送者, d) 三元组,拼 OR 条件用。 */
+function uniqueTuples(tuples: Array<MessageTuple | null>): MessageTuple[] {
+  const seen = new Map<string, MessageTuple>();
+  for (const tuple of tuples) {
+    if (!tuple) continue;
+    const key = JSON.stringify([
+      tuple.conversationID,
+      tuple.senderID,
+      tuple.clientMessageId,
+    ]);
+    if (!seen.has(key)) seen.set(key, tuple);
+  }
+  return [...seen.values()];
+}
 const hash = (value: unknown) =>
   createHash('sha256').update(JSON.stringify(value)).digest('hex');
 const publicDevice = {
@@ -829,32 +859,99 @@ export class E2eeService {
         },
       });
   }
-  private async visibleArchiveMessage(
+  /**
+   * 一批归档引用的可见性,逐项结果与原来逐条判定完全一致(返回值与 refs 对齐,
+   * 不可见为 null):
+   * 1. 发送设备不存在 → null;
+   * 2. 消息仍存活(加密文本、未焚毁、未撤回、未到期)且高于会话清空水位 → 可见;
+   * 3. 否则 AUDIT 且具备 IM_ARCHIVE_READ → 看焚毁留存(未过保留期);
+   * 4. APP 还要本人仍在座、高于本人清空水位;
+   * 5. 信封里的发送设备必须与引用一致。
+   *
+   * 会话行 FOR SHARE 让清空/移除/发送排在归档读写之后,锁持有到事务结束 —— 原来每
+   * 一项各锁一次、各查四五条;现在涉及的会话按 id 排序一次加锁,发送设备、消息、
+   * 留存、座位各一条批量查询。会话锁先于座位锁、座位锁先于消息锁,与发送/清空/
+   * 焚毁的加锁方向一致。
+   */
+  private async visibleArchiveMessages(
     tx: Tx,
     userID: string,
     purpose: Purpose,
-    ref: EncryptionMessageRefDto,
-  ) {
-    // Lock the conversation so clear/remove/send cannot race an archive write.
-    await tx.$queryRaw`SELECT "id" FROM "ChatConversation" WHERE "id"=${ref.conversationId} FOR SHARE`;
-    const sender = await tx.e2eeDevice.findUnique({
-      where: { id: ref.senderDeviceId },
-    });
-    if (!sender) return null;
-    const message = await tx.chatMessage.findFirst({
-      where: {
-        conversationID: ref.conversationId,
-        senderID: sender.userID,
-        clientMessageId: ref.clientMessageId,
-        type: 'encrypted-text',
-        deleted: false,
-        revokedAt: null,
-        OR: [{ burnExpiresAt: null }, { burnExpiresAt: { gt: new Date() } }],
-      },
-      include: { conversation: true },
-    });
-    let visible =
-      message && message.height > message.conversation.clearedBeforeHeight
+    refs: EncryptionMessageRefDto[],
+  ): Promise<Array<VisibleArchive | null>> {
+    if (!refs.length) return [];
+    const conversationIDs = [...new Set(refs.map((ref) => ref.conversationId))];
+    const clearedBefore = new Map(
+      (
+        await tx.$queryRaw<Array<{ id: string; clearedBeforeHeight: number }>>(
+          lockArchiveConversationsQuery(conversationIDs),
+        )
+      ).map((row) => [row.id, row.clearedBeforeHeight]),
+    );
+    const senders = new Map(
+      (
+        await tx.e2eeDevice.findMany({
+          where: {
+            id: { in: [...new Set(refs.map((ref) => ref.senderDeviceId))] },
+          },
+          select: { id: true, userID: true },
+        })
+      ).map((device) => [device.id, device.userID]),
+    );
+    const tupleOf = (ref: EncryptionMessageRefDto) => {
+      const senderID = senders.get(ref.senderDeviceId);
+      return senderID === undefined
+        ? null
+        : {
+            conversationID: ref.conversationId,
+            senderID,
+            clientMessageId: ref.clientMessageId,
+          };
+    };
+    const keyOf = (tuple: {
+      conversationID: string;
+      senderID: string | null;
+      clientMessageId: string | null;
+    }) =>
+      JSON.stringify([
+        tuple.conversationID,
+        tuple.senderID,
+        tuple.clientMessageId,
+      ]);
+    const tuples = refs.map(tupleOf);
+    const wanted = uniqueTuples(tuples);
+    const now = new Date();
+    const live = new Map(
+      (wanted.length
+        ? await tx.chatMessage.findMany({
+            where: {
+              AND: [
+                { OR: wanted },
+                {
+                  OR: [{ burnExpiresAt: null }, { burnExpiresAt: { gt: now } }],
+                },
+              ],
+              type: 'encrypted-text',
+              deleted: false,
+              revokedAt: null,
+            },
+            select: {
+              id: true,
+              conversationID: true,
+              senderID: true,
+              clientMessageId: true,
+              content: true,
+              burnExpiresAt: true,
+              height: true,
+            },
+          })
+        : []
+      ).map((message) => [keyOf(message), message]),
+    );
+    const visible: Array<VisibleArchive | null> = tuples.map((tuple) => {
+      const message = tuple && live.get(keyOf(tuple));
+      return message &&
+        message.height > (clearedBefore.get(message.conversationID) ?? 0)
         ? {
             id: message.id,
             content: message.content,
@@ -862,56 +959,85 @@ export class E2eeService {
             height: message.height,
           }
         : null;
-    if (!visible && purpose === 'AUDIT') {
+    });
+    if (purpose === 'AUDIT') {
+      const missing = uniqueTuples(
+        tuples.filter((tuple, index) => tuple && !visible[index]),
+      );
       // archiveActor already holds the account/grant locks. A separate privilege
       // is required for burned content, even with a valid audit device proof.
-      const actor = await tx.user.findUnique({
-        where: { id: userID },
-        select: { adminAccess: { select: { role: true } } },
-      });
-      if (
-        (ADMIN_ROLE_PERMISSIONS[actor?.adminAccess?.role ?? ''] ?? []).includes(
-          'IM_ARCHIVE_READ',
-        )
-      ) {
-        const retained = await tx.chatBurnArchive.findFirst({
+      if (missing.length && (await this.canReadRetained(tx, userID))) {
+        const retained = new Map<string, VisibleArchive>();
+        for (const row of await tx.chatBurnArchive.findMany({
           where: {
-            conversationID: ref.conversationId,
-            senderID: sender.userID,
-            clientMessageId: ref.clientMessageId,
+            OR: missing,
             type: 'encrypted-text',
-            retainUntil: { gt: new Date() },
+            retainUntil: { gt: now },
           },
+        })) {
+          const key = keyOf(row);
+          if (!retained.has(key))
+            retained.set(key, {
+              id: row.id,
+              content: row.content,
+              burnExpiresAt: row.retainUntil,
+              height: row.height,
+            });
+        }
+        tuples.forEach((tuple, index) => {
+          if (tuple && !visible[index])
+            visible[index] = retained.get(keyOf(tuple)) ?? null;
         });
-        if (retained)
-          visible = {
-            id: retained.id,
-            content: retained.content,
-            burnExpiresAt: retained.retainUntil,
-            height: retained.height,
-          };
       }
     }
-    if (!visible) return null;
     if (purpose === 'APP') {
-      await tx.$queryRaw`SELECT "id" FROM "ChatMember" WHERE "conversationID"=${ref.conversationId} AND "userID"=${userID} FOR SHARE`;
-      const member = await tx.chatMember.findUnique({
-        where: {
-          conversationID_userID: { conversationID: ref.conversationId, userID },
-        },
+      const seatConversations = [
+        ...new Set(
+          refs
+            .filter((_, index) => visible[index])
+            .map((ref) => ref.conversationId),
+        ),
+      ];
+      const seats = new Map(
+        (seatConversations.length
+          ? await tx.$queryRaw<
+              Array<{
+                conversationID: string;
+                leftAt: Date | null;
+                clearedBeforeHeight: number;
+              }>
+            >(lockArchiveSeatsQuery(seatConversations, userID))
+          : []
+        ).map((seat) => [seat.conversationID, seat]),
+      );
+      refs.forEach((ref, index) => {
+        const current = visible[index];
+        const seat = seats.get(ref.conversationId);
+        if (
+          current &&
+          (!seat || seat.leftAt || current.height <= seat.clearedBeforeHeight)
+        )
+          visible[index] = null;
       });
-      if (
-        !member ||
-        member.leftAt ||
-        visible.height <= member.clearedBeforeHeight
-      )
-        return null;
     }
-    const content = visible.content as {
-      envelope?: { senderDeviceId?: string };
-    };
-    if (content?.envelope?.senderDeviceId !== ref.senderDeviceId) return null;
-    return visible;
+    return visible.map((current, index) => {
+      const content = current?.content as
+        | { envelope?: { senderDeviceId?: string } }
+        | undefined;
+      return current &&
+        content?.envelope?.senderDeviceId === refs[index].senderDeviceId
+        ? current
+        : null;
+    });
+  }
+  private async canReadRetained(tx: Tx, userID: string): Promise<boolean> {
+    const actor = await tx.user.findUnique({
+      where: { id: userID },
+      select: { adminAccess: { select: { role: true } } },
+    });
+    return (
+      ADMIN_ROLE_PERMISSIONS[actor?.adminAccess?.role ?? ''] ?? []
+    ).includes('IM_ARCHIVE_READ');
   }
   async resolveArchive(
     userID: string,
@@ -922,19 +1048,28 @@ export class E2eeService {
       await this.archiveActor(tx, userID, purpose, dto, 'archive-resolve', [
         dto.refs.map((ref) => this.ref(ref)),
       ]);
-      const items = [];
-      for (const ref of [...dto.refs].sort((a, b) =>
+      const refs = [...dto.refs].sort((a, b) =>
         a.conversationId.localeCompare(b.conversationId),
-      )) {
-        const m = await this.visibleArchiveMessage(tx, userID, purpose, ref);
-        if (m)
-          items.push({
-            messageID: m.id,
-            ref: this.ref(ref),
-            content: m.content,
-            expiresAt: m.burnExpiresAt?.toISOString() ?? null,
-          });
-      }
+      );
+      const visible = await this.visibleArchiveMessages(
+        tx,
+        userID,
+        purpose,
+        refs,
+      );
+      const items = refs.flatMap((ref, index) => {
+        const m = visible[index];
+        return m
+          ? [
+              {
+                messageID: m.id,
+                ref: this.ref(ref),
+                content: m.content,
+                expiresAt: m.burnExpiresAt?.toISOString() ?? null,
+              },
+            ]
+          : [];
+      });
       const archived = await tx.e2eeArchive.findMany({
         where: {
           recovery: { userID, purpose },
@@ -982,37 +1117,70 @@ export class E2eeService {
       // Serialize inserts per recovery so cursor allocation also follows commit
       // order across devices; a late commit must not appear behind a read cursor.
       await tx.$executeRaw`SELECT pg_advisory_xact_lock(hashtext('e2ee-archive'), hashtext(${recovery.id}))`;
-      let count = 0;
-      for (const item of [...dto.items].sort((a, b) =>
+      const items = [...dto.items].sort((a, b) =>
         a.conversationId.localeCompare(b.conversationId),
-      )) {
-        const m = await this.visibleArchiveMessage(tx, userID, purpose, item);
-        if (!m) continue;
-        // Row lock orders this insert against revoke/burn triggers.
-        await tx.$queryRaw`SELECT "id" FROM "ChatMessage" WHERE "id"=${m.id} AND NOT "deleted" AND "revokedAt" IS NULL FOR SHARE`;
-        const current = await tx.chatMessage.findUnique({
-          where: { id: m.id },
-          select: { deleted: true, revokedAt: true },
-        });
-        if (
-          !current ||
-          (purpose === 'APP' && (current.deleted || current.revokedAt))
-        )
-          continue;
-        await tx.e2eeArchive.upsert({
-          where: {
-            recoveryID_messageID: { recoveryID: recovery.id, messageID: m.id },
-          },
-          create: {
+      );
+      const visible = await this.visibleArchiveMessages(
+        tx,
+        userID,
+        purpose,
+        items,
+      );
+      const messageIDs = [
+        ...new Set(visible.flatMap((m) => (m ? [m.id] : []))),
+      ];
+      if (!messageIDs.length) return { count: 0 };
+      // Row lock orders this insert against revoke/burn triggers. 存活行锁住后不会
+      // 再被撤回/焚毁;已焚毁/撤回的行不锁也不会复活 —— APP 只写锁住的,AUDIT
+      // (焚毁留存)只要求消息行还在。
+      const locked = new Set(
+        (
+          await tx.$queryRaw<Array<{ id: string }>>(
+            lockLiveArchiveMessagesQuery(messageIDs),
+          )
+        ).map((row) => row.id),
+      );
+      const writable =
+        purpose === 'APP'
+          ? locked
+          : new Set(
+              (
+                await tx.chatMessage.findMany({
+                  where: { id: { in: messageIDs } },
+                  select: { id: true },
+                })
+              ).map((row) => row.id),
+            );
+      let count = 0;
+      const archives = new Map<
+        string,
+        {
+          id: string;
+          recoveryID: string;
+          messageID: string;
+          ciphertext: string;
+        }
+      >();
+      items.forEach((item, index) => {
+        const m = visible[index];
+        if (!m || !writable.has(m.id)) return;
+        count++;
+        // 同一条消息只保留第一次出现的密文(原来第二次 upsert 是空操作)。
+        if (!archives.has(m.id))
+          archives.set(m.id, {
             id: hash([recovery.id, m.id]),
             recoveryID: recovery.id,
             messageID: m.id,
             ciphertext: item.ciphertext,
-          },
-          update: {},
+          });
+      });
+      // 与 upsert(update: {})同义:已归档的跳过。按条目顺序插入,cursor 照旧随
+      // 写入顺序递增(上面的 advisory lock 让分配顺序也跟随提交顺序)。
+      if (archives.size)
+        await tx.e2eeArchive.createMany({
+          data: [...archives.values()],
+          skipDuplicates: true,
         });
-        count++;
-      }
       return { count };
     });
   }
@@ -1050,37 +1218,61 @@ export class E2eeService {
           message: { select: { content: true, burnExpiresAt: true } },
         },
       });
-      const items = [];
-      for (const row of rows) {
-        const retained =
-          purpose === 'AUDIT' &&
-          !(row.message.content as { envelope?: unknown })?.envelope
-            ? await tx.chatBurnArchive.findUnique({
-                where: { id: row.messageID },
-              })
-            : null;
-        const body = retained?.content ?? row.message.content;
-        const content = body as { envelope?: EncryptionMessageRefDto };
-        const visible = content.envelope
-          ? await this.visibleArchiveMessage(
-              tx,
-              userID,
-              purpose,
-              content.envelope,
-            )
-          : null;
-        if (visible)
-          items.push({
-            id: row.id,
-            messageID: row.messageID,
-            expiresAt: visible.burnExpiresAt?.toISOString() ?? null,
-            ref: this.ref(content.envelope!),
-            ciphertext: row.ciphertext,
-            content: body,
-          });
+      const retainedIDs =
+        purpose === 'AUDIT'
+          ? rows
+              .filter(
+                (row) =>
+                  !(row.message.content as { envelope?: unknown })?.envelope,
+              )
+              .map((row) => row.messageID)
+          : [];
+      const retained = new Map(
+        (retainedIDs.length
+          ? await tx.chatBurnArchive.findMany({
+              where: { id: { in: retainedIDs } },
+              select: { id: true, content: true },
+            })
+          : []
+        ).map((row) => [row.id, row.content]),
+      );
+      const bodies = rows.map((row) => {
+        const body = retained.get(row.messageID) ?? row.message.content;
+        return {
+          body,
+          envelope: (body as { envelope?: EncryptionMessageRefDto }).envelope,
+        };
+      });
+      const withEnvelope = bodies.flatMap((entry, index) =>
+        entry.envelope ? [{ index, envelope: entry.envelope }] : [],
+      );
+      const visible = await this.visibleArchiveMessages(
+        tx,
+        userID,
+        purpose,
+        withEnvelope.map((entry) => entry.envelope),
+      );
+      const visibleAt = new Map(
+        withEnvelope.map((entry, position) => [entry.index, visible[position]]),
+      );
+      const items = rows.flatMap((row, index) => {
+        const current = visibleAt.get(index);
+        const { body, envelope } = bodies[index];
         // Visibility can fail because the caller lost a permission. Retention
         // triggers and cleanup own deletion; an unauthorized read never does.
-      }
+        return current && envelope
+          ? [
+              {
+                id: row.id,
+                messageID: row.messageID,
+                expiresAt: current.burnExpiresAt?.toISOString() ?? null,
+                ref: this.ref(envelope),
+                ciphertext: row.ciphertext,
+                content: body,
+              },
+            ]
+          : [];
+      });
       return {
         items,
         next:

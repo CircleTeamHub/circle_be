@@ -12,6 +12,10 @@ import { PrismaService } from 'src/prisma/prisma.service';
 import { RedisService } from 'src/redis/redis.service';
 import { PROFILE_NOTIFICATION_TYPES } from 'src/notification/notification.constants';
 import { loadUnreadNotificationsByDomain } from 'src/notification/notification-unread.query';
+import {
+  profileUnreadCountsByRecipientQuery,
+  type ProfileUnreadCountRow,
+} from 'src/notification/notification-profile-unread.query';
 import type { NotificationRealtimeDto } from 'src/notification/notification.dto';
 import {
   SESSION_REVOCATION_CHANNEL,
@@ -629,6 +633,46 @@ export class RealtimeService implements OnModuleInit, OnModuleDestroy {
         changedAt: new Date().toISOString(),
       },
     });
+  }
+
+  /**
+   * 系统公告扇出后一批收件人的未读广播。逐人语义与 broadcastSystemNotificationUnread
+   * 相同 —— 先失效徽标快照缓存、再计数、再推同一个 system.notification.unread.changed
+   * 事件(payload 形状不变,没有未读的收件人收到 0);缓存失效失败的收件人和单人版一样
+   * 不计数、不推送。区别只在计数:整批一条 GROUP BY,而不是每人一条 count。
+   *
+   * 没有改成「只失效缓存 + poke(system.announcement.changed)」:2026-10-18 之前的客户端
+   * 不认识那个事件(default 分支直接丢弃),「我的」页红点会一直等到重连才更新;新客户端
+   * 收到它会强制跑一次完整的徽标恢复(四五个 REST 请求、绕过节流),在线用户越多,
+   * 反而比服务端一条分组计数更重。
+   */
+  async broadcastSystemNotificationUnreadToRecipients(
+    userIds: readonly string[],
+  ): Promise<void> {
+    const invalidated: string[] = [];
+    // 失效缓存是 Redis 往返,维持改动前的 50 路并发上限。
+    for (let index = 0; index < userIds.length; index += 50) {
+      const chunk = userIds.slice(index, index + 50);
+      const results = await Promise.allSettled(
+        chunk.map((userId) => this.invalidateBadgeSnapshotCache(userId)),
+      );
+      results.forEach((result, offset) => {
+        if (result.status === 'fulfilled') invalidated.push(chunk[offset]);
+      });
+    }
+    if (invalidated.length === 0) return;
+
+    const rows = await this.prisma.$queryRaw<ProfileUnreadCountRow[]>(
+      profileUnreadCountsByRecipientQuery(invalidated),
+    );
+    const counts = new Map(rows.map((row) => [row.userId, Number(row.count)]));
+    const changedAt = new Date().toISOString();
+    for (const userId of invalidated) {
+      this.broadcast(userId, {
+        type: 'system.notification.unread.changed',
+        payload: { count: counts.get(userId) ?? 0, changedAt },
+      });
+    }
   }
 
   async broadcastMembershipStatus(userId: string) {

@@ -415,6 +415,91 @@ describe('RealtimeService', () => {
     );
   });
 
+  // 系统公告扇出:每批 500 个收件人。改动前是逐人 broadcastSystemNotificationUnread
+  // (每人一条 count,50 路并发抢池连接);现在整批一条 GROUP BY,事件与 payload 不变。
+  it('broadcasts system unread to a batch of announcement recipients from one grouped count', async () => {
+    const broadcast = jest.spyOn(service, 'broadcast').mockImplementation();
+    prisma.$queryRaw.mockResolvedValueOnce([
+      { userId: 'user-1', count: 3 },
+      { userId: 'user-2', count: 1 },
+    ]);
+
+    await service.broadcastSystemNotificationUnreadToRecipients([
+      'user-1',
+      'user-2',
+      'user-3',
+    ]);
+
+    expect(prisma.$queryRaw).toHaveBeenCalledTimes(1);
+    const query = prisma.$queryRaw.mock.calls[0][0] as {
+      text: string;
+      values: unknown[];
+    };
+    expect(query.text).toContain('GROUP BY n."toUserID"');
+    expect(query.values).toContainEqual(['user-1', 'user-2', 'user-3']);
+    expect(prisma.notification.count).not.toHaveBeenCalled();
+    for (const userId of ['user-1', 'user-2', 'user-3']) {
+      expect(redis.invalidateVersionedKey).toHaveBeenCalledWith(
+        `circle:hot:user:${userId}:badge-snapshot`,
+        `circle:hot:user:${userId}:badge-snapshot:version`,
+      );
+    }
+    // 与单人版 broadcastSystemNotificationUnread 同一个事件、同一个 payload 形状;
+    // 一条未读都没有的收件人也要收到 0(否则客户端徽标不会清)。
+    expect(broadcast.mock.calls).toEqual([
+      [
+        'user-1',
+        {
+          type: 'system.notification.unread.changed',
+          payload: { count: 3, changedAt: expect.any(String) },
+        },
+      ],
+      [
+        'user-2',
+        {
+          type: 'system.notification.unread.changed',
+          payload: { count: 1, changedAt: expect.any(String) },
+        },
+      ],
+      [
+        'user-3',
+        {
+          type: 'system.notification.unread.changed',
+          payload: { count: 0, changedAt: expect.any(String) },
+        },
+      ],
+    ]);
+  });
+
+  it('keeps the single-recipient semantics: no count before the cache is invalidated', async () => {
+    const broadcast = jest.spyOn(service, 'broadcast').mockImplementation();
+    redis.invalidateVersionedKey.mockImplementation(async (key: string) => {
+      if (key.includes(':user-2:')) throw new Error('redis down');
+      return true;
+    });
+    prisma.$queryRaw.mockResolvedValueOnce([{ userId: 'user-1', count: 2 }]);
+
+    await service.broadcastSystemNotificationUnreadToRecipients([
+      'user-1',
+      'user-2',
+    ]);
+
+    const query = prisma.$queryRaw.mock.calls[0][0] as { values: unknown[] };
+    expect(query.values).toContainEqual(['user-1']);
+    expect(broadcast).toHaveBeenCalledTimes(1);
+    expect(broadcast).toHaveBeenCalledWith('user-1', {
+      type: 'system.notification.unread.changed',
+      payload: { count: 2, changedAt: expect.any(String) },
+    });
+  });
+
+  it('does nothing for an empty recipient batch', async () => {
+    const broadcast = jest.spyOn(service, 'broadcast').mockImplementation();
+    await service.broadcastSystemNotificationUnreadToRecipients([]);
+    expect(prisma.$queryRaw).not.toHaveBeenCalled();
+    expect(broadcast).not.toHaveBeenCalled();
+  });
+
   it('broadcastMembershipStatus can emit cached membership status', async () => {
     redis.getJsonWithVersion.mockResolvedValueOnce({
       version: 1,

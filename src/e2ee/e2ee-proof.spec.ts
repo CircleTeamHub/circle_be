@@ -14,6 +14,10 @@ const proof = (action: string, payload: unknown) =>
 
 describe('encrypted text admission', () => {
   let tx: any;
+  // 锁内三条原生查询按表名分派:房间设备 FOR SHARE、审计管理员 FOR SHARE、成员计数。
+  let devices: any[];
+  let admins: any[];
+  let counts: { seats: number; allSeats: number; activeOwners: number };
   const envelope = () => ({
     version: 1,
     protocol: 'mls10',
@@ -37,7 +41,7 @@ describe('encrypted text admission', () => {
   const check = (body: any = content(), type = 'encrypted-text') =>
     assertEncryptedTextSend(tx, 'alice', 'room', type, 'message', body);
   beforeEach(() => {
-    const devices = [
+    devices = [
       {
         id: 'phone',
         userID: 'alice',
@@ -53,29 +57,53 @@ describe('encrypted text admission', () => {
         publicKey,
       },
     ];
+    admins = [
+      {
+        id: 'admin',
+        role: 'ADMIN',
+        status: 'ACTIVE',
+        adminRole: 'SUPER_ADMIN',
+      },
+    ];
+    counts = { seats: 1, allSeats: 1, activeOwners: 1 };
     tx = {
-      $queryRaw: jest.fn(),
-      e2eeRoom: {
-        findUnique: jest.fn().mockResolvedValue({
-          epoch: 2,
-          devices: devices.map((d) => ({ deviceID: d.id })),
-        }),
-      },
-      e2eeDevice: { findMany: jest.fn().mockResolvedValue(devices) },
-      chatMember: { count: jest.fn().mockResolvedValue(1) },
-      user: {
-        findUnique: jest.fn().mockResolvedValue({
-          role: 'ADMIN',
-          status: 'ACTIVE',
-          adminAccess: { role: 'SUPER_ADMIN' },
-        }),
-        count: jest.fn().mockResolvedValue(1),
-      },
+      $queryRaw: jest.fn(({ sql }: { sql: string }) => {
+        if (sql.includes('"AdminAccess"')) return Promise.resolve(admins);
+        if (sql.includes('"E2eeDevice"')) return Promise.resolve(devices);
+        if (sql.includes('"ChatMember"')) return Promise.resolve([counts]);
+        return Promise.resolve([]);
+      }),
+      e2eeRoom: { findUnique: jest.fn().mockResolvedValue({ epoch: 2 }) },
     };
   });
+  const sqlCalls = () =>
+    tx.$queryRaw.mock.calls.map(
+      ([query]: [{ sql: string; values: unknown[] }]) => query,
+    );
   it('accepts a signed envelope only with current active member and administrator devices', async () => {
     await expect(check()).resolves.toBeUndefined();
-    expect(tx.$queryRaw).toHaveBeenCalled();
+    // 设备与审计管理员仍然 FOR SHARE(与吊销/降权排出先后),各一条语句。
+    const [deviceLock, adminLock, seatCounts] = sqlCalls();
+    expect(deviceLock.sql).toContain('FOR SHARE');
+    expect(adminLock.sql).toContain('FOR SHARE');
+    expect(adminLock.sql).toContain('JOIN "AdminAccess"');
+    expect(seatCounts.values).toEqual([['alice'], ['alice'], 'room']);
+    expect(tx.$queryRaw).toHaveBeenCalledTimes(3);
+  });
+  it('locks and checks each audit administrator once, whatever the device count', async () => {
+    devices.push({
+      id: 'audit-2',
+      userID: 'admin',
+      purpose: 'AUDIT',
+      status: 'ACTIVE',
+      publicKey,
+    });
+    await expect(check()).resolves.toBeUndefined();
+    const adminLocks = sqlCalls().filter((query: { sql: string }) =>
+      query.sql.includes('"AdminAccess"'),
+    );
+    expect(adminLocks).toHaveLength(1);
+    expect(adminLocks[0].values).toEqual([['admin']]);
   });
   it.each(['text', 'quote'])(
     'rejects plaintext %s after enabling encryption',
@@ -115,17 +143,15 @@ describe('encrypted text admission', () => {
     ).rejects.toThrow();
   });
   it('rejects an old epoch even with a valid device signature', async () => {
-    tx.e2eeRoom.findUnique.mockResolvedValue({ epoch: 3, devices: [] });
+    tx.e2eeRoom.findUnique.mockResolvedValue({ epoch: 3 });
     await expect(check()).rejects.toThrow('epoch changed');
   });
   it('rejects any revoked device remaining in the group', async () => {
-    tx.e2eeDevice.findMany.mockResolvedValue([
-      { id: 'phone', status: 'REVOKED' },
-    ]);
+    devices = [{ id: 'phone', status: 'REVOKED' }];
     await expect(check()).rejects.toThrow('revoked');
   });
   it('requires an administrator device', async () => {
-    tx.e2eeDevice.findMany.mockResolvedValue([
+    devices = [
       {
         id: 'phone',
         userID: 'alice',
@@ -133,27 +159,29 @@ describe('encrypted text admission', () => {
         status: 'ACTIVE',
         publicKey,
       },
-    ]);
+    ];
     await expect(check()).rejects.toThrow('audit device');
   });
   it('checks current admin database permissions', async () => {
-    tx.user.findUnique.mockResolvedValue({
-      role: 'ADMIN',
-      status: 'ACTIVE',
-      adminAccess: { role: 'OPERATIONS' },
-    });
+    admins = [
+      { id: 'admin', role: 'ADMIN', status: 'ACTIVE', adminRole: 'OPERATIONS' },
+    ];
     await expect(check()).rejects.toThrow('revoked');
   });
+  it('treats an administrator without an admin grant row as revoked', async () => {
+    admins = [];
+    await expect(check()).rejects.toThrow('Administrator read access revoked');
+  });
   it('rejects departed members even with a valid group key', async () => {
-    tx.chatMember.count.mockResolvedValue(0);
+    counts = { seats: 0, allSeats: 1, activeOwners: 1 };
     await expect(check()).rejects.toThrow('members');
   });
   it('requires newly joined participants to be included', async () => {
-    tx.chatMember.count.mockResolvedValueOnce(1).mockResolvedValueOnce(2);
+    counts = { seats: 1, allSeats: 2, activeOwners: 1 };
     await expect(check()).rejects.toThrow('members');
   });
   it('rejects a banned participant', async () => {
-    tx.user.count.mockResolvedValue(0);
+    counts = { seats: 1, allSeats: 1, activeOwners: 0 };
     await expect(check()).rejects.toThrow('members');
   });
   it('cannot reuse an approval proof for revocation or a different account', () => {
