@@ -210,4 +210,65 @@ describePostgres('admin ban vs. concurrent refresh (PostgreSQL)', () => {
     );
     expect(rows[0].live).toBe(0);
   }, 30_000);
+
+  it('keeps waiting for the account lock past the default 5s transaction timeout', async () => {
+    const actor = await seedUser('ADMIN');
+    const target = await seedUser();
+    const observer = await rawClient();
+    const holder = await rawClient();
+
+    // 一个慢的登录 / 续签握着账号锁超过 5 秒(Prisma 交互事务的默认超时)。
+    await holder.query('BEGIN');
+    await holder.query(
+      `SELECT pg_advisory_xact_lock(hashtextextended($1, 0))`,
+      [`auth_session:${target.id}`],
+    );
+    const banning = svc.admin.updateStatus(
+      { userId: actor.id, accountId: actor.accountId },
+      target.id,
+      { status: 'BANNED', reason: 'slow lock holder' } as never,
+    );
+    await waitUntilBlockedBy(observer, await backendPid(holder));
+    await new Promise((done) => setTimeout(done, 6_000));
+    await holder.query('COMMIT');
+
+    await expect(banning).resolves.toMatchObject({ status: 'BANNED' });
+    const user = await env.db.query<{ status: string }>(
+      `SELECT status FROM "User" WHERE id = $1`,
+      [target.id],
+    );
+    expect(user.rows[0].status).toBe('BANNED');
+  }, 30_000);
+
+  it('does not hold the global admin lock while waiting for an account lock', async () => {
+    const actor = await seedUser('ADMIN');
+    const slow = await seedUser();
+    const other = await seedUser();
+    const observer = await rawClient();
+    const holder = await rawClient();
+
+    await holder.query('BEGIN');
+    await holder.query(
+      `SELECT pg_advisory_xact_lock(hashtextextended($1, 0))`,
+      [`auth_session:${slow.id}`],
+    );
+    const stuck = svc.admin.updateStatus(
+      { userId: actor.id, accountId: actor.accountId },
+      slow.id,
+      { status: 'BANNED', reason: 'slow lock holder' } as never,
+    );
+    await waitUntilBlockedBy(observer, await backendPid(holder));
+
+    // 等账号锁的那笔没占着全局锁:另一个用户的封禁照常完成,不用排队。
+    await expect(
+      svc.admin.updateStatus(
+        { userId: actor.id, accountId: actor.accountId },
+        other.id,
+        { status: 'BANNED', reason: 'independent ban' } as never,
+      ),
+    ).resolves.toMatchObject({ status: 'BANNED' });
+
+    await holder.query('COMMIT');
+    await expect(stuck).resolves.toMatchObject({ status: 'BANNED' });
+  }, 30_000);
 });
