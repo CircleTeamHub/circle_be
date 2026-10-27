@@ -363,7 +363,7 @@
 
 ### BackupRestoreDrillFailing
 
-**含义**：（critical）最近一次恢复演练（`deploy/backup/drill.sh`，调度器默认北京时间周三 03:30，`BACKUP_CRON_DRILL`）失败。`stage` 是停在哪一步：`preflight` / `live_counts` / `space` / `restore` / `start` / `query` / `compare`。
+**含义**：（critical）最近一次恢复演练（`deploy/backup/drill.sh`，调度器默认北京时间周三 03:30，`BACKUP_CRON_DRILL`）失败。`stage` 是停在哪一步：`preflight` / `live_counts` / `space` / `restore` / `start` / `query` / `compare` / `objects`。
 
 **先看**：
 - `<备份栈> logs --since 24h backup | grep '\[drill\]'`：演练的完整输出，失败原因写在 `FATAL` / `WARN` 行。
@@ -374,6 +374,7 @@
 - `space`：`backup_scratch` 卷所在的盘放不下第二份数据库（要留 `DRILL_MIN_FREE_PERCENT`，默认 20%，高于 `HostDiskFilling` 的 15%）。先清盘或给备份 overlay 换一块盘，别为了让演练通过把余量调小 —— 演练会和线上库争同一块盘。
 - `restore`：pgbackrest 拿不到仓库（凭证、目标桶、加密口令），通常 `BackupCheckFailing` 也在响，按它处理。
 - `start` / `query`：恢复出来的集簇起不来或查不了，缺 WAL、配置不兼容，看日志里 scratch postgres 的输出。`start` 会等到 WAL 回放完（`DRILL_START_TIMEOUT`，默认 3600 秒），一周的 WAL 很多时可以调大。
+- `objects`：数据库恢复没问题，但对象核验没过，大盘「演练抽样的媒体对象」上能看到是哪一种。查不了：对象存储连不上或凭证被拒，先修 `BACKUP_S3_*` / `BACKUP_MINIO_*`。异地缺失（日志里的 `MISSING` 行）：线上还在、副本里没有，说明对象镜像跟不上或一直在失败：看 `<备份栈> logs backup | grep '\[minio-backup\]'`，对照 `BackupCheckFailing{check="minio_source"}` / `destination_bucket`；修好后手动跑一次 `run --rm backup run minio` 补齐，再跑一次演练确认。日志里的 `GONE` 行（两边都没有）不让演练失败，但说明有数据库行指着一个已经不存在的对象，要按文件夹去查是哪条写入路径出了问题。
 - `compare`：恢复里少了表，一张有 `DRILL_EMPTY_TABLE_MIN_ROWS`（默认 1000）行以上的表恢复成了空表，或者日志里有 `BEHIND`（回放没追到演练开始时已归档的最新 WAL，归档里缺段）—— 这份备份不可信，当成真正的事故处理。
 
 ### BackupRestoreDrillStale

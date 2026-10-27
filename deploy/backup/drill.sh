@@ -58,22 +58,60 @@ DRILL_MIN_FREE_PERCENT="${DRILL_MIN_FREE_PERCENT:-20}"
 DRILL_EMPTY_TABLE_MIN_ROWS="${DRILL_EMPTY_TABLE_MIN_ROWS:-1000}"
 # Replaying a week of WAL on a big database takes longer than pg_ctl's default.
 DRILL_START_TIMEOUT="${DRILL_START_TIMEOUT:-3600}"
-# The live count runs as one long transaction on a big database; naming it lets
-# PostgresLongTransaction leave it alone (and shows who it is in pg_stat_activity).
+# Counting one big table can still take minutes; naming the drill's connections
+# lets PostgresLongTransaction leave them alone (and shows who they are in
+# pg_stat_activity).
 export PGAPPNAME=circle-restore-drill
 
 # Exact counts for every base table in `public`. pg_stat_user_tables.n_live_tup
 # is an estimate and is reset by a restore, so it cannot be used to compare a
 # restored cluster against a live one.
-COUNT_SQL="
-SELECT table_name || '=' || (xpath('/row/cnt/text()', xml_count))[1]::text
-FROM (
-  SELECT table_name,
-         query_to_xml(format('SELECT count(*) AS cnt FROM %I.%I', table_schema, table_name),
-                      false, true, '') AS xml_count
-  FROM information_schema.tables
-  WHERE table_schema = 'public' AND table_type = 'BASE TABLE'
-) t ORDER BY table_name;"
+#
+# One statement per table (\gexec, autocommit): each count holds its table's
+# ACCESS SHARE lock only while that one count runs. Counting every table in a
+# single statement keeps all of those locks until the last table is done, and a
+# migration's ALTER TABLE waiting behind one of them makes every later query on
+# that table wait behind the ALTER — on the live database, every week.
+COUNT_SCRIPT="SELECT format('SELECT %L || ''='' || count(*) FROM %I.%I', table_name, table_schema, table_name)
+FROM information_schema.tables
+WHERE table_schema = 'public' AND table_type = 'BASE TABLE'
+ORDER BY table_name
+\\gexec"
+# -X: no psqlrc, so nothing can turn autocommit off behind the drill's back.
+count_tables() {
+  printf '%s\n' "$COUNT_SCRIPT" | psql -X "$@" -At -v ON_ERROR_STOP=1 -f -
+}
+
+# Object backup spot check (step 7): how many keys to sample, and the age window.
+# The mirror runs every 15 minutes, so anything older than two hours must have
+# been copied by now.
+DRILL_OBJECT_SAMPLE="${DRILL_OBJECT_SAMPLE:-20}"
+case "$DRILL_OBJECT_SAMPLE" in ''|*[!0-9]*) DRILL_OBJECT_SAMPLE=20 ;; esac
+DRILL_MC_TIMEOUT="${DRILL_MC_TIMEOUT:-30}"
+OBJECTS_CHECKED=""
+OBJECTS_MISSING=""
+OBJECTS_GONE=""
+OBJECTS_UNVERIFIABLE=""
+
+# present | absent | error for one object. `mc stat` exits 1 for "no such
+# object" and for every other failure alike, and for a bad credential, a missing
+# bucket or an unreachable host it still ends with "Object does not exist" —
+# after an "Unable to list folder" line carrying the real error. Only that one
+# line on its own, with nothing else, is a genuine "not there". Bounded, because
+# the scratch cluster (a second copy of the database) stays up meanwhile.
+object_state() {
+  local out flags=()
+  [ "${BACKUP_S3_INSECURE_TLS:-}" = "1" ] && flags+=(--insecure)
+  if out="$(timeout "$DRILL_MC_TIMEOUT" mc "${flags[@]}" stat --json "$1" 2>&1)"; then
+    echo present
+    return
+  fi
+  case "$out" in
+    *'Unable to list folder'*) echo error ;;
+    *'"message":"Object does not exist"'*) echo absent ;;
+    *) echo error ;;
+  esac
+}
 
 # Only ever removes a DRILL_ROOT this run owns: one it created or one carrying
 # the marker. A refused DRILL_ROOT (a real PGDATA) is left exactly as it was.
@@ -124,6 +162,21 @@ circle_backup_drill_last_run_timestamp_seconds $now
 # TYPE circle_backup_drill_duration_seconds gauge
 circle_backup_drill_duration_seconds $(( now - STARTED_AT ))
 "
+  if [ -n "$OBJECTS_CHECKED" ]; then
+    body="$body# HELP circle_backup_drill_objects_checked Sampled media objects the last drill looked up in the off-host copy.
+# TYPE circle_backup_drill_objects_checked gauge
+circle_backup_drill_objects_checked $OBJECTS_CHECKED
+# HELP circle_backup_drill_objects_missing Sampled media objects present in the live bucket but missing from the off-host copy.
+# TYPE circle_backup_drill_objects_missing gauge
+circle_backup_drill_objects_missing $OBJECTS_MISSING
+# HELP circle_backup_drill_objects_gone Sampled media objects the database references that are in neither the live bucket nor the off-host copy.
+# TYPE circle_backup_drill_objects_gone gauge
+circle_backup_drill_objects_gone $OBJECTS_GONE
+# HELP circle_backup_drill_objects_unverifiable Sampled media objects the drill could not look up (object storage unreachable or credentials rejected).
+# TYPE circle_backup_drill_objects_unverifiable gauge
+circle_backup_drill_objects_unverifiable $OBJECTS_UNVERIFIABLE
+"
+  fi
   if [ -n "$RESTORE_POINT_AGE" ]; then
     body="$body# HELP circle_backup_drill_restore_point_age_seconds Age of the newest transaction the restored cluster contained when the drill read it.
 # TYPE circle_backup_drill_restore_point_age_seconds gauge
@@ -211,8 +264,8 @@ mkdir -p "$DRILL_ROOT"
 # ── 1. live counts ────────────────────────────────────────────────────────────
 STAGE=live_counts
 log "reading live row counts"
-live="$(psql -h /var/run/postgresql -p 5432 -U "$LIVE_USER" -d "$LIVE_DB" \
-          -At -c "$COUNT_SQL")" || die "cannot read live database"
+live="$(count_tables -h /var/run/postgresql -p 5432 -U "$LIVE_USER" -d "$LIVE_DB")" \
+  || die "cannot read live database"
 [ -n "$live" ] || die "live database has no tables in schema public — wrong target?"
 log "live has $(printf '%s\n' "$live" | wc -l | tr -d ' ') tables"
 # Where the newest segment archive_command has shipped starts (bytes). Replay
@@ -298,8 +351,8 @@ log "scratch postgres is up and finished recovery"
 # ── 5. restored counts ────────────────────────────────────────────────────────
 STAGE=query
 log "reading restored row counts"
-restored="$(psql -h "$DRILL_SOCK" -p "$DRILL_PORT" -U "$LIVE_USER" -d "$LIVE_DB" \
-              -At -c "$COUNT_SQL")" || die "cannot query the restored cluster"
+restored="$(count_tables -h "$DRILL_SOCK" -p "$DRILL_PORT" -U "$LIVE_USER" -d "$LIVE_DB")" \
+  || die "cannot query the restored cluster"
 # How recent the restored data is: the commit time of the last transaction WAL
 # replay applied. Informational (it is old on a database nobody wrote to);
 # whether WAL archiving keeps up is BackupCheckFailing's job.
@@ -350,6 +403,90 @@ elif [ -n "$ARCHIVED_START" ]; then
 fi
 
 log "=== drill result: ${matched} exact, ${drifted} drifted ==="
+
+# ── 7. object backup spot check ───────────────────────────────────────────────
+# Postgres is only half of a restore: avatars, chat attachments and note media
+# live in MinIO and reach the off-host bucket through `mc mirror` (backup-minio.sh),
+# and nothing else ever reads that copy back. Sample keys the database
+# references — chat media messages, note media, note media forwarded into chats —
+# and look each one up there. The mirror never deletes, so an object whose row is
+# older than the window must be in the copy:
+#   copy has it                 → checked
+#   copy lacks it, live has it  → missing: the mirror lost it (fails the drill)
+#   neither has it              → gone: the object vanished from live storage
+#                                  although a live row still points at it — a
+#                                  data problem, not a backup one (warned, counted)
+#   lookup failed               → unverifiable: fails the drill, never "passes"
+# Only runs when the database already restored cleanly, so the stage label
+# always names the first thing that broke.
+if [ "$rc" -eq 0 ]; then
+  STAGE=objects
+  if [ -z "${BACKUP_MINIO_ENDPOINT:-}" ] || [ -z "${BACKUP_MINIO_BUCKET:-}" ]; then
+    log "object mirror not configured (BACKUP_MINIO_*) — skipping the object backup check"
+  else
+    # Split DRILL_OBJECT_SAMPLE over the three sources without exceeding it: the
+    # remainder goes to chat messages first, then note media (20 → 7 / 7 / 6).
+    base=$(( DRILL_OBJECT_SAMPLE / 3 )); extra=$(( DRILL_OBJECT_SAMPLE % 3 ))
+    limit_chat=$(( base + (extra > 0 ? 1 : 0) ))
+    limit_note=$(( base + (extra > 1 ? 1 : 0) ))
+    limit_ref=$base
+    window="\"createdAt\" BETWEEN now() - interval '14 days' AND now() - interval '2 hours'"
+    keys="$(psql -h /var/run/postgresql -p 5432 -U "$LIVE_USER" -d "$LIVE_DB" -At -v ON_ERROR_STOP=1 -c "
+      SELECT key FROM (
+        (SELECT content->>'key' AS key FROM \"ChatMessage\"
+          WHERE type IN ('image', 'video', 'voice', 'file') AND NOT deleted AND \"revokedAt\" IS NULL
+            AND (\"burnExpiresAt\" IS NULL OR \"burnExpiresAt\" > now() + interval '1 hour')
+            AND $window ORDER BY random() LIMIT $limit_chat)
+        UNION
+        (SELECT \"objectKey\" AS key FROM \"NoteMedia\" WHERE $window ORDER BY random() LIMIT $limit_note)
+        UNION
+        (SELECT \"objectKey\" AS key FROM \"ChatMediaReference\" WHERE $window ORDER BY random() LIMIT $limit_ref)
+      ) sampled
+      WHERE key ~ '^[A-Za-z0-9][A-Za-z0-9/._=-]*\$'")" || die "cannot sample media keys from the live database"
+    mc_alias_source
+    mc_alias_destination
+    src="source/${BACKUP_MINIO_BUCKET}"
+    copy="backup/${BACKUP_S3_BUCKET}/minio/${BACKUP_MINIO_BUCKET}"
+    sampled=0; checked=0; missing=0; gone=0; unverifiable=0
+    while IFS= read -r key; do
+      [ -n "$key" ] || continue
+      sampled=$((sampled + 1))
+      # Keys are <folder>/<userId>/<uuid>.<ext>: log the folder and file, never the user.
+      shown="${key%%/*}/…/${key##*/}"
+      case "$(object_state "$copy/$key")" in
+        present) checked=$((checked + 1)); continue ;;
+        error) unverifiable=$((unverifiable + 1)); continue ;;
+      esac
+      case "$(object_state "$src/$key")" in
+        present)
+          checked=$((checked + 1)); missing=$((missing + 1))
+          warn "  MISSING  $shown is in the live bucket but not in the off-host copy" ;;
+        absent)
+          gone=$((gone + 1))
+          warn "  GONE     $shown is referenced by a live row but exists in neither the live bucket nor the copy" ;;
+        *) unverifiable=$((unverifiable + 1)) ;;
+      esac
+    done <<< "$keys"
+    OBJECTS_CHECKED="$checked"
+    OBJECTS_MISSING="$missing"
+    OBJECTS_GONE="$gone"
+    OBJECTS_UNVERIFIABLE="$unverifiable"
+    log "objects: ${sampled} sampled, ${checked} checked, ${missing} missing from the off-host copy, ${gone} gone everywhere, ${unverifiable} unverifiable"
+    if [ "$unverifiable" -gt 0 ]; then
+      warn "  could not look up ${unverifiable} object(s) — object storage unreachable or credentials rejected; nothing about them is proven"
+      rc=1
+    fi
+    if [ "$missing" -gt 0 ]; then
+      warn "  the object mirror is not keeping up — media uploaded hours ago is not in the backup"
+      rc=1
+    fi
+    if [ "$sampled" -gt 0 ] && [ "$checked" -eq 0 ]; then
+      warn "  ${sampled} object(s) sampled and not one could be confirmed in the off-host copy"
+      rc=1
+    fi
+  fi
+fi
+
 if [ "$rc" -eq 0 ]; then
   log "DRILL PASSED — the off-host backup restores to a queryable, consistent cluster"
 else

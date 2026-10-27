@@ -984,6 +984,720 @@
           "legendFormat": "{{queue}}"
         }
       ]
+    },
+    {
+      "id": 21,
+      "type": "row",
+      "title": "恢复演练与钱包对账 · Restore drill & wallet ledger",
+      "collapsed": false,
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 68
+      },
+      "panels": []
+    },
+    {
+      "id": 22,
+      "type": "stat",
+      "title": "最近一次恢复演练",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "h": 6,
+        "w": 6,
+        "x": 0,
+        "y": 69
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "noValue": "还没有演练结果",
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "red",
+                "value": null
+              },
+              {
+                "color": "green",
+                "value": 1
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "colorMode": "value",
+        "graphMode": "none",
+        "textMode": "value_and_name",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "values": false
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "expr": "max by (stage) (circle_backup_drill_success)",
+          "legendFormat": "{{stage}}",
+          "instant": true
+        }
+      ],
+      "description": "1 = 上一次演练通过（stage=complete）；0 = 失败，名字是停在哪一步（preflight / live_counts / space / restore / start / query / compare / objects），对应 BackupRestoreDrillFailing。\n\n来自备份 overlay 的 backup-metrics；没开备份 overlay 或演练还没跑过时没有数据。"
+    },
+    {
+      "id": 23,
+      "type": "stat",
+      "title": "距上次演练通过（天）",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "h": 6,
+        "w": 6,
+        "x": 6,
+        "y": 69
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "decimals": 1,
+          "noValue": "从没通过",
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "red",
+                "value": 8
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "colorMode": "value",
+        "graphMode": "none",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "values": false
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "expr": "(time() - max(circle_backup_drill_last_success_timestamp_seconds)) / 86400",
+          "legendFormat": "days",
+          "instant": true
+        }
+      ],
+      "description": "每周一次，留一天余量：超过 8 天变红，与 BackupRestoreDrillStale 同一条线。只有通过的演练会刷新这个时间。"
+    },
+    {
+      "id": 24,
+      "type": "stat",
+      "title": "演练抽样的媒体对象",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "h": 6,
+        "w": 6,
+        "x": 12,
+        "y": 69
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "noValue": "本轮没有做对象核验",
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "red",
+                "value": 1
+              }
+            ]
+          }
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byFrameRefID",
+              "options": "C"
+            },
+            "properties": [
+              {
+                "id": "thresholds",
+                "value": {
+                  "mode": "absolute",
+                  "steps": [
+                    {
+                      "color": "green",
+                      "value": null
+                    },
+                    {
+                      "color": "orange",
+                      "value": 1
+                    }
+                  ]
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byFrameRefID",
+              "options": "D"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "blue"
+                }
+              }
+            ]
+          }
+        ]
+      },
+      "options": {
+        "colorMode": "value",
+        "graphMode": "none",
+        "textMode": "value_and_name",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "values": false
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "expr": "max(circle_backup_drill_objects_missing)",
+          "legendFormat": "异地缺失",
+          "instant": true
+        },
+        {
+          "refId": "B",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "expr": "max(circle_backup_drill_objects_unverifiable)",
+          "legendFormat": "查不了",
+          "instant": true
+        },
+        {
+          "refId": "C",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "expr": "max(circle_backup_drill_objects_gone)",
+          "legendFormat": "两边都没有",
+          "instant": true
+        },
+        {
+          "refId": "D",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "expr": "max(circle_backup_drill_objects_checked)",
+          "legendFormat": "已核验",
+          "instant": true
+        }
+      ],
+      "description": "演练从聊天媒体消息、NoteMedia、ChatMediaReference 里抽样建行于 2 小时到 14 天前的媒体，逐个到异地副本里查。\n\n异地缺失（红）= 线上还在、副本没有：镜像丢了东西，演练记为 objects 失败。查不了（红）= 对象存储连不上或凭证被拒，同样判失败，绝不当成通过。两边都没有（橙）= 线上的行指着一个哪里都不存在的对象，是数据问题、不是备份问题。已核验 = 在副本里确认到的数量。\n\n没有数据：没配对象镜像（BACKUP_MINIO_*），或者这一轮演练在数据库那几步就停了、没走到对象核验。"
+    },
+    {
+      "id": 25,
+      "type": "stat",
+      "title": "钱包对账：不一致的钱包（最近一次）",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "h": 6,
+        "w": 6,
+        "x": 18,
+        "y": 69
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "noValue": "还没对过账",
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "red",
+                "value": 1
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "colorMode": "value",
+        "graphMode": "none",
+        "textMode": "value_and_name",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "values": false
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "expr": "max by (check) (last_over_time(circle_wallet_reconciliation_violations[26h]))",
+          "legendFormat": "{{check}}",
+          "instant": true
+        }
+      ],
+      "description": "ledger_mismatch = 余额不等于该用户全部流水之和；negative_balance = 余额为负。每天 05:00 对一次，读的是最近一次结果（与 WalletLedgerMismatch 同一口径），进程重启不会让它清零。定位用的只读查询在告警处置手册里。"
+    },
+    {
+      "id": 26,
+      "type": "timeseries",
+      "title": "演练耗时与恢复点年龄",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 75
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "min": 0
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "expr": "max(circle_backup_drill_duration_seconds)",
+          "legendFormat": "演练耗时"
+        },
+        {
+          "refId": "B",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "expr": "max(circle_backup_drill_restore_point_age_seconds)",
+          "legendFormat": "恢复出来的数据离演练时刻"
+        }
+      ],
+      "description": "耗时随数据库变大而变长；突然变长多半是恢复要回放的 WAL 变多了（全量备份没按时做）。恢复点年龄是恢复出来的最后一个事务距演练时刻多久，只作参考：深夜没人写库时它本来就大。"
+    },
+    {
+      "id": 27,
+      "type": "timeseries",
+      "title": "对账覆盖的钱包数",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 75
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "min": 0
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "expr": "max(circle_wallet_reconciliation_wallets)",
+          "legendFormat": "钱包"
+        }
+      ],
+      "description": "最近一次对账核对了多少个钱包（含只有流水、没有钱包行的用户）。突然掉到 0 说明对账查询读错了库或表。"
+    },
+    {
+      "id": 28,
+      "type": "row",
+      "title": "Postgres 锁与事务 · Locks, long transactions, wraparound",
+      "collapsed": false,
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 83
+      },
+      "panels": []
+    },
+    {
+      "id": 29,
+      "type": "timeseries",
+      "title": "最老的客户端事务（按状态）",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 84
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "min": 0,
+          "custom": {
+            "thresholdsStyle": {
+              "mode": "line"
+            }
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "red",
+                "value": 300
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "expr": "max by (state) (pg_stat_activity_max_tx_duration{backend_type=\"client backend\", state=~\"active|idle in transaction.*\", application_name!~\"pg_dump|circle-restore-drill\"})",
+          "legendFormat": "{{state}}"
+        }
+      ],
+      "description": "应用的交互式事务最长 30 秒。红线 300 秒是 PostgresLongTransaction 的阈值（持续 5 分钟才报）；发版前的 pg_dump 和恢复演练的计数查询已排除。idle in transaction 拖长最危险：它拿着锁什么也不干。"
+    },
+    {
+      "id": 30,
+      "type": "timeseries",
+      "title": "等锁的会话（按锁类型）",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 84
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "min": 0,
+          "custom": {
+            "thresholdsStyle": {
+              "mode": "line"
+            }
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "red",
+                "value": 5
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "expr": "sum by (wait_event) (pg_stat_activity_count{backend_type=\"client backend\", wait_event_type=\"Lock\"})",
+          "legendFormat": "{{wait_event}}"
+        },
+        {
+          "refId": "B",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "expr": "sum by (datname) (pg_stat_activity_count{backend_type=\"client backend\", wait_event_type=\"Lock\"})",
+          "legendFormat": "合计 · {{datname}}"
+        }
+      ],
+      "description": "advisory = 咨询锁（auth_session 这类按用户串行的锁），transactionid / tuple = 等别的事务改完同一行。正常是毫秒级、抓取几乎碰不到。红线 5 对的是「合计」那条线 —— PostgresLockPileUp 按库合计判，同一热点行的排队会拆成 transactionid 加若干 tuple，单看各类锁可能一条都没过线。每个实例的连接池只有 10 个。"
+    },
+    {
+      "id": 31,
+      "type": "timeseries",
+      "title": "死锁（15 分钟内新增）",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 92
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "min": 0,
+          "custom": {
+            "thresholdsStyle": {
+              "mode": "line"
+            }
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "red",
+                "value": 1
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "expr": "sum by (datname) (increase(pg_stat_database_deadlocks[15m]))",
+          "legendFormat": "{{datname}}"
+        }
+      ],
+      "description": "大于 0 就是 PostgresDeadlocks：Postgres 中止了其中一个事务，那个请求失败了。看 postgres 日志里的 deadlock detected，找按相反顺序拿锁的两段代码。"
+    },
+    {
+      "id": 32,
+      "type": "timeseries",
+      "title": "事务 ID 年龄",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 92
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "min": 0,
+          "custom": {
+            "thresholdsStyle": {
+              "mode": "line"
+            }
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "red",
+                "value": 500000000
+              }
+            ]
+          }
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byFrameRefID",
+              "options": "B"
+            },
+            "properties": [
+              {
+                "id": "thresholds",
+                "value": {
+                  "mode": "absolute",
+                  "steps": [
+                    {
+                      "color": "green",
+                      "value": null
+                    },
+                    {
+                      "color": "red",
+                      "value": 800000000
+                    }
+                  ]
+                }
+              }
+            ]
+          }
+        ]
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "expr": "max by (datname) (pg_database_wraparound_age_datfrozenxid_seconds)",
+          "legendFormat": "{{datname}} xid"
+        },
+        {
+          "refId": "B",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "expr": "max by (datname) (pg_database_wraparound_age_datminmxid_seconds)",
+          "legendFormat": "{{datname}} multixact"
+        }
+      ],
+      "description": "指标名带 _seconds 是上游命名问题，值是事务 ID 年龄。正常在 2 亿附近来回（autovacuum_freeze_max_age）。红线与 PostgresXidWraparoundRisk 一致：xid 5 亿、multixact 8 亿（multixact 的默认冻结线是 4 亿）；21 亿 Postgres 会拒绝写入。没有数据说明 exporter 没开 --collector.database_wraparound。"
     }
   ]
 }

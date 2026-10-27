@@ -6,7 +6,9 @@
 # - 磁盘不够放第二份数据时根本不开始恢复；
 # - 另一轮演练还在跑时既不动它的文件，也不覆盖它的指标；
 # - 被杀掉的演练留下的恢复副本由下一轮清掉，真正的 PGDATA 绝不碰、但要报出来；
-# - 回放没追到最新归档的 WAL 时判失败。
+# - 回放没追到最新归档的 WAL 时判失败；
+# - 线上计数逐表单独提交，不让一条语句同时攥着所有表的锁；
+# - 抽样的媒体对象必须在异地副本里，只有「线上还在、副本没有」才算丢。
 set -euo pipefail
 
 repo_root="$(cd "$(dirname "$0")/.." && pwd)"
@@ -47,7 +49,11 @@ cat > "$fake_bin/psql" <<'SH'
 #!/usr/bin/env bash
 host=''; sql=''; prev=''
 for arg in "$@"; do
-  case "$prev" in -h) host="$arg" ;; -c) sql="$arg" ;; esac
+  case "$prev" in
+    -h) host="$arg" ;;
+    -c) sql="$arg" ;;
+    -f) [ "$arg" = - ] && sql="$(cat)" ;;
+  esac
   prev="$arg"
 done
 echo "psql PGAPPNAME=${PGAPPNAME:-}" >> "$STUB_CALLS"
@@ -55,8 +61,17 @@ case "$sql" in
   *pg_last_xact_replay_timestamp*) printf '%s\n' "${STUB_RESTORE_AGE:-}" ;;
   *pg_stat_archiver*) printf '%s\n' "${STUB_ARCHIVED_START-1000}" ;;
   *pg_last_wal_replay_lsn*) printf '%s\n' "${STUB_REPLAYED_TO-5000}" ;;
-  *query_to_xml*)
+  *query_to_xml*) echo "psql counted every table in one statement" >> "$STUB_CALLS"; exit 64 ;;
+  *'\gexec'*)
     if [ "$host" = /var/run/postgresql ]; then printf '%s\n' "$STUB_LIVE"; else printf '%s\n' "$STUB_RESTORED"; fi
+    ;;
+  *ChatMediaReference*)
+    # 三个来源都要抽：普通聊天媒体只在 ChatMessage.content 里，ChatMediaReference 只记
+    # 笔记转发进聊天的那部分。
+    case "$sql" in *'"ChatMessage"'*"'image', 'video', 'voice', 'file'"*) ;; *) echo "psql sample left out chat message media" >> "$STUB_CALLS" ;; esac
+    case "$sql" in *'"NoteMedia"'*) ;; *) echo "psql sample left out note media" >> "$STUB_CALLS" ;; esac
+    echo "psql sample limits: $(printf '%s\n' "$sql" | grep -o 'LIMIT [0-9]*' | awk '{print $2}' | tr '\n' ' ')" >> "$STUB_CALLS"
+    printf '%s\n' "${STUB_OBJECT_KEYS-}"
     ;;
   *) exit 64 ;;
 esac
@@ -73,6 +88,40 @@ cat > "$fake_bin/df" <<'SH'
 [ -e "${@: -1}" ] || { echo "df: ${@: -1}: No such file or directory" >&2; exit 1; }
 printf 'Filesystem 1024-blocks Used Available Capacity Mounted on\n'
 printf '/dev/vda1 %s 0 %s 50%% /tmp\n' "${STUB_DF_TOTAL_KB:-104857600}" "${STUB_DF_AVAIL_KB:-52428800}"
+SH
+# mc stat --json <alias>/<bucket>[/minio/<bucket>]/<key>，输出照抄 mc RELEASE.2025-08-13 的实测：
+# - 不存在：只有一行 "Object does not exist"；
+# - 凭证错、桶不在、连不上：先一行带错误码的 "Unable to list folder"，**最后同样是**
+#   "Object does not exist"。只看最后一行就会把它们当成「对象不存在」。
+# 键在 STUB_*_MISSING 里算不存在，在 STUB_*_ERROR 里算出错；别的子命令一律报错 ——
+# 演练对对象存储只读。
+cat > "$fake_bin/mc" <<'SH'
+#!/usr/bin/env bash
+echo "mc $*" >> "$STUB_CALLS"
+[ "$1" = stat ] || exit 64
+path="${@: -1}"
+key="${path#*/*/}"
+case "$path" in
+  backup/*) key="${key#minio/*/}"; missing="${STUB_COPY_MISSING:-}"; broken="${STUB_COPY_ERROR:-}" ;;
+  source/*) missing="${STUB_LIVE_MISSING:-}"; broken="${STUB_LIVE_ERROR:-}" ;;
+  *) exit 64 ;;
+esac
+not_found='{"status":"error","error":{"message":"Unable to stat `'"$path"'`.","cause":{"message":"Object does not exist","error":{}},"type":"fatal"}}'
+for k in $broken; do
+  if [ "$k" = "$key" ]; then
+    echo '{"status":"error","error":{"message":"Unable to list folder.","cause":{"message":"The request signature we calculated does not match the signature you provided.","error":{"Code":"SignatureDoesNotMatch"}},"type":"error"}}'
+    echo "$not_found"
+    exit 1
+  fi
+done
+for k in $missing; do [ "$k" = "$key" ] && { echo "$not_found"; exit 1; }; done
+echo '{"status":"success","name":"'"${key##*/}"'","size":1,"type":"file"}'
+SH
+# 演练给 mc 套了超时；macOS 没有 timeout，桩直接执行后面的命令。
+cat > "$fake_bin/timeout" <<'SH'
+#!/usr/bin/env bash
+shift
+exec "$@"
 SH
 cat > "$fake_bin/flock" <<'SH'
 #!/usr/bin/env bash
@@ -134,6 +183,10 @@ assert_metric "$success_prom" "circle_backup_drill_last_success_timestamp_second
 grep -q 'pg_ctl .* stop' "$dir/calls" || fail 'the scratch postmaster was not stopped'
 # 不开 hot standby：否则 pg_ctl -w 在 WAL 还在回放时就返回，读到的是恢复到一半的集簇。
 grep -q 'pg_ctl .*hot_standby=off.* start' "$dir/calls" || fail 'the scratch cluster was started with hot standby'
+if grep -q 'counted every table in one statement' "$dir/calls"; then fail 'the live counts ran as one statement holding every table lock'; fi
+# 没配对象镜像：不做对象核验，也不导出它的指标。
+if grep -q '^mc ' "$dir/calls"; then fail 'the object check ran without an object mirror configured'; fi
+if grep -q 'circle_backup_drill_objects' "$prom"; then fail 'object metrics exported although the check did not run'; fi
 if grep -q 'inherited fd 9' "$dir/calls"; then fail 'the scratch postmaster inherited the drill lock'; fi
 if grep -q '^psql PGAPPNAME=$' "$dir/calls"; then fail 'a drill query ran without PGAPPNAME'; fi
 [ "$(find "$dir/metrics" -type f | wc -l | tr -d ' ')" = 2 ] || { ls -la "$dir/metrics" >&2; fail 'temporary files left behind'; }
@@ -262,6 +315,84 @@ dir="$tmp_dir/lock-inside-root"
 rc="$(run_drill "$dir" DRILL_LOCK_FILE="$dir/scratch/drill/.drill.lock")"
 [ "$rc" = 1 ] || fail "a lock inside DRILL_ROOT exited $rc, want 1"
 assert_metric "$dir/metrics/backup_drill.prom" 'circle_backup_drill_success\{stage="preflight"\} 0'
+
+# ── 对象备份抽样核验 ───────────────────────────────────────────────────────
+MINIO_ENV=(BACKUP_MINIO_ENDPOINT=http://minio:9000 BACKUP_MINIO_BUCKET=media BACKUP_MINIO_ACCESS_KEY=src-key-not-a-metric BACKUP_MINIO_SECRET_KEY=src-secret-not-a-metric)
+KEYS=$'chat/user-1/a.jpg\nnotes/user-2/b.png\nchat/user-3/c.mp4'
+
+dir="$tmp_dir/objects-ok"
+rc="$(run_drill "$dir" "${MINIO_ENV[@]}" STUB_OBJECT_KEYS="$KEYS")"
+[ "$rc" = 0 ] || { cat "$dir/err" >&2; fail "a drill whose sampled objects are all backed up exited $rc"; }
+assert_metric "$dir/metrics/backup_drill.prom" 'circle_backup_drill_objects_checked 3'
+assert_metric "$dir/metrics/backup_drill.prom" 'circle_backup_drill_objects_missing 0'
+grep -q '^mc stat --json backup/offsite/minio/media/chat/user-1/a.jpg' "$dir/calls" || { cat "$dir/calls" >&2; fail 'the off-host copy was not looked up under minio/<bucket>/'; }
+assert_metric "$dir/metrics/backup_drill.prom" 'circle_backup_drill_objects_gone 0'
+assert_metric "$dir/metrics/backup_drill.prom" 'circle_backup_drill_objects_unverifiable 0'
+if grep -Eq '^mc (rm|cp|mirror|mv)' "$dir/calls"; then fail 'the object check wrote to object storage'; fi
+if grep -q 'psql sample left out' "$dir/calls"; then grep 'psql sample left out' "$dir/calls" >&2; fail 'the media sample does not cover every source'; fi
+
+# 抽样总数不超过 DRILL_OBJECT_SAMPLE：余数先分给聊天消息、再分给笔记媒体。
+sample_limits() { sed -n 's/^psql sample limits: //p' "$1/calls"; }
+[ "$(sample_limits "$dir")" = '7 7 6 ' ] || fail "the default sample of 20 was split as '$(sample_limits "$dir")', want 7 7 6"
+for n_want in '1:1 0 0 ' '2:1 1 0 ' '4:2 1 1 '; do
+  n="${n_want%%:*}"; want="${n_want#*:}"
+  dir="$tmp_dir/objects-sample-$n"
+  rc="$(run_drill "$dir" "${MINIO_ENV[@]}" STUB_OBJECT_KEYS="$KEYS" DRILL_OBJECT_SAMPLE="$n")"
+  [ "$rc" = 0 ] || { cat "$dir/err" >&2; fail "a drill with DRILL_OBJECT_SAMPLE=$n exited $rc"; }
+  [ "$(sample_limits "$dir")" = "$want" ] || fail "DRILL_OBJECT_SAMPLE=$n was split as '$(sample_limits "$dir")', want '$want'"
+done
+
+# 线上还在、异地副本没有：镜像丢了东西，判失败；日志里不出现用户 ID。
+dir="$tmp_dir/objects-missing"
+rc="$(run_drill "$dir" "${MINIO_ENV[@]}" STUB_OBJECT_KEYS="$KEYS" STUB_COPY_MISSING='notes/user-2/b.png')"
+[ "$rc" = 1 ] || fail "a drill with an object missing from the copy exited $rc, want 1"
+assert_metric "$dir/metrics/backup_drill.prom" 'circle_backup_drill_success\{stage="objects"\} 0'
+assert_metric "$dir/metrics/backup_drill.prom" 'circle_backup_drill_objects_missing 1'
+grep -q 'MISSING  notes/…/b.png' "$dir/err" || { cat "$dir/err" >&2; fail 'the missing object was not reported'; }
+if grep -q 'user-2' "$dir/out" "$dir/err"; then fail 'a user id from an object key reached the drill log'; fi
+
+# 两边都没有：线上的行指着一个哪里都不存在的对象 —— 是数据问题、不是备份问题：
+# 告警、计数，但只要其余的核验过了就不让演练失败。
+dir="$tmp_dir/objects-gone"
+rc="$(run_drill "$dir" "${MINIO_ENV[@]}" STUB_OBJECT_KEYS="$KEYS" STUB_COPY_MISSING='chat/user-3/c.mp4' STUB_LIVE_MISSING='chat/user-3/c.mp4')"
+[ "$rc" = 0 ] || { cat "$dir/err" >&2; fail "a drill whose missing object is gone everywhere exited $rc, want 0"; }
+assert_metric "$dir/metrics/backup_drill.prom" 'circle_backup_drill_objects_checked 2'
+assert_metric "$dir/metrics/backup_drill.prom" 'circle_backup_drill_objects_gone 1'
+grep -q 'GONE     chat/…/c.mp4' "$dir/err" || { cat "$dir/err" >&2; fail 'an object gone from everywhere was not warned about'; }
+
+# 抽到的全都哪里都找不到：一个也没核验成，不能算通过。
+dir="$tmp_dir/objects-all-gone"
+rc="$(run_drill "$dir" "${MINIO_ENV[@]}" STUB_OBJECT_KEYS='chat/user-1/a.jpg' STUB_COPY_MISSING='chat/user-1/a.jpg' STUB_LIVE_MISSING='chat/user-1/a.jpg')"
+[ "$rc" = 1 ] || fail "a drill that confirmed none of its sampled objects exited $rc, want 1"
+assert_metric "$dir/metrics/backup_drill.prom" 'circle_backup_drill_success\{stage="objects"\} 0'
+
+# 异地副本那边查不了（凭证、网络、桶名）：不能当成「不在」，更不能当成通过。
+dir="$tmp_dir/objects-copy-error"
+rc="$(run_drill "$dir" "${MINIO_ENV[@]}" STUB_OBJECT_KEYS="$KEYS" STUB_COPY_ERROR='chat/user-1/a.jpg notes/user-2/b.png chat/user-3/c.mp4')"
+[ "$rc" = 1 ] || fail "a drill that could not reach the off-host copy exited $rc, want 1"
+assert_metric "$dir/metrics/backup_drill.prom" 'circle_backup_drill_success\{stage="objects"\} 0'
+assert_metric "$dir/metrics/backup_drill.prom" 'circle_backup_drill_objects_unverifiable 3'
+
+# 源 MinIO 凭证失效 —— 正是让镜像停下来的那种故障：副本里没有的对象在线上也查不了。
+# 以前会被算成「两边都没有」，演练照样通过。
+dir="$tmp_dir/objects-source-error"
+rc="$(run_drill "$dir" "${MINIO_ENV[@]}" STUB_OBJECT_KEYS="$KEYS" STUB_COPY_MISSING='chat/user-3/c.mp4' STUB_LIVE_ERROR='chat/user-3/c.mp4')"
+[ "$rc" = 1 ] || fail "a drill whose live-bucket lookup failed exited $rc, want 1"
+assert_metric "$dir/metrics/backup_drill.prom" 'circle_backup_drill_objects_unverifiable 1'
+if grep -q 'GONE' "$dir/err"; then fail 'a failed lookup was reported as an object gone everywhere'; fi
+
+# 窗口里没有任何媒体：照常通过，核验数为 0。
+dir="$tmp_dir/objects-none"
+rc="$(run_drill "$dir" "${MINIO_ENV[@]}" STUB_OBJECT_KEYS=)"
+[ "$rc" = 0 ] || { cat "$dir/err" >&2; fail "a drill with no media to sample exited $rc, want 0"; }
+assert_metric "$dir/metrics/backup_drill.prom" 'circle_backup_drill_objects_checked 0'
+
+# 数据库对比已经失败：不再做对象核验，stage 仍然指向第一个出错的地方。
+dir="$tmp_dir/objects-after-compare-failure"
+rc="$(run_drill "$dir" "${MINIO_ENV[@]}" STUB_OBJECT_KEYS="$KEYS" STUB_RESTORED=$'chat_message=5000\nnotification=40\noutbox=3')"
+[ "$rc" = 1 ] || fail "a drill with a missing table exited $rc, want 1"
+assert_metric "$dir/metrics/backup_drill.prom" 'circle_backup_drill_success\{stage="compare"\} 0'
+if grep -q '^mc ' "$dir/calls"; then fail 'the object check ran after the database restore had already failed'; fi
 
 # ── 另一轮演练持有锁：退出 75，什么都不写 ──────────────────────────────────
 dir="$tmp_dir/busy"

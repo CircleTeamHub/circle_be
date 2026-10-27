@@ -424,8 +424,8 @@ groups:
 
       # 恢复演练（deploy/backup/drill.sh，调度器默认每周二 19:30 UTC、即北京时间周三
       # 03:30 跑，见 BACKUP_CRON_DRILL）。上面的自检只证明备份在、而且新鲜；能不能恢复出来只有
-      # 演练能证明。stage 是失败的演练停在了哪一步（space / restore / start /
-      # query / compare ...）。critical：与 BackupCheckFailing 同级 —— 一份恢复
+      # 演练能证明。stage 是失败的演练停在了哪一步（preflight / live_counts / space /
+      # restore / start / query / compare / objects —— 最后一步抽样核对媒体对象的异地副本）。critical：与 BackupCheckFailing 同级 —— 一份恢复
       # 不出来的备份等于没有备份。
       - alert: BackupRestoreDrillFailing
         expr: circle_backup_drill_success == 0
@@ -945,8 +945,8 @@ groups:
 
       # 长事务。pg_stat_activity_max_tx_duration 是 postgres-exporter 自带的：按
       # state 等分组、组内最老事务开了多少秒。应用的交互式事务最长 30s（Prisma
-      # timeout）。发版前的 pg_dump 和恢复演练的计数查询（PGAPPNAME=circle-restore-drill）
-      # 本来就是一个长事务，库大了会超过 5 分钟，按 application_name 排除。一个开了
+      # timeout）。发版前的 pg_dump 是一个长事务，恢复演练（PGAPPNAME=circle-restore-drill）
+      # 数一张大表也可能要几分钟，库大了都会超过 5 分钟，按 application_name 排除。一个开了
       # 5 分钟还在继续的事务会拿着锁、挡住 autovacuum，常见于事务里等外部调用（#285
       # 修过一处），或有人在 psql 里 BEGIN 了没提交。
       - alert: PostgresLongTransaction
