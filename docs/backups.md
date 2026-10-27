@@ -327,7 +327,8 @@ cause, `docker compose ... run --rm backup run check` refreshes it immediately.
 **Not checked, by design:** object-mirror freshness. The mirror only creates
 objects when users upload, so "nothing new this hour" is indistinguishable from
 a broken mirror. The source-credential probe above is the closest proxy; the
-drill is what actually proves the objects are there.
+weekly drill's object spot check (below) is what proves uploaded media actually
+reached the off-host copy.
 
 Chat history has no check of its own: it lives in the same Postgres the first two
 rows already cover, so a passing WAL/freshness check is a passing chat-history
@@ -347,7 +348,11 @@ docker compose -f docker-compose.prod.yml -f docker-compose.backup.yml \
 
 It is **non-destructive** and safe against production. It:
 
-1. reads exact per-table row counts from the **live** database,
+1. reads exact per-table row counts from the **live** database, one statement
+   per table, so no table's lock is held longer than its own count (a single
+   statement counting everything would hold every table's ACCESS SHARE lock
+   until the last one, and a migration's `ALTER TABLE` queued behind it would
+   stall that table for everyone),
 2. refuses to start unless the scratch disk can hold a second copy and still keep
    `DRILL_MIN_FREE_PERCENT` (default 20%, above `HostDiskFilling`'s 15%) free —
    the scratch volume shares the disk with the live cluster,
@@ -356,7 +361,22 @@ It is **non-destructive** and safe against production. It:
    is read until WAL replay has finished and the cluster has promoted,
 5. compares exact row counts table by table, and checks that replay reached the
    newest WAL segment that was archived when the drill started,
-6. exits non-zero if the restore is not usable.
+6. when the object mirror is configured (`BACKUP_MINIO_*`), samples up to
+   `DRILL_OBJECT_SAMPLE` (default 20) media keys the database references —
+   chat media messages (`ChatMessage` image/video/voice/file, not deleted,
+   revoked or about to burn), `NoteMedia` and `ChatMediaReference` — whose rows
+   were created between 2 hours and 14 days ago (row age, not upload time: a
+   note edit recreates its `NoteMedia` rows; anything older than the 15-minute
+   mirror interval must be in the copy either way), and looks each up in the
+   off-host copy (`minio/<bucket>/<key>`). It fails the drill
+   (`stage="objects"`) when the live bucket has a key the copy does not, when a
+   lookup itself fails (unreachable storage, rejected credentials — `mc stat`
+   says "Object does not exist" for those too, so its full output is read), or
+   when it sampled keys and could confirm none. A key that is in neither place
+   is a live data problem rather than a backup one: warned and counted
+   (`circle_backup_drill_objects_gone`). Read-only on both sides; the log names
+   the folder and file, never the user id in the key,
+7. exits non-zero if the restore is not usable.
 
 **The backup scheduler runs it weekly** (`BACKUP_JOBS` includes `drill`;
 schedule `BACKUP_CRON_DRILL`, default `30 19 * * 2` — the container runs in UTC,

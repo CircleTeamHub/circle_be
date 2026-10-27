@@ -715,6 +715,422 @@
           "legendFormat": "bytes/s"
         }
       ]
+    },
+    {
+      "id": 14,
+      "type": "stat",
+      "title": "Call server-side failure ratio (15m)",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "h": 6,
+        "w": 6,
+        "x": 0,
+        "y": 47
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percentunit",
+          "noValue": "No calls",
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "red",
+                "value": 0.2
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "colorMode": "value",
+        "graphMode": "none",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "values": false
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "expr": "(sum(increase(circle_call_setups_total{job=\"circle-be\",result=~\"livekit_unavailable|failed\"}[15m])) + sum(increase(circle_call_accepts_total{job=\"circle-be\",result=\"failed\"}[15m]))) / (sum(increase(circle_call_setups_total{job=\"circle-be\"}[15m])) + sum(increase(circle_call_accepts_total{job=\"circle-be\"}[15m]))) and (sum(increase(circle_call_setups_total{job=\"circle-be\"}[15m])) + sum(increase(circle_call_accepts_total{job=\"circle-be\"}[15m]))) > 0",
+          "legendFormat": "failure ratio",
+          "instant": true
+        }
+      ],
+      "description": "Call starts and answers that failed on the server (LiveKit unavailable or errors) over all attempts. Busy and too-late answers are normal outcomes and only count in the denominator. 20% is the CallSetupFailing threshold (with at least 5 attempts)."
+    },
+    {
+      "id": 15,
+      "type": "stat",
+      "title": "Answered calls ending within 10s (30m)",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "h": 6,
+        "w": 6,
+        "x": 6,
+        "y": 47
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percentunit",
+          "noValue": "No answered calls",
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "red",
+                "value": 0.6
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "colorMode": "value",
+        "graphMode": "none",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "values": false
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "expr": "sum(increase(circle_call_answered_duration_seconds_bucket{job=\"circle-be\",le=\"10\"}[30m])) / sum(increase(circle_call_answered_duration_seconds_count{job=\"circle-be\"}[30m])) and sum(increase(circle_call_answered_duration_seconds_count{job=\"circle-be\"}[30m])) > 0",
+          "legendFormat": "ended within 10s",
+          "instant": true
+        }
+      ],
+      "description": "Signalling worked but the call was over almost at once — usually media never connected and people hung up. 60% is the CallsEndingTooQuickly threshold (with at least 5 answered calls). Calls that end through LiveKit room_finished include its departure timeout, so drop-outs are under-counted here."
+    },
+    {
+      "id": 16,
+      "type": "stat",
+      "title": "LiveKit webhooks failed or rejected (30m)",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "h": 6,
+        "w": 6,
+        "x": 12,
+        "y": 47
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "red",
+                "value": 1
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "colorMode": "value",
+        "graphMode": "none",
+        "textMode": "value_and_name",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "values": false
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "expr": "sum by (result) (increase(circle_call_livekit_webhooks_total{job=\"circle-be\",result=~\"failed|rejected\"}[30m]))",
+          "legendFormat": "{{result}}",
+          "instant": true
+        }
+      ],
+      "description": "failed = a correctly signed event that threw while processing (answered 500, LiveKit retries); rejected = signature check failed. Rejections while handled events keep flowing are scanners; only rejected with nothing handled raises LiveKitWebhookRejected."
+    },
+    {
+      "id": 17,
+      "type": "stat",
+      "title": "Calls started (24h)",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "h": 6,
+        "w": 6,
+        "x": 18,
+        "y": 47
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "blue",
+                "value": null
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "colorMode": "value",
+        "graphMode": "none",
+        "textMode": "value_and_name",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "values": false
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "expr": "sum by (kind) (increase(circle_call_setups_total{job=\"circle-be\",result=\"started\"}[24h]))",
+          "legendFormat": "{{kind}}",
+          "instant": true
+        }
+      ],
+      "description": "Volume context for the ratios on the left: with a handful of calls a day, a single failure moves them a lot."
+    },
+    {
+      "id": 18,
+      "type": "timeseries",
+      "title": "Call setups by result",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 53
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "reqps",
+          "min": 0
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": [
+            "lastNotNull",
+            "max"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "expr": "sum by (kind, result) (rate(circle_call_setups_total{job=\"circle-be\"}[5m]))",
+          "legendFormat": "{{kind}} · {{result}}"
+        }
+      ],
+      "description": "started / busy (callee already in a call) / livekit_unavailable (room or token could not be created) / failed (anything else on the server). Requests rejected by validation (not friends, no permission) are not counted."
+    },
+    {
+      "id": 19,
+      "type": "timeseries",
+      "title": "Call answers by result",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 53
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "reqps",
+          "min": 0
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": [
+            "lastNotNull",
+            "max"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "expr": "sum by (kind, result) (rate(circle_call_accepts_total{job=\"circle-be\"}[5m]))",
+          "legendFormat": "{{kind}} · {{result}}"
+        }
+      ],
+      "description": "accepted / too_late (the call had already ended or expired — a normal race) / failed (server-side errors, including LiveKit tokens)."
+    },
+    {
+      "id": 20,
+      "type": "timeseries",
+      "title": "Call endings by reason",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 61
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "reqps",
+          "min": 0
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": [
+            "lastNotNull",
+            "max"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "expr": "sum by (reason, answered) (rate(circle_call_endings_total{job=\"circle-be\"}[15m]))",
+          "legendFormat": "{{reason}} · answered={{answered}}"
+        }
+      ],
+      "description": "Every ended call is counted once. no_answer with answered=false rising means calls ring out; error means the server failed a ringing call; normal is LiveKit reporting the room finished."
+    },
+    {
+      "id": 21,
+      "type": "timeseries",
+      "title": "LiveKit webhooks by result",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 61
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "reqps",
+          "min": 0
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": [
+            "lastNotNull",
+            "max"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "expr": "sum by (result) (rate(circle_call_livekit_webhooks_total{job=\"circle-be\"}[15m]))",
+          "legendFormat": "{{result}}"
+        }
+      ],
+      "description": "handled = room_finished for a known call; ignored = other event types or unknown rooms; rejected = bad signature; failed = processing error (LiveKit retries)."
     }
   ]
 }

@@ -70,3 +70,48 @@ test('the synthetic probe runs, is scraped by name and keeps its config across r
   assert.match(LAUNCHER, /--exclude='\/\.env\.\*'/);
   assert.match(GITIGNORE, /^!\.env\.synthetic-probe\.example$/m);
 });
+
+const DASHBOARDS = ['circle-be.json', 'circle-be-operations.json', 'circle-be-jobs.json', 'circle-be-deliveries.json'].map(
+  (file) => ({ file, value: JSON.parse(readText(`monitoring/grafana/dashboards/${file}`)) }),
+);
+
+test('every new metric family is on a dashboard, not only in an alert', () => {
+  // 告警响了要能看趋势、看是哪一档：只有告警读、大盘上看不到的指标，排查时只能
+  // 去 Prometheus 里手敲查询。
+  const joined = DASHBOARDS.flatMap(({ value }) => value.panels.flatMap((p) => (p.targets ?? []).map((t) => t.expr))).join('\n');
+  for (const metric of [
+    'circle_backup_drill_success',
+    'circle_backup_drill_last_success_timestamp_seconds',
+    'circle_backup_drill_objects_missing',
+    'circle_wallet_reconciliation_violations',
+    'pg_stat_activity_max_tx_duration',
+    'pg_stat_database_deadlocks',
+    'pg_database_wraparound_age_datfrozenxid_seconds',
+    'circle_call_setups_total',
+    'circle_call_accepts_total',
+    'circle_call_endings_total',
+    'circle_call_answered_duration_seconds',
+    'circle_call_livekit_webhooks_total',
+    'circle_synthetic_probe_last_success_timestamp_seconds',
+    'circle_synthetic_probe_failures_total',
+    'circle_build_info',
+  ]) {
+    assert.match(joined, new RegExp(`\\b${metric}`), `${metric} is not on any dashboard`);
+  }
+});
+
+test('every dashboard has unique panel ids and a non-overlapping layout', () => {
+  for (const { file, value } of DASHBOARDS) {
+    const ids = value.panels.map(({ id }) => id);
+    assert.equal(new Set(ids).size, ids.length, `${file}: panel ids must be unique`);
+    for (let i = 0; i < value.panels.length; i += 1) {
+      const a = value.panels[i].gridPos;
+      assert.ok(a.x >= 0 && a.y >= 0 && a.w > 0 && a.h > 0 && a.x + a.w <= 24, `${file}: panel ${ids[i]} is off the grid`);
+      for (let j = i + 1; j < value.panels.length; j += 1) {
+        const b = value.panels[j].gridPos;
+        const overlaps = a.x < b.x + b.w && a.x + a.w > b.x && a.y < b.y + b.h && a.y + a.h > b.y;
+        assert.equal(overlaps, false, `${file}: panels ${ids[i]} and ${ids[j]} overlap`);
+      }
+    }
+  }
+});
