@@ -21,7 +21,9 @@ import {
   ApiOperation,
   ApiTags,
 } from '@nestjs/swagger';
+import { Throttle } from '@nestjs/throttler';
 import { JwtGuard } from 'src/guards/jwt.guard';
+import { UserThrottlerGuard } from 'src/guards/user-throttler.guard';
 import type { RequestWithUser } from 'src/auth/types';
 import { CircleService } from './circle.service';
 import {
@@ -45,6 +47,10 @@ export class CircleController {
   constructor(private readonly circleService: CircleService) {}
 
   @Post()
+  // 没有全局 ThrottlerGuard。建圈是一个大事务（圈子 + 群聊 + 圈主席位 + 配额校验），
+  // 正常人一分钟建不了几个圈：5 次/分钟/账号（UserThrottlerGuard 按账号计数）。
+  @UseGuards(UserThrottlerGuard)
+  @Throttle({ default: { limit: 5, ttl: 60_000 } })
   @ApiOperation({ summary: 'Create a circle' })
   @ApiOkResponse({ type: CircleDetailDto })
   create(
@@ -87,6 +93,10 @@ export class CircleController {
 
   @Post(':id/join')
   @HttpCode(HttpStatus.ACCEPTED)
+  // 申请入圈要锁圈子行、建担保单、发通知：20 次/分钟/账号，与 POST /circle-invitation
+  // 的邀请预算一致（UserThrottlerGuard 按账号计数）。
+  @UseGuards(UserThrottlerGuard)
+  @Throttle({ default: { limit: 20, ttl: 60_000 } })
   @ApiOperation({ summary: 'Submit a circle membership application' })
   @ApiAcceptedResponse({ type: InvitationDto })
   join(

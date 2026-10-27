@@ -27,6 +27,8 @@ describe('UserService', () => {
     chatMember: { findMany: jest.fn() },
     friend: { findFirst: jest.fn() },
     circleMember: { findFirst: jest.fn() },
+    // 账号号码精确查找走 lower("accountId") 原生查询(activeUserIdByAccountIdQuery)。
+    $queryRaw: jest.fn(),
     $transaction: jest.fn(async (operation: any) => operation(prisma)),
   };
   const refreshTokens = {
@@ -84,6 +86,7 @@ describe('UserService', () => {
     prisma.friend.findFirst.mockResolvedValue(null);
     prisma.circleMember.findFirst.mockResolvedValue(null);
     prisma.user.findMany.mockResolvedValue([]);
+    prisma.$queryRaw.mockResolvedValue([{ id: 'matched-user' }]);
     avatarFrames.resolvePublicAppearances.mockResolvedValue(new Map());
     service = await buildService();
   });
@@ -258,7 +261,11 @@ describe('UserService', () => {
     ]);
   });
 
-  it('finds an active user by exact accountId without exposing admin pagination', async () => {
+  // mode:'insensitive' 编译成 ILIKE:用不上 User_accountId_lower_key,还把输入里的
+  // _ / % 当通配符(a_b 能命中 axb,% 能命中任意一个人)。改成 lower() 等值查 id,
+  // 再按主键取资料列(真库口径见 test/postgres/user-account-lookup.pg-spec.ts)。
+  it('finds an active user by exact accountId through the lower(accountId) index', async () => {
+    prisma.$queryRaw.mockResolvedValue([{ id: 'user-1' }]);
     prisma.user.findFirst.mockResolvedValue({
       id: 'user-1',
       accountId: 'jimmy',
@@ -266,19 +273,29 @@ describe('UserService', () => {
     });
 
     await expect(
-      service.findByExactAccountId(' jimmy '),
+      service.findByExactAccountId(' Jimmy '),
     ).resolves.toMatchObject({ id: 'user-1', accountId: 'jimmy' });
+    expect(prisma.$queryRaw).toHaveBeenCalledTimes(1);
+    const sql = prisma.$queryRaw.mock.calls[0][0];
+    expect(sql.sql).toMatch(/lower\("accountId"\) = lower\(\?\)/);
+    expect(sql.sql).toMatch(/"status" = 'ACTIVE'/);
+    expect(sql.values).toEqual(['Jimmy']);
     expect(prisma.user.findFirst).toHaveBeenCalledWith({
-      where: {
-        accountId: { equals: 'jimmy', mode: 'insensitive' },
-        status: 'ACTIVE',
-      },
-      select: expect.any(Object),
+      where: { id: 'user-1', status: 'ACTIVE' },
+      select: expect.objectContaining({ id: true, accountId: true }),
     });
+  });
+
+  it('returns null without loading a profile when no account matches', async () => {
+    prisma.$queryRaw.mockResolvedValue([]);
+
+    await expect(service.findByExactAccountId('a_b')).resolves.toBeNull();
+    expect(prisma.user.findFirst).not.toHaveBeenCalled();
   });
 
   it('returns null for empty accountId search keywords', async () => {
     await expect(service.findByExactAccountId('   ')).resolves.toBeNull();
+    expect(prisma.$queryRaw).not.toHaveBeenCalled();
     expect(prisma.user.findFirst).not.toHaveBeenCalled();
   });
 

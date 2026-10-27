@@ -88,6 +88,36 @@ export type AvatarFrameSelectionState = MembershipState & {
   avatarFrameGrants: FrameGrantState[];
 };
 
+/**
+ * 解析公开外观(有效会员档 + 当前头像框)要读的 User 列。
+ *
+ * 调用方本来就要查同一批用户时(好友列表等),把它并进自己的 user 查询,
+ * 再把行交给 resolvePublicAppearancesForUsers —— 同一批用户不必读两遍。
+ */
+export const PUBLIC_APPEARANCE_USER_SELECT = {
+  id: true,
+  vipLevel: true,
+  vipExpiresAt: true,
+  selectedAvatarFrameID: true,
+  selectedAvatarFrameExpiresAt: true,
+  selectedAvatarFrame: {
+    select: {
+      id: true,
+      key: true,
+      name: true,
+      description: true,
+      imageUrl: true,
+      minimumVipLevel: true,
+      isActive: true,
+      sortOrder: true,
+    },
+  },
+} as const satisfies Prisma.UserSelect;
+
+export type PublicAppearanceUserRow = Prisma.UserGetPayload<{
+  select: typeof PUBLIC_APPEARANCE_USER_SELECT;
+}>;
+
 const ACTIVE_GRANT_WHERE = (userId: string, now: Date) =>
   ({
     userID: userId,
@@ -152,26 +182,33 @@ export class AvatarFrameService {
 
     const users = await this.prisma.user.findMany({
       where: { id: { in: uniqueUserIds } },
-      select: {
-        id: true,
-        vipLevel: true,
-        vipExpiresAt: true,
-        selectedAvatarFrameID: true,
-        selectedAvatarFrameExpiresAt: true,
-        selectedAvatarFrame: {
-          select: {
-            id: true,
-            key: true,
-            name: true,
-            description: true,
-            imageUrl: true,
-            minimumVipLevel: true,
-            isActive: true,
-            sortOrder: true,
-          },
-        },
-      },
+      select: PUBLIC_APPEARANCE_USER_SELECT,
     });
+    const appearanceById = await this.resolvePublicAppearancesForUsers(
+      users,
+      now,
+    );
+
+    return new Map(
+      uniqueUserIds.flatMap((userId) => {
+        const appearance = appearanceById.get(userId);
+        return appearance ? [[userId, appearance] as const] : [];
+      }),
+    );
+  }
+
+  /**
+   * 同 resolvePublicAppearances,但 user 行由调用方查好传进来(至少含
+   * PUBLIC_APPEARANCE_USER_SELECT 的列),这里不再读 User 表,只按需补查授予记录。
+   * 返回的 Map 只含传入的用户。
+   */
+  async resolvePublicAppearancesForUsers(
+    users: readonly PublicAppearanceUserRow[],
+    now = new Date(),
+  ): Promise<Map<string, PublicUserAppearance>> {
+    if (users.length === 0) {
+      return new Map();
+    }
 
     const selectedPairs = users.flatMap((user) =>
       user.selectedAvatarFrameID
@@ -220,7 +257,12 @@ export class AvatarFrameService {
     const appearanceById = new Map<string, PublicUserAppearance>();
     for (const user of users) {
       const state: AvatarFrameSelectionState = {
-        ...user,
+        id: user.id,
+        vipLevel: user.vipLevel,
+        vipExpiresAt: user.vipExpiresAt,
+        selectedAvatarFrameID: user.selectedAvatarFrameID,
+        selectedAvatarFrameExpiresAt: user.selectedAvatarFrameExpiresAt,
+        selectedAvatarFrame: user.selectedAvatarFrame,
         avatarFrameGrants: grantsByUser.get(user.id) ?? [],
       };
       appearanceById.set(user.id, {
@@ -228,13 +270,7 @@ export class AvatarFrameService {
         avatarFrame: this.toPublicAppearance(state, now),
       });
     }
-
-    return new Map(
-      uniqueUserIds.flatMap((userId) => {
-        const appearance = appearanceById.get(userId);
-        return appearance ? [[userId, appearance] as const] : [];
-      }),
-    );
+    return appearanceById;
   }
 
   async getInventory(

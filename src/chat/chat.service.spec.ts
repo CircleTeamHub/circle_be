@@ -2686,6 +2686,29 @@ describe('ChatService', () => {
       expect(values).toEqual(expect.arrayContaining(['合同', '%合同%']));
     });
 
+    // 「图片 / 视频 / 文件」页签与普通翻页靠 20261026000300 的两条部分索引
+    // (conversationID[, type], height) WHERE deleted = false 跨过焚毁墓碑(真库见
+    // test/postgres/chat-history-live-indexes.pg-spec.ts)。条件形状一变索引就静默失效。
+    it('keeps type tabs on the live (conversationID, type, height) index shape', async () => {
+      prisma.chatMember.findUnique.mockResolvedValue(membership());
+      prisma.chatMessage.findMany.mockResolvedValue([]);
+
+      await service.getHistory('u1', 'conv-1', 40, 50, {
+        types: ['video', 'file'],
+      });
+
+      const [[args]] = prisma.chatMessage.findMany.mock.calls as [
+        [Prisma.ChatMessageFindManyArgs],
+      ];
+      expect(args.where).toMatchObject({
+        conversationID: 'conv-1',
+        deleted: false,
+        height: { lt: 40 },
+        type: { in: ['video', 'file'] },
+      });
+      expect(args.orderBy).toEqual({ height: 'desc' });
+    });
+
     it('escapes LIKE wildcards in the keyword', async () => {
       prisma.chatMember.findUnique.mockResolvedValue(membership());
       prisma.$queryRaw.mockResolvedValue([]);
@@ -2736,27 +2759,50 @@ describe('ChatService', () => {
   });
 
   describe('listMessageDays', () => {
-    it('groups message timestamps into client-timezone days', async () => {
-      prisma.chatMember.findUnique.mockResolvedValue(membership());
-      prisma.chatMessage.findMany.mockResolvedValue([
-        // UTC 8/4 17:00 = 东八区 8/5 01:00;UTC 8/5 15:00 = 东八区 8/5 23:00。
-        { createdAt: new Date('2026-08-04T17:00:00.000Z') },
-        { createdAt: new Date('2026-08-05T15:00:00.000Z') },
-        { createdAt: new Date('2026-08-05T17:00:00.000Z') }, // 东八区 8/6
+    // 原来不带 orderBy 取 5000 行 createdAt 回来去重,活跃月份随机漏天;现在按客户端
+    // 时区把这个月切成天,逐天问库里有没有可见消息(真库口径见
+    // test/postgres/chat-message-days.pg-spec.ts)。
+    const daysQuery = () => {
+      const [[query]] = prisma.$queryRaw.mock.calls as [[Prisma.Sql]];
+      const [days, starts, ends, conversationId, floor] = query.values as [
+        string[],
+        string[],
+        string[],
+        string,
+        number,
+      ];
+      return { sql: query.sql, days, starts, ends, conversationId, floor };
+    };
+
+    it('asks the database per client-timezone day and returns the days sorted', async () => {
+      prisma.chatMember.findUnique.mockResolvedValue(
+        membership({ clearedBeforeHeight: 12 }),
+      );
+      prisma.$queryRaw.mockResolvedValue([
+        { day: '2026-08-06' },
+        { day: '2026-08-05' },
       ]);
 
       const days = await service.listMessageDays('u1', 'conv-1', 2026, 7, -480);
+
       expect(days).toEqual(['2026-08-05', '2026-08-06']);
+      expect(prisma.chatMessage.findMany).not.toHaveBeenCalled();
+      const query = daysQuery();
+      expect(query.conversationId).toBe('conv-1');
+      // 清空水位之下的消息不给日历上色。
+      expect(query.floor).toBe(12);
+      expect(query.days).toHaveLength(31);
+      // 东八区:当地 8/5 = UTC 8/4 16:00 起。
+      expect(query.starts[4]).toBe('2026-08-04T16:00:00.000Z');
+      expect(query.ends[4]).toBe('2026-08-05T16:00:00.000Z');
+      expect(query.days[4]).toBe('2026-08-05');
     });
 
-    it('uses the IANA timezone for month boundaries and per-message days', async () => {
+    it('uses the IANA timezone for month boundaries and per-day windows', async () => {
       prisma.chatMember.findUnique.mockResolvedValue(membership());
-      prisma.chatMessage.findMany.mockResolvedValue([
-        { createdAt: new Date('2026-03-08T07:30:00.000Z') }, // 3/7 23:30 PST
-        { createdAt: new Date('2026-03-08T08:30:00.000Z') }, // 3/8 00:30 PST
-      ]);
+      prisma.$queryRaw.mockResolvedValue([]);
 
-      const days = await service.listMessageDays(
+      await service.listMessageDays(
         'u1',
         'conv-1',
         2026,
@@ -2765,17 +2811,15 @@ describe('ChatService', () => {
         'America/Los_Angeles',
       );
 
-      expect(prisma.chatMessage.findMany).toHaveBeenCalledWith(
-        expect.objectContaining({
-          where: expect.objectContaining({
-            createdAt: {
-              gte: new Date('2026-03-01T08:00:00.000Z'),
-              lt: new Date('2026-04-01T07:00:00.000Z'),
-            },
-          }),
-        }),
-      );
-      expect(days).toEqual(['2026-03-07', '2026-03-08']);
+      const query = daysQuery();
+      expect(query.starts[0]).toBe('2026-03-01T08:00:00.000Z');
+      expect(query.ends[30]).toBe('2026-04-01T07:00:00.000Z');
+      // 3/8 切夏令时,这一天的 UTC 区间只有 23 小时。
+      expect([query.starts[7], query.ends[7]]).toEqual([
+        '2026-03-08T08:00:00.000Z',
+        '2026-03-09T07:00:00.000Z',
+      ]);
+      expect(query.floor).toBe(0);
     });
 
     it('denies non-members', async () => {
@@ -2827,6 +2871,53 @@ describe('ChatService', () => {
 
       await expect(service.listMembers('u1', 'conv-1')).resolves.toEqual([
         expect.objectContaining({ userId: 'u1', role: 'ADMIN' }),
+      ]);
+    });
+
+    // 角色只用来标在座的人:不再把整个圈子的 ACTIVE 成员(可能远多于在座座位)拉回来。
+    it('reads circle roles only for the seated users', async () => {
+      prisma.chatMember.findUnique.mockResolvedValue(
+        membership({
+          conversation: {
+            ...membership().conversation,
+            circleID: 'circle-1',
+          },
+        }),
+      );
+      prisma.circleMember.findUnique.mockResolvedValue({
+        role: 'OWNER',
+        status: 'ACTIVE',
+      });
+      prisma.chatMember.findMany.mockResolvedValue([
+        { userID: 'u1' },
+        { userID: 'u2' },
+        { userID: 'u3' },
+      ]);
+      prisma.user.findMany.mockResolvedValue([
+        { id: 'u1', nickname: '一', avatarUrl: null },
+        { id: 'u2', nickname: '二', avatarUrl: null },
+        { id: 'u3', nickname: '三', avatarUrl: null },
+      ]);
+      prisma.circleMember.findMany.mockResolvedValue([
+        { userID: 'u1', role: 'OWNER' },
+        { userID: 'u2', role: 'MEMBER' },
+      ]);
+
+      const members = await service.listMembers('u1', 'conv-1');
+
+      expect(prisma.circleMember.findMany).toHaveBeenCalledWith({
+        where: {
+          circleID: 'circle-1',
+          status: 'ACTIVE',
+          userID: { in: ['u1', 'u2', 'u3'] },
+        },
+        select: { userID: true, role: true },
+      });
+      // 不在 ACTIVE 名单里的在座者照旧没有角色。
+      expect(members.map((m) => [m.userId, m.role])).toEqual([
+        ['u1', 'OWNER'],
+        ['u2', 'MEMBER'],
+        ['u3', null],
       ]);
     });
   });
@@ -3022,6 +3113,50 @@ describe('ChatService', () => {
       expect(page.conversations).toHaveLength(2);
     });
 
+    // 连接池默认只有 10 个:一页的 7 条补充查询原来一起发,两个请求同时拉列表就能
+    // 把池占满。现在同时最多 3 条,返回内容不变。
+    it('runs at most three page loaders at once and still calls each one', async () => {
+      prisma.chatMember.findMany.mockResolvedValueOnce([membership()]);
+      let running = 0;
+      let peak = 0;
+      const results: Record<string, unknown> = {
+        loadDirectPeers: {
+          info: new Map(),
+          readHeights: new Map(),
+          deliveredHeights: new Map(),
+        },
+        loadUnreadCounts: new Map([['conv-1', 4]]),
+      };
+      const spies = [
+        'loadLastMessages',
+        'loadUnreadCounts',
+        'loadDirectPeers',
+        'loadCircleInfos',
+        'loadTempChatInfos',
+        'loadCircleRoles',
+        'loadGroupMemberCounts',
+      ].map((name) =>
+        jest
+          .spyOn(service as never, name as never)
+          .mockImplementation((async () => {
+            running += 1;
+            peak = Math.max(peak, running);
+            await new Promise<void>((resolve) => setImmediate(resolve));
+            running -= 1;
+            return results[name] ?? new Map();
+          }) as never),
+      );
+      try {
+        const page = await service.listConversationsPage('u1');
+
+        expect(peak).toBe(3);
+        for (const spy of spies) expect(spy).toHaveBeenCalledTimes(1);
+        expect(page.conversations[0]).toMatchObject({ unreadCount: 4 });
+      } finally {
+        for (const spy of spies) spy.mockRestore();
+      }
+    });
+
     it('reports no more conversations when the page is not full', async () => {
       prisma.chatMember.findMany.mockResolvedValueOnce([membership()]);
       prisma.$queryRaw.mockResolvedValue([]);
@@ -3056,8 +3191,8 @@ describe('ChatService', () => {
       await service.listConversations('u1');
 
       expect(privacySettings.getSelfDestructPolicy).not.toHaveBeenCalled();
-      for (const [strings] of prisma.$queryRaw.mock.calls) {
-        expect(strings.join('')).toContain('"burnExpiresAt"');
+      for (const [query] of prisma.$queryRaw.mock.calls as [Prisma.Sql][]) {
+        expect(query.sql).toContain('"burnExpiresAt"');
       }
     });
 
@@ -3139,8 +3274,8 @@ describe('ChatService', () => {
 
       await service.listConversations('u1');
 
-      const unreadSql = (prisma.$queryRaw.mock.calls as unknown[][])
-        .map((call) => (call[0] as TemplateStringsArray).join('?'))
+      const unreadSql = (prisma.$queryRaw.mock.calls as [Prisma.Sql][])
+        .map(([query]) => query.sql)
         .find((sql) => sql.includes('COUNT(*)'));
       expect(unreadSql).toContain('m."revokedAt" IS NULL');
     });

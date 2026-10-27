@@ -58,9 +58,19 @@ import {
   MEDIA_MESSAGE_TYPES,
   SYNC_PAGE_MAX,
   READERS_PAGE_MAX,
-  UNREAD_COUNT_CAP,
 } from './chat.constants';
 import { recentTextMatchesQuery } from './chat-text-search.query';
+import { allWithConcurrency } from 'src/utils/concurrency-limit';
+import {
+  historyPageArgs,
+  historyPageWhere,
+  MESSAGE_READ_OMIT,
+} from './chat-history-page.query';
+import {
+  lastMessagesQuery,
+  unreadCountsQuery,
+} from './chat-conversation-summary.query';
+import { messageDaysQuery, messageDayWindows } from './chat-message-days.query';
 import { messagePreviewText } from './chat-message-preview';
 import {
   buildChatRetentionWindow,
@@ -131,6 +141,12 @@ interface SendResult {
 type ChatBurnPolicyInput = ChatBurnPolicy | number | null;
 
 /**
+ * 会话列表一页的补充查询(末条/未读/对端/圈子/临时房/角色/人数)同时最多跑几条。
+ * 连接池默认只有 10 个:原来 7 条一起发,两个请求同时拉列表就能把池占满。
+ */
+const CONVERSATION_LIST_QUERY_CONCURRENCY = 3;
+
+/**
  * A note-card message carries the effective cards that were visible when it
  * was sent.  They live inside the message content so a later profile/group
  * change cannot rewrite an already shared order.  The personal card is
@@ -180,7 +196,6 @@ function senderSeatRefs(
       : [],
   );
 }
-const MESSAGE_READ_OMIT = { contentHistory: true } as const;
 
 /**
  * 会话变更序号流的水位:已分配出去的最高 revision,<= 它的变更都已提交。
@@ -1630,30 +1645,32 @@ export class ChatService {
       tempChats,
       circleRoles,
       memberCounts,
-    ] = await Promise.all([
-      this.loadLastMessages(conversationIds, retentionWindows),
-      this.loadUnreadCounts(
-        userId,
-        // G-14:未读底数取已读水位与清空水位的更高者,清空过的段落不再计数。
-        memberships.map((m) => ({
-          conversationID: m.conversationID,
-          lastReadHeight: Math.max(
-            m.lastReadHeight,
-            m.clearedBeforeHeight ?? 0,
-            m.conversation.clearedBeforeHeight ?? 0,
-          ),
-        })),
-        retentionWindows,
-      ),
-      this.loadDirectPeers(userId, directIds),
-      this.loadCircleInfos(circleIds),
-      this.loadTempChatInfos(
-        memberships
-          .map((m) => m.conversation.tempChatID)
-          .filter((id): id is string => id !== null),
-      ),
-      this.loadCircleRoles(userId, circleIds),
-      this.loadGroupMemberCounts(groupIds),
+    ] = await allWithConcurrency(CONVERSATION_LIST_QUERY_CONCURRENCY, [
+      () => this.loadLastMessages(conversationIds, retentionWindows),
+      () =>
+        this.loadUnreadCounts(
+          userId,
+          // G-14:未读底数取已读水位与清空水位的更高者,清空过的段落不再计数。
+          memberships.map((m) => ({
+            conversationID: m.conversationID,
+            lastReadHeight: Math.max(
+              m.lastReadHeight,
+              m.clearedBeforeHeight ?? 0,
+              m.conversation.clearedBeforeHeight ?? 0,
+            ),
+          })),
+          retentionWindows,
+        ),
+      () => this.loadDirectPeers(userId, directIds),
+      () => this.loadCircleInfos(circleIds),
+      () =>
+        this.loadTempChatInfos(
+          memberships
+            .map((m) => m.conversation.tempChatID)
+            .filter((id): id is string => id !== null),
+        ),
+      () => this.loadCircleRoles(userId, circleIds),
+      () => this.loadGroupMemberCounts(groupIds),
     ]);
 
     const lastRows = [...lastMessages.values()];
@@ -2630,22 +2647,13 @@ export class ChatService {
     // 读取只按各消息首次发送时确定的到期时间过滤，不应用查看者的设置。
     const viewer = NO_VIEWER_RETENTION;
     const retention = buildChatRetentionWindow(conversation, viewer);
-    const heightCondition: Prisma.IntFilter = {
-      ...(heightFloor > 0 ? { gt: heightFloor } : {}),
-      ...(beforeHeight !== undefined ? { lt: beforeHeight } : {}),
-    };
-    const where: Prisma.ChatMessageWhereInput = {
-      conversationID: conversationId,
-      deleted: false,
-      ...(Object.keys(heightCondition).length > 0
-        ? { height: heightCondition }
-        : {}),
-      ...this.buildHistoryFilterWhere(filters),
-    };
-    // 必须用 AND 追加,不能并进同一层 —— 按日期过滤同样写 createdAt,
-    // 平铺展开会被它整个盖掉:客户端只要带上 date 参数就能翻出销毁窗口
-    // 之外的消息,等于给这个设置留了个后门。
-    Object.assign(where, chatRetentionWhere(retention));
+    const where = historyPageWhere({
+      conversationId,
+      heightFloor,
+      beforeHeight,
+      filters,
+      retention,
+    });
     const rows = filters.keyword
       ? await this.findHistoryKeywordRows({
           conversationId,
@@ -2656,13 +2664,9 @@ export class ChatService {
           beforeHeight,
           take,
         })
-      : await this.prisma.chatMessage.findMany({
-          where,
-          omit: MESSAGE_READ_OMIT,
-          // 增量补拉从缺口低端往高处追;向旧翻页照旧取最近一段再反转。
-          orderBy: { height: ascendingPull ? 'asc' : 'desc' },
-          take,
-        });
+      : await this.prisma.chatMessage.findMany(
+          historyPageArgs(where, ascendingPull, take),
+        );
     const senderIds = rows
       .map((r) => r.senderID)
       .filter((id): id is string => id !== null);
@@ -2795,32 +2799,10 @@ export class ChatService {
    * [00:00, 24:00) 的 UTC 区间。keyword 不在这里:它先走二元组索引取候选
    * (findHistoryKeywordRows),这里的条件再套在候选上。
    */
-  private buildHistoryFilterWhere(
-    filters: HistoryFilters,
-  ): Prisma.ChatMessageWhereInput {
-    const where: Prisma.ChatMessageWhereInput = {};
-    if (filters.types?.length) {
-      where.type = { in: filters.types };
-    }
-    if (filters.date) {
-      const tzOffset = filters.tzOffsetMinutes ?? 0;
-      const tzEndOffset = filters.tzEndOffsetMinutes ?? tzOffset;
-      const utcStart = Date.parse(`${filters.date}T00:00:00Z`);
-      const start = utcStart + tzOffset * 60_000;
-      const end = utcStart + 24 * 60 * 60 * 1000 + tzEndOffset * 60_000;
-      if (Number.isFinite(start)) {
-        where.createdAt = {
-          gte: new Date(start),
-          lt: new Date(end),
-        };
-      }
-    }
-    return where;
-  }
-
   /**
    * 某月内有聊天记录的日期集合('YYYY-MM-DD',按客户端时区归日),
-   * 按日期日历给有记录的天上色用。上限 5000 行,极端活跃会话截断可接受。
+   * 按日期日历给有记录的天上色用。时区规则见 messageDayWindows,逐天的存在性查询见
+   * messageDaysQuery(原来取 5000 行回来去重,活跃月份会随机漏天)。
    */
   async listMessageDays(
     userId: string,
@@ -2830,94 +2812,19 @@ export class ChatService {
     tzOffsetMinutes = 0,
     timeZone?: string,
   ): Promise<string[]> {
-    // 座位行也要带回来:下面按清空水位与销毁/焚毁窗口过滤(main 的 #143 改的是
-    // 月份边界的时区算法,与这里的可见性过滤互不相干,两边都要)。
-    const { conversation, member } = await this.requireMembershipSeat(
-      conversationId,
-      userId,
+    // 座位行也要带回来:日历同样要按 getHistory 的尺子上色 —— 清空/焚毁之后那些天
+    // 点进去是空的,日历却还标着有记录。
+    const { member } = await this.requireMembershipSeat(conversationId, userId);
+    const windows = messageDayWindows(year, month, tzOffsetMinutes, timeZone);
+    if (windows.length === 0) return [];
+    const rows = await this.prisma.$queryRaw<Array<{ day: string }>>(
+      messageDaysQuery(
+        conversationId,
+        member.clearedBeforeHeight ?? 0,
+        windows,
+      ),
     );
-    const formatter = timeZone
-      ? new Intl.DateTimeFormat('en-US', {
-          timeZone,
-          year: 'numeric',
-          month: '2-digit',
-          day: '2-digit',
-        })
-      : undefined;
-    const monthStart = formatter
-      ? this.findUtcStartOfZonedDate(formatter, year, month, 1)
-      : Date.UTC(year, month, 1) + tzOffsetMinutes * 60_000;
-    const monthEnd = formatter
-      ? this.findUtcStartOfZonedDate(formatter, year, month + 1, 1)
-      : Date.UTC(year, month + 1, 1) + tzOffsetMinutes * 60_000;
-    if (!Number.isFinite(monthStart) || !Number.isFinite(monthEnd)) return [];
-    // 日历同样要按 getHistory 的尺子上色:清空/销毁/焚毁之后那些天点进去是空的,
-    // 日历却还标着有记录。
-    const floor = member.clearedBeforeHeight ?? 0;
-    const retention = buildChatRetentionWindow(
-      conversation,
-      NO_VIEWER_RETENTION,
-    );
-    const lowerBound = new Date(monthStart);
-    const messageWhere: Prisma.ChatMessageWhereInput = {
-      conversationID: conversationId,
-      deleted: false,
-      ...(floor > 0 ? { height: { gt: floor } } : {}),
-      createdAt: {
-        gte: lowerBound,
-        lt: new Date(monthEnd),
-      },
-    };
-    const retentionWhere = chatRetentionWhere(retention);
-    if (retentionWhere.AND) {
-      messageWhere.AND = retentionWhere.AND;
-    }
-    const rows = await this.prisma.chatMessage.findMany({
-      where: messageWhere,
-      select: { createdAt: true },
-      take: 5000,
-    });
-    const days = new Set<string>();
-    for (const row of rows) {
-      if (formatter) {
-        days.add(this.formatZonedDate(formatter, row.createdAt));
-      } else {
-        const local = new Date(
-          row.createdAt.getTime() - tzOffsetMinutes * 60_000,
-        );
-        days.add(local.toISOString().slice(0, 10));
-      }
-    }
-    return [...days].sort((a, b) => (a < b ? -1 : 1));
-  }
-
-  private findUtcStartOfZonedDate(
-    formatter: Intl.DateTimeFormat,
-    year: number,
-    month: number,
-    day: number,
-  ): number {
-    const normalized = new Date(Date.UTC(year, month, day));
-    const target = normalized.toISOString().slice(0, 10);
-    let low = normalized.getTime() - 36 * 60 * 60 * 1000;
-    let high = normalized.getTime() + 36 * 60 * 60 * 1000;
-    while (low < high) {
-      const middle = Math.floor((low + high) / 2);
-      if (this.formatZonedDate(formatter, new Date(middle)) < target) {
-        low = middle + 1;
-      } else {
-        high = middle;
-      }
-    }
-    return low;
-  }
-
-  private formatZonedDate(formatter: Intl.DateTimeFormat, date: Date): string {
-    const parts = formatter.formatToParts(date);
-    const year = parts.find((part) => part.type === 'year')?.value;
-    const month = parts.find((part) => part.type === 'month')?.value;
-    const day = parts.find((part) => part.type === 'day')?.value;
-    return `${year}-${month}-${day}`;
+    return rows.map((row) => row.day).sort((a, b) => (a < b ? -1 : 1));
   }
 
   /**
@@ -3490,10 +3397,15 @@ export class ChatService {
     const userIds = seats.map((s) => s.userID);
     const [users, roles] = await Promise.all([
       this.resolveSenders(userIds, null),
-      conversation.circleID
+      // 角色只用来标这批在座的人:按 userID 取,不把整个圈子的 ACTIVE 成员拉回来。
+      conversation.circleID && userIds.length > 0
         ? this.prisma.circleMember
             .findMany({
-              where: { circleID: conversation.circleID, status: 'ACTIVE' },
+              where: {
+                circleID: conversation.circleID,
+                status: 'ACTIVE',
+                userID: { in: userIds },
+              },
               select: { userID: true, role: true },
             })
             .then((rows) => new Map(rows.map((r) => [r.userID, r.role])))
@@ -3816,75 +3728,26 @@ export class ChatService {
   }
 
   /**
-   * 每个会话的末条消息,一次集合查询取回。
+   * 每个会话的末条消息,一次集合查询取回(SQL 见 lastMessagesQuery)。
    * 原来是每会话一次 findFirst:100 个会话的列表页就要 100 次往返,叠加
    * 未读计数共 ~201 次,正常用户打开会话列表就能把 Prisma 连接池吃干。
-   * DISTINCT ON + (conversationID, height desc) 命中既有索引,单次即可。
    */
   private async loadLastMessages(
     conversationIds: string[],
     retentionWindows: ChatRetentionWindow[],
   ): Promise<Map<string, MessageRow>> {
     if (conversationIds.length === 0) return new Map();
-    const viewerCutoffs = retentionWindows.map((window) => window.viewerCutoff);
-    const viewerStarts = retentionWindows.map(
-      (window) => window.viewerStartedAt,
+    const rows = await this.prisma.$queryRaw<MessageRow[]>(
+      lastMessagesQuery(conversationIds, retentionWindows),
     );
-    const burnStarts = retentionWindows.map((window) => window.burnStartedAt);
-    const burnCutoffs = retentionWindows.map((window) => window.burnCutoff);
-    // 每个会话只沿 (conversationID, height) 唯一索引倒着找第一条可见的消息。原来的
-    // DISTINCT ON 在 PG16 上没有 skip scan:要把每个会话的全部历史读出来、连正文
-    // 一起排序,几个十万条的大群就是每次拉列表上百万行。
-    //
-    // 列名逐个写出而不是 SELECT *:唯一的目的是别把 contentHistory 拖进来
-    // (见 MessageRow 上的注释)。原始 SQL 绕过 Prisma 的 omit,只能手写 ——
-    // 也绕过了类型检查,漏一列 tsc 照过,chat-last-message-columns.spec 兜着。
-    const rows = await this.prisma.$queryRaw<MessageRow[]>`
-      SELECT latest.*
-      FROM unnest(
-        ${conversationIds}::text[],
-        ${viewerCutoffs}::timestamptz[],
-        ${viewerStarts}::timestamptz[],
-        ${burnStarts}::timestamptz[],
-        ${burnCutoffs}::timestamptz[]
-      ) AS w("conversationID", "viewerCutoff", "viewerStartedAt",
-             "burnStartedAt", "burnCutoff")
-      CROSS JOIN LATERAL (
-        SELECT
-          m."id", m."conversationID", m."height", m."senderID", m."type", m."content",
-          m."clientMessageId", m."requestHash", m."replyToID", m."deleted",
-          m."revokedAt", m."revokedBy", m."editedAt", m."deletedAt", m."revision",
-          m."createdAt", m."burnDurationSec", m."burnExpiresAt"
-        FROM "ChatMessage" AS m
-        WHERE m."conversationID" = w."conversationID"
-          AND m."deleted" = false
-          AND (m."burnExpiresAt" IS NULL OR m."burnExpiresAt" > NOW())
-          AND (
-            w."viewerCutoff" IS NULL
-            OR (w."viewerStartedAt" IS NOT NULL AND m."createdAt" < w."viewerStartedAt")
-            OR m."createdAt" >= w."viewerCutoff"
-          )
-          AND (
-            w."burnCutoff" IS NULL
-            OR (w."burnStartedAt" IS NOT NULL AND m."createdAt" < w."burnStartedAt")
-            OR m."createdAt" >= w."burnCutoff"
-          )
-        ORDER BY m."height" DESC
-        LIMIT 1
-      ) AS latest
-    `;
     const map = new Map<string, MessageRow>();
     for (const row of rows) map.set(row.conversationID, row);
     return map;
   }
 
   /**
-   * 每个会话的未读数,一次查询取回(每会话各自的 lastReadHeight 水位)。原来每会话
-   * 一次 count。
-   *
-   * 数到 UNREAD_COUNT_CAP 就停:界面最多显示 99+,而不封顶的 COUNT 对一个积了上万条
-   * 未读的大群要逐行回表(deleted/revokedAt/createdAt/senderID 都不在索引里),每次
-   * 拉会话列表都来一遍。
+   * 每个会话的未读数,一次查询取回(每会话各自的 lastReadHeight 水位,数到
+   * UNREAD_COUNT_CAP 封顶;SQL 见 unreadCountsQuery)。原来每会话一次 count。
    */
   private async loadUnreadCounts(
     userId: string,
@@ -3895,55 +3758,9 @@ export class ChatService {
       memberships.map((m) => [m.conversationID, 0]),
     );
     if (memberships.length === 0) return map;
-    const ids = memberships.map((m) => m.conversationID);
-    const floors = memberships.map((m) => m.lastReadHeight);
-    const viewerCutoffs = retentionWindows.map((window) => window.viewerCutoff);
-    const viewerStarts = retentionWindows.map(
-      (window) => window.viewerStartedAt,
-    );
-    const burnStarts = retentionWindows.map((window) => window.burnStartedAt);
-    const burnCutoffs = retentionWindows.map((window) => window.burnCutoff);
     const rows = await this.prisma.$queryRaw<
       Array<{ conversationID: string; count: bigint }>
-    >`
-      SELECT w."conversationID", unread.count
-      FROM unnest(
-        ${ids}::text[],
-        ${floors}::int[],
-        ${viewerCutoffs}::timestamptz[],
-        ${viewerStarts}::timestamptz[],
-        ${burnStarts}::timestamptz[],
-        ${burnCutoffs}::timestamptz[]
-      ) AS w("conversationID", floor, "viewerCutoff", "viewerStartedAt",
-             "burnStartedAt", "burnCutoff")
-      CROSS JOIN LATERAL (
-        SELECT COUNT(*)::bigint AS count
-        FROM (
-          SELECT 1
-          FROM "ChatMessage" AS m
-          WHERE m."conversationID" = w."conversationID"
-            AND m."height" > w.floor
-            AND m."deleted" = false
-          AND (m."burnExpiresAt" IS NULL OR m."burnExpiresAt" > NOW())
-            -- 撤回的消息不计未读:对方发了又撤回,红点不该还挂着一条看不到内容的「新消息」。
-            AND m."revokedAt" IS NULL
-            AND (
-              w."viewerCutoff" IS NULL
-              OR (w."viewerStartedAt" IS NOT NULL AND m."createdAt" < w."viewerStartedAt")
-              OR m."createdAt" >= w."viewerCutoff"
-            )
-            AND (
-              w."burnCutoff" IS NULL
-              OR (w."burnStartedAt" IS NOT NULL AND m."createdAt" < w."burnStartedAt")
-              OR m."createdAt" >= w."burnCutoff"
-            )
-            -- 自己发的消息不计未读。
-            AND (m."senderID" IS NULL OR m."senderID" <> ${userId})
-          LIMIT ${UNREAD_COUNT_CAP}
-        ) AS capped
-      ) AS unread
-      WHERE unread.count > 0
-    `;
+    >(unreadCountsQuery(userId, memberships, retentionWindows));
     for (const row of rows) map.set(row.conversationID, Number(row.count));
     return map;
   }

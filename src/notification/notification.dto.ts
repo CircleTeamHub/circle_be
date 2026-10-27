@@ -267,21 +267,71 @@ export function decodeNotificationCursor(
   }
 }
 
-export const NOTIFICATION_REALTIME_INCLUDE = {
-  systemAnnouncement: { select: { title: true } },
-  fromUser: { select: { id: true, nickname: true, avatarUrl: true } },
-  fromTrace: { select: { id: true, content: true, images: true } },
-  fromReply: { select: { id: true, content: true } },
-  fromCircle: { select: { id: true, name: true } },
-  fromCirclePost: { select: { id: true, content: true, images: true } },
-  fromInvitation: { select: { id: true, status: true } },
-  fromGroupAdmission: { select: { id: true, status: true } },
-  fromFriendRequest: { select: { id: true } },
-} as const;
+/**
+ * 组装实时 DTO / 推送文案要读的 Notification 本表列（含全部外键）。
+ *
+ * 关系不再用 include 一次拉 9 个：Prisma 7 对每个 include 各发一条查询、用
+ * Promise.all 并发（非事务时一条占一个池连接），外键全空的关系也照发。现在先取
+ * 本表列，再由 notification-realtime.loader 按外键只查用得到的关系、逐条顺序查。
+ */
+export const NOTIFICATION_REALTIME_BASE_SELECT = {
+  id: true,
+  type: true,
+  content: true,
+  read: true,
+  createdAt: true,
+  toUserID: true,
+  fromUserID: true,
+  fromTraceID: true,
+  fromReplyID: true,
+  fromCircleID: true,
+  fromCirclePostID: true,
+  fromInvitationID: true,
+  fromGroupAdmissionID: true,
+  fromFriendRequestID: true,
+  systemAnnouncementID: true,
+} as const satisfies Prisma.NotificationSelect;
 
-export type NotificationRealtimeRow = Prisma.NotificationGetPayload<{
-  include: typeof NOTIFICATION_REALTIME_INCLUDE;
+export type NotificationRealtimeBaseRow = Prisma.NotificationGetPayload<{
+  select: typeof NOTIFICATION_REALTIME_BASE_SELECT;
 }>;
+
+/** 与原来 9 路 include 各关系 select 出来的形状一致。 */
+export type NotificationRealtimeRelations = {
+  systemAnnouncement: { title: string | null } | null;
+  fromUser: { id: string; nickname: string; avatarUrl: string | null } | null;
+  fromTrace: { id: string; content: string; images: string[] } | null;
+  fromReply: { id: string; content: string } | null;
+  fromCircle: { id: string; name: string } | null;
+  fromCirclePost: { id: string; content: string; images: string[] } | null;
+  fromInvitation: { id: string; status: string } | null;
+  fromGroupAdmission: { id: string; status: string } | null;
+};
+
+export type NotificationRealtimeRow = NotificationRealtimeBaseRow &
+  NotificationRealtimeRelations;
+
+/**
+ * composeMessage 实际读到的字段。正文非空时它不会往下读回复 / 帖子 / 动态的摘要，
+ * 所以这几个字段可以缺省 —— 推送路径因此不必为每条通知都去拉 5000 字的正文。
+ * NotificationRealtimeDto 结构上是它的超集，可以直接传进去。
+ */
+export type NotificationPushSource = {
+  id: string;
+  type: NotificationType;
+  content: string;
+  title?: string | null;
+  fromUser: { id: string; nickname: string } | null;
+  fromTrace: { id: string; excerpt?: string } | null;
+  fromReply: { id: string; content?: string } | null;
+  fromCirclePost: { id: string; excerpt?: string } | null;
+  fromInvitation: { id: string } | null;
+  fromGroupAdmission?: { id: string } | null;
+  requestId?: string | null;
+};
+
+/** 动态 / 帖子在通知里只露这么长的摘要。 */
+export const NOTIFICATION_EXCERPT_LENGTH = 60;
 
 export function mapNotificationRealtimeDto(
   n: NotificationRealtimeRow,
@@ -303,7 +353,7 @@ export function mapNotificationRealtimeDto(
     fromTrace: n.fromTrace
       ? {
           id: n.fromTrace.id,
-          excerpt: n.fromTrace.content.slice(0, 60),
+          excerpt: n.fromTrace.content.slice(0, NOTIFICATION_EXCERPT_LENGTH),
           firstImage: n.fromTrace.images[0] ?? null,
         }
       : null,
@@ -316,7 +366,10 @@ export function mapNotificationRealtimeDto(
     fromCirclePost: n.fromCirclePost
       ? {
           id: n.fromCirclePost.id,
-          excerpt: n.fromCirclePost.content.slice(0, 60),
+          excerpt: n.fromCirclePost.content.slice(
+            0,
+            NOTIFICATION_EXCERPT_LENGTH,
+          ),
           firstImage: n.fromCirclePost.images[0] ?? null,
         }
       : null,
@@ -331,7 +384,8 @@ export function mapNotificationRealtimeDto(
           },
         }
       : {}),
-    requestId: n.fromFriendRequest?.id ?? null,
+    // 外键 ON DELETE SET NULL：外键非空时 Friend 行一定在，不必为一个 id 再查一次表。
+    requestId: n.fromFriendRequestID ?? null,
   };
 }
 

@@ -191,6 +191,34 @@ describe('ChatMediaService', () => {
     expect(sql).toContain('"ChatMessage"');
     expect(sql).toContain('"ChatBurnArchive"');
   });
+  // 归档清理一个事务处理同会话的多行:逐行加锁的话跨行顺序是乱的。整批先按
+  // 「自有附件 key(排序)→ 笔记导入 key(排序)」锁齐,与焚毁清扫一个事务里的顺序一致。
+  it('locks a whole archive batch in the same global order as the burn sweep', async () => {
+    prisma.$queryRaw.mockResolvedValue([]);
+    await service.lockArchiveKeys(prisma as never, [
+      'chat/u2/b.jpg',
+      'chat/u1/note-import/z.jpg',
+      'chat/u1/a.jpg',
+      'chat/u2/b.jpg',
+      'not-chat/c.jpg',
+      'chat/u1/note-import/m.jpg',
+    ]);
+    const owned = prisma.$queryRaw.mock.calls.map((call: unknown[]) => call[1]);
+    const notes = prisma.$executeRaw.mock.calls.map(
+      (call: unknown[]) => call[1],
+    );
+    expect(owned).toEqual(['chat/u1/a.jpg', 'chat/u2/b.jpg']);
+    expect(notes).toEqual([
+      'chat/u1/note-import/m.jpg',
+      'chat/u1/note-import/z.jpg',
+    ]);
+    expect(prisma.$queryRaw.mock.calls[0][0].join(' ')).toContain(
+      'pg_advisory_xact_lock(hashtext(',
+    );
+    expect(
+      prisma.$queryRaw.mock.invocationCallOrder[owned.length - 1],
+    ).toBeLessThan(prisma.$executeRaw.mock.invocationCallOrder[0]);
+  });
   it('never queues physical deletion when another live or retained reference still owns the key', async () => {
     prisma.$queryRaw.mockResolvedValue([]);
     await service.queueDeletions(prisma as never, ['chat/u1/shared.jpg']);

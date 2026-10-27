@@ -63,6 +63,11 @@ import { reportOperationalError } from 'src/logging/error-aggregation.service';
 
 const ME_SELECT = USER_ME_SELECT;
 
+// lastOnline 只喂「N 分钟前在线」和管理台的活跃统计,分钟级精度足够:同一账号
+// 60 秒内最多写一次。它在 User_lastOnline_idx 里,每次写都不是 HOT 更新,User 表
+// 的十几个索引都要写新条目;me() 每次打开 App 都会调。
+const LAST_ONLINE_WRITE_INTERVAL_MS = 60_000;
+
 // 管理台按账号锁定（#83）：与 securityCode 锁定同款参数量级。
 // 5 次错密码 → 锁 15 分钟；成功登录清零。只对 role=ADMIN 账号生效。
 const ADMIN_LOGIN_MAX_ATTEMPTS = 5;
@@ -429,13 +434,7 @@ export class AuthService {
         errorCode: AuthErrorCode.LoginChallengeInvalid,
       });
     }
-    this.prisma.user
-      .update({ where: { id: user.id }, data: { lastOnline: new Date() } })
-      .catch((err) =>
-        this.logger.warn(
-          `lastOnline update failed for ${user.id}: ${err?.message}`,
-        ),
-      );
+    this.touchLastOnline(user.id);
     const { sessionId, ...tokens } = await this.issueTokensWithSession(
       user.id,
       user.accountId,
@@ -744,13 +743,7 @@ export class AuthService {
       throw new ForbiddenException('管理员尚未分配权限，请联系超级管理员');
     await this.resetAdminLockCounters(user);
 
-    this.prisma.user
-      .update({ where: { id: user.id }, data: { lastOnline: new Date() } })
-      .catch((err) =>
-        this.logger.warn(
-          `lastOnline update failed for ${user.id}: ${err?.message}`,
-        ),
-      );
+    this.touchLastOnline(user.id);
 
     const tokens = await this.issueTokens(
       user.id,
@@ -806,13 +799,7 @@ export class AuthService {
     sessionContext?: SessionContext,
   ) {
     // Fire-and-forget: lastOnline is best-effort and must never block token issuance.
-    this.prisma.user
-      .update({ where: { id: user.id }, data: { lastOnline: new Date() } })
-      .catch((err) =>
-        this.logger.warn(
-          `lastOnline update failed for ${user.id}: ${err?.message}`,
-        ),
-      );
+    this.touchLastOnline(user.id);
 
     const tokens = await this.issueTokens(
       user.id,
@@ -890,13 +877,7 @@ export class AuthService {
       }
 
       // Fire-and-forget: lastOnline is best-effort and must never block token issuance.
-      this.prisma.user
-        .update({ where: { id: user.id }, data: { lastOnline: new Date() } })
-        .catch((err) =>
-          this.logger.warn(
-            `lastOnline update failed for ${user.id}: ${err?.message}`,
-          ),
-        );
+      this.touchLastOnline(user.id);
 
       const accessToken = await this.signAccessToken(
         user.id,
@@ -960,13 +941,7 @@ export class AuthService {
       throw new ForbiddenException('Admin account is not active');
     }
 
-    this.prisma.user
-      .update({ where: { id: user.id }, data: { lastOnline: new Date() } })
-      .catch((err) =>
-        this.logger.warn(
-          `lastOnline update failed for ${user.id}: ${err?.message}`,
-        ),
-      );
+    this.touchLastOnline(user.id);
 
     const accessToken = await this.signAccessToken(
       user.id,
@@ -1163,6 +1138,36 @@ export class AuthService {
     });
   }
 
+  /**
+   * 记一笔最近在线,fire-and-forget:失败只记日志,绝不阻塞登录 / 续签 / me。
+   * - 条件写:库里的值在 LAST_ONLINE_WRITE_INTERVAL_MS 之内就跳过(0 行,不产生
+   *   新行版本),写法同 ChatService.touchLastOnline;
+   * - updateMany 不 RETURNING 整行(update 会把含 passwordHash 在内的全部列读回来,
+   *   而调用方从不读返回值);用户行不存在时也不会像 update 那样抛 P2025。
+   */
+  private touchLastOnline(userId: string, now = new Date()): void {
+    this.prisma.user
+      .updateMany({
+        where: {
+          id: userId,
+          OR: [
+            { lastOnline: null },
+            {
+              lastOnline: {
+                lt: new Date(now.getTime() - LAST_ONLINE_WRITE_INTERVAL_MS),
+              },
+            },
+          ],
+        },
+        data: { lastOnline: now },
+      })
+      .catch((err) =>
+        this.logger.warn(
+          `lastOnline update failed for ${userId}: ${err?.message}`,
+        ),
+      );
+  }
+
   async me(userId: string): Promise<SafeUser> {
     const [user, displayIcons, appearances] = await Promise.all([
       this.prisma.user.findUnique({
@@ -1182,15 +1187,10 @@ export class AuthService {
 
     // Fire-and-forget lastOnline update so a DB hiccup never blocks the read
     // and never produces a fabricated "success" response. The returned shape
-    // shows the optimistic timestamp; persistence is best-effort.
+    // shows the optimistic timestamp; persistence is best-effort (and throttled,
+    // see touchLastOnline) — the response never depends on the write.
     const now = new Date();
-    this.prisma.user
-      .update({ where: { id: userId }, data: { lastOnline: now } })
-      .catch((err) =>
-        this.logger.warn(
-          `lastOnline update failed for ${userId}: ${err?.message}`,
-        ),
-      );
+    this.touchLastOnline(userId, now);
 
     return {
       ...user,

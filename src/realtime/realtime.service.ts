@@ -8,15 +8,10 @@ import {
 } from '@nestjs/common';
 import { randomUUID } from 'crypto';
 import { WebSocket } from 'ws';
-import { NotificationType } from 'src/generated/prisma';
 import { PrismaService } from 'src/prisma/prisma.service';
 import { RedisService } from 'src/redis/redis.service';
-import {
-  CIRCLE_NOTIFICATION_TYPES,
-  DISCOVER_NOTIFICATION_TYPES,
-  MOMENT_NOTIFICATION_TYPES,
-  PROFILE_NOTIFICATION_TYPES,
-} from 'src/notification/notification.constants';
+import { PROFILE_NOTIFICATION_TYPES } from 'src/notification/notification.constants';
+import { loadUnreadNotificationsByDomain } from 'src/notification/notification-unread.query';
 import type { NotificationRealtimeDto } from 'src/notification/notification.dto';
 import {
   SESSION_REVOCATION_CHANNEL,
@@ -514,23 +509,17 @@ export class RealtimeService implements OnModuleInit, OnModuleDestroy {
   }
 
   private async queryBadgeSnapshot(userId: string): Promise<BadgeSnapshot> {
-    const [
-      contactsUnread,
-      discoverUnread,
-      momentsUnread,
-      circleUnread,
-      signupUnread,
-      profileUnread,
-    ] = await Promise.all([
+    // 通知的四个域来自同一条 GROUP BY type；连同好友动态、报名两条 count，
+    // 同一时刻最多占两个池连接（之前是六条 count 一起并发）。
+    const [notifications, contactsUnread] = await Promise.all([
+      loadUnreadNotificationsByDomain(this.prisma, userId),
       this.prisma.friendActivity.count({
         where: { viewerId: userId, readAt: null },
       }),
-      this.countUnreadNotifications(userId, DISCOVER_NOTIFICATION_TYPES),
-      this.countUnreadNotifications(userId, MOMENT_NOTIFICATION_TYPES),
-      this.countUnreadNotifications(userId, CIRCLE_NOTIFICATION_TYPES),
-      this.countUnreadSignups(userId),
-      this.countUnreadNotifications(userId, PROFILE_NOTIFICATION_TYPES),
     ]);
+    const signupUnread = await this.countUnreadSignups(userId);
+    const { discoverUnread, momentsUnread, circleUnread, profileUnread } =
+      notifications;
 
     const snapshot: BadgeSnapshot = {
       messagesUnread: 0,
@@ -544,20 +533,6 @@ export class RealtimeService implements OnModuleInit, OnModuleDestroy {
       syncedAt: new Date().toISOString(),
     };
     return snapshot;
-  }
-
-  private countUnreadNotifications(
-    userId: string,
-    types: readonly NotificationType[],
-  ): Promise<number> {
-    return this.prisma.notification.count({
-      where: {
-        toUserID: userId,
-        deleted: false,
-        read: false,
-        type: { in: [...types] },
-      },
-    });
   }
 
   async emitSnapshot(userId: string) {
@@ -596,11 +571,12 @@ export class RealtimeService implements OnModuleInit, OnModuleDestroy {
   /** "互动消息" unread — trace comments/replies + circle verification/invitation. */
   async broadcastInteractionUnread(userId: string) {
     await this.invalidateBadgeSnapshotCache(userId);
-    const [count, momentsUnread, circleUnread] = await Promise.all([
-      this.countUnreadNotifications(userId, DISCOVER_NOTIFICATION_TYPES),
-      this.countUnreadNotifications(userId, MOMENT_NOTIFICATION_TYPES),
-      this.countUnreadNotifications(userId, CIRCLE_NOTIFICATION_TYPES),
-    ]);
+    // 每条新通知都会走到这里：三个数取自同一条分组查询，只占一个池连接。
+    const {
+      discoverUnread: count,
+      momentsUnread,
+      circleUnread,
+    } = await loadUnreadNotificationsByDomain(this.prisma, userId);
 
     this.broadcast(userId, {
       type: 'interaction.unread.changed',

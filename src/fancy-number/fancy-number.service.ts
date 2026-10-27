@@ -1243,18 +1243,29 @@ export class FancyNumberService {
 
   async expireDue(now = new Date()): Promise<number> {
     let expired = 0;
-    let cursor: string | undefined;
+    // 按 (expiresAt, id) 键集翻页，不用 Prisma 的 cursor + skip:1 —— 排序列 expiresAt
+    // 可空时 Prisma 7 生成的 SQL 只有 OFFSET、没有 LIMIT，每页都会把游标之后的全部
+    // 到期租约读进内存再截 100 条。键集照样跳过上一页处理失败的租约（它们还满足
+    // 到期条件），不会反复取到同一行；where 已排除 expiresAt 为 NULL 的行。
+    let after: { id: string; expiresAt: Date } | undefined;
     while (true) {
       const due = await this.prisma.fancyNumberLease.findMany({
         where: {
           endedAt: null,
           permanentAt: null,
           expiresAt: { lte: now },
+          ...(after
+            ? {
+                OR: [
+                  { expiresAt: { gt: after.expiresAt } },
+                  { expiresAt: after.expiresAt, id: { gt: after.id } },
+                ],
+              }
+            : {}),
         },
-        select: { id: true },
+        select: { id: true, expiresAt: true },
         orderBy: [{ expiresAt: 'asc' }, { id: 'asc' }],
         take: 100,
-        ...(cursor ? { cursor: { id: cursor }, skip: 1 } : {}),
       });
       for (const lease of due) {
         try {
@@ -1270,8 +1281,9 @@ export class FancyNumberService {
         }
       }
       if (due.length < 100) break;
-      cursor = due[due.length - 1]?.id;
-      if (!cursor) break;
+      const last = due[due.length - 1];
+      if (!last?.expiresAt) break;
+      after = { id: last.id, expiresAt: last.expiresAt };
     }
     return expired;
   }

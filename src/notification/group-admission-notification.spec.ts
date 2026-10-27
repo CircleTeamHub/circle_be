@@ -10,8 +10,6 @@ it('replaying an admission delivery creates one unread notification and one push
             ...create,
             read: false,
             createdAt: new Date(),
-            fromUser: null,
-            fromGroupAdmission: { id: 'admission', status: 'INVITED' },
           });
         return rows.get(where.id);
       }),
@@ -24,7 +22,16 @@ it('replaying an admission delivery creates one unread notification and one push
         ),
     },
   };
-  const prisma: any = { $transaction: async (callback: any) => callback(tx) };
+  // 关系在事务提交之后才读：只查到入群申请这一张关系表（发送者行已不在也照样出 null）。
+  const prisma: any = {
+    $transaction: async (callback: any) => callback(tx),
+    user: { findMany: jest.fn().mockResolvedValue([]) },
+    groupAdmission: {
+      findMany: jest
+        .fn()
+        .mockResolvedValue([{ id: 'admission', status: 'INVITED' }]),
+    },
+  };
   const realtime: any = {
     broadcastNotificationCreated: jest.fn(),
     broadcastInteractionUnread: jest.fn().mockResolvedValue(undefined),
@@ -45,7 +52,14 @@ it('replaying an admission delivery creates one unread notification and one push
   expect(realtime.broadcastNotificationCreated).toHaveBeenLastCalledWith(
     'guest',
     expect.objectContaining({
+      fromUser: null,
       fromGroupAdmission: { id: 'admission', status: 'INVITED' },
     }),
   );
+  expect(tx.notification.upsert).toHaveBeenCalledWith(
+    expect.objectContaining({
+      select: expect.objectContaining({ fromGroupAdmissionID: true }),
+    }),
+  );
+  expect(tx.notification.upsert.mock.calls[0][0]).not.toHaveProperty('include');
 });

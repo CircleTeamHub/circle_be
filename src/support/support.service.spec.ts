@@ -42,13 +42,17 @@ describe('SupportService', () => {
     $transaction: jest.fn(runTransaction),
   };
   const audit = { recordInTransaction: jest.fn(), listForTarget: jest.fn() };
-  const service = new SupportService(
-    prisma as unknown as PrismaService,
-    audit as unknown as AdminUserAuditService,
-  );
+  // 每个用例一个新实例:getConfig 有进程内缓存,共用实例会让后面的用例读到前面的缓存。
+  let service: SupportService;
   const operator = { userId: 'admin-1', accountId: 'admin-account' };
 
-  beforeEach(() => jest.clearAllMocks());
+  beforeEach(() => {
+    jest.clearAllMocks();
+    service = new SupportService(
+      prisma as unknown as PrismaService,
+      audit as unknown as AdminUserAuditService,
+    );
+  });
 
   describe('getConfig', () => {
     it('groups agents by category and always returns all five keys', async () => {
@@ -77,6 +81,64 @@ describe('SupportService', () => {
       const args = prisma.supportAgent.findMany.mock.calls[0][0];
       expect(args.where).toEqual({ enabled: true, user: { status: 'ACTIVE' } });
       expect(args.orderBy).toContainEqual({ sortOrder: 'asc' });
+    });
+  });
+
+  // GET /support/config 每次 App 启动都拉、所有人结果相同:进程内缓存 30 秒。
+  describe('getConfig cache', () => {
+    const configReads = () =>
+      prisma.supportAgent.findMany.mock.calls.filter(
+        ([args]) => args?.where?.enabled === true,
+      ).length;
+    afterEach(() => jest.restoreAllMocks());
+
+    it('serves repeated reads within 30 seconds from memory', async () => {
+      const now = jest.spyOn(Date, 'now').mockReturnValue(1_000_000);
+      prisma.supportAgent.findMany.mockResolvedValue([
+        { category: 'recharge', user: user('u1') },
+      ]);
+
+      const first = await service.getConfig();
+      now.mockReturnValue(1_000_000 + 29_999);
+      const second = await service.getConfig();
+
+      expect(second).toEqual(first);
+      expect(configReads()).toBe(1);
+    });
+
+    it('reloads after 30 seconds', async () => {
+      const now = jest.spyOn(Date, 'now').mockReturnValue(1_000_000);
+      prisma.supportAgent.findMany
+        .mockResolvedValueOnce([{ category: 'recharge', user: user('u1') }])
+        .mockResolvedValueOnce([{ category: 'recharge', user: user('u2') }]);
+
+      await service.getConfig();
+      now.mockReturnValue(1_000_000 + 30_000);
+      const { agents } = await service.getConfig();
+
+      expect(agents.recharge.map((a) => a.userID)).toEqual(['u2']);
+      expect(configReads()).toBe(2);
+    });
+
+    it('drops the cached config as soon as an admin replaces the agents', async () => {
+      jest.spyOn(Date, 'now').mockReturnValue(1_000_000);
+      prisma.supportAgent.findMany.mockResolvedValue([]);
+      prisma.user.findMany.mockResolvedValue([{ id: 'u9', status: 'ACTIVE' }]);
+      tx.supportAgent.findMany.mockResolvedValue([]);
+
+      await service.getConfig();
+      await service.replaceAgents(
+        operator,
+        [{ category: 'issue', userID: 'u9', sortOrder: 0 }],
+        supportAgentsRevision([]),
+      );
+      prisma.supportAgent.findMany.mockResolvedValue([
+        { category: 'issue', user: user('u9') },
+      ]);
+      const { agents } = await service.getConfig();
+
+      expect(agents.issue.map((a) => a.userID)).toEqual(['u9']);
+      expect(configReads()).toBe(2);
     });
   });
 

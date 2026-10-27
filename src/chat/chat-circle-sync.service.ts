@@ -10,6 +10,10 @@ import { PrismaService } from 'src/prisma/prisma.service';
 import { JobLeaseContext, runWithJobLease } from 'src/redis/job-lease';
 import { RedisService } from 'src/redis/redis.service';
 import { ChatBroadcastService } from './chat-broadcast.service';
+import {
+  type CircleSeatChange,
+  circleSeatDiffQuery,
+} from './chat-circle-seat-diff.query';
 import { ChatGroupEventService } from './chat-group-event.service';
 import { ChatSystemMessageService } from './chat-system-message.service';
 import { sanitizeLogValue } from '../logging/log-sanitizer';
@@ -484,70 +488,17 @@ export class ChatCircleSyncService {
         }
       }
 
-      const activeMembers = await tx.circleMember.findMany({
-        where: { circleID: circleId, status: 'ACTIVE' },
-        select: { userID: true },
-      });
-      const activeIds = activeMembers.map((m) => m.userID);
-      const activeSet = new Set(activeIds);
-
-      const seats = await tx.chatMember.findMany({
-        where: { conversationID: conversation.id },
-        select: { userID: true, leftAt: true },
-      });
-      const seatByUser = new Map(seats.map((s) => [s.userID, s]));
-
-      const toJoin = activeIds.filter((id) => {
-        const seat = seatByUser.get(id);
-        return !seat || seat.leftAt !== null;
-      });
-      const toRemove = seats
-        .filter((s) => s.leftAt === null && !activeSet.has(s.userID))
-        .map((s) => s.userID);
-
-      // 新座位的已读水位必须落在当前最高消息高度上,而不是 schema 默认的 0。
-      // 落 0 的话,新入群成员一进来就背着整个群的历史未读数(老群可能是几万),
-      // 红点永远清不掉;重新入群的人同理 —— 离座期间的消息本就与他无关。
-      // height 只增不减,所以直接取当前最大值即可,不必逐人比大小。
-      const top = await tx.chatMessage.aggregate({
-        where: { conversationID: conversation.id },
-        _max: { height: true },
-      });
-      const watermark = top._max.height ?? 0;
-
-      await tx.chatMember.createMany({
-        data: activeIds
-          .filter((id) => !seatByUser.has(id))
-          .map((userID) => ({
-            conversationID: conversation.id,
-            userID,
-            lastReadHeight: watermark,
-            // 这条路径不持有会话行锁（它锁的是圈子），所以继承之外读路径还按
-            // max(座位, 会话) 兜底，覆盖「入座与清空并发」的窗口。
-            clearedBeforeHeight: conversation.clearedBeforeHeight,
-          })),
-        skipDuplicates: true,
-      });
-      await tx.chatMember.updateMany({
-        where: {
-          conversationID: conversation.id,
-          userID: { in: activeIds },
-          leftAt: { not: null },
-        },
-        // joinedAt 也要重置:逐条已读回执按 joinedAt 排掉「入群前的消息」,
-        // 复位座位不刷新它的话,重新入群的人会显示成他离座期间每一条消息的已读者。
-        data: { leftAt: null, lastReadHeight: watermark, joinedAt: new Date() },
-      });
-      if (activeIds.length > 0) {
-        await tx.chatMember.updateMany({
-          where: {
-            conversationID: conversation.id,
-            userID: { notIn: activeIds },
-            leftAt: null,
-          },
-          data: { leftAt: new Date() },
-        });
-      }
+      // 差集在库里用 JOIN 算(仍在圈子锁内):原来把全部 ACTIVE 成员和全部座位
+      // 读回来,再拿 ≤3000 个 userID 拼 IN / NOT IN 写两遍,而绝大多数时候没有变化。
+      const diff = await tx.$queryRaw<CircleSeatChange[]>(
+        circleSeatDiffQuery(circleId, conversation.id),
+      );
+      const { toJoin, toRemove } = await this.applySeatDiff(
+        tx,
+        circleId,
+        conversation,
+        diff,
+      );
 
       return { conversationId: conversation.id, toJoin, toRemove, created };
     });
@@ -732,6 +683,86 @@ export class ChatCircleSyncService {
     // Manager removal can continue even if both cleanup dispatches failed:
     // its detailed log explicitly excludes the target and all chat:msg
     // delivery is independently filtered by the authoritative active seats.
+  }
+
+  /**
+   * 把对账差集写进座位表(在 ensureCircleConversation 的圈子锁事务里调用)。写入只点名
+   * 差集里的人;没有差异就一条都不写。返回值与原来逐个比对时一致:toJoin = 新建 +
+   * 复活,toRemove = 在座却已不是 ACTIVE 成员的人。
+   */
+  private async applySeatDiff(
+    tx: Prisma.TransactionClient,
+    circleId: string,
+    conversation: { id: string; clearedBeforeHeight: number },
+    diff: CircleSeatChange[],
+  ): Promise<{ toJoin: string[]; toRemove: string[] }> {
+    const usersWith = (action: CircleSeatChange['action']) =>
+      diff.filter((row) => row.action === action).map((row) => row.userID);
+    const toCreate = usersWith('create');
+    const toRejoin = usersWith('rejoin');
+    const toJoin = [...toCreate, ...toRejoin];
+    const toRemove = usersWith('remove');
+
+    if (toJoin.length > 0) {
+      // 新座位的已读水位必须落在当前最高消息高度上,而不是 schema 默认的 0。
+      // 落 0 的话,新入群成员一进来就背着整个群的历史未读数(老群可能是几万),
+      // 红点永远清不掉;重新入群的人同理 —— 离座期间的消息本就与他无关。
+      // height 只增不减,所以直接取当前最大值即可,不必逐人比大小。
+      const top = await tx.chatMessage.aggregate({
+        where: { conversationID: conversation.id },
+        _max: { height: true },
+      });
+      const watermark = top._max.height ?? 0;
+      if (toCreate.length > 0) {
+        await tx.chatMember.createMany({
+          data: toCreate.map((userID) => ({
+            conversationID: conversation.id,
+            userID,
+            lastReadHeight: watermark,
+            // 这条路径不持有会话行锁（它锁的是圈子），所以继承之外读路径还按
+            // max(座位, 会话) 兜底，覆盖「入座与清空并发」的窗口。
+            clearedBeforeHeight: conversation.clearedBeforeHeight,
+          })),
+          skipDuplicates: true,
+        });
+      }
+      if (toRejoin.length > 0) {
+        await tx.chatMember.updateMany({
+          where: {
+            conversationID: conversation.id,
+            userID: { in: toRejoin },
+            leftAt: { not: null },
+          },
+          // joinedAt 也要重置:逐条已读回执按 joinedAt 排掉「入群前的消息」,
+          // 复位座位不刷新它的话,重新入群的人会显示成他离座期间每一条消息的已读者。
+          data: {
+            leftAt: null,
+            lastReadHeight: watermark,
+            joinedAt: new Date(),
+          },
+        });
+      }
+    }
+    // 原来 ACTIVE 名单为空时不写离座(防一次异常读把整群清空),口径保留:有人要
+    // 离座时才多问一句圈子里是否还有 ACTIVE 成员;有人入座就说明一定有。
+    if (
+      toRemove.length > 0 &&
+      (toJoin.length > 0 ||
+        (await tx.circleMember.findFirst({
+          where: { circleID: circleId, status: 'ACTIVE' },
+          select: { id: true },
+        })) !== null)
+    ) {
+      await tx.chatMember.updateMany({
+        where: {
+          conversationID: conversation.id,
+          userID: { in: toRemove },
+          leftAt: null,
+        },
+        data: { leftAt: new Date() },
+      });
+    }
+    return { toJoin, toRemove };
   }
 
   /**

@@ -8,6 +8,7 @@ import {
 import { TempChatStatus } from 'src/generated/prisma';
 import { PrismaService } from 'src/prisma/prisma.service';
 import { TempChatService } from './temp-chat.service';
+import { dueTempChatsQuery } from './temp-chat-cleanup.query';
 import { reportOperationalError } from 'src/logging/error-aggregation.service';
 
 /** 单轮处理的房间数上限。剩余的留给下一轮,不在一次 sweep 里跑完。 */
@@ -87,30 +88,14 @@ export class TempChatCleanup {
    * 一次 findMany 进内存:房间上限是按主机算的、TTL 又普遍相同,一次大批量到期
    * 就能让单轮 sweep 跑过一分钟。有序 + 分批之后,最老的房间一定先被清掉,
    * 不会出现「每轮都在处理同一批、排在后面的永远轮不到」。
+   *
+   * 两类房间(到期的 ACTIVE、已结束待清理的)各走各的索引再合并,见 dueTempChatsQuery。
    */
   private claimBatch(): Promise<Array<{ id: string; groupId: string }>> {
     const now = new Date();
     const staleLeaseBefore = new Date(now.getTime() - 2 * 60 * 1000);
-    return this.prisma.tempChat.findMany({
-      where: {
-        OR: [
-          {
-            status: TempChatStatus.ACTIVE,
-            expiresAt: { lte: now },
-          },
-          {
-            status: { in: [TempChatStatus.ENDED, TempChatStatus.EXPIRED] },
-            cleanupCompletedAt: null,
-            OR: [
-              { cleanupLockedAt: null },
-              { cleanupLockedAt: { lt: staleLeaseBefore } },
-            ],
-          },
-        ],
-      },
-      orderBy: { expiresAt: 'asc' },
-      take: SWEEP_BATCH,
-      select: { id: true, groupId: true },
-    });
+    return this.prisma.$queryRaw<Array<{ id: string; groupId: string }>>(
+      dueTempChatsQuery(now, staleLeaseBefore, SWEEP_BATCH),
+    );
   }
 }

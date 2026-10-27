@@ -22,6 +22,18 @@ import { FancyNumberService } from 'src/fancy-number/fancy-number.service';
 import { AvatarFrameService } from 'src/avatar-frame/avatar-frame.service';
 import { AuthErrorCode } from 'src/common/app-error-codes';
 
+/**
+ * lastOnline 的节流写:60 秒内写过就跳过(条件写,0 行),不再每次 login / refresh /
+ * me 都 update 整行并 RETURNING 全部列。
+ */
+const LAST_ONLINE_THROTTLED_WRITE = (userId: string) => ({
+  where: {
+    id: userId,
+    OR: [{ lastOnline: null }, { lastOnline: { lt: expect.any(Date) } }],
+  },
+  data: { lastOnline: expect.any(Date) },
+});
+
 describe('AuthService', () => {
   let service: AuthService;
 
@@ -80,6 +92,7 @@ describe('AuthService', () => {
         return user;
       }),
       update: jest.fn(),
+      updateMany: jest.fn(),
     },
     referral: { create: jest.fn() },
     fancyNumberLease: {
@@ -232,6 +245,26 @@ describe('AuthService', () => {
       users.push(user);
       return user;
     });
+    // lastOnline 的节流写:按内存用户表执行 { id, OR: [null, lt] } 条件,返回命中行数。
+    mockPrisma.user.updateMany.mockImplementation(
+      async ({ where, data }: any) => {
+        const user = users.find((u) => u.id === where.id);
+        const throttle = where.OR as
+          | Array<{ lastOnline: null | { lt: Date } }>
+          | undefined;
+        const due =
+          !throttle ||
+          throttle.some((cond) =>
+            cond.lastOnline === null
+              ? user?.lastOnline == null
+              : user?.lastOnline != null &&
+                user.lastOnline.getTime() < cond.lastOnline.lt.getTime(),
+          );
+        if (!user || !due) return { count: 0 };
+        Object.assign(user, data, { updatedAt: new Date() });
+        return { count: 1 };
+      },
+    );
     mockPrisma.user.update.mockImplementation(
       async ({ where, data, select }) => {
         const user = users.find((u) => u.id === where.id);
@@ -737,6 +770,14 @@ describe('AuthService', () => {
     expect((result as { accessToken: string }).accessToken).toBe(
       'access-token',
     );
+    expect(mockPrisma.user.updateMany).toHaveBeenCalledWith(
+      LAST_ONLINE_THROTTLED_WRITE('uuid-1'),
+    );
+    expect(mockPrisma.user.update).not.toHaveBeenCalledWith(
+      expect.objectContaining({
+        data: expect.objectContaining({ lastOnline: expect.anything() }),
+      }),
+    );
   });
 
   it('login by user ID returns tokens with correct password', async () => {
@@ -896,6 +937,9 @@ describe('AuthService', () => {
 
     expect((result as { accessToken: string }).accessToken).toBe(
       'access-token',
+    );
+    expect(mockPrisma.user.updateMany).toHaveBeenCalledWith(
+      LAST_ONLINE_THROTTLED_WRITE('uuid-1'),
     );
     expect(
       mockRefreshTokenService.createSessionForCurrentSingleDeviceSetting,
@@ -1691,14 +1735,10 @@ describe('AuthService', () => {
       'uuid-1',
       'session-2',
     );
-    expect(mockPrisma.user.update).toHaveBeenCalledWith(
-      expect.objectContaining({
-        where: { id: 'uuid-1' },
-        data: expect.objectContaining({
-          lastOnline: expect.any(Date),
-        }),
-      }),
+    expect(mockPrisma.user.updateMany).toHaveBeenCalledWith(
+      LAST_ONLINE_THROTTLED_WRITE('uuid-1'),
     );
+    expect(mockPrisma.user.update).not.toHaveBeenCalled();
     expect(users[0].lastOnline.getTime()).toBeGreaterThanOrEqual(beforeRefresh);
     // A plain USER session is never revoked by the role gate below.
     expect(mockRefreshTokenService.revokeAll).not.toHaveBeenCalled();
@@ -1821,6 +1861,10 @@ describe('AuthService', () => {
       accessToken: 'access-token',
       refreshToken: 'new-refresh-token',
     });
+    expect(mockPrisma.user.updateMany).toHaveBeenCalledWith(
+      LAST_ONLINE_THROTTLED_WRITE('uuid-1'),
+    );
+    expect(mockPrisma.user.update).not.toHaveBeenCalled();
     expect(mockRefreshTokenService.rotate).toHaveBeenCalledWith(
       'refresh-token',
       undefined,
@@ -1886,12 +1930,12 @@ describe('AuthService', () => {
         gender: true,
       }),
     });
-    // me() now fires a lastOnline update without `select` (the response is
-    // synthesized from the already-fetched user) and does not await it.
-    expect(mockPrisma.user.update).toHaveBeenCalledWith({
-      where: { id: 'uuid-1' },
-      data: { lastOnline: expect.any(Date) },
-    });
+    // me() fire-and-forget 地节流写 lastOnline(updateMany,不 RETURNING 整行);
+    // 响应由已经查好的 user 拼出来,不依赖这次写的返回值。
+    expect(mockPrisma.user.updateMany).toHaveBeenCalledWith(
+      LAST_ONLINE_THROTTLED_WRITE('uuid-1'),
+    );
+    expect(mockPrisma.user.update).not.toHaveBeenCalled();
     expect(me).toMatchObject({
       city: '杭州',
       gender: 'male',
@@ -1906,6 +1950,65 @@ describe('AuthService', () => {
     expect(me).not.toHaveProperty('membership');
     expect(me.lastOnline).toBeInstanceOf(Date);
     expect(me.lastOnline.getTime()).toBeGreaterThanOrEqual(beforeMe);
+  });
+
+  it('skips the lastOnline write when it was recorded within the last minute', async () => {
+    const recent = new Date(Date.now() - 10_000);
+    users.push({
+      id: 'uuid-1',
+      accountId: 'testuser',
+      status: 'ACTIVE',
+      role: 'USER',
+      vipLevel: 0,
+      vipExpiresAt: null,
+      lastOnline: recent,
+    });
+
+    const me = await service.me('uuid-1');
+
+    expect(mockPrisma.user.updateMany).toHaveBeenCalledTimes(1);
+    const [{ where, data }] = mockPrisma.user.updateMany.mock.calls[0] as [any];
+    // 截止点 = 本次时刻 - 60 秒。
+    expect(
+      data.lastOnline.getTime() - where.OR[1].lastOnline.lt.getTime(),
+    ).toBe(60_000);
+    expect(users[0].lastOnline).toBe(recent);
+    // 响应里的 lastOnline 仍是本次请求时刻,与改动前一致。
+    expect(me.lastOnline).toBe(data.lastOnline);
+  });
+
+  it('writes lastOnline again once the previous value is older than a minute', async () => {
+    users.push({
+      id: 'uuid-1',
+      accountId: 'testuser',
+      status: 'ACTIVE',
+      role: 'USER',
+      vipLevel: 0,
+      vipExpiresAt: null,
+      lastOnline: new Date(Date.now() - 61_000),
+    });
+    const before = Date.now();
+
+    await service.me('uuid-1');
+
+    expect(users[0].lastOnline.getTime()).toBeGreaterThanOrEqual(before);
+  });
+
+  it('never lets a failed lastOnline write break /auth/me', async () => {
+    users.push({
+      id: 'uuid-1',
+      accountId: 'testuser',
+      status: 'ACTIVE',
+      role: 'USER',
+      vipLevel: 0,
+      vipExpiresAt: null,
+      lastOnline: null,
+    });
+    mockPrisma.user.updateMany.mockRejectedValueOnce(new Error('db down'));
+
+    await expect(service.me('uuid-1')).resolves.toMatchObject({
+      id: 'uuid-1',
+    });
   });
 
   it('includes the effective avatar-frame appearance in /auth/me', async () => {

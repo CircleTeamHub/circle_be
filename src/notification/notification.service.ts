@@ -17,19 +17,16 @@ import { AdminAuditService } from 'src/moderation/admin-audit.service';
 import { PrismaService } from 'src/prisma/prisma.service';
 import { RealtimeService } from 'src/realtime/realtime.service';
 import {
-  CIRCLE_NOTIFICATION_TYPES,
   DISCOVER_NOTIFICATION_TYPES,
-  MOMENT_NOTIFICATION_TYPES,
   notificationTypesForDomain,
   PROFILE_NOTIFICATION_TYPES,
   type NotificationDomain,
 } from './notification.constants';
 import {
-  mapNotificationRealtimeDto,
-  NOTIFICATION_REALTIME_INCLUDE,
+  NOTIFICATION_REALTIME_BASE_SELECT,
   decodeNotificationCursor,
   encodeNotificationCursor,
-  type NotificationRealtimeRow,
+  type NotificationRealtimeBaseRow,
   type RegisterPushTokenDto,
   type NotificationRealtimeDto,
   type PublishSystemAnnouncementDto,
@@ -37,6 +34,9 @@ import {
   type RevokePushTokenDto,
 } from './notification.dto';
 import { NotificationPushService } from './notification-push.service';
+import { loadUnreadNotificationsByDomain } from './notification-unread.query';
+import { notificationPageScanQuery } from './notification-list.query';
+import { loadNotificationRealtimeDtos } from './notification-realtime.loader';
 
 const NOTIFICATION_DEDUPE_WINDOW_MS = 60 * 60 * 1000;
 const SYSTEM_ANNOUNCEMENT_BATCH_SIZE = 500;
@@ -113,16 +113,29 @@ export class NotificationService {
     }
   }
 
-  private async createNotificationWithPush<T extends NotificationRealtimeRow>(
-    operation: (tx: any) => Promise<T>,
-  ): Promise<T> {
-    return this.prisma.$transaction(async (tx) => {
-      const notification = await operation(tx);
+  /**
+   * 事务里只写通知行和推送 outbox（create 带 select 本表列 = 一条 INSERT RETURNING），
+   * 关系在提交之后再按外键补 —— 不在持有事务的连接上串行跑关系查询。
+   */
+  private async createNotificationWithPush(
+    operation: (tx: any) => Promise<NotificationRealtimeBaseRow>,
+  ): Promise<NotificationRealtimeDto> {
+    const notification = await this.prisma.$transaction(async (tx) => {
+      const created = await operation(tx);
       await tx.notificationPushOutbox.create({
-        data: { notificationID: notification.id },
+        data: { notificationID: created.id },
       });
-      return notification;
+      return created;
     });
+    return this.toRealtimeDto(notification);
+  }
+
+  /** 一行通知 → 实时 DTO（关系按外键只查用得到的、逐条顺序查）。 */
+  private async toRealtimeDto(
+    row: NotificationRealtimeBaseRow,
+  ): Promise<NotificationRealtimeDto> {
+    const [dto] = await loadNotificationRealtimeDtos(this.prisma, [row]);
+    return dto;
   }
 
   /** 读圈子推送偏好。只有「离线提醒」需要服务端执行，其余全是客户端展示。 */
@@ -340,13 +353,9 @@ export class NotificationService {
   async getUnreadSummary(userId: string) {
     // momentsUnread / circleUnread 各自喂一个铃铛（朋友圈 / 圈子广场）；
     // discoverUnread 仍是整个互动域的总数，老客户端和 tab 徽标继续读它。
-    const [discoverUnread, momentsUnread, circleUnread, profileUnread] =
-      await Promise.all([
-        this.countUnreadByTypes(userId, DISCOVER_NOTIFICATION_TYPES),
-        this.countUnreadByTypes(userId, MOMENT_NOTIFICATION_TYPES),
-        this.countUnreadByTypes(userId, CIRCLE_NOTIFICATION_TYPES),
-        this.countUnreadByTypes(userId, PROFILE_NOTIFICATION_TYPES),
-      ]);
+    // 四个数来自同一条 GROUP BY type（一个池连接），域的求和在 JS 里做。
+    const { discoverUnread, momentsUnread, circleUnread, profileUnread } =
+      await loadUnreadNotificationsByDomain(this.prisma, userId);
 
     return {
       discoverUnread,
@@ -355,20 +364,6 @@ export class NotificationService {
       profileUnread,
       totalUnread: discoverUnread + profileUnread,
     };
-  }
-
-  private countUnreadByTypes(
-    userId: string,
-    types: readonly NotificationType[],
-  ): Promise<number> {
-    return this.prisma.notification.count({
-      where: {
-        toUserID: userId,
-        deleted: false,
-        read: false,
-        type: { in: [...types] },
-      },
-    });
   }
 
   async markProfileNotificationsRead(userId: string) {
@@ -411,7 +406,7 @@ export class NotificationService {
           fromCircleID: input.circleId,
         },
         update: {},
-        include: NOTIFICATION_REALTIME_INCLUDE,
+        select: NOTIFICATION_REALTIME_BASE_SELECT,
       });
       await tx.notificationPushOutbox.upsert({
         where: { notificationID: row.id },
@@ -422,7 +417,7 @@ export class NotificationService {
     });
     this.realtimeService.broadcastNotificationCreated(
       input.toUserID,
-      mapNotificationRealtimeDto(row),
+      await this.toRealtimeDto(row),
     );
     await this.broadcastUnreadForType(
       input.toUserID,
@@ -450,7 +445,7 @@ export class NotificationService {
         where: { id: input.id },
         create: data,
         update: {},
-        include: NOTIFICATION_REALTIME_INCLUDE,
+        select: NOTIFICATION_REALTIME_BASE_SELECT,
       });
       await tx.notificationPushOutbox.upsert({
         where: { notificationID: row.id },
@@ -461,7 +456,7 @@ export class NotificationService {
     });
     this.realtimeService.broadcastNotificationCreated(
       input.toUserID,
-      mapNotificationRealtimeDto(row),
+      await this.toRealtimeDto(row),
     );
     await this.broadcastUnreadForType(
       input.toUserID,
@@ -478,7 +473,7 @@ export class NotificationService {
       return null;
     }
 
-    const notification = await this.createNotificationWithPush((tx) =>
+    return this.createNotificationWithPush((tx) =>
       tx.notification.create({
         data: {
           toUserID: toUserId,
@@ -486,11 +481,9 @@ export class NotificationService {
           type: NotificationType.SYSTEM,
           content,
         },
-        include: NOTIFICATION_REALTIME_INCLUDE,
+        select: NOTIFICATION_REALTIME_BASE_SELECT,
       }),
     );
-    const dto = mapNotificationRealtimeDto(notification);
-    return dto;
   }
 
   async profileNotificationDetail(userId: string, id: string) {
@@ -501,10 +494,10 @@ export class NotificationService {
         deleted: false,
         type: { in: [...PROFILE_NOTIFICATION_TYPES] },
       },
-      include: NOTIFICATION_REALTIME_INCLUDE,
+      select: NOTIFICATION_REALTIME_BASE_SELECT,
     });
     if (!row) throw new NotFoundException('Notification not found');
-    return mapNotificationRealtimeDto(row);
+    return this.toRealtimeDto(row);
   }
 
   async scrollingAnnouncements(userId: string) {
@@ -976,12 +969,14 @@ export class NotificationService {
         if (duplicate) return null;
       }
 
+      // 事务里只做 去重判断 + create + outbox；create 用 select 拿本表列，
+      // 一条 INSERT RETURNING，不在事务连接上串行跑 9 条关系查询。
       const created = await tx.notification.create({
         data: {
           ...notificationData,
           content: notificationData.content ?? '',
         },
-        include: NOTIFICATION_REALTIME_INCLUDE,
+        select: NOTIFICATION_REALTIME_BASE_SELECT,
       });
       await tx.notificationPushOutbox.create({
         data: { notificationID: created.id },
@@ -989,8 +984,8 @@ export class NotificationService {
       return created;
     });
     if (!notification) return null;
-    const dto = mapNotificationRealtimeDto(notification);
-    return dto;
+    // 关系在提交之后补：通知与推送已经落库，这里只决定实时广播的内容。
+    return this.toRealtimeDto(notification);
   }
 
   async createFriendRequestNotification(params: {
@@ -1066,7 +1061,7 @@ export class NotificationService {
       return null;
     }
 
-    const notification = await this.createNotificationWithPush((tx) =>
+    return this.createNotificationWithPush((tx) =>
       tx.notification.create({
         data: {
           toUserID: params.toUserId,
@@ -1075,12 +1070,9 @@ export class NotificationService {
           fromCirclePostID: params.postId,
           content: '',
         },
-        include: NOTIFICATION_REALTIME_INCLUDE,
+        select: NOTIFICATION_REALTIME_BASE_SELECT,
       }),
     );
-
-    const dto = mapNotificationRealtimeDto(notification);
-    return dto;
   }
 
   /**
@@ -1103,8 +1095,11 @@ export class NotificationService {
 
   /**
    * "XX 在圈子发布了新活动" —— 在调用方事务内批量落库通知及 durable push
-   * outbox，再回查带 fromUser/fromCirclePost 的 DTO 供提交后 realtime 广播。
+   * outbox，再补上 fromUser/fromCirclePost 组成 DTO 供提交后 realtime 广播。
    * recipientIds 由调用方保证已排除作者、被拉黑者、并去重。
+   *
+   * DTO 要在调用方事务里返回，关系查询只能留在事务里；但整批只有一个作者、一条帖子，
+   * 只查这两张表各一次（原来是整批回读 + 9 路 include）。
    */
   async createCirclePostPublishedNotifications(
     tx: Prisma.TransactionClient,
@@ -1133,27 +1128,22 @@ export class NotificationService {
         fromCirclePostID: params.postId,
         content: '',
       })),
-      select: { id: true, toUserID: true },
+      select: NOTIFICATION_REALTIME_BASE_SELECT,
     });
 
     await tx.notificationPushOutbox.createMany({
       data: created.map(({ id }) => ({ notificationID: id })),
     });
 
-    const rows = await tx.notification.findMany({
-      where: { id: { in: created.map(({ id }) => id) } },
-      include: NOTIFICATION_REALTIME_INCLUDE,
-    });
-
-    return rows
-      .filter(
-        (row): row is typeof row & { toUserID: string } =>
-          typeof row.toUserID === 'string',
-      )
-      .map((row) => ({
-        toUserId: row.toUserID,
-        notification: mapNotificationRealtimeDto(row),
-      }));
+    const recipientRows = created.filter(
+      (row): row is typeof row & { toUserID: string } =>
+        typeof row.toUserID === 'string',
+    );
+    const dtos = await loadNotificationRealtimeDtos(tx, recipientRows);
+    return recipientRows.map((row, index) => ({
+      toUserId: row.toUserID,
+      notification: dtos[index],
+    }));
   }
 
   async createCircleInvitationNotification(data: {
@@ -1258,79 +1248,37 @@ export class NotificationService {
     const pageSize = input.take ?? NOTIFICATION_PAGE_SIZE;
     const useCursor = input.keyset === true || Boolean(input.cursor);
 
-    if (input.cursor) {
-      const cursorDate = new Date(input.cursor.createdAt);
-      const cursorRows = await this.prisma.$queryRaw<
-        Array<{ id: string; createdAt: Date }>
-      >(
-        Prisma.sql`
-          SELECT n."id", n."createdAt"
-          FROM "Notification" n
-          WHERE n."toUserID" = ${input.userId}
-            AND n."deleted" = false
-            AND n."type" IN (${Prisma.join([...input.typeFilter])})
-            AND (n."createdAt", n."id") < (${cursorDate}, ${input.cursor.id})
-          ORDER BY n."createdAt" DESC, n."id" DESC
-          LIMIT ${pageSize + 1}
-        `,
-      );
-
-      const ids = cursorRows.slice(0, pageSize).map(({ id }) => id);
-      if (ids.length === 0) {
-        return { items: [], nextCursor: null };
-      }
-
-      // Hydrate the same relation graph as the legacy query, then restore the
-      // keyset order because an IN predicate does not guarantee row order.
-      const hydratedRows = await this.prisma.notification.findMany({
-        where: {
-          id: { in: ids },
-          toUserID: input.userId,
-          deleted: false,
-          type: { in: [...input.typeFilter] },
-        },
-        include: NOTIFICATION_REALTIME_INCLUDE,
-      });
-      const byId = new Map(hydratedRows.map((row) => [row.id, row]));
-      const orderedRows = ids
-        .map((id) => byId.get(id))
-        .filter((row): row is NotificationRealtimeRow => row !== undefined);
-      const hasMore = cursorRows.length > pageSize;
-      const pageRows = orderedRows.slice(0, pageSize);
-      const items = pageRows.map(mapNotificationRealtimeDto);
-      // A concurrent delete can make hydration return fewer rows than the ID
-      // scan. Advance from the last scanned key, rather than only the last
-      // hydrated row, so an empty hydrated page cannot strand later rows.
-      const last = hasMore ? (cursorRows[pageSize - 1] ?? null) : null;
-
-      return {
-        items,
-        nextCursor: last
-          ? encodeNotificationCursor({
-              createdAt: last.createdAt.toISOString(),
-              id: last.id,
-            })
-          : null,
-      };
-    }
-
-    const where: Prisma.NotificationWhereInput = {
-      toUserID: input.userId,
-      deleted: false,
-      type: { in: [...input.typeFilter] },
-    };
-    const rows = await this.prisma.notification.findMany({
-      where,
-      orderBy: [{ createdAt: 'desc' }, { id: 'desc' }],
-      ...(useCursor ? {} : { skip: input.skip ?? 0 }),
-      take: useCursor ? pageSize + 1 : pageSize,
-      include: NOTIFICATION_REALTIME_INCLUDE,
-    });
-    const hasMore = Boolean(useCursor && rows.length > pageSize);
-    const items = (hasMore ? rows.slice(0, pageSize) : rows).map(
-      mapNotificationRealtimeDto,
+    // 三种分页（老分页 / 游标首页 / 游标续页）共用一条 id 扫描：只取 id 与
+    // createdAt，(toUserID, createdAt DESC, id DESC, type) 部分索引自己就能回答，
+    // type 在索引元组上过滤，不为不匹配的行回表（见 notificationPageScanQuery）。
+    const scanned = await this.prisma.$queryRaw<
+      Array<{ id: string; createdAt: Date }>
+    >(
+      notificationPageScanQuery({
+        userId: input.userId,
+        types: input.typeFilter,
+        limit: useCursor ? pageSize + 1 : pageSize,
+        before: input.cursor
+          ? {
+              createdAt: new Date(input.cursor.createdAt),
+              id: input.cursor.id,
+            }
+          : undefined,
+        offset: useCursor ? undefined : (input.skip ?? 0),
+      }),
     );
-    const last = hasMore ? rows[pageSize - 1] : null;
+
+    const items = await this.hydrateNotificationPage(
+      input.userId,
+      input.typeFilter,
+      scanned.slice(0, pageSize).map(({ id }) => id),
+    );
+    // A concurrent delete can make hydration return fewer rows than the ID
+    // scan. Advance from the last scanned key, rather than only the last
+    // hydrated row, so an empty hydrated page cannot strand later rows.
+    const hasMore = useCursor && scanned.length > pageSize;
+    const last = hasMore ? (scanned[pageSize - 1] ?? null) : null;
+
     return {
       items,
       nextCursor: last
@@ -1340,6 +1288,32 @@ export class NotificationService {
           })
         : null,
     };
+  }
+
+  /**
+   * 按扫描出来的 id 回填本表列和关系，并恢复扫描顺序（IN 不保证顺序）。回填时重复
+   * 收件人 / 未删除 / 类型三个条件：扫描和回填之间被删掉的行直接不出现。
+   */
+  private async hydrateNotificationPage(
+    userId: string,
+    typeFilter: readonly NotificationType[],
+    ids: readonly string[],
+  ): Promise<NotificationRealtimeDto[]> {
+    if (ids.length === 0) return [];
+    const rows = await this.prisma.notification.findMany({
+      where: {
+        id: { in: [...ids] },
+        toUserID: userId,
+        deleted: false,
+        type: { in: [...typeFilter] },
+      },
+      select: NOTIFICATION_REALTIME_BASE_SELECT,
+    });
+    const byId = new Map(rows.map((row) => [row.id, row]));
+    const ordered = ids
+      .map((id) => byId.get(id))
+      .filter((row): row is NotificationRealtimeBaseRow => row !== undefined);
+    return loadNotificationRealtimeDtos(this.prisma, ordered);
   }
 
   async getNotificationOpenOwnership(
@@ -1489,40 +1463,28 @@ export class NotificationService {
     }
     if (rows.length === 0) return [];
 
+    // 事务里只写通知行 + outbox；INSERT ... RETURNING 直接带回本表列（按插入顺序，
+    // 即上面的优先级顺序），关系在提交之后再补，不再整批回读 + 9 路 include。
     const created = await this.prisma.$transaction(async (tx) => {
       const inserted = await tx.notification.createManyAndReturn({
         data: rows,
-        select: { id: true },
+        select: NOTIFICATION_REALTIME_BASE_SELECT,
       });
 
       await tx.notificationPushOutbox.createMany({
         data: inserted.map(({ id }) => ({ notificationID: id })),
       });
-
-      const hydrated = await tx.notification.findMany({
-        where: { id: { in: inserted.map(({ id }) => id) } },
-        include: NOTIFICATION_REALTIME_INCLUDE,
-      });
-      // findMany does not promise the insert order back, so restore it to keep
-      // the precedence order above observable to callers.
-      const byId = new Map(hydrated.map((row) => [row.id, row]));
-      return inserted
-        .map(({ id }) => byId.get(id))
-        .filter((row): row is (typeof hydrated)[number] => row !== undefined);
+      return inserted;
     });
 
-    return created
-      .map((notification) => ({
-        targetUserId: notification.toUserID,
-        notification: mapNotificationRealtimeDto(notification),
-      }))
-      .filter(
-        (
-          item,
-        ): item is {
-          targetUserId: string;
-          notification: NotificationRealtimeDto;
-        } => typeof item.targetUserId === 'string',
-      );
+    const recipientRows = created.filter(
+      (row): row is typeof row & { toUserID: string } =>
+        typeof row.toUserID === 'string',
+    );
+    const dtos = await loadNotificationRealtimeDtos(this.prisma, recipientRows);
+    return recipientRows.map((row, index) => ({
+      targetUserId: row.toUserID,
+      notification: dtos[index],
+    }));
   }
 }

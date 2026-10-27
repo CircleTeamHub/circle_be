@@ -922,7 +922,6 @@ model RefreshToken {
   lastUsedAt                 DateTime                      @default(now())
   user                       User                          @relation(fields: [userId], references: [id], onDelete: Cascade)
 
-  @@index([userId])
   @@index([userId, familyId])
   @@index([userId, audience, createdAt])
   @@index([userId, deviceKey])
@@ -948,7 +947,6 @@ model SessionScopeGeneration {
   user                User                   @relation(fields: [userId], references: [id], onDelete: Cascade)
 
   @@unique([userId, scope, scopeKey])
-  @@index([userId])
   @@index([notificationPending, updatedAt])
 }
 
@@ -1051,8 +1049,8 @@ model Friend {
   chatReplayJobs             FriendChatReplayOutbox[]
   requestNotifications       Notification[]              @relation("friendRequestNotifications")
 
-  @@index([userID])
-  @@index([friendID])
+  @@index([userID, friendID])
+  @@index([friendID, userID])
 }
 
 // 好友申请阶段的多轮留言线程（双方 accept/reject 前的往来）。
@@ -1346,7 +1344,6 @@ model FriendActivity {
   @@unique([requestId, viewerId, type])
   // review 修复：保留期清理按裸 createdAt 截断分批删除
   @@index([createdAt])
-  @@index([requestId])
   @@index([viewerId, createdAt])
   @@index([viewerId, readAt])
 }
@@ -1363,7 +1360,6 @@ model FriendTag {
   pendingRequests PendingFriendTagOnRequest[]
 
   @@unique([ownerID, name])
-  @@index([ownerID])
 }
 
 // Junction: which tags an owner has applied to which friendship
@@ -1379,6 +1375,8 @@ model FriendTagOnFriend {
 
   @@unique([ownerID, tagID, friendID])
   @@index([ownerID, friendID])
+  @@index([friendID])
+  @@index([tagID])
 }
 
 model PendingFriendTagOnRequest {
@@ -1392,7 +1390,6 @@ model PendingFriendTagOnRequest {
   tag       FriendTag @relation(fields: [tagID], references: [id], onDelete: Cascade)
 
   @@unique([ownerID, requestID, tagID])
-  @@index([ownerID, requestID])
   @@index([requestID])
 }
 
@@ -1405,7 +1402,6 @@ model Block {
   blocked   User     @relation("blocked", fields: [blockedID], references: [id], onDelete: Cascade)
 
   @@unique([blockerID, blockedID])
-  @@index([blockerID])
   @@index([blockedID])
 }
 
@@ -1478,7 +1474,6 @@ model ConversationGroup {
   memberships  ConversationGroupMembership[]
 
   @@unique([ownerID, name])
-  @@index([ownerID])
 }
 
 model ConversationGroupMembership {
@@ -1546,7 +1541,7 @@ model TraceComment {
   fromNotifications Notification[] @relation("fromReply")
   toNotifications   Notification[] @relation("toReply")
 
-  @@index([traceID])
+  @@index([traceID, createdAt])
   @@index([userID])
 }
 
@@ -1573,7 +1568,6 @@ model UserTracePreference {
   user      User                    @relation(fields: [userID], references: [id], onDelete: Cascade)
 
   @@unique([userID, traceID])
-  @@index([userID])
   @@index([traceID])
 }
 
@@ -1616,7 +1610,6 @@ model UserPrivacySetting {
   updatedAt                     DateTime  @updatedAt
   user                          User      @relation(fields: [userID], references: [id], onDelete: Cascade)
 
-  @@index([userID])
 }
 
 // ─── Coin / Wallet ────────────────────────────────────────────────────────────
@@ -1814,8 +1807,6 @@ model Notification {
   @@index([toUserID])
   // review 修复：保留期清理按裸 createdAt 截断分批删除
   @@index([createdAt])
-  @@index([fromFriendRequestID])
-  @@index([fromGroupAdmissionID])
 }
 
 model SystemAnnouncement {
@@ -1858,6 +1849,7 @@ model NotificationPushOutbox {
   deliveries   NotificationPushDelivery[]
 
   @@index([status, nextAttemptAt])
+  @@index([createdAt(sort: Desc), id(sort: Desc)])
 }
 
 model NotificationPushDelivery {
@@ -1910,6 +1902,7 @@ model AdminAuditLog {
   @@index([entityType, entityID, createdAt])
   @@index([action, createdAt])
   @@index([action(ops: raw("gin_trgm_ops"))], type: Gin, map: "AdminAuditLog_action_trgm_idx")
+  @@index([createdAt(sort: Desc), id(sort: Desc)])
 }
 
 model DevicePushToken {
@@ -1932,7 +1925,6 @@ model DevicePushToken {
   // partial index；Prisma schema 无法表达 WHERE 条件。
 
   @@index([userID, deviceKey])
-  @@index([userID])
   @@index([provider, platform])
   @@index([updatedAt])
   @@index([disabledAt])
@@ -2060,7 +2052,6 @@ model CircleMember {
   circle Circle @relation(fields: [circleID], references: [id], onDelete: Cascade)
 
   @@unique([userID, circleID])
-  @@index([circleID])
   @@index([status, createdAt])
   @@index([updatedAt, circleID])
   @@index([circleID, status, userID])
@@ -2144,7 +2135,6 @@ model CirclePostSignup {
   user User       @relation(fields: [userID], references: [id], onDelete: Cascade)
 
   @@unique([postID, userID])
-  @@index([postID])
   @@index([userID])
   @@index([postID, seenByAuthor])
 }
@@ -2166,7 +2156,6 @@ model CirclePostReport {
 
   // review 修复：同 GroupReport —— PENDING 局部唯一，审结后可重新举报。
   @@index([postID, reporterID])
-  @@index([postID])
   @@index([status, createdAt])
 }
 
@@ -2185,7 +2174,6 @@ model CollaborationRecognition {
   @@unique([circlePostID, recipientID])
   @@index([recipientID, revokedAt])
   @@index([recognizerID, createdAt])
-  @@index([circlePostID])
 }
 
 model CircleInvitation {
@@ -2292,6 +2280,7 @@ model EmailVerificationCode {
   createdAt  DateTime         @default(now())
 
   @@index([email, purpose])
+  @@index([expiresAt])
 }
 
 /// 用户对用户的点赞：每人对同一目标「每天」最多一条（likedOn 为日期，唯一约束防当日重复）。
@@ -2646,7 +2635,6 @@ model ChatMessageReaction {
   message ChatMessage @relation(fields: [messageID], references: [id], onDelete: Cascade)
 
   @@unique([messageID, userID, emoji])
-  @@index([messageID])
 }
 
 /// 二维码令牌类型:个人名片 / 独立群聊 / 圈子。

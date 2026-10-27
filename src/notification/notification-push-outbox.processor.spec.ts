@@ -2,6 +2,7 @@ import { readFileSync } from 'fs';
 import { join } from 'path';
 import { NotificationPushOutboxProcessor } from './notification-push-outbox.processor';
 import { NotificationPushService } from './notification-push.service';
+import { NOTIFICATION_REALTIME_BASE_SELECT } from './notification.dto';
 import { Logger } from '@nestjs/common';
 import * as errorAggregation from '../logging/error-aggregation.service';
 
@@ -45,6 +46,8 @@ describe('fair batch selection contract', () => {
   });
 });
 
+// 出队回填的是 Notification 本表列（NOTIFICATION_REALTIME_BASE_SELECT），关系只在
+// 需要组装文案时按外键补。
 const notification = {
   id: 'notification-1',
   type: 'SYSTEM',
@@ -52,13 +55,15 @@ const notification = {
   read: false,
   createdAt: new Date('2026-07-11T00:00:00.000Z'),
   toUserID: 'user-1',
-  fromUser: null,
-  fromTrace: null,
-  fromReply: null,
-  fromCircle: null,
-  fromCirclePost: null,
-  fromInvitation: null,
-  fromFriendRequest: null,
+  fromUserID: 'user-1',
+  fromTraceID: null,
+  fromReplyID: null,
+  fromCircleID: null,
+  fromCirclePostID: null,
+  fromInvitationID: null,
+  fromGroupAdmissionID: null,
+  fromFriendRequestID: null,
+  systemAnnouncementID: null,
 };
 
 function buildHarness({
@@ -110,6 +115,11 @@ function buildHarness({
           ),
         ),
     },
+    // 组装文案时按外键补的关系表。
+    systemAnnouncement: { findMany: jest.fn().mockResolvedValue([]) },
+    trace: { findMany: jest.fn().mockResolvedValue([]) },
+    traceComment: { findMany: jest.fn().mockResolvedValue([]) },
+    circlePost: { findMany: jest.fn().mockResolvedValue([]) },
   };
   const push = {
     composeMessage: jest.fn().mockReturnValue({
@@ -128,6 +138,105 @@ function buildHarness({
 }
 
 describe('NotificationPushOutboxProcessor (#88 per-token)', () => {
+  it('hydrates jobs with notification columns only, never the nine relations', async () => {
+    const { prisma, processor } = buildHarness({
+      jobs: [
+        {
+          id: 'job-1',
+          notificationID: 'notification-1',
+          attempts: 0,
+          payload: { title: 'T', body: 'B', data: {} },
+          notification,
+        },
+      ],
+      pendingDeliveries: [{ id: 'd-a', token: 'tok-a' }],
+      outcomes: [{ token: 'tok-a', status: 'SENT', ticketId: 't1' }],
+    });
+
+    await processor.processPending();
+
+    expect(prisma.notificationPushOutbox.findMany).toHaveBeenCalledWith({
+      where: { id: { in: ['job-1'] } },
+      include: { notification: { select: NOTIFICATION_REALTIME_BASE_SELECT } },
+    });
+    // 有快照的重试原样重发：一条关系都不用读。
+    expect(prisma.systemAnnouncement.findMany).not.toHaveBeenCalled();
+    expect(prisma.trace.findMany).not.toHaveBeenCalled();
+  });
+
+  it('composes from the fields composeMessage reads, loaded once per batch', async () => {
+    const commentNotification = {
+      ...notification,
+      id: 'notification-2',
+      type: 'TRACE_COMMENT',
+      content: '',
+      fromUserID: 'actor',
+      fromTraceID: 'trace-1',
+      fromReplyID: 'reply-1',
+    };
+    const { prisma, push, processor } = buildHarness({
+      jobs: [
+        {
+          id: 'job-1',
+          notificationID: 'notification-2',
+          attempts: 0,
+          payload: null,
+          notification: commentNotification,
+        },
+        {
+          id: 'job-2',
+          notificationID: 'notification-1',
+          attempts: 0,
+          payload: null,
+          notification,
+        },
+      ],
+      pendingDeliveries: [{ id: 'd-a', token: 'tok-a' }],
+      outcomes: [{ token: 'tok-a', status: 'SENT', ticketId: 't1' }],
+    });
+    prisma.user.findMany.mockImplementation(({ where, select }: any) =>
+      Promise.resolve(
+        select.nickname
+          ? where.id.in.map((id: string) => ({ id, nickname: `nick-${id}` }))
+          : [],
+      ),
+    );
+    prisma.trace.findMany.mockResolvedValue([
+      { id: 'trace-1', content: 'trace body' },
+    ]);
+    prisma.traceComment.findMany.mockResolvedValue([
+      { id: 'reply-1', content: 'reply body' },
+    ]);
+
+    await processor.processPending();
+
+    expect(push.composeMessage).toHaveBeenNthCalledWith(1, 'user-1', {
+      id: 'notification-2',
+      type: 'TRACE_COMMENT',
+      content: '',
+      title: null,
+      fromUser: { id: 'actor', nickname: 'nick-actor' },
+      fromTrace: { id: 'trace-1', excerpt: 'trace body' },
+      fromReply: { id: 'reply-1', content: 'reply body' },
+      fromCirclePost: null,
+      fromInvitation: null,
+      fromGroupAdmission: null,
+      requestId: null,
+    });
+    expect(push.composeMessage).toHaveBeenNthCalledWith(
+      2,
+      'user-1',
+      expect.objectContaining({ id: 'notification-1', content: 'hello' }),
+    );
+    // 两个任务的发送者一次查完；动态 / 回复各一次。
+    expect(prisma.user.findMany).toHaveBeenCalledWith({
+      where: { id: { in: ['actor', 'user-1'] } },
+      select: { id: true, nickname: true },
+    });
+    expect(prisma.trace.findMany).toHaveBeenCalledTimes(1);
+    expect(prisma.traceComment.findMany).toHaveBeenCalledTimes(1);
+  });
+
   it('does not send an announcement cancelled after the job was claimed', async () => {
     const { prisma, push, processor } = buildHarness({
       jobs: [
@@ -188,15 +297,16 @@ describe('NotificationPushOutboxProcessor (#88 per-token)', () => {
 
     await expect(processor.processPending()).resolves.toBe(0);
 
-    expect(prisma.notificationPushDelivery.update).toHaveBeenCalledWith({
-      where: { id: 'delivery-1' },
+    expect(prisma.notificationPushDelivery.updateMany).toHaveBeenCalledTimes(1);
+    expect(prisma.notificationPushDelivery.updateMany).toHaveBeenCalledWith({
+      where: { id: { in: ['delivery-1'] } },
       data: {
         status: 'FAILED',
         attempts: { increment: 1 },
         lastError: 'JPushNotConfigured',
       },
     });
-    expect(prisma.notificationPushDelivery.updateMany).not.toHaveBeenCalled();
+    expect(prisma.notificationPushDelivery.update).not.toHaveBeenCalled();
     expect(prisma.notificationPushOutbox.updateMany).toHaveBeenCalledWith(
       expect.objectContaining({
         data: expect.objectContaining({
@@ -289,8 +399,8 @@ describe('NotificationPushOutboxProcessor (#88 per-token)', () => {
       { title: 'T', body: 'B', data: {} },
     );
     // ticket 落到投递行
-    expect(prisma.notificationPushDelivery.update).toHaveBeenCalledWith({
-      where: { id: 'd-b' },
+    expect(prisma.notificationPushDelivery.updateMany).toHaveBeenCalledWith({
+      where: { id: { in: ['d-b'] } },
       data: expect.objectContaining({ status: 'SENT', ticketID: 'ticket-b' }),
     });
     // 快照已存在则不再重新组装
@@ -382,13 +492,13 @@ describe('NotificationPushOutboxProcessor (#88 per-token)', () => {
 
     expect(processed).toBe(0);
     // tok-a 已 SENT（下一轮不会再收到）
-    expect(prisma.notificationPushDelivery.update).toHaveBeenCalledWith({
-      where: { id: 'd-a' },
+    expect(prisma.notificationPushDelivery.updateMany).toHaveBeenCalledWith({
+      where: { id: { in: ['d-a'] } },
       data: expect.objectContaining({ status: 'SENT' }),
     });
     // tok-b FAILED 待补发
-    expect(prisma.notificationPushDelivery.update).toHaveBeenCalledWith({
-      where: { id: 'd-b' },
+    expect(prisma.notificationPushDelivery.updateMany).toHaveBeenCalledWith({
+      where: { id: { in: ['d-b'] } },
       data: expect.objectContaining({ status: 'FAILED' }),
     });
     const failWrite = prisma.notificationPushOutbox.updateMany.mock.calls
@@ -396,6 +506,89 @@ describe('NotificationPushOutboxProcessor (#88 per-token)', () => {
       .find((input) => input.data.status === 'FAILED');
     expect(failWrite).toBeDefined();
     expect(failWrite.data.nextAttemptAt).toBeInstanceOf(Date);
+  });
+
+  it('writes token outcomes with one updateMany per distinct result', async () => {
+    const tokens = ['j1', 'j2', 'j3', 'e1', 'e2', 'x1', 'x2'].map((token) => ({
+      token,
+      projectId: null,
+    }));
+    const { prisma, processor } = buildHarness({
+      jobs: [
+        {
+          id: 'job-1',
+          notificationID: 'notification-1',
+          status: 'PENDING',
+          attempts: 0,
+          payload: { title: 'T', body: 'B', data: {} },
+          notification,
+        },
+      ],
+      tokens,
+      pendingDeliveries: tokens.map(({ token }) => ({
+        id: `d-${token}`,
+        token,
+      })),
+      outcomes: [
+        // JPush 没有异步回执阶段：三条写的数据完全一样，合并成一条。
+        { token: 'j1', status: 'SENT', receiptFinal: true },
+        { token: 'j2', status: 'SENT', receiptFinal: true },
+        { token: 'j3', status: 'SENT', receiptFinal: true },
+        // Expo 每条带自己的 ticket，只能各写各的。
+        { token: 'e1', status: 'SENT', ticketId: 'ticket-1' },
+        { token: 'e2', status: 'SENT', ticketId: 'ticket-2' },
+        { token: 'x1', status: 'TERMINAL', error: 'MessageTooBig' },
+        { token: 'x2', status: 'TERMINAL', error: 'MessageTooBig' },
+      ],
+    });
+
+    await expect(processor.processPending()).resolves.toBe(1);
+
+    expect(prisma.notificationPushDelivery.update).not.toHaveBeenCalled();
+    const writes = prisma.notificationPushDelivery.updateMany.mock.calls.map(
+      ([input]: any[]) => input,
+    );
+    expect(writes).toEqual([
+      {
+        where: { id: { in: ['d-j1', 'd-j2', 'd-j3'] } },
+        data: {
+          status: 'CONFIRMED',
+          ticketID: null,
+          sentAt: expect.any(Date),
+          receiptCheckedAt: expect.any(Date),
+          attempts: { increment: 1 },
+          lastError: null,
+        },
+      },
+      {
+        where: { id: { in: ['d-e1'] } },
+        data: {
+          status: 'SENT',
+          ticketID: 'ticket-1',
+          sentAt: expect.any(Date),
+          attempts: { increment: 1 },
+          lastError: null,
+        },
+      },
+      {
+        where: { id: { in: ['d-e2'] } },
+        data: {
+          status: 'SENT',
+          ticketID: 'ticket-2',
+          sentAt: expect.any(Date),
+          attempts: { increment: 1 },
+          lastError: null,
+        },
+      },
+      {
+        where: { id: { in: ['d-x1', 'd-x2'] } },
+        data: {
+          status: 'TERMINAL',
+          attempts: { increment: 1 },
+          lastError: 'MessageTooBig',
+        },
+      },
+    ]);
   });
 
   it('completes immediately when nothing is pending (all delivered/terminal)', async () => {

@@ -22,8 +22,10 @@ import {
   ApiOperation,
   ApiTags,
 } from '@nestjs/swagger';
+import { Throttle } from '@nestjs/throttler';
 import { FriendState } from 'src/generated/prisma';
 import { JwtGuard } from 'src/guards/jwt.guard';
+import { UserThrottlerGuard } from 'src/guards/user-throttler.guard';
 import type { RequestWithUser } from 'src/auth/types';
 import { ClampPagePipe } from 'src/common/pagination';
 import { ParseUserIdPipe } from 'src/user/parse-user-id.pipe';
@@ -43,6 +45,12 @@ import {
   SetRemarkDto,
 } from './dto/friend.dto';
 import { FriendService } from './friend.service';
+
+// 发好友申请的限流:每个账号 10 分钟最多 20 次(产品可按需调整这两个数)。
+// 每次申请都会给对方写动态、推通知;没有路由级限流时,一个账号能对全站刷屏。
+// 按账号计数(UserThrottlerGuard),同一 NAT 出口的其他用户不受牵连。
+const FRIEND_REQUEST_THROTTLE_LIMIT = 20;
+const FRIEND_REQUEST_THROTTLE_TTL_MS = 10 * 60_000;
 
 @ApiTags('Friend')
 @ApiBearerAuth()
@@ -131,6 +139,13 @@ export class FriendController {
 
   @Post('requests')
   @HttpCode(HttpStatus.NO_CONTENT)
+  @UseGuards(UserThrottlerGuard)
+  @Throttle({
+    default: {
+      limit: FRIEND_REQUEST_THROTTLE_LIMIT,
+      ttl: FRIEND_REQUEST_THROTTLE_TTL_MS,
+    },
+  })
   @ApiOperation({ summary: 'Send a friend request' })
   @ApiNoContentResponse()
   sendRequest(

@@ -18,7 +18,9 @@ import {
   ApiOperation,
   ApiTags,
 } from '@nestjs/swagger';
+import { Throttle } from '@nestjs/throttler';
 import { JwtGuard } from 'src/guards/jwt.guard';
+import { UserThrottlerGuard } from 'src/guards/user-throttler.guard';
 import type { RequestWithUser } from 'src/auth/types';
 import { CoinService } from './coin.service';
 import { CoinTransactionDto, SendGiftDto, WalletDto } from './dto/coin.dto';
@@ -49,6 +51,11 @@ export class CoinController {
 
   @Post('gift')
   @HttpCode(HttpStatus.NO_CONTENT)
+  // 没有全局 ThrottlerGuard。送一次金币是一个 Serializable 事务（双方钱包行锁 + 流水 +
+  // 礼物卡片 outbox），换着幂等键循环调用就能把钱包行锁成热点。30 次/分钟/账号对真人
+  // 送礼绰绰有余；按账号计数（UserThrottlerGuard），NAT 后的用户不互相挤出 429。
+  @UseGuards(UserThrottlerGuard)
+  @Throttle({ default: { limit: 30, ttl: 60_000 } })
   @ApiOperation({ summary: 'Send coins to a friend' })
   @ApiHeader({
     name: 'idempotency-key',

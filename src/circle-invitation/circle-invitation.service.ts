@@ -35,6 +35,11 @@ import {
   InvitationUserDto,
   InvitationVerifierDto,
 } from './dto/circle-invitation.dto';
+import {
+  approvedInvitationsToReconcileQuery,
+  pendingConsentDeliveriesQuery,
+} from './circle-invitation-cron.query';
+import { eligibleVerifierIdsQuery } from './eligible-verifiers.query';
 
 // 验证卡片补偿的节流参数。宽限期给 inline 签发留出完成时间。
 //
@@ -297,17 +302,11 @@ export class CircleInvitationService {
     'circle_consent_invitation_delivery',
   )
   async deliverPendingConsentInvitations() {
-    const rows = await this.prisma.circleInvitation.findMany({
-      where: {
-        consentNoticeDeliveredAt: null,
-        consentNoticeRequired: true,
-        status: 'INVITED',
-        consentNoticeAttempts: { lt: 8 },
-      },
-      orderBy: [{ consentNoticeAttempts: 'asc' }, { createdAt: 'asc' }],
-      take: 50,
-      select: { id: true, consentNoticeAttempts: true },
-    });
+    // 原生 SQL + 部分索引（见 pendingConsentDeliveriesQuery）：Prisma 把 status 参数化
+    // 成 CAST($n AS 枚举) 后任何部分索引都用不上，每分钟一次整表扫描。
+    const rows = await this.prisma.$queryRaw<
+      Array<{ id: string; consentNoticeAttempts: number }>
+    >(pendingConsentDeliveriesQuery({ maxAttempts: 8, limit: 50 }));
     for (const row of rows) {
       try {
         await this.deliverConsentInvitation(row.id);
@@ -708,8 +707,9 @@ export class CircleInvitationService {
    * VerifierNotMember 打回;而资格规则本身归服务端所有,那就由服务端算好再给,
    * 前端不做集合运算 —— 否则同一条规则会在两个仓里各写一遍、各自漂移。
    *
-   * 先查成员再查好友(而不是反过来):成员数受圈子容量约束,好友数不受约束,
-   * 用成员集合去收窄 `in` 才不会在好友多的账号上退化成一条几千个 uuid 的查询。
+   * 交集在一条 SQL 里算(eligibleVerifierIdsQuery):此前先把全圈 ACTIVE 成员(容量上限
+   * 3000)拉进内存,再拿两个 3000 项的 IN 去查好友表;现在好友集合是子查询,哪边小
+   * 由规划器从哪边收窄,应用里只拿到交集的 id。
    *
    * 排除已占席时**不看状态**:addVerifier 的 AlreadyVerifier 判定同样不看状态
    * (拒过的人不能再被拉回来),两处必须同口径,否则列表里会出现点了必报错的人。
@@ -753,47 +753,20 @@ export class CircleInvitationService {
     ).length;
     if (activeSlots >= invitation.requiredCount) return [];
 
-    // 只取 id,不带 profile:交集之前把成员表整张拉成用户资料,是在为
-    // 「最后只会剩几个好友」的结果付一次全员 hydration(圈子可以很大)。
-    const members = await this.prisma.circleMember.findMany({
-      where: {
-        circleID: invitation.circleID,
-        status: 'ACTIVE',
-        userID: {
-          notIn: [
-            ...invitation.verifiers.map((verifier) => verifier.verifierID),
-            callerId,
-          ],
-        },
-      },
-      select: { userID: true },
-      orderBy: { createdAt: 'asc' },
-    });
-    if (members.length === 0) return [];
-
-    const memberIds = members.map((member) => member.userID);
-    const friendships = await this.prisma.friend.findMany({
-      where: {
-        state: 'ACCEPTED',
-        OR: [
-          { userID: callerId, friendID: { in: memberIds } },
-          { friendID: callerId, userID: { in: memberIds } },
+    // 只取 id,不带 profile:hydration 只落在交集上(圈子可以很大)。好友行重复
+    // (friend 表没有 @@unique([userID, friendID]))由 SQL 的半连接收敛,每个成员在
+    // 圈里只有一行,结果天然不重;顺序是入圈先后。
+    const eligibleRows = await this.prisma.$queryRaw<Array<{ userID: string }>>(
+      eligibleVerifierIdsQuery({
+        circleId: invitation.circleID,
+        callerId,
+        excludedUserIds: [
+          ...invitation.verifiers.map((verifier) => verifier.verifierID),
+          callerId,
         ],
-      },
-      select: { userID: true, friendID: true },
-    });
-    // friend 表没有 @@unique([userID, friendID]),同一对可能有重复行 —— 过 Set
-    // 收敛,再按 members 过滤(每个成员在圈里只有一行),结果天然不重。
-    const friendIds = new Set(
-      friendships.map((friendship) =>
-        friendship.userID === callerId
-          ? friendship.friendID
-          : friendship.userID,
-      ),
+      }),
     );
-
-    // 入圈先后序由 memberIds 保着,hydration 只落在交集上。
-    const eligibleIds = memberIds.filter((memberId) => friendIds.has(memberId));
+    const eligibleIds = eligibleRows.map((row) => row.userID);
     if (eligibleIds.length === 0) return [];
 
     const users = await this.prisma.user.findMany({
@@ -1532,16 +1505,10 @@ export class CircleInvitationService {
     'circle_invitation_reconciliation',
   )
   async reconcileApprovedInvitations(): Promise<number> {
+    // 落在只收「票够了却还 PENDING」的部分索引上（正常为空），不再每 5 分钟扫整表。
     const candidates = await this.prisma.$queryRaw<
       Array<{ id: string; circleID: string; applicantID: string }>
-    >`
-      SELECT "id", "circleID", "applicantID"
-      FROM "CircleInvitation"
-      WHERE "status" = 'PENDING'
-        AND "approvedCount" >= "requiredCount"
-      ORDER BY "updatedAt" ASC, "id" ASC
-      LIMIT 100
-    `;
+    >(approvedInvitationsToReconcileQuery());
     let finalizedCount = 0;
     for (const candidate of candidates) {
       try {

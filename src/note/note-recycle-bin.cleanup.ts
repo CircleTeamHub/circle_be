@@ -7,6 +7,7 @@ import {
 import { PrismaService } from 'src/prisma/prisma.service';
 import { prismaErrorCode } from 'src/utils/prisma-tx';
 import { purgeDeletedNote } from './note-purge';
+import { expiredRecycleBinNotesQuery } from './note-recycle-bin.query';
 
 /**
  * 回收站到期清理：软删（status=DELETED）满 30 天的笔记行硬删。
@@ -43,22 +44,22 @@ export class NoteRecycleBinCleanup {
     try {
       // 逐行删：每行要先把收录链下游改指向它的上游（见 purgeDeletedNote），
       // 一条 deleteMany 做不到。处理顺序无关：改指向时读的是上游的当前值。
-      // 按 id 游标前进：某一行删失败（例如改指向撞唯一索引）只跳过它、明天再试，
-      // 不会卡住整轮，也不会反复取到同一行。
+      // 按 (updatedAt, id) 键集前进（走部分索引，见 expiredRecycleBinNotesQuery）：
+      // 某一行删失败（例如改指向撞唯一索引）只跳过它、明天再试，不会卡住整轮，
+      // 也不会反复取到同一行。
       let purged = 0;
       let failed = 0;
-      let after: string | undefined;
+      let after: { updatedAt: Date; id: string } | undefined;
       for (;;) {
-        const batch = await this.prisma.note.findMany({
-          where: {
-            status: 'DELETED',
-            updatedAt: { lt: cutoff },
-            ...(after ? { id: { gt: after } } : {}),
-          },
-          select: { id: true },
-          orderBy: { id: 'asc' },
-          take: NoteRecycleBinCleanup.BATCH_SIZE,
-        });
+        const batch = await this.prisma.$queryRaw<
+          Array<{ id: string; updatedAt: Date }>
+        >(
+          expiredRecycleBinNotesQuery({
+            cutoff,
+            after,
+            limit: NoteRecycleBinCleanup.BATCH_SIZE,
+          }),
+        );
         for (const { id } of batch) {
           try {
             if (
@@ -77,7 +78,8 @@ export class NoteRecycleBinCleanup {
           }
         }
         if (batch.length < NoteRecycleBinCleanup.BATCH_SIZE) break;
-        after = batch[batch.length - 1].id;
+        const last = batch[batch.length - 1];
+        after = { updatedAt: last.updatedAt, id: last.id };
       }
       if (failed > 0) reportHandledJobFailure();
       if (purged > 0) {
