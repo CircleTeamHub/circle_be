@@ -58,7 +58,6 @@ import { AdminAccessModule } from './admin-access/admin-access.module';
 import { AdminOperationsModule } from './admin-operations/admin-operations.module';
 import { AdminCommerceModule } from './admin-commerce/admin-commerce.module';
 import { AdminContentModule } from './admin-content/admin-content.module';
-import { E2eeModule } from './e2ee/e2ee.module';
 import { AdminImModule } from './admin-im/admin-im.module';
 
 const nodeEnv = process.env.NODE_ENV || 'development';
@@ -124,7 +123,6 @@ const envFilePath = `.env.${nodeEnv}`;
     AdminCommerceModule,
     AdminContentModule,
     AdminImModule,
-    E2eeModule,
     ConsoleModule,
   ],
   controllers: [],

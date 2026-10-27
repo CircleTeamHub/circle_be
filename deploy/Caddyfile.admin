@@ -62,9 +62,10 @@
 # 直接映射到本机、前面没有 CDN/代理，所以 {remote_host} 就是真实客户端 IP；哪天
 # 挪到 Cloudflare 之类后面，必须同时配 trusted_proxies，否则所有人会共用一个桶。
 #
-# ⚠️ 不要给下面的整个站点开 access log（`log` 指令）。API 域只给 /chat-ws 分配
-#    no_hostname 的专用 logger，并在输出前移除 query、请求头和 IP；媒体预签名 URL
-#    及普通 API 请求仍不会进入 Caddy access log。
+# ⚠️ 不要给下面的整个站点开 access log。API 域只给 /chat-ws 分配 no_hostname 的
+#    专用 logger，并在输出前移除 query、请求头和 IP；媒体预签名 URL 及普通 API
+#    请求不进 Caddy access log。注意站点里写了 `log chat_ws` 本身就会打开整站的
+#    access log，所以还要靠 `log_skip @not_chat_ws` 把其余请求挡掉（见下方）。
 
 {$API_DOMAIN} {
 	# 只记录 chat WebSocket 握手。连接追踪 ID 由 Caddy 生成，不含账号；
@@ -90,6 +91,19 @@
 	log_name @chat_ws chat_ws
 	log_append @chat_ws event ws_proxy_access
 	log_append @chat_ws traceId {http.vars.connection_trace_id}
+	# 上面的 `log chat_ws` 一写，整个站点就开了 access log：没被 log_name 认领的
+	# 请求落到默认 logger（stdout、不过滤），完整 URI（分享链接、临时聊天的 token、
+	# 对象存储签名）、客户端 IP 和请求头全在里面 —— 不只是 5xx，每个请求都有。
+	# /chat-ws 以外一律跳过。
+	@not_chat_ws not path /chat-ws /chat-ws/*
+	log_skip @not_chat_ws
+
+	# /realtime 的原生 WebSocket 同样由这里生成连接追踪 ID：网关拿它把升级、认证、
+	# 就绪和关闭几行日志串起来（src/realtime/realtime.gateway.ts）。不设的话，下面
+	# 的 header_up 会把这个头置成空值，网关只能自己另起一个，和这里对不上。它不进
+	# Caddy access log，access log 的范围仍然只有 /chat-ws。
+	@realtime_ws path /realtime
+	vars @realtime_ws connection_trace_id ws-{http.request.uuid}
 
 	@metrics path /metrics /metrics/*
 	handle @metrics {

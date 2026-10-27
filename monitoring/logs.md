@@ -128,6 +128,14 @@ rather than exposing Loki. Current rules:
 | `BackendErrorLogSpike` | more than 50 backend error-level lines per 5m, sustained for 10m |
 | `CaddyProxyErrors` | more than 10 error-level Caddy proxy/handler lines per 5m, sustained for 10m |
 | `CaddyCertificateErrors` | any Caddy TLS error in the last 30m — renewal is failing well before `TlsCertificateExpiringSoon` |
+| `SecurityCodeGuessing` | more than 20 wrong security / login-challenge codes per 5m, sustained for 10m |
+| `SecurityCodeLockouts` | 3 or more security-code lockouts in 30m (each is 5 wrong codes on one account) |
+| `RevokedSessionTokenReplay` | one revoked session used 20+ times in 15m, or revoked sessions of 5+ users replayed (a normal logout-all of several devices does neither) |
+| `InvalidTokenSpike` | more than 50 forged / mis-signed tokens per 5m, sustained for 10m (a key rotation recovers on the next refresh and does not last that long) |
+
+The security rules read the `security_event` lines described in
+[docs/logging.md](../docs/logging.md#security-event-catalogue); they need
+`SECURITY_LOG_ON` (on by default outside tests).
 
 After enabling the overlay, `curl -s loki:3100/loki/api/v1/rules` from a
 container on the `logs` network lists the loaded rules.

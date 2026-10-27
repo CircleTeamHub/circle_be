@@ -9,7 +9,7 @@ import { Prisma } from 'src/generated/prisma';
  */
 
 /**
- * 锁行时顺带读回锁内复查要用的全部会话列(禁言、拉黑、临时房、加密、取号)。
+ * 锁行时顺带读回锁内复查要用的全部会话列(禁言、拉黑、临时房、取号)。
  *
  * 只读**被锁的这一行**:等锁之后 PostgreSQL 会对这一行取最新提交版本重算
  * (EvalPlanQual),所以这些列与锁同样新。别的表不能塞进这条语句 —— 等过锁的
@@ -20,7 +20,7 @@ export function lockConversationForSendQuery(
   conversationId: string,
 ): Prisma.Sql {
   return Prisma.sql`
-    SELECT "nextHeight", "textEncryption", "type"::text AS "type", "directKey",
+    SELECT "nextHeight", "type"::text AS "type", "directKey",
            "circleID", "ownerID", "muteAllAt", "tempChatID"
     FROM "ChatConversation"
     WHERE "id" = ${conversationId}

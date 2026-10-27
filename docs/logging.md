@@ -121,6 +121,12 @@ Chat WebSocket lifecycle events (`ChatGateway`, correlated by Caddy's random `ws
 - `ws_connection_rejected`: an authenticated socket was refused admission (global or per-user cap, join failure); `reason` is a bounded enum.
 - `ws_connection_ready`: the socket joined its rooms and is fully admitted.
 - `ws_connection_closed`: the socket closed; `stage` says whether it had reached `ready`.
+- `realtime_connection_rejected`: a `/realtime` upgrade was refused (`origin_forbidden`, `capacity`, `admission_full`) before it became a WebSocket; sampled per reason per minute, never carries the origin.
+- `realtime_auth_rejected`: a `/realtime` socket was closed before or during admission; `reason` is a bounded enum (`auth_timeout`, `invalid_message`, `invalid_token`, `revoked`, `session_unverifiable`, `too_many_connections`, `token_expired`, `error`). Client-triggerable reasons are sampled like `ws_auth_rejected`; `error` is a server fault, logged at error level and never sampled. `*_suppressed` summaries carry the sampled-away count.
+- `realtime_connection_ready` / `realtime_connection_closed`: the `/realtime` counterparts of `ws_connection_ready` / `ws_connection_closed`. The close line's `reason` is what the server first closed it for (one of the above, `token_expired_while_open`, `revoked_while_open`, `heartbeat_timeout`, `shutdown`) or `peer_or_network`; `closeCode` is the RFC 6455 code, and the peer's close text is never logged. Closes of sockets that never reached `ready` are sampled per reason like the rejections (auth is message-based, so a client reconnecting with a dead token completes every upgrade); `ready` closes are always logged.
+- Every `*_suppressed` summary is emitted when its window ends, even if no later event of that kind arrives; `/realtime` has no rejection counter, so these summaries are the only record of what sampling dropped.
+
+Both gateways carry the same `traceId` per connection: Caddy sets `X-Connection-Trace-Id: ws-<uuid>` on `/chat-ws` and `/realtime` upgrades (`deploy/Caddyfile.admin`), and `src/logging/connection-trace-id.ts` accepts only that shape, replacing anything else with a server-side ID. Values a client sends in its auth frame are never used for correlation.
 
 Database and job diagnostics:
 
@@ -255,6 +261,12 @@ the request context and a sanitized `reason`:
 - `login_recovery_completed` — the recovery finished (see `auth_login_recovered`).
 - `login_challenge_security_code_budget_exhausted` — the account used up its
   daily failure budget for the security-code fallback.
+
+With the logs overlay on, Loki alerts on bursts of these events
+(`SecurityCodeGuessing`, `SecurityCodeLockouts`, `RevokedSessionTokenReplay`,
+`InvalidTokenSpike`; see `monitoring/logs.md`). Renaming an event or the
+`metadata.authFailureReason` field silently disables its rule —
+`test/logs-pipeline.spec.mjs` checks the names against the code.
 
 The security-log call in `AllExceptionFilter` and `ErrorLoggingInterceptor`
 is wrapped like the Sentry capture: if the log transport throws, an

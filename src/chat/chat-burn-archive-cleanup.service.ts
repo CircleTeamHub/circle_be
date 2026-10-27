@@ -194,9 +194,6 @@ export class ChatBurnArchiveCleanupService {
     const owned = await this.media.unreferencedArchiveMedia(tx, keys, row.id);
     await this.media.queueDeletions(tx, owned, row.id);
     await this.media.releaseNoteImportReferences(tx, [row.id], imports);
-    await tx.e2eeArchive.deleteMany({
-      where: { messageID: row.id, recovery: { purpose: 'AUDIT' } },
-    });
     await tx.chatBurnArchive.delete({ where: { id: row.id } });
   }
 }

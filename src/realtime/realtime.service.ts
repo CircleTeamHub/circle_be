@@ -278,6 +278,9 @@ export class RealtimeService implements OnModuleInit, OnModuleDestroy {
   ]);
 
   private readonly logger = new Logger(RealtimeService.name);
+
+  /** Sockets this service closed because their session was revoked (for the gateway's close log). */
+  private readonly closedForRevocation = new WeakSet<WebSocket>();
   /** Fully admitted sockets eligible to receive business events. */
   private readonly clients = new Map<string, Set<WebSocket>>();
   /**
@@ -1256,6 +1259,11 @@ export class RealtimeService implements OnModuleInit, OnModuleDestroy {
     }
   }
 
+  /** Whether this service closed `socket` for a session revocation. */
+  wasClosedForRevocation(socket: WebSocket): boolean {
+    return this.closedForRevocation.has(socket);
+  }
+
   /**
    * Closes the locally-held sockets this revocation kills, and returns how many.
    *
@@ -1271,6 +1279,7 @@ export class RealtimeService implements OnModuleInit, OnModuleDestroy {
   ): number {
     for (const socket of revoked) {
       try {
+        this.closedForRevocation.add(socket);
         socket.close(REVOKED_CLOSE_CODE, REVOKED_CLOSE_REASON);
       } catch (error) {
         this.logger.warn(

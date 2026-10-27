@@ -61,7 +61,9 @@ export function buildNestFactoryOptions() {
       // GET /note and /note/recycle-bin signal truncation through this header
       // while the body stays an array; browsers hide unlisted response headers
       // from cross-origin callers.
-      exposedHeaders: ['X-Has-More', 'X-Request-Id'],
+      // GET /chat/conversations 的键集分页把下一页游标放在 X-Next-Cursor,
+      // 不放行的话网页端读不到,只能拿到第一页。
+      exposedHeaders: ['X-Has-More', 'X-Next-Cursor', 'X-Request-Id'],
     },
     rawBody: true,
   };

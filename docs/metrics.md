@@ -111,7 +111,7 @@ entry and the backend `ChatGateway` lifecycle entry.
 docker logs --since 10m circle-be-caddy-1 2>&1 | grep ws_proxy_access
 
 # Gateway view: upgrade/auth/admission/ready/closed stage and bounded reason.
-docker logs --since 10m circle-be-blue 2>&1 | grep -E 'ws_(auth|connection)'
+docker logs --since 10m circle-be-blue 2>&1 | grep -E '(ws|realtime)_(auth|connection)'
 ```
 
 Search the copied trace ID in both outputs. Expected event names are
@@ -121,7 +121,10 @@ sampled per reason per minute; when some were dropped, a
 `ws_auth_rejected_suppressed` summary carries the suppressed count (the
 Prometheus counter always counts every rejection). Rejection reason values are
 closed enums; raw exception messages and handshake credentials are deliberately
-excluded.
+excluded. `/realtime` connections log the same lifecycle as `realtime_*` events
+(`realtime_connection_rejected`, `realtime_auth_rejected`,
+`realtime_connection_ready`, `realtime_connection_closed`) under the trace ID
+Caddy sets for that path too; see docs/logging.md.
 
 **Routes are normalized** to keep cardinality bounded: dynamic segments (UUIDs,
 Mongo ObjectIds, numeric ids) collapse to `:id`, e.g.

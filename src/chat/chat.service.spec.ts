@@ -5,6 +5,7 @@ import {
   NotFoundException,
 } from '@nestjs/common';
 import { ChatErrorCode } from 'src/common/app-error-codes';
+import { CONVERSATION_LIST_MAX } from './chat.constants';
 import { ChatService, conversationSyncRevision } from './chat.service';
 import { SINGLE_CHAR_SEARCH_WINDOW } from './chat-text-search.query';
 import type { Prisma } from 'src/generated/prisma';
@@ -1545,6 +1546,46 @@ describe('ChatService', () => {
       );
     });
 
+    // 文字加密已整体下线:encrypted-text 不再是可发送类型,和任何未知类型走同一条
+    // validateSendPayload 拒绝路径(InvalidPayload),在碰数据库之前就被拦下,
+    // 不再有专用错误码。
+    it('rejects the retired encrypted-text type exactly like an unknown type', async () => {
+      const rejection = async (type: string) => {
+        const error = await service
+          .sendMessage(
+            'u1',
+            sendPayload({
+              type,
+              content: {
+                envelope: {
+                  ciphertext: 'opaque',
+                  clientMessageId: 'client-msg-1',
+                },
+                signature: 'proof',
+              },
+            }),
+          )
+          .then(
+            () => null,
+            (caught: unknown) => caught,
+          );
+        expect(error).toBeInstanceOf(BadRequestException);
+        return (error as BadRequestException).getResponse();
+      };
+
+      expect(await rejection('encrypted-text')).toEqual({
+        message: '不支持的消息类型: encrypted-text',
+        errorCode: ChatErrorCode.InvalidPayload,
+      });
+      expect(await rejection('not-a-message-type')).toEqual({
+        message: '不支持的消息类型: not-a-message-type',
+        errorCode: ChatErrorCode.InvalidPayload,
+      });
+      expect(prisma.chatMember.findUnique).not.toHaveBeenCalled();
+      expect(prisma.$transaction).not.toHaveBeenCalled();
+      expect(prisma.chatMessage.create).not.toHaveBeenCalled();
+    });
+
     it('rejects senders that are not members', async () => {
       prisma.chatMember.findUnique.mockResolvedValue(null);
       await expect(service.sendMessage('u1', sendPayload())).rejects.toThrow(
@@ -1662,7 +1703,6 @@ describe('ChatService', () => {
       prisma.$queryRaw.mockResolvedValueOnce([
         {
           nextHeight: 3,
-          textEncryption: 'PLAIN',
           type: 'GROUP',
           directKey: null,
           circleID: null,
@@ -3535,6 +3575,389 @@ describe('ChatService', () => {
       expect(prisma.$queryRaw).toHaveBeenCalledTimes(2);
       expect(prisma.chatMessage.findFirst).not.toHaveBeenCalled();
       expect(prisma.chatMessage.count).not.toHaveBeenCalled();
+    });
+
+    /**
+     * 键集分页(带 cursor):按 conversationID 升序翻页。用户进了几百个群,单页 500
+     * 装不下;而活跃度排序下用 offset 翻页,翻页间隙里来一条新消息就会把会话挪到
+     * 别的页 —— 漏行或重复。id 是稳定的,键集按它走,中途怎么来消息都一个不落。
+     *
+     * ChatMember 表用内存替身按 Prisma 的 where / orderBy / take / skip 语义真查一遍。
+     * 认不出的条件直接抛错:宁可让测试红,也不能让替身悄悄忽略一个过滤条件,把实现
+     * 上的漏洞「测」成绿的。
+     */
+    describe('keyset cursor mode', () => {
+      type Seat = Omit<ReturnType<typeof membership>, 'leftAt'> & {
+        leftAt: Date | null;
+        hiddenAt: Date | null;
+        conversation: ReturnType<typeof membership>['conversation'] & {
+          lastMessageAt: Date | null;
+        };
+      };
+      type FindManyArgs = {
+        where: Record<string, unknown>;
+        include?: { conversation?: boolean };
+        orderBy?: unknown;
+        take?: number;
+        skip?: number;
+      };
+
+      // '0' < … < '9' < 'a' < … < 'f':字典序与插入顺序、活跃度顺序都不一样。
+      const idOf = (digit: string) =>
+        `${digit.repeat(8)}-0000-4000-8000-000000000000`;
+      const BASE_TIME = new Date('2026-08-05T12:00:00Z').getTime();
+      const minutesAfterBase = (minutes: number) =>
+        new Date(BASE_TIME + minutes * 60_000);
+
+      const seat = (
+        digit: string,
+        overrides: Partial<Omit<Seat, 'conversation'>> & {
+          lastMessageAt?: Date | null;
+        } = {},
+      ): Seat => {
+        const base = membership();
+        const { lastMessageAt = null, ...rest } = overrides;
+        return {
+          ...base,
+          id: `member-${digit}`,
+          conversationID: idOf(digit),
+          hiddenAt: null,
+          ...rest,
+          conversation: {
+            ...base.conversation,
+            id: idOf(digit),
+            lastMessageAt,
+          },
+        };
+      };
+
+      let table: Seat[] = [];
+
+      const KNOWN_ARGS = new Set([
+        'where',
+        'include',
+        'orderBy',
+        'take',
+        'skip',
+      ]);
+      const KNOWN_WHERE = new Set([
+        'userID',
+        'leftAt',
+        'hiddenAt',
+        'conversationID',
+      ]);
+
+      const matchesWhere = (row: Seat, where: Record<string, unknown>) =>
+        Object.entries(where).every(([key, condition]) => {
+          if (!KNOWN_WHERE.has(key)) {
+            throw new Error(`替身不认识 where.${key}`);
+          }
+          const value = (row as Record<string, unknown>)[key];
+          if (condition !== null && typeof condition === 'object') {
+            const { gt, ...rest } = condition as { gt?: unknown };
+            if (typeof gt !== 'string' || Object.keys(rest).length > 0) {
+              throw new Error(`替身不认识 where.${key} 的条件`);
+            }
+            return typeof value === 'string' && value > gt;
+          }
+          return value === condition;
+        });
+
+      // 没有消息的会话排在最后(nulls: 'last')。
+      const activityOf = (row: Seat) =>
+        row.conversation.lastMessageAt?.getTime() ?? Number.NEGATIVE_INFINITY;
+      // 按码点比较,与 Postgres 对 UUID 文本的排序一致(localeCompare 不保证)。
+      const compareValues = <T extends string | number>(a: T, b: T): number => {
+        if (a === b) return 0;
+        return a < b ? -1 : 1;
+      };
+
+      const compareOne = (key: unknown, a: Seat, b: Seat): number => {
+        switch (JSON.stringify(key)) {
+          case JSON.stringify({ conversationID: 'asc' }):
+            return compareValues(a.conversationID, b.conversationID);
+          case JSON.stringify({ pinned: 'desc' }):
+            return Number(b.pinned) - Number(a.pinned);
+          case JSON.stringify({
+            conversation: { lastMessageAt: { sort: 'desc', nulls: 'last' } },
+          }):
+            return compareValues(activityOf(b), activityOf(a));
+          default:
+            throw new Error(`替身不认识 orderBy ${JSON.stringify(key)}`);
+        }
+      };
+
+      const queryTable = (args: FindManyArgs) => {
+        // 列表查询之外的 chatMember.findMany(群昵称等)与本组用例无关。
+        if (!args.include?.conversation) return Promise.resolve([]);
+        const unknown = Object.keys(args).filter((k) => !KNOWN_ARGS.has(k));
+        if (unknown.length > 0) {
+          throw new Error(`替身不认识参数 ${unknown.join(',')}`);
+        }
+        const keys = Array.isArray(args.orderBy)
+          ? (args.orderBy as unknown[])
+          : [args.orderBy];
+        const sorted = table
+          .filter((row) => matchesWhere(row, args.where))
+          .sort((a, b) => {
+            for (const key of keys) {
+              const diff = compareOne(key, a, b);
+              if (diff !== 0) return diff;
+            }
+            return 0;
+          });
+        const start = args.skip ?? 0;
+        const end = args.take === undefined ? undefined : start + args.take;
+        return Promise.resolve(sorted.slice(start, end));
+      };
+
+      beforeEach(() => {
+        prisma.chatMember.findMany.mockImplementation(queryTable as never);
+        prisma.$queryRaw.mockResolvedValue([]);
+      });
+
+      describe('single conversation (GET /chat/conversations/:id)', () => {
+        // 客户端收到会话元信息变更事件后只刷新这一个会话,用它替换列表里那一行 ——
+        // 形状必须和列表行逐字段一致,否则替换之后字段会丢。
+        beforeEach(() => {
+          prisma.chatMember.findUnique.mockImplementation((({
+            where,
+          }: {
+            where: {
+              conversationID_userID: { conversationID: string; userID: string };
+            };
+          }) =>
+            Promise.resolve(
+              table.find(
+                (row) =>
+                  row.conversationID ===
+                    where.conversationID_userID.conversationID &&
+                  row.userID === where.conversationID_userID.userID,
+              ) ?? null,
+            )) as never);
+        });
+
+        it('returns exactly the row the list returns for that conversation', async () => {
+          table = [
+            seat('1', { lastMessageAt: minutesAfterBase(1) }),
+            seat('2', { pinned: true, lastMessageAt: minutesAfterBase(2) }),
+          ];
+          const page = await service.listConversationsKeysetPage('u1', '', 10);
+          const row = page.conversations.find((c) => c.id === idOf('2'));
+
+          const single = await service.getConversation('u1', idOf('2'));
+
+          expect(single).toEqual(row);
+        });
+
+        it('rejects a conversation the user left, or never joined, as not a member', async () => {
+          table = [seat('1', { leftAt: minutesAfterBase(1) })];
+
+          await expect(
+            service.getConversation('u1', idOf('1')),
+          ).rejects.toMatchObject({
+            response: { errorCode: ChatErrorCode.NotMember },
+          });
+          await expect(
+            service.getConversation('u1', idOf('9')),
+          ).rejects.toBeInstanceOf(ForbiddenException);
+        });
+
+        it('treats a conversation hidden from the list as not found', async () => {
+          // 列表不返回隐藏的会话;单个接口也不能把它「复活」回客户端列表。
+          table = [seat('1', { hiddenAt: minutesAfterBase(1) })];
+
+          const attempt = service.getConversation('u1', idOf('1'));
+          await expect(attempt).rejects.toBeInstanceOf(NotFoundException);
+          await expect(
+            service.getConversation('u1', idOf('1')),
+          ).rejects.toMatchObject({
+            response: { errorCode: ChatErrorCode.ConversationNotFound },
+          });
+        });
+      });
+
+      it('leaves the legacy activity-ordered query and page shape untouched', async () => {
+        table = [
+          seat('1', { lastMessageAt: minutesAfterBase(1) }),
+          seat('2', { pinned: true, lastMessageAt: null }),
+          seat('3', { lastMessageAt: minutesAfterBase(3) }),
+        ];
+
+        const page = await service.listConversationsPage('u1', 2);
+
+        // 老客户端(不带 cursor)这条查询一字不改:置顶优先,再按末条消息时间倒序。
+        expect(prisma.chatMember.findMany).toHaveBeenNthCalledWith(1, {
+          where: { userID: 'u1', leftAt: null, hiddenAt: null },
+          include: { conversation: true },
+          orderBy: [
+            { pinned: 'desc' },
+            {
+              conversation: { lastMessageAt: { sort: 'desc', nulls: 'last' } },
+            },
+          ],
+          take: 3,
+        });
+        expect(page.conversations.map((c) => c.id)).toEqual([
+          idOf('2'),
+          idOf('3'),
+        ]);
+        // 旧模式的返回形状也不变:没有 nextCursor。
+        expect(page).toEqual({
+          conversations: expect.any(Array),
+          hasMore: true,
+        });
+        expect(page).not.toHaveProperty('nextCursor');
+      });
+
+      it('returns ascending ids, honours limit and continues strictly after the cursor', async () => {
+        table = [
+          seat('c', { pinned: true, lastMessageAt: minutesAfterBase(9) }),
+          seat('0', { lastMessageAt: minutesAfterBase(1) }),
+          seat('a', { lastMessageAt: null }),
+          seat('5', { lastMessageAt: minutesAfterBase(5) }),
+        ];
+
+        const first = await service.listConversationsKeysetPage('u1', '', 2);
+        expect(first.conversations.map((c) => c.id)).toEqual([
+          idOf('0'),
+          idOf('5'),
+        ]);
+        expect(first.hasMore).toBe(true);
+        expect(first.nextCursor).toBe(idOf('5'));
+
+        // 游标是排他的:游标那一行不会在下一页再出现一次。
+        const second = await service.listConversationsKeysetPage(
+          'u1',
+          idOf('5'),
+          2,
+        );
+        expect(second.conversations.map((c) => c.id)).toEqual([
+          idOf('a'),
+          idOf('c'),
+        ]);
+        expect(second.hasMore).toBe(false);
+        expect(second.nextCursor).toBeNull();
+
+        const past = await service.listConversationsKeysetPage(
+          'u1',
+          idOf('c'),
+          2,
+        );
+        expect(past).toEqual({
+          conversations: [],
+          hasMore: false,
+          nextCursor: null,
+        });
+      });
+
+      it('defaults to the regular page size', async () => {
+        table = Array.from({ length: CONVERSATION_LIST_MAX + 1 }, (_, i) => {
+          const suffix = i.toString(16).padStart(12, '0');
+          const row = seat('0');
+          const id = `00000000-0000-4000-8000-${suffix}`;
+          return {
+            ...row,
+            id: `member-${suffix}`,
+            conversationID: id,
+            conversation: { ...row.conversation, id },
+          };
+        });
+
+        const page = await service.listConversationsKeysetPage('u1', '');
+
+        expect(page.conversations).toHaveLength(CONVERSATION_LIST_MAX);
+        expect(page.hasMore).toBe(true);
+        expect(page.nextCursor).toBe(
+          table[CONVERSATION_LIST_MAX - 1].conversationID,
+        );
+      });
+
+      it('visits every visible seat exactly once while new messages reshuffle activity between pages', async () => {
+        const digits = 'f3a8061c94e2d75b'.split('');
+        const visible = digits.slice(0, 13).map((digit, i) =>
+          seat(digit, {
+            pinned: i % 5 === 0,
+            lastMessageAt: i % 4 === 0 ? null : minutesAfterBase(i),
+          }),
+        );
+        const [leftDigit, hiddenDigit, foreignDigit] = digits.slice(13);
+        table = [
+          ...visible,
+          seat(leftDigit, { leftAt: minutesAfterBase(0) }),
+          seat(hiddenDigit, { hiddenAt: minutesAfterBase(0) }),
+          // 别人的座位,与本人无关。
+          seat(foreignDigit, { userID: 'u2' }),
+        ];
+
+        const seen: string[] = [];
+        let cursor = '';
+        let finished = false;
+        for (let page = 0; page < 20 && !finished; page += 1) {
+          const result = await service.listConversationsKeysetPage(
+            'u1',
+            cursor,
+            4,
+          );
+          seen.push(...result.conversations.map((c) => c.id));
+          finished = !result.hasMore;
+          cursor = result.nextCursor ?? cursor;
+
+          // 翻页间隙里,最不活跃的那个会话来了新消息 —— 活跃度排序下它会直接
+          // 跳到第一页(用 offset 翻就再也翻不到它),还有一个会话被置顶。
+          const quietest = table
+            .filter((row) => visible.some((v) => v.id === row.id))
+            .sort((a, b) => compareValues(activityOf(a), activityOf(b)))[0];
+          const bumped = minutesAfterBase(100 + page);
+          table = table.map((row) => {
+            if (row.conversationID === quietest.conversationID) {
+              return {
+                ...row,
+                conversation: { ...row.conversation, lastMessageAt: bumped },
+              };
+            }
+            if (row.conversationID === seen[0]) {
+              return { ...row, pinned: !row.pinned };
+            }
+            return row;
+          });
+        }
+
+        expect(finished).toBe(true);
+        expect(new Set(seen).size).toBe(seen.length);
+        expect(seen).toEqual(
+          visible.map((row) => row.conversationID).sort(compareValues),
+        );
+        expect(seen).not.toContain(idOf(leftDigit));
+        expect(seen).not.toContain(idOf(hiddenDigit));
+        expect(seen).not.toContain(idOf(foreignDigit));
+      });
+
+      it('builds each row through the same enrichment as the legacy list', async () => {
+        table = [
+          seat('7', {
+            pinned: true,
+            muted: true,
+            lastReadHeight: 3,
+            lastMessageAt: minutesAfterBase(2),
+          }),
+        ];
+
+        const legacy = await service.listConversationsPage('u1');
+        const keyset = await service.listConversationsKeysetPage('u1', '');
+
+        expect(keyset.conversations).toEqual(legacy.conversations);
+        expect(keyset.conversations[0]).toMatchObject({
+          id: idOf('7'),
+          pinned: true,
+          muted: true,
+          readHeight: 3,
+          unreadCount: 0,
+          lastMessageAt: minutesAfterBase(2).toISOString(),
+        });
+        // 两条路径都要给末条消息签媒体 URL。
+        expect(media.attachMediaUrls).toHaveBeenCalledTimes(2);
+      });
     });
   });
 

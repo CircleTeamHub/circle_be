@@ -257,12 +257,10 @@ export class ChatDirectAutoReplyProcessor {
       const message = source as SourceMessage;
 
       // Serialize all jobs for one conversation before reading members/cooldown.
-      const counter = await tx.$queryRaw<
-        Array<{ nextHeight: number; textEncryption: string }>
-      >`
-        SELECT "nextHeight", "textEncryption" FROM "ChatConversation"
+      const counter = await tx.$queryRaw<Array<{ nextHeight: number }>>`
+        SELECT "nextHeight" FROM "ChatConversation"
         WHERE "id" = ${message.conversationID} FOR UPDATE`;
-      if (counter.length === 0 || counter[0].textEncryption === 'MLS_V1') {
+      if (counter.length === 0) {
         await this.completeJob(tx, jobId);
         return null;
       }
