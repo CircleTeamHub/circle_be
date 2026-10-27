@@ -192,6 +192,32 @@ describe('Device-bound security push e2e', () => {
       h.sent.mock.calls.flatMap(([tokens]) => tokens.map((t) => t.token)),
     ).toEqual(['ExponentPushToken[current]']);
   });
+  it('the account lock is free while the push provider is being called', async () => {
+    // The provider call is an outbound HTTP request that can take seconds.
+    // Holding the account lock (and a pool connection) for it blocked the
+    // user's login and refresh, and made application shutdown wait for it.
+    const h = await fixture();
+    const lockFreeAtSend: boolean[] = [];
+    h.sent.mockImplementation(async () => {
+      const [{ locked }] = await h.db.$queryRaw<{ locked: boolean }[]>`
+        SELECT pg_try_advisory_xact_lock(hashtextextended(${`auth_session:${h.userId}`}, 0)) AS locked`;
+      lockFreeAtSend.push(locked);
+      return [];
+    });
+    await (h.trust as any).pushToUser(h.userId, {
+      title: 'test',
+      body: 'test',
+      data: { type: 'auth.login.challenge.created' },
+    });
+    expect(lockFreeAtSend).toEqual([true]);
+    // Eligibility is unchanged: still read under the lock, still excluding the
+    // expired session and the unbound legacy address.
+    expect(
+      h.sent.mock.calls
+        .flatMap(([tokens]) => tokens.map((t) => t.token))
+        .sort(),
+    ).toEqual(['ExponentPushToken[current]', 'ExponentPushToken[removed]']);
+  });
   it('application shutdown does not strand a background login-alert transaction', async () => {
     const h = await fixture();
     const privateDb = new PrismaService();

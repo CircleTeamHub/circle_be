@@ -45,6 +45,13 @@ export const CHAT_EVENTS = {
 } as const;
 
 /**
+ * 单个会话的未读数最多数到这里。界面(会话行、消息 tab)超过 99 一律显示 99+,
+ * 数到 100 就足够判断;再往后数只是替大群逐行回表。会话列表和推送角标共用这一个
+ * 封顶 —— app 的 tab 角标就是各会话封顶值之和,推送角标另算一套就会对不上。
+ */
+export const UNREAD_COUNT_CAP = 100;
+
+/**
  * chat:burned_messages 单条载荷的 id 上限。App 的 dispatcher 拒收超过 500 个 id
  * 的载荷(防一条畸形事件清空本地库),超出的按这个尺寸分片发送。
  */
@@ -86,7 +93,6 @@ export const conversationRoom = (conversationId: string): string =>
  * 同理(目前没有生产者,但语义属同一类,先按服务端专属收口,免得日后接线时漏掉)。
  */
 export const CLIENT_MESSAGE_TYPES = [
-  'encrypted-text',
   'text',
   'quote',
   'image',

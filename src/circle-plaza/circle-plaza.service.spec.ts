@@ -29,6 +29,7 @@ describe('CirclePlazaService', () => {
     circleMember: {
       findUnique: jest.fn(),
       findMany: jest.fn(),
+      groupBy: jest.fn(),
     },
     block: {
       findFirst: jest.fn(),
@@ -45,6 +46,7 @@ describe('CirclePlazaService', () => {
       findUnique: jest.fn(),
       update: jest.fn(),
       updateMany: jest.fn(),
+      updateManyAndReturn: jest.fn(),
     },
     circlePostSignup: {
       findUnique: jest.fn(),
@@ -109,6 +111,14 @@ describe('CirclePlazaService', () => {
   beforeEach(async () => {
     jest.clearAllMocks();
     programEnabled = true;
+    // 发帖扇出取收件人走 groupBy(去重和 LIMIT 都在 SQL 里)。各用例按
+    // select.userID 给 findMany 分流的写法沿用:groupBy 默认转给同一个 mock。
+    prisma.circleMember.groupBy.mockImplementation((args: { where: unknown }) =>
+      prisma.circleMember.findMany({
+        where: args.where,
+        select: { userID: true },
+      }),
+    );
     realtime.broadcastNotificationCreated.mockReset();
     notificationService.createCirclePostSignupNotification.mockReset();
     notificationService.createCirclePostAutoEndedNotification.mockReset();
@@ -1349,7 +1359,10 @@ describe('CirclePlazaService', () => {
       fromUserId: 'user-1',
       recipientIds: ['member-2'],
     });
-    expect(prisma.circleMember.findMany).toHaveBeenCalledWith({
+    // 必须是 groupBy:Prisma 对 distinct + take 不生成 LIMIT(在内存里截断),
+    // 50 个圈子 × 3000 人会整批读回来;groupBy 编译成 GROUP BY ... LIMIT。
+    expect(prisma.circleMember.groupBy).toHaveBeenCalledWith({
+      by: ['userID'],
       where: {
         circleID: { in: ['circle-1'] },
         status: 'ACTIVE',
@@ -1359,11 +1372,12 @@ describe('CirclePlazaService', () => {
           blocksReceived: { none: { blockerID: 'user-1' } },
         },
       },
-      select: { userID: true },
-      distinct: ['userID'],
       orderBy: { userID: 'asc' },
       take: 501,
     });
+    expect(prisma.circleMember.findMany).not.toHaveBeenCalledWith(
+      expect.objectContaining({ distinct: expect.anything() }),
+    );
     expect(prisma.block.findMany).not.toHaveBeenCalled();
   });
 
@@ -1525,7 +1539,9 @@ describe('CirclePlazaService', () => {
       prisma.circlePostSignup.findUnique.mockResolvedValue(null);
       prisma.user.findUnique.mockResolvedValue(eligibleViewer);
       prisma.circlePostSignup.create.mockResolvedValue({ id: 's-1' });
-      prisma.circlePost.update.mockResolvedValue({ signupCount: 3 });
+      prisma.circlePost.updateManyAndReturn.mockResolvedValue([
+        { signupCount: 3 },
+      ]);
       notificationService.createCirclePostSignupNotification.mockResolvedValue(
         notification,
       );
@@ -1548,21 +1564,31 @@ describe('CirclePlazaService', () => {
       );
     });
 
-    it('rechecks active linked-circle membership inside the serializable signup transaction', async () => {
+    it('reads visibility once and counts with a conditional increment in one read-committed transaction', async () => {
       prisma.circlePost.findFirst.mockResolvedValue(activePost);
       prisma.circlePostSignup.findUnique.mockResolvedValue(null);
       prisma.user.findUnique.mockResolvedValue(eligibleViewer);
       prisma.circlePostSignup.create.mockResolvedValue({ id: 's-1' });
-      prisma.circlePost.update.mockResolvedValue({ signupCount: 3 });
+      prisma.circlePost.updateManyAndReturn.mockResolvedValue([
+        { signupCount: 3 },
+      ]);
 
       const result = await service.signupForPost('user-2', 'post-1');
 
       expect(result).toEqual({ signed: true, signupCount: 3 });
-      expect(prisma.$transaction).toHaveBeenCalledWith(
-        expect.any(Function),
-        expect.objectContaining({ isolationLevel: 'Serializable' }),
-      );
-      expect(prisma.circlePost.findFirst).toHaveBeenNthCalledWith(2, {
+      // 热门帖并发报名不再互相 40001:读已提交 + 行锁排队,没有重试。
+      expect(prisma.$transaction).toHaveBeenCalledTimes(1);
+      expect(prisma.$transaction).toHaveBeenCalledWith(expect.any(Function), {
+        isolationLevel: 'ReadCommitted',
+      });
+      expect(prisma.circlePost.findFirst).toHaveBeenCalledTimes(1);
+      expect(prisma.user.findUnique).toHaveBeenCalledTimes(1);
+      expect(prisma.circlePostSignup.create).toHaveBeenCalledWith({
+        data: { postID: 'post-1', userID: 'user-2' },
+      });
+      // 计数自增带着帖子状态条件:行锁等到之后按最新版本重判。
+      expect(prisma.circlePost.update).not.toHaveBeenCalled();
+      expect(prisma.circlePost.updateManyAndReturn).toHaveBeenCalledWith({
         where: {
           status: 'ACTIVE',
           OR: [
@@ -1573,63 +1599,29 @@ describe('CirclePlazaService', () => {
             },
           ],
           id: 'post-1',
-          circleLinks: {
-            some: {
-              circle: {
-                deleted: false,
-                members: {
-                  some: { userID: 'user-2', status: 'ACTIVE' },
-                },
-              },
-            },
-          },
         },
-        select: {
-          id: true,
-          signupVipRestriction: true,
-          signupCreditRestriction: true,
-          signupFancyRestriction: true,
-        },
-      });
-      expect(prisma.circlePostSignup.create).toHaveBeenCalledWith({
-        data: { postID: 'post-1', userID: 'user-2' },
+        data: { signupCount: { increment: 1 } },
+        select: { signupCount: true },
       });
     });
 
-    it('rejects signup when linked-circle membership is revoked before the transaction writes', async () => {
-      prisma.circlePost.findFirst
-        .mockResolvedValueOnce(activePost)
-        .mockResolvedValueOnce(null);
+    it('rejects with 404 when the post stops being active before the counter update commits', async () => {
+      prisma.circlePost.findFirst.mockResolvedValue(activePost);
       prisma.circlePostSignup.findUnique.mockResolvedValue(null);
       prisma.user.findUnique.mockResolvedValue(eligibleViewer);
+      prisma.circlePostSignup.create.mockResolvedValue({ id: 's-1' });
+      // 条件自增落空 = 帖子在报名途中被删除/结束/过期;抛错让整笔(含报名行)回滚。
+      prisma.circlePost.updateManyAndReturn.mockResolvedValue([]);
 
-      await expect(service.signupForPost('user-2', 'post-1')).rejects.toThrow(
-        NotFoundException,
-      );
-
-      expect(prisma.circlePostSignup.create).not.toHaveBeenCalled();
-      expect(prisma.circlePost.update).not.toHaveBeenCalled();
-    });
-
-    it('rechecks membership after a serializable conflict retry', async () => {
-      prisma.circlePost.findFirst
-        .mockResolvedValueOnce(activePost)
-        .mockResolvedValueOnce(null);
-      prisma.circlePostSignup.findUnique.mockResolvedValue(null);
-      prisma.user.findUnique.mockResolvedValue(eligibleViewer);
-      prisma.$transaction
-        .mockRejectedValueOnce(
-          Object.assign(new Error('serialization conflict'), { code: 'P2034' }),
-        )
-        .mockImplementationOnce(async (input: any) => input(prisma));
-
-      await expect(service.signupForPost('user-2', 'post-1')).rejects.toThrow(
-        NotFoundException,
-      );
-
-      expect(prisma.$transaction).toHaveBeenCalledTimes(2);
-      expect(prisma.circlePostSignup.create).not.toHaveBeenCalled();
-      expect(prisma.circlePost.update).not.toHaveBeenCalled();
+      await expect(
+        service.signupForPost('user-2', 'post-1'),
+      ).rejects.toMatchObject({
+        response: { errorCode: PlazaErrorCode.PostNotFound },
+      });
+      expect(realtime.broadcastSignupUnread).not.toHaveBeenCalled();
+      expect(
+        notificationService.createCirclePostSignupNotification,
+      ).not.toHaveBeenCalled();
     });
 
     it('rejects a new signup without an active linked-circle membership', async () => {
@@ -1680,15 +1672,16 @@ describe('CirclePlazaService', () => {
     it('is idempotent when already signed up after membership loss', async () => {
       prisma.circlePost.findFirst.mockResolvedValue({
         ...activePost,
+        signupCount: 5,
         circleLinks: [],
       });
       prisma.circlePostSignup.findUnique.mockResolvedValue({ id: 's-1' });
-      prisma.circlePost.findUnique.mockResolvedValue({ signupCount: 5 });
 
       const result = await service.signupForPost('user-2', 'post-1');
 
       expect(result).toEqual({ signed: true, signupCount: 5 });
       expect(prisma.circlePostSignup.create).not.toHaveBeenCalled();
+      expect(prisma.circlePost.updateManyAndReturn).not.toHaveBeenCalled();
       expect(realtime.broadcastSignupUnread).not.toHaveBeenCalled();
     });
 
@@ -2405,26 +2398,24 @@ describe('CirclePlazaService', () => {
       expect(prisma.circlePostSignup.create).not.toHaveBeenCalled();
     });
 
-    it('rechecks effective membership inside the signup transaction', async () => {
+    it('resolves effective membership once, inside the transaction under the program lock', async () => {
       prisma.circlePost.findFirst.mockResolvedValue(restrictedPost);
       prisma.circlePostSignup.findUnique.mockResolvedValue(null);
-      prisma.user.findUnique
-        .mockResolvedValueOnce({
-          vipLevel: 3,
-          vipExpiresAt: new Date('2099-01-01T00:00:00.000Z'),
-          creditScore: 100,
-          fancyNumber: false,
-        })
-        .mockResolvedValueOnce({
-          vipLevel: 3,
-          vipExpiresAt: new Date('2020-01-01T00:00:00.000Z'),
-          creditScore: 100,
-          fancyNumber: false,
-        });
+      prisma.user.findUnique.mockResolvedValue({
+        vipLevel: 3,
+        vipExpiresAt: new Date('2020-01-01T00:00:00.000Z'),
+        creditScore: 100,
+        fancyNumber: false,
+      });
 
       await expect(service.signupForPost('user-2', 'post-1')).rejects.toThrow(
         ForbiddenException,
       );
+      expect(prisma.user.findUnique).toHaveBeenCalledTimes(1);
+      expect(membershipProgram.getStatus).toHaveBeenCalledTimes(1);
+      expect(membershipProgram.getStatus).toHaveBeenCalledWith(prisma, {
+        lockForWrite: true,
+      });
       expect(prisma.circlePostSignup.create).not.toHaveBeenCalled();
     });
 
@@ -2437,7 +2428,9 @@ describe('CirclePlazaService', () => {
         fancyNumber: false,
       });
       prisma.circlePostSignup.create.mockResolvedValue({ id: 's-1' });
-      prisma.circlePost.update.mockResolvedValue({ signupCount: 1 });
+      prisma.circlePost.updateManyAndReturn.mockResolvedValue([
+        { signupCount: 1 },
+      ]);
 
       const result = await service.signupForPost('user-2', 'post-1');
       expect(result).toEqual({ signed: true, signupCount: 1 });

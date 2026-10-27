@@ -5,6 +5,56 @@
 	# 必须在 order 里给出相对位置，否则 Caddy 起不来。放在 reverse_proxy 之前：
 	# 超限的请求要在打到上游之前就被挡下，否则限流毫无意义。
 	order rate_limit before reverse_proxy
+
+	# 运行期错误、反代上游错误、TLS 签发/续期的日志，脱敏后写两份：
+	#   - collected：落到 caddy_logs 卷给日志采集（monitoring/docker-compose.logs.yml
+	#     的 Alloy 读它）。采集器刻意不碰 Docker socket 和主机日志目录
+	#     （monitoring/logs.md），所以由 Caddy 自己落盘；/chat-ws 握手也收一份。
+	#   - collected_stdout：写回 stdout。Caddyfile 会把具名 logger include 的命名空间
+	#     从默认 logger 里 exclude 掉，不补这一份，`docker compose logs caddy` 就再也
+	#     看不到证书续期失败和 502 的原因 —— 没开日志 overlay 的部署只剩这一处。
+	# 两份用同一套过滤：编码前删掉整条 uri（不只是 query：分享链接、临时聊天、二维码的
+	# token 就在路径里）、全部请求头、IP 和端口，并把 error 里「本端->对端」的对端地址
+	# 换掉（客户端中途断开时，error 是 `write tcp 本端->客户端IP:端口: broken pipe`）。
+	# 要定位哪个接口，用后端日志里的路由模板和 requestId。站点 access log 依旧不开
+	# （见下方）。
+	# mode 0644：采集器以非 root 运行，读不了默认的 0600。
+	log collected {
+		output file /var/log/caddy/collected.log {
+			roll_size 20MiB
+			roll_keep 5
+			roll_keep_for 168h
+			mode 0644
+		}
+		format filter {
+			wrap json
+			fields {
+				request>uri delete
+				request>headers delete
+				request>remote_ip delete
+				request>client_ip delete
+				request>remote_port delete
+				error regexp "->\[?[0-9a-fA-F.:]+\]?:[0-9]+" "->REDACTED"
+			}
+		}
+		include http.log.access.chat_ws http.log.error http.handlers.reverse_proxy tls
+	}
+	log collected_stdout {
+		output stdout
+		format filter {
+			wrap json
+			fields {
+				request>uri delete
+				request>headers delete
+				request>remote_ip delete
+				request>client_ip delete
+				request>remote_port delete
+				error regexp "->\[?[0-9a-fA-F.:]+\]?:[0-9]+" "->REDACTED"
+			}
+		}
+		# /chat-ws 握手已经有自己的 stdout logger（下方 log chat_ws），不重复收。
+		include http.log.error http.handlers.reverse_proxy tls
+	}
 }
 
 # ── 限流说明 ──────────────────────────────────────────────────────────────────
@@ -12,9 +62,10 @@
 # 直接映射到本机、前面没有 CDN/代理，所以 {remote_host} 就是真实客户端 IP；哪天
 # 挪到 Cloudflare 之类后面，必须同时配 trusted_proxies，否则所有人会共用一个桶。
 #
-# ⚠️ 不要给下面的整个站点开 access log（`log` 指令）。API 域只给 /chat-ws 分配
-#    no_hostname 的专用 logger，并在输出前移除 query、请求头和 IP；媒体预签名 URL
-#    及普通 API 请求仍不会进入 Caddy access log。
+# ⚠️ 不要给下面的整个站点开 access log。API 域只给 /chat-ws 分配 no_hostname 的
+#    专用 logger，并在输出前移除 query、请求头和 IP；媒体预签名 URL 及普通 API
+#    请求不进 Caddy access log。注意站点里写了 `log chat_ws` 本身就会打开整站的
+#    access log，所以还要靠 `log_skip @not_chat_ws` 把其余请求挡掉（见下方）。
 
 {$API_DOMAIN} {
 	# 只记录 chat WebSocket 握手。连接追踪 ID 由 Caddy 生成，不含账号；
@@ -40,6 +91,19 @@
 	log_name @chat_ws chat_ws
 	log_append @chat_ws event ws_proxy_access
 	log_append @chat_ws traceId {http.vars.connection_trace_id}
+	# 上面的 `log chat_ws` 一写，整个站点就开了 access log：没被 log_name 认领的
+	# 请求落到默认 logger（stdout、不过滤），完整 URI（分享链接、临时聊天的 token、
+	# 对象存储签名）、客户端 IP 和请求头全在里面 —— 不只是 5xx，每个请求都有。
+	# /chat-ws 以外一律跳过。
+	@not_chat_ws not path /chat-ws /chat-ws/*
+	log_skip @not_chat_ws
+
+	# /realtime 的原生 WebSocket 同样由这里生成连接追踪 ID：网关拿它把升级、认证、
+	# 就绪和关闭几行日志串起来（src/realtime/realtime.gateway.ts）。不设的话，下面
+	# 的 header_up 会把这个头置成空值，网关只能自己另起一个，和这里对不上。它不进
+	# Caddy access log，access log 的范围仍然只有 /chat-ws。
+	@realtime_ws path /realtime
+	vars @realtime_ws connection_trace_id ws-{http.request.uuid}
 
 	@metrics path /metrics /metrics/*
 	handle @metrics {

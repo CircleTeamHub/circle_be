@@ -122,6 +122,20 @@ describe('ChatSupportRechargeProcessor payment evidence', () => {
       prisma.chatMember.updateMany.mock.invocationCallOrder[0],
     );
   });
+  // 网关拿着 sendMessage 带回的任务 id 直接 kick,不再按消息 id 查一次任务表。
+  it('processes an enqueued job by id without looking it up by message', async () => {
+    const { processor, prisma, messages } = textMessageHarness('你好');
+
+    await processor.processEnqueuedJob('job-text');
+
+    expect(prisma.supportRechargeJob.findUnique).not.toHaveBeenCalled();
+    expect(prisma.supportRechargeJob.updateMany).toHaveBeenCalledWith(
+      expect.objectContaining({
+        where: expect.objectContaining({ id: 'job-text', status: 'PENDING' }),
+      }),
+    );
+    expect(messages.insertServerMessage).toHaveBeenCalled();
+  });
   it('shows the short numbered menu for an unclassified message', async () => {
     const { processor, messages } = textMessageHarness('你好');
 

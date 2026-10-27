@@ -21,6 +21,11 @@ import { MembershipPolicyService } from 'src/membership/membership-policy.servic
 import { RealtimeService } from 'src/realtime/realtime.service';
 import { purgeDeletedNote } from './note-purge';
 import {
+  NOTE_SUMMARY_CONTENT_HEAD,
+  NoteSummaryProjectionRow,
+  noteSummaryProjectionQuery,
+} from './note-summary.query';
+import {
   ChatCircleSyncService,
   DISABLED_ADMIN_STATES,
 } from 'src/chat/chat-circle-sync.service';
@@ -194,7 +199,7 @@ type NoteRow = {
   mediaCount: number;
   collectedFrom?: unknown;
   collectedFromNoteID?: string | null;
-  rootSourceNoteID?: string | null;
+  rootSourceNoteID: string | null;
   createdAt: Date;
   updatedAt: Date;
   coverMedia: { id: string; type: NoteMediaType; url: string } | null;
@@ -250,7 +255,6 @@ type NoteGroupRow = {
   id: string;
   name: string;
   sortOrder: number;
-  _count: { memberships: number };
 };
 
 const NOTE_INCLUDE = {
@@ -282,6 +286,84 @@ const NOTE_INCLUDE = {
     },
   },
 } as const;
+
+/**
+ * 列表摘要（listNotes / listDeletedNotes / resolveShareLink）专用的 select：只取标量列
+ * 与分组。正文、contentJson、sections、全部 media 不搬回来 —— 摘要要的派生字段由
+ * noteSummaryProjectionQuery 在 SQL 里算（见 note-summary.query.ts）。
+ */
+const NOTE_SUMMARY_SELECT = {
+  id: true,
+  ownerID: true,
+  title: true,
+  status: true,
+  available: true,
+  workStatus: true,
+  sourceConversationID: true,
+  pinned: true,
+  remark: true,
+  imageCount: true,
+  videoCount: true,
+  audioCount: true,
+  mediaCount: true,
+  collectedFrom: true,
+  collectedFromNoteID: true,
+  rootSourceNoteID: true,
+  createdAt: true,
+  updatedAt: true,
+  groupMemberships: {
+    where: NOTE_INCLUDE.groupMemberships.where,
+    select: { group: NOTE_INCLUDE.groupMemberships.include.group },
+  },
+} as const;
+
+/** 摘要 DTO 里直接取自笔记行的那些列（NoteRow 与列表专用行都满足）。 */
+type NoteSummaryBase = Pick<
+  NoteRow,
+  | 'id'
+  | 'ownerID'
+  | 'title'
+  | 'status'
+  | 'available'
+  | 'workStatus'
+  | 'sourceConversationID'
+  | 'pinned'
+  | 'remark'
+  | 'imageCount'
+  | 'videoCount'
+  | 'audioCount'
+  | 'mediaCount'
+  | 'collectedFrom'
+  | 'collectedFromNoteID'
+  | 'rootSourceNoteID'
+  | 'createdAt'
+  | 'updatedAt'
+  | 'groupMemberships'
+>;
+
+/**
+ * 摘要里由正文 / 分区 / 媒体推出来的部分。与 viewer 无关（主人才看得到的名片由
+ * buildSummaryDto 按身份裁剪），与签名无关（封面 url 签名在 buildSummaryDto 里换）。
+ */
+type NoteSummaryFacts = {
+  contentPreview: string | null;
+  hasText: boolean;
+  showcaseCount: number;
+  /** 分区里显式存的名片（只含对象元素）；分区里没有这个数组时为 null。 */
+  contactItems: Array<Record<string, unknown>> | null;
+  groupItems: Array<Record<string, unknown>> | null;
+  hasLocation: boolean;
+  cover: { id: string; type: NoteMediaType; url: string } | null;
+};
+
+/** 收录链 overlay 读写的列。 */
+type CollectedStateFields = Pick<
+  NoteRow,
+  'collectedFromNoteID' | 'status' | 'available' | 'workStatus'
+> & {
+  // 必填:漏 select 这一列时类型直接报错,不会静默退回逐层走收藏链。
+  rootSourceNoteID: string | null;
+};
 
 const MAX_GROUPS_PER_USER = 50;
 // Discarded IDs prevent delayed autosaves for 30 days. Published outcomes never
@@ -1113,14 +1195,18 @@ export class NoteService {
     return group;
   }
 
-  private async requireOwnedNote(ownerID: string, noteId: string) {
+  private async findOwnedNoteOrThrow<S extends Prisma.NoteSelect>(
+    ownerID: string,
+    noteId: string,
+    select: S,
+  ): Promise<Prisma.NoteGetPayload<{ select: S }>> {
     const note = await this.prisma.note.findFirst({
       where: {
         id: noteId,
         ownerID,
         status: { not: 'DELETED' },
       },
-      include: NOTE_INCLUDE,
+      select,
     });
 
     if (!note) {
@@ -1130,12 +1216,30 @@ export class NoteService {
       });
     }
 
-    return note;
+    return note as Prisma.NoteGetPayload<{ select: S }>;
+  }
+
+  /**
+   * 归属校验：笔记是调用者的、且不在回收站，否则 404。调用方都只要这个结论（写入
+   * 本身再带 ownerID + status 守卫防 TOCTOU），所以只取 id —— 不要再 include
+   * NOTE_INCLUDE：正文、contentJson、sections、全部 media 与分组成员共四条查询，
+   * 读完就丢。
+   */
+  private async requireOwnedNote(ownerID: string, noteId: string) {
+    // rootSourceNoteID:状态写入要把广播排到收藏链的根上(noteRootID)。
+    return this.findOwnedNoteOrThrow(ownerID, noteId, {
+      id: true,
+      rootSourceNoteID: true,
+    });
   }
 
   /** 群设置里的来源关联和开工/打烊状态只属于老板的来源笔记。 */
   private async requireOwnedSourceNote(ownerID: string, noteId: string) {
-    const note = await this.requireOwnedNote(ownerID, noteId);
+    const note = await this.findOwnedNoteOrThrow(ownerID, noteId, {
+      id: true,
+      collectedFromNoteID: true,
+      rootSourceNoteID: true,
+    });
     if (note.collectedFromNoteID) {
       throw new ForbiddenException(
         'Only a source note can be managed from its group',
@@ -1146,7 +1250,7 @@ export class NoteService {
 
   private noteRootID(note: {
     id: string;
-    rootSourceNoteID?: string | null;
+    rootSourceNoteID: string | null;
   }): string {
     return note.rootSourceNoteID ?? note.id;
   }
@@ -2582,9 +2686,9 @@ export class NoteService {
    * the bounded chain walk only supports legacy rows without a root key and
    * fails closed if it cannot reach a source.
    */
-  private async overlayCollectedSourceState(
-    notes: NoteRow[],
-  ): Promise<NoteRow[]> {
+  private async overlayCollectedSourceState<T extends CollectedStateFields>(
+    notes: T[],
+  ): Promise<T[]> {
     const initialIDs = [
       ...new Set(
         notes
@@ -2706,7 +2810,7 @@ export class NoteService {
   }
 
   /** Root-overlaid state check shared by single reads and share-link lists. */
-  private isDistributable(effective: NoteRow): boolean {
+  private isDistributable(effective: CollectedStateFields): boolean {
     if (!effective.collectedFromNoteID) return true;
     return effective.status === 'ACTIVE' && effective.available;
   }
@@ -2742,6 +2846,40 @@ export class NoteService {
     viewerID: string,
     presignedUrls?: Map<string, string>,
   ): NoteSummaryDto {
+    return this.buildSummaryDto(
+      note,
+      this.summaryFactsFromRow(note),
+      viewerID,
+      presignedUrls,
+    );
+  }
+
+  /** 整行（NOTE_INCLUDE）推出摘要的派生部分：详情页与写路径的返回值走这里。 */
+  private summaryFactsFromRow(note: NoteRow): NoteSummaryFacts {
+    const fallbackCoverMedia =
+      note.media?.find((item) => item.type === 'IMAGE') ?? null;
+    const coverMedia =
+      note.coverMedia?.type === 'IMAGE' ? note.coverMedia : fallbackCoverMedia;
+    // 签名只换 url，不影响这里取的计数与名片；hasText 等与 viewer 无关。
+    const sections = this.buildSectionsFromRow(note);
+    const availability = this.getSectionAvailability(sections);
+    return {
+      contentPreview: this.buildPreview(note.content),
+      hasText: availability.hasText,
+      showcaseCount: availability.showcaseCount,
+      contactItems: sections.contacts?.items ?? null,
+      groupItems: sections.groups?.items ?? null,
+      hasLocation: availability.hasLocation,
+      cover: coverMedia,
+    };
+  }
+
+  private buildSummaryDto(
+    note: NoteSummaryBase,
+    facts: NoteSummaryFacts,
+    viewerID: string,
+    presignedUrls?: Map<string, string>,
+  ): NoteSummaryDto {
     // 置顶与分组是主人整理自己笔记本的私人标记，与 remark / collectedFrom 一样
     // 不随笔记内容外发：非主人（含分享链接的访客 viewer）恒为 pinned=false、
     // groups=[]。字段名保留，DTO 形状不变。
@@ -2752,30 +2890,17 @@ export class NoteService {
           name: membership.group.name,
         }))
       : [];
-    const fallbackCoverMedia =
-      note.media?.find((item) => item.type === 'IMAGE') ?? null;
-    const coverMedia =
-      note.coverMedia?.type === 'IMAGE' ? note.coverMedia : fallbackCoverMedia;
-    const sections = this.buildSectionsFromRow(note, presignedUrls);
-    const visibleSections = isOwner
-      ? sections
-      : ({
-          ...sections,
-          contacts: { items: [] },
-          groups: { items: [] },
-        } as NoteSections);
-    const availability = this.getSectionAvailability(visibleSections);
-    const cardPreview = {
-      contacts: this.toCardPeers(visibleSections.contacts?.items),
-      groups: this.toCardPeers(visibleSections.groups?.items, true),
-    };
+    // 名片是编辑器里的私人元数据：非主人恒为空（计数与预览都按空算）。
+    const contactItems = isOwner ? (facts.contactItems ?? []) : [];
+    const groupItems = isOwner ? (facts.groupItems ?? []) : [];
+    const coverMedia = facts.cover;
 
     return {
       id: note.id,
       ownerId: note.ownerID,
       canEdit: isOwner,
       title: note.title,
-      contentPreview: this.buildPreview(note.content),
+      contentPreview: facts.contentPreview,
       status: note.status,
       available: note.available,
       workStatus: note.workStatus ?? null,
@@ -2800,8 +2925,15 @@ export class NoteService {
       videoCount: note.videoCount,
       audioCount: note.audioCount ?? 0,
       mediaCount: note.mediaCount,
-      ...availability,
-      cardPreview,
+      hasText: facts.hasText,
+      showcaseCount: facts.showcaseCount,
+      contactCount: contactItems.length,
+      groupCardCount: groupItems.length,
+      hasLocation: facts.hasLocation,
+      cardPreview: {
+        contacts: this.toCardPeers(contactItems),
+        groups: this.toCardPeers(groupItems, true),
+      },
       // 来源名片是收藏者的私人定位标记：available=true 的笔记任何人都能打开，
       // 但「从哪个群/谁那里收藏的」不能跟着泄漏 —— 只回给笔记主人本人。
       collectedFrom:
@@ -2971,9 +3103,11 @@ export class NoteService {
    * 没法按圈子路由。读取时按 Circle.groupID 批量补上（只改内存里的行，不落库）。
    * 带 circleId 或 conversationID（独立群）的卡片不动。
    */
-  private async withLegacyCircleIds(notes: NoteRow[]): Promise<NoteRow[]> {
+  private async withLegacyCircleIds<T extends { sections?: unknown }>(
+    notes: T[],
+  ): Promise<T[]> {
     const legacyIds = new Set<string>();
-    const legacyItems = (note: NoteRow) => {
+    const legacyItems = (note: T) => {
       const sections = this.isRecord(note.sections) ? note.sections : null;
       const groups =
         sections && this.isRecord(sections.groups) ? sections.groups : null;
@@ -3040,28 +3174,181 @@ export class NoteService {
     return this.mapDetail(effectiveNote, viewerID, presigned);
   }
 
+  /**
+   * 列表摘要：行只带标量列与分组（NOTE_SUMMARY_SELECT），正文预览、hasText、计数、名片、
+   * 封面由 noteSummaryProjectionQuery 一次算好；只给封面签名（摘要里唯一的媒体 url）。
+   * 与原先「整行 include + 全量签名 + mapSummary」逐字段一致，见
+   * test/postgres/note-list-summary.pg-spec.ts。
+   */
   private async mapSummaryListResolved(
-    notes: NoteRow[],
+    notes: Array<NoteSummaryBase & { sections?: unknown }>,
     viewerID: string,
   ): Promise<NoteSummaryDto[]> {
+    if (notes.length === 0) return [];
+    const projections = await this.loadSummaryProjections(
+      notes.map((note) => note.id),
+    );
+    // 两次读取之间被永久删除的笔记没有投影行：它已经不在了，不再返回。
+    const present = notes.flatMap((note) => {
+      const projection = projections.get(note.id);
+      return projection
+        ? [
+            {
+              ...note,
+              // withLegacyCircleIds 只读写 sections.groups.items。
+              sections: Array.isArray(projection.row.groupItems)
+                ? { groups: { items: projection.row.groupItems } }
+                : null,
+            },
+          ]
+        : [];
+    });
     const effectiveNotes = await this.withLegacyCircleIds(
-      await this.overlayCollectedSourceState(notes),
+      await this.overlayCollectedSourceState(present),
     );
-    const presigned = await this.presignNoteMedia(
-      effectiveNotes.flatMap((note) => this.collectNoteMediaTargets(note)),
+    const coverTargets = effectiveNotes.flatMap((note) => {
+      const { row } = projections.get(note.id)!;
+      // 原先只签 note.media 里的 url：封面行属于这条笔记、url 与 objectKey 都非空。
+      return row.coverId &&
+        row.coverNoteID === note.id &&
+        row.coverUrl &&
+        row.coverObjectKey
+        ? [{ url: row.coverUrl, objectKey: row.coverObjectKey }]
+        : [];
+    });
+    const presigned = await this.presignNoteMedia(coverTargets);
+    return effectiveNotes.map((note) => {
+      const { row, content } = projections.get(note.id)!;
+      const sections: Record<string, any> = this.isRecord(note.sections)
+        ? note.sections
+        : {};
+      const groups: Record<string, any> = this.isRecord(sections.groups)
+        ? sections.groups
+        : {};
+      const facts: NoteSummaryFacts = {
+        contentPreview: content.contentPreview,
+        hasText:
+          (row.sectionTextHasText ?? content.contentHasText) || row.hasJsonText,
+        showcaseCount: row.showcaseCount,
+        contactItems: Array.isArray(row.contactItems)
+          ? row.contactItems.filter((item) => this.isRecord(item))
+          : null,
+        groupItems: Array.isArray(groups.items)
+          ? groups.items.filter((item: unknown) => this.isRecord(item))
+          : null,
+        hasLocation: row.hasLocation,
+        cover:
+          row.coverId && row.coverType && row.coverUrl !== null
+            ? { id: row.coverId, type: row.coverType, url: row.coverUrl }
+            : null,
+      };
+      return this.buildSummaryDto(note, facts, viewerID, presigned);
+    });
+  }
+
+  /**
+   * 跑一次摘要投影；正文开头定不出预览 / hasText 的少数笔记（开头
+   * NOTE_SUMMARY_CONTENT_HEAD 个字符几乎全是空白）再补读整段正文。
+   */
+  private async loadSummaryProjections(ids: string[]): Promise<
+    Map<
+      string,
+      {
+        row: NoteSummaryProjectionRow;
+        content: { contentPreview: string | null; contentHasText: boolean };
+      }
+    >
+  > {
+    const rows = await this.prisma.$queryRaw<NoteSummaryProjectionRow[]>(
+      noteSummaryProjectionQuery(ids),
     );
-    return effectiveNotes.map((note) =>
-      this.mapSummary(note, viewerID, presigned),
+    const settled = new Map(
+      rows.map((row) => [row.id, this.summarizeContentHead(row.contentHead)]),
+    );
+    const unsettledIds = rows
+      .filter((row) => settled.get(row.id) === null)
+      .map((row) => row.id);
+    if (unsettledIds.length > 0) {
+      const full = await this.prisma.note.findMany({
+        where: { id: { in: unsettledIds } },
+        select: { id: true, content: true },
+      });
+      for (const note of full) {
+        settled.set(note.id, {
+          contentPreview: this.buildPreview(note.content),
+          contentHasText: Boolean(note.content?.trim()),
+        });
+      }
+    }
+    return new Map(
+      rows.flatMap((row) => {
+        const content = settled.get(row.id);
+        // 补读时这条笔记已被删掉：同上，不再返回。
+        return content ? [[row.id, { row, content }] as const] : [];
+      }),
     );
   }
 
-  private mapGroup(group: NoteGroupRow): NoteGroupDto {
+  /**
+   * 从正文开头 left(content, NOTE_SUMMARY_CONTENT_HEAD) 推出 buildPreview(content) 与
+   * Boolean(content?.trim())；推不出来返回 null，由调用方补读整段。
+   *
+   * 开头比 HEAD 短 = 整段正文，原样套原规则。否则正文可能更长：把开头按同一规则压缩
+   * 空白后，若还有 120 个以上字符，这段压缩结果就是整段压缩结果的前缀（被截断处的
+   * 空白串只会在两边都收成一个空格，再被 trim 掉或留在中间），预览 = 前 120 个字符 +
+   * '...'；压缩后的字符都不是 \s，hasText 必为 true。
+   */
+  private summarizeContentHead(
+    head: string | null,
+  ): { contentPreview: string | null; contentHasText: boolean } | null {
+    if (head === null) return { contentPreview: null, contentHasText: false };
+    if (Array.from(head).length < NOTE_SUMMARY_CONTENT_HEAD) {
+      return {
+        contentPreview: this.buildPreview(head),
+        contentHasText: Boolean(head.trim()),
+      };
+    }
+    const flattened = head.replace(NOTE_PREVIEW_WHITESPACE_PATTERN, ' ').trim();
+    if (Array.from(flattened).length <= MAX_NOTE_PREVIEW_LENGTH) return null;
+    return {
+      contentPreview: `${sliceByCodePoints(flattened, MAX_NOTE_PREVIEW_LENGTH)}...`,
+      contentHasText: true,
+    };
+  }
+
+  private mapGroup(group: NoteGroupRow, noteCount: number): NoteGroupDto {
     return {
       id: group.id,
       name: group.name,
       sortOrder: group.sortOrder,
-      noteCount: group._count.memberships,
+      noteCount,
     };
+  }
+
+  /**
+   * 分组 DTO 带上组内未删除笔记的条数。不能用 include._count：Prisma 把它编译成
+   * LEFT JOIN (SELECT "groupID", COUNT(*) ... GROUP BY "groupID")，子查询里没有任何
+   * 用户/分组条件，整张 NoteGroupMembership 连 Note 一起被扫。这里先拿分组，再按
+   * "groupID" IN (...) 聚合一次，只碰本人分组的成员行；没有成员的分组计 0。
+   */
+  private async mapGroupsWithNoteCounts(
+    groups: NoteGroupRow[],
+  ): Promise<NoteGroupDto[]> {
+    if (groups.length === 0) return [];
+    const counts = await this.prisma.noteGroupMembership.groupBy({
+      by: ['groupID'],
+      where: {
+        groupID: { in: groups.map((group) => group.id) },
+        note: { status: { not: 'DELETED' } },
+      },
+      _count: { _all: true },
+    });
+    const countByGroup = new Map(
+      counts.map((row) => [row.groupID, row._count._all]),
+    );
+    return groups.map((group) =>
+      this.mapGroup(group, countByGroup.get(group.id) ?? 0),
+    );
   }
 
   async createNote(
@@ -3241,7 +3528,7 @@ export class NoteService {
             }
           : {}),
       },
-      include: NOTE_INCLUDE,
+      select: NOTE_SUMMARY_SELECT,
       orderBy: [{ pinned: 'desc' }, { updatedAt: 'desc' }],
       // 多取一行只为判断 hasMore，不返回给调用方。
       take: limit + 1,
@@ -3253,7 +3540,7 @@ export class NoteService {
 
   /** 多取的那一行先截掉再映射：它不返回，也不必为它签名媒体 URL。 */
   private async toSummaryPage(
-    notes: NoteRow[],
+    notes: Array<NoteSummaryBase & { sections?: unknown }>,
     limit: number,
     viewerID: string,
   ): Promise<NoteSummaryPage> {
@@ -3404,7 +3691,7 @@ export class NoteService {
 
     const notes = await this.prisma.note.findMany({
       where: this.buildShareLinkNoteFilter(link),
-      include: NOTE_INCLUDE,
+      select: NOTE_SUMMARY_SELECT,
       // 只按新近排序：置顶是主人的私人标记，访客摘要里 pinned 恒为 false；若仍按
       // pinned desc 排，配合摘要里的 updatedAt 就能反推出哪些被置顶。
       orderBy: [{ updatedAt: 'desc' }],
@@ -5296,7 +5583,7 @@ export class NoteService {
       // 多取一行只为判断 hasMore，不返回给调用方。
       take: take + 1,
       skip: (page - 1) * take,
-      include: NOTE_INCLUDE,
+      select: NOTE_SUMMARY_SELECT,
     });
     return this.toSummaryPage(notes, take, ownerID);
   }
@@ -5412,24 +5699,11 @@ export class NoteService {
           ownerID,
           deletedAt: null,
         },
-        include: {
-          _count: {
-            select: {
-              memberships: {
-                where: {
-                  note: {
-                    status: { not: 'DELETED' },
-                  },
-                },
-              },
-            },
-          },
-        },
         orderBy: [{ sortOrder: 'asc' }, { createdAt: 'asc' }],
         take: 500, // #108：防爆护栏（分组数已有业务上限，这里兜异常数据）
       })) ?? [];
 
-    return groups.map((group) => this.mapGroup(group));
+    return this.mapGroupsWithNoteCounts(groups);
   }
 
   async createGroup(
@@ -5534,19 +5808,6 @@ export class NoteService {
         data: {
           name: normalizedName,
         },
-        include: {
-          _count: {
-            select: {
-              memberships: {
-                where: {
-                  note: {
-                    status: { not: 'DELETED' },
-                  },
-                },
-              },
-            },
-          },
-        },
       });
     } catch (error) {
       if (prismaErrorCode(error) === 'P2002') {
@@ -5558,7 +5819,8 @@ export class NoteService {
       throw error;
     }
 
-    return this.mapGroup(updated);
+    const [dto] = await this.mapGroupsWithNoteCounts([updated]);
+    return dto;
   }
 
   async deleteGroup(ownerID: string, groupId: string): Promise<void> {

@@ -1,0 +1,12 @@
+-- 删掉 ChatConversation_id_trgm_idx(另一半见 20261025000400_drop_conversation_circle_trgm)。
+--
+-- 会话行每条消息都要 UPDATE(nextHeight / lastMessageAt,另有 revision 触发器)。
+-- lastMessageAt 在索引里,这条 UPDATE 永远不是 HOT,每次都要给这一行的所有索引写
+-- 新条目 —— 包括 id、circleID 上的 trigram GIN(一个 UUID 三十多个 trigram),而且
+-- 是在行锁里写。管理台的两处会话搜索(OR 里带子查询 / COALESCE)本来就用不上
+-- 它们(EXPLAIN 已确认,关掉顺序扫描也不走),UUID 子串搜索也没有业务价值。
+-- name 的 trigram 索引暂留。
+--
+-- 一份迁移只放这一条:Prisma 只在文件里全是 CREATE INDEX CONCURRENTLY 时才逐条放到
+-- 事务外执行,混进 DROP 或多条 DROP 就整份进事务,部署报 25001。
+DROP INDEX CONCURRENTLY IF EXISTS "ChatConversation_id_trgm_idx";

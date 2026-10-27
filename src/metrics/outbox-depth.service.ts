@@ -3,6 +3,7 @@ import { CronExpression } from '@nestjs/schedule';
 import { PrismaService } from '../prisma/prisma.service';
 import { GIFT_CARD_MAX_ATTEMPTS } from '../coin/gift-card-outbox.processor';
 import { VERIFICATION_CARD_MAX_ATTEMPTS } from '../circle-invitation/circle-invitation.service';
+import { GROUP_ADMISSION_DELIVERY_MAX_ATTEMPTS } from '../chat/group-admission.service';
 import { jobMetrics, type OutboxDepthSample } from './job-metrics';
 import { TrackedCron } from './tracked-cron.decorator';
 
@@ -29,6 +30,8 @@ export interface OutboxDepthSource {
   chatDirectAutoReplyJob: OutboxDelegateLike;
   supportRechargeJob: OutboxDelegateLike;
   refreshToken: OutboxDelegateLike;
+  adminGroupOperation: OutboxDelegateLike;
+  groupAdmissionDelivery: OutboxDelegateLike;
 }
 
 interface OutboxQueueSpec {
@@ -147,6 +150,29 @@ export const OUTBOX_QUEUES: readonly OutboxQueueSpec[] = [
       cardAttempts: { gte: GIFT_CARD_MAX_ATTEMPTS },
     },
   },
+  // 两个 @TrackedInterval 处理器的队列，此前积压和死信都不在监控里。
+  // - admin_group_operation：管理台的停用/恢复/解散。FAILED 是用尽重试后的
+  //   终态（圈子随之标 SYNC_FAILED），PENDING 里也包括退避等待中的行。
+  // - group_admission_delivery：入群邀请/审核卡片与通知。没有状态列，「未送达
+  //   且未达上限」即待处理，与 flush() 的领取条件一致。
+  {
+    name: 'admin_group_operation',
+    model: 'adminGroupOperation',
+    pendingWhere: { status: { in: ['PENDING', 'PROCESSING'] } },
+    deadWhere: { status: 'FAILED' },
+  },
+  {
+    name: 'group_admission_delivery',
+    model: 'groupAdmissionDelivery',
+    pendingWhere: {
+      deliveredAt: null,
+      attempts: { lt: GROUP_ADMISSION_DELIVERY_MAX_ATTEMPTS },
+    },
+    deadWhere: {
+      deliveredAt: null,
+      attempts: { gte: GROUP_ADMISSION_DELIVERY_MAX_ATTEMPTS },
+    },
+  },
 ];
 
 const logger = new Logger('OutboxDepth');
@@ -212,7 +238,7 @@ export async function collectOutboxDepths(
 }
 
 /**
- * 把 4 个 outbox 队列的深度刷进 gauge。
+ * 把 OUTBOX_QUEUES 里每个队列的深度刷进 gauge。
  *
  * 刻意**不**在 gauge 的 `collect()` 里查库（infra-status 那种抓取时求值的写法
  * 在这里是错的）：DB 慢或挂掉时，抓取会一起卡住直到 scrape 超时，于是整个

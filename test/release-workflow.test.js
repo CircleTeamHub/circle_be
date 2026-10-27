@@ -37,11 +37,13 @@ test('manual rollback keeps current trusted deploy tooling with the historical a
     'deploy/app-env-preflight.sh',
     'deploy/app-env-transaction.sh',
     'deploy/offsite-backup.sh',
+    'deploy/sync-ops-stacks.sh',
     'deploy/Caddyfile.admin',
     'monitoring/sync-metrics-token.sh',
     'monitoring/docker-compose.logs.yml',
     'monitoring/alloy/config.alloy',
     'monitoring/loki/config.yml',
+    'monitoring/loki/rules/fake/circle.yml',
     'monitoring/grafana/provisioning/datasources/loki.yml',
     'monitoring/grafana/provisioning/datasources/loki.yml.example',
     'monitoring/prometheus/logs-targets.yml',
@@ -153,6 +155,7 @@ test('manual rollback keeps current trusted deploy tooling with the historical a
         'deploy/admin-web-deploy.sh',
         'deploy/caddy-entrypoint.sh',
         'deploy/overlay-trusted-release-tooling.sh',
+        'deploy/sync-ops-stacks.sh',
         'monitoring/sync-metrics-token.sh',
       ].includes(operationalFile)
         ? 0o755
@@ -192,7 +195,89 @@ test('manual rollback keeps current trusted deploy tooling with the historical a
       '1\n',
       'historical runtime compatibility metadata must remain from the target tag',
     );
+    // 历史树叠了当前工具：同步运维栈会把之后新增的服务当孤儿删掉，所以留标记。
+    assert.match(
+      fs.readFileSync(path.join(directory, '.release-tooling-overlay'), 'utf8'),
+      /^tooling=.*\ntarget=.*\n$/,
+    );
     assert.equal(fs.existsSync(trusted), false);
+  } finally {
+    fs.rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test('the overlay marks a tree only when its tooling comes from another commit', () => {
+  // workflow_dispatch 也用来发 main 本身（不可逆迁移只能手动发）。工具与目标同一个
+  // 提交时树并不混杂，运维栈照常同步；残留的旧标记要清掉。
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'circle-overlay-same-sha-'));
+  try {
+    const target = path.join(directory, 'target');
+    const trusted = path.join(directory, 'trusted');
+    const git = (cwd, ...args) => {
+      const result = spawnSync('git', args, { cwd, encoding: 'utf8' });
+      assert.equal(result.status, 0, result.stderr);
+      return result.stdout.trim();
+    };
+    fs.mkdirSync(target);
+    git(target, 'init', '-q');
+    fs.writeFileSync(path.join(target, 'README'), 'x\n');
+    git(target, 'add', 'README');
+    git(target, '-c', 'user.name=t', '-c', 'user.email=t@example.invalid', 'commit', '-qm', 'x');
+    git(directory, 'clone', '-q', target, trusted);
+    for (const file of [
+      'deploy/release-deploy.sh',
+      'deploy/gen-env.sh',
+      'deploy/admin-web-deploy.sh',
+      'deploy/caddy-entrypoint.sh',
+      'deploy/overlay-trusted-release-tooling.sh',
+      'deploy/app-env-preflight.sh',
+      'deploy/app-env-transaction.sh',
+      'deploy/offsite-backup.sh',
+      'deploy/sync-ops-stacks.sh',
+      'deploy/Caddyfile.admin',
+      'monitoring/sync-metrics-token.sh',
+      'monitoring/docker-compose.logs.yml',
+      'monitoring/alloy/config.alloy',
+      'monitoring/loki/config.yml',
+      'monitoring/loki/rules/fake/circle.yml',
+      'monitoring/grafana/provisioning/datasources/loki.yml',
+      'monitoring/grafana/provisioning/datasources/loki.yml.example',
+      'monitoring/prometheus/logs-targets.yml',
+      'monitoring/prometheus/prometheus.yml',
+      'monitoring/prometheus/prometheus.prod.yml',
+      'monitoring/prometheus/alerts.yml',
+      'Dockerfile.caddy',
+      'docker-compose.prod.yml',
+      'docker-compose.release.yml',
+      'docker-compose.admin-release.yml',
+    ]) {
+      const destination = path.join(trusted, file);
+      fs.mkdirSync(path.dirname(destination), { recursive: true });
+      fs.copyFileSync(path.join(__dirname, '..', file), destination);
+    }
+    fs.writeFileSync(path.join(target, '.release-tooling-overlay'), 'stale\n');
+    const result = spawnSync(
+      '/bin/bash',
+      [path.join(trusted, 'deploy/overlay-trusted-release-tooling.sh'), trusted, target],
+      { encoding: 'utf8' },
+    );
+    assert.equal(result.status, 0, result.stderr);
+    assert.equal(git(target, 'rev-parse', 'HEAD'), git(trusted, 'rev-parse', 'HEAD'));
+    assert.equal(fs.existsSync(path.join(target, '.release-tooling-overlay')), false);
+
+    // 目标换成另一个提交（回滚到别的 tag）：两个 SHA 不同，留下标记并记下两者。
+    fs.writeFileSync(path.join(target, 'README'), 'y\n');
+    git(target, '-c', 'user.name=t', '-c', 'user.email=t@example.invalid', 'commit', '-qam', 'y');
+    const again = spawnSync(
+      '/bin/bash',
+      [path.join(trusted, 'deploy/overlay-trusted-release-tooling.sh'), trusted, target],
+      { encoding: 'utf8' },
+    );
+    assert.equal(again.status, 0, again.stderr);
+    assert.equal(
+      fs.readFileSync(path.join(target, '.release-tooling-overlay'), 'utf8'),
+      `tooling=${git(trusted, 'rev-parse', 'HEAD')}\ntarget=${git(target, 'rev-parse', 'HEAD')}\n`,
+    );
   } finally {
     fs.rmSync(directory, { recursive: true, force: true });
   }

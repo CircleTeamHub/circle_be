@@ -30,6 +30,12 @@ export interface HealthRedis {
  */
 export interface HealthObjectStore {
   objectStoreStatus(): ObjectStoreStatus;
+  /**
+   * A real (cached, time-boxed) round-trip to the bucket; `null` when storage
+   * is not configured. `objectStoreStatus` is computed at boot and stays `ok`
+   * while the store is actually down — this is the live signal.
+   */
+  objectStoreReachable?(): Promise<boolean | null>;
 }
 
 export interface ReadinessDependencies {
@@ -65,6 +71,10 @@ export function createLivenessHandler() {
  * unapplied bucket policy is identical on every replica, so gating readiness on
  * it would pull the whole fleet at once — turning an observable security
  * degradation into a total outage. Report it loudly; let operators act.
+ *
+ * Its reachability follows the same rule: a storage outage is identical on
+ * every replica too, and chat or sign-in do not need the store. It is reported
+ * here and alerted on through `circle_object_store_up` (ObjectStoreUnreachable).
  */
 export function createReadinessHandler({
   database,
@@ -72,9 +82,10 @@ export function createReadinessHandler({
   objectStore,
 }: ReadinessDependencies) {
   return async (_req: Request, res: Response): Promise<void> => {
-    const [databaseUp, redisStatus] = await Promise.all([
+    const [databaseUp, redisStatus, objectStoreReachable] = await Promise.all([
       checkDatabase(database),
       checkRedis(redis),
+      checkObjectStoreReachable(objectStore),
     ]);
     const objectStoreStatus = objectStore?.objectStoreStatus() ?? 'disabled';
 
@@ -91,8 +102,22 @@ export function createReadinessHandler({
       database: databaseUp ? 'up' : 'down',
       redis: redisStatus,
       objectStore: objectStoreStatus,
+      objectStoreReachable,
     });
   };
+}
+
+async function checkObjectStoreReachable(
+  objectStore: HealthObjectStore | null | undefined,
+): Promise<'up' | 'down' | 'disabled'> {
+  if (!objectStore?.objectStoreReachable) return 'disabled';
+  try {
+    const reachable = await objectStore.objectStoreReachable();
+    if (reachable === null) return 'disabled';
+    return reachable ? 'up' : 'down';
+  } catch {
+    return 'down';
+  }
 }
 
 async function checkDatabase(database: HealthDatabase): Promise<boolean> {

@@ -16,20 +16,19 @@ import { NotificationType, Prisma, UserStatus } from 'src/generated/prisma';
 import { AdminAuditService } from 'src/moderation/admin-audit.service';
 import { PrismaService } from 'src/prisma/prisma.service';
 import { RealtimeService } from 'src/realtime/realtime.service';
+import { type JobLeaseContext, runWithJobLease } from 'src/redis/job-lease';
+import { RedisService } from 'src/redis/redis.service';
 import {
-  CIRCLE_NOTIFICATION_TYPES,
   DISCOVER_NOTIFICATION_TYPES,
-  MOMENT_NOTIFICATION_TYPES,
   notificationTypesForDomain,
   PROFILE_NOTIFICATION_TYPES,
   type NotificationDomain,
 } from './notification.constants';
 import {
-  mapNotificationRealtimeDto,
-  NOTIFICATION_REALTIME_INCLUDE,
+  NOTIFICATION_REALTIME_BASE_SELECT,
   decodeNotificationCursor,
   encodeNotificationCursor,
-  type NotificationRealtimeRow,
+  type NotificationRealtimeBaseRow,
   type RegisterPushTokenDto,
   type NotificationRealtimeDto,
   type PublishSystemAnnouncementDto,
@@ -37,10 +36,22 @@ import {
   type RevokePushTokenDto,
 } from './notification.dto';
 import { NotificationPushService } from './notification-push.service';
+import { loadUnreadNotificationsByDomain } from './notification-unread.query';
+import { notificationPageScanQuery } from './notification-list.query';
+import { loadNotificationRealtimeDtos } from './notification-realtime.loader';
 
 const NOTIFICATION_DEDUPE_WINDOW_MS = 60 * 60 * 1000;
 const SYSTEM_ANNOUNCEMENT_BATCH_SIZE = 500;
-const SYSTEM_ANNOUNCEMENT_BROADCAST_BATCH_SIZE = 50;
+/**
+ * 公告扇出的全局互斥:同一时刻全集群只跑一个扇出。持有者每 TTL/3 续租,崩溃后最多
+ * 等一个 TTL 别的实例就能接手(同一个 Idempotency-Key 重试会从断点续上)。
+ */
+const SYSTEM_ANNOUNCEMENT_FANOUT_JOB = 'system-announcement-fanout';
+const SYSTEM_ANNOUNCEMENT_FANOUT_LEASE_MS = 60_000;
+/** 编辑 / 删除公告时一批改多少个收件人的行(一批一个短事务)。 */
+const ANNOUNCEMENT_RECIPIENT_BATCH_SIZE = 1000;
+/** 数据库互斥(Redis 不可用时的退路)没有租约可丢,永远「仍持有」。 */
+const DATABASE_HELD_LEASE: JobLeaseContext = { isCurrent: () => true };
 // #98 显式决定：保持 20 而不是原计划的 10。多设备（手机+平板+重装残留）在
 // 20 内都装得下，超限按 lastSeen 逐出最旧的；收紧到 10 只会更快逐出仍然
 // 活跃的次要设备，没有对应的安全收益（token 本身不可伪造投递身份）。
@@ -57,12 +68,17 @@ type SystemAnnouncementAuditContext = {
   userAgent?: string | null;
 };
 
-function chunkArray<T>(items: readonly T[], size: number): T[][] {
-  const chunks: T[][] = [];
-  for (let i = 0; i < items.length; i += size) {
-    chunks.push(items.slice(i, i + size));
-  }
-  return chunks;
+/** 一批收件人行的处理;返回 false 表示不必再处理后面的批次。 */
+type AnnouncementRecipientBatch = (
+  tx: Prisma.TransactionClient,
+  notificationIDs: string[],
+) => Promise<boolean>;
+
+function announcementFanoutBusy(): HttpException {
+  return new HttpException(
+    'A system announcement publish is already in progress',
+    HttpStatus.TOO_MANY_REQUESTS,
+  );
 }
 
 /** Prisma 唯一约束冲突（P2002）。 */
@@ -89,6 +105,9 @@ export class NotificationService {
     private readonly pushService?: NotificationPushService,
     @Optional()
     private readonly auditService?: AdminAuditService,
+    // 公告扇出的互斥租约;没注入(或 Redis 答不上来)时退回数据库锁。
+    @Optional()
+    private readonly redis?: RedisService,
   ) {}
 
   private isDiscoverNotification(type: NotificationType): boolean {
@@ -113,16 +132,29 @@ export class NotificationService {
     }
   }
 
-  private async createNotificationWithPush<T extends NotificationRealtimeRow>(
-    operation: (tx: any) => Promise<T>,
-  ): Promise<T> {
-    return this.prisma.$transaction(async (tx) => {
-      const notification = await operation(tx);
+  /**
+   * 事务里只写通知行和推送 outbox（create 带 select 本表列 = 一条 INSERT RETURNING），
+   * 关系在提交之后再按外键补 —— 不在持有事务的连接上串行跑关系查询。
+   */
+  private async createNotificationWithPush(
+    operation: (tx: any) => Promise<NotificationRealtimeBaseRow>,
+  ): Promise<NotificationRealtimeDto> {
+    const notification = await this.prisma.$transaction(async (tx) => {
+      const created = await operation(tx);
       await tx.notificationPushOutbox.create({
-        data: { notificationID: notification.id },
+        data: { notificationID: created.id },
       });
-      return notification;
+      return created;
     });
+    return this.toRealtimeDto(notification);
+  }
+
+  /** 一行通知 → 实时 DTO（关系按外键只查用得到的、逐条顺序查）。 */
+  private async toRealtimeDto(
+    row: NotificationRealtimeBaseRow,
+  ): Promise<NotificationRealtimeDto> {
+    const [dto] = await loadNotificationRealtimeDtos(this.prisma, [row]);
+    return dto;
   }
 
   /** 读圈子推送偏好。只有「离线提醒」需要服务端执行，其余全是客户端展示。 */
@@ -153,13 +185,18 @@ export class NotificationService {
     dto: RegisterPushTokenDto,
     sessionId?: string,
   ): Promise<{ deviceBound: boolean }> {
+    // 事务里的每条语句都走持有 auth_session 锁的那个连接(tx):一次登记只占一个池连接。
+    // 仍然占 auth 的数据库名额 —— 不是为了它自己的嵌套查询(已经没有了),而是它在持有
+    // 连接的状态下排队等 auth_session 锁,而锁的持有者(登录 / 刷新 / 设备信任)在锁内
+    // 还要借嵌套连接。不限并发的话,同一账号的一串登记请求就能占满连接池,让持锁者
+    // 借不到连接、一直卡到取连接超时 —— 正是名额要防的池死锁。
     return withDatabaseWorkBudget(this.prisma, () =>
       this.prisma.$transaction(
         async (tx) => {
           await tx.$executeRaw`SELECT pg_advisory_xact_lock(hashtextextended(${`auth_session:${userId}`}, 0))`;
           let deviceKey: string | null = null;
           if (sessionId) {
-            const session = await this.prisma.refreshToken.findUnique({
+            const session = await tx.refreshToken.findUnique({
               where: { id: sessionId },
             });
             if (
@@ -175,7 +212,7 @@ export class NotificationService {
               });
             }
             if (session.revokedAt && session.revocationReason === 'ROTATED') {
-              const live = await this.prisma.refreshToken.findFirst({
+              const live = await tx.refreshToken.findFirst({
                 where: {
                   userId,
                   familyId: session.familyId,
@@ -193,7 +230,7 @@ export class NotificationService {
             }
             deviceKey = session.deviceKey;
             if (deviceKey) {
-              const trusted = await this.prisma.trustedDevice.findUnique({
+              const trusted = await tx.trustedDevice.findUnique({
                 where: { userId_deviceKey: { userId, deviceKey } },
               });
               if (!trusted || trusted.revokedAt)
@@ -203,7 +240,7 @@ export class NotificationService {
                 });
             }
           }
-          await this.registerPushTokenForDevice(userId, dto, deviceKey);
+          await this.registerPushTokenForDevice(tx, userId, dto, deviceKey);
           return { deviceBound: Boolean(deviceKey) };
         },
         { maxWait: 10000, timeout: 30000 },
@@ -212,6 +249,7 @@ export class NotificationService {
   }
 
   private async registerPushTokenForDevice(
+    tx: Prisma.TransactionClient,
     userId: string,
     dto: RegisterPushTokenDto,
     deviceKey: string | null,
@@ -252,7 +290,7 @@ export class NotificationService {
       // 就从「受保护」降级回「谁知道令牌谁就能抢」，等于自己把下面那道闸拆了。
       ...(revocationSecretHash ? { revocationSecretHash } : {}),
     };
-    const claimed = await this.prisma.devicePushToken.updateMany({
+    const claimed = await tx.devicePushToken.updateMany({
       where: {
         token: dto.token,
         OR: [
@@ -277,7 +315,9 @@ export class NotificationService {
     });
     if (claimed.count === 0) {
       try {
-        await this.prisma.devicePushToken.create({
+        // 撞唯一约束会让整个事务进入 aborted 状态;下面无论如何都会抛出、回滚,
+        // 不会再在这个事务上发任何语句。
+        await tx.devicePushToken.create({
           data: {
             token: dto.token,
             userID: userId,
@@ -299,16 +339,16 @@ export class NotificationService {
       }
     }
 
-    const findTokens = this.prisma.devicePushToken.findMany;
-    if (!findTokens) return;
-    const excess = await findTokens({
+    const tokens = tx.devicePushToken;
+    if (!tokens.findMany) return;
+    const excess = await tokens.findMany({
       where: { userID: userId, provider: dto.provider, disabledAt: null },
       orderBy: { updatedAt: 'desc' },
       skip: MAX_PUSH_TOKENS_PER_USER,
       select: { id: true },
     });
     if (excess.length > 0) {
-      await this.prisma.devicePushToken.deleteMany({
+      await tx.devicePushToken.deleteMany({
         where: { id: { in: excess.map((row) => row.id) } },
       });
     }
@@ -340,13 +380,9 @@ export class NotificationService {
   async getUnreadSummary(userId: string) {
     // momentsUnread / circleUnread 各自喂一个铃铛（朋友圈 / 圈子广场）；
     // discoverUnread 仍是整个互动域的总数，老客户端和 tab 徽标继续读它。
-    const [discoverUnread, momentsUnread, circleUnread, profileUnread] =
-      await Promise.all([
-        this.countUnreadByTypes(userId, DISCOVER_NOTIFICATION_TYPES),
-        this.countUnreadByTypes(userId, MOMENT_NOTIFICATION_TYPES),
-        this.countUnreadByTypes(userId, CIRCLE_NOTIFICATION_TYPES),
-        this.countUnreadByTypes(userId, PROFILE_NOTIFICATION_TYPES),
-      ]);
+    // 四个数来自同一条 GROUP BY type（一个池连接），域的求和在 JS 里做。
+    const { discoverUnread, momentsUnread, circleUnread, profileUnread } =
+      await loadUnreadNotificationsByDomain(this.prisma, userId);
 
     return {
       discoverUnread,
@@ -355,20 +391,6 @@ export class NotificationService {
       profileUnread,
       totalUnread: discoverUnread + profileUnread,
     };
-  }
-
-  private countUnreadByTypes(
-    userId: string,
-    types: readonly NotificationType[],
-  ): Promise<number> {
-    return this.prisma.notification.count({
-      where: {
-        toUserID: userId,
-        deleted: false,
-        read: false,
-        type: { in: [...types] },
-      },
-    });
   }
 
   async markProfileNotificationsRead(userId: string) {
@@ -391,14 +413,24 @@ export class NotificationService {
     return result;
   }
 
-  async deliverCircleConsentNotification(input: {
-    id: string;
-    circleId: string;
-    toUserID: string;
-    fromUserID: string;
-    content: string;
-  }) {
+  async deliverCircleConsentNotification(
+    input: {
+      id: string;
+      circleId: string;
+      toUserID: string;
+      fromUserID: string;
+      content: string;
+    },
+    options: {
+      /**
+       * 写入前在同一事务里执行的复核(调用方的锁 + 重读);抛错则通知与 outbox 都不写、
+       * 也不广播。同意制邀请用它在 call-user:* 关系锁下复核拉黑/隐私/邀请状态。
+       */
+      guard?: (tx: Prisma.TransactionClient) => Promise<void>;
+    } = {},
+  ) {
     const row = await this.prisma.$transaction(async (tx) => {
+      await options.guard?.(tx);
       const row = await tx.notification.upsert({
         where: { id: input.id },
         create: {
@@ -411,7 +443,7 @@ export class NotificationService {
           fromCircleID: input.circleId,
         },
         update: {},
-        include: NOTIFICATION_REALTIME_INCLUDE,
+        select: NOTIFICATION_REALTIME_BASE_SELECT,
       });
       await tx.notificationPushOutbox.upsert({
         where: { notificationID: row.id },
@@ -422,7 +454,7 @@ export class NotificationService {
     });
     this.realtimeService.broadcastNotificationCreated(
       input.toUserID,
-      mapNotificationRealtimeDto(row),
+      await this.toRealtimeDto(row),
     );
     await this.broadcastUnreadForType(
       input.toUserID,
@@ -450,7 +482,7 @@ export class NotificationService {
         where: { id: input.id },
         create: data,
         update: {},
-        include: NOTIFICATION_REALTIME_INCLUDE,
+        select: NOTIFICATION_REALTIME_BASE_SELECT,
       });
       await tx.notificationPushOutbox.upsert({
         where: { notificationID: row.id },
@@ -461,7 +493,7 @@ export class NotificationService {
     });
     this.realtimeService.broadcastNotificationCreated(
       input.toUserID,
-      mapNotificationRealtimeDto(row),
+      await this.toRealtimeDto(row),
     );
     await this.broadcastUnreadForType(
       input.toUserID,
@@ -478,7 +510,7 @@ export class NotificationService {
       return null;
     }
 
-    const notification = await this.createNotificationWithPush((tx) =>
+    return this.createNotificationWithPush((tx) =>
       tx.notification.create({
         data: {
           toUserID: toUserId,
@@ -486,11 +518,9 @@ export class NotificationService {
           type: NotificationType.SYSTEM,
           content,
         },
-        include: NOTIFICATION_REALTIME_INCLUDE,
+        select: NOTIFICATION_REALTIME_BASE_SELECT,
       }),
     );
-    const dto = mapNotificationRealtimeDto(notification);
-    return dto;
   }
 
   async profileNotificationDetail(userId: string, id: string) {
@@ -501,10 +531,10 @@ export class NotificationService {
         deleted: false,
         type: { in: [...PROFILE_NOTIFICATION_TYPES] },
       },
-      include: NOTIFICATION_REALTIME_INCLUDE,
+      select: NOTIFICATION_REALTIME_BASE_SELECT,
     });
     if (!row) throw new NotFoundException('Notification not found');
-    return mapNotificationRealtimeDto(row);
+    return this.toRealtimeDto(row);
   }
 
   async scrollingAnnouncements(userId: string) {
@@ -566,28 +596,40 @@ export class NotificationService {
     return row;
   }
 
+  /**
+   * 公告变了(编辑 / 删除 / 滚动选择),给每个收件人一个无内容的 poke,客户端自己拉。
+   *
+   * 按公告逐条、沿唯一索引 (systemAnnouncementID, toUserID) 键集翻页:原来按 id 翻页,
+   * 这张热表上没有 (systemAnnouncementID, id) 的索引,每一页都要把这条公告的全部行
+   * 取出来再排序,一条公告 N 个收件人就是 O(N²/500)。toUserID 为空的行本来就不 poke,
+   * 键集条件天然把它们排除在外。
+   */
   private async notifyAnnouncementChanged(id: string | string[]) {
     try {
-      let cursor: string | undefined;
-      while (true) {
-        const rows = await this.prisma.notification.findMany({
-          where: {
-            systemAnnouncementID: Array.isArray(id) ? { in: id } : id,
-            ...(cursor ? { id: { gt: cursor } } : {}),
-          },
-          select: { id: true, toUserID: true },
-          orderBy: { id: 'asc' },
-          take: 500,
-        });
-        await Promise.allSettled(
-          rows
-            .filter((row) => row.toUserID)
-            .map((row) =>
-              this.realtimeService.broadcastAnnouncementChanged(row.toUserID),
+      for (const announcementID of Array.isArray(id) ? id : [id]) {
+        let after: string | null = null;
+        while (true) {
+          const rows: Array<{ toUserID: string | null }> =
+            await this.prisma.notification.findMany({
+              where: {
+                systemAnnouncementID: announcementID,
+                toUserID: after === null ? { not: null } : { gt: after },
+              },
+              select: { toUserID: true },
+              orderBy: { toUserID: 'asc' },
+              take: 500,
+            });
+          const recipients = rows
+            .map((row) => row.toUserID)
+            .filter((userId): userId is string => Boolean(userId));
+          await Promise.allSettled(
+            recipients.map((userId) =>
+              this.realtimeService.broadcastAnnouncementChanged(userId),
             ),
-        );
-        if (rows.length < 500) break;
-        cursor = rows[rows.length - 1].id;
+          );
+          if (rows.length < 500 || recipients.length === 0) break;
+          after = recipients[recipients.length - 1];
+        }
       }
     } catch {
       // The mutation already committed; reconnect/focus refresh repairs a missed poke.
@@ -595,29 +637,102 @@ export class NotificationService {
     }
   }
 
+  /** 公告的编辑 / 删除 / 滚动选择共用的事务级锁:彼此串行,与发布扇出无关。 */
+  private async lockAnnouncementMutations(
+    tx: Prisma.TransactionClient,
+  ): Promise<void> {
+    await tx.$queryRaw`SELECT pg_advisory_xact_lock(hashtext('system-announcement-scrolling'))::text`;
+  }
+
+  /**
+   * 把一条公告的全部收件人行按批交给 apply,每批 ANNOUNCEMENT_RECIPIENT_BATCH_SIZE 行、
+   * 一批一个短事务(事务里先拿公告锁,和其它编辑 / 删除 / 滚动选择串行)。
+   *
+   * 改动前是一条 updateMany WHERE systemAnnouncementID = $1 改全员:几十万行一条语句、
+   * 一个事务,所有收件人的通知行一直锁到提交(期间他们标已读都会被挡住),还会撞
+   * 5 秒事务超时 / 15 秒语句超时,大公告根本改不动。
+   *
+   * 翻页沿唯一索引 (systemAnnouncementID, toUserID) 走键集;toUserID 为 NULL 的行
+   * (收件人账号被物理删除,外键 SET NULL —— 新扇出的行 fromUserID = toUserID 且外键
+   * RESTRICT,只可能是老数据)最后按 id 补一段,通常为空。
+   *
+   * 公告扇出完成后不会再有新的收件人行,所以翻页期间行集合是稳定的。
+   */
+  private async forEachAnnouncementRecipientBatch(
+    announcementID: string,
+    apply: AnnouncementRecipientBatch,
+  ): Promise<void> {
+    let after: string | null = null;
+    while (true) {
+      const page = await this.applyAnnouncementRecipientBatch(
+        {
+          systemAnnouncementID: announcementID,
+          toUserID: after === null ? { not: null } : { gt: after },
+        },
+        { toUserID: 'asc' },
+        apply,
+      );
+      if (!page.proceed) return;
+      const last = page.rows[page.rows.length - 1]?.toUserID;
+      if (page.rows.length < ANNOUNCEMENT_RECIPIENT_BATCH_SIZE || !last) break;
+      after = last;
+    }
+    let afterId: string | null = null;
+    while (true) {
+      const page = await this.applyAnnouncementRecipientBatch(
+        {
+          systemAnnouncementID: announcementID,
+          toUserID: null,
+          ...(afterId === null ? {} : { id: { gt: afterId } }),
+        },
+        { id: 'asc' },
+        apply,
+      );
+      if (!page.proceed || page.rows.length < ANNOUNCEMENT_RECIPIENT_BATCH_SIZE)
+        return;
+      afterId = page.rows[page.rows.length - 1].id;
+    }
+  }
+
+  private applyAnnouncementRecipientBatch(
+    where: Prisma.NotificationWhereInput,
+    orderBy: Prisma.NotificationOrderByWithRelationInput,
+    apply: AnnouncementRecipientBatch,
+  ): Promise<{
+    rows: Array<{ id: string; toUserID: string | null }>;
+    proceed: boolean;
+  }> {
+    return this.prisma.$transaction(async (tx) => {
+      await this.lockAnnouncementMutations(tx);
+      const rows = await tx.notification.findMany({
+        where,
+        select: { id: true, toUserID: true },
+        orderBy,
+        take: ANNOUNCEMENT_RECIPIENT_BATCH_SIZE,
+      });
+      const proceed =
+        rows.length === 0 ||
+        (await apply(
+          tx,
+          rows.map((row) => row.id),
+        ));
+      return { rows, proceed };
+    });
+  }
+
   async editAnnouncement(
     actorID: string,
     id: string,
     dto: EditSystemAnnouncementDto,
   ) {
+    // 1. 公告本身(收件人行的内容来源)和审计在一个短事务里提交。
     const result = await this.prisma.$transaction(async (tx) => {
-      await tx.$queryRaw`SELECT pg_advisory_xact_lock(hashtext('system-announcement-scrolling'))::text`;
+      await this.lockAnnouncementMutations(tx);
       await this.editableAnnouncement(tx, id);
       const updated = await tx.systemAnnouncement.update({
         where: { id },
         data: { title: dto.title, content: dto.content },
         select: { id: true, title: true, content: true },
-      });
-      await tx.notification.updateMany({
-        where: { systemAnnouncementID: id, deleted: false },
-        data: { content: dto.content },
-      });
-      await tx.notificationPushOutbox.updateMany({
-        where: {
-          notification: { systemAnnouncementID: id },
-          status: { in: ['PENDING', 'FAILED'] },
-        },
-        data: { payload: Prisma.DbNull },
       });
       await this.auditService.recordStrict(tx, {
         actorID,
@@ -628,40 +743,77 @@ export class NotificationService {
       });
       return updated;
     });
+    // 2. 收件人行分批同步。每批在锁内读公告当前的正文再写:两次编辑交错时,后提交的
+    //    那次的正文会覆盖到每一行,不会出现一半新一半旧。中途失败时公告仍可编辑,
+    //    用同样的内容重试即可补齐。
+    await this.forEachAnnouncementRecipientBatch(
+      id,
+      async (tx, notificationIDs) => {
+        const current = await tx.systemAnnouncement.findUnique({
+          where: { id },
+          select: { content: true, deletedAt: true },
+        });
+        // 公告在同步途中被删了:删除会处理所有行,这里不必再写。
+        if (!current || current.deletedAt) return false;
+        await tx.notification.updateMany({
+          where: { id: { in: notificationIDs }, deleted: false },
+          data: { content: current.content },
+        });
+        await tx.notificationPushOutbox.updateMany({
+          where: {
+            notificationID: { in: notificationIDs },
+            status: { in: ['PENDING', 'FAILED'] },
+          },
+          data: { payload: Prisma.DbNull },
+        });
+        return true;
+      },
+    );
     await this.notifyAnnouncementChanged(id);
     return result;
   }
 
   async deleteAnnouncement(actorID: string, id: string) {
+    // 不存在 / 已删 / 发布中:在动任何收件人数据之前拒绝。
+    await this.editableAnnouncement(this.prisma, id);
+    // 1. 先分批隐藏收件人行、终止未发的推送。公告此时仍然在线:中途失败时可以原样
+    //    重试删除,把剩下的批次做完,不会卡在「公告已删、通知还在」的半截状态。
+    await this.forEachAnnouncementRecipientBatch(
+      id,
+      async (tx, notificationIDs) => {
+        await tx.notification.updateMany({
+          where: { id: { in: notificationIDs } },
+          data: { deleted: true },
+        });
+        await tx.notificationPushOutbox.updateMany({
+          where: {
+            notificationID: { in: notificationIDs },
+            status: { in: ['PENDING', 'FAILED', 'PROCESSING'] },
+          },
+          data: {
+            status: 'TERMINAL',
+            completionReason: 'ANNOUNCEMENT_DELETED',
+            leaseToken: null,
+            lockedAt: null,
+          },
+        });
+        await tx.notificationPushDelivery.updateMany({
+          where: {
+            outbox: { notificationID: { in: notificationIDs } },
+            status: { in: ['PENDING', 'FAILED'] },
+          },
+          data: { status: 'TERMINAL', lastError: 'ANNOUNCEMENT_DELETED' },
+        });
+        return true;
+      },
+    );
+    // 2. 收件人数据处理完,再在一个短事务里复核、下线公告并写审计。
     const result = await this.prisma.$transaction(async (tx) => {
-      await tx.$queryRaw`SELECT pg_advisory_xact_lock(hashtext('system-announcement-scrolling'))::text`;
+      await this.lockAnnouncementMutations(tx);
       await this.editableAnnouncement(tx, id);
       await tx.systemAnnouncement.update({
         where: { id },
         data: { deletedAt: new Date(), scrolling: false },
-      });
-      await tx.notification.updateMany({
-        where: { systemAnnouncementID: id },
-        data: { deleted: true },
-      });
-      await tx.notificationPushOutbox.updateMany({
-        where: {
-          notification: { systemAnnouncementID: id },
-          status: { in: ['PENDING', 'FAILED', 'PROCESSING'] },
-        },
-        data: {
-          status: 'TERMINAL',
-          completionReason: 'ANNOUNCEMENT_DELETED',
-          leaseToken: null,
-          lockedAt: null,
-        },
-      });
-      await tx.notificationPushDelivery.updateMany({
-        where: {
-          outbox: { notification: { systemAnnouncementID: id } },
-          status: { in: ['PENDING', 'FAILED'] },
-        },
-        data: { status: 'TERMINAL', lastError: 'ANNOUNCEMENT_DELETED' },
       });
       await this.auditService.recordStrict(tx, {
         actorID,
@@ -736,44 +888,82 @@ export class NotificationService {
     auditContext?: SystemAnnouncementAuditContext,
   ): Promise<{ createdCount: number }> {
     if (this.announcementFanoutInFlight) {
-      throw new HttpException(
-        'A system announcement publish is already in progress',
-        HttpStatus.TOO_MANY_REQUESTS,
-      );
+      throw announcementFanoutBusy();
     }
     this.announcementFanoutInFlight = true;
     try {
-      return await this.prisma.$transaction(
-        async (tx) => {
-          const rows = await tx.$queryRaw<Array<{ acquired: boolean }>>`
-            SELECT pg_try_advisory_xact_lock(
-              hashtext('circle-system-announcement-fanout')
-            ) AS acquired
-          `;
-          if (!rows[0]?.acquired) {
-            throw new HttpException(
-              'A system announcement publish is already in progress',
-              HttpStatus.TOO_MANY_REQUESTS,
-            );
-          }
-          return this.publishSystemAnnouncementOnce(
-            operatorId,
-            dto,
-            idempotencyKey,
-            auditContext,
-          );
-        },
-        { maxWait: 5_000, timeout: 600_000 },
+      return await this.withAnnouncementFanoutMutex((lease) =>
+        this.publishSystemAnnouncementOnce(
+          operatorId,
+          dto,
+          idempotencyKey,
+          lease,
+          auditContext,
+        ),
       );
     } finally {
       this.announcementFanoutInFlight = false;
     }
   }
 
+  /**
+   * 全集群同一时刻只跑一个公告扇出;别的实例持有时直接 429(和改动前一样)。
+   *
+   * 改动前用外层 $transaction(timeout 600_000)持有 pg_try_advisory_xact_lock,而扇出
+   * 本身全走 this.prisma —— 那个事务除了占锁什么都不做,扇出期间(最长 10 分钟)一直
+   * 占着一个 idle in transaction 的池连接;超过 10 分钟事务被回滚,已经提交的扇出反而
+   * 被报成失败。现在用 Redis 租约(runWithJobLease,与各定时任务同一套),不占连接。
+   *
+   * Redis 没注入 / 没配置 / 这一刻答不上来时,退回原来的数据库锁,互斥不弱于改动前。
+   * 残留的窗口只在「一个实例拿着 Redis 租约、另一个实例此刻连不上 Redis」时出现:两条
+   * 不同公告可能同时扇出。正确性不受影响 —— 扇出按 (公告, 收件人) 唯一键幂等,完成标记
+   * 和审计都是条件更新 —— 只是写入量叠加。
+   */
+  private async withAnnouncementFanoutMutex<T>(
+    run: (lease: JobLeaseContext) => Promise<T>,
+  ): Promise<T> {
+    if (!this.redis) return this.withAnnouncementFanoutAdvisoryLock(run);
+    let outcome: { value: T } | undefined;
+    const ran = await runWithJobLease(
+      this.redis,
+      SYSTEM_ANNOUNCEMENT_FANOUT_JOB,
+      SYSTEM_ANNOUNCEMENT_FANOUT_LEASE_MS,
+      async (leaseToken, lease) => {
+        outcome = {
+          value:
+            leaseToken === undefined
+              ? await this.withAnnouncementFanoutAdvisoryLock(run)
+              : await run(lease),
+        };
+      },
+    );
+    if (!ran || !outcome) throw announcementFanoutBusy();
+    return outcome.value;
+  }
+
+  /** Redis 不可用时的退路:改动前的事务级 advisory 锁,原样保留。 */
+  private withAnnouncementFanoutAdvisoryLock<T>(
+    run: (lease: JobLeaseContext) => Promise<T>,
+  ): Promise<T> {
+    return this.prisma.$transaction(
+      async (tx) => {
+        const rows = await tx.$queryRaw<Array<{ acquired: boolean }>>`
+          SELECT pg_try_advisory_xact_lock(
+            hashtext('circle-system-announcement-fanout')
+          ) AS acquired
+        `;
+        if (!rows[0]?.acquired) throw announcementFanoutBusy();
+        return run(DATABASE_HELD_LEASE);
+      },
+      { maxWait: 5_000, timeout: 600_000 },
+    );
+  }
+
   private async publishSystemAnnouncementOnce(
     operatorId: string,
     dto: PublishSystemAnnouncementDto,
     idempotencyKey: string,
+    lease: JobLeaseContext,
     auditContext?: SystemAnnouncementAuditContext,
   ): Promise<{ createdCount: number }> {
     const requestFingerprint = dto.scrolling
@@ -811,6 +1001,13 @@ export class NotificationService {
     if (!announcement.fanoutCompletedAt) {
       let cursor: string | undefined;
       while (true) {
+        // 租约续不上了(Redis 故障或进程长时间卡顿):别的实例可能已经接手,不再开新批。
+        // 已提交的批次保留,用同一个 Idempotency-Key 重试会从断点续上。
+        if (!lease.isCurrent()) {
+          throw new ServiceUnavailableException(
+            'System announcement publish lost its lease; retry with the same Idempotency-Key',
+          );
+        }
         const recipients = await this.prisma.user.findMany({
           where: {
             status: UserStatus.ACTIVE,
@@ -850,14 +1047,19 @@ export class NotificationService {
         const createdUserIds = inserted
           .map(({ toUserID }) => toUserID)
           .filter((userId): userId is string => typeof userId === 'string');
-        for (const batch of chunkArray(
-          createdUserIds,
-          SYSTEM_ANNOUNCEMENT_BROADCAST_BATCH_SIZE,
-        )) {
-          await Promise.allSettled(
-            batch.map((userId) =>
-              this.realtimeService.broadcastSystemNotificationUnread(userId),
-            ),
+        // 这一批新收件人的未读广播:事件与 payload 和逐人广播完全一样
+        // (system.notification.unread.changed + 精确 count),但计数是整批一条 GROUP BY,
+        // 而不是每人一条 count、50 路并发抢池连接。广播失败不影响已提交的扇出
+        // (改动前逐人 allSettled 同样吞掉),客户端重连 / 回前台时会重新拉徽标。
+        try {
+          await this.realtimeService.broadcastSystemNotificationUnreadToRecipients(
+            createdUserIds,
+          );
+        } catch (error) {
+          this.logger.warn(
+            `System announcement unread broadcast failed for a batch of ${createdUserIds.length}: ${
+              error instanceof Error ? error.message : String(error)
+            }`,
           );
         }
 
@@ -976,12 +1178,14 @@ export class NotificationService {
         if (duplicate) return null;
       }
 
+      // 事务里只做 去重判断 + create + outbox；create 用 select 拿本表列，
+      // 一条 INSERT RETURNING，不在事务连接上串行跑 9 条关系查询。
       const created = await tx.notification.create({
         data: {
           ...notificationData,
           content: notificationData.content ?? '',
         },
-        include: NOTIFICATION_REALTIME_INCLUDE,
+        select: NOTIFICATION_REALTIME_BASE_SELECT,
       });
       await tx.notificationPushOutbox.create({
         data: { notificationID: created.id },
@@ -989,8 +1193,8 @@ export class NotificationService {
       return created;
     });
     if (!notification) return null;
-    const dto = mapNotificationRealtimeDto(notification);
-    return dto;
+    // 关系在提交之后补：通知与推送已经落库，这里只决定实时广播的内容。
+    return this.toRealtimeDto(notification);
   }
 
   async createFriendRequestNotification(params: {
@@ -1066,7 +1270,7 @@ export class NotificationService {
       return null;
     }
 
-    const notification = await this.createNotificationWithPush((tx) =>
+    return this.createNotificationWithPush((tx) =>
       tx.notification.create({
         data: {
           toUserID: params.toUserId,
@@ -1075,12 +1279,9 @@ export class NotificationService {
           fromCirclePostID: params.postId,
           content: '',
         },
-        include: NOTIFICATION_REALTIME_INCLUDE,
+        select: NOTIFICATION_REALTIME_BASE_SELECT,
       }),
     );
-
-    const dto = mapNotificationRealtimeDto(notification);
-    return dto;
   }
 
   /**
@@ -1103,8 +1304,11 @@ export class NotificationService {
 
   /**
    * "XX 在圈子发布了新活动" —— 在调用方事务内批量落库通知及 durable push
-   * outbox，再回查带 fromUser/fromCirclePost 的 DTO 供提交后 realtime 广播。
+   * outbox，再补上 fromUser/fromCirclePost 组成 DTO 供提交后 realtime 广播。
    * recipientIds 由调用方保证已排除作者、被拉黑者、并去重。
+   *
+   * DTO 要在调用方事务里返回，关系查询只能留在事务里；但整批只有一个作者、一条帖子，
+   * 只查这两张表各一次（原来是整批回读 + 9 路 include）。
    */
   async createCirclePostPublishedNotifications(
     tx: Prisma.TransactionClient,
@@ -1133,27 +1337,22 @@ export class NotificationService {
         fromCirclePostID: params.postId,
         content: '',
       })),
-      select: { id: true, toUserID: true },
+      select: NOTIFICATION_REALTIME_BASE_SELECT,
     });
 
     await tx.notificationPushOutbox.createMany({
       data: created.map(({ id }) => ({ notificationID: id })),
     });
 
-    const rows = await tx.notification.findMany({
-      where: { id: { in: created.map(({ id }) => id) } },
-      include: NOTIFICATION_REALTIME_INCLUDE,
-    });
-
-    return rows
-      .filter(
-        (row): row is typeof row & { toUserID: string } =>
-          typeof row.toUserID === 'string',
-      )
-      .map((row) => ({
-        toUserId: row.toUserID,
-        notification: mapNotificationRealtimeDto(row),
-      }));
+    const recipientRows = created.filter(
+      (row): row is typeof row & { toUserID: string } =>
+        typeof row.toUserID === 'string',
+    );
+    const dtos = await loadNotificationRealtimeDtos(tx, recipientRows);
+    return recipientRows.map((row, index) => ({
+      toUserId: row.toUserID,
+      notification: dtos[index],
+    }));
   }
 
   async createCircleInvitationNotification(data: {
@@ -1258,79 +1457,37 @@ export class NotificationService {
     const pageSize = input.take ?? NOTIFICATION_PAGE_SIZE;
     const useCursor = input.keyset === true || Boolean(input.cursor);
 
-    if (input.cursor) {
-      const cursorDate = new Date(input.cursor.createdAt);
-      const cursorRows = await this.prisma.$queryRaw<
-        Array<{ id: string; createdAt: Date }>
-      >(
-        Prisma.sql`
-          SELECT n."id", n."createdAt"
-          FROM "Notification" n
-          WHERE n."toUserID" = ${input.userId}
-            AND n."deleted" = false
-            AND n."type" IN (${Prisma.join([...input.typeFilter])})
-            AND (n."createdAt", n."id") < (${cursorDate}, ${input.cursor.id})
-          ORDER BY n."createdAt" DESC, n."id" DESC
-          LIMIT ${pageSize + 1}
-        `,
-      );
-
-      const ids = cursorRows.slice(0, pageSize).map(({ id }) => id);
-      if (ids.length === 0) {
-        return { items: [], nextCursor: null };
-      }
-
-      // Hydrate the same relation graph as the legacy query, then restore the
-      // keyset order because an IN predicate does not guarantee row order.
-      const hydratedRows = await this.prisma.notification.findMany({
-        where: {
-          id: { in: ids },
-          toUserID: input.userId,
-          deleted: false,
-          type: { in: [...input.typeFilter] },
-        },
-        include: NOTIFICATION_REALTIME_INCLUDE,
-      });
-      const byId = new Map(hydratedRows.map((row) => [row.id, row]));
-      const orderedRows = ids
-        .map((id) => byId.get(id))
-        .filter((row): row is NotificationRealtimeRow => row !== undefined);
-      const hasMore = cursorRows.length > pageSize;
-      const pageRows = orderedRows.slice(0, pageSize);
-      const items = pageRows.map(mapNotificationRealtimeDto);
-      // A concurrent delete can make hydration return fewer rows than the ID
-      // scan. Advance from the last scanned key, rather than only the last
-      // hydrated row, so an empty hydrated page cannot strand later rows.
-      const last = hasMore ? (cursorRows[pageSize - 1] ?? null) : null;
-
-      return {
-        items,
-        nextCursor: last
-          ? encodeNotificationCursor({
-              createdAt: last.createdAt.toISOString(),
-              id: last.id,
-            })
-          : null,
-      };
-    }
-
-    const where: Prisma.NotificationWhereInput = {
-      toUserID: input.userId,
-      deleted: false,
-      type: { in: [...input.typeFilter] },
-    };
-    const rows = await this.prisma.notification.findMany({
-      where,
-      orderBy: [{ createdAt: 'desc' }, { id: 'desc' }],
-      ...(useCursor ? {} : { skip: input.skip ?? 0 }),
-      take: useCursor ? pageSize + 1 : pageSize,
-      include: NOTIFICATION_REALTIME_INCLUDE,
-    });
-    const hasMore = Boolean(useCursor && rows.length > pageSize);
-    const items = (hasMore ? rows.slice(0, pageSize) : rows).map(
-      mapNotificationRealtimeDto,
+    // 三种分页（老分页 / 游标首页 / 游标续页）共用一条 id 扫描：只取 id 与
+    // createdAt，(toUserID, createdAt DESC, id DESC, type) 部分索引自己就能回答，
+    // type 在索引元组上过滤，不为不匹配的行回表（见 notificationPageScanQuery）。
+    const scanned = await this.prisma.$queryRaw<
+      Array<{ id: string; createdAt: Date }>
+    >(
+      notificationPageScanQuery({
+        userId: input.userId,
+        types: input.typeFilter,
+        limit: useCursor ? pageSize + 1 : pageSize,
+        before: input.cursor
+          ? {
+              createdAt: new Date(input.cursor.createdAt),
+              id: input.cursor.id,
+            }
+          : undefined,
+        offset: useCursor ? undefined : (input.skip ?? 0),
+      }),
     );
-    const last = hasMore ? rows[pageSize - 1] : null;
+
+    const items = await this.hydrateNotificationPage(
+      input.userId,
+      input.typeFilter,
+      scanned.slice(0, pageSize).map(({ id }) => id),
+    );
+    // A concurrent delete can make hydration return fewer rows than the ID
+    // scan. Advance from the last scanned key, rather than only the last
+    // hydrated row, so an empty hydrated page cannot strand later rows.
+    const hasMore = useCursor && scanned.length > pageSize;
+    const last = hasMore ? (scanned[pageSize - 1] ?? null) : null;
+
     return {
       items,
       nextCursor: last
@@ -1340,6 +1497,32 @@ export class NotificationService {
           })
         : null,
     };
+  }
+
+  /**
+   * 按扫描出来的 id 回填本表列和关系，并恢复扫描顺序（IN 不保证顺序）。回填时重复
+   * 收件人 / 未删除 / 类型三个条件：扫描和回填之间被删掉的行直接不出现。
+   */
+  private async hydrateNotificationPage(
+    userId: string,
+    typeFilter: readonly NotificationType[],
+    ids: readonly string[],
+  ): Promise<NotificationRealtimeDto[]> {
+    if (ids.length === 0) return [];
+    const rows = await this.prisma.notification.findMany({
+      where: {
+        id: { in: [...ids] },
+        toUserID: userId,
+        deleted: false,
+        type: { in: [...typeFilter] },
+      },
+      select: NOTIFICATION_REALTIME_BASE_SELECT,
+    });
+    const byId = new Map(rows.map((row) => [row.id, row]));
+    const ordered = ids
+      .map((id) => byId.get(id))
+      .filter((row): row is NotificationRealtimeBaseRow => row !== undefined);
+    return loadNotificationRealtimeDtos(this.prisma, ordered);
   }
 
   async getNotificationOpenOwnership(
@@ -1489,40 +1672,28 @@ export class NotificationService {
     }
     if (rows.length === 0) return [];
 
+    // 事务里只写通知行 + outbox；INSERT ... RETURNING 直接带回本表列（按插入顺序，
+    // 即上面的优先级顺序），关系在提交之后再补，不再整批回读 + 9 路 include。
     const created = await this.prisma.$transaction(async (tx) => {
       const inserted = await tx.notification.createManyAndReturn({
         data: rows,
-        select: { id: true },
+        select: NOTIFICATION_REALTIME_BASE_SELECT,
       });
 
       await tx.notificationPushOutbox.createMany({
         data: inserted.map(({ id }) => ({ notificationID: id })),
       });
-
-      const hydrated = await tx.notification.findMany({
-        where: { id: { in: inserted.map(({ id }) => id) } },
-        include: NOTIFICATION_REALTIME_INCLUDE,
-      });
-      // findMany does not promise the insert order back, so restore it to keep
-      // the precedence order above observable to callers.
-      const byId = new Map(hydrated.map((row) => [row.id, row]));
-      return inserted
-        .map(({ id }) => byId.get(id))
-        .filter((row): row is (typeof hydrated)[number] => row !== undefined);
+      return inserted;
     });
 
-    return created
-      .map((notification) => ({
-        targetUserId: notification.toUserID,
-        notification: mapNotificationRealtimeDto(notification),
-      }))
-      .filter(
-        (
-          item,
-        ): item is {
-          targetUserId: string;
-          notification: NotificationRealtimeDto;
-        } => typeof item.targetUserId === 'string',
-      );
+    const recipientRows = created.filter(
+      (row): row is typeof row & { toUserID: string } =>
+        typeof row.toUserID === 'string',
+    );
+    const dtos = await loadNotificationRealtimeDtos(this.prisma, recipientRows);
+    return recipientRows.map((row, index) => ({
+      targetUserId: row.toUserID,
+      notification: dtos[index],
+    }));
   }
 }

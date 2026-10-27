@@ -1,5 +1,4 @@
 import { startReadBurnTimers } from './read-burn-timers';
-import { assertEncryptedTextSend } from 'src/e2ee/e2ee-proof';
 import {
   BadRequestException,
   ConflictException,
@@ -60,6 +59,23 @@ import {
   SYNC_PAGE_MAX,
   READERS_PAGE_MAX,
 } from './chat.constants';
+import { recentTextMatchesQuery } from './chat-text-search.query';
+import { allWithConcurrency } from 'src/utils/concurrency-limit';
+import {
+  historyPageArgs,
+  historyPageWhere,
+  MESSAGE_READ_OMIT,
+} from './chat-history-page.query';
+import {
+  advanceConversationAfterSendQuery,
+  lockConversationForSendQuery,
+  pendingReadBurnTimersQuery,
+} from './chat-send-lock.query';
+import {
+  lastMessagesQuery,
+  unreadCountsQuery,
+} from './chat-conversation-summary.query';
+import { messageDaysQuery, messageDayWindows } from './chat-message-days.query';
 import { messagePreviewText } from './chat-message-preview';
 import {
   buildChatRetentionWindow,
@@ -122,12 +138,65 @@ const NON_GROUP_FACETS: GroupFacets = {
   policies: null,
 };
 
+/** 本次发送与消息同事务入队的 durable 任务;没入队的为 null。 */
+export interface EnqueuedSendJobs {
+  directAutoReplyJobId: string | null;
+  supportRechargeJobId: string | null;
+}
+
 interface SendResult {
   message: ChatMessageDto;
   reused: boolean;
+  /**
+   * 首次落库时本次入队了哪些任务,网关只 kick 这些。null 只出现在 DIRECT 会话的
+   * 幂等复用:这次调用什么都没入队,首次发送入队的任务若当时没被 kick(进程恰好
+   * 退出),由网关按消息 id 兜底 kick 一次;定时扫描仍是最终兜底。
+   */
+  enqueuedJobs: EnqueuedSendJobs | null;
 }
 
+/** 锁外判定的入队资格:只决定要不要写任务,处理器在锁下仍会权威复查。 */
+interface SendJobPlan {
+  directAutoReply: boolean;
+  supportRecharge: boolean;
+}
+
+const NO_SEND_JOBS: SendJobPlan = Object.freeze({
+  directAutoReply: false,
+  supportRecharge: false,
+});
+
+const NOTHING_ENQUEUED: EnqueuedSendJobs = Object.freeze({
+  directAutoReplyJobId: null,
+  supportRechargeJobId: null,
+});
+
+/**
+ * 幂等复用的结果带什么任务信息:只有 DIRECT 会话可能入过队,不知道首次发送入了
+ * 什么,交给网关按消息 id 兜底(null);其余会话从来不入队。
+ */
+function reusedSendJobs(
+  conversation: Pick<ChatConversation, 'type'>,
+): EnqueuedSendJobs | null {
+  return conversation.type === 'DIRECT' ? null : NOTHING_ENQUEUED;
+}
+
+/** 锁内复查要读的会话列(lockConversationForSendQuery 从被锁的行读回)。 */
+type SendableConversation = Pick<
+  ChatConversation,
+  'type' | 'directKey' | 'circleID' | 'ownerID' | 'muteAllAt' | 'tempChatID'
+>;
+
+type LockedSendConversation = SendableConversation &
+  Pick<ChatConversation, 'nextHeight'>;
+
 type ChatBurnPolicyInput = ChatBurnPolicy | number | null;
+
+/**
+ * 会话列表一页的补充查询(末条/未读/对端/圈子/临时房/角色/人数)同时最多跑几条。
+ * 连接池默认只有 10 个:原来 7 条一起发,两个请求同时拉列表就能把池占满。
+ */
+const CONVERSATION_LIST_QUERY_CONCURRENCY = 3;
 
 /**
  * A note-card message carries the effective cards that were visible when it
@@ -179,10 +248,6 @@ function senderSeatRefs(
       : [],
   );
 }
-const MESSAGE_READ_OMIT = {
-  contentHistory: true,
-  sourceNoteID: true,
-} as const;
 
 /**
  * 会话变更序号流的水位:已分配出去的最高 revision,<= 它的变更都已提交。
@@ -209,12 +274,6 @@ export function conversationSyncRevision(conversation: {
 function receiptCeiling(conversation: { nextHeight: number }): number {
   return conversation.nextHeight ?? 0;
 }
-
-/**
- * 会话列表里单个会话的未读数最多数到这里。界面(会话行、消息 tab)超过 99 一律显示
- * 99+,数到 100 就足够判断;再往后数只是替大群逐行回表。
- */
-const UNREAD_COUNT_CAP = 100;
 
 /**
  * 关键词搜索每轮从二元组索引取多少条候选,再交给可见性过滤(清空水位、阅后即焚、
@@ -307,7 +366,7 @@ export class ChatService {
     }
     if (
       Buffer.byteLength(JSON.stringify(payload.content), 'utf8') >
-      (payload.type === 'encrypted-text' ? 16_384 : MAX_CONTENT_BYTES)
+      MAX_CONTENT_BYTES
     ) {
       throw new BadRequestException({
         message: '消息体超限',
@@ -717,6 +776,7 @@ export class ChatService {
           senderUserId,
           true,
           conversation,
+          reusedSendJobs(conversation),
         );
       }
     }
@@ -762,9 +822,19 @@ export class ChatService {
       // 拿一条**别的会话**里的消息 UUID 当引用发出去 —— attachReplyTo 照单全收,
       // 把那条消息的发送者昵称、类型和文本摘要广播进当前房间。退群的人手里留着
       // 旧 UUID 同样能这么捞。放在事务外做:被引用消息不会换会话,没有 TOCTOU。
+      //
+      // 入队资格(对方开没开自动回复、对方是不是在岗的充值客服)只决定要不要写
+      // 任务行,不是鉴权:处理器在锁下会权威复查。原来在会话行锁里查,每条私聊
+      // 让锁多持有两次往返;挪到锁外。顺序查而不并发:发消息是最热的路径,并发
+      // 会让每条私聊瞬间占 3 个池连接(池默认 10 个),锁外多两次往返更划算。
       const replyToId = await this.resolveReplyTarget(
         effectivePayload.conversationId,
         effectivePayload.replyToId,
+      );
+      const jobPlan = await this.planSendJobs(
+        conversation,
+        senderUserId,
+        effectivePayload.type,
       );
 
       // 媒体消息落库前剥掉展示字段。这些字段是读路径的产物(ChatMediaService
@@ -791,11 +861,10 @@ export class ChatService {
       const created = await this.prisma.$transaction(async (tx) => {
         // G-05:会话行锁替 advisory lock —— 同会话串行,跨会话零互扰
         // (hashtext 碰撞让无关会话互等的问题消失),也不再做 MAX(height) 聚合扫描。
-        const counter = await tx.$queryRaw<
-          Array<{ nextHeight: number; textEncryption: string }>
-        >`
-        SELECT "nextHeight", "textEncryption" FROM "ChatConversation"
-        WHERE "id" = ${effectivePayload.conversationId} FOR UPDATE`;
+        // 锁行时顺带读回锁内复查要用的会话列,复查不再另查一次会话。
+        const counter = await tx.$queryRaw<LockedSendConversation[]>(
+          lockConversationForSendQuery(effectivePayload.conversationId),
+        );
         if (counter.length === 0) {
           throw new NotFoundException({
             message: '会话不存在',
@@ -806,10 +875,15 @@ export class ChatService {
         // 拉黑、管理台禁言、临时房到期都可能恰好落在这中间,消息照样写进去。
         // 行锁之后才是真正串行的位置,所以复查放在这里 —— 且在取号之前,
         // 被拒绝的发送不推进计数器,height 无空洞。
-        await this.assertStillSendable(
+        //
+        // 锁行读回了复查用到的全部列,会覆盖锁外那份;展开锁外的会话只是补齐
+        // 类型上其余不参与复查的字段。复查读到的座位顺带给下面的焚毁档位用 ——
+        // 原来锁里为它把同一行座位再读一次。
+        const senderSeat = await this.assertStillSendable(
           tx,
           effectivePayload.conversationId,
           senderUserId,
+          { ...conversation, ...counter[0] },
         );
 
         const existing = await tx.chatMessage.findUnique({
@@ -823,21 +897,7 @@ export class ChatService {
         });
         if (existing) {
           this.assertSameSendRequest(existing, requestHash);
-          return { row: existing, reused: true };
-        }
-
-        if (
-          counter[0].textEncryption === 'MLS_V1' ||
-          effectivePayload.type === 'encrypted-text'
-        ) {
-          await assertEncryptedTextSend(
-            tx,
-            senderUserId,
-            effectivePayload.conversationId,
-            effectivePayload.type,
-            effectivePayload.d,
-            effectivePayload.content,
-          );
+          return { row: existing, reused: true, enqueuedJobs: null };
         }
 
         await this.media.lockOwnedKeysForSend(
@@ -846,16 +906,8 @@ export class ChatService {
           effectivePayload.content as Record<string, unknown>,
           copiedKeys,
         );
-        const senderBurn = await tx.chatMember.findUnique({
-          where: {
-            conversationID_userID: {
-              conversationID: effectivePayload.conversationId,
-              userID: senderUserId,
-            },
-          },
-        });
         const durations = [
-          senderBurn?.burnDurationSec ?? 0,
+          senderSeat.burnDurationSec ?? 0,
           senderPolicy.sec,
         ].filter((value) => value > 0);
         const burnDurationSec =
@@ -893,32 +945,17 @@ export class ChatService {
             throw new Error('Forward media reservation claim mismatch');
           }
         }
-        // 计数器前进与会话排序时间合并成一条 UPDATE(临界区少一次往返)。
-        await tx.chatConversation.update({
-          where: { id: effectivePayload.conversationId },
-          data: { nextHeight: height, lastMessageAt: row.createdAt },
-        });
-        await this.enqueueDirectAutoReplyInTx(
-          tx,
-          conversation,
-          senderUserId,
-          row,
+        // 计数器前进、会话排序时间、隐藏会话重新浮出(微信式语义)合成一条语句。
+        await tx.$executeRaw(
+          advanceConversationAfterSendQuery(
+            effectivePayload.conversationId,
+            height,
+            row.createdAt,
+            new Date(),
+          ),
         );
-        await this.enqueueRechargeAutomationInTx(
-          tx,
-          conversation,
-          senderUserId,
-          row,
-        );
-        // 新消息让所有成员的隐藏会话重新浮出(微信式语义)。
-        await tx.chatMember.updateMany({
-          where: {
-            conversationID: effectivePayload.conversationId,
-            hiddenAt: { not: null },
-          },
-          data: { hiddenAt: null },
-        });
-        return { row, reused: false };
+        const enqueuedJobs = await this.enqueueSendJobsInTx(tx, jobPlan, row);
+        return { row, reused: false, enqueuedJobs };
       });
 
       // 提交完成的那一刻就把复制出来的对象交割掉。继续留在 copiedKeys 里的话,
@@ -948,6 +985,7 @@ export class ChatService {
         senderUserId,
         created.reused,
         conversation,
+        created.reused ? reusedSendJobs(conversation) : created.enqueuedJobs,
       );
     } catch (error) {
       if (copiedKeys.length > 0) await this.media.deleteObjects(copiedKeys);
@@ -982,6 +1020,7 @@ export class ChatService {
     senderUserId: string,
     reused: boolean,
     burnPolicy: ChatBurnPolicyInput,
+    enqueuedJobs: EnqueuedSendJobs | null,
   ): Promise<SendResult> {
     let sender: ChatSenderInfo | null = null;
     try {
@@ -1013,7 +1052,7 @@ export class ChatService {
       );
     }
     await this.media.attachMediaUrls([message]);
-    return { message, reused };
+    return { message, reused, enqueuedJobs };
   }
 
   /**
@@ -1094,80 +1133,88 @@ export class ChatService {
     return { type: row.type, content: content as Record<string, unknown> };
   }
 
-  /** 每条首次落库的普通 DIRECT 客户端消息都在同一事务写一个唯一任务。 */
-  private async enqueueDirectAutoReplyInTx(
-    tx: Prisma.TransactionClient,
-    conversation: ChatConversation,
+  /**
+   * 两类 durable 任务的入队资格,在**会话行锁之外**判定:
+   *
+   * - 自动回复:只对 DIRECT。自动回复默认是关的,而此前每条私聊都无条件建一个 job:
+   *   发送事务里多一次 INSERT,提交后还要 kick 一次处理器,而处理器会取会话行锁、
+   *   两把关系锁和用户行锁,跑完才发现开关是关的。所以入队前先看一眼对方开没开。
+   * - 充值客服:只对 DIRECT 的 text/quote/image,对方是在岗的充值客服才入队。这里只做
+   *   资格判定,不匹配关键词、不发消息,避免把客服业务塞进聊天热路径。服务端自动
+   *   消息走 insertServerMessage,不经过这里,因此不会自触发。
+   *
+   * peer 从 directKey 推(不可变),不额外查会话成员。两次读都只是闸,不是权威判定:
+   * 开关/客服状态可能在入队与处理之间改变,处理器在锁下重查(见
+   * chat-direct-auto-reply.processor、chat-support-recharge.processor)。这里放过的
+   * 会被那边拦下;这里拦掉的是「发消息那一刻对方确实没开 / 不在岗」,本就不该处理。
+   * 原来这两次读在会话行锁里,每条私聊让锁多持有两次往返。
+   */
+  private async planSendJobs(
+    conversation: Pick<ChatConversation, 'type' | 'directKey'>,
     senderUserId: string,
-    message: Pick<ChatMessage, 'id'>,
-  ): Promise<void> {
-    if (conversation.type !== 'DIRECT') return;
-    // 自动回复默认是关的,而此前每条私聊都无条件建一个 job:发送事务里多一次
-    // INSERT,提交后还要 kick 一次处理器,而处理器会取会话行锁、两把关系锁和
-    // 用户行锁,跑完才发现开关是关的。抢的正是发消息要的那把会话行锁,一来一回
-    // 的快速对话会被自己的空转串起来;COMPLETED 的行还要留 7 天。
-    //
-    // 入队前先看一眼对方开没开。peer 从 directKey 推,不额外查会话成员 ——
-    // 与隔壁 enqueueRechargeAutomationInTx 同一手法。
-    const responderId = conversation.directKey
+    messageType: string,
+  ): Promise<SendJobPlan> {
+    if (conversation.type !== 'DIRECT') return NO_SEND_JOBS;
+    const peerUserId = conversation.directKey
       ?.split(':')
       .find((id) => id !== senderUserId);
-    if (!responderId) return;
-    const settings = await tx.userPrivacySetting.findUnique({
-      where: { userID: responderId },
+    if (!peerUserId) return NO_SEND_JOBS;
+    const rechargeEligibleType = ['text', 'quote', 'image'].includes(
+      messageType,
+    );
+    const settings = await this.prisma.userPrivacySetting.findUnique({
+      where: { userID: peerUserId },
       select: {
         directMessageAutoReplyEnabled: true,
         directMessageAutoReplyText: true,
       },
     });
-    // 这只是一道闸,不是权威判定:开关可能在入队与处理之间改变,所以处理器仍会
-    // 在锁下重查一遍(见 chat-direct-auto-reply.processor)。这里放过的会被那边
-    // 拦下;这里拦掉的是「发消息那一刻对方确实没开」,本就不该回复。
-    if (!settings?.directMessageAutoReplyEnabled) return;
-    if (!settings.directMessageAutoReplyText.trim()) return;
-    await tx.chatDirectAutoReplyJob.create({
-      data: { sourceMessageID: message.id },
-    });
+    const rechargeAgent = rechargeEligibleType
+      ? await this.prisma.supportAgent.findFirst({
+          where: {
+            category: 'recharge',
+            userID: peerUserId,
+            enabled: true,
+            user: { status: 'ACTIVE' },
+          },
+          select: { id: true },
+        })
+      : null;
+    return {
+      directAutoReply:
+        !!settings?.directMessageAutoReplyEnabled &&
+        !!settings.directMessageAutoReplyText.trim(),
+      supportRecharge: !!rechargeAgent,
+    };
   }
 
   /**
-   * 充值客服 durable inbox：与用户消息同事务写入。
-   *
-   * 这里只做资格判定和入队，不匹配关键词、不发消息，避免把客服业务塞进聊天热
-   * 路径。网关提交后即时 kick；若进程恰好在两者之间退出，定时处理器仍会从这张
-   * 表补消费。服务端自动消息走 insertServerMessage，不经过这里，因此不会自触发。
+   * 与用户消息同事务写入入队资格放行的任务(durable inbox)。网关提交后只 kick
+   * 这里真正写下的任务;若进程恰好在提交与 kick 之间退出,定时处理器仍会从表里
+   * 补消费。
    */
-  private async enqueueRechargeAutomationInTx(
+  private async enqueueSendJobsInTx(
     tx: Prisma.TransactionClient,
-    conversation: ChatConversation,
-    senderUserId: string,
-    message: Pick<ChatMessage, 'id' | 'type'>,
-  ): Promise<void> {
-    if (
-      conversation.type !== 'DIRECT' ||
-      !['text', 'quote', 'image'].includes(message.type)
-    ) {
-      return;
-    }
-    const peerUserId = conversation.directKey
-      ?.split(':')
-      .find((id) => id !== senderUserId);
-    if (!peerUserId) return;
-
-    const rechargeAgent = await tx.supportAgent.findFirst({
-      where: {
-        category: 'recharge',
-        userID: peerUserId,
-        enabled: true,
-        user: { status: 'ACTIVE' },
-      },
-      select: { id: true },
-    });
-    if (!rechargeAgent) return;
-
-    await tx.supportRechargeJob.create({
-      data: { sourceMessageID: message.id },
-    });
+    plan: SendJobPlan,
+    message: Pick<ChatMessage, 'id'>,
+  ): Promise<EnqueuedSendJobs> {
+    const directAutoReplyJobId = plan.directAutoReply
+      ? (
+          await tx.chatDirectAutoReplyJob.create({
+            data: { sourceMessageID: message.id },
+            select: { id: true },
+          })
+        ).id
+      : null;
+    const supportRechargeJobId = plan.supportRecharge
+      ? (
+          await tx.supportRechargeJob.create({
+            data: { sourceMessageID: message.id },
+            select: { id: true },
+          })
+        ).id
+      : null;
+    return { directAutoReplyJobId, supportRechargeJobId };
   }
 
   /**
@@ -1243,6 +1290,25 @@ export class ChatService {
         conversationType: conversation.type,
       };
     }
+    // 会话行锁只为启动阅后即焚计时而取(启动计时改消息行,取号触发器随之更新
+    // 会话行,必须与发送/清空/焚毁同一加锁顺序;多设备并发回执也在锁上串行)。
+    // 没有待启动的计时就不必取锁:原来每条单聊回执都 FOR UPDATE 会话行,一来
+    // 一回的快速对话里已读和发送互相排队。谓词与 startReadBurnTimers 相同,
+    // 这一组只减不增(见 pendingReadBurnTimersQuery),锁外判空与锁内判空等价。
+    const [pending] = await this.prisma.$queryRaw<Array<{ pending: boolean }>>(
+      pendingReadBurnTimersQuery(conversationId, userId, clamped),
+    );
+    if (!pending?.pending) {
+      return {
+        advanced: await this.advanceDirectReadWithoutTimers(
+          userId,
+          conversationId,
+          clamped,
+        ),
+        height: clamped,
+        conversationType: conversation.type,
+      };
+    }
     const result = await this.prisma.$transaction(async (tx) => {
       // Match send/clear/burn lock ordering, and serialize concurrent readers.
       await tx.$queryRaw`SELECT "id" FROM "ChatConversation"
@@ -1300,6 +1366,46 @@ export class ChatService {
       height: clamped,
       conversationType: conversation.type,
     };
+  }
+
+  /**
+   * 单聊已读的无锁分支:没有要启动的计时,只推进本人的已读水位。
+   *
+   * 与持锁分支结果一致:水位只前进(lastReadHeight < clamped)、离座的座位不写
+   * (leftAt 为空才写)。没写成时再看一眼座位 —— 座位没了 / 已离座要和持锁分支
+   * 一样报 NotMember,而不是悄悄回「未推进」。
+   */
+  private async advanceDirectReadWithoutTimers(
+    userId: string,
+    conversationId: string,
+    clamped: number,
+  ): Promise<boolean> {
+    const updated = await this.prisma.chatMember.updateMany({
+      where: {
+        conversationID: conversationId,
+        userID: userId,
+        leftAt: null,
+        lastReadHeight: { lt: clamped },
+      },
+      data: { lastReadHeight: clamped },
+    });
+    if (updated.count > 0) return true;
+    const seat = await this.prisma.chatMember.findUnique({
+      where: {
+        conversationID_userID: {
+          conversationID: conversationId,
+          userID: userId,
+        },
+      },
+      select: { leftAt: true },
+    });
+    if (!seat || seat.leftAt) {
+      throw new ForbiddenException({
+        message: '不在该会话中',
+        errorCode: ChatErrorCode.NotMember,
+      });
+    }
+    return false;
   }
 
   /**
@@ -1536,7 +1642,107 @@ export class ChatService {
     });
     const hasMore = rows.length > limit;
     const memberships = hasMore ? rows.slice(0, limit) : rows;
-    if (memberships.length === 0) return { conversations: [], hasMore };
+    return {
+      conversations: await this.buildConversationList(userId, memberships),
+      hasMore,
+    };
+  }
+
+  /**
+   * 会话列表的键集分页：按 conversationID 升序，只返回 id 严格大于 cursor 的会话
+   * （空串 = 从头开始）。
+   *
+   * 活跃度排序下不能用 offset 翻页：翻页间隙里来一条新消息就会把会话挪到别的页，
+   * 漏行或重复；id 不会变，键集按它走，中途怎么来消息都一个不落。顺序由客户端
+   * 自己按置顶 / 末条消息时间重排。成员过滤、limit 与每行 DTO 与旧模式完全一致。
+   *
+   * 索引：一个用户最多几千个座位，走 userID 打头的索引（含 leftAt/hiddenAt 条件的
+   * 部分索引）取出本人可见座位再按 id 排序即可，不需要新索引。
+   */
+  async listConversationsKeysetPage(
+    userId: string,
+    cursor: string,
+    limit: number = CONVERSATION_LIST_MAX,
+  ): Promise<{
+    conversations: ChatConversationDto[];
+    hasMore: boolean;
+    nextCursor: string | null;
+  }> {
+    const rows = await this.prisma.chatMember.findMany({
+      where: {
+        userID: userId,
+        leftAt: null,
+        hiddenAt: null,
+        ...(cursor === '' ? {} : { conversationID: { gt: cursor } }),
+      },
+      include: { conversation: true },
+      orderBy: { conversationID: 'asc' },
+      take: limit + 1,
+    });
+    const hasMore = rows.length > limit;
+    const memberships = hasMore ? rows.slice(0, limit) : rows;
+    const last = memberships[memberships.length - 1];
+    return {
+      conversations: await this.buildConversationList(userId, memberships),
+      hasMore,
+      nextCursor: hasMore && last ? last.conversationID : null,
+    };
+  }
+
+  /**
+   * 单个会话，与 GET /chat/conversations 的每一行逐字段同形(同一条组装路径)。
+   *
+   * 客户端收到会话元信息变更事件(置顶/免打扰/群公告/群主/角色/全员禁言…)后只刷新
+   * 这一个，而不是重拉整张列表 —— 群一多，一次全量就是几百 KB。
+   * 已退出或从未加入 → CHAT_NOT_MEMBER(403)；从列表里隐藏了 → CHAT_CONVERSATION_NOT_FOUND
+   * (404)，不能借这个接口把隐藏的会话「复活」回客户端列表。
+   */
+  async getConversation(
+    userId: string,
+    conversationId: string,
+  ): Promise<ChatConversationDto> {
+    const membership = await this.prisma.chatMember.findUnique({
+      where: {
+        conversationID_userID: {
+          conversationID: conversationId,
+          userID: userId,
+        },
+      },
+      include: { conversation: true },
+    });
+    if (!membership || membership.leftAt) {
+      throw new ForbiddenException({
+        message: '不是会话成员',
+        errorCode: ChatErrorCode.NotMember,
+      });
+    }
+    if (membership.hiddenAt) {
+      throw new NotFoundException({
+        message: '会话不存在',
+        errorCode: ChatErrorCode.ConversationNotFound,
+      });
+    }
+    const [conversation] = await this.buildConversationList(userId, [
+      membership,
+    ]);
+    if (!conversation) {
+      throw new NotFoundException({
+        message: '会话不存在',
+        errorCode: ChatErrorCode.ConversationNotFound,
+      });
+    }
+    return conversation;
+  }
+
+  /**
+   * 会话列表每一行的 DTO：对端信息 / 末条消息 / 未读数 / 群信息等按整页批量取，
+   * 查询次数不随会话数增长。旧的活跃度分页与键集分页共用这一条路径。
+   */
+  private async buildConversationList(
+    userId: string,
+    memberships: Array<ChatMember & { conversation: ChatConversation }>,
+  ): Promise<ChatConversationDto[]> {
+    if (memberships.length === 0) return [];
 
     const conversationIds = memberships.map((m) => m.conversationID);
     const directIds = memberships
@@ -1561,30 +1767,32 @@ export class ChatService {
       tempChats,
       circleRoles,
       memberCounts,
-    ] = await Promise.all([
-      this.loadLastMessages(conversationIds, retentionWindows),
-      this.loadUnreadCounts(
-        userId,
-        // G-14:未读底数取已读水位与清空水位的更高者,清空过的段落不再计数。
-        memberships.map((m) => ({
-          conversationID: m.conversationID,
-          lastReadHeight: Math.max(
-            m.lastReadHeight,
-            m.clearedBeforeHeight ?? 0,
-            m.conversation.clearedBeforeHeight ?? 0,
-          ),
-        })),
-        retentionWindows,
-      ),
-      this.loadDirectPeers(userId, directIds),
-      this.loadCircleInfos(circleIds),
-      this.loadTempChatInfos(
-        memberships
-          .map((m) => m.conversation.tempChatID)
-          .filter((id): id is string => id !== null),
-      ),
-      this.loadCircleRoles(userId, circleIds),
-      this.loadGroupMemberCounts(groupIds),
+    ] = await allWithConcurrency(CONVERSATION_LIST_QUERY_CONCURRENCY, [
+      () => this.loadLastMessages(conversationIds, retentionWindows),
+      () =>
+        this.loadUnreadCounts(
+          userId,
+          // G-14:未读底数取已读水位与清空水位的更高者,清空过的段落不再计数。
+          memberships.map((m) => ({
+            conversationID: m.conversationID,
+            lastReadHeight: Math.max(
+              m.lastReadHeight,
+              m.clearedBeforeHeight ?? 0,
+              m.conversation.clearedBeforeHeight ?? 0,
+            ),
+          })),
+          retentionWindows,
+        ),
+      () => this.loadDirectPeers(userId, directIds),
+      () => this.loadCircleInfos(circleIds),
+      () =>
+        this.loadTempChatInfos(
+          memberships
+            .map((m) => m.conversation.tempChatID)
+            .filter((id): id is string => id !== null),
+        ),
+      () => this.loadCircleRoles(userId, circleIds),
+      () => this.loadGroupMemberCounts(groupIds),
     ]);
 
     const lastRows = [...lastMessages.values()];
@@ -1609,7 +1817,6 @@ export class ChatService {
       return {
         id: m.conversationID,
         type: m.conversation.type,
-        textEncryption: m.conversation.textEncryption,
         peer: directPeers.info.get(m.conversationID) ?? null,
         circleId: m.conversation.circleID,
         circle: m.conversation.circleID
@@ -1661,7 +1868,7 @@ export class ChatService {
         .map((c) => c.lastMessage)
         .filter((m): m is ChatMessageDto => m !== null),
     );
-    return { conversations: list, hasMore };
+    return list;
   }
 
   /**
@@ -1748,26 +1955,28 @@ export class ChatService {
         },
         select: { id: true },
       });
-      for (const applicantID of memberIds) {
-        const admission = await tx.groupAdmission.create({
-          data: {
-            conversationID: group.id,
-            applicantID,
-            inviterID: userId,
-            kind: 'INVITE',
-            status: 'INVITED',
-            expiresAt: new Date(Date.now() + 7 * 86400000),
-          },
-        });
-        await tx.groupAdmissionDelivery.create({
-          data: {
-            admissionID: admission.id,
-            recipientID: applicantID,
-            actorID: userId,
-            event: 'INVITED',
-          },
-        });
-      }
+      // 全新的群:没有座位、没有旧邀请要查,直接批量写。原来每人两次 INSERT
+      // (最多 199 人约 400 条),全程持有上面那组关系锁。
+      const expiresAt = new Date(Date.now() + 7 * 86400000);
+      const admissions = await tx.groupAdmission.createManyAndReturn({
+        data: memberIds.map((applicantID) => ({
+          conversationID: group.id,
+          applicantID,
+          inviterID: userId,
+          kind: 'INVITE',
+          status: 'INVITED',
+          expiresAt,
+        })),
+        select: { id: true, applicantID: true },
+      });
+      await tx.groupAdmissionDelivery.createMany({
+        data: admissions.map((admission) => ({
+          admissionID: admission.id,
+          recipientID: admission.applicantID,
+          actorID: userId,
+          event: 'INVITED',
+        })),
+      });
       return group;
     });
     await this.seatMembersIntoRoom(conversation.id, [userId]);
@@ -2404,7 +2613,6 @@ export class ChatService {
     return {
       id: conversationId,
       type: member.conversation.type,
-      textEncryption: member.conversation.textEncryption,
       peer: directPeers.info.get(conversationId) ?? null,
       circleId: member.conversation.circleID,
       circle: member.conversation.circleID
@@ -2563,22 +2771,13 @@ export class ChatService {
     // 读取只按各消息首次发送时确定的到期时间过滤，不应用查看者的设置。
     const viewer = NO_VIEWER_RETENTION;
     const retention = buildChatRetentionWindow(conversation, viewer);
-    const heightCondition: Prisma.IntFilter = {
-      ...(heightFloor > 0 ? { gt: heightFloor } : {}),
-      ...(beforeHeight !== undefined ? { lt: beforeHeight } : {}),
-    };
-    const where: Prisma.ChatMessageWhereInput = {
-      conversationID: conversationId,
-      deleted: false,
-      ...(Object.keys(heightCondition).length > 0
-        ? { height: heightCondition }
-        : {}),
-      ...this.buildHistoryFilterWhere(filters),
-    };
-    // 必须用 AND 追加,不能并进同一层 —— 按日期过滤同样写 createdAt,
-    // 平铺展开会被它整个盖掉:客户端只要带上 date 参数就能翻出销毁窗口
-    // 之外的消息,等于给这个设置留了个后门。
-    Object.assign(where, chatRetentionWhere(retention));
+    const where = historyPageWhere({
+      conversationId,
+      heightFloor,
+      beforeHeight,
+      filters,
+      retention,
+    });
     const rows = filters.keyword
       ? await this.findHistoryKeywordRows({
           conversationId,
@@ -2589,13 +2788,9 @@ export class ChatService {
           beforeHeight,
           take,
         })
-      : await this.prisma.chatMessage.findMany({
-          where,
-          omit: MESSAGE_READ_OMIT,
-          // 增量补拉从缺口低端往高处追;向旧翻页照旧取最近一段再反转。
-          orderBy: { height: ascendingPull ? 'asc' : 'desc' },
-          take,
-        });
+      : await this.prisma.chatMessage.findMany(
+          historyPageArgs(where, ascendingPull, take),
+        );
     const senderIds = rows
       .map((r) => r.senderID)
       .filter((id): id is string => id !== null);
@@ -2728,32 +2923,10 @@ export class ChatService {
    * [00:00, 24:00) 的 UTC 区间。keyword 不在这里:它先走二元组索引取候选
    * (findHistoryKeywordRows),这里的条件再套在候选上。
    */
-  private buildHistoryFilterWhere(
-    filters: HistoryFilters,
-  ): Prisma.ChatMessageWhereInput {
-    const where: Prisma.ChatMessageWhereInput = {};
-    if (filters.types?.length) {
-      where.type = { in: filters.types };
-    }
-    if (filters.date) {
-      const tzOffset = filters.tzOffsetMinutes ?? 0;
-      const tzEndOffset = filters.tzEndOffsetMinutes ?? tzOffset;
-      const utcStart = Date.parse(`${filters.date}T00:00:00Z`);
-      const start = utcStart + tzOffset * 60_000;
-      const end = utcStart + 24 * 60 * 60 * 1000 + tzEndOffset * 60_000;
-      if (Number.isFinite(start)) {
-        where.createdAt = {
-          gte: new Date(start),
-          lt: new Date(end),
-        };
-      }
-    }
-    return where;
-  }
-
   /**
    * 某月内有聊天记录的日期集合('YYYY-MM-DD',按客户端时区归日),
-   * 按日期日历给有记录的天上色用。上限 5000 行,极端活跃会话截断可接受。
+   * 按日期日历给有记录的天上色用。时区规则见 messageDayWindows,逐天的存在性查询见
+   * messageDaysQuery(原来取 5000 行回来去重,活跃月份会随机漏天)。
    */
   async listMessageDays(
     userId: string,
@@ -2763,94 +2936,19 @@ export class ChatService {
     tzOffsetMinutes = 0,
     timeZone?: string,
   ): Promise<string[]> {
-    // 座位行也要带回来:下面按清空水位与销毁/焚毁窗口过滤(main 的 #143 改的是
-    // 月份边界的时区算法,与这里的可见性过滤互不相干,两边都要)。
-    const { conversation, member } = await this.requireMembershipSeat(
-      conversationId,
-      userId,
+    // 座位行也要带回来:日历同样要按 getHistory 的尺子上色 —— 清空/焚毁之后那些天
+    // 点进去是空的,日历却还标着有记录。
+    const { member } = await this.requireMembershipSeat(conversationId, userId);
+    const windows = messageDayWindows(year, month, tzOffsetMinutes, timeZone);
+    if (windows.length === 0) return [];
+    const rows = await this.prisma.$queryRaw<Array<{ day: string }>>(
+      messageDaysQuery(
+        conversationId,
+        member.clearedBeforeHeight ?? 0,
+        windows,
+      ),
     );
-    const formatter = timeZone
-      ? new Intl.DateTimeFormat('en-US', {
-          timeZone,
-          year: 'numeric',
-          month: '2-digit',
-          day: '2-digit',
-        })
-      : undefined;
-    const monthStart = formatter
-      ? this.findUtcStartOfZonedDate(formatter, year, month, 1)
-      : Date.UTC(year, month, 1) + tzOffsetMinutes * 60_000;
-    const monthEnd = formatter
-      ? this.findUtcStartOfZonedDate(formatter, year, month + 1, 1)
-      : Date.UTC(year, month + 1, 1) + tzOffsetMinutes * 60_000;
-    if (!Number.isFinite(monthStart) || !Number.isFinite(monthEnd)) return [];
-    // 日历同样要按 getHistory 的尺子上色:清空/销毁/焚毁之后那些天点进去是空的,
-    // 日历却还标着有记录。
-    const floor = member.clearedBeforeHeight ?? 0;
-    const retention = buildChatRetentionWindow(
-      conversation,
-      NO_VIEWER_RETENTION,
-    );
-    const lowerBound = new Date(monthStart);
-    const messageWhere: Prisma.ChatMessageWhereInput = {
-      conversationID: conversationId,
-      deleted: false,
-      ...(floor > 0 ? { height: { gt: floor } } : {}),
-      createdAt: {
-        gte: lowerBound,
-        lt: new Date(monthEnd),
-      },
-    };
-    const retentionWhere = chatRetentionWhere(retention);
-    if (retentionWhere.AND) {
-      messageWhere.AND = retentionWhere.AND;
-    }
-    const rows = await this.prisma.chatMessage.findMany({
-      where: messageWhere,
-      select: { createdAt: true },
-      take: 5000,
-    });
-    const days = new Set<string>();
-    for (const row of rows) {
-      if (formatter) {
-        days.add(this.formatZonedDate(formatter, row.createdAt));
-      } else {
-        const local = new Date(
-          row.createdAt.getTime() - tzOffsetMinutes * 60_000,
-        );
-        days.add(local.toISOString().slice(0, 10));
-      }
-    }
-    return [...days].sort((a, b) => (a < b ? -1 : 1));
-  }
-
-  private findUtcStartOfZonedDate(
-    formatter: Intl.DateTimeFormat,
-    year: number,
-    month: number,
-    day: number,
-  ): number {
-    const normalized = new Date(Date.UTC(year, month, day));
-    const target = normalized.toISOString().slice(0, 10);
-    let low = normalized.getTime() - 36 * 60 * 60 * 1000;
-    let high = normalized.getTime() + 36 * 60 * 60 * 1000;
-    while (low < high) {
-      const middle = Math.floor((low + high) / 2);
-      if (this.formatZonedDate(formatter, new Date(middle)) < target) {
-        low = middle + 1;
-      } else {
-        high = middle;
-      }
-    }
-    return low;
-  }
-
-  private formatZonedDate(formatter: Intl.DateTimeFormat, date: Date): string {
-    const parts = formatter.formatToParts(date);
-    const year = parts.find((part) => part.type === 'year')?.value;
-    const month = parts.find((part) => part.type === 'month')?.value;
-    const day = parts.find((part) => part.type === 'day')?.value;
-    return `${year}-${month}-${day}`;
+    return rows.map((row) => row.day).sort((a, b) => (a < b ? -1 : 1));
   }
 
   /**
@@ -2926,11 +3024,18 @@ export class ChatService {
       round < TEXT_SEARCH_CANDIDATE_ROUNDS && matched.length < take;
       round += 1
     ) {
-      const candidates = await this.findTextMatchesByTime(
-        conversationIds,
-        trimmed,
-        before,
-      );
+      // 单字用不上 bigram 索引,只在每个会话最近一段里找(见 recentTextMatchesQuery)。
+      const candidates =
+        [...trimmed].length < 2
+          ? await this.prisma.$queryRaw<Array<{ id: string; createdAt: Date }>>(
+              recentTextMatchesQuery(
+                conversationIds,
+                likeContainsPattern(trimmed),
+                before,
+                TEXT_SEARCH_CANDIDATE_PAGE,
+              ),
+            )
+          : await this.findTextMatchesByTime(conversationIds, trimmed, before);
       if (candidates.length === 0) break;
       const visible = await this.prisma.chatMessage.findMany({
         where: {
@@ -3416,10 +3521,15 @@ export class ChatService {
     const userIds = seats.map((s) => s.userID);
     const [users, roles] = await Promise.all([
       this.resolveSenders(userIds, null),
-      conversation.circleID
+      // 角色只用来标这批在座的人:按 userID 取,不把整个圈子的 ACTIVE 成员拉回来。
+      conversation.circleID && userIds.length > 0
         ? this.prisma.circleMember
             .findMany({
-              where: { circleID: conversation.circleID, status: 'ACTIVE' },
+              where: {
+                circleID: conversation.circleID,
+                status: 'ACTIVE',
+                userID: { in: userIds },
+              },
               select: { userID: true, role: true },
             })
             .then((rows) => new Map(rows.map((r) => [r.userID, r.role])))
@@ -3654,28 +3764,36 @@ export class ChatService {
    * 「别人可以在这一瞬改掉」的 —— 被踢出圈子(座位置 leftAt)、被对方拉黑、
    * 管理台按下禁言、临时房到期。窗口虽短,但踢人/封禁这类操作的语义就是
    * 「立刻生效」,让一条消息在生效之后还能挤进去,是把安全边界做成了概率问题。
+   *
+   * locked:调用方锁行时已经从**被锁的那一行**读回了复查要用的会话列(发送路径),
+   * 就不再随座位 include 一次会话。返回复查读到的座位,调用方别再读第二遍。
    */
   private async assertStillSendable(
     tx: Prisma.TransactionClient,
     conversationId: string,
     senderUserId: string,
-  ): Promise<void> {
-    const seat = await tx.chatMember.findUnique({
-      where: {
-        conversationID_userID: {
-          conversationID: conversationId,
-          userID: senderUserId,
-        },
+    locked?: SendableConversation,
+  ): Promise<ChatMember> {
+    const where = {
+      conversationID_userID: {
+        conversationID: conversationId,
+        userID: senderUserId,
       },
-      include: { conversation: true },
-    });
+    };
+    const seat: (ChatMember & { conversation?: ChatConversation }) | null =
+      locked
+        ? await tx.chatMember.findUnique({ where })
+        : await tx.chatMember.findUnique({
+            where,
+            include: { conversation: true },
+          });
     if (!seat || seat.leftAt) {
       throw new ForbiddenException({
         message: '不是会话成员',
         errorCode: ChatErrorCode.NotMember,
       });
     }
-    const conversation = seat.conversation;
+    const conversation: SendableConversation = locked ?? seat.conversation!;
 
     // 逐人禁言与全员禁言都要在锁后复查:管理员按下禁言与这条消息落库之间
     // 是真实窗口,禁言的语义就是「立刻生效」。
@@ -3718,6 +3836,7 @@ export class ChatService {
         });
       }
     }
+    return seat;
   }
 
   private async assertNotBlockedBetween(
@@ -3742,75 +3861,26 @@ export class ChatService {
   }
 
   /**
-   * 每个会话的末条消息,一次集合查询取回。
+   * 每个会话的末条消息,一次集合查询取回(SQL 见 lastMessagesQuery)。
    * 原来是每会话一次 findFirst:100 个会话的列表页就要 100 次往返,叠加
    * 未读计数共 ~201 次,正常用户打开会话列表就能把 Prisma 连接池吃干。
-   * DISTINCT ON + (conversationID, height desc) 命中既有索引,单次即可。
    */
   private async loadLastMessages(
     conversationIds: string[],
     retentionWindows: ChatRetentionWindow[],
   ): Promise<Map<string, MessageRow>> {
     if (conversationIds.length === 0) return new Map();
-    const viewerCutoffs = retentionWindows.map((window) => window.viewerCutoff);
-    const viewerStarts = retentionWindows.map(
-      (window) => window.viewerStartedAt,
+    const rows = await this.prisma.$queryRaw<MessageRow[]>(
+      lastMessagesQuery(conversationIds, retentionWindows),
     );
-    const burnStarts = retentionWindows.map((window) => window.burnStartedAt);
-    const burnCutoffs = retentionWindows.map((window) => window.burnCutoff);
-    // 每个会话只沿 (conversationID, height) 唯一索引倒着找第一条可见的消息。原来的
-    // DISTINCT ON 在 PG16 上没有 skip scan:要把每个会话的全部历史读出来、连正文
-    // 一起排序,几个十万条的大群就是每次拉列表上百万行。
-    //
-    // 列名逐个写出而不是 SELECT *:唯一的目的是别把 contentHistory 拖进来
-    // (见 MessageRow 上的注释)。原始 SQL 绕过 Prisma 的 omit,只能手写 ——
-    // 也绕过了类型检查,漏一列 tsc 照过,chat-last-message-columns.spec 兜着。
-    const rows = await this.prisma.$queryRaw<MessageRow[]>`
-      SELECT latest.*
-      FROM unnest(
-        ${conversationIds}::text[],
-        ${viewerCutoffs}::timestamptz[],
-        ${viewerStarts}::timestamptz[],
-        ${burnStarts}::timestamptz[],
-        ${burnCutoffs}::timestamptz[]
-      ) AS w("conversationID", "viewerCutoff", "viewerStartedAt",
-             "burnStartedAt", "burnCutoff")
-      CROSS JOIN LATERAL (
-        SELECT
-          m."id", m."conversationID", m."height", m."senderID", m."type", m."content",
-          m."clientMessageId", m."requestHash", m."replyToID", m."deleted",
-          m."revokedAt", m."revokedBy", m."editedAt", m."deletedAt", m."revision",
-          m."createdAt", m."burnDurationSec", m."burnExpiresAt"
-        FROM "ChatMessage" AS m
-        WHERE m."conversationID" = w."conversationID"
-          AND m."deleted" = false
-          AND (m."burnExpiresAt" IS NULL OR m."burnExpiresAt" > NOW())
-          AND (
-            w."viewerCutoff" IS NULL
-            OR (w."viewerStartedAt" IS NOT NULL AND m."createdAt" < w."viewerStartedAt")
-            OR m."createdAt" >= w."viewerCutoff"
-          )
-          AND (
-            w."burnCutoff" IS NULL
-            OR (w."burnStartedAt" IS NOT NULL AND m."createdAt" < w."burnStartedAt")
-            OR m."createdAt" >= w."burnCutoff"
-          )
-        ORDER BY m."height" DESC
-        LIMIT 1
-      ) AS latest
-    `;
     const map = new Map<string, MessageRow>();
     for (const row of rows) map.set(row.conversationID, row);
     return map;
   }
 
   /**
-   * 每个会话的未读数,一次查询取回(每会话各自的 lastReadHeight 水位)。原来每会话
-   * 一次 count。
-   *
-   * 数到 UNREAD_COUNT_CAP 就停:界面最多显示 99+,而不封顶的 COUNT 对一个积了上万条
-   * 未读的大群要逐行回表(deleted/revokedAt/createdAt/senderID 都不在索引里),每次
-   * 拉会话列表都来一遍。
+   * 每个会话的未读数,一次查询取回(每会话各自的 lastReadHeight 水位,数到
+   * UNREAD_COUNT_CAP 封顶;SQL 见 unreadCountsQuery)。原来每会话一次 count。
    */
   private async loadUnreadCounts(
     userId: string,
@@ -3821,55 +3891,9 @@ export class ChatService {
       memberships.map((m) => [m.conversationID, 0]),
     );
     if (memberships.length === 0) return map;
-    const ids = memberships.map((m) => m.conversationID);
-    const floors = memberships.map((m) => m.lastReadHeight);
-    const viewerCutoffs = retentionWindows.map((window) => window.viewerCutoff);
-    const viewerStarts = retentionWindows.map(
-      (window) => window.viewerStartedAt,
-    );
-    const burnStarts = retentionWindows.map((window) => window.burnStartedAt);
-    const burnCutoffs = retentionWindows.map((window) => window.burnCutoff);
     const rows = await this.prisma.$queryRaw<
       Array<{ conversationID: string; count: bigint }>
-    >`
-      SELECT w."conversationID", unread.count
-      FROM unnest(
-        ${ids}::text[],
-        ${floors}::int[],
-        ${viewerCutoffs}::timestamptz[],
-        ${viewerStarts}::timestamptz[],
-        ${burnStarts}::timestamptz[],
-        ${burnCutoffs}::timestamptz[]
-      ) AS w("conversationID", floor, "viewerCutoff", "viewerStartedAt",
-             "burnStartedAt", "burnCutoff")
-      CROSS JOIN LATERAL (
-        SELECT COUNT(*)::bigint AS count
-        FROM (
-          SELECT 1
-          FROM "ChatMessage" AS m
-          WHERE m."conversationID" = w."conversationID"
-            AND m."height" > w.floor
-            AND m."deleted" = false
-          AND (m."burnExpiresAt" IS NULL OR m."burnExpiresAt" > NOW())
-            -- 撤回的消息不计未读:对方发了又撤回,红点不该还挂着一条看不到内容的「新消息」。
-            AND m."revokedAt" IS NULL
-            AND (
-              w."viewerCutoff" IS NULL
-              OR (w."viewerStartedAt" IS NOT NULL AND m."createdAt" < w."viewerStartedAt")
-              OR m."createdAt" >= w."viewerCutoff"
-            )
-            AND (
-              w."burnCutoff" IS NULL
-              OR (w."burnStartedAt" IS NOT NULL AND m."createdAt" < w."burnStartedAt")
-              OR m."createdAt" >= w."burnCutoff"
-            )
-            -- 自己发的消息不计未读。
-            AND (m."senderID" IS NULL OR m."senderID" <> ${userId})
-          LIMIT ${UNREAD_COUNT_CAP}
-        ) AS capped
-      ) AS unread
-      WHERE unread.count > 0
-    `;
+    >(unreadCountsQuery(userId, memberships, retentionWindows));
     for (const row of rows) map.set(row.conversationID, Number(row.count));
     return map;
   }
@@ -4503,17 +4527,6 @@ export class ChatService {
           errorCode: ChatErrorCode.MessageNotFound,
         });
       }
-      const encryption = await tx.chatConversation.findUnique({
-        where: { id: conversationId },
-        select: { textEncryption: true },
-      });
-      if (
-        encryption?.textEncryption === 'MLS_V1' ||
-        current.type === 'encrypted-text'
-      )
-        throw new BadRequestException(
-          'Send a new encrypted message instead of editing',
-        );
       const previous = (current.content ?? {}) as Record<string, unknown>;
       const history = Array.isArray(current.contentHistory)
         ? [...(current.contentHistory as unknown[])]

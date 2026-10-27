@@ -12,10 +12,12 @@ describe('trace comment mention notification flow', () => {
     trace: {
       findFirst: jest.fn(),
       update: jest.fn(),
+      findMany: jest.fn(),
     },
     traceComment: {
       findFirst: jest.fn(),
       create: jest.fn(),
+      findMany: jest.fn(),
     },
     user: {
       findMany: jest.fn(),
@@ -53,8 +55,10 @@ describe('trace comment mention notification flow', () => {
   beforeEach(() => {
     prisma.trace.findFirst.mockReset();
     prisma.trace.update.mockReset();
+    prisma.trace.findMany.mockReset();
     prisma.traceComment.findFirst.mockReset();
     prisma.traceComment.create.mockReset();
+    prisma.traceComment.findMany.mockReset();
     prisma.user.findMany.mockReset();
     prisma.friend.findMany.mockReset();
     prisma.userPrivacySetting.findMany.mockReset();
@@ -120,42 +124,57 @@ describe('trace comment mention notification flow', () => {
     prisma.trace.update.mockResolvedValue({});
     prisma.friend.findMany.mockResolvedValue([]);
     prisma.userPrivacySetting.findMany.mockResolvedValue([]);
-    // Notifications are written with one createManyAndReturn and hydrated by a
-    // follow-up findMany, so the mock keeps the inserted rows to serve back.
-    let insertedRows: any[] = [];
+    // Notifications are written with one createManyAndReturn whose RETURNING
+    // already carries the notification columns (in insertion order); relations
+    // are loaded by foreign key after the transaction commits.
     prisma.notification.createManyAndReturn.mockImplementation(
-      ({ data }: any) => {
-        insertedRows = data.map((row: any) => ({
-          id: `notification-${row.toUserID}`,
-          ...row,
-          content: row.content ?? '',
-          read: false,
-          createdAt: new Date('2026-07-10T00:00:01Z'),
-          fromUser: { id: 'actor-1', nickname: 'Aki', avatarUrl: null },
-          fromTrace: { id: 'trace-1', content: 'trace body', images: [] },
-          fromReply: { id: 'comment-1', content: 'hello' },
-          fromCircle: null,
-          fromCirclePost: null,
-          fromInvitation: null,
-        }));
-        return Promise.resolve(insertedRows.map(({ id }) => ({ id })));
-      },
+      ({ data }: any) =>
+        Promise.resolve(
+          data.map((row: any) => ({
+            id: `notification-${row.toUserID}`,
+            fromCircleID: null,
+            fromCirclePostID: null,
+            fromInvitationID: null,
+            fromGroupAdmissionID: null,
+            fromFriendRequestID: null,
+            systemAnnouncementID: null,
+            toReplyID: null,
+            ...row,
+            content: row.content ?? '',
+            read: false,
+            createdAt: new Date('2026-07-10T00:00:01Z'),
+          })),
+        ),
     );
-    // Reversed on purpose: findMany gives no order guarantee, so the service
-    // must restore insertion order itself.
-    prisma.notification.findMany.mockImplementation(({ where }: any) => {
-      const ids = new Set(where.id.in);
-      return Promise.resolve(
-        insertedRows.filter((row) => ids.has(row.id)).reverse(),
-      );
-    });
+    prisma.trace.findMany.mockResolvedValue([
+      { id: 'trace-1', content: 'trace body', images: [] },
+    ]);
+    prisma.traceComment.findMany.mockResolvedValue([
+      { id: 'comment-1', content: 'hello' },
+    ]);
   });
 
+  /** user.findMany 同时服务提及资格校验和通知发送者的回填（select 里带 nickname）。 */
+  const eligibilityCalls = () =>
+    prisma.user.findMany.mock.calls.filter(
+      ([args]: any[]) => !args?.select?.nickname,
+    );
+  const mockEligibility = (...batches: Array<Array<{ id: string }>>) => {
+    let call = 0;
+    prisma.user.findMany.mockImplementation(({ select }: any) => {
+      if (select?.nickname) {
+        return Promise.resolve([
+          { id: 'actor-1', nickname: 'Aki', avatarUrl: null },
+        ]);
+      }
+      const batch = batches[Math.min(call, batches.length - 1)];
+      call += 1;
+      return Promise.resolve(batch);
+    });
+  };
+
   it('delivers one eligible mention while reply overlap keeps higher precedence', async () => {
-    prisma.user.findMany.mockResolvedValue([
-      { id: 'reply-user-1' },
-      { id: 'mention-user-1' },
-    ]);
+    mockEligibility([{ id: 'reply-user-1' }, { id: 'mention-user-1' }]);
 
     await traceService.addComment('actor-1', 'trace-1', {
       content: 'hello',
@@ -191,14 +210,16 @@ describe('trace comment mention notification flow', () => {
     expect(realtime.broadcastNotificationCreated).toHaveBeenCalledTimes(2);
     expect(realtime.broadcastNotificationCreated).toHaveBeenCalledWith(
       'mention-user-1',
-      expect.objectContaining({ type: 'TRACE_MENTION' }),
+      expect.objectContaining({
+        type: 'TRACE_MENTION',
+        fromUser: { id: 'actor-1', nickname: 'Aki', avatarUrl: null },
+        fromReply: { id: 'comment-1', content: 'hello' },
+      }),
     );
   });
 
   it('skips a revoked mention while preserving the reply notification at the boundary', async () => {
-    prisma.user.findMany
-      .mockResolvedValueOnce([{ id: 'mention-user-1' }])
-      .mockResolvedValueOnce([]);
+    mockEligibility([{ id: 'mention-user-1' }], []);
 
     await expect(
       traceService.addComment('actor-1', 'trace-1', {
@@ -208,7 +229,7 @@ describe('trace comment mention notification flow', () => {
       }),
     ).resolves.toEqual(expect.objectContaining({ id: 'comment-1' }));
 
-    expect(prisma.user.findMany).toHaveBeenCalledTimes(2);
+    expect(eligibilityCalls()).toHaveLength(2);
     expect(prisma.notification.createManyAndReturn).toHaveBeenCalledTimes(1);
     expect(
       prisma.notification.createManyAndReturn.mock.calls[0][0].data,

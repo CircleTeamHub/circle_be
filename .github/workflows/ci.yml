@@ -59,8 +59,13 @@ jobs:
           bash test/gen-env-existing.spec.sh
           bash test/release-force-command.spec.sh
           bash test/sync-metrics-token.spec.sh
+          bash test/backup-check-metrics.spec.sh
+          bash test/backup-drill.spec.sh
+          bash test/offsite-backup-metrics.spec.sh
+          bash test/sync-ops-stacks.spec.sh
           node --test test/prometheus-alerts.spec.mjs
           node --test test/monitoring-operations-dashboard.spec.mjs
+          node --test test/monitoring-deliveries-dashboard.spec.mjs test/logs-pipeline.spec.mjs test/compose-healthchecks.spec.mjs test/deploy-host-config.spec.mjs test/security-workflow.spec.mjs test/alert-runbooks.spec.mjs test/monitoring-wiring.spec.mjs test/synthetic-probe.spec.mjs
 
       # prometheus-alerts.spec.mjs 断言的是规则的**语义**（阈值、选择器、
       # 用 delta 而不是存量…），它读不出 PromQL 语法错误 —— 一个打错的
@@ -258,8 +263,10 @@ jobs:
       - name: E2E Tests
         run: npm run test:e2e
 
-      - name: Burn archive PostgreSQL regressions
-        run: BURN_ARCHIVE_TEST_DATABASE_URL="$DATABASE_URL" npx jest --config test/jest-postgres.json --runInBand
+      # Burn archive + SQL hot-path regressions (test/postgres/*.pg-spec.ts):
+      # each file builds an isolated schema inside this database.
+      - name: PostgreSQL regressions
+        run: BURN_ARCHIVE_TEST_DATABASE_URL="$DATABASE_URL" POSTGRES_TEST_DATABASE_URL="$DATABASE_URL" npx jest --config test/jest-postgres.json --runInBand
 
       - name: Job Duration
         if: always()
@@ -394,6 +401,8 @@ jobs:
           tags: circle-caddy:ci
           cache-from: type=gha
           cache-to: type=gha,mode=max
+          # 运行阶段每次重建：缓存里的 apk upgrade 层会停在上次构建时的包版本。
+          no-cache-filters: runtime
 
       - name: Verify Caddy rate-limit module
         run: |

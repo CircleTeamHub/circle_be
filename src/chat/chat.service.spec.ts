@@ -5,7 +5,10 @@ import {
   NotFoundException,
 } from '@nestjs/common';
 import { ChatErrorCode } from 'src/common/app-error-codes';
+import { CONVERSATION_LIST_MAX } from './chat.constants';
 import { ChatService, conversationSyncRevision } from './chat.service';
+import { SINGLE_CHAR_SEARCH_WINDOW } from './chat-text-search.query';
+import type { Prisma } from 'src/generated/prisma';
 import { chatSendRequestHash } from './chat-send-request-hash';
 import type { ChatSendPayload } from './chat.types';
 
@@ -201,7 +204,12 @@ describe('ChatService', () => {
       { id: 'u1', nickname: '一波', avatarUrl: null },
     ]);
     prisma.supportAgent.findFirst.mockResolvedValue(null);
-    prisma.chatDirectAutoReplyJob.create.mockResolvedValue(undefined);
+    prisma.chatDirectAutoReplyJob.create.mockResolvedValue({
+      id: 'auto-job-1',
+    });
+    prisma.supportRechargeJob.create.mockResolvedValue({
+      id: 'recharge-job-1',
+    });
     prisma.circle.findMany.mockResolvedValue([]);
     prisma.tempChat.findMany.mockResolvedValue([]);
     prisma.tempChat.findUnique.mockResolvedValue({
@@ -397,15 +405,19 @@ describe('ChatService', () => {
         data: expect.objectContaining({ height: 4 }),
       }),
     );
-    // 计数器前进与 lastMessageAt 合并成同一条 UPDATE。
-    expect(prisma.chatConversation.update).toHaveBeenCalledWith(
-      expect.objectContaining({
-        data: expect.objectContaining({
-          nextHeight: 4,
-          lastMessageAt: expect.any(Date),
-        }),
-      }),
-    );
+    // 计数器前进与 lastMessageAt(以及隐藏会话复现)合并成同一条语句。
+    const [advance] = prisma.$executeRaw.mock.calls[0] as [
+      { sql: string; values: unknown[] },
+    ];
+    expect(advance.sql).toContain('"nextHeight" = ?');
+    expect(advance.sql).toContain('"lastMessageAt" = ?');
+    expect(advance.values).toEqual([
+      'conv-1',
+      4,
+      createdRow.createdAt,
+      expect.any(Date),
+      'conv-1',
+    ]);
   });
 
   it('stamps the current sender personal card on every note-card share', async () => {
@@ -1189,10 +1201,20 @@ describe('ChatService', () => {
           }),
         }),
       );
-      // 会话活跃时间在同一事务内推进(会话列表排序依据)。
-      expect(prisma.chatConversation.update).toHaveBeenCalledWith(
-        expect.objectContaining({ where: { id: 'conv-1' } }),
+      // 会话活跃时间在同一事务内推进(会话列表排序依据):计数器、排序时间与
+      // 隐藏会话复现合成一条语句。
+      const [advance] = prisma.$executeRaw.mock.calls[
+        prisma.$executeRaw.mock.calls.length - 1
+      ] as [{ sql: string; values: unknown[] }];
+      expect(advance.sql).toContain('UPDATE "ChatConversation"');
+      expect(advance.values).toEqual(
+        expect.arrayContaining(['conv-1', 4, createdRow.createdAt]),
       );
+      expect(prisma.chatConversation.update).not.toHaveBeenCalled();
+      expect(result.enqueuedJobs).toEqual({
+        directAutoReplyJobId: null,
+        supportRechargeJobId: null,
+      });
       // G-05:height 分配走会话行锁读(SELECT..FOR UPDATE),advisory lock 退役。
       expect(prisma.$queryRaw).toHaveBeenCalled();
       expect(prisma.chatMessage.aggregate).not.toHaveBeenCalled();
@@ -1217,12 +1239,21 @@ describe('ChatService', () => {
         directMessageAutoReplyText: '稍后回复',
       });
 
-      await service.sendMessage('u1', sendPayload());
+      const result = await service.sendMessage('u1', sendPayload());
 
       expect(prisma.chatDirectAutoReplyJob.create).toHaveBeenCalledWith({
         data: { sourceMessageID: 'msg-1' },
+        select: { id: true },
+      });
+      expect(result.enqueuedJobs).toEqual({
+        directAutoReplyJobId: 'auto-job-1',
+        supportRechargeJobId: null,
       });
       expect(prisma.$transaction).toHaveBeenCalledTimes(1);
+      // 开关只是入队的闸:在取会话行锁之前查,不占锁内往返。
+      expect(
+        prisma.userPrivacySetting.findUnique.mock.invocationCallOrder[0],
+      ).toBeLessThan(prisma.$transaction.mock.invocationCallOrder[0]);
       expect(
         prisma.chatMessage.create.mock.invocationCallOrder[0],
       ).toBeLessThan(
@@ -1284,6 +1315,80 @@ describe('ChatService', () => {
       expect(prisma.chatDirectAutoReplyJob.create).not.toHaveBeenCalled();
     });
 
+    it('enqueues a recharge job for an active recharge agent, deciding outside the lock', async () => {
+      prisma.chatMember.findUnique.mockResolvedValue(
+        membership({
+          conversation: {
+            ...membership().conversation,
+            type: 'DIRECT',
+            directKey: 'u1:agent-1',
+          },
+        }),
+      );
+      prisma.chatMessage.findUnique.mockResolvedValue(null);
+      prisma.chatMessage.create.mockResolvedValue(createdRow);
+      prisma.userPrivacySetting.findUnique.mockResolvedValue(null);
+      prisma.supportAgent.findFirst.mockResolvedValue({ id: 'agent-row' });
+
+      const result = await service.sendMessage('u1', sendPayload());
+
+      expect(prisma.supportAgent.findFirst).toHaveBeenCalledWith({
+        where: {
+          category: 'recharge',
+          userID: 'agent-1',
+          enabled: true,
+          user: { status: 'ACTIVE' },
+        },
+        select: { id: true },
+      });
+      expect(prisma.supportRechargeJob.create).toHaveBeenCalledWith({
+        data: { sourceMessageID: 'msg-1' },
+        select: { id: true },
+      });
+      expect(result.enqueuedJobs).toEqual({
+        directAutoReplyJobId: null,
+        supportRechargeJobId: 'recharge-job-1',
+      });
+      expect(
+        prisma.supportAgent.findFirst.mock.invocationCallOrder[0],
+      ).toBeLessThan(prisma.$transaction.mock.invocationCallOrder[0]);
+      expect(
+        prisma.chatMessage.create.mock.invocationCallOrder[0],
+      ).toBeLessThan(
+        prisma.supportRechargeJob.create.mock.invocationCallOrder[0],
+      );
+    });
+
+    it('never looks up a recharge agent for message types the agent cannot handle', async () => {
+      prisma.chatMember.findUnique.mockResolvedValue(
+        membership({
+          conversation: {
+            ...membership().conversation,
+            type: 'DIRECT',
+            directKey: 'u1:agent-1',
+          },
+        }),
+      );
+      prisma.chatMessage.findUnique.mockResolvedValue(null);
+      prisma.chatMessage.create.mockResolvedValue({
+        ...createdRow,
+        type: 'location',
+      });
+      prisma.userPrivacySetting.findUnique.mockResolvedValue(null);
+      prisma.supportAgent.findFirst.mockResolvedValue({ id: 'agent-row' });
+
+      await service.sendMessage(
+        'u1',
+        sendPayload({
+          type: 'location',
+          content: { latitude: 1, longitude: 2, name: 'x' },
+        }),
+      );
+
+      expect(prisma.supportAgent.findFirst).not.toHaveBeenCalled();
+      expect(prisma.supportRechargeJob.create).not.toHaveBeenCalled();
+    });
+
     it('does not enqueue auto-reply jobs for replayed or group messages', async () => {
       prisma.chatMember.findUnique.mockResolvedValue(
         membership({
@@ -1296,8 +1401,10 @@ describe('ChatService', () => {
       );
       prisma.chatMessage.findUnique.mockResolvedValue(createdRow);
 
-      await service.sendMessage('u1', sendPayload());
+      const replay = await service.sendMessage('u1', sendPayload());
       expect(prisma.chatDirectAutoReplyJob.create).not.toHaveBeenCalled();
+      // 私聊复用不知道首次发送入了什么:交给网关按消息 id 兜底。
+      expect(replay.enqueuedJobs).toBeNull();
 
       jest.clearAllMocks();
       prisma.$transaction.mockImplementation(runTx as never);
@@ -1370,8 +1477,14 @@ describe('ChatService', () => {
 
       expect(result.reused).toBe(true);
       expect(result.message.id).toBe('msg-1');
+      // 群消息复用:群里从来不入队,网关什么都不用 kick。
+      expect(result.enqueuedJobs).toEqual({
+        directAutoReplyJobId: null,
+        supportRechargeJobId: null,
+      });
       expect(prisma.chatMessage.create).not.toHaveBeenCalled();
       expect(prisma.chatConversation.update).not.toHaveBeenCalled();
+      expect(prisma.$executeRaw).not.toHaveBeenCalled();
     });
 
     it('refuses a replay of the same delivery id carrying different content', async () => {
@@ -1433,6 +1546,46 @@ describe('ChatService', () => {
           }),
         }),
       );
+    });
+
+    // 文字加密已整体下线:encrypted-text 不再是可发送类型,和任何未知类型走同一条
+    // validateSendPayload 拒绝路径(InvalidPayload),在碰数据库之前就被拦下,
+    // 不再有专用错误码。
+    it('rejects the retired encrypted-text type exactly like an unknown type', async () => {
+      const rejection = async (type: string) => {
+        const error = await service
+          .sendMessage(
+            'u1',
+            sendPayload({
+              type,
+              content: {
+                envelope: {
+                  ciphertext: 'opaque',
+                  clientMessageId: 'client-msg-1',
+                },
+                signature: 'proof',
+              },
+            }),
+          )
+          .then(
+            () => null,
+            (caught: unknown) => caught,
+          );
+        expect(error).toBeInstanceOf(BadRequestException);
+        return (error as BadRequestException).getResponse();
+      };
+
+      expect(await rejection('encrypted-text')).toEqual({
+        message: '不支持的消息类型: encrypted-text',
+        errorCode: ChatErrorCode.InvalidPayload,
+      });
+      expect(await rejection('not-a-message-type')).toEqual({
+        message: '不支持的消息类型: not-a-message-type',
+        errorCode: ChatErrorCode.InvalidPayload,
+      });
+      expect(prisma.chatMember.findUnique).not.toHaveBeenCalled();
+      expect(prisma.$transaction).not.toHaveBeenCalled();
+      expect(prisma.chatMessage.create).not.toHaveBeenCalled();
     });
 
     it('rejects senders that are not members', async () => {
@@ -1539,6 +1692,42 @@ describe('ChatService', () => {
         response: { errorCode: ChatErrorCode.MemberSilenced },
       });
       expect(prisma.chatMessage.create).not.toHaveBeenCalled();
+    });
+
+    // 锁内复查读的是**被锁那一行**上的会话列(锁行语句顺带读回),座位只读一次。
+    it('rejects a mute-all switched on between the pre-check and the lock', async () => {
+      prisma.chatMember.findUnique.mockResolvedValue(
+        membership({
+          conversation: { ...membership().conversation, ownerID: 'owner-9' },
+        }),
+      );
+      prisma.chatMessage.findUnique.mockResolvedValue(null);
+      prisma.$queryRaw.mockResolvedValueOnce([
+        {
+          nextHeight: 3,
+          type: 'GROUP',
+          directKey: null,
+          circleID: null,
+          ownerID: 'owner-9',
+          muteAllAt: new Date(),
+          tempChatID: null,
+        },
+      ]);
+
+      await expect(
+        service.sendMessage('u1', sendPayload()),
+      ).rejects.toMatchObject({
+        response: { errorCode: ChatErrorCode.ConversationMuted },
+      });
+      const lock = prisma.$queryRaw.mock.calls[0][0] as { sql: string };
+      expect(lock.sql).toContain('"muteAllAt"');
+      expect(lock.sql).toContain('FOR UPDATE');
+      expect(prisma.chatMessage.create).not.toHaveBeenCalled();
+      // 锁外 requireMembershipSeat 一次 + 锁内复查一次;复查不再 include 会话。
+      expect(prisma.chatMember.findUnique).toHaveBeenCalledTimes(2);
+      expect(prisma.chatMember.findUnique.mock.calls[1][0]).not.toHaveProperty(
+        'include',
+      );
     });
 
     it('blocks sensitive words before any DB write', async () => {
@@ -1758,10 +1947,14 @@ describe('ChatService', () => {
       prisma.chatMember.findUnique.mockResolvedValue(seatAt(9, 'DIRECT'));
       prisma.chatMember.updateMany.mockResolvedValue({ count: 1 });
       prisma.$queryRaw
+        .mockResolvedValueOnce([{ pending: true }])
         .mockResolvedValueOnce([])
         .mockResolvedValueOnce([{ revision: 17 }]);
       await service.markRead('u1', 'conv-1', 5);
-      const sql = prisma.$queryRaw.mock.calls[1][0].join(' ');
+      expect(prisma.$queryRaw.mock.calls[1][0].join(' ')).toContain(
+        'FOR UPDATE',
+      );
+      const sql = prisma.$queryRaw.mock.calls[2][0].join(' ');
       expect(sql).toContain('"burnExpiresAt" IS NULL');
       expect(sql).toContain('m."senderID" <>');
       expect(sql).toContain('INTERVAL');
@@ -1771,6 +1964,7 @@ describe('ChatService', () => {
 
     it('does not publish a timer when the transaction fails', async () => {
       prisma.chatMember.findUnique.mockResolvedValue(seatAt(9, 'DIRECT'));
+      prisma.$queryRaw.mockResolvedValueOnce([{ pending: true }]);
       prisma.$transaction.mockRejectedValueOnce(new Error('rollback'));
       await expect(service.markRead('u1', 'conv-1', 5)).rejects.toThrow(
         'rollback',
@@ -1782,11 +1976,57 @@ describe('ChatService', () => {
       prisma.chatMember.findUnique
         .mockResolvedValueOnce(seatAt(9, 'DIRECT'))
         .mockResolvedValueOnce(null);
+      prisma.$queryRaw.mockResolvedValueOnce([{ pending: true }]);
       await expect(service.markRead('u1', 'conv-1', 5)).rejects.toThrow(
         ForbiddenException,
       );
       expect(prisma.chatMember.updateMany).not.toHaveBeenCalled();
       expect(broadcast.emitBurnStarted).not.toHaveBeenCalled();
+    });
+
+    // 没有待启动的阅后即焚计时就不取会话行锁:单聊回执不再和发送互相排队。
+    it('advances a direct watermark without the conversation lock when no timer is pending', async () => {
+      prisma.chatMember.findUnique.mockResolvedValue(seatAt(9, 'DIRECT'));
+      prisma.chatMember.updateMany.mockResolvedValue({ count: 1 });
+      prisma.$queryRaw.mockResolvedValueOnce([{ pending: false }]);
+
+      await expect(service.markRead('u1', 'conv-1', 5)).resolves.toEqual({
+        advanced: true,
+        height: 5,
+        conversationType: 'DIRECT',
+      });
+
+      const precheck = prisma.$queryRaw.mock.calls[0][0] as {
+        sql: string;
+        values: unknown[];
+      };
+      expect(precheck.sql).toContain('"burnExpiresAt" IS NULL');
+      expect(precheck.values).toEqual(['conv-1', 5, 'u1']);
+      expect(prisma.$queryRaw).toHaveBeenCalledTimes(1);
+      expect(prisma.$transaction).not.toHaveBeenCalled();
+      expect(prisma.chatMember.updateMany).toHaveBeenCalledWith({
+        where: {
+          conversationID: 'conv-1',
+          userID: 'u1',
+          leftAt: null,
+          lastReadHeight: { lt: 5 },
+        },
+        data: { lastReadHeight: 5 },
+      });
+      expect(broadcast.emitBurnStarted).not.toHaveBeenCalled();
+    });
+
+    it('still reports NotMember on the lock-free path when the seat is gone', async () => {
+      prisma.chatMember.findUnique
+        .mockResolvedValueOnce(seatAt(9, 'DIRECT'))
+        .mockResolvedValueOnce({ leftAt: new Date() });
+      prisma.chatMember.updateMany.mockResolvedValue({ count: 0 });
+      prisma.$queryRaw.mockResolvedValueOnce([{ pending: false }]);
+
+      await expect(service.markRead('u1', 'conv-1', 5)).rejects.toMatchObject({
+        response: { errorCode: ChatErrorCode.NotMember },
+      });
+      expect(prisma.$transaction).not.toHaveBeenCalled();
     });
 
     it('rejects non-integer heights', async () => {
@@ -2645,6 +2885,29 @@ describe('ChatService', () => {
       expect(values).toEqual(expect.arrayContaining(['合同', '%合同%']));
     });
 
+    // 「图片 / 视频 / 文件」页签与普通翻页靠 20261026000300 的两条部分索引
+    // (conversationID[, type], height) WHERE deleted = false 跨过焚毁墓碑(真库见
+    // test/postgres/chat-history-live-indexes.pg-spec.ts)。条件形状一变索引就静默失效。
+    it('keeps type tabs on the live (conversationID, type, height) index shape', async () => {
+      prisma.chatMember.findUnique.mockResolvedValue(membership());
+      prisma.chatMessage.findMany.mockResolvedValue([]);
+
+      await service.getHistory('u1', 'conv-1', 40, 50, {
+        types: ['video', 'file'],
+      });
+
+      const [[args]] = prisma.chatMessage.findMany.mock.calls as [
+        [Prisma.ChatMessageFindManyArgs],
+      ];
+      expect(args.where).toMatchObject({
+        conversationID: 'conv-1',
+        deleted: false,
+        height: { lt: 40 },
+        type: { in: ['video', 'file'] },
+      });
+      expect(args.orderBy).toEqual({ height: 'desc' });
+    });
+
     it('escapes LIKE wildcards in the keyword', async () => {
       prisma.chatMember.findUnique.mockResolvedValue(membership());
       prisma.$queryRaw.mockResolvedValue([]);
@@ -2695,27 +2958,50 @@ describe('ChatService', () => {
   });
 
   describe('listMessageDays', () => {
-    it('groups message timestamps into client-timezone days', async () => {
-      prisma.chatMember.findUnique.mockResolvedValue(membership());
-      prisma.chatMessage.findMany.mockResolvedValue([
-        // UTC 8/4 17:00 = 东八区 8/5 01:00;UTC 8/5 15:00 = 东八区 8/5 23:00。
-        { createdAt: new Date('2026-08-04T17:00:00.000Z') },
-        { createdAt: new Date('2026-08-05T15:00:00.000Z') },
-        { createdAt: new Date('2026-08-05T17:00:00.000Z') }, // 东八区 8/6
+    // 原来不带 orderBy 取 5000 行 createdAt 回来去重,活跃月份随机漏天;现在按客户端
+    // 时区把这个月切成天,逐天问库里有没有可见消息(真库口径见
+    // test/postgres/chat-message-days.pg-spec.ts)。
+    const daysQuery = () => {
+      const [[query]] = prisma.$queryRaw.mock.calls as [[Prisma.Sql]];
+      const [days, starts, ends, conversationId, floor] = query.values as [
+        string[],
+        string[],
+        string[],
+        string,
+        number,
+      ];
+      return { sql: query.sql, days, starts, ends, conversationId, floor };
+    };
+
+    it('asks the database per client-timezone day and returns the days sorted', async () => {
+      prisma.chatMember.findUnique.mockResolvedValue(
+        membership({ clearedBeforeHeight: 12 }),
+      );
+      prisma.$queryRaw.mockResolvedValue([
+        { day: '2026-08-06' },
+        { day: '2026-08-05' },
       ]);
 
       const days = await service.listMessageDays('u1', 'conv-1', 2026, 7, -480);
+
       expect(days).toEqual(['2026-08-05', '2026-08-06']);
+      expect(prisma.chatMessage.findMany).not.toHaveBeenCalled();
+      const query = daysQuery();
+      expect(query.conversationId).toBe('conv-1');
+      // 清空水位之下的消息不给日历上色。
+      expect(query.floor).toBe(12);
+      expect(query.days).toHaveLength(31);
+      // 东八区:当地 8/5 = UTC 8/4 16:00 起。
+      expect(query.starts[4]).toBe('2026-08-04T16:00:00.000Z');
+      expect(query.ends[4]).toBe('2026-08-05T16:00:00.000Z');
+      expect(query.days[4]).toBe('2026-08-05');
     });
 
-    it('uses the IANA timezone for month boundaries and per-message days', async () => {
+    it('uses the IANA timezone for month boundaries and per-day windows', async () => {
       prisma.chatMember.findUnique.mockResolvedValue(membership());
-      prisma.chatMessage.findMany.mockResolvedValue([
-        { createdAt: new Date('2026-03-08T07:30:00.000Z') }, // 3/7 23:30 PST
-        { createdAt: new Date('2026-03-08T08:30:00.000Z') }, // 3/8 00:30 PST
-      ]);
+      prisma.$queryRaw.mockResolvedValue([]);
 
-      const days = await service.listMessageDays(
+      await service.listMessageDays(
         'u1',
         'conv-1',
         2026,
@@ -2724,17 +3010,15 @@ describe('ChatService', () => {
         'America/Los_Angeles',
       );
 
-      expect(prisma.chatMessage.findMany).toHaveBeenCalledWith(
-        expect.objectContaining({
-          where: expect.objectContaining({
-            createdAt: {
-              gte: new Date('2026-03-01T08:00:00.000Z'),
-              lt: new Date('2026-04-01T07:00:00.000Z'),
-            },
-          }),
-        }),
-      );
-      expect(days).toEqual(['2026-03-07', '2026-03-08']);
+      const query = daysQuery();
+      expect(query.starts[0]).toBe('2026-03-01T08:00:00.000Z');
+      expect(query.ends[30]).toBe('2026-04-01T07:00:00.000Z');
+      // 3/8 切夏令时,这一天的 UTC 区间只有 23 小时。
+      expect([query.starts[7], query.ends[7]]).toEqual([
+        '2026-03-08T08:00:00.000Z',
+        '2026-03-09T07:00:00.000Z',
+      ]);
+      expect(query.floor).toBe(0);
     });
 
     it('denies non-members', async () => {
@@ -2788,12 +3072,102 @@ describe('ChatService', () => {
         expect.objectContaining({ userId: 'u1', role: 'ADMIN' }),
       ]);
     });
+
+    // 角色只用来标在座的人:不再把整个圈子的 ACTIVE 成员(可能远多于在座座位)拉回来。
+    it('reads circle roles only for the seated users', async () => {
+      prisma.chatMember.findUnique.mockResolvedValue(
+        membership({
+          conversation: {
+            ...membership().conversation,
+            circleID: 'circle-1',
+          },
+        }),
+      );
+      prisma.circleMember.findUnique.mockResolvedValue({
+        role: 'OWNER',
+        status: 'ACTIVE',
+      });
+      prisma.chatMember.findMany.mockResolvedValue([
+        { userID: 'u1' },
+        { userID: 'u2' },
+        { userID: 'u3' },
+      ]);
+      prisma.user.findMany.mockResolvedValue([
+        { id: 'u1', nickname: '一', avatarUrl: null },
+        { id: 'u2', nickname: '二', avatarUrl: null },
+        { id: 'u3', nickname: '三', avatarUrl: null },
+      ]);
+      prisma.circleMember.findMany.mockResolvedValue([
+        { userID: 'u1', role: 'OWNER' },
+        { userID: 'u2', role: 'MEMBER' },
+      ]);
+
+      const members = await service.listMembers('u1', 'conv-1');
+
+      expect(prisma.circleMember.findMany).toHaveBeenCalledWith({
+        where: {
+          circleID: 'circle-1',
+          status: 'ACTIVE',
+          userID: { in: ['u1', 'u2', 'u3'] },
+        },
+        select: { userID: true, role: true },
+      });
+      // 不在 ACTIVE 名单里的在座者照旧没有角色。
+      expect(members.map((m) => [m.userId, m.role])).toEqual([
+        ['u1', 'OWNER'],
+        ['u2', 'MEMBER'],
+        ['u3', null],
+      ]);
+    });
   });
 
   describe('searchAllMessages', () => {
     it('returns empty for blank keywords without querying', async () => {
       await expect(service.searchAllMessages('u1', '  ')).resolves.toEqual([]);
       expect(prisma.chatMessage.findMany).not.toHaveBeenCalled();
+    });
+
+    // 单字的二元组集合是空的,`@> '{}'` 恒真、bigram 索引用不上:不设窗口就是把本人
+    // 所有会话的文本消息逐行解 jsonb 做 LIKE。单字只搜每个会话最近 N 条,两个字及以上
+    // 照旧走 bigram 索引搜全部历史。
+    const searchSql = (): string[] =>
+      prisma.$queryRaw.mock.calls.map((call: unknown[]) => {
+        const query = call[0] as TemplateStringsArray | Prisma.Sql;
+        return 'strings' in query ? query.strings.join('?') : query.join('?');
+      });
+
+    it.each(['我', ' 好 ', '😀'])(
+      "searches the single character %j only within each conversation's recent window",
+      async (keyword) => {
+        prisma.chatMember.findMany.mockResolvedValue([
+          {
+            conversationID: 'conv-1',
+            conversation: { clearedBeforeHeight: 0 },
+          },
+        ]);
+        prisma.$queryRaw.mockResolvedValue([]);
+
+        await service.searchAllMessages('u1', keyword);
+
+        const [sql] = searchSql();
+        expect(sql).toContain('CROSS JOIN LATERAL');
+        expect(sql).not.toContain('chat_text_bigrams');
+        const [query] = prisma.$queryRaw.mock.calls[0] as [Prisma.Sql];
+        expect(query.values).toContain(SINGLE_CHAR_SEARCH_WINDOW);
+      },
+    );
+
+    it('keeps two-character keywords on the bigram index over the full history', async () => {
+      prisma.chatMember.findMany.mockResolvedValue([
+        { conversationID: 'conv-1', conversation: { clearedBeforeHeight: 0 } },
+      ]);
+      prisma.$queryRaw.mockResolvedValue([]);
+
+      await service.searchAllMessages('u1', '你好');
+
+      const [sql] = searchSql();
+      expect(sql).toContain('chat_text_bigrams');
+      expect(sql).not.toContain('CROSS JOIN LATERAL');
     });
 
     // 搜索必须和 getHistory 用同一把尺子:自动销毁窗口之外的消息在历史里
@@ -2938,6 +3312,50 @@ describe('ChatService', () => {
       expect(page.conversations).toHaveLength(2);
     });
 
+    // 连接池默认只有 10 个:一页的 7 条补充查询原来一起发,两个请求同时拉列表就能
+    // 把池占满。现在同时最多 3 条,返回内容不变。
+    it('runs at most three page loaders at once and still calls each one', async () => {
+      prisma.chatMember.findMany.mockResolvedValueOnce([membership()]);
+      let running = 0;
+      let peak = 0;
+      const results: Record<string, unknown> = {
+        loadDirectPeers: {
+          info: new Map(),
+          readHeights: new Map(),
+          deliveredHeights: new Map(),
+        },
+        loadUnreadCounts: new Map([['conv-1', 4]]),
+      };
+      const spies = [
+        'loadLastMessages',
+        'loadUnreadCounts',
+        'loadDirectPeers',
+        'loadCircleInfos',
+        'loadTempChatInfos',
+        'loadCircleRoles',
+        'loadGroupMemberCounts',
+      ].map((name) =>
+        jest
+          .spyOn(service as never, name as never)
+          .mockImplementation((async () => {
+            running += 1;
+            peak = Math.max(peak, running);
+            await new Promise<void>((resolve) => setImmediate(resolve));
+            running -= 1;
+            return results[name] ?? new Map();
+          }) as never),
+      );
+      try {
+        const page = await service.listConversationsPage('u1');
+
+        expect(peak).toBe(3);
+        for (const spy of spies) expect(spy).toHaveBeenCalledTimes(1);
+        expect(page.conversations[0]).toMatchObject({ unreadCount: 4 });
+      } finally {
+        for (const spy of spies) spy.mockRestore();
+      }
+    });
+
     it('reports no more conversations when the page is not full', async () => {
       prisma.chatMember.findMany.mockResolvedValueOnce([membership()]);
       prisma.$queryRaw.mockResolvedValue([]);
@@ -2972,8 +3390,8 @@ describe('ChatService', () => {
       await service.listConversations('u1');
 
       expect(privacySettings.getSelfDestructPolicy).not.toHaveBeenCalled();
-      for (const [strings] of prisma.$queryRaw.mock.calls) {
-        expect(strings.join('')).toContain('"burnExpiresAt"');
+      for (const [query] of prisma.$queryRaw.mock.calls as [Prisma.Sql][]) {
+        expect(query.sql).toContain('"burnExpiresAt"');
       }
     });
 
@@ -3055,8 +3473,8 @@ describe('ChatService', () => {
 
       await service.listConversations('u1');
 
-      const unreadSql = (prisma.$queryRaw.mock.calls as unknown[][])
-        .map((call) => (call[0] as TemplateStringsArray).join('?'))
+      const unreadSql = (prisma.$queryRaw.mock.calls as [Prisma.Sql][])
+        .map(([query]) => query.sql)
         .find((sql) => sql.includes('COUNT(*)'));
       expect(unreadSql).toContain('m."revokedAt" IS NULL');
     });
@@ -3159,6 +3577,389 @@ describe('ChatService', () => {
       expect(prisma.$queryRaw).toHaveBeenCalledTimes(2);
       expect(prisma.chatMessage.findFirst).not.toHaveBeenCalled();
       expect(prisma.chatMessage.count).not.toHaveBeenCalled();
+    });
+
+    /**
+     * 键集分页(带 cursor):按 conversationID 升序翻页。用户进了几百个群,单页 500
+     * 装不下;而活跃度排序下用 offset 翻页,翻页间隙里来一条新消息就会把会话挪到
+     * 别的页 —— 漏行或重复。id 是稳定的,键集按它走,中途怎么来消息都一个不落。
+     *
+     * ChatMember 表用内存替身按 Prisma 的 where / orderBy / take / skip 语义真查一遍。
+     * 认不出的条件直接抛错:宁可让测试红,也不能让替身悄悄忽略一个过滤条件,把实现
+     * 上的漏洞「测」成绿的。
+     */
+    describe('keyset cursor mode', () => {
+      type Seat = Omit<ReturnType<typeof membership>, 'leftAt'> & {
+        leftAt: Date | null;
+        hiddenAt: Date | null;
+        conversation: ReturnType<typeof membership>['conversation'] & {
+          lastMessageAt: Date | null;
+        };
+      };
+      type FindManyArgs = {
+        where: Record<string, unknown>;
+        include?: { conversation?: boolean };
+        orderBy?: unknown;
+        take?: number;
+        skip?: number;
+      };
+
+      // '0' < … < '9' < 'a' < … < 'f':字典序与插入顺序、活跃度顺序都不一样。
+      const idOf = (digit: string) =>
+        `${digit.repeat(8)}-0000-4000-8000-000000000000`;
+      const BASE_TIME = new Date('2026-08-05T12:00:00Z').getTime();
+      const minutesAfterBase = (minutes: number) =>
+        new Date(BASE_TIME + minutes * 60_000);
+
+      const seat = (
+        digit: string,
+        overrides: Partial<Omit<Seat, 'conversation'>> & {
+          lastMessageAt?: Date | null;
+        } = {},
+      ): Seat => {
+        const base = membership();
+        const { lastMessageAt = null, ...rest } = overrides;
+        return {
+          ...base,
+          id: `member-${digit}`,
+          conversationID: idOf(digit),
+          hiddenAt: null,
+          ...rest,
+          conversation: {
+            ...base.conversation,
+            id: idOf(digit),
+            lastMessageAt,
+          },
+        };
+      };
+
+      let table: Seat[] = [];
+
+      const KNOWN_ARGS = new Set([
+        'where',
+        'include',
+        'orderBy',
+        'take',
+        'skip',
+      ]);
+      const KNOWN_WHERE = new Set([
+        'userID',
+        'leftAt',
+        'hiddenAt',
+        'conversationID',
+      ]);
+
+      const matchesWhere = (row: Seat, where: Record<string, unknown>) =>
+        Object.entries(where).every(([key, condition]) => {
+          if (!KNOWN_WHERE.has(key)) {
+            throw new Error(`替身不认识 where.${key}`);
+          }
+          const value = (row as Record<string, unknown>)[key];
+          if (condition !== null && typeof condition === 'object') {
+            const { gt, ...rest } = condition as { gt?: unknown };
+            if (typeof gt !== 'string' || Object.keys(rest).length > 0) {
+              throw new Error(`替身不认识 where.${key} 的条件`);
+            }
+            return typeof value === 'string' && value > gt;
+          }
+          return value === condition;
+        });
+
+      // 没有消息的会话排在最后(nulls: 'last')。
+      const activityOf = (row: Seat) =>
+        row.conversation.lastMessageAt?.getTime() ?? Number.NEGATIVE_INFINITY;
+      // 按码点比较,与 Postgres 对 UUID 文本的排序一致(localeCompare 不保证)。
+      const compareValues = <T extends string | number>(a: T, b: T): number => {
+        if (a === b) return 0;
+        return a < b ? -1 : 1;
+      };
+
+      const compareOne = (key: unknown, a: Seat, b: Seat): number => {
+        switch (JSON.stringify(key)) {
+          case JSON.stringify({ conversationID: 'asc' }):
+            return compareValues(a.conversationID, b.conversationID);
+          case JSON.stringify({ pinned: 'desc' }):
+            return Number(b.pinned) - Number(a.pinned);
+          case JSON.stringify({
+            conversation: { lastMessageAt: { sort: 'desc', nulls: 'last' } },
+          }):
+            return compareValues(activityOf(b), activityOf(a));
+          default:
+            throw new Error(`替身不认识 orderBy ${JSON.stringify(key)}`);
+        }
+      };
+
+      const queryTable = (args: FindManyArgs) => {
+        // 列表查询之外的 chatMember.findMany(群昵称等)与本组用例无关。
+        if (!args.include?.conversation) return Promise.resolve([]);
+        const unknown = Object.keys(args).filter((k) => !KNOWN_ARGS.has(k));
+        if (unknown.length > 0) {
+          throw new Error(`替身不认识参数 ${unknown.join(',')}`);
+        }
+        const keys = Array.isArray(args.orderBy)
+          ? (args.orderBy as unknown[])
+          : [args.orderBy];
+        const sorted = table
+          .filter((row) => matchesWhere(row, args.where))
+          .sort((a, b) => {
+            for (const key of keys) {
+              const diff = compareOne(key, a, b);
+              if (diff !== 0) return diff;
+            }
+            return 0;
+          });
+        const start = args.skip ?? 0;
+        const end = args.take === undefined ? undefined : start + args.take;
+        return Promise.resolve(sorted.slice(start, end));
+      };
+
+      beforeEach(() => {
+        prisma.chatMember.findMany.mockImplementation(queryTable as never);
+        prisma.$queryRaw.mockResolvedValue([]);
+      });
+
+      describe('single conversation (GET /chat/conversations/:id)', () => {
+        // 客户端收到会话元信息变更事件后只刷新这一个会话,用它替换列表里那一行 ——
+        // 形状必须和列表行逐字段一致,否则替换之后字段会丢。
+        beforeEach(() => {
+          prisma.chatMember.findUnique.mockImplementation((({
+            where,
+          }: {
+            where: {
+              conversationID_userID: { conversationID: string; userID: string };
+            };
+          }) =>
+            Promise.resolve(
+              table.find(
+                (row) =>
+                  row.conversationID ===
+                    where.conversationID_userID.conversationID &&
+                  row.userID === where.conversationID_userID.userID,
+              ) ?? null,
+            )) as never);
+        });
+
+        it('returns exactly the row the list returns for that conversation', async () => {
+          table = [
+            seat('1', { lastMessageAt: minutesAfterBase(1) }),
+            seat('2', { pinned: true, lastMessageAt: minutesAfterBase(2) }),
+          ];
+          const page = await service.listConversationsKeysetPage('u1', '', 10);
+          const row = page.conversations.find((c) => c.id === idOf('2'));
+
+          const single = await service.getConversation('u1', idOf('2'));
+
+          expect(single).toEqual(row);
+        });
+
+        it('rejects a conversation the user left, or never joined, as not a member', async () => {
+          table = [seat('1', { leftAt: minutesAfterBase(1) })];
+
+          await expect(
+            service.getConversation('u1', idOf('1')),
+          ).rejects.toMatchObject({
+            response: { errorCode: ChatErrorCode.NotMember },
+          });
+          await expect(
+            service.getConversation('u1', idOf('9')),
+          ).rejects.toBeInstanceOf(ForbiddenException);
+        });
+
+        it('treats a conversation hidden from the list as not found', async () => {
+          // 列表不返回隐藏的会话;单个接口也不能把它「复活」回客户端列表。
+          table = [seat('1', { hiddenAt: minutesAfterBase(1) })];
+
+          const attempt = service.getConversation('u1', idOf('1'));
+          await expect(attempt).rejects.toBeInstanceOf(NotFoundException);
+          await expect(
+            service.getConversation('u1', idOf('1')),
+          ).rejects.toMatchObject({
+            response: { errorCode: ChatErrorCode.ConversationNotFound },
+          });
+        });
+      });
+
+      it('leaves the legacy activity-ordered query and page shape untouched', async () => {
+        table = [
+          seat('1', { lastMessageAt: minutesAfterBase(1) }),
+          seat('2', { pinned: true, lastMessageAt: null }),
+          seat('3', { lastMessageAt: minutesAfterBase(3) }),
+        ];
+
+        const page = await service.listConversationsPage('u1', 2);
+
+        // 老客户端(不带 cursor)这条查询一字不改:置顶优先,再按末条消息时间倒序。
+        expect(prisma.chatMember.findMany).toHaveBeenNthCalledWith(1, {
+          where: { userID: 'u1', leftAt: null, hiddenAt: null },
+          include: { conversation: true },
+          orderBy: [
+            { pinned: 'desc' },
+            {
+              conversation: { lastMessageAt: { sort: 'desc', nulls: 'last' } },
+            },
+          ],
+          take: 3,
+        });
+        expect(page.conversations.map((c) => c.id)).toEqual([
+          idOf('2'),
+          idOf('3'),
+        ]);
+        // 旧模式的返回形状也不变:没有 nextCursor。
+        expect(page).toEqual({
+          conversations: expect.any(Array),
+          hasMore: true,
+        });
+        expect(page).not.toHaveProperty('nextCursor');
+      });
+
+      it('returns ascending ids, honours limit and continues strictly after the cursor', async () => {
+        table = [
+          seat('c', { pinned: true, lastMessageAt: minutesAfterBase(9) }),
+          seat('0', { lastMessageAt: minutesAfterBase(1) }),
+          seat('a', { lastMessageAt: null }),
+          seat('5', { lastMessageAt: minutesAfterBase(5) }),
+        ];
+
+        const first = await service.listConversationsKeysetPage('u1', '', 2);
+        expect(first.conversations.map((c) => c.id)).toEqual([
+          idOf('0'),
+          idOf('5'),
+        ]);
+        expect(first.hasMore).toBe(true);
+        expect(first.nextCursor).toBe(idOf('5'));
+
+        // 游标是排他的:游标那一行不会在下一页再出现一次。
+        const second = await service.listConversationsKeysetPage(
+          'u1',
+          idOf('5'),
+          2,
+        );
+        expect(second.conversations.map((c) => c.id)).toEqual([
+          idOf('a'),
+          idOf('c'),
+        ]);
+        expect(second.hasMore).toBe(false);
+        expect(second.nextCursor).toBeNull();
+
+        const past = await service.listConversationsKeysetPage(
+          'u1',
+          idOf('c'),
+          2,
+        );
+        expect(past).toEqual({
+          conversations: [],
+          hasMore: false,
+          nextCursor: null,
+        });
+      });
+
+      it('defaults to the regular page size', async () => {
+        table = Array.from({ length: CONVERSATION_LIST_MAX + 1 }, (_, i) => {
+          const suffix = i.toString(16).padStart(12, '0');
+          const row = seat('0');
+          const id = `00000000-0000-4000-8000-${suffix}`;
+          return {
+            ...row,
+            id: `member-${suffix}`,
+            conversationID: id,
+            conversation: { ...row.conversation, id },
+          };
+        });
+
+        const page = await service.listConversationsKeysetPage('u1', '');
+
+        expect(page.conversations).toHaveLength(CONVERSATION_LIST_MAX);
+        expect(page.hasMore).toBe(true);
+        expect(page.nextCursor).toBe(
+          table[CONVERSATION_LIST_MAX - 1].conversationID,
+        );
+      });
+
+      it('visits every visible seat exactly once while new messages reshuffle activity between pages', async () => {
+        const digits = 'f3a8061c94e2d75b'.split('');
+        const visible = digits.slice(0, 13).map((digit, i) =>
+          seat(digit, {
+            pinned: i % 5 === 0,
+            lastMessageAt: i % 4 === 0 ? null : minutesAfterBase(i),
+          }),
+        );
+        const [leftDigit, hiddenDigit, foreignDigit] = digits.slice(13);
+        table = [
+          ...visible,
+          seat(leftDigit, { leftAt: minutesAfterBase(0) }),
+          seat(hiddenDigit, { hiddenAt: minutesAfterBase(0) }),
+          // 别人的座位,与本人无关。
+          seat(foreignDigit, { userID: 'u2' }),
+        ];
+
+        const seen: string[] = [];
+        let cursor = '';
+        let finished = false;
+        for (let page = 0; page < 20 && !finished; page += 1) {
+          const result = await service.listConversationsKeysetPage(
+            'u1',
+            cursor,
+            4,
+          );
+          seen.push(...result.conversations.map((c) => c.id));
+          finished = !result.hasMore;
+          cursor = result.nextCursor ?? cursor;
+
+          // 翻页间隙里,最不活跃的那个会话来了新消息 —— 活跃度排序下它会直接
+          // 跳到第一页(用 offset 翻就再也翻不到它),还有一个会话被置顶。
+          const quietest = table
+            .filter((row) => visible.some((v) => v.id === row.id))
+            .sort((a, b) => compareValues(activityOf(a), activityOf(b)))[0];
+          const bumped = minutesAfterBase(100 + page);
+          table = table.map((row) => {
+            if (row.conversationID === quietest.conversationID) {
+              return {
+                ...row,
+                conversation: { ...row.conversation, lastMessageAt: bumped },
+              };
+            }
+            if (row.conversationID === seen[0]) {
+              return { ...row, pinned: !row.pinned };
+            }
+            return row;
+          });
+        }
+
+        expect(finished).toBe(true);
+        expect(new Set(seen).size).toBe(seen.length);
+        expect(seen).toEqual(
+          visible.map((row) => row.conversationID).sort(compareValues),
+        );
+        expect(seen).not.toContain(idOf(leftDigit));
+        expect(seen).not.toContain(idOf(hiddenDigit));
+        expect(seen).not.toContain(idOf(foreignDigit));
+      });
+
+      it('builds each row through the same enrichment as the legacy list', async () => {
+        table = [
+          seat('7', {
+            pinned: true,
+            muted: true,
+            lastReadHeight: 3,
+            lastMessageAt: minutesAfterBase(2),
+          }),
+        ];
+
+        const legacy = await service.listConversationsPage('u1');
+        const keyset = await service.listConversationsKeysetPage('u1', '');
+
+        expect(keyset.conversations).toEqual(legacy.conversations);
+        expect(keyset.conversations[0]).toMatchObject({
+          id: idOf('7'),
+          pinned: true,
+          muted: true,
+          readHeight: 3,
+          unreadCount: 0,
+          lastMessageAt: minutesAfterBase(2).toISOString(),
+        });
+        // 两条路径都要给末条消息签媒体 URL。
+        expect(media.attachMediaUrls).toHaveBeenCalledTimes(2);
+      });
     });
   });
 
@@ -3608,10 +4409,14 @@ describe('ChatService', () => {
 
     await service.sendMessage('u1', sendPayload());
 
-    expect(prisma.chatMember.updateMany).toHaveBeenCalledWith({
-      where: { conversationID: 'conv-1', hiddenAt: { not: null } },
-      data: { hiddenAt: null },
-    });
+    // 与计数器推进同一条语句(chat-send-lock.query 的 advanceConversationAfterSendQuery)。
+    const [advance] = prisma.$executeRaw.mock.calls[
+      prisma.$executeRaw.mock.calls.length - 1
+    ] as [{ sql: string; values: unknown[] }];
+    expect(advance.sql).toMatch(
+      /UPDATE "ChatMember" SET "hiddenAt" = NULL\s+WHERE "conversationID" = \? AND "hiddenAt" IS NOT NULL/,
+    );
+    expect(advance.values[0]).toBe('conv-1');
   });
 
   it('commits note-import object references with the new message', async () => {

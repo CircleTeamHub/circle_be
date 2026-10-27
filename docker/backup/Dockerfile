@@ -28,6 +28,13 @@ RUN apk add --no-cache \
     && chown -R postgres:postgres /var/log/pgbackrest /var/spool/pgbackrest /var/log/circle-backup \
     && chmod 750 /var/log/pgbackrest /var/spool/pgbackrest /var/log/circle-backup
 
+# check.sh writes its Prometheus textfile here. Owned by postgres so the
+# backup_metrics named volume inherits a directory uid 70 can write; 755 so the
+# backup-metrics sidecar (nobody) can read it.
+RUN mkdir -p /var/lib/circle-backup/metrics \
+    && chown postgres:postgres /var/lib/circle-backup/metrics \
+    && chmod 755 /var/lib/circle-backup/metrics
+
 COPY deploy/backup/ /opt/backup/
 RUN chmod +x /opt/backup/*.sh
 

@@ -46,9 +46,17 @@ describe('ChatController.createGroupConversation', () => {
 });
 
 describe('ChatController.listConversations', () => {
-  function build(page: { conversations: unknown[]; hasMore: boolean }) {
+  function build(
+    page: { conversations: unknown[]; hasMore: boolean },
+    keysetPage: {
+      conversations: unknown[];
+      hasMore: boolean;
+      nextCursor: string | null;
+    } = { conversations: [], hasMore: false, nextCursor: null },
+  ) {
     const chatService = {
       listConversationsPage: jest.fn().mockResolvedValue(page),
+      listConversationsKeysetPage: jest.fn().mockResolvedValue(keysetPage),
     };
     const controller = new ChatController(
       chatService as never,
@@ -80,6 +88,12 @@ describe('ChatController.listConversations', () => {
 
     expect(chatService.listConversationsPage).toHaveBeenCalledWith('u1', 2);
     expect(res.setHeader).toHaveBeenCalledWith('X-Has-More', 'true');
+    // 旧模式（不带 cursor）不走键集，也绝不发游标头：老客户端行为一字不改。
+    expect(chatService.listConversationsKeysetPage).not.toHaveBeenCalled();
+    expect(res.setHeader).not.toHaveBeenCalledWith(
+      'X-Next-Cursor',
+      expect.anything(),
+    );
   });
 
   it('keeps the default page size when the client sends no limit', async () => {
@@ -95,5 +109,77 @@ describe('ChatController.listConversations', () => {
       undefined,
     );
     expect(res.setHeader).toHaveBeenCalledWith('X-Has-More', 'false');
+  });
+
+  // 带 cursor = 键集分页（按 conversationID 升序）：活跃度排序下翻页，新消息会把
+  // 会话在页之间挪来挪去，造成漏行/重复；键集按稳定的 id 走，一个不落。
+  describe('keyset cursor mode', () => {
+    const NEXT = '3f2a9c1e-7b4d-4e8a-9c0f-1a2b3c4d5e6f';
+
+    it('pages by conversation id and hands back the next cursor while more rows remain', async () => {
+      const conversations = [{ id: 'a' }, { id: NEXT }];
+      const { chatService, controller, res } = build(
+        { conversations: [], hasMore: false },
+        { conversations, hasMore: true, nextCursor: NEXT },
+      );
+
+      await expect(
+        controller.listConversations(
+          req,
+          { cursor: '', limit: 2 },
+          res as unknown as Response,
+        ),
+      ).resolves.toEqual(conversations);
+
+      expect(chatService.listConversationsKeysetPage).toHaveBeenCalledWith(
+        'u1',
+        '',
+        2,
+      );
+      expect(chatService.listConversationsPage).not.toHaveBeenCalled();
+      expect(res.setHeader).toHaveBeenCalledWith('X-Has-More', 'true');
+      expect(res.setHeader).toHaveBeenCalledWith('X-Next-Cursor', NEXT);
+    });
+
+    it('omits X-Next-Cursor on the last page', async () => {
+      const { chatService, controller, res } = build(
+        { conversations: [], hasMore: false },
+        { conversations: [{ id: NEXT }], hasMore: false, nextCursor: null },
+      );
+
+      await controller.listConversations(
+        req,
+        { cursor: NEXT },
+        res as unknown as Response,
+      );
+
+      expect(chatService.listConversationsKeysetPage).toHaveBeenCalledWith(
+        'u1',
+        NEXT,
+        undefined,
+      );
+      expect(res.setHeader).toHaveBeenCalledWith('X-Has-More', 'false');
+      expect(res.setHeader).not.toHaveBeenCalledWith(
+        'X-Next-Cursor',
+        expect.anything(),
+      );
+    });
+
+    it('documents the cursor mode and both paging headers in Swagger', () => {
+      const operation = Reflect.getMetadata(
+        'swagger/apiOperation',
+        ChatController.prototype.listConversations,
+      ) as { description: string };
+      const responses = Reflect.getMetadata(
+        'swagger/apiResponse',
+        ChatController.prototype.listConversations,
+      ) as Record<string, { headers?: Record<string, unknown> }>;
+
+      expect(operation.description).toContain('cursor');
+      expect(operation.description).toContain('X-Next-Cursor');
+      expect(Object.keys(responses['200']?.headers ?? {})).toEqual(
+        expect.arrayContaining(['X-Has-More', 'X-Next-Cursor']),
+      );
+    });
   });
 });

@@ -2,7 +2,8 @@
   "rootDir": "..",
   "testEnvironment": "node",
   "testMatch": [
-    "<rootDir>/test/chat-burn-archive.e2e-spec.ts"
+    "<rootDir>/test/chat-burn-archive.e2e-spec.ts",
+    "<rootDir>/test/postgres/**/*.pg-spec.ts"
   ],
   "transform": {
     "^.+\\.ts$": "ts-jest"
@@ -10,5 +11,9 @@
   "maxWorkers": 1,
   "roots": [
     "<rootDir>/test"
-  ]
+  ],
+  "moduleNameMapper": {
+    "^src/(.*)$": "<rootDir>/src/$1"
+  },
+  "globalSetup": "<rootDir>/test/postgres/utc-timezone.setup.ts"
 }

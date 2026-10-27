@@ -4,49 +4,25 @@ import { TrackedCron } from '../metrics/tracked-cron.decorator';
 import { randomUUID } from 'crypto';
 import { PrismaService } from 'src/prisma/prisma.service';
 import {
-  mapNotificationRealtimeDto,
-  NOTIFICATION_REALTIME_INCLUDE,
+  NOTIFICATION_REALTIME_BASE_SELECT,
+  type NotificationPushSource,
+  type NotificationRealtimeBaseRow,
 } from './notification.dto';
+import { loadNotificationPushSources } from './notification-realtime.loader';
 import { isCircleOfflinePushGated } from './notification.constants';
-import type { NotificationType } from 'src/generated/prisma';
+import type { NotificationType, Prisma } from 'src/generated/prisma';
 import {
   DELIVERY_MAX_ATTEMPTS,
   NotificationPushService,
   type ExpoPushPayload,
+  type TokenDeliveryOutcome,
 } from './notification-push.service';
 import { reportOperationalError } from 'src/logging/error-aggregation.service';
 import { sanitizeLogValue } from 'src/logging/log-sanitizer';
+import { pushOutboxFairBatchQuery } from './notification-push-outbox.query';
 
-const BATCH_SIZE = 100;
 const STALE_LOCK_MS = 10 * 60 * 1000;
 
-/**
- * 一次 tick 里，同一个发送者最多占多少个投递名额。
- *
- * 为什么需要这个：出队是 BATCH_SIZE 条/分钟，而一次发圈帖扇出上限 500 人
- * （CIRCLE_POST_PUBLISH_FANOUT_CAP），发帖接口限流是 40 次/15 分钟/IP —— 单个账号
- * 就能以约 1300 条/分钟往队列里灌，比出队快 13 倍。队列按 createdAt 升序取，于是
- * 正常推送（好友请求、评论回复、系统通知）全部排在洪水后面：脚本跑十分钟就能买到
- * 约两小时的全站推送黑屏。
- *
- * 公平调度只改「先发谁」，不提高发送速率 —— 对推送服务商的压力一点没变，因此不存在
- * 被上游限流或封禁的风险。攻击者仍会占满自己的配额，但吃不掉别人的。
- */
-const MAX_PER_SENDER_PER_TICK = 10;
-/**
- * 系统公告一轮的名额，独立于发送者配额。
- *
- * 公告扇出给每个活跃用户建一行，而这些行的 fromUserID 全是同一个管理员，落进
- * 发送者配额里就是「整条公告共用 10 条/轮」—— 10000 人的公告要发约 17 小时。
- * 但公告不是发送者洪水：每一行的收件人都不同，管理员也不是要防的那个角色，
- * 拿发送者配额去套它属于误伤。
- *
- * 所以公告改成**按公告 ID 分区**（同一管理员发的两条公告互不挤占），并给一份
- * 更宽的名额。上限仍然存在而不是完全豁免 —— 豁免的话一条大公告会吃满整批
- * BATCH_SIZE，把好友请求、评论回复挤到公告发完为止，等于把饿死方向调了个头。
- * 取 BATCH_SIZE 的一半：公告按 50 条/轮走，另外一半永远留给日常推送。
- */
-const SYSTEM_ANNOUNCEMENT_ROWS_PER_TICK = BATCH_SIZE / 2;
 /**
  * Push outbox 处理器（#88 重构后）。
  *
@@ -71,50 +47,18 @@ export class NotificationPushOutboxProcessor {
   async processPending(): Promise<number> {
     const now = new Date();
     const staleBefore = new Date(now.getTime() - STALE_LOCK_MS);
-    // 名额分配必须跨**整个**待发队列做,不能先按 createdAt 取一个窗口再在窗口里调度。
-    // 取窗口的话洪水本身就把窗口占满了:一个发送者灌 13000 条之后再来一条正常推送,
-    // 每一轮的候选窗口里都只有洪水发送者,公平调度每分钟只挪走 10 条 ——
-    // 那条正常推送要等约 22 小时,比改之前的纯 FIFO 还慢。
-    // 用 PARTITION BY 按发送者分组排名,每人每轮最多 MAX_PER_SENDER_PER_TICK 条,
-    // 再按名次(而不是时间)取前 BATCH_SIZE —— 名次相同的按时间,于是「每个人的第一条」
-    // 一定先于「任何人的第二条」,新来的发送者立刻能挤进这一轮。
-    const ranked = await this.prisma.$queryRaw<Array<{ id: string }>>`
-      WITH eligible AS (
-        SELECT
-          o."id",
-          o."createdAt",
-          (n."systemAnnouncementID" IS NOT NULL) AS is_announcement,
-          ROW_NUMBER() OVER (
-            PARTITION BY CASE
-              WHEN n."systemAnnouncementID" IS NOT NULL
-                THEN 'announcement:' || n."systemAnnouncementID"
-              ELSE 'sender:' || n."fromUserID"
-            END
-            ORDER BY o."createdAt" ASC, o."id" ASC
-          ) AS rn
-        FROM "NotificationPushOutbox" AS o
-        JOIN "Notification" AS n ON n."id" = o."notificationID"
-        WHERE EXISTS (SELECT 1 FROM "ConsolePushSettings" WHERE id='global' AND enabled)
-          AND ((o."status" = 'PENDING' AND o."nextAttemptAt" <= ${now})
-           OR (o."status" = 'FAILED' AND o."nextAttemptAt" <= ${now})
-           OR (o."status" = 'PROCESSING' AND o."lockedAt" < ${staleBefore}))
-      )
-      SELECT "id"
-      FROM eligible
-      -- 两个分支都是绑定参数,不显式转型的话 Postgres 推不出 CASE 的结果类型
-      -- (两侧都是 unknown),会直接报 could not determine data type。
-      WHERE rn <= CASE
-        WHEN is_announcement THEN ${SYSTEM_ANNOUNCEMENT_ROWS_PER_TICK}::int
-        ELSE ${MAX_PER_SENDER_PER_TICK}::int
-      END
-      ORDER BY rn ASC, "createdAt" ASC, "id" ASC
-      LIMIT ${BATCH_SIZE}
-    `;
+    // 公平分区与配额(每个公告 / 发送者每轮的名额、名次排序)全在这条查询里,
+    // 口径与形状见 notification-push-outbox.query.ts。这里只回 id,再按 id 水合。
+    const ranked = await this.prisma.$queryRaw<Array<{ id: string }>>(
+      pushOutboxFairBatchQuery({ now, staleBefore }),
+    );
     if (ranked.length === 0) return 0;
     const order = new Map(ranked.map((row, index) => [row.id, index]));
+    // 只带 Notification 本表列：原来的 9 路 include 每轮并发占 9 个池连接，还把
+    // 动态 / 帖子 5000 字的正文和配图整拉回来，而重试任务根本不重新组装文案。
     const hydrated = await this.prisma.notificationPushOutbox.findMany({
       where: { id: { in: ranked.map((row) => row.id) } },
-      include: { notification: { include: NOTIFICATION_REALTIME_INCLUDE } },
+      include: { notification: { select: NOTIFICATION_REALTIME_BASE_SELECT } },
     });
     // findMany 不保证顺序,而这一批的顺序就是公平性本身,按名次重排回去。
     const jobs = hydrated.sort(
@@ -124,6 +68,11 @@ export class NotificationPushOutboxProcessor {
     // 放在出队之后、投递之前：仍然是投递时刻的值，而不是入队时刻的。
     const circleOfflinePushByUser =
       await this.loadCircleOfflinePushPreferences(jobs);
+    // 只有还没有 payload 快照、又确实要发的任务才组装文案；关系整批一次按外键补。
+    const pushSources = await this.loadPushSourcesToCompose(
+      jobs,
+      circleOfflinePushByUser,
+    );
 
     let processed = 0;
     for (const job of jobs) {
@@ -157,11 +106,7 @@ export class NotificationPushOutboxProcessor {
         // composeMessage 与 payload 快照**之前** —— 既然这条不发，就不该白组装
         // 一份文案再写回一次库，那份快照还会一直挂在已 COMPLETED 的行上。
         // 缺行（用户已删）按默认值「收」处理，不静默丢推送。
-        if (
-          isCircleOfflinePushGated(job.notification.type) &&
-          userId &&
-          circleOfflinePushByUser.get(userId) === false
-        ) {
+        if (isCirclePushSkipped(job.notification, circleOfflinePushByUser)) {
           await this.finishJob(
             job.id,
             leaseToken,
@@ -176,11 +121,12 @@ export class NotificationPushOutboxProcessor {
 
         // payload 快照：第一次组装后固化，重试永远发「当初组装的那份」。
         let payload = job.payload as ExpoPushPayload | null;
-        if (!payload || typeof payload.title !== 'string') {
-          payload = this.pushService.composeMessage(
-            userId,
-            mapNotificationRealtimeDto(job.notification),
-          );
+        if (!hasPayloadSnapshot(payload)) {
+          const source = pushSources.get(job.notificationID);
+          if (!source) {
+            throw new Error('push source missing for an unsnapshotted job');
+          }
+          payload = this.pushService.composeMessage(userId, source);
           await this.prisma.notificationPushOutbox.updateMany({
             where: { id: job.id, leaseToken },
             // Prisma Json 列入参要求 InputJsonValue；payload 本身就是纯 JSON。
@@ -316,41 +262,34 @@ export class NotificationPushOutboxProcessor {
         );
         const sentAt = new Date();
         let retryable = 0;
+        // 结果相同的行合并成一条 updateMany（JPush 一批全是同一份 CONFIRMED，
+        // 同一个错误码的 TERMINAL / FAILED 也一样）；只有带各自 ticket 的 Expo
+        // SENT 行仍是一行一条。
+        const writes = new Map<
+          string,
+          {
+            ids: string[];
+            data: Prisma.NotificationPushDeliveryUpdateManyMutationInput;
+          }
+        >();
         for (const outcome of outcomes) {
           const deliveryId = deliveryByToken.get(outcome.token);
           if (!deliveryId) continue;
-          if (outcome.status === 'SENT') {
-            await this.prisma.notificationPushDelivery.update({
-              where: { id: deliveryId },
-              data: {
-                status: outcome.receiptFinal ? 'CONFIRMED' : 'SENT',
-                ticketID: outcome.ticketId ?? null,
-                sentAt,
-                ...(outcome.receiptFinal ? { receiptCheckedAt: sentAt } : {}),
-                attempts: { increment: 1 },
-                lastError: null,
-              },
-            });
-          } else if (outcome.status === 'TERMINAL') {
-            await this.prisma.notificationPushDelivery.update({
-              where: { id: deliveryId },
-              data: {
-                status: 'TERMINAL',
-                attempts: { increment: 1 },
-                lastError: (outcome.error ?? 'terminal').slice(0, 1000),
-              },
-            });
-          } else {
+          if (outcome.status !== 'SENT' && outcome.status !== 'TERMINAL') {
             retryable += 1;
-            await this.prisma.notificationPushDelivery.update({
-              where: { id: deliveryId },
-              data: {
-                status: 'FAILED',
-                attempts: { increment: 1 },
-                lastError: (outcome.error ?? 'retryable').slice(0, 1000),
-              },
-            });
           }
+          const { key, data } = deliveryOutcomeWrite(outcome, sentAt);
+          const group = writes.get(key);
+          writes.set(key, {
+            ids: [...(group?.ids ?? []), deliveryId],
+            data,
+          });
+        }
+        for (const { ids, data } of writes.values()) {
+          await this.prisma.notificationPushDelivery.updateMany({
+            where: { id: { in: ids } },
+            data,
+          });
         }
 
         if (retryable > 0) {
@@ -396,6 +335,29 @@ export class NotificationPushOutboxProcessor {
       }
     }
     return processed;
+  }
+
+  /**
+   * 这一轮里要现组装文案的任务（没有 payload 快照、且没被圈子开关挡掉），
+   * 一次性补齐 composeMessage 读得到的字段，按 notificationID 取用。
+   */
+  private async loadPushSourcesToCompose(
+    jobs: readonly {
+      notificationID: string;
+      payload: unknown;
+      notification: NotificationRealtimeBaseRow;
+    }[],
+    circleOfflinePushByUser: ReadonlyMap<string, boolean>,
+  ): Promise<ReadonlyMap<string, NotificationPushSource>> {
+    const rows = jobs
+      .filter(
+        (job) =>
+          !hasPayloadSnapshot(job.payload) &&
+          !isCirclePushSkipped(job.notification, circleOfflinePushByUser),
+      )
+      .map((job) => job.notification);
+    const sources = await loadNotificationPushSources(this.prisma, rows);
+    return new Map(sources.map((source) => [source.id, source]));
   }
 
   /**
@@ -447,6 +409,64 @@ export class NotificationPushOutboxProcessor {
       },
     });
   }
+}
+
+/**
+ * 一个 token 的投递结果要写回投递行的数据，以及合并用的键：键相同的结果写的数据
+ * 完全一样，可以并进同一条 updateMany。
+ */
+function deliveryOutcomeWrite(
+  outcome: TokenDeliveryOutcome,
+  sentAt: Date,
+): {
+  key: string;
+  data: Prisma.NotificationPushDeliveryUpdateManyMutationInput;
+} {
+  if (outcome.status === 'SENT') {
+    const status = outcome.receiptFinal ? 'CONFIRMED' : 'SENT';
+    const ticketID = outcome.ticketId ?? null;
+    return {
+      key: JSON.stringify([status, ticketID]),
+      data: {
+        status,
+        ticketID,
+        sentAt,
+        ...(outcome.receiptFinal ? { receiptCheckedAt: sentAt } : {}),
+        attempts: { increment: 1 },
+        lastError: null,
+      },
+    };
+  }
+  const status = outcome.status === 'TERMINAL' ? 'TERMINAL' : 'FAILED';
+  const lastError = (
+    outcome.error ?? (status === 'TERMINAL' ? 'terminal' : 'retryable')
+  ).slice(0, 1000);
+  return {
+    key: JSON.stringify([status, lastError]),
+    data: { status, attempts: { increment: 1 }, lastError },
+  };
+}
+
+/** 第一次处理时组装并固化的 payload；重试原样重发，不再读任何关系。 */
+function hasPayloadSnapshot(payload: unknown): payload is ExpoPushPayload {
+  return (
+    typeof payload === 'object' &&
+    payload !== null &&
+    typeof (payload as { title?: unknown }).title === 'string'
+  );
+}
+
+/** 收件人关掉了圈子「离线提醒」，这条圈子推送不发（与处理循环里的判断一致）。 */
+function isCirclePushSkipped(
+  notification: { type: NotificationType; toUserID: string | null },
+  circleOfflinePushByUser: ReadonlyMap<string, boolean>,
+): boolean {
+  const userId = notification.toUserID ?? '';
+  return (
+    isCircleOfflinePushGated(notification.type) &&
+    Boolean(userId) &&
+    circleOfflinePushByUser.get(userId) === false
+  );
 }
 
 /** 部分 token 可重试失败：走 outbox 退避重试，但不值得按异常告警。 */

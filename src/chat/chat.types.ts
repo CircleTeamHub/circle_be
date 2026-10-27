@@ -352,7 +352,6 @@ export interface ChatPresenceBroadcast {
 
 /** 会话列表项 DTO(REST GET /chat/conversations)。 */
 export interface ChatConversationDto {
-  textEncryption?: string;
   id: string;
   type: 'DIRECT' | 'GROUP' | 'TEMP' | 'SUPPORT';
   /** DIRECT 会话的对端用户;其余类型为 null。 */

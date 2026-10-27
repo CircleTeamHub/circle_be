@@ -1,0 +1,11 @@
+-- 删掉 Friend_friendID_idx(另一个单列索引见 20261026000230_drop_friend_user_idx)。
+--
+-- 20261026000200 建的 ("friendID", "userID") 以 friendID 打头,覆盖所有只按 friendID
+-- 查的语句和删用户时的外键级联,单列索引只剩每次写 Friend 都要多维护一份的成本。
+--
+-- 部署前确认 Friend_friendID_userID_idx 的 pg_index.indisvalid = true:并发建索引
+-- 中断会留下 invalid 索引,那时删掉这个单列索引会让按 friendID 的查询退回全表扫描。
+--
+-- 一份迁移只放这一条:Prisma 只在文件里全是 CREATE INDEX CONCURRENTLY 时才逐条放到
+-- 事务外执行,混进 DROP 或多条 DROP 就整份进事务,部署报 25001。
+DROP INDEX CONCURRENTLY IF EXISTS "Friend_friendID_idx";

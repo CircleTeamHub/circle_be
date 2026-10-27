@@ -35,6 +35,7 @@ import {
 import {
   RefreshTokenAudience,
   RefreshTokenService,
+  ReplayedRotation,
   SessionContext,
 } from './refresh-token.service';
 import { accessTokenTtlSeconds } from './session-revocation.service';
@@ -60,8 +61,14 @@ import {
 } from 'src/referral/referral.rules';
 import { logSecurityEvent } from 'src/logging/security-event.logger';
 import { reportOperationalError } from 'src/logging/error-aggregation.service';
+import { withSavepoint } from 'src/utils/prisma-savepoint';
 
 const ME_SELECT = USER_ME_SELECT;
+
+// lastOnline 只喂「N 分钟前在线」和管理台的活跃统计,分钟级精度足够:同一账号
+// 60 秒内最多写一次。它在 User_lastOnline_idx 里,每次写都不是 HOT 更新,User 表
+// 的十几个索引都要写新条目;me() 每次打开 App 都会调。
+const LAST_ONLINE_WRITE_INTERVAL_MS = 60_000;
 
 // 管理台按账号锁定（#83）：与 securityCode 锁定同款参数量级。
 // 5 次错密码 → 锁 15 分钟；成功登录清零。只对 role=ADMIN 账号生效。
@@ -88,6 +95,21 @@ function assertValidSecurityCode(value: string, fieldName = 'securityCode') {
 function loginIdentifier(dto: LoginDto): string {
   return dto.identifier?.trim() || dto.email?.trim() || '';
 }
+
+/**
+ * 续签事务的结局。会让请求失败的分支不在事务里抛:它们的写入(重放整族吊销、
+ * 封禁 / ADMIN 全部吊销)必须提交,提交后再写 Redis 吊销标记、抛出原来的错误。
+ */
+type RefreshOutcome =
+  | ReplayedRotation
+  | { kind: 'missing' }
+  | { kind: 'blocked'; userId: string; error: ForbiddenException }
+  | {
+      kind: 'issued';
+      userId: string;
+      tokens: { accessToken: string; refreshToken: string };
+      cancelledRecoveries: string[];
+    };
 
 export type SafeUser = {
   id: string;
@@ -429,13 +451,7 @@ export class AuthService {
         errorCode: AuthErrorCode.LoginChallengeInvalid,
       });
     }
-    this.prisma.user
-      .update({ where: { id: user.id }, data: { lastOnline: new Date() } })
-      .catch((err) =>
-        this.logger.warn(
-          `lastOnline update failed for ${user.id}: ${err?.message}`,
-        ),
-      );
+    this.touchLastOnline(user.id);
     const { sessionId, ...tokens } = await this.issueTokensWithSession(
       user.id,
       user.accountId,
@@ -744,13 +760,7 @@ export class AuthService {
       throw new ForbiddenException('管理员尚未分配权限，请联系超级管理员');
     await this.resetAdminLockCounters(user);
 
-    this.prisma.user
-      .update({ where: { id: user.id }, data: { lastOnline: new Date() } })
-      .catch((err) =>
-        this.logger.warn(
-          `lastOnline update failed for ${user.id}: ${err?.message}`,
-        ),
-      );
+    this.touchLastOnline(user.id);
 
     const tokens = await this.issueTokens(
       user.id,
@@ -777,16 +787,17 @@ export class AuthService {
   }
 
   // All admission/session issuance and account recovery share this distributed lock.
-  // It uses a dedicated advisory namespace; nested services retain their own transactions.
+  // It uses a dedicated advisory namespace. Most callers' nested services retain
+  // their own transactions; refresh() does all of its work on the lock's tx.
   private withAccountAuthLock<T>(
     userId: string,
-    operation: () => Promise<T>,
+    operation: (tx: Prisma.TransactionClient) => Promise<T>,
   ): Promise<T> {
     return withDatabaseWorkBudget(this.prisma, () =>
       this.prisma.$transaction(
         async (tx) => {
           await tx.$executeRaw`SELECT pg_advisory_xact_lock(hashtextextended(${`auth_session:${userId}`}, 0))`;
-          return operation();
+          return operation(tx);
         },
         { maxWait: 10000, timeout: 30000 },
       ),
@@ -806,13 +817,7 @@ export class AuthService {
     sessionContext?: SessionContext,
   ) {
     // Fire-and-forget: lastOnline is best-effort and must never block token issuance.
-    this.prisma.user
-      .update({ where: { id: user.id }, data: { lastOnline: new Date() } })
-      .catch((err) =>
-        this.logger.warn(
-          `lastOnline update failed for ${user.id}: ${err?.message}`,
-        ),
-      );
+    this.touchLastOnline(user.id);
 
     const tokens = await this.issueTokens(
       user.id,
@@ -838,102 +843,165 @@ export class AuthService {
       refreshToken,
       'APP',
     );
-    return this.withAccountAuthLock(owner, async () => {
-      const {
-        token: newRefreshToken,
-        userId,
-        sessionId,
-        deviceKey,
-        deviceName,
-      } = await this.refreshTokenService.rotate(
-        refreshToken,
-        sessionContext,
-        'APP',
-      );
-
-      const user = await this.prisma.user.findUnique({ where: { id: userId } });
-      if (!user) {
+    // 整个续签只用账号锁这一个事务、一个连接:原来轮换 / 查用户 / 记 access 过期 /
+    // 设备信任各自走 this.prisma,外层连接全程 idle in transaction 干等。
+    const outcome = await this.withAccountAuthLock(owner, (tx) =>
+      this.refreshLocked(tx, refreshToken, owner, sessionContext),
+    );
+    switch (outcome.kind) {
+      case 'reuse':
+        return this.refreshTokenService.rejectReplayedRotation(outcome);
+      case 'missing':
         throw new NotFoundException({
           message: '用户不存在',
           errorCode: AuthErrorCode.UserNotFound,
         });
-      }
-
-      // Banned/deleted users must not be able to keep refreshing tokens just
-      // because they still hold a valid refresh token. Revoke their sessions
-      // and reject the rotation result.
-      if (user.status !== 'ACTIVE') {
-        this.logger.warn(
-          `Refresh blocked for non-active user ${user.id} (status=${user.status}); revoking sessions.`,
+      case 'blocked':
+        // revokeAll 的 Redis 那一半:数据库吊销已随轮换一起提交。
+        await this.refreshTokenService.revokeAllAccessMarkers(outcome.userId);
+        throw outcome.error;
+      case 'issued':
+        this.deviceTrust.announceCancelledRecoveries(
+          outcome.userId,
+          outcome.cancelledRecoveries,
         );
-        await this.refreshTokenService.revokeAll(user.id);
-        throw new ForbiddenException({
+        return outcome.tokens;
+    }
+  }
+
+  /** refresh 在账号锁事务里的全部工作;所有读写都走 tx。 */
+  private async refreshLocked(
+    tx: Prisma.TransactionClient,
+    refreshToken: string,
+    owner: string,
+    sessionContext: SessionContext | undefined,
+  ): Promise<RefreshOutcome> {
+    const rotation = await this.refreshTokenService.rotateInTransaction(
+      tx,
+      refreshToken,
+      owner,
+      sessionContext,
+      'APP',
+    );
+    if (rotation.kind === 'reuse') return rotation;
+    const {
+      token: newRefreshToken,
+      userId,
+      sessionId,
+      deviceKey,
+      deviceName,
+    } = rotation;
+
+    // 下面只用到这四列:不再整行读回(含 passwordHash、安全码哈希等)。
+    const user = await tx.user.findUnique({
+      where: { id: userId },
+      select: { id: true, accountId: true, role: true, status: true },
+    });
+    if (!user) return { kind: 'missing' };
+
+    // Banned/deleted users must not be able to keep refreshing tokens just
+    // because they still hold a valid refresh token. Revoke their sessions
+    // and reject the rotation result.
+    if (user.status !== 'ACTIVE') {
+      this.logger.warn(
+        `Refresh blocked for non-active user ${user.id} (status=${user.status}); revoking sessions.`,
+      );
+      await this.refreshTokenService.revokeAllInTransaction(tx, user.id);
+      return {
+        kind: 'blocked',
+        userId: user.id,
+        error: new ForbiddenException({
           message: '账号已被禁用',
           errorCode: AuthErrorCode.AccountDisabled,
-        });
-      }
+        }),
+      };
+    }
 
-      // 与 login() 一致：ADMIN 账号不能持有 APP audience 会话。晋升前签发的 APP
-      // refresh token 否则会一直续签出 role=ADMIN 的 APP access token，而任何只看
-      // role、不看 audience 的授权判断都会把它当成管理员，等于绕开短 TTL/审计的
-      // 管理会话模型。像 adminRefresh 一样撤销全部会话；文案与普通登录失败一致
-      // （不泄露该账号是管理员）。
-      if (user.role === 'ADMIN') {
-        this.logger.warn(
-          `Refresh blocked for ADMIN account ${user.id} on the APP audience; revoking sessions.`,
-        );
-        await this.refreshTokenService.revokeAll(user.id);
-        throw new ForbiddenException({
+    // 与 login() 一致：ADMIN 账号不能持有 APP audience 会话。晋升前签发的 APP
+    // refresh token 否则会一直续签出 role=ADMIN 的 APP access token，而任何只看
+    // role、不看 audience 的授权判断都会把它当成管理员，等于绕开短 TTL/审计的
+    // 管理会话模型。像 adminRefresh 一样撤销全部会话；文案与普通登录失败一致
+    // （不泄露该账号是管理员）。
+    if (user.role === 'ADMIN') {
+      this.logger.warn(
+        `Refresh blocked for ADMIN account ${user.id} on the APP audience; revoking sessions.`,
+      );
+      await this.refreshTokenService.revokeAllInTransaction(tx, user.id);
+      return {
+        kind: 'blocked',
+        userId: user.id,
+        error: new ForbiddenException({
           message: '邮箱、用户ID或密码错误',
           errorCode: AuthErrorCode.InvalidCredentials,
-        });
-      }
+        }),
+      };
+    }
 
-      // Fire-and-forget: lastOnline is best-effort and must never block token issuance.
-      this.prisma.user
-        .update({ where: { id: user.id }, data: { lastOnline: new Date() } })
-        .catch((err) =>
-          this.logger.warn(
-            `lastOnline update failed for ${user.id}: ${err?.message}`,
-          ),
-        );
+    // Fire-and-forget: lastOnline is best-effort and must never block token issuance.
+    this.touchLastOnline(user.id);
 
-      const accessToken = await this.signAccessToken(
-        user.id,
-        user.accountId,
-        user.role,
-        sessionId,
-        'APP',
-      );
-      await this.refreshTokenService.assertSessionActive(user.id, sessionId);
-      // 持有有效会话的设备就是本人设备：功能上线前已登录的设备靠这条补记信任，
-      // 免得一升级所有人都变成「陌生设备」。只认会话绑定的设备，不认请求头里新报的。
-      // 续签请求不带设备名头：受信任记录沿用会话上登录时记下的设备名。
-      await this.deviceTrust.trustOnRefresh(user.id, deviceKey, {
+    const accessToken = await this.signAccessToken(
+      user.id,
+      user.accountId,
+      user.role,
+      sessionId,
+      'APP',
+      tx,
+    );
+    // 原来这里还有一次 assertSessionActive:那时轮换已在另一个连接上提交,签发前可能
+    // 被并发吊销。现在新会话行是本事务刚插入、尚未提交的:别的事务看不见它,也就改
+    // 不了它;expiredAt = 插入时 + TTL(最短 1 分钟)而事务上限 30 秒。这次读取恒为真。
+    //
+    // 持有有效会话的设备就是本人设备：功能上线前已登录的设备靠这条补记信任，
+    // 免得一升级所有人都变成「陌生设备」。只认会话绑定的设备，不认请求头里新报的。
+    // 续签请求不带设备名头：受信任记录沿用会话上登录时记下的设备名。
+    const trusted = await this.deviceTrust.trustOnRefresh(
+      user.id,
+      deviceKey,
+      {
         ...sessionContext,
         deviceName: sessionContext?.deviceName ?? deviceName,
-      });
-      // 受信任设备还在正常使用：别的设备发起的找回申请取消（本人能直接批准）。
-      // 尽力而为：此时 refresh token 已经轮换，这里抛错会让客户端拿不到新 token、
-      // 重试被当成 token 复用而整族吊销。下一次续签 / 登录会再取消一次。
-      if (deviceKey) {
-        try {
-          if (await this.deviceTrust.isTrusted(user.id, deviceKey)) {
-            await this.deviceTrust.cancelRecoveriesForActiveDevice(
-              user.id,
-              deviceKey,
-            );
-          }
-        } catch (error) {
-          this.logger.warn(
-            `cancel recoveries on refresh failed for ${user.id}: ${
-              error instanceof Error ? error.message : String(error)
-            }`,
-          );
-        }
-      }
-      return { accessToken, refreshToken: newRefreshToken };
-    });
+      },
+      tx,
+    );
+    const cancelledRecoveries = deviceKey
+      ? await this.cancelRecoveriesOnRefresh(tx, user.id, deviceKey, trusted)
+      : [];
+    return {
+      kind: 'issued',
+      userId: user.id,
+      tokens: { accessToken, refreshToken: newRefreshToken },
+      cancelledRecoveries,
+    };
+  }
+
+  /**
+   * 受信任设备还在正常使用：别的设备发起的找回申请取消（本人能直接批准）。
+   * 尽力而为：失败不能挡住续签（下一次续签 / 登录会再取消一次）。保存点让失败的
+   * 语句只回滚这一步，续签事务照常提交。trusted 是信任补记的结论；补记出错（null）
+   * 时退回原来那次独立的 isTrusted 判定。
+   */
+  private async cancelRecoveriesOnRefresh(
+    tx: Prisma.TransactionClient,
+    userId: string,
+    deviceKey: string,
+    trusted: boolean | null,
+  ): Promise<string[]> {
+    if (trusted === false) return [];
+    try {
+      return await withSavepoint(tx, 'refresh_recovery_cancel', async () =>
+        (trusted ?? (await this.deviceTrust.isTrusted(userId, deviceKey, tx)))
+          ? this.deviceTrust.cancelRecoveries(userId, deviceKey, tx)
+          : [],
+      );
+    } catch (error) {
+      this.logger.warn(
+        `cancel recoveries on refresh failed for ${userId}: ${
+          error instanceof Error ? error.message : String(error)
+        }`,
+      );
+      return [];
+    }
   }
 
   async adminRefresh(refreshToken: string, sessionContext?: SessionContext) {
@@ -960,13 +1028,7 @@ export class AuthService {
       throw new ForbiddenException('Admin account is not active');
     }
 
-    this.prisma.user
-      .update({ where: { id: user.id }, data: { lastOnline: new Date() } })
-      .catch((err) =>
-        this.logger.warn(
-          `lastOnline update failed for ${user.id}: ${err?.message}`,
-        ),
-      );
+    this.touchLastOnline(user.id);
 
     const accessToken = await this.signAccessToken(
       user.id,
@@ -1163,6 +1225,36 @@ export class AuthService {
     });
   }
 
+  /**
+   * 记一笔最近在线,fire-and-forget:失败只记日志,绝不阻塞登录 / 续签 / me。
+   * - 条件写:库里的值在 LAST_ONLINE_WRITE_INTERVAL_MS 之内就跳过(0 行,不产生
+   *   新行版本),写法同 ChatService.touchLastOnline;
+   * - updateMany 不 RETURNING 整行(update 会把含 passwordHash 在内的全部列读回来,
+   *   而调用方从不读返回值);用户行不存在时也不会像 update 那样抛 P2025。
+   */
+  private touchLastOnline(userId: string, now = new Date()): void {
+    this.prisma.user
+      .updateMany({
+        where: {
+          id: userId,
+          OR: [
+            { lastOnline: null },
+            {
+              lastOnline: {
+                lt: new Date(now.getTime() - LAST_ONLINE_WRITE_INTERVAL_MS),
+              },
+            },
+          ],
+        },
+        data: { lastOnline: now },
+      })
+      .catch((err) =>
+        this.logger.warn(
+          `lastOnline update failed for ${userId}: ${err?.message}`,
+        ),
+      );
+  }
+
   async me(userId: string): Promise<SafeUser> {
     const [user, displayIcons, appearances] = await Promise.all([
       this.prisma.user.findUnique({
@@ -1182,15 +1274,10 @@ export class AuthService {
 
     // Fire-and-forget lastOnline update so a DB hiccup never blocks the read
     // and never produces a fabricated "success" response. The returned shape
-    // shows the optimistic timestamp; persistence is best-effort.
+    // shows the optimistic timestamp; persistence is best-effort (and throttled,
+    // see touchLastOnline) — the response never depends on the write.
     const now = new Date();
-    this.prisma.user
-      .update({ where: { id: userId }, data: { lastOnline: now } })
-      .catch((err) =>
-        this.logger.warn(
-          `lastOnline update failed for ${userId}: ${err?.message}`,
-        ),
-      );
+    this.touchLastOnline(userId, now);
 
     return {
       ...user,
@@ -1848,6 +1935,7 @@ export class AuthService {
     role: string,
     sessionId?: string,
     audience: RefreshTokenAudience = 'APP',
+    tx?: Prisma.TransactionClient,
   ): Promise<string> {
     const issuedAtMs = Date.now();
     const payload = {
@@ -1886,15 +1974,29 @@ export class AuthService {
       accessToken = await this.jwt.signAsync(payload);
     }
     if (sessionId) {
+      const expiresAt = new Date(issuedAtMs + expiresIn * 1000);
       try {
-        await this.refreshTokenService.recordAccessTokenIssued(
-          userId,
-          sessionId,
-          new Date(issuedAtMs + expiresIn * 1000),
-        );
+        if (tx) {
+          // 续签事务里:保存点让失败只回滚这一条,不把整个续签事务拖进 aborted。
+          await withSavepoint(tx, 'refresh_access_expiry', () =>
+            this.refreshTokenService.recordAccessTokenIssued(
+              userId,
+              sessionId,
+              expiresAt,
+              tx,
+            ),
+          );
+        } else {
+          await this.refreshTokenService.recordAccessTokenIssued(
+            userId,
+            sessionId,
+            expiresAt,
+          );
+        }
       } catch (error) {
-        // Rotation already committed before signing. Failing the response here
-        // strands the new refresh token and makes a retry look like token reuse.
+        // Never fail token issuance on this metadata: outside a transaction the
+        // session row is already committed, and failing would strand the new
+        // refresh token and make a retry look like token reuse.
         // A null expiry is safe: revocation records a conservative full TTL.
         this.logger.warn({
           event: 'access_token_expiry_metadata_persist_failed',

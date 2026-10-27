@@ -3,6 +3,7 @@ import { Test } from '@nestjs/testing';
 import {
   Cron,
   CronExpression,
+  Interval,
   ScheduleModule,
   SchedulerRegistry,
 } from '@nestjs/schedule';
@@ -12,6 +13,7 @@ import {
   reportJobSkipped,
   runTracked,
   TrackedCron,
+  TrackedInterval,
 } from './tracked-cron.decorator';
 import { jobMetrics } from './job-metrics';
 import { getOperationContext } from '../logging/operation-context';
@@ -201,6 +203,92 @@ describe('TrackedCron runtime registration', () => {
       const after = await jobMetrics.registry.metrics();
       expect(after).toMatch(
         /circle_cron_runs_total\{[^}]*job="runtime_probe"[^}]*result="success"[^}]*\}\s+1/,
+      );
+    } finally {
+      await app.close();
+    }
+  });
+});
+
+// 两个 outbox 式处理器用的是 @Interval 而不是 @Cron：此前它们既没有心跳也没有
+// 运行记账，停摆或一直失败都没有任何信号。
+describe('TrackedInterval', () => {
+  it('registers the same scheduler metadata as a plain named @Interval', () => {
+    class Plain {
+      @Interval('tracked_interval_metadata_probe', 5_000)
+      run(): void {}
+    }
+    class Tracked {
+      @TrackedInterval(5_000, 'tracked_interval_metadata_probe')
+      run(): void {}
+    }
+
+    const plainKeys = Reflect.getMetadataKeys(Plain.prototype.run).sort();
+    const trackedKeys = Reflect.getMetadataKeys(Tracked.prototype.run).sort();
+    expect(trackedKeys).toEqual(plainKeys);
+    expect(trackedKeys.length).toBeGreaterThan(0);
+    for (const key of plainKeys) {
+      expect(Reflect.getMetadata(key, Tracked.prototype.run)).toEqual(
+        Reflect.getMetadata(key, Plain.prototype.run),
+      );
+    }
+  });
+
+  it('seeds the heartbeat and exports the interval in seconds for CronJobStalled', async () => {
+    class Probe {
+      @TrackedInterval(10_000, 'tracked_interval_seed_probe')
+      run(): void {}
+    }
+    expect(Probe).toBeDefined();
+
+    const text = await jobMetrics.registry.metrics();
+    expect(text).toMatch(
+      /circle_cron_last_success_timestamp_seconds\{job="tracked_interval_seed_probe"\}/,
+    );
+    expect(text).toMatch(
+      /circle_cron_interval_seconds\{job="tracked_interval_seed_probe"\}\s+10\b/,
+    );
+  });
+
+  it('preserves `this`, arguments and the return value', async () => {
+    class Probe {
+      multiplier = 3;
+
+      @TrackedInterval(5_000, 'tracked_interval_passthrough_probe')
+      async run(value: number): Promise<number> {
+        return value * this.multiplier;
+      }
+    }
+
+    await expect(new Probe().run(5)).resolves.toBe(15);
+  });
+
+  it('is scheduled by the real scheduler as the wrapped, recorded function', async () => {
+    @Injectable()
+    class Probe {
+      ran = 0;
+
+      @TrackedInterval(20, 'interval_runtime_probe')
+      async run(): Promise<void> {
+        this.ran += 1;
+      }
+    }
+
+    const moduleRef = await Test.createTestingModule({
+      imports: [ScheduleModule.forRoot()],
+      providers: [Probe],
+    }).compile();
+    const app = moduleRef.createNestApplication();
+    await app.init();
+
+    try {
+      expect(
+        app.get(SchedulerRegistry).getInterval('interval_runtime_probe'),
+      ).toBeDefined();
+      await new Promise((resolve) => setTimeout(resolve, 120));
+      expect(app.get(Probe).ran).toBeGreaterThan(0);
+      expect(await jobMetrics.registry.metrics()).toMatch(
+        /circle_cron_runs_total\{[^}]*job="interval_runtime_probe"[^}]*result="success"[^}]*\}\s+[1-9]/,
       );
     } finally {
       await app.close();

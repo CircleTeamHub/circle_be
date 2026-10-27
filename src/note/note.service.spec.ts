@@ -14,6 +14,7 @@ import { mkdtempSync, writeFileSync } from 'fs';
 import { tmpdir } from 'os';
 import { join } from 'path';
 import PDFDocument from 'pdfkit';
+import { Prisma } from 'src/generated/prisma';
 import { PrismaService } from 'src/prisma/prisma.service';
 import {
   CHAT_MEDIA_DELETE_CLAIM_REASON,
@@ -88,6 +89,8 @@ describe('NoteService', () => {
     noteGroupMembership: {
       deleteMany: jest.fn(),
       createMany: jest.fn(),
+      // 分组计数单独按 groupID 聚合；默认没有成员。
+      groupBy: jest.fn().mockResolvedValue([]),
     },
     noteShareLink: {
       count: jest.fn(),
@@ -105,6 +108,78 @@ describe('NoteService', () => {
   };
 
   const chatService = { requireVisibleMessage: jest.fn() };
+
+  const isPlainObject = (value: unknown): value is Record<string, any> =>
+    Boolean(value && typeof value === 'object' && !Array.isArray(value));
+  /**
+   * 列表摘要投影（note-summary.query.ts）在单测里的替身：从 note.findMany 桩返回过的
+   * 「整行」夹具按同一口径推出投影行，夹具仍是唯一的数据来源。真实 SQL 的口径由
+   * test/postgres/note-list-summary.pg-spec.ts 在真库上与原实现逐字段对照。
+   */
+  const summaryProjectionFromFixture = (id: string, row: any) => {
+    const sections = isPlainObject(row?.sections) ? row.sections : {};
+    const text = isPlainObject(sections.text) ? sections.text : {};
+    const items = (name: string): unknown[] | null => {
+      const section = sections[name];
+      return isPlainObject(section) && Array.isArray(section.items)
+        ? section.items
+        : null;
+    };
+    const blocks = Array.isArray(text.contentJson)
+      ? text.contentJson
+      : Array.isArray(row?.contentJson)
+        ? row.contentJson
+        : null;
+    const media: any[] = row?.media ?? [];
+    const images = [...media]
+      .filter((item) => item.type === 'IMAGE')
+      .sort((a, b) => a.sortOrder - b.sortOrder);
+    const chosen =
+      row?.coverMedia?.type === 'IMAGE'
+        ? (media.find((item) => item.id === row.coverMedia.id) ?? {
+            ...row.coverMedia,
+            objectKey: null,
+            noteID: null,
+          })
+        : null;
+    const cover = chosen ?? images[0] ?? null;
+    return {
+      id,
+      contentHead:
+        typeof row?.content === 'string'
+          ? Array.from(row.content as string)
+              .slice(0, 1024)
+              .join('')
+          : null,
+      sectionTextHasText:
+        typeof text.content === 'string' ? text.content.trim() !== '' : null,
+      hasJsonText: blocks ? blocks.some(isPlainObject) : false,
+      showcaseCount:
+        items('showcase')?.length ?? (items('media') ? 0 : images.length),
+      contactItems: items('contacts'),
+      groupItems: items('groups'),
+      hasLocation: isPlainObject(sections.location),
+      coverId: cover?.id ?? null,
+      coverType: cover?.type ?? null,
+      coverUrl: cover?.url ?? null,
+      coverObjectKey: cover?.objectKey ?? null,
+      coverNoteID: cover ? (cover.noteID === null ? null : id) : null,
+    };
+  };
+  const listFixture = async (id: string) => {
+    for (const result of prisma.note.findMany.mock.results) {
+      if (result.type !== 'return') continue;
+      const rows: unknown = await Promise.resolve(result.value).catch(
+        () => null,
+      );
+      if (!Array.isArray(rows)) continue;
+      const row = rows.find(
+        (candidate) => candidate?.id === id && 'title' in candidate,
+      );
+      if (row) return row;
+    }
+    return null;
+  };
   const uploadService = {
     uploadBuffer: jest.fn(),
     downloadObjectBuffer: jest.fn(),
@@ -162,12 +237,28 @@ describe('NoteService', () => {
     });
     prisma.chatConversation.findMany.mockReset();
     prisma.chatConversation.findMany.mockResolvedValue([]);
+    prisma.noteGroupMembership.groupBy.mockReset();
+    prisma.noteGroupMembership.groupBy.mockResolvedValue([]);
     // 写笔记事务内复核群主（FOR SHARE 读会话）与 findUnique 桩读到同一行；
     // 其他原生查询维持默认空结果。
     prisma.$queryRaw.mockReset();
     prisma.$queryRaw.mockImplementation(
-      async (strings: TemplateStringsArray) => {
-        const sql = strings.join('?');
+      async (query: TemplateStringsArray | Prisma.Sql) => {
+        // 模板字面量调用拿到字符串数组；预先构造好的 Prisma.Sql 直接读 sql。
+        const sql = Array.isArray(query)
+          ? query.join('?')
+          : (query as Prisma.Sql).sql;
+        // 列表摘要投影：按这一页的 id 从夹具推出来。
+        if (sql.includes('jsonb_to_record')) {
+          const ids = (query as Prisma.Sql).values.find(
+            Array.isArray,
+          ) as string[];
+          return Promise.all(
+            ids.map(async (id) =>
+              summaryProjectionFromFixture(id, await listFixture(id)),
+            ),
+          );
+        }
         // 编辑笔记在事务内锁读笔记行（FOR UPDATE），沿用 findFirst 桩的调用顺序。
         if (sql.includes('FROM "Note"')) {
           const note = await prisma.note.findFirst();
@@ -1540,6 +1631,141 @@ describe('NoteService', () => {
     });
   });
 
+  // 列表摘要只取标量列，派生字段走 SQL 投影；摘要里唯一的媒体 url 是封面，只签它。
+  describe('list summaries without full rows', () => {
+    const mediaRow = (id: string, type: string, sortOrder: number) => ({
+      id,
+      type,
+      objectKey: `notes/user-1/${id}.jpg`,
+      url: `https://api.example.com/circle/notes/user-1/${id}.jpg`,
+      posterUrl:
+        type === 'VIDEO'
+          ? `https://api.example.com/circle/notes/user-1/${id}-poster.jpg`
+          : null,
+      sortOrder,
+    });
+    const richRow = {
+      ...listRow(0),
+      content: '正文',
+      media: [
+        mediaRow('img-0', 'IMAGE', 0),
+        mediaRow('vid-1', 'VIDEO', 1),
+        mediaRow('img-2', 'IMAGE', 2),
+      ],
+      sections: {
+        showcase: {
+          items: [
+            {
+              url: 'https://api.example.com/circle/notes/user-1/extra.jpg',
+              objectKey: 'notes/user-1/extra.jpg',
+            },
+          ],
+        },
+      },
+    };
+
+    it('selects only summary columns and signs only the cover', async () => {
+      prisma.note.findMany.mockResolvedValueOnce([richRow]);
+
+      const [item] = (await service.listNotes('user-1', {})).items;
+
+      const args = prisma.note.findMany.mock.calls[0][0];
+      expect(args.include).toBeUndefined();
+      for (const heavy of ['content', 'contentJson', 'sections', 'media']) {
+        expect(args.select).not.toHaveProperty(heavy);
+      }
+      expect(uploadService.createPresignedGetUrl).toHaveBeenCalledTimes(1);
+      expect(uploadService.createPresignedGetUrl.mock.calls[0][0]).toBe(
+        'notes/user-1/img-0.jpg',
+      );
+      expect(item.cover).toEqual({
+        id: 'img-0',
+        type: 'IMAGE',
+        url: expect.stringContaining(
+          'https://signed.example.com/notes/user-1/img-0.jpg',
+        ),
+      });
+      expect(item.showcaseCount).toBe(1);
+    });
+
+    it.each([
+      ['listDeletedNotes', () => service.listDeletedNotes('user-1')],
+      [
+        'resolveShareLink',
+        () => {
+          prisma.noteShareLink.findUnique.mockResolvedValueOnce({
+            ownerID: 'user-1',
+            token: 'tok',
+            title: 't',
+            status: null,
+            group: null,
+            groupID: null,
+            search: null,
+            noteIDs: [],
+            expiresAt: null,
+            revokedAt: null,
+          });
+          return service.resolveShareLink('tok');
+        },
+      ],
+    ])('%s uses the same summary-only select', async (_name, run) => {
+      prisma.note.findMany.mockResolvedValueOnce([richRow]);
+
+      await run();
+
+      const args = prisma.note.findMany.mock.calls[0][0];
+      expect(args.include).toBeUndefined();
+      expect(args.select).toEqual(
+        expect.objectContaining({ id: true, title: true, updatedAt: true }),
+      );
+      expect(args.select).not.toHaveProperty('content');
+      expect(uploadService.createPresignedGetUrl).toHaveBeenCalledTimes(1);
+    });
+
+    it('reads the full content only when the head cannot decide the preview', async () => {
+      const longHead = ' '.repeat(1024);
+      prisma.note.findMany.mockResolvedValueOnce([listRow(0), listRow(1)]);
+      prisma.$queryRaw.mockImplementationOnce(async () => [
+        {
+          ...summaryProjectionFromFixture('note-0', null),
+          contentHead: longHead,
+        },
+        {
+          ...summaryProjectionFromFixture('note-1', null),
+          contentHead: `${'字'.repeat(1024)}`,
+        },
+      ]);
+      prisma.note.findMany.mockResolvedValueOnce([
+        { id: 'note-0', content: `${longHead}${'\n'.repeat(10)}结尾的正文` },
+      ]);
+
+      const { items } = await service.listNotes('user-1', {});
+
+      expect(prisma.note.findMany).toHaveBeenCalledWith({
+        where: { id: { in: ['note-0'] } },
+        select: { id: true, content: true },
+      });
+      expect(items[0]).toMatchObject({
+        contentPreview: '结尾的正文',
+        hasText: true,
+      });
+      // 开头 1024 个字已经够定出预览：不补读，截到 120 个字加省略号。
+      expect(items[1].contentPreview).toBe(`${'字'.repeat(120)}...`);
+    });
+
+    it('drops a note that was purged between the page read and its projection', async () => {
+      prisma.note.findMany.mockResolvedValueOnce([listRow(0), listRow(1)]);
+      prisma.$queryRaw.mockImplementationOnce(async () => [
+        summaryProjectionFromFixture('note-1', null),
+      ]);
+
+      const { items, hasMore } = await service.listNotes('user-1', {});
+
+      expect(items.map((item) => item.id)).toEqual(['note-1']);
+      expect(hasMore).toBe(false);
+    });
+  });
+
   it('returns a note detail with owner edit metadata', async () => {
     prisma.note.findFirst.mockResolvedValueOnce({
       id: 'note-1',
@@ -2576,6 +2802,93 @@ describe('NoteService', () => {
     });
   });
 
+  // 归属校验只决定「是不是你的、还在不在」,此前却 include NOTE_INCLUDE(正文、
+  // contentJson、sections、全部 media、分组成员 —— 四条查询)再整个丢掉。
+  describe('ownership checks read only what they decide on', () => {
+    // rootSourceNoteID:状态写入按收藏链的根排广播;漏读它,收藏副本会把广播排在
+    // 自己的 id 上,而不是来源笔记上。
+    const OWNED_NOTE_LOOKUP = {
+      where: { id: 'note-1', ownerID: 'user-1', status: { not: 'DELETED' } },
+      select: { id: true, rootSourceNoteID: true },
+    };
+
+    it.each([
+      ['setPinned', (s: NoteService) => s.setPinned('user-1', 'note-1', true)],
+      ['setRemark', (s: NoteService) => s.setRemark('user-1', 'note-1', 'x')],
+      [
+        'setAvailable',
+        (s: NoteService) => s.setAvailable('user-1', 'note-1', false),
+      ],
+      [
+        'setStatus',
+        (s: NoteService) => s.setStatus('user-1', 'note-1', 'UNLISTED'),
+      ],
+      ['deleteNote', (s: NoteService) => s.deleteNote('user-1', 'note-1')],
+    ])(
+      '%s checks ownership reading only id and the chain root',
+      async (_, run) => {
+        prisma.note.findFirst.mockResolvedValueOnce({ id: 'note-1' });
+        prisma.note.update.mockResolvedValueOnce({ id: 'note-1' });
+
+        await run(service);
+
+        expect(prisma.note.findFirst).toHaveBeenCalledWith(OWNED_NOTE_LOOKUP);
+      },
+    );
+
+    it.each([
+      [
+        'setPinned',
+        (s: NoteService) => s.setPinned('intruder', 'note-1', true),
+      ],
+      ['deleteNote', (s: NoteService) => s.deleteNote('intruder', 'note-1')],
+    ])('%s still 404s for a note the caller does not own', async (_, run) => {
+      prisma.note.findFirst.mockResolvedValueOnce(null);
+
+      await expect(run(service)).rejects.toThrow(NotFoundException);
+      expect(prisma.note.update).not.toHaveBeenCalled();
+    });
+
+    it('source-note checks also read collectedFromNoteID and nothing more', async () => {
+      prisma.note.findFirst.mockResolvedValueOnce({
+        id: 'note-1',
+        collectedFromNoteID: null,
+      });
+      prisma.note.update.mockResolvedValueOnce({
+        id: 'note-1',
+        workStatus: 'WORKING',
+      });
+
+      await service.setWorkStatus('user-1', 'note-1', 'WORKING');
+
+      expect(prisma.note.findFirst).toHaveBeenCalledWith({
+        where: OWNED_NOTE_LOOKUP.where,
+        select: { id: true, collectedFromNoteID: true, rootSourceNoteID: true },
+      });
+    });
+
+    it('source-note checks still reject a collected copy', async () => {
+      prisma.note.findFirst.mockResolvedValueOnce({
+        id: 'note-1',
+        collectedFromNoteID: 'source-note',
+      });
+
+      await expect(
+        service.setWorkStatus('user-1', 'note-1', 'WORKING'),
+      ).rejects.toThrow(ForbiddenException);
+      await expect(
+        (async () => {
+          prisma.note.findFirst.mockResolvedValueOnce({
+            id: 'note-1',
+            collectedFromNoteID: 'source-note',
+          });
+          return service.setSourceConversation('user-1', 'note-1', null);
+        })(),
+      ).rejects.toThrow(ForbiddenException);
+      expect(prisma.note.update).not.toHaveBeenCalled();
+    });
+  });
+
   it('toggles note availability for the owner only', async () => {
     prisma.note.findFirst.mockResolvedValueOnce({
       id: 'note-1',
@@ -2758,8 +3071,10 @@ describe('NoteService', () => {
         ownerID: 'user-1',
         name: '上海',
         sortOrder: 0,
-        _count: { memberships: 2 },
       },
+    ]);
+    prisma.noteGroupMembership.groupBy.mockResolvedValueOnce([
+      { groupID: 'group-1', _count: { _all: 2 } },
     ]);
 
     const created = await service.createGroup('user-1', { name: '上海' });
@@ -2767,6 +3082,51 @@ describe('NoteService', () => {
 
     expect(created).toMatchObject({ name: '上海' });
     expect(groups[0]).toMatchObject({ name: '上海', noteCount: 2 });
+  });
+
+  it('counts group notes with one groupBy scoped to the listed groups', async () => {
+    prisma.noteGroup.findMany.mockResolvedValueOnce([
+      { id: 'group-1', ownerID: 'user-1', name: '上海', sortOrder: 0 },
+      { id: 'group-2', ownerID: 'user-1', name: '北京', sortOrder: 1 },
+      { id: 'group-3', ownerID: 'user-1', name: '深圳', sortOrder: 2 },
+    ]);
+    prisma.noteGroupMembership.groupBy.mockResolvedValueOnce([
+      { groupID: 'group-3', _count: { _all: 4 } },
+      { groupID: 'group-1', _count: { _all: 2 } },
+    ]);
+
+    const groups = await service.listGroups('user-1');
+
+    // 计数不再挂在分组查询上：_count 关系子查询没有分组条件，会扫全站成员表。
+    const listArgs = prisma.noteGroup.findMany.mock.calls[0][0];
+    expect(listArgs).toEqual({
+      where: { ownerID: 'user-1', deletedAt: null },
+      orderBy: [{ sortOrder: 'asc' }, { createdAt: 'asc' }],
+      take: 500,
+    });
+    expect(prisma.noteGroupMembership.groupBy).toHaveBeenCalledTimes(1);
+    expect(prisma.noteGroupMembership.groupBy).toHaveBeenCalledWith({
+      by: ['groupID'],
+      where: {
+        groupID: { in: ['group-1', 'group-2', 'group-3'] },
+        note: { status: { not: 'DELETED' } },
+      },
+      _count: { _all: true },
+    });
+    // DTO 形状与顺序不变；没有成员的分组计 0。
+    expect(groups).toEqual([
+      { id: 'group-1', name: '上海', sortOrder: 0, noteCount: 2 },
+      { id: 'group-2', name: '北京', sortOrder: 1, noteCount: 0 },
+      { id: 'group-3', name: '深圳', sortOrder: 2, noteCount: 4 },
+    ]);
+  });
+
+  it('skips the count query when the owner has no groups', async () => {
+    prisma.noteGroup.findMany.mockResolvedValueOnce([]);
+
+    await expect(service.listGroups('user-1')).resolves.toEqual([]);
+
+    expect(prisma.noteGroupMembership.groupBy).not.toHaveBeenCalled();
   });
 
   it('forbids renaming another user group', async () => {
@@ -2811,8 +3171,10 @@ describe('NoteService', () => {
       ownerID: 'user-1',
       name: '上海',
       sortOrder: 0,
-      _count: { memberships: 1 },
     });
+    prisma.noteGroupMembership.groupBy.mockResolvedValueOnce([
+      { groupID: 'group-1', _count: { _all: 1 } },
+    ]);
 
     const result = await service.updateGroup('user-1', 'group-1', {
       name: '上海',
@@ -2820,7 +3182,52 @@ describe('NoteService', () => {
 
     // No second findFirst call for conflict because name is unchanged
     expect(prisma.noteGroup.findFirst).toHaveBeenCalledTimes(1);
-    expect(result).toMatchObject({ name: '上海' });
+    expect(prisma.noteGroup.update).toHaveBeenCalledWith({
+      where: { id: 'group-1' },
+      data: { name: '上海' },
+    });
+    expect(prisma.noteGroupMembership.groupBy).toHaveBeenCalledWith({
+      by: ['groupID'],
+      where: {
+        groupID: { in: ['group-1'] },
+        note: { status: { not: 'DELETED' } },
+      },
+      _count: { _all: true },
+    });
+    expect(result).toEqual({
+      id: 'group-1',
+      name: '上海',
+      sortOrder: 0,
+      noteCount: 1,
+    });
+  });
+
+  it('reports zero notes for a renamed group without members', async () => {
+    prisma.noteGroup.findFirst
+      .mockResolvedValueOnce({
+        id: 'group-1',
+        ownerID: 'user-1',
+        name: '上海',
+        deletedAt: null,
+      })
+      .mockResolvedValueOnce(null);
+    prisma.noteGroup.update.mockResolvedValueOnce({
+      id: 'group-1',
+      ownerID: 'user-1',
+      name: '杭州',
+      sortOrder: 3,
+    });
+
+    const result = await service.updateGroup('user-1', 'group-1', {
+      name: '杭州',
+    });
+
+    expect(result).toEqual({
+      id: 'group-1',
+      name: '杭州',
+      sortOrder: 3,
+      noteCount: 0,
+    });
   });
 
   it('deletes a group by clearing note ownership group references first', async () => {
@@ -3056,22 +3463,31 @@ describe('NoteService', () => {
       ownerID: 'user-1',
       name: '北京',
       sortOrder: 0,
-      _count: { memberships: 0 },
     });
     prisma.noteGroup.update.mockResolvedValueOnce({
       id: 'group-1',
       ownerID: 'user-1',
       name: '上海',
       sortOrder: 1,
-      _count: { memberships: 0 },
     });
     // listGroups call at the end of reorderGroups
     prisma.noteGroup.findMany.mockResolvedValueOnce([
-      { id: 'group-2', name: '北京', sortOrder: 0, _count: { memberships: 0 } },
-      { id: 'group-1', name: '上海', sortOrder: 1, _count: { memberships: 0 } },
+      { id: 'group-2', name: '北京', sortOrder: 0 },
+      { id: 'group-1', name: '上海', sortOrder: 1 },
+    ]);
+    prisma.noteGroupMembership.groupBy.mockResolvedValueOnce([
+      { groupID: 'group-1', _count: { _all: 3 } },
     ]);
 
-    await service.reorderGroups('user-1', ['group-2', 'group-1']);
+    const groups = await service.reorderGroups('user-1', [
+      'group-2',
+      'group-1',
+    ]);
+
+    expect(groups).toEqual([
+      { id: 'group-2', name: '北京', sortOrder: 0, noteCount: 0 },
+      { id: 'group-1', name: '上海', sortOrder: 1, noteCount: 3 },
+    ]);
 
     expect(prisma.noteGroup.update).toHaveBeenCalledWith(
       expect.objectContaining({

@@ -13,6 +13,12 @@ RUN xcaddy build \
     --replace golang.org/x/crypto=golang.org/x/crypto@v0.57.0 \
     --replace google.golang.org/grpc=google.golang.org/grpc@v1.83.2
 
-FROM caddy:2-alpine
+# 运行阶段有名字，CI 才能对它关掉层缓存（ci.yml 的 no-cache-filters）：基础镜像
+# 没更新时，带缓存的构建会一直沿用旧的 apk upgrade 结果，Alpine 已经修好的漏洞照样
+# 让 Trivy 红。xcaddy 编译那一阶段照常走缓存。
+FROM caddy:2-alpine AS runtime
 RUN apk upgrade --no-cache
+# 采集用日志副本的目录（Caddyfile 全局块的 log collected）。0755：caddy_logs 命名卷
+# 首次挂载时继承它，以非 root 运行的 Alloy 才进得去。
+RUN mkdir -p /var/log/caddy && chmod 0755 /var/log/caddy
 COPY --from=builder /usr/bin/caddy /usr/bin/caddy

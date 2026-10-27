@@ -215,6 +215,13 @@ services:
       circle_be: { condition: service_healthy, required: false }
     expose:
       - '80'
+    # nginx:alpine 自带 busybox wget。只探容器内的 80 端口：静态文件能出来就是好的。
+    healthcheck:
+      test: ['CMD', 'wget', '-q', '-O', '/dev/null', 'http://127.0.0.1/']
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
 
   caddy:
     # 官方镜像不带限流模块，故本地构建（见 Dockerfile.caddy）。
@@ -240,11 +247,23 @@ services:
     ports:
       - '80:80'
       - '443:443'
+    # 探 Caddy 自己的 admin API（默认只听容器内 localhost:2019，不对外）。它能应答
+    # 说明进程和配置加载正常；站点证书、上游健康由 blackbox 的公网探测负责。
+    # 探 /metrics 而不是 /config/：其余 admin 请求每次都记一行 INFO「received
+    # request」，每 30 秒一次就是每天近三千行噪音；/metrics 只记 debug。
+    healthcheck:
+      test: ['CMD', 'wget', '-q', '-O', '/dev/null', 'http://127.0.0.1:2019/metrics']
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
     volumes:
       - ./deploy/Caddyfile.admin:/etc/caddy/Caddyfile:ro
       - ./deploy/caddy-entrypoint.sh:/usr/local/bin/caddy-entrypoint.sh:ro
       - caddy_data:/data
       - caddy_config:/config
+      # 采集用的脱敏日志副本（见 Caddyfile 全局块）。日志 overlay 以只读方式挂它。
+      - caddy_logs:/var/log/caddy
 
 volumes:
   app_logs_blue:
@@ -253,3 +272,4 @@ volumes:
   minio_data:
   caddy_data:
   caddy_config:
+  caddy_logs:

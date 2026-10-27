@@ -15,7 +15,7 @@ describe('ChatCircleSyncService', () => {
     },
     circle: { findUnique: jest.fn() },
     user: { findMany: jest.fn() },
-    circleMember: { findMany: jest.fn() },
+    circleMember: { findMany: jest.fn(), findFirst: jest.fn() },
     chatConversation: { findUnique: jest.fn(), create: jest.fn() },
     chatMember: {
       findMany: jest.fn(),
@@ -60,6 +60,10 @@ describe('ChatCircleSyncService', () => {
     redis as never,
   );
   const runTx = async (cb: (tx: typeof prisma) => unknown) => cb(prisma);
+  /** 圈子成员与座位的差集(circleSeatDiffQuery 的结果行)。 */
+  const seatDiff = (
+    rows: Array<{ userID: string; action: 'create' | 'rejoin' | 'remove' }>,
+  ) => prisma.$queryRaw.mockResolvedValueOnce(rows);
 
   beforeEach(() => {
     jest.clearAllMocks();
@@ -77,6 +81,7 @@ describe('ChatCircleSyncService', () => {
     systemMessage.emit.mockResolvedValue(undefined);
     prisma.user.findMany.mockResolvedValue([]);
     prisma.$queryRaw.mockResolvedValue([]);
+    prisma.circleMember.findFirst.mockResolvedValue({ id: 'cm-active' });
     redis.tryAcquireLease.mockResolvedValue(undefined);
     redis.renewLease.mockResolvedValue(true);
     redis.releaseLease.mockResolvedValue(undefined);
@@ -127,9 +132,9 @@ describe('ChatCircleSyncService', () => {
         adminState: 'ACTIVE',
       });
       prisma.chatConversation.findUnique.mockResolvedValue({ id: 'conv-1' });
-      prisma.circleMember.findMany.mockResolvedValue([{ userID: 'u1' }]);
-      prisma.chatMember.findMany.mockResolvedValue([
-        { userID: 'u2', leftAt: null },
+      seatDiff([
+        { userID: 'u1', action: 'create' },
+        { userID: 'u2', action: 'remove' },
       ]);
       broadcast.joinUserToConversation.mockRejectedValueOnce(privateFailure());
       broadcast.removeUserFromConversation.mockRejectedValueOnce(
@@ -304,11 +309,10 @@ describe('ChatCircleSyncService', () => {
     });
     prisma.chatConversation.findUnique.mockResolvedValue(null);
     prisma.chatConversation.create.mockResolvedValue({ id: 'conv-1' });
-    prisma.circleMember.findMany.mockResolvedValue([
-      { userID: 'u1' },
-      { userID: 'u2' },
+    seatDiff([
+      { userID: 'u1', action: 'create' },
+      { userID: 'u2', action: 'create' },
     ]);
-    prisma.chatMember.findMany.mockResolvedValue([]);
 
     const id = await service.ensureCircleConversation('circle-1');
 
@@ -354,10 +358,9 @@ describe('ChatCircleSyncService', () => {
       adminState: 'ACTIVE',
     });
     prisma.chatConversation.findUnique.mockResolvedValue({ id: 'conv-1' });
-    prisma.circleMember.findMany.mockResolvedValue([{ userID: 'u1' }]);
-    prisma.chatMember.findMany.mockResolvedValue([
-      { userID: 'u1', leftAt: new Date() }, // 重新入圈:复活
-      { userID: 'u2', leftAt: null }, // 已被踢:离座
+    seatDiff([
+      { userID: 'u1', action: 'rejoin' }, // 重新入圈:复活
+      { userID: 'u2', action: 'remove' }, // 已被踢:离座
     ]);
 
     await service.ensureCircleConversation('circle-1');
@@ -380,10 +383,12 @@ describe('ChatCircleSyncService', () => {
     );
     expect(prisma.chatMember.updateMany).toHaveBeenCalledWith(
       expect.objectContaining({
-        where: expect.objectContaining({
-          userID: { notIn: ['u1'] },
+        // 只点名差集里的人:不再把全部 ACTIVE 成员拼成 NOT IN (≤3000 个参数)。
+        where: {
+          conversationID: 'conv-1',
+          userID: { in: ['u2'] },
           leftAt: null,
-        }),
+        },
         data: { leftAt: expect.any(Date) },
       }),
     );
@@ -417,8 +422,7 @@ describe('ChatCircleSyncService', () => {
       adminState: 'ACTIVE',
     });
     prisma.chatConversation.findUnique.mockResolvedValue({ id: 'conv-1' });
-    prisma.circleMember.findMany.mockResolvedValue([{ userID: 'newcomer' }]);
-    prisma.chatMember.findMany.mockResolvedValue([]);
+    seatDiff([{ userID: 'newcomer', action: 'create' }]);
     prisma.chatMessage.aggregate.mockResolvedValue({ _max: { height: 4321 } });
 
     await service.ensureCircleConversation('circle-1');
@@ -432,6 +436,142 @@ describe('ChatCircleSyncService', () => {
         },
       ],
       skipDuplicates: true,
+    });
+  });
+
+  // 每分钟的对账原来每次都把全部 ACTIVE 成员和全部座位读进内存,再拿 ≤3000 个
+  // userID 拼 IN / NOT IN 写两遍 —— 绝大多数时候根本没有变化。差集改在库里用 JOIN
+  // 算(circleSeatDiffQuery),写入只点名差集里的人。
+  describe('seat diff reconciliation', () => {
+    beforeEach(() => {
+      prisma.circle.findUnique.mockResolvedValue({
+        id: 'circle-1',
+        deleted: false,
+        adminState: 'ACTIVE',
+      });
+      prisma.chatConversation.findUnique.mockResolvedValue({
+        id: 'conv-1',
+        clearedBeforeHeight: 3,
+      });
+    });
+
+    it('computes the diff in one statement under the circle lock, without shipping member lists', async () => {
+      seatDiff([]);
+
+      await service.ensureCircleConversation('circle-1');
+
+      expect(prisma.circleMember.findMany).not.toHaveBeenCalled();
+      expect(prisma.chatMember.findMany).not.toHaveBeenCalled();
+      const [query] = prisma.$queryRaw.mock.calls[0] as [
+        { sql: string; values: unknown[] },
+      ];
+      expect(query.sql).toContain('"CircleMember"');
+      expect(query.sql).toContain('"ChatMember"');
+      expect(new Set(query.values)).toEqual(new Set(['circle-1', 'conv-1']));
+      // 同圈对账仍串行化:advisory lock 在算差集之前。
+      expect(prisma.$executeRaw.mock.invocationCallOrder[0]).toBeLessThan(
+        prisma.$queryRaw.mock.invocationCallOrder[0],
+      );
+    });
+
+    it('writes nothing at all when seats already match the ACTIVE members', async () => {
+      seatDiff([]);
+
+      await expect(service.ensureCircleConversation('circle-1')).resolves.toBe(
+        'conv-1',
+      );
+
+      expect(prisma.chatMessage.aggregate).not.toHaveBeenCalled();
+      expect(prisma.chatMember.createMany).not.toHaveBeenCalled();
+      expect(prisma.chatMember.updateMany).not.toHaveBeenCalled();
+      expect(broadcast.emitConversationChange).not.toHaveBeenCalled();
+      expect(groupEvents.record).not.toHaveBeenCalled();
+    });
+
+    it('seats only the added members: new seats are created, left seats revived', async () => {
+      seatDiff([
+        { userID: 'fresh', action: 'create' },
+        { userID: 'returning', action: 'rejoin' },
+      ]);
+      prisma.chatMessage.aggregate.mockResolvedValue({ _max: { height: 9 } });
+
+      await service.ensureCircleConversation('circle-1');
+
+      expect(prisma.chatMember.createMany).toHaveBeenCalledWith({
+        data: [
+          {
+            conversationID: 'conv-1',
+            userID: 'fresh',
+            lastReadHeight: 9,
+            clearedBeforeHeight: 3,
+          },
+        ],
+        skipDuplicates: true,
+      });
+      expect(prisma.chatMember.updateMany).toHaveBeenCalledTimes(1);
+      expect(prisma.chatMember.updateMany).toHaveBeenCalledWith({
+        where: {
+          conversationID: 'conv-1',
+          userID: { in: ['returning'] },
+          leftAt: { not: null },
+        },
+        data: { leftAt: null, lastReadHeight: 9, joinedAt: expect.any(Date) },
+      });
+      for (const userId of ['fresh', 'returning']) {
+        expect(broadcast.emitConversationChange).toHaveBeenCalledWith(userId, {
+          kind: 'joined',
+          conversationId: 'conv-1',
+          userId,
+        });
+      }
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      expect(groupEvents.record).toHaveBeenCalledWith('conv-1', {
+        kind: 'member-joined',
+        actorId: null,
+        targetIds: ['fresh', 'returning'],
+      });
+    });
+
+    it('retires only the seats of members who are no longer ACTIVE', async () => {
+      seatDiff([{ userID: 'gone', action: 'remove' }]);
+
+      await service.ensureCircleConversation('circle-1');
+
+      expect(prisma.chatMessage.aggregate).not.toHaveBeenCalled();
+      expect(prisma.chatMember.createMany).not.toHaveBeenCalled();
+      expect(prisma.chatMember.updateMany).toHaveBeenCalledTimes(1);
+      expect(prisma.chatMember.updateMany).toHaveBeenCalledWith({
+        where: {
+          conversationID: 'conv-1',
+          userID: { in: ['gone'] },
+          leftAt: null,
+        },
+        data: { leftAt: expect.any(Date) },
+      });
+      expect(broadcast.emitConversationChange).toHaveBeenCalledWith('gone', {
+        kind: 'removed',
+        conversationId: 'conv-1',
+        userId: 'gone',
+      });
+    });
+
+    // 原来 activeIds 为空时不执行离座的 updateMany(防一次异常读把整群清空),
+    // 差集里的人照常收到 removed 事件。口径原样保留。
+    it('keeps the old guard: no seat is retired while the circle has no ACTIVE member', async () => {
+      seatDiff([{ userID: 'gone', action: 'remove' }]);
+      prisma.circleMember.findFirst.mockResolvedValue(null);
+
+      await service.ensureCircleConversation('circle-1');
+
+      expect(prisma.circleMember.findFirst).toHaveBeenCalledWith({
+        where: { circleID: 'circle-1', status: 'ACTIVE' },
+        select: { id: true },
+      });
+      expect(prisma.chatMember.updateMany).not.toHaveBeenCalled();
+      expect(broadcast.emitConversationChange).toHaveBeenCalledWith(
+        'gone',
+        expect.objectContaining({ kind: 'removed' }),
+      );
     });
   });
 
@@ -589,8 +729,6 @@ describe('ChatCircleSyncService', () => {
       .mockResolvedValueOnce(null)
       .mockResolvedValueOnce({ id: 'conv-1' });
     prisma.chatConversation.create.mockRejectedValue({ code: 'P2002' });
-    prisma.circleMember.findMany.mockResolvedValue([]);
-    prisma.chatMember.findMany.mockResolvedValue([]);
 
     await expect(service.ensureCircleConversation('circle-1')).resolves.toBe(
       'conv-1',
@@ -1422,5 +1560,140 @@ describe('circle sync durable scan progress', () => {
       await Promise.all([pendingA, pendingC]);
       clock.mockRestore();
     }
+  });
+});
+
+/**
+ * 激活后的即时座位同步按圈子在进程内合并(syncCircleSeatsCoalesced)。
+ *
+ * ensureCircleConversation 一开始就在事务里排对账锁:同一圈子 N 次激活各 fire 一次,
+ * 就是 N 个事务各占一个池连接排队,做的却是同一件事。合并后同一圈子同一时刻只跑
+ * 一次;期间再来的请求并成「结束后补跑一次」,补跑覆盖它们提交的全部变更。
+ */
+describe('ChatCircleSyncService.syncCircleSeatsCoalesced', () => {
+  const service = new ChatCircleSyncService(
+    {} as never,
+    {} as never,
+    {} as never,
+    {} as never,
+    {} as never,
+  );
+
+  type Deferred = {
+    circleId: string;
+    resolve: (value: string | null) => void;
+    reject: (error: unknown) => void;
+  };
+  let calls: Deferred[];
+  let running: Map<string, number>;
+  let peak: Map<string, number>;
+
+  beforeEach(() => {
+    calls = [];
+    running = new Map();
+    peak = new Map();
+    jest
+      .spyOn(service, 'ensureCircleConversation')
+      .mockImplementation((circleId: string) => {
+        const now = (running.get(circleId) ?? 0) + 1;
+        running.set(circleId, now);
+        peak.set(circleId, Math.max(peak.get(circleId) ?? 0, now));
+        return new Promise<string | null>((resolve, reject) => {
+          const done = () =>
+            running.set(circleId, (running.get(circleId) ?? 1) - 1);
+          calls.push({
+            circleId,
+            resolve: (value) => {
+              done();
+              resolve(value);
+            },
+            reject: (error) => {
+              done();
+              reject(error);
+            },
+          });
+        });
+      });
+  });
+
+  afterEach(() => jest.restoreAllMocks());
+
+  const flush = () => new Promise<void>((done) => setImmediate(done));
+
+  it('runs one sync per circle at a time and folds requests that arrive meanwhile into one trailing run', async () => {
+    const first = service.syncCircleSeatsCoalesced('c1');
+    await flush();
+    expect(calls).toHaveLength(1);
+
+    // 第一次还在跑:再来 7 个请求,一个都不另起。
+    const late = Array.from({ length: 7 }, () =>
+      service.syncCircleSeatsCoalesced('c1'),
+    );
+    await flush();
+    expect(calls).toHaveLength(1);
+
+    calls[0].resolve('conv-1');
+    await expect(first).resolves.toBe('conv-1');
+    await flush();
+    // 结束后恰好补跑一次,覆盖期间所有请求。
+    expect(calls).toHaveLength(2);
+    calls[1].resolve('conv-1');
+    await expect(Promise.all(late)).resolves.toEqual(Array(7).fill('conv-1'));
+    expect(peak.get('c1')).toBe(1);
+
+    // 都结束了:下一个请求重新起跑,而不是挂在旧状态上。
+    const next = service.syncCircleSeatsCoalesced('c1');
+    await flush();
+    expect(calls).toHaveLength(3);
+    calls[2].resolve('conv-1');
+    await expect(next).resolves.toBe('conv-1');
+  });
+
+  it('lets a request that arrives during the trailing run schedule exactly one more run', async () => {
+    const a = service.syncCircleSeatsCoalesced('c1');
+    await flush();
+    const b = service.syncCircleSeatsCoalesced('c1');
+    calls[0].resolve('conv');
+    await a;
+    await flush();
+    expect(calls).toHaveLength(2);
+
+    // b 的补跑已经开始,它读到的快照可能早于 c 的提交:c 必须再排一次。
+    const c = service.syncCircleSeatsCoalesced('c1');
+    const d = service.syncCircleSeatsCoalesced('c1');
+    calls[1].resolve('conv');
+    await expect(b).resolves.toBe('conv');
+    await flush();
+    expect(calls).toHaveLength(3);
+    calls[2].resolve('conv');
+    await expect(Promise.all([c, d])).resolves.toEqual(['conv', 'conv']);
+    expect(peak.get('c1')).toBe(1);
+  });
+
+  it('keeps different circles independent', async () => {
+    const one = service.syncCircleSeatsCoalesced('c1');
+    const two = service.syncCircleSeatsCoalesced('c2');
+    await flush();
+    expect(calls.map((call) => call.circleId)).toEqual(['c1', 'c2']);
+    calls[1].resolve('conv-2');
+    calls[0].resolve('conv-1');
+    await expect(Promise.all([one, two])).resolves.toEqual([
+      'conv-1',
+      'conv-2',
+    ]);
+  });
+
+  it('rejects the callers of a failed run (so they queue a retry) and still runs the trailing sync', async () => {
+    const first = service.syncCircleSeatsCoalesced('c1');
+    await flush();
+    const late = service.syncCircleSeatsCoalesced('c1');
+    const boom = new Error('db down');
+    calls[0].reject(boom);
+    await expect(first).rejects.toBe(boom);
+    await flush();
+    // 第一次失败不吞掉期间的请求:补跑照常发生,成败归它自己的等待者。
+    expect(calls).toHaveLength(2);
+    calls[1].resolve('conv-1');
+    await expect(late).resolves.toBe('conv-1');
   });
 });

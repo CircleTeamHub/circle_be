@@ -28,6 +28,7 @@ import {
 import { createLoggingConfig } from 'src/logging/logging.config';
 import { logBusinessEvent } from 'src/logging/business-event.logger';
 import { isBlockedByStandaloneGroupPolicy } from 'src/chat/standalone-group-policy-gate';
+import { activeUserIdByAccountIdQuery } from './user-account-lookup.query';
 
 const URL_FIELDS: (keyof UpdateUserInput)[] = [
   'avatarUrl',
@@ -293,14 +294,16 @@ export class UserService {
       return null;
     }
 
+    // 先按 lower("accountId") 唯一索引精确找 id(不走 ILIKE,_ / % 不是通配符),
+    // 再按主键取资料列 —— 资料列仍由 PUBLIC_SELECT 这一处维护,不在原生 SQL 里抄一份。
+    const [match] = await this.prisma.$queryRaw<{ id: string }[]>(
+      activeUserIdByAccountIdQuery(normalized),
+    );
+    if (!match) {
+      return null;
+    }
     const user = await this.prisma.user.findFirst({
-      where: {
-        accountId: {
-          equals: normalized,
-          mode: 'insensitive',
-        },
-        status: 'ACTIVE',
-      },
+      where: { id: match.id, status: 'ACTIVE' },
       select: PUBLIC_SELECT,
     });
 

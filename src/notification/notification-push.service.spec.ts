@@ -1,5 +1,6 @@
 import { PrismaService } from 'src/prisma/prisma.service';
 import { NotificationPushService } from './notification-push.service';
+import { deliveryMetrics } from 'src/metrics/delivery-metrics';
 
 jest.mock('src/logging/error-aggregation.service', () => ({
   reportOperationalError: jest.fn(),
@@ -308,6 +309,63 @@ describe('NotificationPushService (#88 per-token delivery)', () => {
 
       const [, init] = fetchMock.mock.calls[0] as [string, { body: string }];
       expect(JSON.parse(init.body).options.apns_production).toBe(true);
+    });
+
+    it('counts every outcome by provider, keeping dead tokens apart from failures', async () => {
+      // 失效 token（卸载 App）是正常流失，不能算进推送失败率；凭证/限流/
+      // 未配置这类可重试错误和消息级终态才是。
+      const record = jest.spyOn(deliveryMetrics, 'recordPushDelivery');
+      fetchMock.mockResolvedValue({
+        ok: true,
+        json: async () => ({
+          data: [
+            { status: 'ok', id: 'ticket-1' },
+            { status: 'error', details: { error: 'DeviceNotRegistered' } },
+            { status: 'error', details: { error: 'MessageTooBig' } },
+          ],
+        }),
+      });
+      prisma.devicePushToken.updateMany.mockResolvedValue({ count: 1 });
+
+      await service.sendMessages([
+        { token: 'tok-a', projectId: null, payload },
+        { token: 'tok-b', projectId: null, payload },
+        { token: 'tok-c', projectId: null, payload },
+        {
+          token: '1a0018970a9d4f4f8f1',
+          provider: 'jpush',
+          platform: 'android',
+          projectId: null,
+          payload,
+        },
+      ]);
+
+      expect(record.mock.calls).toEqual([
+        ['expo', 'sent'],
+        ['expo', 'dead_token'],
+        ['expo', 'rejected'],
+        ['jpush', 'retryable'],
+      ]);
+      record.mockRestore();
+    });
+
+    it('still returns outcomes when recording metrics throws', async () => {
+      const record = jest
+        .spyOn(deliveryMetrics, 'recordPushDelivery')
+        .mockImplementation(() => {
+          throw new Error('registry gone');
+        });
+      fetchMock.mockResolvedValue({
+        ok: true,
+        json: async () => ({ data: [{ status: 'ok', id: 'ticket-1' }] }),
+      });
+
+      await expect(
+        service.sendToTokens([{ token: 'tok-a', projectId: null }], payload),
+      ).resolves.toEqual([
+        { token: 'tok-a', status: 'SENT', ticketId: 'ticket-1' },
+      ]);
+      record.mockRestore();
     });
 
     it('keeps JPush deliveries retryable when server credentials are absent', async () => {
@@ -624,17 +682,20 @@ describe('NotificationPushService (#88 per-token delivery)', () => {
       const processed = await service.pollReceipts(now);
 
       expect(processed).toBe(3);
-      expect(prisma.notificationPushDelivery.update).toHaveBeenCalledWith({
-        where: { id: 'd1' },
-        data: expect.objectContaining({ status: 'CONFIRMED' }),
+      expect(prisma.notificationPushDelivery.updateMany).toHaveBeenCalledWith({
+        where: { id: { in: ['d1'] } },
+        data: { status: 'CONFIRMED', receiptCheckedAt: now, lastError: null },
       });
-      expect(prisma.notificationPushDelivery.update).toHaveBeenCalledWith({
-        where: { id: 'd2' },
-        data: expect.objectContaining({
+      expect(prisma.notificationPushDelivery.updateMany).toHaveBeenCalledWith({
+        where: { id: { in: ['d2'] } },
+        data: {
           status: 'TERMINAL',
+          receiptCheckedAt: now,
           lastError: 'DeviceNotRegistered',
-        }),
+        },
       });
+      // 逐行 update 只剩可重试那一条（它要和 outbox 重开同事务）。
+      expect(prisma.notificationPushDelivery.update).toHaveBeenCalledTimes(1);
       expect(prisma.devicePushToken.updateMany).toHaveBeenCalledWith({
         where: { token: { in: ['tok-b'] } },
         data: { disabledAt: expect.any(Date) },
@@ -649,6 +710,134 @@ describe('NotificationPushService (#88 per-token delivery)', () => {
         where: { id: 'o3', status: 'COMPLETED' },
         data: { status: 'PENDING', nextAttemptAt: now },
       });
+    });
+
+    it('settles ok and terminal receipts with one updateMany each, keeping retryable rows transactional', async () => {
+      const deliveries = Array.from({ length: 6 }, (_, index) => ({
+        id: `d${index}`,
+        ticketID: `t${index}`,
+        token: `tok-${index}`,
+        outboxID: `o${index}`,
+        sentAt,
+      }));
+      prisma.notificationPushDelivery.findMany.mockResolvedValue(deliveries);
+      fetchMock.mockResolvedValue({
+        ok: true,
+        json: async () => ({
+          data: {
+            t0: { status: 'ok' },
+            t1: { status: 'ok' },
+            t2: { status: 'ok' },
+            t3: { status: 'error', details: { error: 'DeviceNotRegistered' } },
+            t4: { status: 'error', details: { error: 'DeviceNotRegistered' } },
+            t5: { status: 'error', details: { error: 'ExpoServerError' } },
+          },
+        }),
+      });
+      prisma.notificationPushDelivery.groupBy
+        .mockResolvedValueOnce([])
+        .mockResolvedValueOnce([{ outboxID: 'o0' }]);
+      const order: string[] = [];
+      prisma.notificationPushDelivery.updateMany.mockImplementation(
+        async ({ data }: any) => {
+          order.push(`delivery:${data.status}`);
+          return { count: 1 };
+        },
+      );
+      prisma.notificationPushDelivery.update.mockImplementation(
+        async ({ data }: any) => {
+          order.push(`delivery-row:${data.status}`);
+          return {};
+        },
+      );
+      prisma.notificationPushOutbox.updateMany.mockImplementation(
+        async ({ data }: any) => {
+          order.push(`outbox:${data.status}`);
+          return { count: 1 };
+        },
+      );
+
+      const processed = await service.pollReceipts(now);
+
+      expect(processed).toBe(6);
+      expect(prisma.notificationPushDelivery.updateMany.mock.calls).toEqual([
+        [
+          {
+            where: { id: { in: ['d0', 'd1', 'd2'] } },
+            data: {
+              status: 'CONFIRMED',
+              receiptCheckedAt: now,
+              lastError: null,
+            },
+          },
+        ],
+        [
+          {
+            where: { id: { in: ['d3', 'd4'] } },
+            data: {
+              status: 'TERMINAL',
+              receiptCheckedAt: now,
+              lastError: 'DeviceNotRegistered',
+            },
+          },
+        ],
+      ]);
+      // 可重试那条仍是「行改 FAILED + outbox 拉回 PENDING」同一个事务。
+      expect(prisma.$transaction).toHaveBeenCalledTimes(1);
+      expect(prisma.notificationPushDelivery.update).toHaveBeenCalledTimes(1);
+      expect(prisma.notificationPushDelivery.update).toHaveBeenCalledWith({
+        where: { id: 'd5' },
+        data: {
+          status: 'FAILED',
+          receiptCheckedAt: now,
+          lastError: 'ExpoServerError',
+        },
+      });
+      expect(prisma.devicePushToken.updateMany).toHaveBeenCalledWith({
+        where: { token: { in: ['tok-3', 'tok-4'] } },
+        data: { disabledAt: expect.any(Date) },
+      });
+      // 行状态必须先落库，outbox 的终结判定（看还有没有 SENT）才读得到它们。
+      expect(order.indexOf('outbox:TERMINAL')).toBe(order.length - 1);
+      expect(order).toEqual(
+        expect.arrayContaining([
+          'delivery-row:FAILED',
+          'outbox:PENDING',
+          'delivery:CONFIRMED',
+          'delivery:TERMINAL',
+        ]),
+      );
+    });
+
+    // APNs/FCM 凭证坏掉（InvalidCredentials）、限流这类错误主要出现在异步回执里，
+    // 同步 ticket 是 ok：只计 ticket 的话 Expo 失败率接近 0，PushDeliveryFailing
+    // 对凭证失效完全看不见。回执阶段的失败按同一套结果再计一次。
+    it('counts receipt-stage failures, which is where expired credentials show up', async () => {
+      const record = jest.spyOn(deliveryMetrics, 'recordPushDelivery');
+      prisma.notificationPushDelivery.findMany.mockResolvedValue([
+        { id: 'd1', ticketID: 't1', token: 'tok-a', outboxID: 'o1', sentAt },
+        { id: 'd2', ticketID: 't2', token: 'tok-b', outboxID: 'o2', sentAt },
+        { id: 'd3', ticketID: 't3', token: 'tok-c', outboxID: 'o3', sentAt },
+      ]);
+      fetchMock.mockResolvedValue({
+        ok: true,
+        json: async () => ({
+          data: {
+            t1: { status: 'ok' },
+            t2: { status: 'error', details: { error: 'DeviceNotRegistered' } },
+            t3: { status: 'error', details: { error: 'InvalidCredentials' } },
+          },
+        }),
+      });
+
+      await service.pollReceipts(now);
+
+      // ok 回执不再计：那条在 ticket 阶段已经记过 sent。
+      expect(record.mock.calls).toEqual([
+        ['expo', 'dead_token'],
+        ['expo', 'retryable'],
+      ]);
+      record.mockRestore();
     });
 
     it('marks a completed outbox terminal after its last receipt settles with an exhausted failure', async () => {
@@ -826,6 +1015,7 @@ describe('NotificationPushService (#88 per-token delivery)', () => {
 
       expect(processed).toBe(0);
       expect(prisma.notificationPushDelivery.update).not.toHaveBeenCalled();
+      expect(prisma.notificationPushDelivery.updateMany).not.toHaveBeenCalled();
     });
   });
 

@@ -176,14 +176,6 @@ export function createEnvValidationSchema(
     ADMIN_JWT_EXPIRES_IN: Joi.string()
       .pattern(jwtTtlPattern, { name: 'duration like 15m / 900s' })
       .default('15m'),
-    E2EE_TEXT_ENABLED: Joi.string().valid('true', 'false').default('false'),
-    E2EE_AUDIT_ROOT_PUBLIC_KEY: Joi.string()
-      .pattern(/^[A-Za-z0-9+/]{43}=$/)
-      .when('E2EE_TEXT_ENABLED', {
-        is: 'true',
-        then: Joi.required(),
-        otherwise: Joi.allow('').optional(),
-      }),
     LOG_ON: Joi.boolean(),
     // File logging stays opt-in for existing deployments. When enabled, Alloy
     // tails these JSON files, so malformed values must fail boot instead of
@@ -219,6 +211,9 @@ export function createEnvValidationSchema(
     SENTRY_DSN: Joi.string().uri().optional(),
     SENTRY_ENVIRONMENT: Joi.string().optional(),
     SENTRY_RELEASE: Joi.string().optional(),
+    // 镜像构建时由 Dockerfile.prod 的 ARG 烤进去（build-image.yml 传 github.sha），
+    // 只用作 circle_build_info 的 commit 标签；不在 env 文件里配。
+    CIRCLE_BUILD_COMMIT: Joi.string().optional(),
     // Optional performance tracing sample rate (0..1). Unset / 0 = errors only.
     SENTRY_TRACES_SAMPLE_RATE: Joi.number().min(0).max(1).optional(),
     // /metrics requires `Authorization: Bearer <token>` when this is set. It

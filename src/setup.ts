@@ -37,6 +37,12 @@ import { redisMetrics } from './redis/redis.metrics';
 import { uploadMetrics } from './metrics/upload-metrics';
 import { chatMetrics } from './chat/chat-metrics';
 import { gatewayMetrics } from './metrics/gateway-metrics';
+import { processMetrics } from './metrics/process-metrics';
+import { deliveryMetrics } from './metrics/delivery-metrics';
+import { dependencyMetrics } from './metrics/dependency-metrics';
+import { createBuildInfoMetrics } from './metrics/build-info';
+import { walletMetrics } from './metrics/wallet-metrics';
+import { callMetrics } from './metrics/call-metrics';
 import { installUnhandledRejectionGuard } from './logging/unhandled-rejection-guard';
 
 /** Strict limit for sensitive auth endpoints: 10 requests / 15 min per IP. */
@@ -396,6 +402,13 @@ export const setupApp = (app: INestApplication): ErrorAggregationProvider => {
     objectStoreStatus: uploadServiceForMetrics
       ? () => uploadServiceForMetrics.objectStoreStatus()
       : null,
+    // 与 Redis 同理：未启用对象存储时不挂，免得 ObjectStoreUnreachable 对着一个
+    // 本来就不存在的依赖长鸣。
+    objectStoreReachable:
+      uploadServiceForMetrics &&
+      uploadServiceForMetrics.objectStoreStatus() !== 'disabled'
+        ? () => uploadServiceForMetrics.objectStoreReachable()
+        : null,
     // 未启用 Redis（无 REDIS_URL 的单机部署）时不挂 ping：否则 gauge 恒 0，
     // RedisDown 告警对着一个本来就不存在的依赖长鸣。
     redisPing: redisService?.isEnabled() ? () => redisService.ping() : null,
@@ -408,6 +421,10 @@ export const setupApp = (app: INestApplication): ErrorAggregationProvider => {
   const dbPoolMetrics = createDbPoolMetrics(() =>
     prismaForMetrics ? prismaForMetrics.getPoolStats() : null,
   );
+  const buildInfoMetrics = createBuildInfoMetrics({
+    release: config['SENTRY_RELEASE'],
+    commit: config['CIRCLE_BUILD_COMMIT'],
+  });
   app.use(
     '/metrics',
     createMetricsHandler(
@@ -421,6 +438,12 @@ export const setupApp = (app: INestApplication): ErrorAggregationProvider => {
         gatewayMetrics.registry,
         jobMetrics.registry,
         dbPoolMetrics.registry,
+        processMetrics.registry,
+        deliveryMetrics.registry,
+        dependencyMetrics.registry,
+        buildInfoMetrics.registry,
+        walletMetrics.registry,
+        callMetrics.registry,
       ]),
       { authToken: metricsAuthToken },
     ),

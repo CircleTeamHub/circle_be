@@ -1,5 +1,9 @@
 import { Injectable, Logger } from '@nestjs/common';
-import { Interval } from '@nestjs/schedule';
+import {
+  reportHandledJobFailure,
+  reportJobSkipped,
+  TrackedInterval,
+} from 'src/metrics/tracked-cron.decorator';
 import { ChatCircleSyncService } from 'src/chat/chat-circle-sync.service';
 import { AdminGroupOperation } from 'src/generated/prisma';
 import { PrismaService } from 'src/prisma/prisma.service';
@@ -42,9 +46,13 @@ export class AdminGroupOperationProcessor {
     });
   }
 
-  @Interval(PROCESS_INTERVAL_MS)
+  @TrackedInterval(PROCESS_INTERVAL_MS, 'admin_group_operation')
   async processAvailable(): Promise<void> {
-    if (this.running) return;
+    if (this.running) {
+      // 挡回的那次不能刷新心跳：一轮卡死之后每 5 秒的跳过都会被当成成功。
+      reportJobSkipped();
+      return;
+    }
     this.running = true;
     try {
       await this.recoverStaleClaims(new Date());
@@ -85,6 +93,9 @@ export class AdminGroupOperationProcessor {
       if (operation.type === 'DISMISS' && this.isAlreadyAbsentGroup(error)) {
         await this.complete(operation, now);
       } else {
+        // 失败被改写成行状态后正常返回 —— 不报的话这一轮记成成功，一直失败时
+        // CronJobFailing 打不中。脱离调度上下文（直接调 processOne）是无操作。
+        reportHandledJobFailure();
         await this.fail(operation, error, now);
       }
     }

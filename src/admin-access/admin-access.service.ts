@@ -15,6 +15,11 @@ import { PrismaService } from 'src/prisma/prisma.service';
 import { getRequestContext } from 'src/logging/request-context';
 import { ADMIN_ROLE_PERMISSIONS } from './admin-permission.guard';
 import {
+  AdminListRow,
+  buildAdminListCountQuery,
+  buildAdminListPageQuery,
+} from './admin-access-list.query';
+import {
   AdminAccountAvailabilityQuery,
   DeleteAdminAccountDto,
   CreateAdminAccountDto,
@@ -213,51 +218,27 @@ export class AdminAccessService {
   }
 
   async list(query: AdminPageQuery) {
-    const where = {
-      role: 'ADMIN' as const,
-      status: { not: 'DELETED' as const },
-      ...(query.search
-        ? {
-            OR: [
-              {
-                accountId: {
-                  contains: query.search,
-                  mode: 'insensitive' as const,
-                },
-              },
-              {
-                nickname: {
-                  contains: query.search,
-                  mode: 'insensitive' as const,
-                },
-              },
-            ],
-          }
-        : {}),
-    };
-    const [rows, total] = await this.prisma.$transaction([
-      this.prisma.user.findMany({
-        where,
-        select: {
-          id: true,
-          accountId: true,
-          nickname: true,
-          status: true,
-          adminAccess: true,
-        },
-        orderBy: [{ createdAt: 'desc' }, { id: 'desc' }],
-        skip: (query.page - 1) * query.limit,
-        take: query.limit,
-      }),
-      this.prisma.user.count({ where }),
+    // 原生 SQL:role/status 写成字面量才能用上只收管理员的部分索引,
+    // 筛选口径与原 Prisma 查询一致,见 admin-access-list.query.ts。
+    const [rows, counted] = await this.prisma.$transaction([
+      this.prisma.$queryRaw<AdminListRow[]>(
+        buildAdminListPageQuery({
+          search: query.search,
+          limit: query.limit,
+          offset: (query.page - 1) * query.limit,
+        }),
+      ),
+      this.prisma.$queryRaw<Array<{ total: number }>>(
+        buildAdminListCountQuery({ search: query.search }),
+      ),
     ]);
     return {
-      items: rows.map(({ adminAccess, ...user }) => ({
+      items: rows.map(({ consoleRole, version, ...user }) => ({
         ...user,
-        consoleRole: adminAccess?.role ?? null,
-        version: adminAccess?.version ?? 0,
+        consoleRole: consoleRole ?? null,
+        version: version ?? 0,
       })),
-      total,
+      total: counted[0]?.total ?? 0,
       page: query.page,
       limit: query.limit,
     };

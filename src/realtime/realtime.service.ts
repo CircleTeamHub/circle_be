@@ -8,15 +8,14 @@ import {
 } from '@nestjs/common';
 import { randomUUID } from 'crypto';
 import { WebSocket } from 'ws';
-import { NotificationType } from 'src/generated/prisma';
 import { PrismaService } from 'src/prisma/prisma.service';
 import { RedisService } from 'src/redis/redis.service';
+import { PROFILE_NOTIFICATION_TYPES } from 'src/notification/notification.constants';
+import { loadUnreadNotificationsByDomain } from 'src/notification/notification-unread.query';
 import {
-  CIRCLE_NOTIFICATION_TYPES,
-  DISCOVER_NOTIFICATION_TYPES,
-  MOMENT_NOTIFICATION_TYPES,
-  PROFILE_NOTIFICATION_TYPES,
-} from 'src/notification/notification.constants';
+  profileUnreadCountsByRecipientQuery,
+  type ProfileUnreadCountRow,
+} from 'src/notification/notification-profile-unread.query';
 import type { NotificationRealtimeDto } from 'src/notification/notification.dto';
 import {
   SESSION_REVOCATION_CHANNEL,
@@ -279,6 +278,9 @@ export class RealtimeService implements OnModuleInit, OnModuleDestroy {
   ]);
 
   private readonly logger = new Logger(RealtimeService.name);
+
+  /** Sockets this service closed because their session was revoked (for the gateway's close log). */
+  private readonly closedForRevocation = new WeakSet<WebSocket>();
   /** Fully admitted sockets eligible to receive business events. */
   private readonly clients = new Map<string, Set<WebSocket>>();
   /**
@@ -511,23 +513,17 @@ export class RealtimeService implements OnModuleInit, OnModuleDestroy {
   }
 
   private async queryBadgeSnapshot(userId: string): Promise<BadgeSnapshot> {
-    const [
-      contactsUnread,
-      discoverUnread,
-      momentsUnread,
-      circleUnread,
-      signupUnread,
-      profileUnread,
-    ] = await Promise.all([
+    // 通知的四个域来自同一条 GROUP BY type；连同好友动态、报名两条 count，
+    // 同一时刻最多占两个池连接（之前是六条 count 一起并发）。
+    const [notifications, contactsUnread] = await Promise.all([
+      loadUnreadNotificationsByDomain(this.prisma, userId),
       this.prisma.friendActivity.count({
         where: { viewerId: userId, readAt: null },
       }),
-      this.countUnreadNotifications(userId, DISCOVER_NOTIFICATION_TYPES),
-      this.countUnreadNotifications(userId, MOMENT_NOTIFICATION_TYPES),
-      this.countUnreadNotifications(userId, CIRCLE_NOTIFICATION_TYPES),
-      this.countUnreadSignups(userId),
-      this.countUnreadNotifications(userId, PROFILE_NOTIFICATION_TYPES),
     ]);
+    const signupUnread = await this.countUnreadSignups(userId);
+    const { discoverUnread, momentsUnread, circleUnread, profileUnread } =
+      notifications;
 
     const snapshot: BadgeSnapshot = {
       messagesUnread: 0,
@@ -541,20 +537,6 @@ export class RealtimeService implements OnModuleInit, OnModuleDestroy {
       syncedAt: new Date().toISOString(),
     };
     return snapshot;
-  }
-
-  private countUnreadNotifications(
-    userId: string,
-    types: readonly NotificationType[],
-  ): Promise<number> {
-    return this.prisma.notification.count({
-      where: {
-        toUserID: userId,
-        deleted: false,
-        read: false,
-        type: { in: [...types] },
-      },
-    });
   }
 
   async emitSnapshot(userId: string) {
@@ -593,11 +575,12 @@ export class RealtimeService implements OnModuleInit, OnModuleDestroy {
   /** "互动消息" unread — trace comments/replies + circle verification/invitation. */
   async broadcastInteractionUnread(userId: string) {
     await this.invalidateBadgeSnapshotCache(userId);
-    const [count, momentsUnread, circleUnread] = await Promise.all([
-      this.countUnreadNotifications(userId, DISCOVER_NOTIFICATION_TYPES),
-      this.countUnreadNotifications(userId, MOMENT_NOTIFICATION_TYPES),
-      this.countUnreadNotifications(userId, CIRCLE_NOTIFICATION_TYPES),
-    ]);
+    // 每条新通知都会走到这里：三个数取自同一条分组查询，只占一个池连接。
+    const {
+      discoverUnread: count,
+      momentsUnread,
+      circleUnread,
+    } = await loadUnreadNotificationsByDomain(this.prisma, userId);
 
     this.broadcast(userId, {
       type: 'interaction.unread.changed',
@@ -653,6 +636,46 @@ export class RealtimeService implements OnModuleInit, OnModuleDestroy {
         changedAt: new Date().toISOString(),
       },
     });
+  }
+
+  /**
+   * 系统公告扇出后一批收件人的未读广播。逐人语义与 broadcastSystemNotificationUnread
+   * 相同 —— 先失效徽标快照缓存、再计数、再推同一个 system.notification.unread.changed
+   * 事件(payload 形状不变,没有未读的收件人收到 0);缓存失效失败的收件人和单人版一样
+   * 不计数、不推送。区别只在计数:整批一条 GROUP BY,而不是每人一条 count。
+   *
+   * 没有改成「只失效缓存 + poke(system.announcement.changed)」:2026-10-18 之前的客户端
+   * 不认识那个事件(default 分支直接丢弃),「我的」页红点会一直等到重连才更新;新客户端
+   * 收到它会强制跑一次完整的徽标恢复(四五个 REST 请求、绕过节流),在线用户越多,
+   * 反而比服务端一条分组计数更重。
+   */
+  async broadcastSystemNotificationUnreadToRecipients(
+    userIds: readonly string[],
+  ): Promise<void> {
+    const invalidated: string[] = [];
+    // 失效缓存是 Redis 往返,维持改动前的 50 路并发上限。
+    for (let index = 0; index < userIds.length; index += 50) {
+      const chunk = userIds.slice(index, index + 50);
+      const results = await Promise.allSettled(
+        chunk.map((userId) => this.invalidateBadgeSnapshotCache(userId)),
+      );
+      results.forEach((result, offset) => {
+        if (result.status === 'fulfilled') invalidated.push(chunk[offset]);
+      });
+    }
+    if (invalidated.length === 0) return;
+
+    const rows = await this.prisma.$queryRaw<ProfileUnreadCountRow[]>(
+      profileUnreadCountsByRecipientQuery(invalidated),
+    );
+    const counts = new Map(rows.map((row) => [row.userId, Number(row.count)]));
+    const changedAt = new Date().toISOString();
+    for (const userId of invalidated) {
+      this.broadcast(userId, {
+        type: 'system.notification.unread.changed',
+        payload: { count: counts.get(userId) ?? 0, changedAt },
+      });
+    }
   }
 
   async broadcastMembershipStatus(userId: string) {
@@ -1236,6 +1259,11 @@ export class RealtimeService implements OnModuleInit, OnModuleDestroy {
     }
   }
 
+  /** Whether this service closed `socket` for a session revocation. */
+  wasClosedForRevocation(socket: WebSocket): boolean {
+    return this.closedForRevocation.has(socket);
+  }
+
   /**
    * Closes the locally-held sockets this revocation kills, and returns how many.
    *
@@ -1251,6 +1279,7 @@ export class RealtimeService implements OnModuleInit, OnModuleDestroy {
   ): number {
     for (const socket of revoked) {
       try {
+        this.closedForRevocation.add(socket);
         socket.close(REVOKED_CLOSE_CODE, REVOKED_CLOSE_REASON);
       } catch (error) {
         this.logger.warn(

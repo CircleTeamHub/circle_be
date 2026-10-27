@@ -437,6 +437,42 @@ test_proxy_switch_precedes_old_color_retirement() {
     assert_running circle_be_green && assert_absent circle_be
 }
 
+assert_log_before() {
+  local first_line second_line
+  first_line="$(grep -Fn -- "$1" "$CASE_DIR/release.log" | head -n 1 | cut -d: -f1)"
+  second_line="$(grep -Fn -- "$2" "$CASE_DIR/release.log" | head -n 1 | cut -d: -f1)"
+  if [ -z "$first_line" ] || [ -z "$second_line" ] || [ "$first_line" -ge "$second_line" ]; then
+    echo "expected log line '$1' before '$2'" >&2
+    cat "$CASE_DIR/release.log" >&2
+    return 1
+  fi
+}
+
+# 发版成功、切流完成之后才同步可选运维栈（deploy/sync-ops-stacks.sh）。这里的
+# launcher 环境没有保留本机配置的标记，所以同步脚本只打一行提示就退出 —— 正好
+# 用这行确认它被调用、且调用在「deployed」之后。
+test_ops_stacks_sync_runs_only_after_a_successful_cutover() {
+  new_case
+  printf 'running\n' > "$TEST_STATE_DIR/circle_be"
+  printf 'running\n' > "$TEST_STATE_DIR/caddy"
+  printf 'circle_be\n' > "$RELEASE_STATE_DIR/active-color"
+  run_release || return 1
+  assert_log_before '==> Release v1.2.3 deployed' 'predates host-config preservation'
+}
+
+test_ops_stacks_sync_never_runs_on_rollback() {
+  new_case
+  printf 'running\n' > "$TEST_STATE_DIR/circle_be"
+  printf 'running\n' > "$TEST_STATE_DIR/caddy"
+  printf 'circle_be\n' > "$RELEASE_STATE_DIR/active-color"
+  SMOKE_CODE=500
+  ! run_release || return 1
+  if grep -q 'host-config preservation\|Syncing the' "$CASE_DIR/release.log"; then
+    echo 'ops stacks synced during a rollback' >&2
+    return 1
+  fi
+}
+
 test_release_stamps_sentry_release_before_starting_the_new_color() {
   new_case
   printf 'running\n' > "$TEST_STATE_DIR/circle_be"
@@ -1059,6 +1095,8 @@ for test_name in \
   test_missing_caddy_rate_limit_module_aborts_before_touching_colors \
   test_caddy_rate_limit_check_is_skipped_when_caddy_is_down \
   test_proxy_switch_precedes_old_color_retirement \
+  test_ops_stacks_sync_runs_only_after_a_successful_cutover \
+  test_ops_stacks_sync_never_runs_on_rollback \
   test_release_stamps_sentry_release_before_starting_the_new_color \
   test_release_never_widens_permissions_on_the_secrets_it_rewrites \
   test_failed_sentry_stamp_leaves_no_readable_copy_of_the_secrets \

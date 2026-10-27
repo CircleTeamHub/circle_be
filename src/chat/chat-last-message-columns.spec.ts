@@ -12,17 +12,20 @@ import { Prisma } from 'src/generated/prisma';
  * 这里拿 Prisma 生成的列清单去对 SELECT 列表:ChatMessage 以后加列,要么在这条
  * SQL 里选上,要么在下面显式说明为什么不选。
  */
-describe('loadLastMessages raw SELECT', () => {
-  /** 刻意不选的列：编辑留痕和内部来源索引都不属于消息列表响应。 */
+describe('lastMessagesQuery raw SELECT', () => {
+  /**
+   * 刻意不选的列:contentHistory 是编辑前的原文,列表末条不该把它拖出来;
+   * sourceNoteID 是笔记来源状态广播用的内部索引列,不属于消息列表响应。
+   */
   const NOT_SELECTED = new Set(['contentHistory', 'sourceNoteID']);
   const byName = (a: string, b: string): number => a.localeCompare(b);
 
   function selectedColumns(): string[] {
     const source = readFileSync(
-      resolve(process.cwd(), 'src/chat/chat.service.ts'),
+      resolve(process.cwd(), 'src/chat/chat-conversation-summary.query.ts'),
       'utf8',
     );
-    const start = source.indexOf('private async loadLastMessages(');
+    const start = source.indexOf('export function lastMessagesQuery(');
     expect(start).toBeGreaterThan(-1);
     const select =
       /CROSS JOIN LATERAL \(\s*SELECT([\s\S]*?)FROM "ChatMessage" AS m/.exec(

@@ -26,6 +26,7 @@ import {
   LOGIN_CHALLENGE_SECURITY_CODE_DAILY_FAILURES,
   LOGIN_RECOVERY_DELAY_MS,
   LOGIN_RECOVERY_MAX_ACTIVE,
+  LOGIN_ALERT_SHUTDOWN_GRACE_MS,
 } from './device-trust.service';
 
 type Trusted = {
@@ -210,17 +211,66 @@ function setup() {
       count: jest.fn(async () => liveSessions.count),
     },
   };
-  let serial = Promise.resolve();
-  const transactionScope = new AsyncLocalStorage<boolean>();
-  (prisma as any).$executeRaw = jest.fn();
-  (prisma as any).$queryRaw = jest.fn().mockResolvedValue([]);
-  (prisma as any).$transaction = jest.fn((fn) => {
+  type TransactionScope = {
+    locks: Set<string>;
+    releases: Array<() => void>;
+  };
+  const transactionScope = new AsyncLocalStorage<TransactionScope>();
+  const lockTails = new Map<string, Promise<void>>();
+  const acquireLock = async (key: string) => {
+    const scope = transactionScope.getStore();
+    if (!scope || scope.locks.has(key)) return;
+
+    const previous = lockTails.get(key) ?? Promise.resolve();
+    let release!: () => void;
+    const held = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const tail = previous.then(() => held);
+    lockTails.set(key, tail);
+    await previous;
+    scope.locks.add(key);
+    scope.releases.push(() => {
+      release();
+      if (lockTails.get(key) === tail) lockTails.delete(key);
+    });
+  };
+  // 既有标签模板调用,也有 $executeRaw(Prisma.raw('SAVEPOINT …')) 这种传 Sql 对象的。
+  const sqlText = (query: TemplateStringsArray | { sql: string }) =>
+    Array.isArray(query) ? query.join('?') : (query as { sql: string }).sql;
+  (prisma as any).$executeRaw = jest.fn(
+    async (
+      query: TemplateStringsArray | { sql: string },
+      ...values: unknown[]
+    ) => {
+      if (sqlText(query).includes('pg_advisory_xact_lock')) {
+        await acquireLock(`advisory:${String(values[0])}`);
+      }
+      return 0;
+    },
+  );
+  (prisma as any).$queryRaw = jest.fn(
+    async (
+      query: TemplateStringsArray | { sql: string },
+      ...values: unknown[]
+    ) => {
+      if (/FROM "User"[\s\S]*FOR UPDATE/.test(sqlText(query))) {
+        await acquireLock(`user:${String(values[0])}`);
+      }
+      return [];
+    },
+  );
+  (prisma as any).$transaction = jest.fn(async (fn) => {
     if (transactionScope.getStore()) return fn(prisma);
-    const next = serial.then(() =>
-      transactionScope.run(true, () => fn(prisma)),
-    );
-    serial = next.catch(() => undefined);
-    return next;
+    const scope: TransactionScope = { locks: new Set(), releases: [] };
+    return transactionScope.run(scope, async () => {
+      try {
+        return await fn(prisma);
+      } finally {
+        scope.releases.reverse();
+        scope.releases.forEach((release) => release());
+      }
+    });
   });
   const realtime = { broadcast: jest.fn() };
   const push = {
@@ -496,6 +546,75 @@ describe('DeviceTrustService approve / verify', () => {
     );
   });
 
+  it('rejects a recovery after a failed completion releases its claim', async () => {
+    const { service, prisma, challenges, challengeId } = await pending();
+    const db = prisma as any;
+    challenges[0].recoveryRequestedAt = new Date(Date.now() - 2000);
+    challenges[0].recoveryAvailableAt = new Date(Date.now() - 1000);
+    await new Promise((resolve) => setImmediate(resolve));
+
+    let claimed!: () => void;
+    const claimHeld = new Promise<void>((resolve) => {
+      claimed = resolve;
+    });
+    let releaseClaim!: () => void;
+    const canReleaseClaim = new Promise<void>((resolve) => {
+      releaseClaim = resolve;
+    });
+    const failedCompletion = db.$transaction(async (tx: any) => {
+      const accountLockKey = 'auth_session:u1';
+      await tx.$executeRaw`SELECT pg_advisory_xact_lock(hashtextextended(${accountLockKey}, 0))`;
+      challenges[0].status = 'CONSUMED';
+      claimed();
+      await canReleaseClaim;
+      challenges[0].status = 'PENDING';
+    });
+    await claimHeld;
+
+    const rejection = service.reject('u1', 'phone', challengeId);
+    await new Promise((resolve) => setImmediate(resolve));
+    releaseClaim();
+    await Promise.all([failedCompletion, rejection]);
+
+    expect(challenges[0].status).toBe('REJECTED');
+  });
+
+  it('reject takes the exact account advisory lock through the transaction client', async () => {
+    const { service, prisma, challengeId } = await pending();
+    const db = prisma as any;
+    await new Promise((resolve) => setImmediate(resolve));
+    const txExecuteRaw = jest.fn().mockResolvedValue(0);
+    const txQueryRaw = jest
+      .fn()
+      .mockRejectedValue(new Error('$queryRaw must not execute void locks'));
+    db.$executeRaw.mockClear();
+    db.$queryRaw.mockClear();
+    db.$transaction.mockClear();
+    db.$transaction.mockImplementationOnce(async (fn: (tx: any) => unknown) =>
+      fn({
+        ...prisma,
+        $executeRaw: txExecuteRaw,
+        $queryRaw: txQueryRaw,
+      }),
+    );
+
+    await service.reject('u1', 'phone', challengeId);
+
+    expect(db.$transaction).toHaveBeenCalledWith(expect.any(Function), {
+      maxWait: 10000,
+      timeout: 30000,
+    });
+    expect(txExecuteRaw).toHaveBeenCalledTimes(1);
+    const [strings, lockKey] = txExecuteRaw.mock.calls[0];
+    expect(strings.join('?')).toBe(
+      'SELECT pg_advisory_xact_lock(hashtextextended(?, 0))',
+    );
+    expect(lockKey).toBe('auth_session:u1');
+    expect(txQueryRaw).not.toHaveBeenCalled();
+    expect(db.$executeRaw).not.toHaveBeenCalled();
+    expect(db.$queryRaw).not.toHaveBeenCalled();
+  });
+
   it('resend opens a fresh challenge only after the old one expired', async () => {
     const { service, challenges, challengeId } = await pending();
     const same = await service.resend(challengeId, 'stranger');
@@ -632,6 +751,56 @@ describe('DeviceTrustService revocation', () => {
     trusted[0].revokedAt = revokedAt;
     await service.trustOnRefresh('u1', 'removed', {});
     expect(trusted[0].revokedAt).toBe(revokedAt);
+  });
+
+  it('trustOnRefresh reports the trust conclusion so refresh need not read it again', async () => {
+    const { service, trusted, trust, prisma } = setup();
+    trust('phone');
+    const revokedAt = new Date();
+    trust('removed');
+    trusted[1].revokedAt = revokedAt;
+
+    await expect(
+      service.trustOnRefresh('u1', 'phone', { ip: '203.0.113.1' }),
+    ).resolves.toBe(true);
+    await expect(service.trustOnRefresh('u1', 'removed', {})).resolves.toBe(
+      false,
+    );
+    await expect(service.trustOnRefresh('u1', 'brand-new', {})).resolves.toBe(
+      true,
+    );
+    await expect(service.trustOnRefresh('u1', null, {})).resolves.toBe(false);
+
+    expect(trusted[0].lastIp).toBe('203.0.113.1');
+    expect(trusted[1].revokedAt).toBe(revokedAt);
+    expect(trusted.map((t) => t.deviceKey)).toEqual([
+      'phone',
+      'removed',
+      'brand-new',
+    ]);
+    // 已受信任的设备一条条件 UPDATE 就完事,不先 SELECT。
+    expect(prisma.trustedDevice.updateMany).toHaveBeenNthCalledWith(1, {
+      where: { userId: 'u1', deviceKey: 'phone', revokedAt: null },
+      data: { lastSeenAt: expect.any(Date), lastIp: '203.0.113.1' },
+    });
+    expect(prisma.trustedDevice.findUnique).toHaveBeenCalledTimes(2);
+  });
+
+  it('trustOnRefresh inside a transaction isolates a failure behind a savepoint and reports it as unknown', async () => {
+    const { service, prisma } = setup();
+    const tx = prisma as any;
+    tx.trustedDevice.updateMany.mockRejectedValueOnce(
+      new Error('storage unavailable'),
+    );
+
+    await expect(
+      service.trustOnRefresh('u1', 'phone', {}, tx),
+    ).resolves.toBeNull();
+
+    expect(tx.$executeRaw.mock.calls.map(([q]: any[]) => q.sql)).toEqual([
+      'SAVEPOINT refresh_device_trust',
+      'ROLLBACK TO SAVEPOINT refresh_device_trust',
+    ]);
   });
 
   it('trust() re-trusts a revoked device after it passes verification', async () => {
@@ -915,6 +1084,28 @@ describe('DeviceTrustService recovery (no trusted device available)', () => {
     );
   });
 
+  it('cancelRecoveries only writes; the broadcast waits for announceCancelledRecoveries', async () => {
+    const { service, challenges, challengeId, realtime } =
+      await pendingChallenge();
+    await service.requestRecovery(challengeId, 'reinstalled');
+    realtime.broadcast.mockClear();
+
+    const cancelled = await service.cancelRecoveries('u1', 'old-install');
+
+    expect(cancelled).toEqual([challengeId]);
+    expect(challenges[0].status).toBe('REJECTED');
+    expect(realtime.broadcast).not.toHaveBeenCalled();
+
+    service.announceCancelledRecoveries('u1', cancelled);
+    expect(realtime.broadcast).toHaveBeenCalledWith(
+      'u1',
+      expect.objectContaining({
+        type: 'auth.login.challenge.resolved',
+        payload: expect.objectContaining({ challengeId, status: 'REJECTED' }),
+      }),
+    );
+  });
+
   it('cancelling on activity leaves ordinary login challenges alone', async () => {
     const { service, challenges } = await pendingChallenge();
     await service.cancelRecoveriesForActiveDevice('u1', 'old-install');
@@ -996,5 +1187,164 @@ describe('DeviceTrustService recovery (no trusted device available)', () => {
         recoveryAvailableAt: view.recoveryAvailableAt,
       }),
     ]);
+  });
+});
+
+describe('DeviceTrustService login-alert pushes', () => {
+  const payload = { title: 't', body: 'b', data: { type: 'test' } };
+  const flush = () => new Promise((r) => setImmediate(r));
+
+  /** Counts transactions still open, so a test can see where the provider was called. */
+  function trackOpenTransactions(prisma: any) {
+    const state = { open: 0 };
+    const original = prisma.$transaction;
+    prisma.$transaction = jest.fn(async (fn: any, options: any) => {
+      state.open++;
+      try {
+        return await original(fn, options);
+      } finally {
+        state.open--;
+      }
+    });
+    return state;
+  }
+
+  function deferred() {
+    let resolve!: () => void;
+    const promise = new Promise<[]>((r) => {
+      resolve = () => r([]);
+    });
+    return { promise, resolve };
+  }
+
+  it('reads tokens under the account lock but calls the provider after the transaction', async () => {
+    // The provider call can take seconds. Holding the account lock and a pool
+    // connection for it stalls the user's login and refresh, and a shutdown
+    // that has to wait for the transaction to end.
+    const { service, prisma, push } = setup();
+    const tx = trackOpenTransactions(prisma);
+    const openAtSend: number[] = [];
+    push.sendToTokens.mockImplementation(async () => {
+      openAtSend.push(tx.open);
+      return [];
+    });
+    await (service as any).pushToUser('u1', payload);
+    expect((prisma as any).$executeRaw).toHaveBeenCalled();
+    expect(push.listLoginAlertTokens).toHaveBeenCalledWith('u1', prisma);
+    expect(openAtSend).toEqual([0]);
+  });
+
+  it('does not call the provider when no device may receive the alert', async () => {
+    const { service, push } = setup();
+    push.listLoginAlertTokens.mockResolvedValueOnce([]);
+    await (service as any).pushToUser('u1', payload);
+    expect(push.sendToTokens).not.toHaveBeenCalled();
+  });
+
+  type Ctx = ReturnType<typeof setup>;
+  /**
+   * The three background login alerts. `prepare` runs with sends resolving at
+   * once (it may itself send alerts); only the alert `trigger` starts hangs.
+   */
+  const alertSites: Array<
+    [
+      string,
+      (ctx: Ctx) => Promise<unknown>,
+      (ctx: Ctx, state: any) => Promise<unknown>,
+    ]
+  > = [
+    [
+      'a login challenge',
+      async ({ trust }) => trust('known'),
+      ({ service }) =>
+        service.evaluateLogin(user, {
+          deviceKey: 'stranger',
+          deviceName: 'Pixel 9',
+          ip: '1.2.3.4',
+        }),
+    ],
+    [
+      'a recovery request',
+      async ({ service, trust }) => {
+        trust('old-install');
+        const decision = await service.evaluateLogin(user, {
+          deviceKey: 'reinstalled',
+          deviceName: 'SM-F9360',
+        });
+        if (decision.kind !== 'challenge')
+          throw new Error('expected challenge');
+        return decision.challenge.id;
+      },
+      ({ service }, challengeId) =>
+        service.requestRecovery(challengeId, 'reinstalled'),
+    ],
+    [
+      'a newly added device',
+      async () => undefined,
+      ({ service }) =>
+        service.completeVerifiedLogin('u1', 'challenge-1', 'new-device', {
+          deviceName: 'iPad',
+        } as never),
+    ],
+  ];
+
+  it.each(alertSites)(
+    'shutdown waits for the alert sent for %s',
+    async (_site, prepare, trigger) => {
+      const ctx = setup();
+      const state = await prepare(ctx);
+      await flush();
+      const send = deferred();
+      ctx.push.sendToTokens.mockReset().mockReturnValue(send.promise);
+      await trigger(ctx, state);
+      await flush();
+      expect(ctx.push.sendToTokens).toHaveBeenCalledTimes(1);
+      let closed = false;
+      const closing = ctx.service.onModuleDestroy().then(() => {
+        closed = true;
+      });
+      await flush();
+      expect(closed).toBe(false);
+      send.resolve();
+      await closing;
+      expect(closed).toBe(true);
+    },
+  );
+
+  it('shutdown gives up on an alert that outlives the grace period', async () => {
+    jest.useFakeTimers({ doNotFake: ['setImmediate', 'nextTick'] });
+    try {
+      const { service, push } = setup();
+      push.sendToTokens.mockReturnValue(new Promise(() => undefined));
+      const warn = jest
+        .spyOn((service as any).logger, 'warn')
+        .mockImplementation(() => undefined);
+      (service as any).dispatchPush('u1', payload);
+      await flush();
+      expect(push.sendToTokens).toHaveBeenCalledTimes(1);
+      let closed = false;
+      const closing = service.onModuleDestroy().then(() => {
+        closed = true;
+      });
+      await jest.advanceTimersByTimeAsync(LOGIN_ALERT_SHUTDOWN_GRACE_MS - 1);
+      expect(closed).toBe(false);
+      await jest.advanceTimersByTimeAsync(1);
+      await closing;
+      expect(closed).toBe(true);
+      expect(warn).toHaveBeenCalledWith(
+        expect.stringContaining('1 login alert push'),
+      );
+    } finally {
+      jest.useRealTimers();
+    }
+  });
+
+  it('starts no new login alerts once shutdown has begun', async () => {
+    const { service, push } = setup();
+    await service.onModuleDestroy();
+    (service as any).dispatchPush('u1', payload);
+    await flush();
+    expect(push.listLoginAlertTokens).not.toHaveBeenCalled();
+    expect(push.sendToTokens).not.toHaveBeenCalled();
   });
 });

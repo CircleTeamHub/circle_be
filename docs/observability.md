@@ -27,10 +27,13 @@
 | **Alertmanager**    | 指标(告警) | 不产数据，按 severity 分级路由 + 抑制       | ✅ `:9093` → Discord      |
 | 自建聊天 `/metrics` | 指标       | 在线连接、聊天事件吞吐、ACK/广播延迟        | ✅                        |
 | 定时任务/outbox     | 指标       | 任务心跳、失败率、队列积压、死信            | ✅（见下）                |
-| **postgres-exporter** | 指标     | 连接数、事务、锁、idle-in-transaction       | ✅（仅生产 overlay）      |
+| **postgres-exporter** | 指标     | 连接数、长事务、锁等待、死锁、事务 ID 回卷、idle-in-transaction | ✅（仅生产 overlay）      |
 | pg 连接池           | 指标       | 排队等连接数、已建立/空闲/上限              | ✅（应用内，见下）        |
 | **redis-exporter**  | 指标       | 存活、内存占用、客户端数、被拒连接          | ✅（仅生产 overlay）      |
 | **blackbox-exporter** | 可达性   | 按用户的路径探测公网入口（DNS/TLS/Caddy/`/healthz`）、证书剩余天数 | ✅（仅生产 overlay）      |
+| backup-metrics      | 指标       | 备份每小时自检的逐项结果、最近一次完成时间、每周恢复演练的结果 | ✅（仅备份 overlay，见 docs/backups.md） |
+| 只读合成探测        | 可达性     | 测试号按用户路径走一遍登录态 → 接口 → `/realtime` | ✅（仅生产 overlay，要配测试号，见下） |
+| 钱包对账 / 通话 / 版本 | 指标    | 余额与流水是否一致、通话发起/接听/时长/回调、当前构建 | ✅（应用内，见下）        |
 | **外部心跳**        | 元监控     | 监控栈自身是否还活着                        | ✅ Watchdog → 外部服务    |
 | **PostHog** 等      | 业务分析   | 用户行为、漏斗、留存、转化                  | ❌ 未做                   |
 
@@ -96,17 +99,24 @@
 
 ### 6. Grafana —— 可视化（不产数据）
 
-连 Prometheus 做大盘。配置自动 provision：Prometheus 数据源 + 三张大盘 ——
+连 Prometheus 做大盘。配置自动 provision：Prometheus 数据源 + 四张大盘 ——
 **「circle_be — RED」**（每路由请求速率 / 5xx 错误率 / p95 延迟 / 进程内存 / 聊天指标）
 和 **「circle_be — Jobs, Queues & Datastores」**（任务心跳滞后与失败率、outbox 积压/死信、
 pg 连接池排队、Postgres 连接与状态、Redis 内存与被拒连接），以及
-**「circle_be — Operations Overview」**（告警状态、抓取目标、告警投递失败、规则执行错误、入口/TLS、主机余量、可选 Alloy 重试与丢弃）。
+**「circle_be — Operations Overview」**（告警状态、抓取目标、告警投递失败、规则执行错误、入口/TLS、主机余量、可选 Alloy 重试与丢弃），以及
+**「circle_be — Deliveries, Dependencies & Business」**（推送与验证码邮件的结果和失败率、对象存储与 LiveKit 请求及可达性、发版异地备份、业务事件、上传预签名、漏网 rejection）。
+
+开了日志 overlay 时，Loki 还按 `monitoring/loki/rules/fake/*.yml` 做日志告警（进程崩溃退出、
+error 日志突增、Caddy 反代失败与证书错误，以及安全事件：猜安全码、批量锁定、吊销令牌重放、
+伪造令牌突增），与 Prometheus 告警走同一个 Alertmanager。
 入口 `:3001`，密码取自 `monitoring/.env`（**没有默认值**，且只在数据卷首次启动时生效 —— 见 monitoring/README.md 的首启动坑）。
 
 ### 7. Alertmanager —— 告警路由（不产数据）
 
-Prometheus 规则越界 → 发给它 → 去重 / 聚合 / 静默 / 路由。当前规则文件有 40 条规则，覆盖
-接口 RED、聊天容量、主机与容器、定时任务与 outbox、连接池与数据存储、公网探测、监控组件自身故障。
+Prometheus 规则越界 → 发给它 → 去重 / 聚合 / 静默 / 路由。当前规则文件有 62 条规则，覆盖
+接口 RED、漏网的 promise rejection、聊天容量、主机与容器（含磁盘两档与 24 小时趋势、inode 两档、崩溃循环）、
+定时任务与 outbox、备份自检与发版时的异地备份、推送与验证码邮件的失败率、对象存储与 LiveKit 的失败率、
+对象存储可达性、连接池与数据存储、公网探测、监控组件自身故障。
 
 出口按 severity 分级：`critical` → Discord（10s 聚合 / 1h 重提），`warning` → Discord
 （30s / 4h），`Watchdog` → **外部**心跳服务。另有抑制规则，避免一次故障被报成
@@ -144,9 +154,13 @@ Prometheus 规则越界 → 发给它 → 去重 / 聚合 / 静默 / 路由。�
 | `circle_outbox_dead{queue}`                   | 已放弃、不会再重试的行（死信）                      |
 | `circle_outbox_last_probe_timestamp_seconds{queue}` | 该队列读数的新鲜度 —— 探测一直失败时它会变陈旧 |
 
-五个队列：`session_revocation`、`notification_push`、`friend_chat_replay`、
-`gift_card`（`CoinGift` 上的虚拟队列）、`verification_card`
-（`CircleInvitationVerifier` 上的虚拟队列，与前者同构）。
+队列清单以 `src/metrics/outbox-depth.service.ts` 的 `OUTBOX_QUEUES` 为准，目前 10 个：
+`session_revocation`、`access_revocation`、`notification_push`、`friend_chat_replay`、
+`verification_card`（`CircleInvitationVerifier` 上的虚拟队列）、`chat_direct_auto_reply`、
+`chat_support_recharge`、`gift_card`（`CoinGift` 上的虚拟队列，与前者同构）、
+`admin_group_operation`、`group_admission_delivery`。最后两个由 `@TrackedInterval`
+处理器消费（`@Interval` 版的 `@TrackedCron`，心跳与运行记账完全相同；裸 `@Interval`
+和裸 `@Cron` 一样会被 `tracked-cron.coverage.spec.ts` 拦下）。
 
 四个关键设计，改动前务必先读懂：
 
@@ -229,7 +243,90 @@ Prometheus / Alertmanager / blackbox-exporter 一起没了，Discord 一条消�
 （healthchecks.io 等）。方向和其他所有告警相反：外部服务**收不到**心跳才报警。
 配置见 [../monitoring/README.md](../monitoring/README.md) 的「外部心跳」一节。
 
-### 13. 产品分析 / 业务埋点（❌ 未做）
+### 13. 告警处置手册
+
+每条告警都带 `runbook_url`，指向 [runbooks/alerts.md](./runbooks/alerts.md) 里的同名
+小节：含义（阈值、窗口）、先看什么、常见原因与处置。Discord 消息里直接带着这个
+链接。新增或改名告警时同时改手册，`test/alert-runbooks.spec.mjs` 会逐条核对两边。
+
+### 14. 版本与发版标记
+
+`circle_build_info{version,commit}`：`version` 来自发版脚本写进 env 文件的
+`SENTRY_RELEASE`，`commit` 在构建镜像时写进去（`build-image.yml` 传 `github.sha`）。
+四张大盘都有「发版」注释，某次发版之后指标变了一眼就能对上；蓝绿两色跑着不同
+构建超过 30 分钟（发版停在半路）报 `BackendVersionSkew`。
+
+### 15. 数据库：长事务、锁、回卷；钱包对账
+
+postgres-exporter 自带的 `pg_stat_activity` 已经按 state 和等待事件分组导出最老
+事务的年龄，长事务（`PostgresLongTransaction`）、卡在锁上
+（`PostgresLockWaitStuck`、`PostgresLockPileUp`，含 `auth_session` 这类咨询锁）
+直接用它；死锁读 `pg_stat_database_deadlocks`；事务 ID 回卷要打开默认关闭的
+`--collector.database_wraparound`（`PostgresXidWraparound*`，采集项没生效时
+`PostgresWraparoundMetricsMissing` 会报）。
+
+钱包对账（`WalletReconciliationService`，每天 05:00）：只读事务里一条 SQL 核对
+每个钱包余额是否等于该用户全部流水金额之和、有没有负余额。只比总和、不比
+「最后一条流水的余额」：流水的 `createdAt` 是事务开始时刻，并发扣款的提交顺序
+可以和它相反。不一致报 `WalletLedgerMismatch`（critical），日志只有计数，定位
+查询在手册里。
+
+### 16. 通话
+
+LiveKit 用的是云服务，媒体面坏了后端看不到任何错误。后端能看到的是信令面：
+发起/接听的服务端失败（`CallSetupFailing`）、接通后 10 秒内就挂断的比例
+（`CallsEndingTooQuickly`，多半是媒体连不上）、LiveKit 回调处理失败或签名全被拒
+（`LiveKitWebhookFailing` / `LiveKitWebhookRejected`）。签名有效但处理失败的回调
+现在返回 500，LiveKit 会重试；签名不对仍是 401。指标见 docs/metrics.md。
+
+### 17. 只读合成探测 —— /healthz 正常不代表能用
+
+`monitoring/synthetic-probe/probe.mjs`：一个专用测试号每 5 分钟走一遍「刷新令牌
+（必要时密码登录）→ `GET /api/v1/chat/conversations` → 连 `/realtime` 等到
+`badge.snapshot`」，走公网域名。不发消息、不写业务数据；会更新测试号的
+`lastOnline`，管理台的活跃用户数会多算它一个。15 分钟没有一轮走通报
+`SyntheticProbeFailing`（critical），容器在跑却没配测试号报
+`SyntheticProbeNotConfigured`。
+
+开通：
+
+1. 注册一个普通用户（不要用管理员账号，也不要拿真人的号）做探测专用号，不加
+   好友、不进群。
+2. 照 `.env.synthetic-probe.example` 在**仓库根目录**建 `.env.synthetic-probe`
+   （`chmod 600`）：根目录的 `.env.*` 是发版 rsync 原样保留的本机配置，放在
+   `monitoring/` 下会被旧版 launcher 每次发版删掉。`PROBE_DEVICE_ID` 生成一次
+   就别换 —— 换了就是一台新设备。
+3. 用监控栈当初启动时的**同一组** compose 文件拉起它（在仓库根目录）：
+   `docker compose -f monitoring/docker-compose.yml -f monitoring/docker-compose.prod.yml up -d synthetic-probe`，
+   开了日志 overlay 的机器再加 `--env-file monitoring/.env -f monitoring/docker-compose.logs.yml`
+   （与 [runbooks/alerts.md](./runbooks/alerts.md) 里的 `<日志栈>` 相同）。文件组不一致时，发版同步
+   （`deploy/sync-ops-stacks.sh`）每次都会提示，并跳过清理孤儿容器。
+   测试号还没有任何受信任设备时，第一次登录会把探测设备直接记为受信任；否则
+   在测试号的受信任设备上批准一次（探测失败日志会是
+   `device_verification_required`，批准前它每 15 分钟才重试一次登录）。
+4. `docker logs circle-synthetic-probe` 看到 `"result":"success"` 即可。
+
+刷新令牌是一次性轮换的，存在 `synthetic_probe_state` 卷里，重启容器不会丢。
+请求在网络上丢了回复时，下一轮会拿旧令牌刷新、触发服务端的重用检测吊销整个
+会话，探测随即用密码重新登录 —— 能自己恢复，只是会在后端的会话日志里留一笔。
+探测和服务在同一台机器上，测不到外部网络；脚本零依赖（Node ≥ 22），需要时可以
+原样放到别的机器上跑。间隔最多 300 秒、单步超时最多 30 秒，超出的值会被收回到上限：
+告警按「15 分钟没有一轮走通」判，间隔再长就凑不够 3 轮。
+
+### 18. Sentry 告警规则（在 sentry.io 后台配）
+
+Sentry 只负责「出了什么错」，要它主动叫人，得在 sentry.io 里给两个项目（后端、
+App）各配几条规则，环境都限定 `production`。前提是两边都填好了 DSN，后端还要有
+`SENTRY_RELEASE`（发版脚本会写）：
+
+- **新问题**：Issue Alert「A new issue is created」→ 发到 Discord（或邮件）。
+- **回归**：Issue Alert「The issue changes state from resolved to unresolved」。
+- **错误量突增**：Issue Alert「The issue is seen more than 100 times in 1h」，
+  阈值按实际流量调。
+- **App 崩溃率**：Metric Alert「Crash Free Session Rate」低于 99%（1 小时窗口），
+  按 release 看是哪个版本带来的。
+
+### 19. 产品分析 / 业务埋点（❌ 未做）
 
 用户行为事件、**漏斗、留存、转化**——给产品 / 增长。和 Prometheus 不同：**per-user**，不是聚合，Prometheus 存不了。推荐 PostHog（免费云起步）。这是独立的一套系统。
 

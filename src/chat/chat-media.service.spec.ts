@@ -137,6 +137,69 @@ describe('ChatMediaService', () => {
       deadline.getTime(),
     );
   });
+  // 已开始计时的截止时间不会再变:不开事务、不对会话行 FOR SHARE(不再与发送的
+  // FOR UPDATE 互相阻塞),只读一次权威行。
+  it('signs started-timer media without a transaction or a conversation lock', async () => {
+    const deadline = new Date(Date.now() + 15_000);
+    prisma.chatMessage.findMany.mockResolvedValue([
+      {
+        id: 'm1',
+        conversationID: 'c1',
+        deleted: false,
+        revokedAt: null,
+        burnDurationSec: 60,
+        burnExpiresAt: deadline,
+      },
+    ]);
+    await service.attachMediaUrls([
+      dto({
+        type: 'image',
+        burnDurationSec: 60,
+        burnExpiresAt: deadline.toISOString(),
+        content: { key: 'chat/u1/a.jpg' },
+      }),
+    ]);
+    expect(prisma.$transaction).not.toHaveBeenCalled();
+    expect(prisma.$queryRaw).not.toHaveBeenCalled();
+    const [, ttl] = uploadService.createPresignedGetUrl.mock.calls[0];
+    expect(ttl).toBeLessThanOrEqual(15);
+  });
+  it('falls back to the locked check when the stored row is still pending read', async () => {
+    prisma.chatMessage.findMany
+      .mockResolvedValueOnce([
+        {
+          id: 'm1',
+          conversationID: 'c9',
+          deleted: false,
+          revokedAt: null,
+          burnDurationSec: 60,
+          burnExpiresAt: null,
+        },
+      ])
+      .mockResolvedValueOnce([
+        {
+          id: 'm1',
+          deleted: false,
+          revokedAt: null,
+          burnDurationSec: 60,
+          burnExpiresAt: null,
+        },
+      ]);
+    await service.attachMediaUrls([
+      dto({
+        type: 'image',
+        burnDurationSec: 60,
+        burnExpiresAt: new Date(Date.now() + 60_000).toISOString(),
+        content: { key: 'chat/u1/a.jpg' },
+      }),
+    ]);
+    expect(prisma.$transaction).toHaveBeenCalledTimes(1);
+    const [strings, conversations] = prisma.$queryRaw.mock.calls[0];
+    expect(strings.join(' ')).toContain('FOR SHARE');
+    expect(conversations).toEqual(['c9']);
+    const [, ttl] = uploadService.createPresignedGetUrl.mock.calls[0];
+    expect(ttl).toBe(60);
+  });
   it('strips a previously issued URL when the authoritative message already burned', async () => {
     prisma.chatMessage.findMany.mockResolvedValue([
       { id: 'm1', deleted: true },
@@ -190,6 +253,34 @@ describe('ChatMediaService', () => {
     const sql = prisma.$queryRaw.mock.calls[1][0].join(' ');
     expect(sql).toContain('"ChatMessage"');
     expect(sql).toContain('"ChatBurnArchive"');
+  });
+  // 归档清理一个事务处理同会话的多行:逐行加锁的话跨行顺序是乱的。整批先按
+  // 「自有附件 key(排序)→ 笔记导入 key(排序)」锁齐,与焚毁清扫一个事务里的顺序一致。
+  it('locks a whole archive batch in the same global order as the burn sweep', async () => {
+    prisma.$queryRaw.mockResolvedValue([]);
+    await service.lockArchiveKeys(prisma as never, [
+      'chat/u2/b.jpg',
+      'chat/u1/note-import/z.jpg',
+      'chat/u1/a.jpg',
+      'chat/u2/b.jpg',
+      'not-chat/c.jpg',
+      'chat/u1/note-import/m.jpg',
+    ]);
+    const owned = prisma.$queryRaw.mock.calls.map((call: unknown[]) => call[1]);
+    const notes = prisma.$executeRaw.mock.calls.map(
+      (call: unknown[]) => call[1],
+    );
+    expect(owned).toEqual(['chat/u1/a.jpg', 'chat/u2/b.jpg']);
+    expect(notes).toEqual([
+      'chat/u1/note-import/m.jpg',
+      'chat/u1/note-import/z.jpg',
+    ]);
+    expect(prisma.$queryRaw.mock.calls[0][0].join(' ')).toContain(
+      'pg_advisory_xact_lock(hashtext(',
+    );
+    expect(
+      prisma.$queryRaw.mock.invocationCallOrder[owned.length - 1],
+    ).toBeLessThan(prisma.$executeRaw.mock.invocationCallOrder[0]);
   });
   it('never queues physical deletion when another live or retained reference still owns the key', async () => {
     prisma.$queryRaw.mockResolvedValue([]);

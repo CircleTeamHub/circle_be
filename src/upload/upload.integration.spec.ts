@@ -96,6 +96,9 @@ describeMinio('UploadService real MinIO integration', () => {
       chatMessage: { findMany: async () => [row] },
     };
     const media = new ChatMediaService(service, {
+      // 已开始计时的消息(截止时间写下就不再变)不进事务、直接读;待读的才在事务里
+      // 对会话 FOR SHARE。这条用例的消息已开始计时,走的是前一条路径。
+      chatMessage: tx.chatMessage,
       $transaction: async (fn) => fn(tx),
     } as never);
     try {

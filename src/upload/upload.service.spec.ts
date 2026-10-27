@@ -70,6 +70,50 @@ describe('UploadService', () => {
     expect(JSON.stringify(policy)).not.toContain('circle/chat/*');
   });
 
+  // /readyz 与 circle_object_store_up 用的真实往返：HeadBucket，带中止信号。
+  describe('objectStoreReachable', () => {
+    const configured = (key: string) =>
+      (
+        ({
+          MINIO_ENDPOINT: 'http://localhost:9000',
+          MINIO_ACCESS_KEY: 'minioadmin',
+          MINIO_SECRET_KEY: 'minioadmin123',
+          MINIO_BUCKET: 'circle',
+          MINIO_PUBLIC_URL: 'http://localhost:9000',
+        }) as Record<string, string>
+      )[key] ?? null;
+
+    it('checks the bucket with an abortable HeadBucket', async () => {
+      const send = jest.fn().mockResolvedValue({});
+      const service = new UploadService({ get: configured } as any);
+      (service as any).client = { send };
+
+      await expect(service.objectStoreReachable()).resolves.toBe(true);
+      expect(send.mock.calls[0][0].constructor.name).toBe('HeadBucketCommand');
+      expect(send.mock.calls[0][0].input).toEqual({ Bucket: 'circle' });
+      expect(send.mock.calls[0][1]).toEqual({
+        abortSignal: expect.any(AbortSignal),
+      });
+    });
+
+    it('reports false when the bucket cannot be reached', async () => {
+      const send = jest.fn().mockRejectedValue(new Error('ECONNREFUSED'));
+      const service = new UploadService({ get: configured } as any);
+      (service as any).client = { send };
+
+      await expect(service.objectStoreReachable()).resolves.toBe(false);
+    });
+
+    it('reports null (not configured) without touching the network', async () => {
+      const send = jest.fn();
+      const service = new UploadService({ get: () => null } as any);
+      (service as any).client = { send };
+
+      await expect(service.objectStoreReachable()).resolves.toBeNull();
+      expect(send).not.toHaveBeenCalled();
+    });
+  });
+
   it('applies a public-read bucket policy during module init', async () => {
     const send = jest.fn().mockResolvedValue({});
     const service = new UploadService({

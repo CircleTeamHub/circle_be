@@ -1,0 +1,12 @@
+-- 删掉 ChatMessage_note_card_noteId_idx(另一半见 20261027000000_drop_note_card_source_expression_index)。
+--
+-- 这两条部分表达式索引是 20261025000000_note_card_reference_indexes 给「笔记来源状态
+-- 同步广播」查卡片所在会话建的。广播已改成 NoteStatusFanoutOutbox 异步处理,按
+-- ChatMessage."sourceNoteID" 列 + ChatMessage_live_note_source_conversation_idx 查;
+-- 老卡片只有 content.noteId 的,20261020000000 已把解析后的根来源回填进该列。
+-- 再没有查询按 content ->> 'sourceNoteId' / 'noteId' 查,留着只会让每条笔记卡片
+-- 消息多写两份索引。
+--
+-- 一份迁移只放这一条:Prisma 只在文件里全是 CREATE INDEX CONCURRENTLY 时才逐条放到
+-- 事务外执行,混进 DROP 或多条 DROP 就整份进事务,部署报 25001。
+DROP INDEX CONCURRENTLY IF EXISTS "ChatMessage_note_card_noteId_idx";

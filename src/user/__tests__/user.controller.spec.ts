@@ -212,3 +212,14 @@ describe('POST /user/appearances rate limiting', () => {
     ).toBe(60_000);
   });
 });
+
+describe('GET /user/search/account rate limiting', () => {
+  // 账号号码是唯一能换出 userID 的入口:不限流的话可以按号段批量枚举用户。
+  it('limits exact account lookups to 30 per minute per account', () => {
+    const handler = UserController.prototype.searchUserByAccountId;
+    const guards = Reflect.getMetadata(GUARDS_METADATA, handler) ?? [];
+    expect(guards).toContain(UserThrottlerGuard);
+    expect(Reflect.getMetadata('THROTTLER:LIMITdefault', handler)).toBe(30);
+    expect(Reflect.getMetadata('THROTTLER:TTLdefault', handler)).toBe(60_000);
+  });
+});

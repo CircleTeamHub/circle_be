@@ -7,10 +7,15 @@ import {
 } from '../metrics/tracked-cron.decorator';
 import { Prisma } from 'src/generated/prisma';
 import { PrismaService } from 'src/prisma/prisma.service';
-import type { NotificationRealtimeDto } from './notification.dto';
+import type { NotificationPushSource } from './notification.dto';
 import { createLoggingConfig } from 'src/logging/logging.config';
 import { logExternalCallFailure } from 'src/logging/external-service.logger';
 import { reportOperationalError } from 'src/logging/error-aggregation.service';
+import {
+  deliveryMetrics,
+  type PushDeliveryResult,
+  type PushProvider,
+} from 'src/metrics/delivery-metrics';
 
 const EXPO_PUSH_URL = 'https://exp.host/--/api/v2/push/send';
 const EXPO_RECEIPT_URL = 'https://exp.host/--/api/v2/push/getReceipts';
@@ -115,6 +120,45 @@ const TERMINAL_TOKEN_ERRORS = new Set(['DeviceNotRegistered']);
 const TERMINAL_JPUSH_TOKEN_ERRORS = new Set(['JPushInvalidRegistrationId']);
 const DELIVERY_MAX_ATTEMPTS = 5;
 
+function isDeadTokenOutcome(outcome: TokenDeliveryOutcome): boolean {
+  return (
+    outcome.status === 'TERMINAL' &&
+    (TERMINAL_TOKEN_ERRORS.has(outcome.error ?? '') ||
+      TERMINAL_JPUSH_TOKEN_ERRORS.has(outcome.error ?? ''))
+  );
+}
+
+function pushDeliveryResult(outcome: TokenDeliveryOutcome): PushDeliveryResult {
+  if (outcome.status === 'SENT') return 'sent';
+  if (outcome.status === 'RETRYABLE') return 'retryable';
+  return isDeadTokenOutcome(outcome) ? 'dead_token' : 'rejected';
+}
+
+/** 计数失败不能影响投递结果。 */
+function recordPushDelivery(
+  provider: PushProvider,
+  result: PushDeliveryResult,
+): void {
+  try {
+    deliveryMetrics.recordPushDelivery(provider, result);
+  } catch {
+    // Metrics are best effort.
+  }
+}
+
+/** 结论与入参同下标。 */
+function recordPushOutcomes(
+  messages: ReadonlyArray<Pick<PushTokenTarget, 'provider'>>,
+  outcomes: readonly TokenDeliveryOutcome[],
+): void {
+  outcomes.forEach((outcome, index) => {
+    recordPushDelivery(
+      messages[index]?.provider === 'jpush' ? 'jpush' : 'expo',
+      pushDeliveryResult(outcome),
+    );
+  });
+}
+
 @Injectable()
 export class NotificationPushService {
   private staleTokenCleanupRunning = false;
@@ -149,10 +193,13 @@ export class NotificationPushService {
     return Boolean(this.jpushAppKey && this.jpushMasterSecret);
   }
 
-  /** 组装推送 payload。外置成公开方法：outbox 第一次处理时快照进 DB（#88）。 */
+  /**
+   * 组装推送 payload。外置成公开方法：outbox 第一次处理时快照进 DB（#88）。
+   * 入参只要求它读得到的字段（NotificationPushSource），实时 DTO 也能直接传。
+   */
   composeMessage(
     userId: string,
-    notification: NotificationRealtimeDto,
+    notification: NotificationPushSource,
   ): ExpoPushPayload {
     const actor = notification.fromUser?.nickname || 'CircleIM';
     const body =
@@ -386,15 +433,12 @@ export class NotificationPushService {
       outcomes[index] = outcome;
     });
 
+    recordPushOutcomes(messages, outcomes);
+
     // 只有「令牌已死」类错误才停用 token —— MessageTooBig 等消息级终态
     // 与 token 健康无关，误停会把活设备静音。
     const deadTokens = outcomes
-      .filter(
-        (outcome) =>
-          outcome.status === 'TERMINAL' &&
-          (TERMINAL_TOKEN_ERRORS.has(outcome.error ?? '') ||
-            TERMINAL_JPUSH_TOKEN_ERRORS.has(outcome.error ?? '')),
-      )
+      .filter(isDeadTokenOutcome)
       .map((outcome) => outcome.token);
     if (deadTokens.length > 0) {
       await this.prisma.devicePushToken.updateMany({
@@ -518,6 +562,11 @@ export class NotificationPushService {
 
     let processed = expired.length;
     const deadTokens: string[] = [];
+    // ok 与「令牌已死」两类回执写的都是同一份数据，攒起来各用一条 updateMany，
+    // 不再一行一次往返（一批最多 RECEIPT_BATCH_SIZE 行）。按错误码分组只是防御：
+    // 目前回执里判终态的只有 DeviceNotRegistered 一种。
+    const confirmedIDs: string[] = [];
+    const terminalIDsByError = new Map<string, string[]>();
     for (const delivery of pending) {
       const receipt = delivery.ticketID
         ? receipts[delivery.ticketID]
@@ -531,25 +580,20 @@ export class NotificationPushService {
       settledOutboxIDs.add(delivery.outboxID);
       processed += 1;
       if (receipt.status === 'ok') {
-        await this.prisma.notificationPushDelivery.update({
-          where: { id: delivery.id },
-          data: { status: 'CONFIRMED', receiptCheckedAt: now, lastError: null },
-        });
+        confirmedIDs.push(delivery.id);
         continue;
       }
+      // 回执阶段的失败再计一次（ok 回执不计，ticket 阶段已经记过 sent）：
+      // APNs/FCM 凭证失效、限流主要只出现在这里，同步 ticket 照样是 ok。
       const errorCode = receipt.details?.error ?? 'UnknownExpoReceiptError';
       if (TERMINAL_TOKEN_ERRORS.has(errorCode)) {
+        recordPushDelivery('expo', 'dead_token');
         deadTokens.push(delivery.token);
-        await this.prisma.notificationPushDelivery.update({
-          where: { id: delivery.id },
-          data: {
-            status: 'TERMINAL',
-            receiptCheckedAt: now,
-            lastError: errorCode,
-          },
-        });
+        const ids = terminalIDsByError.get(errorCode) ?? [];
+        terminalIDsByError.set(errorCode, [...ids, delivery.id]);
         continue;
       }
+      recordPushDelivery('expo', 'retryable');
       // round 3 review：FAILED 标记与 outbox 重开必须同事务 —— 行改成
       // FAILED 后 outbox 若没能拉回 PENDING（写失败），这条可重试失败就
       // 永远没有下一次 sweep。
@@ -567,6 +611,25 @@ export class NotificationPushService {
           data: { status: 'PENDING', nextAttemptAt: now },
         }),
       ]);
+    }
+
+    // 必须排在 reconcileCompletedOutboxes 之前：它按「还有没有 SENT 行」判定 outbox
+    // 能否终结，这些行得先离开 SENT。
+    if (confirmedIDs.length > 0) {
+      await this.prisma.notificationPushDelivery.updateMany({
+        where: { id: { in: confirmedIDs } },
+        data: { status: 'CONFIRMED', receiptCheckedAt: now, lastError: null },
+      });
+    }
+    for (const [errorCode, ids] of terminalIDsByError) {
+      await this.prisma.notificationPushDelivery.updateMany({
+        where: { id: { in: ids } },
+        data: {
+          status: 'TERMINAL',
+          receiptCheckedAt: now,
+          lastError: errorCode,
+        },
+      });
     }
 
     if (deadTokens.length > 0) {

@@ -12,6 +12,10 @@ import {
 } from 'src/generated/prisma';
 import { PrismaService } from 'src/prisma/prisma.service';
 import {
+  buildCircleSearchCountQuery,
+  buildCircleSearchPageQuery,
+} from './admin-circle-search.query';
+import {
   prismaErrorCode,
   runSerializableTransaction,
 } from 'src/utils/prisma-tx';
@@ -79,6 +83,23 @@ function toCircleAdminView(
   };
 }
 
+const CIRCLE_LIST_SELECT = {
+  id: true,
+  name: true,
+  groupID: true,
+  memberCount: true,
+  postCount: true,
+  deleted: true,
+  adminState: true,
+  adminDisabledAt: true,
+  adminDisabledBy: true,
+  adminDisableReason: true,
+  createdAt: true,
+  owner: {
+    select: { id: true, accountId: true, nickname: true },
+  },
+} satisfies Prisma.CircleSelect;
+
 @Injectable()
 export class AdminCommunityService {
   constructor(private readonly prisma: PrismaService) {}
@@ -90,63 +111,9 @@ export class AdminCommunityService {
     status?: CircleAdminState;
   }) {
     const search = query.search?.trim();
-    const where: Prisma.CircleWhereInput = {
-      ...(query.status ? { adminState: query.status } : {}),
-      ...(search
-        ? {
-            OR: [
-              { id: { contains: search, mode: 'insensitive' } },
-              { name: { contains: search, mode: 'insensitive' } },
-              { groupID: { contains: search, mode: 'insensitive' } },
-              {
-                owner: {
-                  is: {
-                    OR: [
-                      {
-                        accountId: {
-                          contains: search,
-                          mode: 'insensitive',
-                        },
-                      },
-                      {
-                        nickname: {
-                          contains: search,
-                          mode: 'insensitive',
-                        },
-                      },
-                    ],
-                  },
-                },
-              },
-            ],
-          }
-        : {}),
-    };
-    const [total, circles] = await Promise.all([
-      this.prisma.circle.count({ where }),
-      this.prisma.circle.findMany({
-        where,
-        select: {
-          id: true,
-          name: true,
-          groupID: true,
-          memberCount: true,
-          postCount: true,
-          deleted: true,
-          adminState: true,
-          adminDisabledAt: true,
-          adminDisabledBy: true,
-          adminDisableReason: true,
-          createdAt: true,
-          owner: {
-            select: { id: true, accountId: true, nickname: true },
-          },
-        },
-        orderBy: [{ createdAt: 'desc' }, { id: 'desc' }],
-        skip: (query.page - 1) * query.limit,
-        take: query.limit,
-      }),
-    ]);
+    const { total, circles } = search
+      ? await this.searchCircles({ ...query, search })
+      : await this.pageCircles(query);
     const operations = await this.latestOperations(
       circles.flatMap((circle) => (circle.groupID ? [circle.groupID] : [])),
     );
@@ -174,6 +141,66 @@ export class AdminCommunityService {
       total,
       page: query.page,
       limit: query.limit,
+    };
+  }
+
+  private async pageCircles(query: {
+    page: number;
+    limit: number;
+    status?: CircleAdminState;
+  }) {
+    const where: Prisma.CircleWhereInput = query.status
+      ? { adminState: query.status }
+      : {};
+    const [total, circles] = await Promise.all([
+      this.prisma.circle.count({ where }),
+      this.prisma.circle.findMany({
+        where,
+        select: CIRCLE_LIST_SELECT,
+        orderBy: [{ createdAt: 'desc' }, { id: 'desc' }],
+        skip: (query.page - 1) * query.limit,
+        take: query.limit,
+      }),
+    ]);
+    return { total, circles };
+  }
+
+  /**
+   * 关键词搜索:原来的 Prisma OR 里有圈主关系条件,编译成跨 LEFT JOIN 的 OR,用不上
+   * 任何 trigram 索引。改成 UNION 查询取当前页 id 和 total(口径与原查询一致,见
+   * admin-circle-search.query.ts),再按 id 回查行、保持页内顺序。
+   */
+  private async searchCircles(query: {
+    page: number;
+    limit: number;
+    search: string;
+    status?: CircleAdminState;
+  }) {
+    const filter = { search: query.search, status: query.status };
+    const [page, counted] = await Promise.all([
+      this.prisma.$queryRaw<Array<{ id: string }>>(
+        buildCircleSearchPageQuery({
+          ...filter,
+          limit: query.limit,
+          offset: (query.page - 1) * query.limit,
+        }),
+      ),
+      this.prisma.$queryRaw<Array<{ total: number }>>(
+        buildCircleSearchCountQuery(filter),
+      ),
+    ]);
+    const ids = page.map((row) => row.id);
+    const rows = ids.length
+      ? await this.prisma.circle.findMany({
+          where: { id: { in: ids } },
+          select: CIRCLE_LIST_SELECT,
+        })
+      : [];
+    const byId = new Map(rows.map((row) => [row.id, row]));
+    return {
+      total: counted[0]?.total ?? 0,
+      // 页查询与回查之间被硬删的圈子直接跳过。
+      circles: ids.flatMap((id) => byId.get(id) ?? []),
     };
   }
 
@@ -226,7 +253,6 @@ export class AdminCommunityService {
         id: true,
         name: true,
         muteAllAt: true,
-        textEncryption: true,
         qrJoinEnabled: true,
         cardJoinEnabled: true,
         joinApprovalRequired: true,
@@ -468,7 +494,6 @@ export class AdminCommunityService {
         updatedAt: true,
         lastMessageAt: true,
         muteAllAt: true,
-        textEncryption: true,
         memberCanInvite: true,
         qrJoinEnabled: true,
         cardJoinEnabled: true,

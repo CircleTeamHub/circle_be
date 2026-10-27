@@ -7,7 +7,11 @@ import {
   Logger,
   NotFoundException,
 } from '@nestjs/common';
-import { Interval } from '@nestjs/schedule';
+import {
+  reportHandledJobFailure,
+  reportJobSkipped,
+  TrackedInterval,
+} from '../metrics/tracked-cron.decorator';
 import { PrismaService } from 'src/prisma/prisma.service';
 import type { GroupAdmission, Prisma } from 'src/generated/prisma';
 import { NotificationService } from 'src/notification/notification.service';
@@ -21,6 +25,9 @@ import { normalizeUserIdAlias } from 'src/user/user-id-alias';
 const ACTIVE = ['INVITED', 'PENDING'];
 const TTL = 7 * 24 * 60 * 60 * 1000;
 const MAX_MEMBERS = 200;
+const DELIVERY_FLUSH_INTERVAL_MS = 10_000;
+/** 投递重试上限。outbox-depth 的积压/死信定义也引用它，两边不能分叉。 */
+export const GROUP_ADMISSION_DELIVERY_MAX_ATTEMPTS = 8;
 type Tx = Prisma.TransactionClient;
 type Group = {
   id: string;
@@ -193,6 +200,78 @@ export class GroupAdmissionService {
       },
     });
   }
+  /**
+   * 逐人邀请的批量版,每位被邀请人的结果与原来逐人跑 member → current → create →
+   * event 完全一致:在座的跳过;不在座的先把已过期的有效邀请标 EXPIRED(current 的
+   * 语义),仍有有效邀请(INVITED/PENDING)的跳过;其余各建一条 INVITED 邀请和一条
+   * INVITED 投递。
+   *
+   * 原来每人 5-6 次往返(100 人约 500 条),全程持有会话行 FOR UPDATE、事务默认 5 秒
+   * 超时;现在与人数无关的 3-5 条。同一会话的邀请写入都在这把会话行锁下串行,部分
+   * 唯一索引 GroupAdmission_active_applicant_key 兜底「每人至多一条有效邀请」。
+   */
+  private async inviteBatch(
+    tx: Tx,
+    group: string,
+    actor: string,
+    users: string[],
+  ): Promise<void> {
+    const seated = new Set(
+      (
+        await tx.chatMember.findMany({
+          where: { conversationID: group, userID: { in: users }, leftAt: null },
+          select: { userID: true },
+        })
+      ).map((seat) => seat.userID),
+    );
+    const candidates = users.filter((user) => !seated.has(user));
+    if (!candidates.length) return;
+    await tx.groupAdmission.updateMany({
+      where: {
+        conversationID: group,
+        applicantID: { in: candidates },
+        status: { in: ACTIVE },
+        expiresAt: { lte: new Date() },
+      },
+      data: { status: 'EXPIRED' },
+    });
+    const pending = new Set(
+      (
+        await tx.groupAdmission.findMany({
+          where: {
+            conversationID: group,
+            applicantID: { in: candidates },
+            status: { in: ACTIVE },
+          },
+          select: { applicantID: true },
+        })
+      ).map((admission) => admission.applicantID),
+    );
+    const fresh = candidates.filter((user) => !pending.has(user));
+    if (!fresh.length) return;
+    const expiresAt = new Date(Date.now() + TTL);
+    const created = await tx.groupAdmission.createManyAndReturn({
+      data: fresh.map((applicantID) => ({
+        conversationID: group,
+        applicantID,
+        inviterID: actor,
+        kind: 'INVITE',
+        status: 'INVITED',
+        expiresAt,
+      })),
+      select: { id: true, applicantID: true },
+    });
+    // 与 event() 的 upsert(update: {})同义:新建的邀请不会已有投递,冲突即跳过。
+    await tx.groupAdmissionDelivery.createMany({
+      data: created.map((admission) => ({
+        admissionID: admission.id,
+        recipientID: admission.applicantID,
+        actorID: actor,
+        event: 'INVITED',
+      })),
+      skipDuplicates: true,
+    });
+  }
   async invite(actor: string, group: string, rawUsers: string[]) {
     const users = [...new Set(rawUsers.map(normalizeUserIdAlias))].filter(
       (u) => u !== actor,
@@ -203,23 +282,7 @@ export class GroupAdmissionService {
       const g = await this.lock(tx, group);
       await this.assertInviter(tx, g, actor);
       await this.targets(tx, actor, users);
-      for (const user of users) {
-        const seat = await this.member(tx, group, user);
-        if (seat && !seat.leftAt) continue;
-        const existing = await this.current(tx, group, user);
-        if (existing) continue;
-        const a = await tx.groupAdmission.create({
-          data: {
-            conversationID: group,
-            applicantID: user,
-            inviterID: actor,
-            kind: 'INVITE',
-            status: 'INVITED',
-            expiresAt: new Date(Date.now() + TTL),
-          },
-        });
-        await this.event(tx, a, actor, 'INVITED', [user]);
-      }
+      await this.inviteBatch(tx, group, actor, users);
     });
     void this.flush().catch(() =>
       this.logger.warn({
@@ -840,15 +903,19 @@ export class GroupAdmissionService {
     });
     return { items, nextCursor: rows.length > 50 ? page[49].id : null };
   }
-  @Interval(10_000)
+  @TrackedInterval(DELIVERY_FLUSH_INTERVAL_MS, 'group_admission_delivery')
   async flush() {
-    if (this.delivering) return;
+    if (this.delivering) {
+      // 挡回的那次不能刷新心跳：一轮卡死之后每 10 秒的跳过都会被当成成功。
+      reportJobSkipped();
+      return;
+    }
     this.delivering = true;
     try {
       const jobs = await this.prisma.groupAdmissionDelivery.findMany({
         where: {
           deliveredAt: null,
-          attempts: { lt: 8 },
+          attempts: { lt: GROUP_ADMISSION_DELIVERY_MAX_ATTEMPTS },
           nextAttemptAt: { lte: new Date() },
         },
         orderBy: { createdAt: 'asc' },
@@ -993,7 +1060,11 @@ export class GroupAdmissionService {
             ),
           );
         } catch {
-          const terminal = job.attempts + 1 >= 8;
+          // 失败被改写成重试计数后这一轮照常返回：不报的话记成成功，一直
+          // 投递失败时 CronJobFailing 打不中。
+          reportHandledJobFailure();
+          const terminal =
+            job.attempts + 1 >= GROUP_ADMISSION_DELIVERY_MAX_ATTEMPTS;
           if (terminal)
             businessMetrics.recordEvent(
               'group_admission_delivery_exhausted',

@@ -39,13 +39,26 @@ docker compose -f monitoring/docker-compose.yml up -d
 | Prometheus   | http://localhost:9090 | —                      |
 | Alertmanager | http://localhost:9093 | —                      |
 
-In Grafana the **Prometheus** datasource and three dashboards are auto-provisioned:
+In Grafana the **Prometheus** datasource and four dashboards are auto-provisioned:
 
 | Dashboard | Covers |
 | --------- | ------ |
 | **circle_be — RED** | per-route request rate, 5xx ratio, p95 latency, process memory, chat gateway |
 | **circle_be — Jobs, Queues & Datastores** | cron heartbeat lag and failure rate, outbox backlog / dead letters, pg pool queueing, Postgres connections, Redis memory |
 | **circle_be — Operations Overview** | firing alerts, scrape and probe health, alert-delivery pipeline errors, TLS expiry, host memory and disk capacity |
+| **circle_be — Deliveries, Dependencies & Business** | push and verification-email outcomes and failure ratios, object storage / LiveKit requests and reachability, release-time off-host backup, business events, upload presigns, unhandled rejections |
+
+Releases keep a running stack current: after a successful cutover,
+`deploy/sync-ops-stacks.sh` re-runs `docker compose` with the exact project,
+files and env files the running containers were started with, and recreates
+Prometheus and Alertmanager (plus Loki and Alloy with the logs overlay) so
+edited rules take effect — they mount single files, so a reload would keep the
+old inode. Stacks started from another directory are left alone with a warning,
+and so is a stack whose bind-mounted files are missing (Docker would create a
+directory in their place), or whose logs overlay needs a `caddy_logs` volume
+that does not exist yet. This needs the upgraded release launcher, which keeps
+`monitoring/.env*`, `alertmanager/*.url`, `prometheus/metrics_token` and the
+probe targets across releases; with an older one the sync skips itself.
 
 The jobs dashboard normalises cron heartbeat lag by each job's own expected
 interval, so a per-minute job and a daily job are readable on one axis — the
@@ -391,9 +404,17 @@ at that file.
 Inhibition suppresses the alerts a known upstream failure is *guaranteed* to
 cause, so one incident is not reported five different ways:
 
-- `CircleBeNoTarget` → suppresses 5xx / latency / event-loop / cron / outbox, and
-  the public API probe (`PublicEndpointDown` with `component="api"`)
-- `PostgresDown` → suppresses cron / outbox / 5xx
+- `CircleBeNoTarget` → suppresses 5xx / latency / event-loop / cron / outbox,
+  `BackendErrorLogSpike`, and the public API probe (`PublicEndpointDown` with
+  `component="api"`). `CaddyProxyErrors` stays on: it also covers the MinIO and
+  admin_web upstreams, which nothing else watches while the backend is down.
+- `PostgresDown` → suppresses cron / outbox / 5xx / `BackendErrorLogSpike`
+- `HostDiskNearlyFull` (<5% free, critical) → suppresses `HostDiskFilling`
+  (<15%, warning) and `HostDiskWillFillWithin24h` (trend) for the **same disk
+  only** (`equal: ['instance', 'mountpoint']`), for the same reason as the
+  certificate pair below. `HostInodesNearlyExhausted` → `HostInodesLow` likewise.
+- `ObjectStoreUnreachable` → suppresses `DependencyRequestsFailing` with
+  `dependency="object_storage"` only (LiveKit failures are unrelated).
 - `TlsCertificateExpiryImminent` → suppresses `TlsCertificateExpiringSoon` for the
   **same certificate only** (`equal: ['instance']`). The two tiers deliberately
   have different names: under the shared-name rule below, one domain's critical

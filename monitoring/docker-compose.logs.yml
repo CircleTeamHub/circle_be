@@ -19,6 +19,8 @@ services:
     command: ['-config.file=/etc/loki/config.yml']
     volumes:
       - ./loki/config.yml:/etc/loki/config.yml:ro
+      # 日志告警规则（单租户模式下 Loki 的租户名是 fake）。
+      - ./loki/rules:/etc/loki/rules:ro
       - loki_data:/loki
     networks: [logs]
 
@@ -48,6 +50,8 @@ services:
       - ./alloy/config.alloy:/etc/alloy/config.alloy:ro
       - app_logs_blue:/var/log/circle/blue:ro
       - app_logs_green:/var/log/circle/green:ro
+      # Caddy 自己写的脱敏副本（Caddyfile 全局块的 log collected）。
+      - caddy_logs:/var/log/caddy:ro
       - alloy_data:/var/lib/alloy/data
     networks: [logs]
     depends_on: [loki]
@@ -58,6 +62,11 @@ services:
       # Replaces the empty loki.yml mountpoint in the read-only provisioning
       # directory; metrics-only installs have no unreachable datasource.
       - ./grafana/provisioning/datasources/loki.yml.example:/etc/grafana/provisioning/datasources/loki.yml:ro
+
+  # Loki 的 ruler 把日志告警发给 Alertmanager。让 Alertmanager 加入内部的 logs 网络，
+  # 而不是把 Loki 放到默认网络里去。
+  alertmanager:
+    networks: [default, logs]
 
   prometheus:
     networks: [default, circle-be, logs]
@@ -77,3 +86,8 @@ volumes:
   app_logs_green:
     external: true
     name: ${CIRCLE_BE_PROJECT_NAME:-circle-be}_app_logs_green
+  # 由应用栈的 caddy 服务创建：Caddy 没用这一版的编排重建过时，它还不存在，
+  # 本 overlay 会起不来（见 logs.md）。
+  caddy_logs:
+    external: true
+    name: ${CIRCLE_BE_PROJECT_NAME:-circle-be}_caddy_logs

@@ -9,10 +9,13 @@
  *   DELETE /friend/block/:targetId 完全重复,App 只用后者。
  */
 import { ExecutionContext, INestApplication } from '@nestjs/common';
+import { GUARDS_METADATA } from '@nestjs/common/constants';
 import { Test } from '@nestjs/testing';
+import { ThrottlerModule } from '@nestjs/throttler';
 import request from 'supertest';
 import { MAX_PAGE } from 'src/common/pagination';
 import { JwtGuard } from 'src/guards/jwt.guard';
+import { UserThrottlerGuard } from 'src/guards/user-throttler.guard';
 import { FriendController } from './friend.controller';
 import { FriendService } from './friend.service';
 
@@ -23,18 +26,26 @@ describe('FriendController routes', () => {
   const friendService = {
     listBlocked: jest.fn().mockResolvedValue([]),
     setFriendPermission: jest.fn().mockResolvedValue(undefined),
+    sendRequest: jest.fn().mockResolvedValue(undefined),
   };
+  // 当前登录用户;按账号限流的用例会切换它。
+  let currentUserId = 'user-1';
 
   beforeEach(async () => {
     jest.clearAllMocks();
+    currentUserId = 'user-1';
     const moduleRef = await Test.createTestingModule({
+      // 与 app.module 一致:ThrottlerModule 全局注册,路由按需挂 UserThrottlerGuard。
+      imports: [
+        ThrottlerModule.forRoot([{ name: 'default', ttl: 60_000, limit: 100 }]),
+      ],
       controllers: [FriendController],
       providers: [{ provide: FriendService, useValue: friendService }],
     })
       .overrideGuard(JwtGuard)
       .useValue({
         canActivate: (context: ExecutionContext) => {
-          context.switchToHttp().getRequest().user = { userId: 'user-1' };
+          context.switchToHttp().getRequest().user = { userId: currentUserId };
           return true;
         },
       })
@@ -83,6 +94,37 @@ describe('FriendController routes', () => {
     ]) {
       expect(service[method]).toBeUndefined();
     }
+  });
+
+  // 好友申请会给对方推通知、写动态,不限流的话一个账号能对全站刷屏。
+  // 阈值:每个账号 10 分钟 20 次(产品可调,见 friend.controller.ts)。
+  it('throttles POST /friend/requests per account at 20 per 10 minutes', () => {
+    const handler = FriendController.prototype.sendRequest;
+
+    expect(Reflect.getMetadata(GUARDS_METADATA, handler)).toContain(
+      UserThrottlerGuard,
+    );
+    expect(Reflect.getMetadata('THROTTLER:LIMITdefault', handler)).toBe(20);
+    expect(Reflect.getMetadata('THROTTLER:TTLdefault', handler)).toBe(
+      10 * 60_000,
+    );
+  });
+
+  it('answers the 21st friend request in the window with 429, counted per account', async () => {
+    const send = () =>
+      request(app.getHttpServer())
+        .post('/friend/requests')
+        .send({ targetId: FRIEND_ID });
+
+    for (let i = 0; i < 20; i += 1) {
+      await send().expect(204);
+    }
+    await send().expect(429);
+    expect(friendService.sendRequest).toHaveBeenCalledTimes(20);
+
+    // 额度按账号算:同一出口的另一个账号不受影响。
+    currentUserId = 'user-2';
+    await send().expect(204);
   });
 
   // 页码走 src/common/pagination 的统一上限,不再是控制器里私有的 10_000。

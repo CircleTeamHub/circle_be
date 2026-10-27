@@ -20,7 +20,10 @@ import { RedisService } from 'src/redis/redis.service';
 import { PrismaService } from 'src/prisma/prisma.service';
 import { ChatErrorCode, type AppErrorCode } from 'src/common/app-error-codes';
 import { reportOperationalError } from 'src/logging/error-aggregation.service';
-import { randomUUID } from 'node:crypto';
+import {
+  CONNECTION_TRACE_HEADER,
+  resolveConnectionTraceId,
+} from 'src/logging/connection-trace-id';
 import {
   CHAT_EVENTS,
   CHAT_RATE_LIMITS,
@@ -38,7 +41,7 @@ import { ChatBroadcastService } from './chat-broadcast.service';
 import { ChatPushService } from './chat-push.service';
 import { ChatSupportRechargeProcessor } from './chat-support-recharge.processor';
 import { ChatDirectAutoReplyProcessor } from './chat-direct-auto-reply.processor';
-import { ChatService } from './chat.service';
+import { ChatService, type EnqueuedSendJobs } from './chat.service';
 import { SocketAdmission } from 'src/realtime/socket-admission';
 import {
   chatMetrics as defaultChatMetrics,
@@ -97,10 +100,7 @@ type EngineConnectionError = {
   context?: { status?: unknown };
 };
 
-const CONNECTION_TRACE_HEADER = 'x-connection-trace-id';
 const GUEST_CLIENT_TYPE_SET = new Set<string>(GUEST_CLIENT_MESSAGE_TYPES);
-const SAFE_CONNECTION_TRACE_ID =
-  /^ws-[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 const CHAT_AUTH_FAILURE_REASONS: ReadonlySet<ChatAuthFailureReason> = new Set([
   'missing_token',
   'invalid_token',
@@ -118,16 +118,6 @@ const CHAT_AUTH_FAILURE_REASONS: ReadonlySet<ChatAuthFailureReason> = new Set([
 
 function firstHeader(value: string | string[] | undefined): string | undefined {
   return Array.isArray(value) ? value[0] : value;
-}
-
-function safeConnectionTraceId(value: unknown): string | undefined {
-  return typeof value === 'string' && SAFE_CONNECTION_TRACE_ID.test(value)
-    ? value
-    : undefined;
-}
-
-function resolveConnectionTraceId(trustedProxyValue: unknown): string {
-  return safeConnectionTraceId(trustedProxyValue) ?? `ws-${randomUUID()}`;
 }
 
 function engineRejectionReason(code: unknown): ChatConnectionRejectionReason {
@@ -1482,23 +1472,7 @@ export class ChatGateway implements OnModuleDestroy {
           );
         }
       }
-      // 原消息和 durable job 已在同一事务提交。这里做低延迟 kick；若本次进程
-      // 恰好退出或数据库短暂失败，processor 的定时扫描会继续补消费。
-      void this.supportRecharge
-        .processMessage(result.message.id)
-        .catch((error) =>
-          this.logger.warn(
-            `support recharge immediate kick failed: ${
-              error instanceof Error ? error.message : String(error)
-            }`,
-          ),
-        );
-      void this.directAutoReply.processMessage(result.message.id).catch(() =>
-        this.logger.warn({
-          event: 'direct_auto_reply_immediate_kick_failed',
-          category: 'PROCESSING_FAILED',
-        }),
-      );
+      this.kickSendJobs(result.message.id, result.enqueuedJobs);
     } catch (error) {
       this.metrics.observeEvent('send', 'failure');
       reply(this.toAckError(error, 'send', userId, payload?.conversationId));
@@ -1507,6 +1481,48 @@ export class ChatGateway implements OnModuleDestroy {
         'send',
         Number(process.hrtime.bigint() - startedAt) / 1e9,
       );
+    }
+  }
+
+  /**
+   * 原消息和 durable job 已在同一事务提交。这里做低延迟 kick；若本次进程恰好
+   * 退出或数据库短暂失败，processor 的定时扫描会继续补消费。
+   *
+   * 只 kick 这次真正入队的任务(sendMessage 带回任务 id)。原来每条消息(含群
+   * 消息)都无条件按消息 id 各查一次两张任务表,绝大多数必然落空。
+   * enqueuedJobs 为 null 表示幂等重发、不知道首次发送有没有入队:仍按消息 id 兜底
+   * 查一次 —— 首次发送若恰好在提交与 kick 之间宕机,重发能立刻补上,不必等扫描。
+   */
+  private kickSendJobs(messageId: string, jobs: EnqueuedSendJobs | null): void {
+    const onRechargeKickFailed = (error: unknown) =>
+      this.logger.warn(
+        `support recharge immediate kick failed: ${
+          error instanceof Error ? error.message : String(error)
+        }`,
+      );
+    const onAutoReplyKickFailed = () =>
+      this.logger.warn({
+        event: 'direct_auto_reply_immediate_kick_failed',
+        category: 'PROCESSING_FAILED',
+      });
+    if (jobs === null) {
+      void this.supportRecharge
+        .processMessage(messageId)
+        .catch(onRechargeKickFailed);
+      void this.directAutoReply
+        .processMessage(messageId)
+        .catch(onAutoReplyKickFailed);
+      return;
+    }
+    if (jobs.supportRechargeJobId) {
+      void this.supportRecharge
+        .processEnqueuedJob(jobs.supportRechargeJobId)
+        .catch(onRechargeKickFailed);
+    }
+    if (jobs.directAutoReplyJobId) {
+      void this.directAutoReply
+        .processEnqueuedJob(jobs.directAutoReplyJobId)
+        .catch(onAutoReplyKickFailed);
     }
   }
 

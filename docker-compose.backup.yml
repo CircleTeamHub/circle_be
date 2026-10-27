@@ -23,6 +23,15 @@
 
 name: circle-be
 
+# 与 docker-compose.prod.yml 的 x-logging 同值。overlay 引用不到别的文件里的
+# 锚点，所以在这里再定义一份：没有它，backup 每小时的检查日志和每 15 分钟的
+# 对象镜像日志会写进不轮转的 json-file，慢慢把磁盘写满。
+x-logging: &default-logging
+  driver: json-file
+  options:
+    max-size: '10m'
+    max-file: '3'
+
 services:
   # 覆盖基础文件里的 postgres:16-alpine —— 换成带 pgbackrest 的镜像并开启 WAL 归档。
   postgres:
@@ -66,8 +75,12 @@ services:
     build:
       context: .
       dockerfile: docker/backup/Dockerfile
-    image: circle-backup:1
+    # 镜像里的脚本改了「能调度哪些任务」时必须升这个标签（2：新增 drill）。
+    # 旧镜像不认识新任务名，entrypoint 会直接退出、备份随之停掉；标签不存在时
+    # `docker compose up -d` 会自己先构建，手动部署漏了 --build 也不会配错。
+    image: circle-backup:2
     restart: unless-stopped
+    logging: *default-logging
     # uid 70 = postgres. PGDATA is 0700 postgres:postgres, so pgbackrest has to
     # run as that user to read the data files it backs up.
     user: '70:70'
@@ -80,7 +93,11 @@ services:
       # restoring a differential needs full + 1 backup, an incremental needs
       # full + every incremental since. That is a direct RTO win — day-6 recovery
       # fetches 2 backup sets instead of 7 — for a modest storage cost.
-      BACKUP_JOBS: pg-full,pg-diff,minio,check
+      #
+      # drill：每周一次恢复演练（deploy/backup/drill.sh，默认北京时间周三 03:30，见
+      # BACKUP_CRON_DRILL），
+      # 结果写进 backup_metrics 卷，由 BackupRestoreDrill* 告警读取。
+      BACKUP_JOBS: pg-full,pg-diff,minio,check,drill
     volumes:
       # Read-WRITE, and it has to be. pgbackrest only READS these files to back
       # them up, but this same container is also the disaster-recovery tool:
@@ -100,6 +117,8 @@ services:
       # database of any real size that is an OOM on the first drill. Needs free
       # disk roughly equal to the database size.
       - backup_scratch:/tmp
+      # check.sh 的结果(Prometheus textfile),由下面的 backup-metrics 导出。
+      - backup_metrics:/var/lib/circle-backup/metrics
     tmpfs:
       # Secrets only (short-lived credential files the jobs write with mktemp),
       # so they never touch disk. Small by construction — do NOT add /tmp here,
@@ -112,9 +131,35 @@ services:
       # world-writable directory inside a single-purpose container costs nothing.
       - /run:mode=1777
 
+  # 把 check.sh 写出的 textfile 导出给 Prometheus(prometheus.prod.yml 的 backup
+  # job 按这个服务名做 DNS 发现)。它跟着本 overlay 一起出现和消失:overlay 没叠上
+  # 时那边没有目标,由 BackupCheckNotReporting 把「备份根本没部署」叫出来。
+  # 只开 textfile 采集器 —— 主机指标归监控栈自己的 node-exporter。
+  # 版本与 monitoring/docker-compose.prod.yml 锁定的保持一致。
+  backup-metrics:
+    image: prom/node-exporter:v1.11.0
+    restart: unless-stopped
+    command:
+      - --collector.disable-defaults
+      - --collector.textfile
+      - --collector.textfile.directory=/textfile
+      - --web.disable-exporter-metrics
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: ['no-new-privileges:true']
+    mem_limit: 64m
+    logging: *default-logging
+    volumes:
+      - backup_metrics:/textfile:ro
+
 volumes:
   # postgres 与 backup 共享 postmaster 的 unix socket,让 pgbackrest 能在
   # 不开 TCP、不配 SSH/TLS 的前提下调用 pg_backup_start()/pg_backup_stop()。
   pg_socket:
   # 恢复演练用的临时空间(见 backup 服务的注释)。演练结束即清空。
   backup_scratch:
+  # check.sh → backup-metrics 的 textfile。只有一个几百字节的文件。
+  # 空卷第一次被 backup 挂载时,Docker 把镜像里那个归 uid 70 的目录(连同属主)
+  # 复制进来,check.sh 才写得进去;实测与 backup-metrics 谁先挂载无关。
+  # 万一写不进去,check.sh 会在日志里警告,BackupCheckNotReporting 也会响。
+  backup_metrics:

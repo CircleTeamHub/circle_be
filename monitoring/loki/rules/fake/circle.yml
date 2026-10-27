@@ -1,0 +1,115 @@
+# Loki 日志告警。指标里看不到、只出现在日志里的几类故障：
+# Loki 以单租户模式运行（auth_enabled: false），租户名固定是 fake —— 规则必须
+# 放在 rules/fake/ 下才会被加载。告警发给与 Prometheus 同一个 Alertmanager。
+groups:
+  - name: circle-logs
+    interval: 1m
+    rules:
+      # 进程因未捕获异常退出前写的那一行（src/logging/fatal-log-file.ts → 采集目录
+      # 里的 application-fatal.log）。重启后进程照常服务，指标上看不出来；单次
+      # 也值得一看，所以不设 for。
+      - alert: BackendFatalExit
+        expr: |
+          sum(count_over_time({service="circle-be"} |= "[fatal] Uncaught exception" [10m])) > 0
+        labels:
+          severity: warning
+        annotations:
+          runbook_url: https://github.com/CircleTeamHub/circle_be/blob/main/docs/runbooks/alerts.md#backendfatalexit
+          summary: 'The backend exited on an uncaught exception in the last 10m — see the [fatal] line in Loki'
+
+      # 兜底：error 级日志突增。阈值按单机量级取，宁可迟报；具体是哪一类，在
+      # Grafana Explore 里按 `| json` 的 event / component 字段分组看。
+      # for 比窗口长：一阵突发只在 5m 窗口里待 5 分钟，撑不满 10 分钟的 for，
+      # 持续出错才会响。窗口比 for 长的话，一次突发就够了。
+      - alert: BackendErrorLogSpike
+        expr: |
+          sum(count_over_time({service="circle-be", level="error"} [5m])) > 50
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          runbook_url: https://github.com/CircleTeamHub/circle_be/blob/main/docs/runbooks/alerts.md#backenderrorlogspike
+          summary: 'Backend has kept writing more than 50 error-level log lines per 5m for 10m'
+
+      # Caddy 反代失败（上游连不上、读写中断）。只算 error 级：客户端自己断开
+      # 之类是 warn/debug，量大且与上游无关。蓝绿切换的一瞬间会有零星几条，窗口与
+      # for 的关系同上 —— 一次切换的突发撑不满 for。
+      - alert: CaddyProxyErrors
+        expr: |
+          sum(count_over_time({service="caddy", level="error"} | json | logger=~"http\\.log\\.error.*|http\\.handlers\\.reverse_proxy" [5m])) > 10
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          runbook_url: https://github.com/CircleTeamHub/circle_be/blob/main/docs/runbooks/alerts.md#caddyproxyerrors
+          summary: 'Caddy has kept failing to proxy more than 10 requests per 5m for 10m — is an upstream down or restarting?'
+
+      # 证书签发/续期出错。TlsCertificateExpiringSoon 要等到剩 14 天才响，这条在
+      # 续期第一次失败时就能看到原因（DNS、ACME 限流、80 端口被挡）。
+      - alert: CaddyCertificateErrors
+        expr: |
+          sum(count_over_time({service="caddy", level="error"} | json | logger=~"tls.*" [30m])) > 0
+        labels:
+          severity: warning
+        annotations:
+          runbook_url: https://github.com/CircleTeamHub/circle_be/blob/main/docs/runbooks/alerts.md#caddycertificateerrors
+          summary: 'Caddy logged a TLS certificate error in the last 30m — renewal may be failing'
+
+  # 安全事件（docs/logging.md 的 Security Event Catalogue）：warn 级 JSON 行，
+  # `"event":"security_event"` 加上 `securityEvent` 字段。阈值按单机量级取，宁可
+  # 迟报；具体是哪些账号、哪些来源，在 Grafana Explore 里按 requestId / userId 看。
+  - name: circle-security-logs
+    interval: 1m
+    rules:
+      # 安全码、新设备验证码连续输错：一个人记错只会是零星几次，持续成批出现像是
+      # 在猜码（撞库拿到密码之后的第二道门）。for 比窗口长，一阵手滑撑不满。
+      - alert: SecurityCodeGuessing
+        expr: |
+          sum(count_over_time({service="circle-be"} |= "security_event" | json | securityEvent=~"security_code_invalid|login_challenge_code_invalid" [5m])) > 20
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          runbook_url: https://github.com/CircleTeamHub/circle_be/blob/main/docs/runbooks/alerts.md#securitycodeguessing
+          summary: 'Over 20 wrong security / login-challenge codes per 5m for 10m — someone may be guessing codes'
+
+      # 锁定是 5 次输错之后的结果。30 分钟里好几个账号被锁，比单个账号的反复输错
+      # 更像撞库；单个用户记不住安全码不会到这个量。
+      - alert: SecurityCodeLockouts
+        expr: |
+          sum(count_over_time({service="circle-be"} |= "security_event" | json | securityEvent="security_code_locked" [30m])) >= 3
+        labels:
+          severity: warning
+        annotations:
+          runbook_url: https://github.com/CircleTeamHub/circle_be/blob/main/docs/runbooks/alerts.md#securitycodelockouts
+          summary: '3 or more accounts hit the security-code lockout in 30m — possible credential stuffing'
+
+      # 签名有效、会话已被吊销（全部登出、封号、改密）的令牌还在被用：令牌泄露
+      # 后被重放，或者某个客户端在登出后没清掉凭证。不按原始条数算：一次正常的
+      # 「登出所有设备」，几台设备上在途的并发请求各撞一次就有十几条，随后刷新
+      # 失败、客户端登出。所以只看两种不正常的形态：同一个会话在 15 分钟里还被
+      # 用了 20 次以上，或者 5 个以上不同用户的已吊销会话被重放。
+      - alert: RevokedSessionTokenReplay
+        expr: |
+          max(sum by (metadata_sessionId) (count_over_time({service="circle-be"} |= "security_event" | json | securityEvent="session_revoked_token_used" [15m]))) > 20
+          or
+          count(sum by (userId) (count_over_time({service="circle-be"} |= "security_event" | json | securityEvent="session_revoked_token_used" [15m]))) >= 5
+        labels:
+          severity: warning
+        annotations:
+          runbook_url: https://github.com/CircleTeamHub/circle_be/blob/main/docs/runbooks/alerts.md#revokedsessiontokenreplay
+          summary: 'A revoked session was used 20+ times in 15m, or revoked sessions of 5+ users were replayed — leaked tokens or a client that ignores logout'
+
+      # 伪造、签名不对、audience/issuer 不对的令牌（token_invalid）。过期和缺失的
+      # 不记安全日志，所以这里不受正常续期影响；换 JWT 密钥后客户端刷新一次就
+      # 恢复，撑不满 for。持续出现说明有人在拿伪造的令牌试，或者有实例之间的
+      # 签名配置不一致（同一个令牌在这台验得过、那台验不过）。
+      - alert: InvalidTokenSpike
+        expr: |
+          sum(count_over_time({service="circle-be"} |= "security_event" | json | securityEvent="auth_unauthorized" | metadata_authFailureReason="token_invalid" [5m])) > 50
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          runbook_url: https://github.com/CircleTeamHub/circle_be/blob/main/docs/runbooks/alerts.md#invalidtokenspike
+          summary: 'Over 50 invalid (forged or mis-signed) tokens per 5m for 10m — forged tokens, or instances disagreeing on JWT signing settings'

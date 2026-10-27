@@ -387,7 +387,6 @@ model User {
   consoleEvents                ConsoleEvent[]
   consoleInstallations         AppInstallation[]
   consoleApiKeys               ConsoleApiKey[]
-  encryptionRecovery           E2eeRecovery[]
   id                           String            @id @default(uuid())
   accountId                    String            @unique
   inviteCode                   String            @unique
@@ -934,7 +933,6 @@ model RefreshToken {
   lastUsedAt                 DateTime                      @default(now())
   user                       User                          @relation(fields: [userId], references: [id], onDelete: Cascade)
 
-  @@index([userId])
   @@index([userId, familyId])
   @@index([userId, audience, createdAt])
   @@index([userId, deviceKey])
@@ -960,7 +958,6 @@ model SessionScopeGeneration {
   user                User                   @relation(fields: [userId], references: [id], onDelete: Cascade)
 
   @@unique([userId, scope, scopeKey])
-  @@index([userId])
   @@index([notificationPending, updatedAt])
 }
 
@@ -1063,8 +1060,8 @@ model Friend {
   chatReplayJobs             FriendChatReplayOutbox[]
   requestNotifications       Notification[]              @relation("friendRequestNotifications")
 
-  @@index([userID])
-  @@index([friendID])
+  @@index([userID, friendID])
+  @@index([friendID, userID])
 }
 
 // 好友申请阶段的多轮留言线程（双方 accept/reject 前的往来）。
@@ -1383,7 +1380,6 @@ model FriendActivity {
   @@unique([requestId, viewerId, type])
   // review 修复：保留期清理按裸 createdAt 截断分批删除
   @@index([createdAt])
-  @@index([requestId])
   @@index([viewerId, createdAt])
   @@index([viewerId, readAt])
 }
@@ -1400,7 +1396,6 @@ model FriendTag {
   pendingRequests PendingFriendTagOnRequest[]
 
   @@unique([ownerID, name])
-  @@index([ownerID])
 }
 
 // Junction: which tags an owner has applied to which friendship
@@ -1416,6 +1411,8 @@ model FriendTagOnFriend {
 
   @@unique([ownerID, tagID, friendID])
   @@index([ownerID, friendID])
+  @@index([friendID])
+  @@index([tagID])
 }
 
 model PendingFriendTagOnRequest {
@@ -1429,7 +1426,6 @@ model PendingFriendTagOnRequest {
   tag       FriendTag @relation(fields: [tagID], references: [id], onDelete: Cascade)
 
   @@unique([ownerID, requestID, tagID])
-  @@index([ownerID, requestID])
   @@index([requestID])
 }
 
@@ -1442,7 +1438,6 @@ model Block {
   blocked   User     @relation("blocked", fields: [blockedID], references: [id], onDelete: Cascade)
 
   @@unique([blockerID, blockedID])
-  @@index([blockerID])
   @@index([blockedID])
 }
 
@@ -1515,7 +1510,6 @@ model ConversationGroup {
   memberships  ConversationGroupMembership[]
 
   @@unique([ownerID, name])
-  @@index([ownerID])
 }
 
 model ConversationGroupMembership {
@@ -1583,7 +1577,7 @@ model TraceComment {
   fromNotifications Notification[] @relation("fromReply")
   toNotifications   Notification[] @relation("toReply")
 
-  @@index([traceID])
+  @@index([traceID, createdAt])
   @@index([userID])
 }
 
@@ -1610,7 +1604,6 @@ model UserTracePreference {
   user      User                    @relation(fields: [userID], references: [id], onDelete: Cascade)
 
   @@unique([userID, traceID])
-  @@index([userID])
   @@index([traceID])
 }
 
@@ -1653,7 +1646,6 @@ model UserPrivacySetting {
   updatedAt                     DateTime  @updatedAt
   user                          User      @relation(fields: [userID], references: [id], onDelete: Cascade)
 
-  @@index([userID])
 }
 
 // ─── Coin / Wallet ────────────────────────────────────────────────────────────
@@ -1851,8 +1843,6 @@ model Notification {
   @@index([toUserID])
   // review 修复：保留期清理按裸 createdAt 截断分批删除
   @@index([createdAt])
-  @@index([fromFriendRequestID])
-  @@index([fromGroupAdmissionID])
 }
 
 model SystemAnnouncement {
@@ -1888,6 +1878,9 @@ model NotificationPushOutbox {
   /// Immutable snapshot of the composed push payload (#88) — retries resend
   /// exactly what was originally composed instead of re-reading live rows.
   payload          Json?
+  /// 出队公平分区键(announcement:<id> / sender:<fromUserID>),由 BEFORE INSERT 触发器
+  /// circle_push_outbox_fairness_key 按 Notification 填;应用层不写。老行为 NULL。
+  fairnessKey      String?
   createdAt        DateTime                     @default(now())
   updatedAt        DateTime                     @updatedAt
 
@@ -1895,6 +1888,7 @@ model NotificationPushOutbox {
   deliveries   NotificationPushDelivery[]
 
   @@index([status, nextAttemptAt])
+  @@index([createdAt(sort: Desc), id(sort: Desc)])
 }
 
 model NotificationPushDelivery {
@@ -1947,6 +1941,7 @@ model AdminAuditLog {
   @@index([entityType, entityID, createdAt])
   @@index([action, createdAt])
   @@index([action(ops: raw("gin_trgm_ops"))], type: Gin, map: "AdminAuditLog_action_trgm_idx")
+  @@index([createdAt(sort: Desc), id(sort: Desc)])
 }
 
 model DevicePushToken {
@@ -1969,7 +1964,6 @@ model DevicePushToken {
   // partial index；Prisma schema 无法表达 WHERE 条件。
 
   @@index([userID, deviceKey])
-  @@index([userID])
   @@index([provider, platform])
   @@index([updatedAt])
   @@index([disabledAt])
@@ -2097,7 +2091,6 @@ model CircleMember {
   circle Circle @relation(fields: [circleID], references: [id], onDelete: Cascade)
 
   @@unique([userID, circleID])
-  @@index([circleID])
   @@index([status, createdAt])
   @@index([updatedAt, circleID])
   @@index([circleID, status, userID])
@@ -2181,7 +2174,6 @@ model CirclePostSignup {
   user User       @relation(fields: [userID], references: [id], onDelete: Cascade)
 
   @@unique([postID, userID])
-  @@index([postID])
   @@index([userID])
   @@index([postID, seenByAuthor])
 }
@@ -2203,7 +2195,6 @@ model CirclePostReport {
 
   // review 修复：同 GroupReport —— PENDING 局部唯一，审结后可重新举报。
   @@index([postID, reporterID])
-  @@index([postID])
   @@index([status, createdAt])
 }
 
@@ -2222,7 +2213,6 @@ model CollaborationRecognition {
   @@unique([circlePostID, recipientID])
   @@index([recipientID, revokedAt])
   @@index([recognizerID, createdAt])
-  @@index([circlePostID])
 }
 
 model CircleInvitation {
@@ -2231,6 +2221,8 @@ model CircleInvitation {
   applicantID              String
   inviterID                String
   consentNoticeDeliveredAt DateTime?
+  /// 同意制投递的认领租约:事务里写 now(),IO 成功或失败后清空;过期后补投接手。
+  consentNoticeClaimedAt   DateTime?
   consentNoticeAttempts    Int                    @default(0)
   consentNoticeRequired    Boolean                @default(false)
   /// 默认值只在「迁移已落地、旧色还没换掉」的发布窗口里有意义:新代码两条
@@ -2329,6 +2321,7 @@ model EmailVerificationCode {
   createdAt  DateTime         @default(now())
 
   @@index([email, purpose])
+  @@index([expiresAt])
 }
 
 /// 用户对用户的点赞：每人对同一目标「每天」最多一条（likedOn 为日期，唯一约束防当日重复）。
@@ -2384,8 +2377,6 @@ enum ChatMemberRole {
 /// userID 类字段一律不建 User 外键 —— 聊天行是高频写入的历史数据，
 /// 不随账号删除级联清除（保留群聊上下文；同 SensitiveWord.createdBy 先例）。
 model ChatConversation {
-  textEncryption         String               @default("PLAIN")
-  encryptionRoom         E2eeRoom?
   id                     String               @id @default(uuid())
   type                   ChatConversationType
   /// DIRECT 会话防重键：两个 userID 升序以 ':' 拼接；其余类型为 null。
@@ -2466,9 +2457,9 @@ model ChatConversation {
   // ChatConversation 扫描范围。ChatMember 的 active/pinned partial index 在
   // migration 中定义，因为 Prisma schema 无法表达 NULLS LAST / WHERE 条件。
   @@index([lastMessageAt(sort: Desc), id(sort: Desc)])
-  @@index([id(ops: raw("gin_trgm_ops"))], type: Gin, map: "ChatConversation_id_trgm_idx")
+  // id / circleID 的 trigram 索引已删(20261025000300/0400):会话行每条消息都会被非 HOT
+  // 更新,每个索引都要写新条目,而 UUID 子串搜索用不上它们。
   @@index([name(ops: raw("gin_trgm_ops"))], type: Gin, map: "ChatConversation_name_trgm_idx")
-  @@index([circleID(ops: raw("gin_trgm_ops"))], type: Gin, map: "ChatConversation_circleID_trgm_idx")
 }
 
 /// 会话成员。成员行的存在即成员资格（发送/收取的授权来源）；
@@ -2586,7 +2577,6 @@ model ChatMessage {
   createdAt       DateTime  @default(now())
 
   conversation       ChatConversation        @relation(fields: [conversationID], references: [id], onDelete: Cascade)
-  encryptionArchives E2eeArchive[]
   reactions          ChatMessageReaction[]
   mediaReferences    ChatMediaReference[]
   directAutoReplyJob ChatDirectAutoReplyJob? @relation("directAutoReplySource")
@@ -2605,6 +2595,8 @@ model ChatMessage {
   @@index([conversationID, deletedAt])
   /// 增量同步（GET /chat/conversations/:id/sync）按序号区间扫。
   @@index([conversationID, revision])
+  // 只在迁移里、Prisma 表达不了的对象(别当漂移清掉):部分索引 *_audit_irregular_media_idx
+  // (20261026000900)与表达式统计 *_media_key_expr_stats(20261026000910),供存储盘点按 key 反查。
 }
 
 /// 普通 DIRECT 客户端消息同事务写入的 durable inbox。服务端自动回复绕过
@@ -2688,7 +2680,6 @@ model ChatMessageReaction {
   message ChatMessage @relation(fields: [messageID], references: [id], onDelete: Cascade)
 
   @@unique([messageID, userID, emoji])
-  @@index([messageID])
 }
 
 /// 二维码令牌类型:个人名片 / 独立群聊 / 圈子。
@@ -2784,98 +2775,6 @@ model GroupAdmissionDelivery {
 
   @@unique([admissionID, recipientID, event])
   @@index([deliveredAt, nextAttemptAt])
-}
-
-/// Public encryption identities only. Private material remains on devices.
-model E2eeDevice {
-  id                String           @id
-  userID            String
-  purpose           String
-  publicKey         String           @unique
-  label             String
-  status            String           @default("PENDING")
-  approvedByID      String?
-  approvalSignature String?
-  revokedAt         DateTime?
-  createdAt         DateTime         @default(now())
-  packages          E2eeKeyPackage[]
-  seats             E2eeRoomDevice[]
-
-  @@index([userID, purpose, status])
-}
-
-model E2eeKeyPackage {
-  id        String     @id
-  deviceID  String
-  encoded   String
-  signature String
-  claimedBy String?
-  createdAt DateTime   @default(now())
-  device    E2eeDevice @relation(fields: [deviceID], references: [id], onDelete: Cascade)
-
-  @@index([deviceID, claimedBy])
-}
-
-model E2eeRoom {
-  conversationID  String           @id
-  conversation    ChatConversation @relation(fields: [conversationID], references: [id], onDelete: Cascade)
-  managerDeviceID String
-  epoch           Int              @default(0)
-  createdAt       DateTime         @default(now())
-  devices         E2eeRoomDevice[]
-  events          E2eeEpochEvent[]
-}
-
-model E2eeRoomDevice {
-  conversationID String
-  deviceID       String
-  joinedEpoch    Int
-  removedEpoch   Int?
-  room           E2eeRoom   @relation(fields: [conversationID], references: [conversationID], onDelete: Cascade)
-  device         E2eeDevice @relation(fields: [deviceID], references: [id], onDelete: Cascade)
-
-  @@id([conversationID, deviceID])
-  @@index([deviceID, removedEpoch])
-}
-
-model E2eeEpochEvent {
-  id             String   @id
-  conversationID String
-  epoch          Int
-  packet         Json
-  requestHash    String
-  createdAt      DateTime @default(now())
-  room           E2eeRoom @relation(fields: [conversationID], references: [conversationID], onDelete: Cascade)
-
-  @@unique([conversationID, epoch])
-}
-
-/// Public recovery credential only; the secret stays on authorized devices/offline.
-model E2eeRecovery {
-  user      User          @relation(fields: [userID], references: [id], onDelete: Cascade)
-  id        String        @id
-  userID    String
-  purpose   String
-  publicKey String
-  createdAt DateTime      @default(now())
-  archives  E2eeArchive[]
-
-  @@unique([userID, purpose])
-}
-
-/// Per-account ciphertext archive, tied to the original message retention lifecycle.
-model E2eeArchive {
-  cursor     BigInt @unique @default(autoincrement())
-  id         String       @id
-  recoveryID String
-  messageID  String
-  ciphertext String
-  recovery   E2eeRecovery @relation(fields: [recoveryID], references: [id], onDelete: Cascade)
-  message    ChatMessage  @relation(fields: [messageID], references: [id], onDelete: Cascade)
-
-  @@unique([recoveryID, messageID])
-  @@index([recoveryID, cursor])
-  @@index([messageID])
 }
 
 model ConsoleEvent {
@@ -2987,4 +2886,6 @@ model ChatBurnArchive {
   retainUntil DateTime
   @@index([conversationID, height])
   @@index([retainUntil, id])
+  // 只在迁移里、Prisma 表达不了的对象(别当漂移清掉):部分索引 *_audit_irregular_media_idx
+  // (20261026000900)与表达式统计 *_media_key_expr_stats(20261026000910),供存储盘点按 key 反查。
 }

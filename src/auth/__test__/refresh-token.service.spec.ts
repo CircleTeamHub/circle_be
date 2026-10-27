@@ -5,6 +5,11 @@ import { PrismaService } from '../../prisma/prisma.service';
 import { RefreshTokenService } from '../refresh-token.service';
 import { SessionRevocationService } from '../session-revocation.service';
 import { SessionVerifier } from '../session-verifier.service';
+import { sessionVerificationQuery } from '../session-verification.query';
+import {
+  matchingScopeGenerations,
+  sessionVerificationRow,
+} from './session-verification-row.fixture';
 import { jobMetrics } from '../../metrics/job-metrics';
 
 function metricValue(
@@ -441,28 +446,33 @@ describe('RefreshTokenService', () => {
       expect.objectContaining({ scope: 'FAMILY' }),
     );
 
+    // 回落判定是一条合并查询:用内存里的会话行和 scope generation 拼出那一行。
+    const ancestorRow = records.find(
+      (record) => record.id === ancestorSessionId,
+    );
+    const $queryRaw = jest
+      .fn()
+      .mockResolvedValue([
+        sessionVerificationRow(
+          { status: 'ACTIVE', accessTokensRevokedAt: null },
+          ancestorRow ?? null,
+          matchingScopeGenerations(
+            'user-1',
+            ancestorRow ?? null,
+            scopeGenerations.values(),
+          ),
+        ),
+      ]);
     const verifier = new SessionVerifier(
       { checkRevocation: jest.fn().mockResolvedValue('unknown') } as any,
-      {
-        user: {
-          findUnique: jest.fn().mockResolvedValue({
-            status: 'ACTIVE',
-            accessTokensRevokedAt: null,
-          }),
-        },
-        refreshToken: {
-          findUnique: jest.fn(({ where }) =>
-            Promise.resolve(
-              records.find((record) => record.id === where.id) ?? null,
-            ),
-          ),
-        },
-        sessionScopeGeneration: prisma.sessionScopeGeneration,
-      } as any,
+      { $queryRaw } as any,
     );
     await expect(
       verifier.verify({ sub: 'user-1', sid: ancestorSessionId }),
     ).resolves.toBe('revoked');
+    expect($queryRaw).toHaveBeenCalledWith(
+      sessionVerificationQuery('user-1', ancestorSessionId),
+    );
   });
 
   it('revokes a rotated family by incrementing one scope generation without rewriting history', async () => {
@@ -1332,5 +1342,137 @@ describe('RefreshTokenService', () => {
     await expect(service.rotate('missing-token')).rejects.toThrow(
       UnauthorizedException,
     );
+  });
+
+  describe('rotateInTransaction (APP refresh inside the account-lock transaction)', () => {
+    it('rotates on the caller transaction with one token read, after the per-user lock', async () => {
+      const { token: raw } = await service.create('user-1', {
+        deviceName: 'MacBook',
+      });
+      jest.clearAllMocks();
+
+      const outcome = await service.rotateInTransaction(
+        prisma as never,
+        raw,
+        'user-1',
+        { ip: privateIp },
+      );
+
+      expect(outcome).toMatchObject({
+        kind: 'rotated',
+        userId: 'user-1',
+        sessionId: 'session-2',
+        deviceName: 'MacBook',
+      });
+      // 不自己开事务;锁前不再重复读 token,锁后那次复核照旧。
+      expect(prisma.$transaction).not.toHaveBeenCalled();
+      expect(prisma.refreshToken.findUnique).toHaveBeenCalledTimes(1);
+      expect(prisma.$executeRaw.mock.invocationCallOrder[0]).toBeLessThan(
+        prisma.refreshToken.findUnique.mock.invocationCallOrder[0],
+      );
+      expect(records[0].revocationReason).toBe('ROTATED');
+      expect(records[1]).toMatchObject({ revokedAt: null, ip: privateIp });
+    });
+
+    it('refuses to rotate under another account lock when the owner does not match', async () => {
+      const { token: raw } = await service.create('user-1');
+
+      await expect(
+        service.rotateInTransaction(prisma as never, raw, 'someone-else'),
+      ).rejects.toThrow('Invalid or expired refresh token');
+
+      expect(records).toHaveLength(1);
+      expect(records[0].revokedAt).toBeNull();
+    });
+
+    it('returns a replay instead of throwing so the family revocation commits with the caller', async () => {
+      const { token: raw } = await service.create('user-1');
+      await service.rotate(raw);
+      jest.clearAllMocks();
+
+      const outcome = await service.rotateInTransaction(
+        prisma as never,
+        raw,
+        'user-1',
+      );
+
+      expect(outcome).toEqual({
+        kind: 'reuse',
+        userId: 'user-1',
+        sessionIds: ['session-1', 'session-2'],
+      });
+      expect(records[1].revocationReason).toBe('TOKEN_FAMILY_REUSE');
+      // access 吊销标记要等调用方提交后由 rejectReplayedRotation 写。
+      expect(revocation.revokeSession).not.toHaveBeenCalled();
+
+      await expect(
+        service.rejectReplayedRotation(outcome as never),
+      ).rejects.toThrow('Refresh token reuse detected; token family revoked');
+      expect(revocation.revokeSession).toHaveBeenCalledWith('session-1');
+      expect(revocation.revokeSession).toHaveBeenCalledWith('session-2');
+    });
+
+    it('still rejects revoked and expired tokens without writing', async () => {
+      const { token: loggedOut } = await service.create('user-1');
+      records[0].revokedAt = new Date();
+      records[0].revocationReason = 'LOGOUT';
+      const { token: expired } = await service.create('user-1');
+      records[1].expiredAt = new Date(Date.now() - 1);
+
+      for (const raw of [loggedOut, expired]) {
+        await expect(
+          service.rotateInTransaction(prisma as never, raw, 'user-1'),
+        ).rejects.toThrow('Invalid or expired refresh token');
+      }
+      expect(records).toHaveLength(2);
+      expect(records[1].revokedAt).toBeNull();
+    });
+  });
+
+  it('revokeAllInTransaction writes the same two revocations as revokeAll, but no access markers', async () => {
+    await service.create('user-1');
+    await service.create('user-1');
+    const tx = {
+      refreshToken: { updateMany: jest.fn().mockResolvedValue({ count: 2 }) },
+      user: { update: jest.fn().mockResolvedValue({}) },
+    };
+
+    await service.revokeAllInTransaction(tx as never, 'user-1');
+
+    expect(tx.refreshToken.updateMany).toHaveBeenCalledWith({
+      where: { userId: 'user-1', revokedAt: null },
+      data: { revokedAt: expect.any(Date), revocationReason: 'LOGOUT_ALL' },
+    });
+    const revokedAt =
+      tx.refreshToken.updateMany.mock.calls[0][0].data.revokedAt;
+    expect(tx.user.update).toHaveBeenCalledWith({
+      where: { id: 'user-1' },
+      data: { accessTokensRevokedAt: revokedAt },
+    });
+    expect(tx.refreshToken.updateMany.mock.invocationCallOrder[0]).toBeLessThan(
+      tx.user.update.mock.invocationCallOrder[0],
+    );
+    expect(revocation.revokeUser).not.toHaveBeenCalled();
+    expect(prisma.refreshToken.updateMany).not.toHaveBeenCalled();
+  });
+
+  it('records the access-token expiry on the given transaction client', async () => {
+    const tx = {
+      refreshToken: { updateMany: jest.fn().mockResolvedValue({ count: 1 }) },
+    };
+    const expiresAt = new Date();
+
+    await service.recordAccessTokenIssued(
+      'user-1',
+      'session-9',
+      expiresAt,
+      tx as never,
+    );
+
+    expect(tx.refreshToken.updateMany).toHaveBeenCalledWith({
+      where: { id: 'session-9', userId: 'user-1' },
+      data: { accessTokenExpiresAt: expiresAt },
+    });
+    expect(prisma.refreshToken.updateMany).not.toHaveBeenCalled();
   });
 });

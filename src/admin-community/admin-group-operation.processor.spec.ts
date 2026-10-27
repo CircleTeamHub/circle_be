@@ -1,4 +1,13 @@
 import { AdminGroupOperationProcessor } from './admin-group-operation.processor';
+import { jobMetrics } from '../metrics/job-metrics';
+
+async function operationRuns(result: string): Promise<number> {
+  const text = await jobMetrics.registry.metrics();
+  const match = new RegExp(
+    `circle_cron_runs_total\\{job="admin_group_operation",result="${result}"\\} (\\d+)`,
+  ).exec(text);
+  return match ? Number(match[1]) : 0;
+}
 
 describe('AdminGroupOperationProcessor', () => {
   const operation = {
@@ -234,5 +243,40 @@ describe('AdminGroupOperationProcessor', () => {
     expect(prisma.chatConversation.updateMany).toHaveBeenCalled();
     expect(prisma.circle.update).not.toHaveBeenCalled();
     expect(prisma.adminAuditLog.create).not.toHaveBeenCalled();
+  });
+
+  // processAvailable 由 @TrackedInterval 包装：重入被挡回去的那次记 skipped，
+  // 吞掉执行失败后正常返回的那一轮记 failure —— 否则卡死或一直失败时心跳照常
+  // 前进，CronJobStalled / CronJobFailing 都打不中。
+  it('records an overlapping run as skipped', async () => {
+    let release = (_value: unknown) => {};
+    prisma.adminGroupOperation.updateMany.mockReturnValueOnce(
+      new Promise((resolve) => {
+        release = resolve;
+      }),
+    );
+    const before = await operationRuns('skipped');
+
+    const stuck = processor.processAvailable();
+    await processor.processAvailable();
+    expect(await operationRuns('skipped')).toBe(before + 1);
+
+    prisma.adminGroupOperation.findFirst.mockResolvedValue(null);
+    release({ count: 0 });
+    await stuck;
+  });
+
+  it('records a run whose operation failed as a failed run', async () => {
+    prisma.adminGroupOperation.findFirst
+      .mockResolvedValueOnce({ ...operation, status: 'PENDING', attempts: 0 })
+      .mockResolvedValue(null);
+    prisma.chatConversation.updateMany.mockRejectedValue(
+      new Error('db timeout'),
+    );
+    const before = await operationRuns('failure');
+
+    await processor.processAvailable();
+
+    expect(await operationRuns('failure')).toBe(before + 1);
   });
 });

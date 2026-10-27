@@ -52,10 +52,23 @@ sudo netfilter-persistent save   # 持久化,重启不丢
 
 ```bash
 rsync -az --delete \
-  --exclude node_modules --exclude dist --exclude .git \
+  --exclude node_modules --exclude dist --exclude .git --exclude .claude \
+  --exclude /logs --exclude /coverage --exclude /.release \
+  --include /.env.example --include '/.env.*.example' \
+  --exclude /.env --exclude '/.env.*' \
+  --exclude /monitoring/.env --exclude /monitoring/.env.exporters \
+  --exclude '/monitoring/alertmanager/*.url' \
+  --exclude /monitoring/prometheus/metrics_token \
+  --exclude '/monitoring/prometheus/probe-targets/*.yml' \
   -e "ssh -i ~/.ssh/circle_oracle" \
   ./ ubuntu@<公网IP>:~/circle_be/
 ```
+
+`--delete` 会删掉服务器上所有「仓库里没有」的文件，所以本机生成的配置必须排除：
+应用与备份凭证(`.env*`)、监控栈的 Grafana 密码与 exporter 连接串、Alertmanager
+webhook、Prometheus 抓取令牌与公网探测目标、发布状态目录 `.release` 和日志。反过来
+这也挡住了把本地开发用的 `.env` 传上去覆盖服务器那份。排除清单与发版 launcher
+(`deploy/release-launcher.sh`)的一致，`test/deploy-host-config.spec.mjs` 守着两边。
 
 ## 4. 生成配置并启动核心栈
 
@@ -110,7 +123,9 @@ curl -i https://<API域名>/api/v1/auth/me
 - `GET /healthz` —— 存活:进程还在就返回 200,不查任何依赖。公网可访问,供外部
   uptime 监控使用。
 - `GET /readyz` —— 就绪:真查数据库(`SELECT 1`),连不上返回 503;Redis 状态只
-  上报不拦截(Redis 可选,故障时降级为单实例限流/实时)。compose 的 healthcheck
+  上报不拦截(Redis 可选,故障时降级为单实例限流/实时)。对象存储同样只上报:
+  `objectStoreReachable` 是一次真实的 HeadBucket(30 秒缓存、2 秒超时),连不上
+  由 `ObjectStoreUnreachable` 告警,而不是把整个集群摘掉。compose 的 healthcheck
   探的就是它,因此 `circle_be` 显示 healthy 才代表真的能服务。Caddy 对公网 404
   它,只能在容器内查:
 
@@ -172,6 +187,21 @@ flock 单飞锁 → 拉镜像 → pg_dump 备份(保留 7 份,~/circle_be_backup
 → 容器健康门禁(300s)→ validate 并原子 reload Caddy 到新色的唯一容器端点
   (`circle-be-blue` / `circle-be-green`)→ 走公网域名烟测
 → 通过:停/删旧色,完成;失败:代理切回旧色并清理新色,CI 标红
+→ 完成后:同步已经在跑的可选运维栈(deploy/sync-ops-stacks.sh)——备份 overlay
+  的 backup/backup-metrics,监控栈及日志 overlay,让新的告警规则、抑制、Loki/Alloy
+  配置随发布生效。只动从这棵树启动的栈里**正在跑**的服务(停掉的不拉起、新增的
+  不自动起),挂单文件配置的服务和 Alertmanager 强制重建;绝不碰 postgres,也不
+  强制重建 backup(两者共用 pgbackrest.conf,改它要择时一起重启);失败只告警。
+  以下情况跳过并提示:挂载源缺失、`monitoring/.env.exporters` 缺失(exporter 会以
+  空连接串重建)、日志 overlay 要的 caddy_logs 卷还没建、手动回滚(历史树叠了当前
+  工具,overlay 会留 `.release-tooling-overlay` 标记)。整个同步共用 300s 预算,备份
+  镜像构建最多用其中三分之一;会重建容器的一步至少要剩 60s 才开始,中途失败会把
+  停下的服务按新配置再拉起来。没能确认项目里每个容器都按同一组文件起来时不清孤儿。
+  **关闭**:`touch .release/skip-ops-sync`(自动发版的环境变量是固定的,环境变量
+  `RELEASE_SYNC_OPS_STACKS=0` 只对手动运行有效)。
+  **前提是服务器上的 launcher 已更新**(docs/release-hardening-runbook.md 的升级
+  步骤):旧 launcher 的 rsync 会删掉 `.env.backup` 与 monitoring 下的本机配置,
+  并把整棵树收成 go-rwx;同步脚本看不到新 launcher 的标记就整个跳过。
 ```
 
 Caddy 通过 `CIRCLE_BE_UPSTREAM` 明确选择在役颜色，并把选择原子写入
@@ -181,7 +211,11 @@ Caddy 通过 `CIRCLE_BE_UPSTREAM` 明确选择在役颜色，并把选择原子�
 为 JSON，SPA 的 `200 text/html` 不会被误判为成功。
 两色交接期间请求不会落到 502 —— 正常发版**零停机**。
 postgres/redis/minio/caddy/admin_web 属于开通期资产,发版**不碰**;
-`.env` / `.env.production` 被 rsync 排除并保护,不会被发版覆盖或删除。
+`.env*`(含 `.env.backup`)与 monitoring 下的本机配置(`.env`、`.env.exporters`、
+Alertmanager 的 `*.url`、`metrics_token`、`probe-targets/*.yml`)被 rsync 排除并保护,
+不会被发版覆盖或删除;发布文件恢复成 0755/0644,以非 root 运行的监控容器才读得到
+挂载的配置;部署根目录本身在整个同步过程中(包括同步失败时)始终是 0700,
+本机其他账号碰不到按默认 umask 建出来的本机密钥。
 
 **迁移兼容性要求**:蓝绿窗口内旧代码会短暂运行在新 schema 上,迁移必须向后兼容
 (expand/contract:先加列/表,删除留到后续版本)。确实不兼容时,手动触发 workflow
@@ -220,6 +254,16 @@ fail closed,不会连接服务器。必须从 Actions 手动运行 Release,同�
 `deploy/SCHEMA_COMPATIBILITY` 抬到 `4`:迁移后旧二进制不再是合法回滚目标,
 launcher 会拒绝任何兼容级别低于 4 的 tag。
 
+**文字加密下线迁移(`20261026000000_remove_text_encryption`)同样必须走停机路径。**
+它删掉 E2ee* 七张表和 `ChatConversation.textEncryption` 列,而发布前的二进制仍会读写
+它们(旧 Prisma 客户端查会话默认带上 `textEncryption`),迁移一完成旧色的会话读写就开始
+报错。因此这个版本继续携带 `deploy/REQUIRES_IRREVERSIBLE_MIGRATION`,并把
+`deploy/SCHEMA_COMPATIBILITY` 抬到 `5`,launcher 会拒绝任何兼容级别低于 5 的 tag。
+迁移失败时的探针不用改:这份迁移末尾带一段含 `$$` 的自检,Prisma 切不开,整份在一个
+隐式事务里执行(见 `docs/migration-baseline.md`),失败即整体回滚;已经上线过会员迁移的库
+四个约束都在,探针判为 applied 并保持维护 —— 只会比实际更保守,不会把旧二进制放回一个
+已删列的库。
+
 ### 一次性配置(GitHub 仓库 Settings → Secrets and variables → Actions)
 
 | 类型 | 名称 | 值 |
@@ -236,6 +280,33 @@ launcher 会拒绝任何兼容级别低于 4 的 tag。
 镜像推/拉全用内置 `GITHUB_TOKEN`,无需额外 PAT;服务器只在部署那一刻用临时 token
 登录 GHCR(隔离的 DOCKER_CONFIG,用完即删),镜像随后留在本地 Docker 缓存,
 重启和回滚不依赖注册表。
+
+### 迁移里的并发建索引(CONCURRENTLY):发版前后必查
+
+热表上的索引一律 `CREATE / DROP INDEX CONCURRENTLY`(不锁写),代价是中断后会留下
+**invalid 的残骸索引**,而 `CREATE INDEX ... IF NOT EXISTS` 会把残骸当成「已存在」跳过。
+
+- **每次发版后**:下面的查询必须为空,否则按下一条处理。
+
+  ```sql
+  SELECT indexrelid::regclass AS index FROM pg_index WHERE NOT indisvalid;
+  ```
+
+- **某个建索引迁移失败 / 留下 invalid 索引时**:先确认
+  `SELECT * FROM pg_stat_progress_create_index` 里没有还在跑的构建,再
+  `DROP INDEX CONCURRENTLY IF EXISTS "<那个新索引>";`,然后
+  `npx prisma migrate resolve --rolled-back <迁移名>` 并重新 `migrate deploy`。
+  不要对 invalid 索引执行 `--applied`。
+- **「先建后删」的成对迁移**:删旧索引的那一份跑之前,新索引必须 `indisvalid = true`;
+  否则停下按上一条处理 —— 让删除迁移跑过去,查询会直接退回全表扫描或排序。目前有:
+  - `20261026000200` 建 Friend 复合索引 → `0230` / `0240` 删单列索引;
+  - `20261026000100` 建通知列表与稀疏外键索引 → `0110` / `0120` / `0130` 删旧索引;
+  - `20261026000530` 建评论 `(traceID, createdAt)` → `0540` 删 `(traceID)`。
+- **在热表上拿表锁的迁移**带 `lock_timeout = 5s`:换触发器的 `20261025000100`、`0150`,
+  给推送 outbox 加列和建触发器的 `20261026000800`,以及要和 autovacuum 抢锁的
+  `20261026000910`(扩展统计 + ANALYZE)。撞上长事务等不到表锁就整份回滚,
+  `_prisma_migrations` 留下失败记录。处理:
+  `npx prisma migrate resolve --rolled-back <迁移名>`,避开长事务(或等 autovacuum 跑完)后重跑。
 
 ### 回滚 / 重放
 
@@ -471,7 +542,13 @@ apt 装的是 aws-cli v1(22.04 上是 1.22.34),已实测可用;官方安装器�
 - stderr 打一整块 `OFF-HOST BACKUP UPLOAD FAILED` 横幅;
 - stdout 写一行 GitHub Actions annotation,在 run 摘要页显示红色告警
   (**不会**让 job 变红,job 状态只看退出码);
-- 写状态文件 `~/circle_be_backups/.offsite-status`。
+- 写状态文件 `~/circle_be_backups/.offsite-status`;
+- 备份 overlay 在跑时,经 `docker exec` 把结果写成指标
+  (`circle_release_offsite_backup_success`)放进 `backup_metrics` 卷,失败时
+  `ReleaseOffsiteBackupFailed` 告警,直到下一次发版成功才消。overlay 没跑时会打一行
+  NOTE 说明「这次结果不会告警」。失败后若决定关掉发版异地备份(或已手动补传),
+  这条结果不会再被覆盖,要手动清掉:
+  `docker compose -f docker-compose.prod.yml -f docker-compose.backup.yml exec backup rm -f /var/lib/circle-backup/metrics/release_offsite.prom`
 
 例行检查(建议进值班清单):
 
