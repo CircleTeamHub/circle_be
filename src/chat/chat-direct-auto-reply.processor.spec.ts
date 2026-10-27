@@ -244,8 +244,13 @@ describe('ChatDirectAutoReplyProcessor', () => {
 
     await processor.processMessage('source-1');
 
-    expect(prisma.$executeRaw).toHaveBeenCalledTimes(2);
-    expect(prisma.$executeRaw.mock.invocationCallOrder[1]).toBeLessThan(
+    // 两个用户的关系锁一条语句拿完,在复查拉黑之前。
+    expect(prisma.$executeRaw).toHaveBeenCalledTimes(1);
+    expect(prisma.$executeRaw).toHaveBeenCalledWith(expect.anything(), [
+      'call-user:u1',
+      'call-user:u2',
+    ]);
+    expect(prisma.$executeRaw.mock.invocationCallOrder[0]).toBeLessThan(
       prisma.block.findFirst.mock.invocationCallOrder[0],
     );
     expect(prisma.block.findFirst).toHaveBeenCalledWith({

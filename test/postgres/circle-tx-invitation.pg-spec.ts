@@ -632,7 +632,8 @@ describePostgres('circle invitation transactions (PostgreSQL)', () => {
       const lockKeys = (tx: Array<{ sql: string; values: unknown[] }>) =>
         tx
           .filter(({ sql }) => sql.includes('pg_advisory_xact_lock'))
-          .flatMap(({ values }) => values.map(String));
+          // lockUserRelationshipState 一条语句传一个 key 数组;单 key 加锁仍是标量参数。
+          .flatMap(({ values }) => values.flat().map(String));
       const writes = transactionEntriesOf(t.statements);
       const notice = writes.find((tx) =>
         tx.some(({ sql }) => /INSERT INTO "[^"]+"\."Notification"/.test(sql)),

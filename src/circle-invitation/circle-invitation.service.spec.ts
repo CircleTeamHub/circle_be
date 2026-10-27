@@ -1920,17 +1920,12 @@ describe('CircleInvitationService', () => {
 
       // 圈成员锁只和圈成员写共享；解除好友拿的是 call-user:*。资格读取必须
       // 先拿同一把 user lock，才能与解除好友严格串行。
-      expect(prisma.$executeRaw).toHaveBeenNthCalledWith(
-        1,
-        expect.anything(),
+      // 两把锁在一条语句里按排序后的顺序拿。
+      expect(prisma.$executeRaw).toHaveBeenNthCalledWith(1, expect.anything(), [
         'call-user:applicant-1',
-      );
-      expect(prisma.$executeRaw).toHaveBeenNthCalledWith(
-        2,
-        expect.anything(),
         'call-user:verifier-9',
-      );
-      expect(prisma.$executeRaw.mock.invocationCallOrder[1]).toBeLessThan(
+      ]);
+      expect(prisma.$executeRaw.mock.invocationCallOrder[0]).toBeLessThan(
         prisma.friend.findFirst.mock.invocationCallOrder[0],
       );
       expect(prisma.friend.findFirst).toHaveBeenCalledWith(
@@ -1998,17 +1993,12 @@ describe('CircleInvitationService', () => {
 
       await service.respond('verifier-9', 'inv-1', true);
 
-      expect(prisma.$executeRaw).toHaveBeenNthCalledWith(
-        1,
-        expect.anything(),
+      // 两把锁在一条语句里按排序后的顺序拿。
+      expect(prisma.$executeRaw).toHaveBeenNthCalledWith(1, expect.anything(), [
         'call-user:applicant-1',
-      );
-      expect(prisma.$executeRaw).toHaveBeenNthCalledWith(
-        2,
-        expect.anything(),
         'call-user:verifier-9',
-      );
-      expect(prisma.$executeRaw.mock.invocationCallOrder[1]).toBeLessThan(
+      ]);
+      expect(prisma.$executeRaw.mock.invocationCallOrder[0]).toBeLessThan(
         prisma.friend.findFirst.mock.invocationCallOrder[0],
       );
     });
@@ -2709,20 +2699,15 @@ describe('CircleInvitationService', () => {
 
       await service.invite('inviter-1', 'applicant-1', 'circle-1');
 
-      expect(prisma.$executeRaw).toHaveBeenNthCalledWith(
-        1,
-        expect.anything(),
+      // 两把 user lock 一条语句按排序后的顺序拿完。
+      expect(prisma.$executeRaw).toHaveBeenNthCalledWith(1, expect.anything(), [
         'call-user:applicant-1',
-      );
-      expect(prisma.$executeRaw).toHaveBeenNthCalledWith(
-        2,
-        expect.anything(),
         'call-user:inviter-1',
-      );
-      expect(prisma.$executeRaw.mock.invocationCallOrder[1]).toBeLessThan(
+      ]);
+      expect(prisma.$executeRaw.mock.invocationCallOrder[0]).toBeLessThan(
         prisma.block.findFirst.mock.invocationCallOrder[0],
       );
-      expect(prisma.$executeRaw.mock.invocationCallOrder[1]).toBeLessThan(
+      expect(prisma.$executeRaw.mock.invocationCallOrder[0]).toBeLessThan(
         prisma.friend.findFirst.mock.invocationCallOrder[1],
       );
     });

@@ -322,6 +322,13 @@ export class AdminUserService {
 
     const result = await this.prisma.$transaction(async (tx) => {
       await tx.$executeRaw`SELECT pg_advisory_xact_lock(72419930)`;
+      // 再拿和登录 / 续签 / 设备信任同一把账号锁(AuthService.withAccountAuthLock)。
+      // 续签是「先轮换出新会话、再读 status」:不排队的话,续签读到 ACTIVE 之后、提交
+      // 之前封禁提交,下面的 updateMany 看不到那条还没提交的新会话,它就躲过吊销 ——
+      // 封禁期间被 status 拦住,解封后又能用。排队后续签要么先提交(新会话被一并吊销),
+      // 要么在封禁之后开始(读到非 ACTIVE 直接拒绝)。顺序固定为 全局锁 → 账号锁,
+      // 账号锁的其他持有者都不拿全局锁,不会成环。
+      await tx.$executeRaw`SELECT pg_advisory_xact_lock(hashtextextended(${`auth_session:${targetId}`}, 0))`;
       const current = await tx.user.findUnique({
         where: { id: targetId },
         select: {
