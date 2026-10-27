@@ -132,7 +132,7 @@ EOF
 step "1. building both images, then starting throwaway postgres + S3 stand-in"
 # Build BOTH, explicitly. `up --build postgres` only rebuilds postgres; the
 # backup image is used later via `run --rm backup`, and `compose run` does NOT
-# build. Without this the test silently exercises whatever circle-backup:1
+# build. Without this the test silently exercises whatever circle-backup image
 # happens to be lying around from an earlier build, so every edit to
 # deploy/backup/*.sh appears to pass without once having been executed.
 if ! build_out="$("${compose[@]}" build postgres backup 2>&1)"; then

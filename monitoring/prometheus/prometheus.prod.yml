@@ -144,6 +144,19 @@ scrape_configs:
       - source_labels: [__meta_dns_name]
         target_label: instance
 
+  # 只读合成探测（monitoring/synthetic-probe/probe.mjs，SyntheticProbe* 告警）。
+  # 和 backup 一样按名字发现：探测容器没起时这个 job 没有目标，不会冒出一个
+  # 常年 DOWN 的 target。
+  - job_name: synthetic-probe
+    dns_sd_configs:
+      - names: ['synthetic-probe']
+        type: A
+        port: 9464
+        refresh_interval: 30s
+    relabel_configs:
+      - source_labels: [__meta_dns_name]
+        target_label: instance
+
   # ── 公网可达性探测（blackbox-exporter）────────────────────────────────
   # 上面的 job 都在 compose 内网里直连容器，看不到只发生在「进来的路上」的故障：
   # DNS 指错、证书过期、Caddy 配坏、入口被拦 —— 内网一切正常，用户却进不来。
