@@ -572,6 +572,101 @@ describe('NotificationPushService (#88 per-token delivery)', () => {
     });
   });
 
+  describe('sendJPushCallAlerts (notification-mode iOS calls)', () => {
+    beforeEach(() => {
+      configValues.JPUSH_APP_KEY = 'jpush-app-key';
+      configValues.JPUSH_MASTER_SECRET = 'jpush-master-secret';
+      service = new NotificationPushService(
+        prisma as unknown as PrismaService,
+        config as any,
+      );
+      fetchMock.mockResolvedValue({
+        ok: true,
+        status: 200,
+        json: async () => ({}),
+      });
+    });
+
+    it('sends an iOS-only time-sensitive alert keyed by the call collapse id', async () => {
+      await service.sendJPushCallAlerts(['rid-1'], {
+        title: '小明',
+        body: '邀请你语音通话',
+        collapseId: 'call:c1',
+        sound: 'call_ring.caf',
+        interruptionLevel: 'time-sensitive',
+        extras: { type: 'call.invite', callId: 'c1' },
+        ttlSeconds: 44.5,
+      });
+
+      expect(JSON.parse(fetchMock.mock.calls[0][1].body)).toEqual({
+        platform: ['ios'],
+        audience: { registration_id: ['rid-1'] },
+        notification: {
+          ios: {
+            alert: { title: '小明', body: '邀请你语音通话' },
+            sound: 'call_ring.caf',
+            'interruption-level': 'time-sensitive',
+            'thread-id': 'call:c1',
+            extras: { type: 'call.invite', callId: 'c1' },
+          },
+        },
+        options: {
+          time_to_live: 45,
+          apns_production: false,
+          apns_collapse_id: 'call:c1',
+        },
+      });
+    });
+
+    it('omits the sound for a silent replacement', async () => {
+      await service.sendJPushCallAlerts(['rid-1'], {
+        title: '风信',
+        body: '未接来电',
+        collapseId: 'call:c1',
+        sound: null,
+        interruptionLevel: 'passive',
+        extras: {},
+        ttlSeconds: 45,
+      });
+
+      const ios = JSON.parse(fetchMock.mock.calls[0][1].body).notification.ios;
+      expect(ios).not.toHaveProperty('sound');
+      expect(ios['interruption-level']).toBe('passive');
+    });
+  });
+
+  describe('call paths and JPush 1003', () => {
+    it('does not treat a parameter error on a call push as dead tokens', async () => {
+      configValues.JPUSH_APP_KEY = 'jpush-app-key';
+      configValues.JPUSH_MASTER_SECRET = 'jpush-master-secret';
+      service = new NotificationPushService(
+        prisma as unknown as PrismaService,
+        config as any,
+      );
+      // 极光不认新载荷里的某个字段：整批与每个单发都回 1003。
+      fetchMock.mockResolvedValue({
+        ok: false,
+        status: 400,
+        json: async () => ({ error: { code: 1003 } }),
+      });
+
+      const outcomes = await service.sendJPushCustomMessages(['a', 'b'], {
+        type: 'call.invite',
+        extras: {},
+        ttlSeconds: 45,
+      });
+      await service.settleDirectOutcomes('jpush', outcomes);
+
+      // 不拆单发、不停用：这两台设备的聊天推送照常。
+      expect(fetchMock).toHaveBeenCalledTimes(1);
+      expect(outcomes.map((o) => o.error)).toEqual([
+        'JPushError:1003',
+        'JPushError:1003',
+      ]);
+      expect(prisma.devicePushToken.updateMany).not.toHaveBeenCalled();
+    });
+  });
+
   describe('settleDirectOutcomes', () => {
     it('counts per provider and disables dead APNs and JPush tokens only', async () => {
       const record = jest.spyOn(deliveryMetrics, 'recordPushDelivery');

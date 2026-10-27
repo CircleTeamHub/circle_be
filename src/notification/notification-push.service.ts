@@ -118,6 +118,11 @@ const RETRYABLE_TICKET_ERRORS = new Set([
 // 项目级/消息级错误（InvalidCredentials/MessageTooBig）绝不 reap token。
 const TERMINAL_TOKEN_ERRORS = new Set(['DeviceNotRegistered']);
 const TERMINAL_JPUSH_TOKEN_ERRORS = new Set(['JPushInvalidRegistrationId']);
+// 原有通知路径把 1003（参数不合法）也当成死令牌（单个 registration id 格式坏了也报 1003）。
+// 来电的两条新路径（透传、iOS 来电通知）只认 1011（找不到目标）：新载荷字段一旦被极光判
+// 不合法，每个单发重试也都是 1003 —— 那会把被叫的极光 token 全部停掉，连聊天推送一起断。
+const LEGACY_DEAD_TOKEN_CODES: ReadonlySet<number> = new Set([1003, 1011]);
+const CALL_DEAD_TOKEN_CODES: ReadonlySet<number> = new Set([1011]);
 // APNs 直连(VoIP):410 = App 已卸载 / token 已注销;BadDeviceToken = token 不属于这个环境。
 const TERMINAL_APNS_TOKEN_ERRORS = new Set([
   'ApnsUnregistered',
@@ -477,6 +482,64 @@ export class NotificationPushService {
   }
 
   /**
+   * 极光的 iOS 来电通知,只给中国区通知模式的包(它没有 CallKit,来电不能走 VoIP 推送):
+   * time-sensitive 打断级别 + 包内自带铃声;apns_collapse_id 固定为 call:<callId>,撤销时
+   * 用同一个 id 发一条静音通知把它覆盖掉。结论与 tokens 同下标。
+   *
+   * ⚠️ interruption-level 字段需在中国区包上线前对照极光文档 / 真机确认已被透传给 APNs。
+   */
+  async sendJPushCallAlerts(
+    tokens: readonly string[],
+    alert: {
+      title: string;
+      body: string;
+      collapseId: string;
+      sound: string | null;
+      interruptionLevel: 'time-sensitive' | 'passive';
+      extras: Record<string, string>;
+      ttlSeconds: number;
+    },
+  ): Promise<TokenDeliveryOutcome[]> {
+    if (tokens.length === 0) return [];
+    if (!this.isJPushConfigured()) {
+      return tokens.map((token) => ({
+        token,
+        status: 'RETRYABLE',
+        error: 'JPushNotConfigured',
+      }));
+    }
+    const outcomes: TokenDeliveryOutcome[] = [];
+    for (let offset = 0; offset < tokens.length; offset += JPUSH_BATCH_SIZE) {
+      const batch = tokens.slice(offset, offset + JPUSH_BATCH_SIZE);
+      outcomes.push(
+        ...(await this.postJPush(
+          batch,
+          (registrationIds) => ({
+            platform: ['ios'],
+            audience: { registration_id: registrationIds },
+            notification: {
+              ios: {
+                alert: { title: alert.title, body: alert.body },
+                ...(alert.sound ? { sound: alert.sound } : {}),
+                'interruption-level': alert.interruptionLevel,
+                'thread-id': alert.collapseId,
+                extras: alert.extras,
+              },
+            },
+            options: {
+              time_to_live: Math.max(1, Math.ceil(alert.ttlSeconds)),
+              apns_production: this.jpushApnsProduction,
+              apns_collapse_id: alert.collapseId,
+            },
+          }),
+          { deadTokenCodes: CALL_DEAD_TOKEN_CODES },
+        )),
+      );
+    }
+    return outcomes;
+  }
+
+  /**
    * 极光自定义消息(透传),只发安卓,来电专用。
    *
    * 透传不会被极光 SDK 显示成通知,由 App 原生层收下后自己画全屏来电通知、自己收掉。
@@ -503,19 +566,23 @@ export class NotificationPushService {
     for (let offset = 0; offset < tokens.length; offset += JPUSH_BATCH_SIZE) {
       const batch = tokens.slice(offset, offset + JPUSH_BATCH_SIZE);
       outcomes.push(
-        ...(await this.postJPush(batch, (registrationIds) => ({
-          platform: ['android'],
-          audience: { registration_id: registrationIds },
-          message: {
-            msg_content: message.type,
-            content_type: 'call',
-            extras: message.extras,
-          },
-          options: {
-            time_to_live: Math.max(1, Math.ceil(message.ttlSeconds)),
-            apns_production: this.jpushApnsProduction,
-          },
-        }))),
+        ...(await this.postJPush(
+          batch,
+          (registrationIds) => ({
+            platform: ['android'],
+            audience: { registration_id: registrationIds },
+            message: {
+              msg_content: message.type,
+              content_type: 'call',
+              extras: message.extras,
+            },
+            options: {
+              time_to_live: Math.max(1, Math.ceil(message.ttlSeconds)),
+              apns_production: this.jpushApnsProduction,
+            },
+          }),
+          { deadTokenCodes: CALL_DEAD_TOKEN_CODES },
+        )),
       );
     }
     return outcomes;
@@ -970,7 +1037,9 @@ export class NotificationPushService {
   private async postJPush(
     tokens: readonly string[],
     buildBody: (registrationIds: string[]) => Record<string, unknown>,
+    options: { deadTokenCodes?: ReadonlySet<number> } = {},
   ): Promise<TokenDeliveryOutcome[]> {
+    const deadTokenCodes = options.deadTokenCodes ?? LEGACY_DEAD_TOKEN_CODES;
     const batch = tokens.map((token) => ({ token }));
     try {
       const credentials = `${this.jpushAppKey}:${this.jpushMasterSecret}`;
@@ -995,13 +1064,16 @@ export class NotificationPushService {
         error?: { code?: number; message?: string };
       };
       const code = body.error?.code;
-      if ((code === 1003 || code === 1011) && batch.length > 1) {
+      const deadTokenCode = code !== undefined && deadTokenCodes.has(code);
+      if (deadTokenCode && batch.length > 1) {
         const nested = await Promise.all(
-          batch.map((entry) => this.postJPush([entry.token], buildBody)),
+          batch.map((entry) =>
+            this.postJPush([entry.token], buildBody, options),
+          ),
         );
         return nested.flat();
       }
-      if (code === 1003 || code === 1011) {
+      if (deadTokenCode) {
         return batch.map(({ token }) => ({
           token,
           status: 'TERMINAL',

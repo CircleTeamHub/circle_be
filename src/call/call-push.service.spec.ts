@@ -16,6 +16,7 @@ type Row = {
   userID: string;
   token: string;
   provider: string;
+  platform?: string;
   apnsEnvironment: string | null;
 };
 
@@ -45,13 +46,22 @@ describe('CallPushService', () => {
     rows = [];
     prisma = {
       devicePushToken: {
-        findMany: jest.fn(async () => rows),
+        // 测试数据里省略 platform 时按通道推断：VoIP 只有 iOS，极光默认安卓。
+        findMany: jest.fn(async () =>
+          rows.map((row) => ({
+            platform: row.provider === 'apns_voip' ? 'ios' : 'android',
+            ...row,
+          })),
+        ),
       },
       chatConversation: { findUnique: jest.fn().mockResolvedValue(null) },
       circle: { findFirst: jest.fn().mockResolvedValue(null) },
     };
     push = {
       sendJPushCustomMessages: jest.fn(async (tokens: string[]) =>
+        tokens.map((token) => ({ token, status: 'SENT', receiptFinal: true })),
+      ),
+      sendJPushCallAlerts: jest.fn(async (tokens: string[]) =>
         tokens.map((token) => ({ token, status: 'SENT', receiptFinal: true })),
       ),
       settleDirectOutcomes: jest.fn().mockResolvedValue(undefined),
@@ -86,10 +96,10 @@ describe('CallPushService', () => {
       userID: { in: [CALLEE] },
       disabledAt: null,
       callPushVersion: { gte: CALL_PUSH_VERSION },
-      // iOS 的极光 token 不在其列：iOS 来电只走 VoIP。
+      // 极光的 iOS token 只有中国区通知模式的包才会声明 callPushVersion。
       OR: [
         { provider: 'apns_voip', platform: 'ios' },
-        { provider: 'jpush', platform: 'android' },
+        { provider: 'jpush', platform: { in: ['android', 'ios'] } },
       ],
     });
   });
@@ -157,8 +167,8 @@ describe('CallPushService', () => {
     await service.flushPending();
 
     const extras = push.sendJPushCustomMessages.mock.calls[0][1].extras;
-    expect(Object.keys(extras).sort()).toEqual(
-      [
+    expect(new Set(Object.keys(extras))).toEqual(
+      new Set([
         'callId',
         'callType',
         'callerId',
@@ -168,7 +178,7 @@ describe('CallPushService', () => {
         'sessionType',
         'type',
         'v',
-      ].sort(),
+      ]),
     );
     expect(
       Object.values(extras).every((value) => typeof value === 'string'),
@@ -337,6 +347,50 @@ describe('CallPushService', () => {
     await expect(service.flushPending()).resolves.toBeUndefined();
   });
 
+  it('rings notification-mode iOS builds with a time-sensitive alert and the bundled ringtone', async () => {
+    rows = [
+      {
+        userID: CALLEE,
+        token: 'jp-ios',
+        provider: 'jpush',
+        platform: 'ios',
+        apnsEnvironment: null,
+      },
+      {
+        userID: CALLEE,
+        token: 'jp-android',
+        provider: 'jpush',
+        platform: 'android',
+        apnsEnvironment: null,
+      },
+    ];
+
+    service.ringInvitees(invite({ callType: 'VIDEO' }), [CALLEE]);
+    await service.flushPending();
+
+    // 安卓仍是透传，iOS 极光 token 走通知。
+    expect(push.sendJPushCustomMessages.mock.calls[0][0]).toEqual([
+      'jp-android',
+    ]);
+    expect(push.sendJPushCallAlerts).toHaveBeenCalledWith(['jp-ios'], {
+      title: '小明',
+      body: '邀请你视频通话',
+      collapseId: `call:${CALL_ID}`,
+      sound: 'call_ring.caf',
+      interruptionLevel: 'time-sensitive',
+      // 通知模式没有原生拒接：不带拒接令牌。
+      extras: {
+        v: '1',
+        type: 'call.invite',
+        callId: CALL_ID,
+        callType: 'VIDEO',
+        sessionType: 'single',
+      },
+      ttlSeconds: 45,
+    });
+    expect(apns.send).not.toHaveBeenCalled();
+  });
+
   describe('dismiss', () => {
     beforeEach(() => {
       rows = [
@@ -388,6 +442,40 @@ describe('CallPushService', () => {
         },
         ttlSeconds: 45,
       });
+    });
+
+    it('overwrites a notification-mode iOS call alert with a silent one', async () => {
+      rows = [
+        {
+          userID: CALLEE,
+          token: 'jp-ios',
+          provider: 'jpush',
+          platform: 'ios',
+          apnsEnvironment: null,
+        },
+      ];
+
+      service.dismissForUser(CALL_ID, CALLEE, 'answered_elsewhere');
+      await service.flushPending();
+
+      expect(push.sendJPushCallAlerts).toHaveBeenCalledWith(['jp-ios'], {
+        title: '风信',
+        body: '已在其他设备接听',
+        collapseId: `call:${CALL_ID}`,
+        sound: null,
+        interruptionLevel: 'passive',
+        extras: {
+          v: '1',
+          type: 'call.dismiss',
+          callId: CALL_ID,
+          reason: 'answered_elsewhere',
+        },
+        ttlSeconds: 45,
+      });
+      expect(push.sendJPushCustomMessages).toHaveBeenCalledWith(
+        [],
+        expect.anything(),
+      );
     });
 
     it('sends nothing when nobody is left ringing', async () => {

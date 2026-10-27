@@ -78,6 +78,10 @@ export function classifyApnsResponse(
   if (response.status === 200) {
     return { token, status: 'SENT', receiptFinal: true };
   }
+  // 0 = 流在拿到响应头之前就断了（连接被对端关掉 / 被我们因超时丢弃）：是传输故障，不是 APNs 的结论。
+  if (response.status === 0) {
+    return { token, status: 'RETRYABLE', error: 'ApnsConnectionClosed' };
+  }
   const reason = response.reason ?? String(response.status);
   if (response.status === 410) {
     return { token, status: 'TERMINAL', error: 'ApnsUnregistered' };
@@ -102,6 +106,7 @@ export class Http2ApnsTransport implements ApnsTransport {
 
   constructor(
     private readonly origins: Record<ApnsEnvironment, string> = APNS_ORIGINS,
+    private readonly timeoutMs: number = APNS_REQUEST_TIMEOUT_MS,
   ) {}
 
   send(request: ApnsRequest): Promise<ApnsResponse> {
@@ -115,8 +120,11 @@ export class Http2ApnsTransport implements ApnsTransport {
       let status = 0;
       let raw = '';
       stream.setEncoding('utf8');
-      stream.setTimeout(APNS_REQUEST_TIMEOUT_MS, () => {
+      stream.setTimeout(this.timeoutMs, () => {
         stream.close(http2Constants.NGHTTP2_CANCEL);
+        // 超时多半是半开连接（NAT / 防火墙悄悄丢了空闲流，不发 RST）：error / goaway / close
+        // 都不会触发，不主动丢掉的话之后每一通来电都会在这条死连接上再等满一次超时。
+        this.discard(request.environment, session);
         reject(new Error('APNs request timed out'));
       });
       stream.on('response', (headers) => {
@@ -126,6 +134,7 @@ export class Http2ApnsTransport implements ApnsTransport {
         raw += chunk;
       });
       stream.on('end', () => {
+        if (status === 0) this.discard(request.environment, session);
         let reason: string | undefined;
         if (raw) {
           try {
@@ -144,6 +153,13 @@ export class Http2ApnsTransport implements ApnsTransport {
   close(): void {
     for (const session of this.sessions.values()) session.close();
     this.sessions.clear();
+  }
+
+  private discard(environment: ApnsEnvironment, session: ClientHttp2Session) {
+    if (this.sessions.get(environment) === session) {
+      this.sessions.delete(environment);
+    }
+    session.destroy();
   }
 
   private session(environment: ApnsEnvironment): ClientHttp2Session {

@@ -16,7 +16,10 @@ import { deriveDeclineTokenKey, issueDeclineToken } from './call-decline-token';
  *
  * WS 邀请照发（覆盖在线端），这里并行给每台「声明了能处理来电推送」的设备发：
  * - iOS：PushKit VoIP，直连 APNs；App 原生层当场上报 CallKit 响铃；
- * - 安卓：极光透传；App 原生层画全屏来电通知。
+ * - 安卓：极光透传；App 原生层画全屏来电通知；
+ * - 中国区通知模式的 iOS 包（构建期开关，没有 CallKit）：它的极光 token 声明了来电，
+ *   发 time-sensitive 通知 + 包内铃声。CallKit 包的 iOS 极光 token 从不声明 —— 来电走
+ *   VoIP token，两边都发会响两次。
  * 撤销（取消 / 超时 / 结束 / 本人在别的设备接听或拒接）只发安卓透传：iOS 每一条 VoIP
  * 推送都必须上报一通来电，拿它当撤销会闪一下来电界面；CallKit 响铃期间 App 在后台
  * 运行，靠 WS 与 GET /calls/current 对账收掉。
@@ -30,6 +33,18 @@ export const CALL_PUSH_VERSION = 1;
 /** 每人每个通道最多推几台设备（按最近登记的算）。 */
 const MAX_CALL_DEVICES_PER_PROVIDER = 5;
 const NAME_MAX_CHARS = 32;
+/** 中国区通知模式包内自带的铃声（circle-im assets/sounds/call_ring.caf，28 秒，APNs 上限 30 秒）。 */
+export const CALL_RING_SOUND = 'call_ring.caf';
+
+/** 通知模式下撤销通知的正文：同一个 collapse id 静音覆盖掉还在通知中心里的来电。 */
+const DISMISS_ALERT_BODY: Record<CallDismissReason, string> = {
+  canceled: '对方已取消通话',
+  missed: '未接来电',
+  ended: '通话已结束',
+  failed: '通话已结束',
+  answered_elsewhere: '已在其他设备接听',
+  declined_elsewhere: '已在其他设备拒接',
+};
 
 export type CallDismissReason =
   | 'canceled'
@@ -52,6 +67,7 @@ type CallPushTarget = {
   userID: string;
   token: string;
   provider: 'apns_voip' | 'jpush';
+  platform: 'ios' | 'android';
   apnsEnvironment: ApnsEnvironment;
 };
 
@@ -207,8 +223,13 @@ export class CallPushService implements OnModuleDestroy {
     });
 
     const voip = targets.filter((target) => target.provider === 'apns_voip');
-    const jpush = targets.filter((target) => target.provider === 'jpush');
-    const [voipOutcomes, jpushOutcomes] = await Promise.all([
+    const jpush = targets.filter(
+      (target) => target.provider === 'jpush' && target.platform === 'android',
+    );
+    const alerts = targets.filter(
+      (target) => target.provider === 'jpush' && target.platform === 'ios',
+    );
+    const [voipOutcomes, messageOutcomes, alertOutcomes] = await Promise.all([
       this.sendVoip(voip, payloadFor, expiresAt),
       // 每个人的拒接令牌不同，按人分开发；被叫最多 CALL_MAX_PARTICIPANTS 人。
       Promise.all(
@@ -220,7 +241,30 @@ export class CallPushService implements OnModuleDestroy {
           }),
         ),
       ).then((nested) => nested.flat()),
+      // 通知模式没有原生拒接（点开后在应用内操作），不带拒接令牌，所有人同一条。
+      this.push.sendJPushCallAlerts(
+        alerts.map((target) => target.token),
+        {
+          title: groupName
+            ? `${base.callerName} · ${truncateChars(groupName, NAME_MAX_CHARS)}`
+            : base.callerName,
+          body:
+            invite.callType === 'VIDEO' ? '邀请你视频通话' : '邀请你语音通话',
+          collapseId: `call:${invite.callId}`,
+          sound: CALL_RING_SOUND,
+          interruptionLevel: 'time-sensitive',
+          extras: {
+            v: base.v,
+            type: 'call.invite',
+            callId: invite.callId,
+            callType: invite.callType,
+            sessionType: invite.sessionType,
+          },
+          ttlSeconds,
+        },
+      ),
     ]);
+    const jpushOutcomes = [...messageOutcomes, ...alertOutcomes];
     await this.settle(voipOutcomes, jpushOutcomes);
     this.logResult('invite', invite.callId, voipOutcomes, jpushOutcomes);
   }
@@ -234,21 +278,39 @@ export class CallPushService implements OnModuleDestroy {
       (target) => target.provider === 'jpush',
     );
     if (targets.length === 0) return;
+    const extras = {
+      v: String(CALL_PUSH_VERSION),
+      type: 'call.dismiss',
+      callId,
+      reason,
+    };
     // 撤销追着邀请跑：邀请的 TTL 是剩余振铃时间，撤销留一整个振铃窗口就一定够；
     // 多留几秒无害（原生层收不到对应的振铃就什么都不做），少留会漏收。
-    const outcomes = await this.push.sendJPushCustomMessages(
-      targets.map((target) => target.token),
-      {
-        type: 'call.dismiss',
-        extras: {
-          v: String(CALL_PUSH_VERSION),
-          type: 'call.dismiss',
-          callId,
-          reason,
+    const ttlSeconds = this.ringTimeoutSeconds();
+    const [messageOutcomes, alertOutcomes] = await Promise.all([
+      this.push.sendJPushCustomMessages(
+        targets
+          .filter((target) => target.platform === 'android')
+          .map((target) => target.token),
+        { type: 'call.dismiss', extras, ttlSeconds },
+      ),
+      // 通知模式的 iOS：同一个 collapse id、静音、passive，把来电通知覆盖成一条说明。
+      this.push.sendJPushCallAlerts(
+        targets
+          .filter((target) => target.platform === 'ios')
+          .map((target) => target.token),
+        {
+          title: '风信',
+          body: DISMISS_ALERT_BODY[reason],
+          collapseId: `call:${callId}`,
+          sound: null,
+          interruptionLevel: 'passive',
+          extras,
+          ttlSeconds,
         },
-        ttlSeconds: this.ringTimeoutSeconds(),
-      },
-    );
+      ),
+    ]);
+    const outcomes = [...messageOutcomes, ...alertOutcomes];
     await this.settle([], outcomes);
     this.logResult(`dismiss:${reason}`, callId, [], outcomes);
   }
@@ -306,8 +368,9 @@ export class CallPushService implements OnModuleDestroy {
   }
 
   /**
-   * 能处理来电推送的设备：iOS 的 VoIP token，安卓的极光 token；都要求客户端登记时声明了
-   * callPushVersion（旧客户端收到也不会响铃）。iOS 的极光 token 不在其列 —— iOS 来电只走 VoIP。
+   * 能处理来电推送的设备：iOS 的 VoIP token，以及声明了来电的极光 token（安卓；中国区通知
+   * 模式的 iOS）。都要求客户端登记时声明了 callPushVersion（旧客户端收到也不会响铃；CallKit
+   * 包的 iOS 极光 token 从不声明）。
    */
   private async listTargets(userIDs: string[]): Promise<CallPushTarget[]> {
     const rows = await this.prisma.devicePushToken.findMany({
@@ -317,7 +380,7 @@ export class CallPushService implements OnModuleDestroy {
         callPushVersion: { gte: CALL_PUSH_VERSION },
         OR: [
           { provider: 'apns_voip', platform: 'ios' },
-          { provider: 'jpush', platform: 'android' },
+          { provider: 'jpush', platform: { in: ['android', 'ios'] } },
         ],
       },
       orderBy: [{ updatedAt: 'desc' }, { id: 'desc' }],
@@ -325,6 +388,7 @@ export class CallPushService implements OnModuleDestroy {
         userID: true,
         token: true,
         provider: true,
+        platform: true,
         apnsEnvironment: true,
       },
       // 被叫最多 CALL_MAX_PARTICIPANTS 人，每人每通道登记上限 20 台：兜底封顶。
@@ -341,6 +405,7 @@ export class CallPushService implements OnModuleDestroy {
         userID: row.userID,
         token: row.token,
         provider: row.provider as CallPushTarget['provider'],
+        platform: row.platform === 'ios' ? 'ios' : 'android',
         apnsEnvironment:
           row.apnsEnvironment === 'development' ? 'development' : 'production',
       });

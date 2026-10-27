@@ -288,6 +288,8 @@ describe('classifyApnsResponse', () => {
       'TERMINAL',
       'ApnsError:InvalidProviderToken',
     ],
+    // 流在响应头之前就断了：传输故障，下次重连再发。
+    [{ status: 0 }, 'RETRYABLE', 'ApnsConnectionClosed'],
   ] as const)('%p → %s %s', (response, status, error) => {
     expect(classifyApnsResponse(TOKEN, response)).toEqual({
       token: TOKEN,
@@ -348,6 +350,49 @@ describe('Http2ApnsTransport', () => {
     expect(seen[0].headers[':method']).toBe('POST');
     expect(seen[0].headers['apns-push-type']).toBe('voip');
     expect(seen[0].body).toBe('{"call":{}}');
+  });
+
+  it('drops a session whose request timed out so the next push reconnects', async () => {
+    const sessions = new Set<unknown>();
+    server.on('session', (session) => sessions.add(session));
+    let hangFirst = true;
+    server.removeAllListeners('stream');
+    server.on('stream', (stream: ServerHttp2Stream) => {
+      stream.on('data', () => undefined);
+      stream.on('end', () => {
+        // 第一条请求模拟半开连接：一直不回。
+        if (hangFirst) {
+          hangFirst = false;
+          return;
+        }
+        stream.respond({ ':status': 200 });
+        stream.end();
+      });
+    });
+    const transport = new Http2ApnsTransport(
+      { production: origin, development: origin },
+      200,
+    );
+
+    await expect(
+      transport.send({
+        environment: 'production',
+        token: TOKEN,
+        headers: {},
+        body: '{}',
+      }),
+    ).rejects.toThrow('APNs request timed out');
+    await expect(
+      transport.send({
+        environment: 'production',
+        token: TOKEN,
+        headers: {},
+        body: '{}',
+      }),
+    ).resolves.toEqual({ status: 200, reason: undefined });
+    transport.close();
+
+    expect(sessions.size).toBe(2);
   });
 
   it('reuses one session per environment', async () => {
