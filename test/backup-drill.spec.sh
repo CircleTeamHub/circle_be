@@ -70,6 +70,7 @@ case "$sql" in
     # 笔记转发进聊天的那部分。
     case "$sql" in *'"ChatMessage"'*"'image', 'video', 'voice', 'file'"*) ;; *) echo "psql sample left out chat message media" >> "$STUB_CALLS" ;; esac
     case "$sql" in *'"NoteMedia"'*) ;; *) echo "psql sample left out note media" >> "$STUB_CALLS" ;; esac
+    echo "psql sample limits: $(printf '%s\n' "$sql" | grep -o 'LIMIT [0-9]*' | awk '{print $2}' | tr '\n' ' ')" >> "$STUB_CALLS"
     printf '%s\n' "${STUB_OBJECT_KEYS-}"
     ;;
   *) exit 64 ;;
@@ -329,6 +330,17 @@ assert_metric "$dir/metrics/backup_drill.prom" 'circle_backup_drill_objects_gone
 assert_metric "$dir/metrics/backup_drill.prom" 'circle_backup_drill_objects_unverifiable 0'
 if grep -Eq '^mc (rm|cp|mirror|mv)' "$dir/calls"; then fail 'the object check wrote to object storage'; fi
 if grep -q 'psql sample left out' "$dir/calls"; then grep 'psql sample left out' "$dir/calls" >&2; fail 'the media sample does not cover every source'; fi
+
+# 抽样总数不超过 DRILL_OBJECT_SAMPLE：余数先分给聊天消息、再分给笔记媒体。
+sample_limits() { sed -n 's/^psql sample limits: //p' "$1/calls"; }
+[ "$(sample_limits "$dir")" = '7 7 6 ' ] || fail "the default sample of 20 was split as '$(sample_limits "$dir")', want 7 7 6"
+for n_want in '1:1 0 0 ' '2:1 1 0 ' '4:2 1 1 '; do
+  n="${n_want%%:*}"; want="${n_want#*:}"
+  dir="$tmp_dir/objects-sample-$n"
+  rc="$(run_drill "$dir" "${MINIO_ENV[@]}" STUB_OBJECT_KEYS="$KEYS" DRILL_OBJECT_SAMPLE="$n")"
+  [ "$rc" = 0 ] || { cat "$dir/err" >&2; fail "a drill with DRILL_OBJECT_SAMPLE=$n exited $rc"; }
+  [ "$(sample_limits "$dir")" = "$want" ] || fail "DRILL_OBJECT_SAMPLE=$n was split as '$(sample_limits "$dir")', want '$want'"
+done
 
 # 线上还在、异地副本没有：镜像丢了东西，判失败；日志里不出现用户 ID。
 dir="$tmp_dir/objects-missing"

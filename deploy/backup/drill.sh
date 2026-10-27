@@ -424,18 +424,23 @@ if [ "$rc" -eq 0 ]; then
   if [ -z "${BACKUP_MINIO_ENDPOINT:-}" ] || [ -z "${BACKUP_MINIO_BUCKET:-}" ]; then
     log "object mirror not configured (BACKUP_MINIO_*) — skipping the object backup check"
   else
-    per_source=$(( (DRILL_OBJECT_SAMPLE + 2) / 3 ))
+    # Split DRILL_OBJECT_SAMPLE over the three sources without exceeding it: the
+    # remainder goes to chat messages first, then note media (20 → 7 / 7 / 6).
+    base=$(( DRILL_OBJECT_SAMPLE / 3 )); extra=$(( DRILL_OBJECT_SAMPLE % 3 ))
+    limit_chat=$(( base + (extra > 0 ? 1 : 0) ))
+    limit_note=$(( base + (extra > 1 ? 1 : 0) ))
+    limit_ref=$base
     window="\"createdAt\" BETWEEN now() - interval '14 days' AND now() - interval '2 hours'"
     keys="$(psql -h /var/run/postgresql -p 5432 -U "$LIVE_USER" -d "$LIVE_DB" -At -v ON_ERROR_STOP=1 -c "
       SELECT key FROM (
         (SELECT content->>'key' AS key FROM \"ChatMessage\"
           WHERE type IN ('image', 'video', 'voice', 'file') AND NOT deleted AND \"revokedAt\" IS NULL
             AND (\"burnExpiresAt\" IS NULL OR \"burnExpiresAt\" > now() + interval '1 hour')
-            AND $window ORDER BY random() LIMIT $per_source)
+            AND $window ORDER BY random() LIMIT $limit_chat)
         UNION
-        (SELECT \"objectKey\" AS key FROM \"NoteMedia\" WHERE $window ORDER BY random() LIMIT $per_source)
+        (SELECT \"objectKey\" AS key FROM \"NoteMedia\" WHERE $window ORDER BY random() LIMIT $limit_note)
         UNION
-        (SELECT \"objectKey\" AS key FROM \"ChatMediaReference\" WHERE $window ORDER BY random() LIMIT $per_source)
+        (SELECT \"objectKey\" AS key FROM \"ChatMediaReference\" WHERE $window ORDER BY random() LIMIT $limit_ref)
       ) sampled
       WHERE key ~ '^[A-Za-z0-9][A-Za-z0-9/._=-]*\$'")" || die "cannot sample media keys from the live database"
     mc_alias_source
