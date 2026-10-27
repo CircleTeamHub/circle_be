@@ -16,6 +16,7 @@ describe('CallService direct calls (#113 #115) + current (#FE93)', () => {
   let livekit: any;
   let realtime: any;
   let privacySettings: any;
+  let callPush: any;
   let service: CallService;
 
   beforeEach(() => {
@@ -85,6 +86,12 @@ describe('CallService direct calls (#113 #115) + current (#FE93)', () => {
       canBeCalled: jest.fn().mockResolvedValue(true),
     };
 
+    callPush = {
+      ringInvitees: jest.fn(),
+      dismissForUser: jest.fn(),
+      dismissForEndedCall: jest.fn(),
+    };
+
     service = new CallService(
       prisma,
       chatService,
@@ -93,6 +100,7 @@ describe('CallService direct calls (#113 #115) + current (#FE93)', () => {
       realtime,
       config,
       privacySettings,
+      callPush,
     );
   });
 

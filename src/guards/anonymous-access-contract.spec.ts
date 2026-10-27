@@ -84,6 +84,7 @@ it('keeps the anonymous HTTP surface an explicit reviewed method allowlist', () 
     'NoteShareLinkPublicController.resolveShareLink',
     'NotificationPublicController.revokePushToken',
     'CallWebhookController.handleLiveKitWebhook',
+    'CallPushController.pushDecline',
   ];
   anonymous.sort((a, b) => a.localeCompare(b));
   expected.sort((a, b) => a.localeCompare(b));

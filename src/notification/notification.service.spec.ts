@@ -778,6 +778,78 @@ describe('NotificationService', () => {
       });
     });
 
+    it('stores the call push version and APNs environment of a VoIP token', async () => {
+      prisma.devicePushToken.updateMany.mockResolvedValue({ count: 0 });
+      prisma.devicePushToken.create.mockResolvedValue({ id: 'token-row-1' });
+
+      await service.registerPushToken('user-1', {
+        token: 'a1'.repeat(32),
+        platform: 'ios',
+        provider: 'apns_voip',
+        callPushVersion: 1,
+        apnsEnvironment: 'development',
+      });
+
+      expect(prisma.devicePushToken.updateMany).toHaveBeenCalledWith(
+        expect.objectContaining({
+          data: expect.objectContaining({
+            provider: 'apns_voip',
+            callPushVersion: 1,
+            apnsEnvironment: 'development',
+          }),
+        }),
+      );
+      expect(prisma.devicePushToken.create).toHaveBeenCalledWith({
+        data: expect.objectContaining({
+          provider: 'apns_voip',
+          callPushVersion: 1,
+          apnsEnvironment: 'development',
+        }),
+      });
+    });
+
+    it('defaults VoIP tokens to production and clears call fields for old clients', async () => {
+      prisma.devicePushToken.updateMany.mockResolvedValue({ count: 1 });
+
+      await service.registerPushToken('user-1', {
+        token: 'b2'.repeat(32),
+        platform: 'ios',
+        provider: 'apns_voip',
+        callPushVersion: 1,
+      });
+      // 降级回旧版本的 App 重新登记时不带 callPushVersion：要清回 null，
+      // 否则后端会继续给一台不会响铃的设备发来电推送。
+      await service.registerPushToken('user-1', {
+        token: '190e35e4f7b94e5fa2c6',
+        platform: 'android',
+        provider: 'jpush',
+      });
+
+      expect(
+        prisma.devicePushToken.updateMany.mock.calls[0][0].data,
+      ).toMatchObject({
+        callPushVersion: 1,
+        apnsEnvironment: 'production',
+      });
+      expect(
+        prisma.devicePushToken.updateMany.mock.calls[1][0].data,
+      ).toMatchObject({
+        callPushVersion: null,
+        apnsEnvironment: null,
+      });
+    });
+
+    it('refuses VoIP tokens that do not come from iOS', async () => {
+      await expect(
+        service.registerPushToken('user-1', {
+          token: 'a1'.repeat(32),
+          platform: 'android',
+          provider: 'apns_voip',
+        }),
+      ).rejects.toMatchObject({ status: 400 });
+      expect(prisma.devicePushToken.updateMany).not.toHaveBeenCalled();
+    });
+
     it('re-registering an own token never falls through to create', async () => {
       prisma.devicePushToken.updateMany.mockResolvedValue({ count: 1 });
 

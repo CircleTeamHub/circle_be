@@ -118,13 +118,24 @@ const RETRYABLE_TICKET_ERRORS = new Set([
 // 项目级/消息级错误（InvalidCredentials/MessageTooBig）绝不 reap token。
 const TERMINAL_TOKEN_ERRORS = new Set(['DeviceNotRegistered']);
 const TERMINAL_JPUSH_TOKEN_ERRORS = new Set(['JPushInvalidRegistrationId']);
+// 原有通知路径把 1003（参数不合法）也当成死令牌（单个 registration id 格式坏了也报 1003）。
+// 来电的两条新路径（透传、iOS 来电通知）只认 1011（找不到目标）：新载荷字段一旦被极光判
+// 不合法，每个单发重试也都是 1003 —— 那会把被叫的极光 token 全部停掉，连聊天推送一起断。
+const LEGACY_DEAD_TOKEN_CODES: ReadonlySet<number> = new Set([1003, 1011]);
+const CALL_DEAD_TOKEN_CODES: ReadonlySet<number> = new Set([1011]);
+// APNs 直连(VoIP):410 = App 已卸载 / token 已注销;BadDeviceToken = token 不属于这个环境。
+const TERMINAL_APNS_TOKEN_ERRORS = new Set([
+  'ApnsUnregistered',
+  'ApnsBadDeviceToken',
+]);
 const DELIVERY_MAX_ATTEMPTS = 5;
 
 function isDeadTokenOutcome(outcome: TokenDeliveryOutcome): boolean {
   return (
     outcome.status === 'TERMINAL' &&
     (TERMINAL_TOKEN_ERRORS.has(outcome.error ?? '') ||
-      TERMINAL_JPUSH_TOKEN_ERRORS.has(outcome.error ?? ''))
+      TERMINAL_JPUSH_TOKEN_ERRORS.has(outcome.error ?? '') ||
+      TERMINAL_APNS_TOKEN_ERRORS.has(outcome.error ?? ''))
   );
 }
 
@@ -434,9 +445,31 @@ export class NotificationPushService {
     });
 
     recordPushOutcomes(messages, outcomes);
+    await this.disableDeadTokens(outcomes);
+    return outcomes;
+  }
 
-    // 只有「令牌已死」类错误才停用 token —— MessageTooBig 等消息级终态
-    // 与 token 健康无关，误停会把活设备静音。
+  /**
+   * 不经 sendMessages 的直发通道(来电透传、APNs VoIP)发完后调用:按 provider 计数,
+   * 并停用死令牌 —— 与 sendMessages 同一套判据。
+   */
+  async settleDirectOutcomes(
+    provider: PushProvider,
+    outcomes: readonly TokenDeliveryOutcome[],
+  ): Promise<void> {
+    for (const outcome of outcomes) {
+      recordPushDelivery(provider, pushDeliveryResult(outcome));
+    }
+    await this.disableDeadTokens(outcomes);
+  }
+
+  /**
+   * 只有「令牌已死」类错误才停用 token —— MessageTooBig 等消息级终态
+   * 与 token 健康无关，误停会把活设备静音。
+   */
+  private async disableDeadTokens(
+    outcomes: readonly TokenDeliveryOutcome[],
+  ): Promise<void> {
     const deadTokens = outcomes
       .filter(isDeadTokenOutcome)
       .map((outcome) => outcome.token);
@@ -445,6 +478,112 @@ export class NotificationPushService {
         where: { token: { in: deadTokens } },
         data: { disabledAt: new Date() },
       });
+    }
+  }
+
+  /**
+   * 极光的 iOS 来电通知,只给中国区通知模式的包(它没有 CallKit,来电不能走 VoIP 推送):
+   * time-sensitive 打断级别 + 包内自带铃声;apns_collapse_id 固定为 call:<callId>,撤销时
+   * 用同一个 id 发一条静音通知把它覆盖掉。结论与 tokens 同下标。
+   *
+   * ⚠️ interruption-level 字段需在中国区包上线前对照极光文档 / 真机确认已被透传给 APNs。
+   */
+  async sendJPushCallAlerts(
+    tokens: readonly string[],
+    alert: {
+      title: string;
+      body: string;
+      collapseId: string;
+      sound: string | null;
+      interruptionLevel: 'time-sensitive' | 'passive';
+      extras: Record<string, string>;
+      ttlSeconds: number;
+    },
+  ): Promise<TokenDeliveryOutcome[]> {
+    if (tokens.length === 0) return [];
+    if (!this.isJPushConfigured()) {
+      return tokens.map((token) => ({
+        token,
+        status: 'RETRYABLE',
+        error: 'JPushNotConfigured',
+      }));
+    }
+    const outcomes: TokenDeliveryOutcome[] = [];
+    for (let offset = 0; offset < tokens.length; offset += JPUSH_BATCH_SIZE) {
+      const batch = tokens.slice(offset, offset + JPUSH_BATCH_SIZE);
+      outcomes.push(
+        ...(await this.postJPush(
+          batch,
+          (registrationIds) => ({
+            platform: ['ios'],
+            audience: { registration_id: registrationIds },
+            notification: {
+              ios: {
+                alert: { title: alert.title, body: alert.body },
+                ...(alert.sound ? { sound: alert.sound } : {}),
+                'interruption-level': alert.interruptionLevel,
+                'thread-id': alert.collapseId,
+                extras: alert.extras,
+              },
+            },
+            options: {
+              time_to_live: Math.max(1, Math.ceil(alert.ttlSeconds)),
+              apns_production: this.jpushApnsProduction,
+              apns_collapse_id: alert.collapseId,
+            },
+          }),
+          { deadTokenCodes: CALL_DEAD_TOKEN_CODES },
+        )),
+      );
+    }
+    return outcomes;
+  }
+
+  /**
+   * 极光自定义消息(透传),只发安卓,来电专用。
+   *
+   * 透传不会被极光 SDK 显示成通知,由 App 原生层收下后自己画全屏来电通知、自己收掉。
+   * time_to_live 由调用方给(剩余振铃秒数):设备离线攒着的来电,过期就不再补发。
+   * 结论与 tokens 同下标;计数与死令牌停用由调用方经 settleDirectOutcomes 完成。
+   */
+  async sendJPushCustomMessages(
+    tokens: readonly string[],
+    message: {
+      type: string;
+      extras: Record<string, string>;
+      ttlSeconds: number;
+    },
+  ): Promise<TokenDeliveryOutcome[]> {
+    if (tokens.length === 0) return [];
+    if (!this.isJPushConfigured()) {
+      return tokens.map((token) => ({
+        token,
+        status: 'RETRYABLE',
+        error: 'JPushNotConfigured',
+      }));
+    }
+    const outcomes: TokenDeliveryOutcome[] = [];
+    for (let offset = 0; offset < tokens.length; offset += JPUSH_BATCH_SIZE) {
+      const batch = tokens.slice(offset, offset + JPUSH_BATCH_SIZE);
+      outcomes.push(
+        ...(await this.postJPush(
+          batch,
+          (registrationIds) => ({
+            platform: ['android'],
+            audience: { registration_id: registrationIds },
+            message: {
+              msg_content: message.type,
+              content_type: 'call',
+              extras: message.extras,
+            },
+            options: {
+              time_to_live: Math.max(1, Math.ceil(message.ttlSeconds)),
+              apns_production: this.jpushApnsProduction,
+            },
+          }),
+          { deadTokenCodes: CALL_DEAD_TOKEN_CODES },
+        )),
+      );
     }
     return outcomes;
   }
@@ -876,6 +1015,32 @@ export class NotificationPushService {
         : {}),
     };
 
+    return this.postJPush(
+      batch.map((entry) => entry.token),
+      (registrationIds) => ({
+        platform,
+        audience: { registration_id: registrationIds },
+        notification,
+        options: {
+          time_to_live: payload.ttl ?? 24 * 60 * 60,
+          apns_production: this.jpushApnsProduction,
+          ...(payload.tag ? { apns_collapse_id: payload.tag } : {}),
+        },
+      }),
+    );
+  }
+
+  /**
+   * 一次极光 push 请求:结论与 tokens 同下标。批里有失效 registration_id(1003/1011)
+   * 时逐个重发,把死令牌单独挑出来,别连累同批的活设备。
+   */
+  private async postJPush(
+    tokens: readonly string[],
+    buildBody: (registrationIds: string[]) => Record<string, unknown>,
+    options: { deadTokenCodes?: ReadonlySet<number> } = {},
+  ): Promise<TokenDeliveryOutcome[]> {
+    const deadTokenCodes = options.deadTokenCodes ?? LEGACY_DEAD_TOKEN_CODES;
+    const batch = tokens.map((token) => ({ token }));
     try {
       const credentials = `${this.jpushAppKey}:${this.jpushMasterSecret}`;
       const response = await fetch(JPUSH_PUSH_URL, {
@@ -884,16 +1049,7 @@ export class NotificationPushService {
           'Content-Type': 'application/json',
           Authorization: `Basic ${Buffer.from(credentials).toString('base64')}`,
         },
-        body: JSON.stringify({
-          platform,
-          audience: { registration_id: batch.map((entry) => entry.token) },
-          notification,
-          options: {
-            time_to_live: payload.ttl ?? 24 * 60 * 60,
-            apns_production: this.jpushApnsProduction,
-            ...(payload.tag ? { apns_collapse_id: payload.tag } : {}),
-          },
-        }),
+        body: JSON.stringify(buildBody([...tokens])),
         signal: AbortSignal.timeout(EXPO_PUSH_TIMEOUT_MS),
       });
       if (response.ok) {
@@ -908,13 +1064,16 @@ export class NotificationPushService {
         error?: { code?: number; message?: string };
       };
       const code = body.error?.code;
-      if ((code === 1003 || code === 1011) && batch.length > 1) {
+      const deadTokenCode = code !== undefined && deadTokenCodes.has(code);
+      if (deadTokenCode && batch.length > 1) {
         const nested = await Promise.all(
-          batch.map((entry) => this.sendJPushBatch([entry])),
+          batch.map((entry) =>
+            this.postJPush([entry.token], buildBody, options),
+          ),
         );
         return nested.flat();
       }
-      if (code === 1003 || code === 1011) {
+      if (deadTokenCode) {
         return batch.map(({ token }) => ({
           token,
           status: 'TERMINAL',

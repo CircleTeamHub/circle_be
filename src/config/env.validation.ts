@@ -199,6 +199,14 @@ export function createEnvValidationSchema(
     JPUSH_APP_KEY: Joi.string().trim().min(1).optional(),
     JPUSH_MASTER_SECRET: Joi.string().trim().min(1).optional(),
     JPUSH_APNS_PRODUCTION: Joi.boolean().default(false),
+    // iOS 来电(PushKit VoIP)直连 APNs 的 .p8 凭据;三项要么都配、要么都不配。
+    // 不配时来电只走 WS 与安卓透传。sandbox / production 按 token 登记时上报的环境选。
+    APNS_KEY_ID: Joi.string().trim().min(1).optional(),
+    APNS_TEAM_ID: Joi.string().trim().min(1).optional(),
+    APNS_PRIVATE_KEY: Joi.string().trim().min(1).optional(),
+    APNS_VOIP_TOPIC: Joi.string().trim().min(1).optional(),
+    // 推送里「拒接这一通」令牌的 HMAC 密钥。不配时从 SECRET 派生。
+    CALL_PUSH_ACTION_SECRET: Joi.string().min(secretMin).optional(),
     SECURITY_LOG_ON: Joi.boolean(),
     PERFORMANCE_LOG_ON: Joi.boolean(),
     SLOW_EXTERNAL_MS: Joi.number().integer().min(1).default(1000),
@@ -370,6 +378,18 @@ export function createEnvValidationSchema(
         return helpers.message({
           custom:
             'JPUSH_APP_KEY and JPUSH_MASTER_SECRET must be configured together',
+        });
+      }
+
+      const apnsParts = [
+        value.APNS_KEY_ID,
+        value.APNS_TEAM_ID,
+        value.APNS_PRIVATE_KEY,
+      ].filter(Boolean).length;
+      if (apnsParts !== 0 && apnsParts !== 3) {
+        return helpers.message({
+          custom:
+            'APNS_KEY_ID, APNS_TEAM_ID and APNS_PRIVATE_KEY must be configured together',
         });
       }
 

@@ -260,6 +260,19 @@ export class NotificationService {
     ) {
       throw new ServiceUnavailableException('JPush is not configured');
     }
+    // VoIP token 只可能来自 iOS 的 PushKit;平台对不上的登记要么是脏数据,要么是伪造,
+    // 收下了就会对着 APNs 发一串必然失败的请求。APNs 凭据没配时照样收:凭据配好的
+    // 那一刻,已经登记过的设备就能直接响铃,不用等它们重新登记。
+    if (dto.provider === 'apns_voip' && dto.platform !== 'ios') {
+      throw new BadRequestException(
+        'apns_voip tokens must be registered from iOS',
+      );
+    }
+    const callPushVersion = dto.callPushVersion ?? null;
+    const apnsEnvironment =
+      dto.provider === 'apns_voip'
+        ? (dto.apnsEnvironment ?? 'production')
+        : null;
     const revocationSecretHash = dto.revocationSecret
       ? this.hashRevocationSecret(dto.revocationSecret)
       : undefined;
@@ -284,6 +297,9 @@ export class NotificationService {
       provider: dto.provider,
       projectId: dto.projectId ?? null,
       appVersion: dto.appVersion ?? null,
+      // 每次登记都覆盖:降级回旧版本的 App 重新登记时会把它清回 null,不再收来电推送。
+      callPushVersion,
+      apnsEnvironment,
       disabledAt: null,
       // 只在本次确实带了 secret 时才写。用 `?? null` 的话，老客户端(或任何一次
       // 不带 secret 的重新登记)会把已有的撤销密钥抹成 null —— 这台设备的令牌
@@ -326,6 +342,8 @@ export class NotificationService {
             provider: dto.provider,
             projectId: dto.projectId ?? null,
             appVersion: dto.appVersion ?? null,
+            callPushVersion,
+            apnsEnvironment,
             ...(revocationSecretHash ? { revocationSecretHash } : {}),
           },
         });

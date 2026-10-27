@@ -672,6 +672,43 @@ describe('METRICS_AUTH_TOKEN', () => {
   });
 });
 
+describe('APNs VoIP credentials', () => {
+  const base = {
+    NODE_ENV: 'development',
+    SECRET: 'test-secret',
+    DATABASE_URL: 'postgresql://user:pass@localhost:5432/db',
+  };
+
+  it.each([
+    { APNS_KEY_ID: 'KEY' },
+    { APNS_TEAM_ID: 'TEAM' },
+    { APNS_PRIVATE_KEY: 'pem' },
+    { APNS_KEY_ID: 'KEY', APNS_TEAM_ID: 'TEAM' },
+  ])('rejects an incomplete credential set: %o', (partial) => {
+    const env = { ...base, ...partial };
+    const { error } = createEnvValidationSchema(env).validate(env);
+    expect(error?.message).toContain(
+      'APNS_KEY_ID, APNS_TEAM_ID and APNS_PRIVATE_KEY must be configured together',
+    );
+  });
+
+  it('accepts none or all three', () => {
+    for (const env of [
+      base,
+      {
+        ...base,
+        APNS_KEY_ID: 'KEY',
+        APNS_TEAM_ID: 'TEAM',
+        APNS_PRIVATE_KEY: 'pem',
+      },
+    ]) {
+      expect(
+        createEnvValidationSchema(env).validate(env).error,
+      ).toBeUndefined();
+    }
+  });
+});
+
 describe('JPush credentials', () => {
   const base = {
     NODE_ENV: 'development',

@@ -22,6 +22,7 @@ describe('CallService call metrics', () => {
   let livekit: any;
   let realtime: any;
   let privacySettings: any;
+  let callPush: any;
   let service: CallService;
   let setups: jest.SpyInstance;
   let accepts: jest.SpyInstance;
@@ -95,6 +96,12 @@ describe('CallService call metrics', () => {
       getSettingsForUsers: jest.fn().mockResolvedValue(new Map()),
     };
 
+    callPush = {
+      ringInvitees: jest.fn(),
+      dismissForUser: jest.fn(),
+      dismissForEndedCall: jest.fn(),
+    };
+
     service = new CallService(
       prisma,
       chatService,
@@ -103,6 +110,7 @@ describe('CallService call metrics', () => {
       realtime,
       config,
       privacySettings,
+      callPush,
     );
 
     setups = jest.spyOn(callMetrics, 'recordSetup');

@@ -15,7 +15,7 @@ import { Counter, Registry } from 'prom-client';
  *   推送失败，单列出来就是为了让失败率不被它拉高；
  * - rejected：消息级终态（MessageTooBig 等），与 token 健康无关。
  */
-export const PUSH_PROVIDERS = ['expo', 'jpush'] as const;
+export const PUSH_PROVIDERS = ['expo', 'jpush', 'apns_voip'] as const;
 export const PUSH_DELIVERY_RESULTS = [
   'sent',
   'retryable',

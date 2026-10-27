@@ -5,7 +5,7 @@ describe('createDeliveryMetrics', () => {
     // 从 0 开始导出：increase() 才能把进程启动后的第一批失败算进失败率。
     const output = await createDeliveryMetrics().registry.metrics();
 
-    for (const provider of ['expo', 'jpush']) {
+    for (const provider of ['expo', 'jpush', 'apns_voip']) {
       for (const result of ['sent', 'retryable', 'dead_token', 'rejected']) {
         expect(output).toMatch(
           new RegExp(
