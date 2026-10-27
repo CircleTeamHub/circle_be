@@ -113,6 +113,53 @@ describe('push token shape validation (#98)', () => {
   });
 });
 
+describe('call push registration fields', () => {
+  const voip = (overrides: Record<string, unknown> = {}) =>
+    plainToInstance(RegisterPushTokenDto, {
+      token: 'a1'.repeat(32),
+      platform: 'ios',
+      provider: 'apns_voip',
+      callPushVersion: 1,
+      apnsEnvironment: 'development',
+      ...overrides,
+    });
+
+  it('accepts a hex PushKit token with its APNs environment', () => {
+    expect(validateSync(voip())).toHaveLength(0);
+    expect(validateSync(voip({ apnsEnvironment: 'production' }))).toHaveLength(
+      0,
+    );
+  });
+
+  it.each([
+    ['too short', 'ab'.repeat(10)],
+    ['not hex', 'zz'.repeat(32)],
+    ['an Expo token', 'ExponentPushToken[abc]'],
+  ])('rejects a VoIP token that is %s', (_case, token) => {
+    expect(validateSync(voip({ token }))).not.toHaveLength(0);
+  });
+
+  it('rejects unknown APNs environments and protocol versions', () => {
+    expect(validateSync(voip({ apnsEnvironment: 'staging' }))).not.toHaveLength(
+      0,
+    );
+    expect(validateSync(voip({ callPushVersion: 0 }))).not.toHaveLength(0);
+    expect(validateSync(voip({ callPushVersion: 1.5 }))).not.toHaveLength(0);
+  });
+
+  it('keeps callPushVersion optional so old clients still register', () => {
+    expect(
+      validateSync(
+        plainToInstance(RegisterPushTokenDto, {
+          token: '190e35e4f7b94e5fa2c6',
+          platform: 'android',
+          provider: 'jpush',
+        }),
+      ),
+    ).toHaveLength(0);
+  });
+});
+
 describe('UpdateCirclePushPreferenceDto', () => {
   // 全局 ValidationPipe 开着 enableImplicitConversion（src/setup.ts），它跑在
   // 校验之前，会把任意非空字符串转成 true。plainToInstance 带上同一个选项，

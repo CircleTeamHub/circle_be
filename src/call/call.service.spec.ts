@@ -17,6 +17,7 @@ describe('CallService', () => {
   let livekit: any;
   let realtime: any;
   let privacySettings: any;
+  let callPush: any;
   let mockCallPermissions: (byUser: Record<string, string>) => void;
   let service: CallService;
 
@@ -101,6 +102,12 @@ describe('CallService', () => {
         ),
       );
 
+    callPush = {
+      ringInvitees: jest.fn(),
+      dismissForUser: jest.fn(),
+      dismissForEndedCall: jest.fn(),
+    };
+
     service = new CallService(
       prisma,
       chatService,
@@ -109,6 +116,7 @@ describe('CallService', () => {
       realtime,
       config,
       privacySettings,
+      callPush,
     );
   });
 
@@ -246,6 +254,18 @@ describe('CallService', () => {
       expect.objectContaining({ isolationLevel: 'Serializable' }),
     );
     expect(prisma.$executeRaw).toHaveBeenCalledTimes(2);
+    // 推送来电与 WS 邀请并行，名单与 WS 一致（去重、去掉发起人）。
+    expect(callPush.ringInvitees).toHaveBeenCalledWith(
+      {
+        callId: result.call.id,
+        conversationID: 'sg_group-1',
+        sessionType: 'group',
+        callType: 'AUDIO',
+        initiator: { id: 'user-1', nickname: 'Alice' },
+        expiresAt: '2026-06-11T03:00:45.000Z',
+      },
+      ['user-2'],
+    );
   });
 
   it('returns an existing call for a repeated create idempotency key', async () => {
@@ -793,6 +813,11 @@ describe('CallService', () => {
       }),
     );
     expect(realtime.broadcastCallParticipantJoined).toHaveBeenCalled();
+    expect(callPush.dismissForUser).toHaveBeenCalledWith(
+      'call-1',
+      'user-2',
+      'answered_elsewhere',
+    );
     expect(result.livekit.token).toBe('livekit-token');
   });
 
@@ -1080,6 +1105,37 @@ describe('CallService', () => {
         rejectedAt: now.toISOString(),
       }),
     );
+    expect(callPush.dismissForUser).toHaveBeenCalledWith(
+      'call-1',
+      'user-2',
+      'declined_elsewhere',
+    );
+    // 还有别的被叫在响：通话没终局，不发整通撤销。
+    expect(callPush.dismissForEndedCall).not.toHaveBeenCalled();
+  });
+
+  it('declines from a push as an idempotent reject', async () => {
+    prisma.callParticipant.findUnique.mockResolvedValue({
+      callID: 'call-1',
+      userID: 'user-2',
+      status: 'MISSED',
+      call: { id: 'call-1', status: 'CANCELED', participants: [] },
+      user: { id: 'user-2', nickname: 'Bob', avatarUrl: null },
+    });
+
+    await expect(
+      service.declineFromPush('user-2', 'call-1'),
+    ).resolves.toBeUndefined();
+
+    prisma.callParticipant.findUnique.mockResolvedValue(null);
+    await expect(
+      service.declineFromPush('user-2', 'call-1'),
+    ).resolves.toBeUndefined();
+
+    prisma.callParticipant.findUnique.mockRejectedValue(new Error('db down'));
+    await expect(service.declineFromPush('user-2', 'call-1')).rejects.toThrow(
+      'db down',
+    );
   });
 
   it('treats repeated reject as idempotent when the participant already rejected', async () => {
@@ -1178,6 +1234,10 @@ describe('CallService', () => {
     );
     expect(livekit.deleteRoom).toHaveBeenCalledWith('circle_call_1');
     expect(realtime.broadcastCallEnded).toHaveBeenCalledTimes(2);
+    expect(callPush.dismissForEndedCall).toHaveBeenCalledWith(
+      expect.objectContaining({ id: 'call-1' }),
+      'NO_ANSWER',
+    );
   });
 
   it('broadcasts when a joined participant leaves and the call remains active', async () => {

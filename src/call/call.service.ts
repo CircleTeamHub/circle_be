@@ -28,6 +28,7 @@ import { PrismaService } from 'src/prisma/prisma.service';
 import { RealtimeService } from 'src/realtime/realtime.service';
 import { CreateDirectCallDto, CreateGroupCallDto } from './dto/call.dto';
 import { LiveKitCallService } from './livekit.service';
+import { CallPushService } from './call-push.service';
 import { createLoggingConfig } from 'src/logging/logging.config';
 import { logBusinessEvent } from 'src/logging/business-event.logger';
 import {
@@ -172,6 +173,7 @@ export class CallService {
     private readonly realtime: RealtimeService,
     private readonly config: ConfigService,
     private readonly privacySettings: PrivacySettingsService,
+    private readonly callPush: CallPushService,
   ) {}
 
   async createGroupCall(
@@ -478,6 +480,22 @@ export class CallService {
           this.realtime.broadcastCallInvite(userID, invitePayload),
       ),
     );
+    // 推送来电与 WS 并行：App 被杀 / 挂起 / 断网时也要响铃（后台发，不阻塞发起）。
+    this.callPush.ringInvitees(
+      {
+        callId: invitePayload.callId,
+        conversationID,
+        sessionType: invitePayload.sessionType,
+        callType,
+        // 只给推送需要的两项；头像等其余字段不进推送。
+        initiator: {
+          id: invitePayload.initiator.id,
+          nickname: invitePayload.initiator.nickname,
+        },
+        expiresAt: invitePayload.expiresAt,
+      },
+      inviteeIDs,
+    );
     this.logger.log(
       `call.created callId=${call.id} conversationID=${conversationID} participants=${participantIDs.length}`,
     );
@@ -645,6 +663,8 @@ export class CallService {
     await this.broadcastToCallParticipants(call, (targetID) =>
       this.realtime.broadcastCallParticipantJoined(targetID, payload),
     );
+    // 本人其他设备上的振铃（安卓全屏通知）收掉；iOS 由 WS 的 participant.joined 收。
+    this.callPush.dismissForUser(callId, userID, 'answered_elsewhere');
     this.logger.log(
       `call.participant_joined callId=${callId} userID=${userID}`,
     );
@@ -729,6 +749,7 @@ export class CallService {
           changedAt: rejectedAt.toISOString(),
         }),
     );
+    this.callPush.dismissForUser(callId, userID, 'declined_elsewhere');
     await this.endRingingCallIfNoInviteesRemain(
       participant.call as CallWithParticipants,
       rejectedAt,
@@ -748,6 +769,26 @@ export class CallService {
       await this.reloadCall(callId, participant.call as CallWithParticipants),
       updatedParticipant,
     );
+  }
+
+  /**
+   * 推送来电里的「拒接」（POST /calls/:id/push-decline，凭单通令牌、不带登录态）。
+   * 与 rejectCall 同一条路径；电话已经不在振铃（已取消 / 超时 / 本人已在别处接听或
+   * 拒接）时按幂等成功处理 —— 原生层只关心振铃收掉了，不该因此重试，也不该从
+   * 状态码里读出这通电话后来怎样了。
+   */
+  async declineFromPush(userID: string, callId: string): Promise<void> {
+    try {
+      await this.rejectCall(userID, callId);
+    } catch (error) {
+      if (
+        error instanceof NotFoundException ||
+        error instanceof ConflictException
+      ) {
+        return;
+      }
+      throw error;
+    }
   }
 
   /**
@@ -1659,6 +1700,8 @@ export class CallService {
     endedAt: Date,
     options: { suppressOfflinePush?: boolean } = {},
   ): void {
+    // 同一个「只有终局赢家才走到」的漏斗：收掉还在响铃的被叫的推送来电。
+    this.callPush.dismissForEndedCall(call, endReason);
     recordCallEnding({
       kind: callKindOf(call.sessionType),
       reason: endReason,

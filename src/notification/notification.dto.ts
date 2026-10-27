@@ -121,28 +121,39 @@ export class PublishSystemAnnouncementResponseDto {
 }
 
 export const PUSH_TOKEN_PLATFORMS = ['ios', 'android', 'web'] as const;
-export const PUSH_TOKEN_PROVIDERS = ['expo', 'jpush'] as const;
+// apns_voip:iOS PushKit 的 VoIP token,只用于来电推送(直连 APNs,不经极光);
+// 聊天 / 通知推送的查询只认 expo 与 jpush,不会把它卷进去。
+export const PUSH_TOKEN_PROVIDERS = ['expo', 'jpush', 'apns_voip'] as const;
+export const APNS_ENVIRONMENTS = ['development', 'production'] as const;
+export type ApnsEnvironment = (typeof APNS_ENVIRONMENTS)[number];
 
 export type PushTokenPlatform = (typeof PUSH_TOKEN_PLATFORMS)[number];
 export type PushTokenProvider = (typeof PUSH_TOKEN_PROVIDERS)[number];
 
 const EXPO_PUSH_TOKEN_PATTERN = /^Expo(nent)?PushToken\[[^\s\]]+\]$/;
+// PushKit 的 token 是 32 字节,客户端按十六进制上报;留余量给将来变长。
+const APNS_TOKEN_PATTERN = /^[0-9a-f]{64,200}$/i;
+
+function pushTokenPattern(provider: PushTokenProvider | undefined): RegExp {
+  if (provider === 'expo') return EXPO_PUSH_TOKEN_PATTERN;
+  if (provider === 'apns_voip') return APNS_TOKEN_PATTERN;
+  return /^\S+$/;
+}
 
 @ValidatorConstraint({ name: 'pushTokenShape', async: false })
 class PushTokenShapeConstraint implements ValidatorConstraintInterface {
   validate(value: unknown, args: ValidationArguments) {
     if (typeof value !== 'string') return true;
     const provider = (args.object as { provider?: PushTokenProvider }).provider;
-    return provider === 'expo'
-      ? EXPO_PUSH_TOKEN_PATTERN.test(value)
-      : /^\S+$/.test(value);
+    return pushTokenPattern(provider).test(value);
   }
 
   defaultMessage(args: ValidationArguments) {
     const provider = (args.object as { provider?: PushTokenProvider }).provider;
-    return provider === 'expo'
-      ? 'token must be an Expo push token (ExponentPushToken[...])'
-      : 'token must not contain whitespace';
+    if (provider === 'expo')
+      return 'token must be an Expo push token (ExponentPushToken[...])';
+    if (provider === 'apns_voip') return 'token must be a hex APNs token';
+    return 'token must not contain whitespace';
   }
 }
 
@@ -185,6 +196,23 @@ export class RegisterPushTokenDto {
   @MaxLength(256)
   @IsOptional()
   revocationSecret?: string;
+
+  /**
+   * 客户端能处理的来电推送协议版本(当前 1)。旧客户端不带 = 不给这台设备发来电推送:
+   * 它收到透传 / VoIP 推送也不会响铃。
+   */
+  @ApiPropertyOptional({ minimum: 1, maximum: 99 })
+  @IsOptional()
+  @IsInt()
+  @Min(1)
+  @Max(99)
+  callPushVersion?: number;
+
+  /** 仅 apns_voip:TestFlight / App Store 包是 production,Xcode 调试包是 development。 */
+  @ApiPropertyOptional({ enum: APNS_ENVIRONMENTS })
+  @IsOptional()
+  @IsIn(APNS_ENVIRONMENTS)
+  apnsEnvironment?: ApnsEnvironment;
 }
 
 export class DeletePushTokenDto {

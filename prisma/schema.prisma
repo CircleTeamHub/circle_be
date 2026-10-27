@@ -1919,6 +1919,10 @@ model DevicePushToken {
   disabledAt           DateTime?
   /// Server-derived sha256 device identity from the authenticated session.
   deviceKey            String?
+  /// 来电推送协议版本:新客户端登记时声明(当前 1)。null = 旧客户端,不收来电推送。
+  callPushVersion      Int?
+  /// 仅 apns_voip:token 属于哪个 APNs 环境('development' | 'production')。
+  apnsEnvironment      String?
   createdAt            DateTime  @default(now())
   updatedAt            DateTime  @updatedAt
 
