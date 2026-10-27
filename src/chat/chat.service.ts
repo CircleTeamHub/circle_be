@@ -1,5 +1,4 @@
 import { startReadBurnTimers } from './read-burn-timers';
-import { assertEncryptedTextSend } from 'src/e2ee/e2ee-proof';
 import {
   BadRequestException,
   ConflictException,
@@ -315,7 +314,7 @@ export class ChatService {
     }
     if (
       Buffer.byteLength(JSON.stringify(payload.content), 'utf8') >
-      (payload.type === 'encrypted-text' ? 16_384 : MAX_CONTENT_BYTES)
+      MAX_CONTENT_BYTES
     ) {
       throw new BadRequestException({
         message: '消息体超限',
@@ -793,10 +792,8 @@ export class ChatService {
       const created = await this.prisma.$transaction(async (tx) => {
         // G-05:会话行锁替 advisory lock —— 同会话串行,跨会话零互扰
         // (hashtext 碰撞让无关会话互等的问题消失),也不再做 MAX(height) 聚合扫描。
-        const counter = await tx.$queryRaw<
-          Array<{ nextHeight: number; textEncryption: string }>
-        >`
-        SELECT "nextHeight", "textEncryption" FROM "ChatConversation"
+        const counter = await tx.$queryRaw<Array<{ nextHeight: number }>>`
+        SELECT "nextHeight" FROM "ChatConversation"
         WHERE "id" = ${effectivePayload.conversationId} FOR UPDATE`;
         if (counter.length === 0) {
           throw new NotFoundException({
@@ -826,20 +823,6 @@ export class ChatService {
         if (existing) {
           this.assertSameSendRequest(existing, requestHash);
           return { row: existing, reused: true };
-        }
-
-        if (
-          counter[0].textEncryption === 'MLS_V1' ||
-          effectivePayload.type === 'encrypted-text'
-        ) {
-          await assertEncryptedTextSend(
-            tx,
-            senderUserId,
-            effectivePayload.conversationId,
-            effectivePayload.type,
-            effectivePayload.d,
-            effectivePayload.content,
-          );
         }
 
         await this.media.lockOwnedKeysForSend(
@@ -1537,7 +1520,107 @@ export class ChatService {
     });
     const hasMore = rows.length > limit;
     const memberships = hasMore ? rows.slice(0, limit) : rows;
-    if (memberships.length === 0) return { conversations: [], hasMore };
+    return {
+      conversations: await this.buildConversationList(userId, memberships),
+      hasMore,
+    };
+  }
+
+  /**
+   * 会话列表的键集分页：按 conversationID 升序，只返回 id 严格大于 cursor 的会话
+   * （空串 = 从头开始）。
+   *
+   * 活跃度排序下不能用 offset 翻页：翻页间隙里来一条新消息就会把会话挪到别的页，
+   * 漏行或重复；id 不会变，键集按它走，中途怎么来消息都一个不落。顺序由客户端
+   * 自己按置顶 / 末条消息时间重排。成员过滤、limit 与每行 DTO 与旧模式完全一致。
+   *
+   * 索引：一个用户最多几千个座位，走 userID 打头的索引（含 leftAt/hiddenAt 条件的
+   * 部分索引）取出本人可见座位再按 id 排序即可，不需要新索引。
+   */
+  async listConversationsKeysetPage(
+    userId: string,
+    cursor: string,
+    limit: number = CONVERSATION_LIST_MAX,
+  ): Promise<{
+    conversations: ChatConversationDto[];
+    hasMore: boolean;
+    nextCursor: string | null;
+  }> {
+    const rows = await this.prisma.chatMember.findMany({
+      where: {
+        userID: userId,
+        leftAt: null,
+        hiddenAt: null,
+        ...(cursor === '' ? {} : { conversationID: { gt: cursor } }),
+      },
+      include: { conversation: true },
+      orderBy: { conversationID: 'asc' },
+      take: limit + 1,
+    });
+    const hasMore = rows.length > limit;
+    const memberships = hasMore ? rows.slice(0, limit) : rows;
+    const last = memberships[memberships.length - 1];
+    return {
+      conversations: await this.buildConversationList(userId, memberships),
+      hasMore,
+      nextCursor: hasMore && last ? last.conversationID : null,
+    };
+  }
+
+  /**
+   * 单个会话，与 GET /chat/conversations 的每一行逐字段同形(同一条组装路径)。
+   *
+   * 客户端收到会话元信息变更事件(置顶/免打扰/群公告/群主/角色/全员禁言…)后只刷新
+   * 这一个，而不是重拉整张列表 —— 群一多，一次全量就是几百 KB。
+   * 已退出或从未加入 → CHAT_NOT_MEMBER(403)；从列表里隐藏了 → CHAT_CONVERSATION_NOT_FOUND
+   * (404)，不能借这个接口把隐藏的会话「复活」回客户端列表。
+   */
+  async getConversation(
+    userId: string,
+    conversationId: string,
+  ): Promise<ChatConversationDto> {
+    const membership = await this.prisma.chatMember.findUnique({
+      where: {
+        conversationID_userID: {
+          conversationID: conversationId,
+          userID: userId,
+        },
+      },
+      include: { conversation: true },
+    });
+    if (!membership || membership.leftAt) {
+      throw new ForbiddenException({
+        message: '不是会话成员',
+        errorCode: ChatErrorCode.NotMember,
+      });
+    }
+    if (membership.hiddenAt) {
+      throw new NotFoundException({
+        message: '会话不存在',
+        errorCode: ChatErrorCode.ConversationNotFound,
+      });
+    }
+    const [conversation] = await this.buildConversationList(userId, [
+      membership,
+    ]);
+    if (!conversation) {
+      throw new NotFoundException({
+        message: '会话不存在',
+        errorCode: ChatErrorCode.ConversationNotFound,
+      });
+    }
+    return conversation;
+  }
+
+  /**
+   * 会话列表每一行的 DTO：对端信息 / 末条消息 / 未读数 / 群信息等按整页批量取，
+   * 查询次数不随会话数增长。旧的活跃度分页与键集分页共用这一条路径。
+   */
+  private async buildConversationList(
+    userId: string,
+    memberships: Array<ChatMember & { conversation: ChatConversation }>,
+  ): Promise<ChatConversationDto[]> {
+    if (memberships.length === 0) return [];
 
     const conversationIds = memberships.map((m) => m.conversationID);
     const directIds = memberships
@@ -1612,7 +1695,6 @@ export class ChatService {
       return {
         id: m.conversationID,
         type: m.conversation.type,
-        textEncryption: m.conversation.textEncryption,
         peer: directPeers.info.get(m.conversationID) ?? null,
         circleId: m.conversation.circleID,
         circle: m.conversation.circleID
@@ -1664,7 +1746,7 @@ export class ChatService {
         .map((c) => c.lastMessage)
         .filter((m): m is ChatMessageDto => m !== null),
     );
-    return { conversations: list, hasMore };
+    return list;
   }
 
   /**
@@ -2407,7 +2489,6 @@ export class ChatService {
     return {
       id: conversationId,
       type: member.conversation.type,
-      textEncryption: member.conversation.textEncryption,
       peer: directPeers.info.get(conversationId) ?? null,
       circleId: member.conversation.circleID,
       circle: member.conversation.circleID
@@ -4313,17 +4394,6 @@ export class ChatService {
           errorCode: ChatErrorCode.MessageNotFound,
         });
       }
-      const encryption = await tx.chatConversation.findUnique({
-        where: { id: conversationId },
-        select: { textEncryption: true },
-      });
-      if (
-        encryption?.textEncryption === 'MLS_V1' ||
-        current.type === 'encrypted-text'
-      )
-        throw new BadRequestException(
-          'Send a new encrypted message instead of editing',
-        );
       const previous = (current.content ?? {}) as Record<string, unknown>;
       const history = Array.isArray(current.contentHistory)
         ? [...(current.contentHistory as unknown[])]

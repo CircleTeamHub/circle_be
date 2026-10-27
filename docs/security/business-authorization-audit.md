@@ -34,11 +34,9 @@
 - 最终完整后端 Jest：316 suites / 4190 tests 通过，原有 3 suites / 15 tests 跳过；随后新增的管理接口权限契约检查单独运行 1 suite / 1 test 通过。
 - 两组真实 HTTP 回归：35 tests 通过，涵盖笔记、收藏、会话分组、通知、钱包、群角色和管理台权限。
 - 后端 `npm run build` 通过；改动文件 eslint 零错误（14 条现有代码警告），`git diff --check` 通过。通话专项 8 suites / 102 tests 通过。运行中的本地后端 `/readyz` 返回 200，database / redis / objectStore 正常。
-- E2EE 原型在相邻 `circle-im/tools/e2ee-poc` 独立运行；20 tests 通过。详情见该目录 README 和 `end-to-end-encryption-plan.md`。
 
 ## 验证边界
 
 - 尚未做线上渗透测试、真实多机压力测试或腾讯云端口复核；旧服务器不可用。网关并发预算仍按进程计数，不能据此宣称具有上游带宽抗 DDoS 能力。
 - HTTP 矩阵替换了 Prisma 持久层；并发/事务数据库行为需依赖既有集成测试及恢复部署后的验收，不能用 mock 模拟结果替代真实数据库保证。
 - 本轮通话修复覆盖**新 LiveKit 凭证签发**。已签发的媒体 JWT 与正在进行的媒体连接不受 HTTP Guard 直接控制；即时驱逐、旧 JWT 重连策略及事件时序仍需 LiveKit 侧联调验证，不能宣称本修复具有即时媒体撤销能力。
-- E2EE 尚未对正式聊天启用。原生兼容、设备批准/恢复、服务端密文投递、完整互操作和独立密码学审查仍是生产接入门槛；Node PoC 不等于完成 App E2EE。

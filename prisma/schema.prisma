@@ -376,7 +376,6 @@ model User {
   consoleEvents                ConsoleEvent[]
   consoleInstallations         AppInstallation[]
   consoleApiKeys               ConsoleApiKey[]
-  encryptionRecovery           E2eeRecovery[]
   id                           String            @id @default(uuid())
   accountId                    String            @unique
   inviteCode                   String            @unique
@@ -2337,8 +2336,6 @@ enum ChatMemberRole {
 /// userID 类字段一律不建 User 外键 —— 聊天行是高频写入的历史数据，
 /// 不随账号删除级联清除（保留群聊上下文；同 SensitiveWord.createdBy 先例）。
 model ChatConversation {
-  textEncryption         String               @default("PLAIN")
-  encryptionRoom         E2eeRoom?
   id                     String               @id @default(uuid())
   type                   ChatConversationType
   /// DIRECT 会话防重键：两个 userID 升序以 ':' 拼接；其余类型为 null。
@@ -2537,7 +2534,6 @@ model ChatMessage {
   createdAt       DateTime  @default(now())
 
   conversation       ChatConversation        @relation(fields: [conversationID], references: [id], onDelete: Cascade)
-  encryptionArchives E2eeArchive[]
   reactions          ChatMessageReaction[]
   mediaReferences    ChatMediaReference[]
   directAutoReplyJob ChatDirectAutoReplyJob? @relation("directAutoReplySource")
@@ -2734,98 +2730,6 @@ model GroupAdmissionDelivery {
 
   @@unique([admissionID, recipientID, event])
   @@index([deliveredAt, nextAttemptAt])
-}
-
-/// Public encryption identities only. Private material remains on devices.
-model E2eeDevice {
-  id                String           @id
-  userID            String
-  purpose           String
-  publicKey         String           @unique
-  label             String
-  status            String           @default("PENDING")
-  approvedByID      String?
-  approvalSignature String?
-  revokedAt         DateTime?
-  createdAt         DateTime         @default(now())
-  packages          E2eeKeyPackage[]
-  seats             E2eeRoomDevice[]
-
-  @@index([userID, purpose, status])
-}
-
-model E2eeKeyPackage {
-  id        String     @id
-  deviceID  String
-  encoded   String
-  signature String
-  claimedBy String?
-  createdAt DateTime   @default(now())
-  device    E2eeDevice @relation(fields: [deviceID], references: [id], onDelete: Cascade)
-
-  @@index([deviceID, claimedBy])
-}
-
-model E2eeRoom {
-  conversationID  String           @id
-  conversation    ChatConversation @relation(fields: [conversationID], references: [id], onDelete: Cascade)
-  managerDeviceID String
-  epoch           Int              @default(0)
-  createdAt       DateTime         @default(now())
-  devices         E2eeRoomDevice[]
-  events          E2eeEpochEvent[]
-}
-
-model E2eeRoomDevice {
-  conversationID String
-  deviceID       String
-  joinedEpoch    Int
-  removedEpoch   Int?
-  room           E2eeRoom   @relation(fields: [conversationID], references: [conversationID], onDelete: Cascade)
-  device         E2eeDevice @relation(fields: [deviceID], references: [id], onDelete: Cascade)
-
-  @@id([conversationID, deviceID])
-  @@index([deviceID, removedEpoch])
-}
-
-model E2eeEpochEvent {
-  id             String   @id
-  conversationID String
-  epoch          Int
-  packet         Json
-  requestHash    String
-  createdAt      DateTime @default(now())
-  room           E2eeRoom @relation(fields: [conversationID], references: [conversationID], onDelete: Cascade)
-
-  @@unique([conversationID, epoch])
-}
-
-/// Public recovery credential only; the secret stays on authorized devices/offline.
-model E2eeRecovery {
-  user      User          @relation(fields: [userID], references: [id], onDelete: Cascade)
-  id        String        @id
-  userID    String
-  purpose   String
-  publicKey String
-  createdAt DateTime      @default(now())
-  archives  E2eeArchive[]
-
-  @@unique([userID, purpose])
-}
-
-/// Per-account ciphertext archive, tied to the original message retention lifecycle.
-model E2eeArchive {
-  cursor     BigInt @unique @default(autoincrement())
-  id         String       @id
-  recoveryID String
-  messageID  String
-  ciphertext String
-  recovery   E2eeRecovery @relation(fields: [recoveryID], references: [id], onDelete: Cascade)
-  message    ChatMessage  @relation(fields: [messageID], references: [id], onDelete: Cascade)
-
-  @@unique([recoveryID, messageID])
-  @@index([recoveryID, cursor])
-  @@index([messageID])
 }
 
 model ConsoleEvent {

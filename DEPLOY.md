@@ -254,6 +254,16 @@ fail closed,不会连接服务器。必须从 Actions 手动运行 Release,同�
 `deploy/SCHEMA_COMPATIBILITY` 抬到 `4`:迁移后旧二进制不再是合法回滚目标,
 launcher 会拒绝任何兼容级别低于 4 的 tag。
 
+**文字加密下线迁移(`20261026000000_remove_text_encryption`)同样必须走停机路径。**
+它删掉 E2ee* 七张表和 `ChatConversation.textEncryption` 列,而发布前的二进制仍会读写
+它们(旧 Prisma 客户端查会话默认带上 `textEncryption`),迁移一完成旧色的会话读写就开始
+报错。因此这个版本继续携带 `deploy/REQUIRES_IRREVERSIBLE_MIGRATION`,并把
+`deploy/SCHEMA_COMPATIBILITY` 抬到 `5`,launcher 会拒绝任何兼容级别低于 5 的 tag。
+迁移失败时的探针不用改:这份迁移末尾带一段含 `$$` 的自检,Prisma 切不开,整份在一个
+隐式事务里执行(见 `docs/migration-baseline.md`),失败即整体回滚;已经上线过会员迁移的库
+四个约束都在,探针判为 applied 并保持维护 —— 只会比实际更保守,不会把旧二进制放回一个
+已删列的库。
+
 ### 一次性配置(GitHub 仓库 Settings → Secrets and variables → Actions)
 
 | 类型 | 名称 | 值 |
