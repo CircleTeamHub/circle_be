@@ -96,6 +96,17 @@ export class ChatCircleSyncService {
   private readonly retryQueue = new Set<string>();
   /** Redis 不可用时的单实例兜底；Redis 可用时以共享游标为准。 */
   private scanCursor: CircleSyncScanCursor | null = null;
+  /**
+   * 进程内按圈子合并的即时同步(见 syncCircleSeatsCoalesced):current 是正在跑的那次,
+   * next 是它结束后的补跑(期间到达的请求都挂在它上面)。
+   */
+  private readonly coalescedSyncs = new Map<
+    string,
+    {
+      current: Promise<string | null>;
+      next: Promise<string | null> | null;
+    }
+  >();
 
   constructor(
     private readonly prisma: PrismaService,
@@ -116,6 +127,57 @@ export class ChatCircleSyncService {
   scheduleRetry(circleID: string): void {
     if (this.retryQueue.size >= ChatCircleSyncService.RETRY_QUEUE_MAX) return;
     this.retryQueue.add(circleID);
+  }
+
+  /**
+   * 激活写点(入圈获批、拉人进群…)提交后的即时座位同步入口:同一圈子在本进程里
+   * 同一时刻只跑一次 ensureCircleConversation。
+   *
+   * ensure 一开始就在事务里排对账锁 —— 不合并的话,一个圈子同时进来 N 个人就是 N 个
+   * 事务各占一个池连接,排在同一把锁后面做同一件事(后来者在锁后重读,差集是空的)。
+   * 合并规则:没有在跑的就立刻跑;正在跑时再来的请求不另起,而是并成「当前这次结束后
+   * 补跑一次」—— 当前这次的快照可能早于它们的提交,所以不能直接复用当前结果;补跑
+   * 读到的是它们全部提交之后的成员表。补跑还没开始前再来的请求挂同一次补跑。
+   *
+   * 每次运行的成败只归挂在它上面的调用方(失败的调用方各自排对账重试,
+   * scheduleRetry 按圈子去重)。只合并本进程:跨实例仍由对账锁串行,行为与原来一致。
+   */
+  syncCircleSeatsCoalesced(circleId: string): Promise<string | null> {
+    const inflight = this.coalescedSyncs.get(circleId);
+    if (!inflight) {
+      const entry: {
+        current: Promise<string | null>;
+        next: Promise<string | null> | null;
+      } = { current: Promise.resolve(null), next: null };
+      this.coalescedSyncs.set(circleId, entry);
+      entry.current = this.runCoalescedSync(circleId, entry);
+      return entry.current;
+    }
+    if (inflight.next) return inflight.next;
+    const settled = () => undefined;
+    inflight.next = inflight.current.then(settled, settled).then(() => {
+      inflight.next = null;
+      inflight.current = this.runCoalescedSync(circleId, inflight);
+      return inflight.current;
+    });
+    return inflight.next;
+  }
+
+  private async runCoalescedSync(
+    circleId: string,
+    entry: {
+      current: Promise<string | null>;
+      next: Promise<string | null> | null;
+    },
+  ): Promise<string | null> {
+    try {
+      return await this.ensureCircleConversation(circleId);
+    } finally {
+      // 有补跑排着就留给它;否则这一轮彻底结束,下一个请求重新起跑。
+      if (!entry.next && this.coalescedSyncs.get(circleId) === entry) {
+        this.coalescedSyncs.delete(circleId);
+      }
+    }
   }
 
   @TrackedCron(CronExpression.EVERY_MINUTE, 'chat_circle_sync')

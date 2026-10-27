@@ -112,6 +112,7 @@ describe('NotificationService', () => {
   const realtimeService = {
     broadcastInteractionUnread: jest.fn(),
     broadcastSystemNotificationUnread: jest.fn(),
+    broadcastSystemNotificationUnreadToRecipients: jest.fn(),
   };
   const pushService = {
     sendNotification: jest.fn(),
@@ -360,12 +361,16 @@ describe('NotificationService', () => {
         { notificationID: 'notification-2' },
       ],
     });
+    // 每批收件人一次批量广播(一条 GROUP BY 计数),不再逐人一条 count。
+    expect(
+      realtimeService.broadcastSystemNotificationUnreadToRecipients,
+    ).toHaveBeenCalledTimes(1);
+    expect(
+      realtimeService.broadcastSystemNotificationUnreadToRecipients,
+    ).toHaveBeenCalledWith(['user-1', 'user-2']);
     expect(
       realtimeService.broadcastSystemNotificationUnread,
-    ).toHaveBeenCalledWith('user-1');
-    expect(
-      realtimeService.broadcastSystemNotificationUnread,
-    ).toHaveBeenCalledWith('user-2');
+    ).not.toHaveBeenCalled();
     expect(auditService.recordStrict).toHaveBeenCalledWith(prisma, {
       actorID: 'admin-1',
       action: 'system_announcement_publish',
@@ -693,6 +698,36 @@ describe('NotificationService', () => {
       'Idempotency-Key has already been used for another announcement',
     );
     expect(prisma.user.findMany).not.toHaveBeenCalled();
+  });
+
+  it('does not fail a committed announcement when the unread broadcast fails', async () => {
+    prisma.systemAnnouncement.upsert.mockResolvedValue({
+      id: 'announcement-1',
+      requestFingerprint: 'admin-1:Maintenance',
+      createdAt: new Date('2026-07-29T12:00:00.000Z'),
+      auditRecordedAt: null,
+    });
+    prisma.user.findMany.mockResolvedValue([{ id: 'user-1' }]);
+    prisma.notification.createManyAndReturn.mockResolvedValue([
+      { id: 'notification-1', toUserID: 'user-1' },
+    ]);
+    prisma.notification.count.mockResolvedValue(1);
+    realtimeService.broadcastSystemNotificationUnreadToRecipients.mockRejectedValueOnce(
+      new Error('redis down'),
+    );
+
+    await expect(
+      service.publishSystemAnnouncement(
+        'admin-1',
+        { content: 'Maintenance' },
+        'announcement-request-1',
+      ),
+    ).resolves.toEqual({ createdCount: 1 });
+    expect(prisma.systemAnnouncement.updateMany).toHaveBeenCalledWith(
+      expect.objectContaining({
+        data: expect.objectContaining({ recipientCount: 1 }),
+      }),
+    );
   });
 
   describe('push tokens', () => {
@@ -1875,9 +1910,17 @@ describe('scrolling announcements', () => {
     );
     await service.setAnnouncementScrolling('admin', 'new', true);
     expect(tx.$queryRaw).toHaveBeenCalledTimes(1);
+    // 每条受影响的公告各自沿唯一索引 (systemAnnouncementID, toUserID) 翻页。
     expect(prisma.notification.findMany).toHaveBeenCalledWith(
       expect.objectContaining({
-        where: { systemAnnouncementID: { in: ['new', 'old'] } },
+        where: { systemAnnouncementID: 'new', toUserID: { not: null } },
+        orderBy: { toUserID: 'asc' },
+      }),
+    );
+    expect(prisma.notification.findMany).toHaveBeenCalledWith(
+      expect.objectContaining({
+        where: { systemAnnouncementID: 'old', toUserID: { not: null } },
+        orderBy: { toUserID: 'asc' },
       }),
     );
     expect(realtime.broadcastAnnouncementChanged).toHaveBeenCalledWith(
@@ -1995,30 +2038,102 @@ describe('profile notification details ownership', () => {
 });
 
 describe('editing and deleting announcements', () => {
-  function harness(row: unknown = { id: 'a', fanoutCompletedAt: new Date() }) {
+  type RecipientRow = { id: string; toUserID: string | null };
+  type FindArgs = {
+    where: {
+      toUserID?: null | { not: null } | { gt: string };
+      id?: { gt: string };
+    };
+    orderBy: { toUserID?: 'asc'; id?: 'asc' };
+    take: number;
+  };
+
+  /** 按 Prisma 的 where/orderBy/take 在内存里翻页,桩出键集分页的真实行为。 */
+  function page(rows: readonly RecipientRow[], args: FindArgs) {
+    const { toUserID, id } = args.where;
+    const kept = rows.filter((row) => {
+      if (toUserID === null && row.toUserID !== null) return false;
+      if (toUserID && 'not' in toUserID && row.toUserID === null) return false;
+      if (
+        toUserID &&
+        'gt' in toUserID &&
+        (row.toUserID === null || row.toUserID <= toUserID.gt)
+      )
+        return false;
+      if (id && row.id <= id.gt) return false;
+      return true;
+    });
+    const key = args.orderBy.toUserID ? 'toUserID' : 'id';
+    return [...kept]
+      .sort((a, b) => String(a[key]).localeCompare(String(b[key])))
+      .slice(0, args.take);
+  }
+
+  /** 2345 个有收件人的行(分 1000/1000/345 三批)+ 2 个收件人已被物理删除的老行。 */
+  const MANY_ROWS: RecipientRow[] = [
+    ...Array.from({ length: 2345 }, (_, index) => ({
+      id: `n-${String(index).padStart(4, '0')}`,
+      toUserID: `u-${String(index).padStart(4, '0')}`,
+    })),
+    { id: 'n-orphan-1', toUserID: null },
+    { id: 'n-orphan-2', toUserID: null },
+  ];
+
+  function harness({
+    row = { id: 'a', fanoutCompletedAt: new Date() } as unknown,
+    rows = [{ id: 'n', toUserID: 'u' }] as RecipientRow[],
+    current = { content: 'New body', deletedAt: null as Date | null },
+  } = {}) {
+    // events 记录每个事务的边界与其中的语句,用来断言「一批一个短事务」和先后次序。
+    const events: string[] = [];
+    const record =
+      <T>(name: string, value?: T) =>
+      async (...args: unknown[]) => {
+        events.push(name);
+        return typeof value === 'function'
+          ? (value as (...inner: unknown[]) => unknown)(...args)
+          : value;
+      };
     const tx = {
-      $queryRaw: jest.fn(),
+      $queryRaw: jest.fn(record('lock', [])),
       systemAnnouncement: {
-        findFirst: jest.fn().mockResolvedValue(row),
-        update: jest.fn().mockResolvedValue({ id: 'a' }),
+        findFirst: jest.fn(record('announcement.check', row)),
+        findUnique: jest.fn(record('announcement.read', current)),
+        update: jest.fn(record('announcement.update', { id: 'a' })),
       },
       notification: {
-        updateMany: jest.fn(),
-        findMany: jest.fn().mockResolvedValue([{ id: 'n', toUserID: 'u' }]),
+        findMany: jest.fn(
+          record('notification.page', (args: FindArgs) => page(rows, args)),
+        ),
+        updateMany: jest.fn(record('notification.updateMany', { count: 0 })),
       },
-      notificationPushOutbox: { updateMany: jest.fn() },
-      notificationPushDelivery: { updateMany: jest.fn() },
+      notificationPushOutbox: {
+        updateMany: jest.fn(record('outbox.updateMany', { count: 0 })),
+      },
+      notificationPushDelivery: {
+        updateMany: jest.fn(record('delivery.updateMany', { count: 0 })),
+      },
     };
     const prisma = {
-      notification: tx.notification,
-      $transaction: jest.fn(async (fn: any) => fn(tx)),
+      systemAnnouncement: tx.systemAnnouncement,
+      notification: {
+        findMany: jest.fn(async (args: FindArgs) => page(rows, args)),
+      },
+      $transaction: jest.fn(async (fn: (client: typeof tx) => unknown) => {
+        events.push('begin');
+        const result = await fn(tx);
+        events.push('commit');
+        return result;
+      }),
     };
-    const audit = { recordStrict: jest.fn() };
+    const audit = { recordStrict: jest.fn(record('audit')) };
     const realtime = { broadcastAnnouncementChanged: jest.fn() };
     return {
       tx,
+      prisma,
       audit,
       realtime,
+      events,
       service: new NotificationService(
         prisma as any,
         realtime as any,
@@ -2027,6 +2142,26 @@ describe('editing and deleting announcements', () => {
       ),
     };
   }
+
+  /** 事务列表:每个元素是一个 begin…commit 之间的语句名。 */
+  const transactions = (events: readonly string[]) => {
+    const result: string[][] = [];
+    let current: string[] | null = null;
+    for (const event of events) {
+      if (event === 'begin') current = [];
+      else if (event === 'commit') {
+        if (current) result.push(current);
+        current = null;
+      } else current?.push(event);
+    }
+    return result;
+  };
+
+  const updatedIds = (mock: jest.Mock) =>
+    mock.mock.calls.flatMap(
+      ([args]: [{ where: { id: { in: string[] } } }]) => args.where.id.in,
+    );
+
   it('updates the title and all live recipient bodies without sending another push', async () => {
     const { service, tx, audit, realtime } = harness();
     await service.editAnnouncement('admin', 'a', {
@@ -2039,24 +2174,23 @@ describe('editing and deleting announcements', () => {
       }),
     );
     expect(tx.notification.updateMany).toHaveBeenCalledWith({
-      where: { systemAnnouncementID: 'a', deleted: false },
+      where: { id: { in: ['n'] }, deleted: false },
       data: { content: 'New body' },
     });
-    expect(tx.notificationPushOutbox.updateMany).toHaveBeenCalledWith(
-      expect.objectContaining({
-        where: {
-          notification: { systemAnnouncementID: 'a' },
-          status: { in: ['PENDING', 'FAILED'] },
-        },
-        data: { payload: Prisma.DbNull },
-      }),
-    );
+    expect(tx.notificationPushOutbox.updateMany).toHaveBeenCalledWith({
+      where: {
+        notificationID: { in: ['n'] },
+        status: { in: ['PENDING', 'FAILED'] },
+      },
+      data: { payload: Prisma.DbNull },
+    });
     expect(realtime.broadcastAnnouncementChanged).toHaveBeenCalledWith('u');
     expect(audit.recordStrict).toHaveBeenCalledWith(
       tx,
       expect.objectContaining({ action: 'system_announcement_edit' }),
     );
   });
+
   it('hides recipient notifications, stops scrolling and cancels unfinished pushes', async () => {
     const { service, tx, audit, realtime } = harness();
     expect(await service.deleteAnnouncement('admin', 'a')).toEqual({
@@ -2068,30 +2202,457 @@ describe('editing and deleting announcements', () => {
       data: { deletedAt: expect.any(Date), scrolling: false },
     });
     expect(tx.notification.updateMany).toHaveBeenCalledWith({
-      where: { systemAnnouncementID: 'a' },
+      where: { id: { in: ['n'] } },
       data: { deleted: true },
     });
-    expect(tx.notificationPushOutbox.updateMany).toHaveBeenCalledWith(
-      expect.objectContaining({
-        data: expect.objectContaining({
-          status: 'TERMINAL',
-          leaseToken: null,
-          completionReason: 'ANNOUNCEMENT_DELETED',
-        }),
-      }),
-    );
+    expect(tx.notificationPushOutbox.updateMany).toHaveBeenCalledWith({
+      where: {
+        notificationID: { in: ['n'] },
+        status: { in: ['PENDING', 'FAILED', 'PROCESSING'] },
+      },
+      data: {
+        status: 'TERMINAL',
+        completionReason: 'ANNOUNCEMENT_DELETED',
+        leaseToken: null,
+        lockedAt: null,
+      },
+    });
+    expect(tx.notificationPushDelivery.updateMany).toHaveBeenCalledWith({
+      where: {
+        outbox: { notificationID: { in: ['n'] } },
+        status: { in: ['PENDING', 'FAILED'] },
+      },
+      data: { status: 'TERMINAL', lastError: 'ANNOUNCEMENT_DELETED' },
+    });
     expect(audit.recordStrict).toHaveBeenCalledWith(
       tx,
       expect.objectContaining({ action: 'system_announcement_delete' }),
     );
   });
+
   it('rejects deleted and still-publishing announcements before changing recipient data', async () => {
     for (const row of [null, { id: 'a', fanoutCompletedAt: null }]) {
-      const { service, tx } = harness(row);
-      await expect(
-        service.deleteAnnouncement('admin', 'a'),
-      ).rejects.toBeDefined();
-      expect(tx.notification.updateMany).not.toHaveBeenCalled();
+      for (const run of [
+        (service: NotificationService) =>
+          service.deleteAnnouncement('admin', 'a'),
+        (service: NotificationService) =>
+          service.editAnnouncement('admin', 'a', { title: 't', content: 'x' }),
+      ]) {
+        const { service, tx } = harness({ row });
+        await expect(run(service)).rejects.toBeDefined();
+        expect(tx.notification.updateMany).not.toHaveBeenCalled();
+        expect(tx.notificationPushOutbox.updateMany).not.toHaveBeenCalled();
+      }
     }
+  });
+
+  // 改动前是一条 updateMany WHERE systemAnnouncementID = $1 改全员的行:几十万行一条
+  // 语句、一个事务,锁住所有收件人的通知行直到提交,还会撞 5 秒事务超时 / 15 秒语句
+  // 超时。现在按收件人键集每批 1000 行,一批一个短事务。
+  it('edits recipient rows in keyset batches of 1000, one short transaction each', async () => {
+    const { service, tx, events } = harness({ rows: MANY_ROWS });
+    await service.editAnnouncement('admin', 'a', {
+      title: 'New title',
+      content: 'New body',
+    });
+
+    // 一个改公告 + 审计的事务,然后四个批次事务(1000/1000/345 + 2 个孤儿行)。
+    const txs = transactions(events);
+    expect(txs[0]).toEqual([
+      'lock',
+      'announcement.check',
+      'announcement.update',
+      'audit',
+    ]);
+    expect(txs.slice(1)).toHaveLength(4);
+    for (const batch of txs.slice(1)) {
+      expect(batch).toEqual([
+        'lock',
+        'notification.page',
+        'announcement.read',
+        'notification.updateMany',
+        'outbox.updateMany',
+      ]);
+    }
+    for (const [args] of tx.notification.updateMany.mock.calls as any[][]) {
+      expect(args.where.id.in.length).toBeLessThanOrEqual(1000);
+      expect(args).toEqual({
+        where: { id: { in: expect.any(Array) }, deleted: false },
+        data: { content: 'New body' },
+      });
+    }
+    expect(new Set(updatedIds(tx.notification.updateMany))).toEqual(
+      new Set(MANY_ROWS.map((row) => row.id)),
+    );
+    expect(updatedIds(tx.notification.updateMany)).toHaveLength(
+      MANY_ROWS.length,
+    );
+    expect(
+      (tx.notificationPushOutbox.updateMany.mock.calls as any[][]).flatMap(
+        ([args]) => args.where.notificationID.in as string[],
+      ),
+    ).toHaveLength(MANY_ROWS.length);
+    // 翻页走唯一索引 (systemAnnouncementID, toUserID);收件人为 NULL 的老行最后按 id 补。
+    expect(tx.notification.findMany.mock.calls.map(([args]) => args)).toEqual([
+      {
+        where: { systemAnnouncementID: 'a', toUserID: { not: null } },
+        select: { id: true, toUserID: true },
+        orderBy: { toUserID: 'asc' },
+        take: 1000,
+      },
+      expect.objectContaining({
+        where: { systemAnnouncementID: 'a', toUserID: { gt: 'u-0999' } },
+      }),
+      expect.objectContaining({
+        where: { systemAnnouncementID: 'a', toUserID: { gt: 'u-1999' } },
+      }),
+      {
+        where: { systemAnnouncementID: 'a', toUserID: null },
+        select: { id: true, toUserID: true },
+        orderBy: { id: 'asc' },
+        take: 1000,
+      },
+    ]);
+  });
+
+  it('propagates the committed announcement body, so a later concurrent edit wins everywhere', async () => {
+    const { service, tx } = harness({
+      current: { content: 'Body from a newer edit', deletedAt: null },
+    });
+    await service.editAnnouncement('admin', 'a', {
+      title: 'Title',
+      content: 'Older body',
+    });
+    expect(tx.notification.updateMany).toHaveBeenCalledWith({
+      where: { id: { in: ['n'] }, deleted: false },
+      data: { content: 'Body from a newer edit' },
+    });
+  });
+
+  it('stops propagating an edit once the announcement has been deleted', async () => {
+    const { service, tx } = harness({
+      rows: MANY_ROWS,
+      current: { content: 'New body', deletedAt: new Date() },
+    });
+    await service.editAnnouncement('admin', 'a', {
+      title: 'Title',
+      content: 'New body',
+    });
+    expect(tx.notification.updateMany).not.toHaveBeenCalled();
+    expect(tx.notification.findMany).toHaveBeenCalledTimes(1);
+  });
+
+  it('deletes recipient rows in batches first and retires the announcement last', async () => {
+    const { service, tx, events } = harness({ rows: MANY_ROWS });
+    await service.deleteAnnouncement('admin', 'a');
+
+    const txs = transactions(events);
+    const batches = txs.filter((statements) =>
+      statements.includes('notification.updateMany'),
+    );
+    expect(batches).toHaveLength(4);
+    for (const batch of batches) {
+      expect(batch).toEqual([
+        'lock',
+        'notification.page',
+        'notification.updateMany',
+        'outbox.updateMany',
+        'delivery.updateMany',
+      ]);
+    }
+    // 收件人数据处理完之后,才在一个短事务里复核、下线公告并写审计 —— 中途失败时公告
+    // 仍然可删,重试会把剩下的批次做完,不会卡在「公告已删、通知还在」的状态。
+    expect(txs[txs.length - 1]).toEqual([
+      'lock',
+      'announcement.check',
+      'announcement.update',
+      'audit',
+    ]);
+    expect(new Set(updatedIds(tx.notification.updateMany))).toEqual(
+      new Set(MANY_ROWS.map((row) => row.id)),
+    );
+    expect(updatedIds(tx.notification.updateMany)).toHaveLength(
+      MANY_ROWS.length,
+    );
+    for (const [args] of tx.notificationPushDelivery.updateMany.mock
+      .calls as any[][]) {
+      expect(args.where.outbox.notificationID.in.length).toBeLessThanOrEqual(
+        1000,
+      );
+    }
+  });
+});
+
+describe('announcement fan-out mutex', () => {
+  const createdAt = new Date('2026-07-29T12:00:00.000Z');
+
+  function harness(lease: string | null | undefined) {
+    const recipients = Array.from({ length: 501 }, (_, index) => ({
+      id: `user-${String(index).padStart(3, '0')}`,
+    }));
+    const prisma: Record<string, any> = {
+      $queryRaw: jest.fn().mockResolvedValue([{ acquired: true }]),
+      systemAnnouncement: {
+        upsert: jest.fn().mockResolvedValue({
+          id: 'announcement-1',
+          requestFingerprint: 'admin-1:Maintenance',
+          createdAt,
+          auditRecordedAt: null,
+          fanoutCompletedAt: null,
+        }),
+        updateMany: jest.fn().mockResolvedValue({ count: 1 }),
+        findUniqueOrThrow: jest.fn(),
+      },
+      user: {
+        findMany: jest
+          .fn()
+          .mockResolvedValueOnce(recipients.slice(0, 500))
+          .mockResolvedValueOnce(recipients.slice(500))
+          .mockResolvedValue([]),
+      },
+      notification: {
+        createManyAndReturn: jest.fn(async ({ data }) =>
+          data.map((row: { toUserID: string }) => ({
+            id: `n-${row.toUserID}`,
+            toUserID: row.toUserID,
+          })),
+        ),
+        count: jest.fn().mockResolvedValue(501),
+      },
+      notificationPushOutbox: { createMany: jest.fn() },
+    };
+    prisma.$transaction = jest.fn(async (fn: any) => fn(prisma));
+    const redis = {
+      tryAcquireLease: jest.fn().mockResolvedValue(lease),
+      renewLease: jest.fn().mockResolvedValue(true),
+      releaseLease: jest.fn().mockResolvedValue(undefined),
+    };
+    const realtime = {
+      broadcastSystemNotificationUnreadToRecipients: jest.fn(),
+    };
+    const service = new NotificationService(
+      prisma as any,
+      realtime as any,
+      undefined,
+      { recordStrict: jest.fn() } as any,
+      redis as any,
+    );
+    return { prisma, redis, service };
+  }
+
+  const publish = (service: NotificationService) =>
+    service.publishSystemAnnouncement(
+      'admin-1',
+      { content: 'Maintenance' },
+      'announcement-request-1',
+    );
+
+  afterEach(() => {
+    jest.restoreAllMocks();
+  });
+
+  // 改动前:外层 $transaction(timeout 600_000)只为持有 pg_try_advisory_xact_lock,
+  // 扇出期间(最长 10 分钟)占着一个 idle in transaction 的连接。
+  it('holds the fan-out mutex as a Redis lease, not an open database transaction', async () => {
+    const { prisma, redis, service } = harness('lease-token');
+
+    await expect(publish(service)).resolves.toEqual({ createdCount: 501 });
+
+    expect(redis.tryAcquireLease).toHaveBeenCalledWith(
+      'job-lease:system-announcement-fanout',
+      60_000,
+    );
+    expect(redis.releaseLease).toHaveBeenCalledWith(
+      'job-lease:system-announcement-fanout',
+      'lease-token',
+    );
+    expect(prisma.$queryRaw).not.toHaveBeenCalled();
+    for (const call of prisma.$transaction.mock.calls) {
+      expect(call[1]).toBeUndefined();
+    }
+    expect(prisma.notification.createManyAndReturn).toHaveBeenCalledTimes(2);
+  });
+
+  it('rejects with 429 while another replica holds the lease', async () => {
+    const { prisma, service } = harness(null);
+
+    await expect(publish(service)).rejects.toMatchObject({ status: 429 });
+    expect(prisma.systemAnnouncement.upsert).not.toHaveBeenCalled();
+    expect(prisma.$transaction).not.toHaveBeenCalled();
+  });
+
+  // Redis 未配置 / 这一刻答不上来:退回原来的数据库锁,互斥不弱于改动前。
+  it('falls back to the database advisory lock when Redis cannot answer', async () => {
+    const { prisma, service } = harness(undefined);
+
+    await expect(publish(service)).resolves.toEqual({ createdCount: 501 });
+    expect(prisma.$queryRaw).toHaveBeenCalledTimes(1);
+    expect(prisma.$transaction).toHaveBeenCalledWith(expect.any(Function), {
+      maxWait: 5_000,
+      timeout: 600_000,
+    });
+  });
+
+  it('falls back to the database advisory lock when Redis is not wired in', async () => {
+    const { prisma } = harness(undefined);
+    const service = new NotificationService(
+      prisma as any,
+      { broadcastSystemNotificationUnreadToRecipients: jest.fn() } as any,
+      undefined,
+      { recordStrict: jest.fn() } as any,
+    );
+    prisma.$queryRaw.mockResolvedValueOnce([{ acquired: false }]);
+
+    await expect(publish(service)).rejects.toMatchObject({ status: 429 });
+    expect(prisma.systemAnnouncement.upsert).not.toHaveBeenCalled();
+  });
+
+  it('stops before the next batch once the lease can no longer be renewed', async () => {
+    const { prisma, service } = harness('lease-token');
+    const startedAt = Date.now();
+    const clock = jest.spyOn(Date, 'now').mockReturnValue(startedAt);
+    prisma.notification.createManyAndReturn.mockImplementationOnce(
+      async ({ data }: { data: Array<{ toUserID: string }> }) => {
+        // 第一批写完之后租约已过期(续租没成功):不能再开下一批。
+        clock.mockReturnValue(startedAt + 120_000);
+        return data.map((row) => ({
+          id: `n-${row.toUserID}`,
+          toUserID: row.toUserID,
+        }));
+      },
+    );
+
+    await expect(publish(service)).rejects.toMatchObject({ status: 503 });
+    expect(prisma.user.findMany).toHaveBeenCalledTimes(1);
+    expect(prisma.systemAnnouncement.updateMany).not.toHaveBeenCalled();
+  });
+});
+
+describe('push token registration connection usage', () => {
+  const dto = {
+    token: 'ExponentPushToken[abc]',
+    platform: 'ios',
+    provider: 'expo',
+  } as const;
+
+  function harness() {
+    const order: string[] = [];
+    const step = (name: string, value: unknown) => async () => {
+      order.push(name);
+      return value;
+    };
+    const tx = {
+      $executeRaw: jest.fn(step('lock', 1)),
+      refreshToken: {
+        findUnique: jest.fn(
+          step('session', {
+            userId: 'user-1',
+            audience: 'APP',
+            deviceKey: 'device-1',
+            familyId: 'family-1',
+            expiredAt: new Date(Date.now() + 60_000),
+            revokedAt: new Date(),
+            revocationReason: 'ROTATED',
+          }),
+        ),
+        findFirst: jest.fn(step('live-session', { id: 'live' })),
+      },
+      trustedDevice: {
+        findUnique: jest.fn(step('trusted-device', { revokedAt: null })),
+      },
+      devicePushToken: {
+        updateMany: jest.fn(step('claim', { count: 0 })),
+        create: jest.fn(step('create', { id: 'row' })),
+        findMany: jest.fn(step('excess', [{ id: 'old-row' }])),
+        deleteMany: jest.fn(step('prune', { count: 1 })),
+      },
+    };
+    const untouched = () => ({
+      refreshToken: { findUnique: jest.fn(), findFirst: jest.fn() },
+      trustedDevice: { findUnique: jest.fn() },
+      devicePushToken: {
+        updateMany: jest.fn(),
+        create: jest.fn(),
+        findMany: jest.fn(),
+        deleteMany: jest.fn(),
+      },
+    });
+    const prisma = {
+      ...untouched(),
+      $transaction: jest.fn(async (fn: any) => fn(tx)),
+    };
+    const service = new NotificationService(prisma as any, {} as any);
+    return { tx, prisma, order, service };
+  }
+
+  // 改动前:事务占一个连接持有 auth_session 锁,里面约 8 条语句却走 this.prisma,
+  // 每条再从池里借第二个连接。现在全部走持锁的那个事务连接。
+  it('runs every registration statement on the transaction connection that holds the session lock', async () => {
+    const { tx, prisma, order, service } = harness();
+
+    await expect(
+      service.registerPushToken('user-1', dto, 'session-1'),
+    ).resolves.toEqual({ deviceBound: true });
+
+    expect(order).toEqual([
+      'lock',
+      'session',
+      'live-session',
+      'trusted-device',
+      'claim',
+      'create',
+      'excess',
+      'prune',
+    ]);
+    expect(tx.devicePushToken.deleteMany).toHaveBeenCalledWith({
+      where: { id: { in: ['old-row'] } },
+    });
+    for (const delegate of [
+      prisma.refreshToken,
+      prisma.trustedDevice,
+      prisma.devicePushToken,
+    ]) {
+      for (const method of Object.values(delegate)) {
+        expect(method).not.toHaveBeenCalled();
+      }
+    }
+  });
+
+  it('issues nothing after a lost token race aborts the transaction', async () => {
+    const { tx, service } = harness();
+    tx.devicePushToken.create.mockRejectedValueOnce(
+      Object.assign(new Error('unique'), { code: 'P2002' }),
+    );
+
+    await expect(
+      service.registerPushToken('user-1', dto, 'session-1'),
+    ).rejects.toBeInstanceOf(ForbiddenException);
+    expect(tx.devicePushToken.findMany).not.toHaveBeenCalled();
+    expect(tx.devicePushToken.deleteMany).not.toHaveBeenCalled();
+  });
+
+  // 仍然占 auth 的数据库名额:它在持有连接的状态下排队等 auth_session 锁,而锁的持有者
+  // (登录 / 刷新 / 设备信任)在锁内还要借嵌套连接。不限并发的话,同一账号的一串
+  // 登记请求就能占满连接池,让持锁者借不到连接 —— 正是名额要防的池死锁。
+  it('still shares the auth database work budget', async () => {
+    const { prisma, service } = harness();
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    prisma.$transaction.mockImplementation(async () => {
+      await gate;
+      return { deviceBound: false };
+    });
+
+    const calls = Array.from({ length: 4 }, () =>
+      service.registerPushToken('user-1', dto),
+    );
+    await new Promise((resolve) => setImmediate(resolve));
+    expect(prisma.$transaction).toHaveBeenCalledTimes(3);
+
+    release();
+    await Promise.all(calls);
+    expect(prisma.$transaction).toHaveBeenCalledTimes(4);
   });
 });

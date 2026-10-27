@@ -16,11 +16,7 @@ import {
   storagePublicObjectBasesFromConfig,
 } from 'src/utils/storage-url';
 import { runSerializableTransaction } from 'src/utils/prisma-tx';
-import {
-  decodeFeedCursor,
-  encodeFeedCursor,
-  feedCursorWhere,
-} from 'src/utils/feed-cursor';
+import { decodeFeedCursor, encodeFeedCursor } from 'src/utils/feed-cursor';
 import { resolveEffectiveMembershipLevel } from 'src/membership/membership.catalog';
 import {
   CreateTraceCommentDto,
@@ -43,6 +39,12 @@ import {
   traceCommentPreviewQuery,
   traceLikePreviewQuery,
 } from './trace-preview.query';
+import {
+  MomentFriendScopeRow,
+  TraceFeedPageRow,
+  momentFriendScopeQuery,
+  traceFeedPageQuery,
+} from './trace-feed.query';
 
 const TRACE_FEED_LIKE_PREVIEW_LIMIT = 20;
 const TRACE_FEED_COMMENT_PREVIEW_LIMIT = 20;
@@ -178,53 +180,56 @@ export class TraceService {
         };
       }
     } else {
-      const friendIds = await this.getAcceptedFriendIds(userId);
-      friendIdSet = new Set(friendIds);
+      const scope = await this.loadMomentFriendScope(userId);
+      friendIdSet = new Set(scope.friendIds);
       visibleUserIds = await this.filterMomentVisibleAuthorIds(
         userId,
-        [userId, ...friendIds],
+        [userId, ...scope.friendIds],
         friendIdSet,
+        scope.chatOnlyIds,
       );
     }
 
-    const whereBase = {
+    // offset 模式的 count 仍按原 where 计（IN 列表 + 可见性 OR），口径不变。
+    const countWhere = {
       deleted: false,
       fromID: authorId ? authorId : { in: visibleUserIds },
       // PRIVATE is excluded for everyone but the author. PUBLIC isn't creatable
       // via CreateTraceDto (FRIENDS_ONLY | PRIVATE only) but is honored here on
       // purpose, so legacy / other-origin PUBLIC rows still surface — do not
-      // drop the branch without a data backfill.
+      // drop the branch without a data backfill. traceFeedPageQuery 里是同一条件。
       OR: [
         { fromID: userId },
         { visibility: 'FRIENDS_ONLY' as const },
         { visibility: 'PUBLIC' as const },
       ],
     };
-    // (createdAt, id) tuple keyset — see feedCursorWhere for the semantics.
-    const where = cursor
-      ? { AND: [whereBase, feedCursorWhere(cursor)] }
-      : whereBase;
 
+    // 这一页的 id：每个作者沿 (fromID, createdAt, id) 索引各取前 N 条再合并（见
+    // trace-feed.query.ts），不再把所有好友的全部动态读出来排序。
     // Keyset fetches one extra row to decide `hasMore` without a count();
     // offset still returns an accurate `total` for the legacy page-number UI.
-    const [rows, total] = await Promise.all([
-      this.prisma.trace.findMany({
-        where,
-        // 点赞 / 评论预览不在这里嵌套 include：Prisma 7 对嵌套 take 不生成 LIMIT，
-        // 每条动态的全部点赞、全部评论都会被读出来。见 loadTracePreviews。
-        include: { from: TRACE_AUTHOR_SELECT },
-        orderBy: [{ createdAt: 'desc' }, { id: 'desc' }],
-        ...(useKeyset ? { take: limit + 1 } : { skip, take: limit }),
-      }),
+    const [pageRows, total] = await Promise.all([
+      this.prisma.$queryRaw<TraceFeedPageRow[]>(
+        traceFeedPageQuery({
+          viewerId: userId,
+          authorIds: authorId ? [authorId] : visibleUserIds,
+          cursor,
+          offset: skip,
+          take: useKeyset ? limit + 1 : limit,
+        }),
+      ),
       useKeyset
         ? Promise.resolve<number | null>(null)
-        : this.prisma.trace.count({ where }),
+        : this.prisma.trace.count({ where: countWhere }),
     ]);
 
     const hasMore = useKeyset
-      ? rows.length > limit
-      : skip + rows.length < (total ?? 0);
-    const traces = useKeyset ? rows.slice(0, limit) : rows;
+      ? pageRows.length > limit
+      : skip + pageRows.length < (total ?? 0);
+    const traces = await this.hydrateFeedTraces(
+      (useKeyset ? pageRows.slice(0, limit) : pageRows).map((row) => row.id),
+    );
 
     // Resolve the viewer's own like state from an authoritative query rather
     // than the truncated `likeStats` preview — a like outside the top-20 would
@@ -286,11 +291,12 @@ export class TraceService {
       throw new BadRequestException('Invalid timestamp');
     }
 
-    const friendIds = await this.getAcceptedFriendIds(userId);
+    const scope = await this.loadMomentFriendScope(userId);
     const visibleUserIds = await this.filterMomentVisibleAuthorIds(
       userId,
-      [userId, ...friendIds],
-      new Set(friendIds),
+      [userId, ...scope.friendIds],
+      new Set(scope.friendIds),
+      scope.chatOnlyIds,
     );
 
     return this.prisma.trace.count({
@@ -993,23 +999,34 @@ export class TraceService {
     };
   }
 
-  private async getAcceptedFriendIds(userId: string): Promise<string[]> {
-    const records = await this.prisma.friend.findMany({
-      where: {
-        OR: [{ userID: userId }, { friendID: userId }],
-        state: 'ACCEPTED',
-      },
-      select: { userID: true, friendID: true },
-      orderBy: { updatedAt: 'desc' },
-      take: TRACE_FRIEND_SCOPE_LIMIT,
-    });
-    return records.map((r) => (r.userID === userId ? r.friendID : r.userID));
+  /**
+   * feed / 新动态计数用的好友范围：已接受好友 id（按 updatedAt 倒序最多
+   * TRACE_FRIEND_SCOPE_LIMIT 个）与其中只给了 viewer CHAT_ONLY 的人，一次 Friend 读取
+   * （见 momentFriendScopeQuery）。此前是两次：先取好友 id，再拿最多 5000 个 id 的 IN
+   * 列表把同一批关系行读第二遍，只为看授权列。viewer 本人不进 chatOnlyIds —— 自己的
+   * 动态从不按这条规则隐藏。
+   */
+  private async loadMomentFriendScope(
+    viewerId: string,
+  ): Promise<{ friendIds: string[]; chatOnlyIds: Set<string> }> {
+    const rows = await this.prisma.$queryRaw<MomentFriendScopeRow[]>(
+      momentFriendScopeQuery(viewerId, TRACE_FRIEND_SCOPE_LIMIT),
+    );
+    return {
+      friendIds: rows.map((row) => row.friendId),
+      chatOnlyIds: new Set(
+        rows
+          .filter((row) => row.chatOnly && row.friendId !== viewerId)
+          .map((row) => row.friendId),
+      ),
+    };
   }
 
   private async filterMomentVisibleAuthorIds(
     viewerId: string,
     authorIds: string[],
     friendIdSet: Set<string>,
+    chatOnlyIds: Set<string>,
   ): Promise<string[]> {
     // One settings query for all authors instead of one per author (was an
     // O(friends) N+1 on every feed page).
@@ -1018,13 +1035,9 @@ export class TraceService {
     // Authors who marked the viewer "chat-only" hide their moments from the
     // viewer regardless of the author's global setting. The viewer's own posts
     // are never gated this way.
-    const chatOnlyAuthorIds = await this.getChatOnlyAuthorIdsToward(
-      viewerId,
-      authorIds,
-    );
     return authorIds.filter(
       (authorId) =>
-        !chatOnlyAuthorIds.has(authorId) &&
+        !chatOnlyIds.has(authorId) &&
         this.privacySettings.momentsVisibleFor(
           settingsByAuthor.get(authorId),
           authorId === viewerId,
@@ -1034,50 +1047,27 @@ export class TraceService {
   }
 
   /**
-   * Of the given authors, which ones granted the viewer only CHAT_ONLY access
-   * (so their moments must be hidden from the viewer). The viewer is never
-   * included even if passed in `authorIds`.
+   * 按 traceFeedPageQuery 给出的 id 与次序回填整行和作者资料，形状与原先
+   * trace.findMany({ include: { from } }) 一致。两次读取之间被软删的动态不再返回。
+   * 点赞 / 评论预览不在这里嵌套 include：Prisma 7 对嵌套 take 不生成 LIMIT，每条动态的
+   * 全部点赞、全部评论都会被读出来。见 loadTracePreviews。
    */
-  private async getChatOnlyAuthorIdsToward(
-    viewerId: string,
-    authorIds: string[],
-  ): Promise<Set<string>> {
-    const others = authorIds.filter((id) => id !== viewerId);
-    if (others.length === 0) {
-      return new Set();
-    }
-    const records = await this.prisma.friend.findMany({
-      where: {
-        state: 'ACCEPTED',
-        OR: [
-          { userID: { in: others }, friendID: viewerId },
-          { userID: viewerId, friendID: { in: others } },
-        ],
-      },
-      select: {
-        userID: true,
-        friendID: true,
-        permissionA: true,
-        permissionB: true,
-      },
+  private async hydrateFeedTraces(ids: string[]) {
+    if (ids.length === 0) return [];
+    const rows = await this.prisma.trace.findMany({
+      where: { id: { in: ids }, deleted: false },
+      include: { from: TRACE_AUTHOR_SELECT },
     });
-    const chatOnly = new Set<string>();
-    for (const record of records) {
-      // The author is whichever side isn't the viewer; read that side's grant.
-      if (record.userID === viewerId) {
-        if (record.permissionB === 'CHAT_ONLY') {
-          chatOnly.add(record.friendID);
-        }
-      } else if (record.permissionA === 'CHAT_ONLY') {
-        chatOnly.add(record.userID);
-      }
-    }
-    return chatOnly;
+    const byId = new Map(rows.map((row) => [row.id, row]));
+    return ids.flatMap((id) => {
+      const row = byId.get(id);
+      return row ? [row] : [];
+    });
   }
 
   /**
    * viewer 与某一个作者之间的已接受好友关系（单点查询，正常一行、脏数据最多两行）。
-   * chatOnly 与 getChatOnlyAuthorIdsToward 同口径：读作者那一侧的授权（作者在 userID
+   * chatOnly 与 loadMomentFriendScope 同口径：读作者那一侧的授权（作者在 userID
    * 一侧看 permissionA，在 friendID 一侧看 permissionB），任一行是 CHAT_ONLY 即算。
    */
   private async getFriendshipToward(

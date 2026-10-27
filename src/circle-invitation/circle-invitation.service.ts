@@ -1,4 +1,3 @@
-import { withDatabaseWorkBudget } from '../utils/database-work-budget';
 import { businessMetrics } from 'src/metrics/business-metrics';
 import {
   BadRequestException,
@@ -55,6 +54,32 @@ const VERIFICATION_CARD_GRACE_MS = 2 * 60 * 1000;
 // 否则积压指标会和实际放弃行为分叉（与 GIFT_CARD_MAX_ATTEMPTS 同理）。
 export const VERIFICATION_CARD_MAX_ATTEMPTS = 36;
 const VERIFICATION_CARD_BATCH = 50;
+
+/**
+ * 同意制邀请投递的认领租约(CircleInvitation.consentNoticeClaimedAt)。投递 IO 正常
+ * 一秒内做完;认领者中途崩溃时,过期后每分钟的补投照常接手。
+ */
+const CONSENT_DELIVERY_LEASE_MS = 2 * 60 * 1000;
+/** 见 runInvitationTransaction。 */
+const INVITATION_TX_MAX_ATTEMPTS = 8;
+
+type ConsentDeliveryClaim = {
+  claimedAt: Date;
+  inviterID: string;
+  applicantID: string;
+  circleID: string;
+  circleName: string;
+};
+
+/**
+ * 写点复核不通过:ineligible = 关系/资格/邀请状态变了(作废,不重试);
+ * lost = 认领已不是自己的(租约过期被别人接手,或已投递完),什么都不做。
+ */
+class ConsentDeliveryAborted extends Error {
+  constructor(readonly reason: 'ineligible' | 'lost') {
+    super(`circle consent delivery aborted: ${reason}`);
+  }
+}
 
 type CircleInvitationNotificationData = {
   toUserID: string;
@@ -117,10 +142,13 @@ export class CircleInvitationService {
    * 失败必须排进对账的重试队列,不能只记日志:对账扫的是
    * `CircleMember.updatedAt` 的 2 分钟窗口,一次超过两分钟的数据库故障过后,
    * 这次激活早已滑出窗口 —— 没有任何机制会回来补,新成员的聊天座位就一直缺着。
+   *
+   * 走按圈子合并的入口:同一圈子并发入圈时只跑一次同步(期间的请求并成结束后的
+   * 一次补跑),不再每次激活各占一个池连接排在对账锁后面。
    */
   private syncCircleSeatsSoon(circleID: string): void {
     void this.chatCircleSync
-      .ensureCircleConversation(circleID)
+      .syncCircleSeatsCoalesced(circleID)
       .catch((error) => {
         this.chatCircleSync.scheduleRetry(circleID);
         this.logger.warn(
@@ -192,109 +220,265 @@ export class CircleInvitationService {
     }
   }
 
-  private async deliverConsentInvitation(id: string) {
-    return withDatabaseWorkBudget(this.prisma, () =>
-      this.prisma.$transaction(
-        async (tx) => {
-          await tx.$executeRaw`SELECT pg_advisory_xact_lock(hashtextextended(${`circle_consent_delivery:${id}`}, 0))`;
-
-          const invitation = await this.loadInvitation(id, tx);
-          if (
-            !invitation.consentNoticeRequired ||
-            invitation.consentNoticeDeliveredAt ||
-            invitation.status !== 'INVITED'
-          )
-            return;
-          await this.memberLock.lock(tx, invitation.circleID, [
-            invitation.inviterID,
-            invitation.applicantID,
-          ]);
-          await this.memberLock.lockPolicy(tx, invitation.circleID);
-          await lockUserRelationshipState(tx, [
-            invitation.inviterID,
-            invitation.applicantID,
-          ]);
-          const [circle, membership, blocked, friends] = await Promise.all([
-            tx.circle.findFirst({
-              where: { id: invitation.circleID, deleted: false },
-              select: { id: true, memberCanInvite: true },
-            }),
-            tx.circleMember.findUnique({
-              where: {
-                userID_circleID: {
-                  userID: invitation.inviterID,
-                  circleID: invitation.circleID,
-                },
-              },
-            }),
-            tx.block.findFirst({
-              where: {
-                OR: [
-                  {
-                    blockerID: invitation.inviterID,
-                    blockedID: invitation.applicantID,
-                  },
-                  {
-                    blockerID: invitation.applicantID,
-                    blockedID: invitation.inviterID,
-                  },
-                ],
-              },
-              select: { id: true },
-            }),
-            this.areFriends(invitation.inviterID, invitation.applicantID, tx),
-          ]);
-          const privacyAllowed =
-            await this.privacySettings.canBeInvitedToGroupOrCircle(
-              invitation.applicantID,
-              friends,
-            );
-          if (
-            !circle ||
-            membership?.status !== 'ACTIVE' ||
-            blocked ||
-            !privacyAllowed ||
-            (circle.memberCanInvite === false &&
-              !['OWNER', 'ADMIN'].includes(membership.role))
-          ) {
-            await tx.circleInvitation.updateMany({
-              where: { id, status: 'INVITED' },
-              data: {
-                status: 'CANCELLED',
-                consentNoticeDeliveredAt: new Date(),
-              },
-            });
-            return;
-          }
-          await this.notificationService.deliverCircleConsentNotification({
-            id,
-            toUserID: invitation.applicantID,
-            fromUserID: invitation.inviterID,
-            circleId: invitation.circleID,
-            content: `邀请你加入「${invitation.circle.name}」`,
-          });
-          const direct = await this.chatService.getOrCreateDirectConversation(
-            invitation.inviterID,
-            invitation.applicantID,
-          );
-          await this.chatMessages.insertServerMessage(direct.id, {
-            senderID: invitation.inviterID,
-            type: 'group-invitation',
-            content: {
-              circleInvitationId: id,
-              groupName: invitation.circle.name,
-            },
-            clientMessageId: `circle_invitation_${id}`,
-            rebroadcastOnReplay: true,
-          });
-          await tx.circleInvitation.update({
-            where: { id },
-            data: { consentNoticeDeliveredAt: new Date() },
-          });
+  /**
+   * 同意制邀请的站内通知 + 私聊邀请卡片。
+   *
+   * 原来整段在一个持锁事务里做完(maxWait 10s / timeout 30s):拿着双方的成员锁、
+   * 圈子策略锁、call-user:* 关系锁,在事务里调通知、建私聊会话(要 fetchSockets)、
+   * 发卡片(自带事务和广播)—— 这些都走 this.prisma,事务占一个连接的同时再借连接;
+   * 外面还套着登录共用的 3 个数据库工作名额。
+   *
+   * 现在分两段:
+   * 1. 短事务(claimConsentDelivery):校验 + 认领。失格就像原来一样作废;合格就把
+   *    consentNoticeClaimedAt 记成现在,提交。
+   * 2. 提交之后做 IO;成功写 consentNoticeDeliveredAt 并清掉认领。失败清掉认领再抛,
+   *    由每分钟的补投(consentNoticeAttempts)重试。
+   *
+   * 重试不会重复:通知行的 id 就是邀请 id(upsert,推送 outbox 按 notificationID 唯一
+   * upsert),卡片带 clientMessageId `circle_invitation_${id}`(会话行锁内查重复用)。
+   * 并发的两个投递者(请求内触发 + 补投)由认领租约挡掉后来的那个。
+   */
+  private async deliverConsentInvitation(id: string): Promise<void> {
+    const claim = await this.claimConsentDelivery(id);
+    if (!claim) return;
+    // 两个写点各自在短事务里、拿着这一对人的 call-user:* 锁复核后才写(见
+    // recheckConsentDelivery):拉黑/删好友/改隐私拿的是同一对锁,所以它们返回成功
+    // 之后不可能再有新的通知或卡片落库。IO 本身(fetchSockets、广播)仍不持锁。
+    const guard = (tx: Prisma.TransactionClient) =>
+      this.recheckConsentDelivery(tx, id, claim);
+    try {
+      await this.notificationService.deliverCircleConsentNotification(
+        {
+          id,
+          toUserID: claim.applicantID,
+          fromUserID: claim.inviterID,
+          circleId: claim.circleID,
+          content: `邀请你加入「${claim.circleName}」`,
         },
-        { maxWait: 10000, timeout: 30000 },
-      ),
+        { guard },
+      );
+      const direct = await this.chatService.getOrCreateDirectConversation(
+        claim.inviterID,
+        claim.applicantID,
+      );
+      await this.chatMessages.insertServerMessage(
+        direct.id,
+        {
+          senderID: claim.inviterID,
+          type: 'group-invitation',
+          content: {
+            circleInvitationId: id,
+            groupName: claim.circleName,
+          },
+          clientMessageId: `circle_invitation_${id}`,
+          rebroadcastOnReplay: true,
+        },
+        { guard },
+      );
+    } catch (error) {
+      if (error instanceof ConsentDeliveryAborted) {
+        // 复核不过是终局,不交给补投重试:按认领时失格的同一口径作废。
+        if (error.reason === 'ineligible')
+          await this.prisma.circleInvitation.updateMany({
+            where: {
+              id,
+              status: 'INVITED',
+              consentNoticeClaimedAt: claim.claimedAt,
+            },
+            data: {
+              status: 'CANCELLED',
+              consentNoticeDeliveredAt: new Date(),
+              consentNoticeClaimedAt: null,
+            },
+          });
+        await this.releaseConsentClaim(id, claim);
+        return;
+      }
+      // 放掉自己的认领,下一轮补投不必等租约过期。放不掉也无妨:租约到期自然失效。
+      await this.releaseConsentClaim(id, claim).catch(() => undefined);
+      throw error;
+    }
+    await this.prisma.$executeRaw`
+      UPDATE "CircleInvitation"
+      SET "consentNoticeDeliveredAt" = ${new Date()},
+          "consentNoticeClaimedAt" = NULL
+      WHERE "id" = ${id} AND "consentNoticeDeliveredAt" IS NULL
+    `;
+  }
+
+  private async releaseConsentClaim(
+    id: string,
+    claim: ConsentDeliveryClaim,
+  ): Promise<void> {
+    await this.prisma.$executeRaw`
+      UPDATE "CircleInvitation" SET "consentNoticeClaimedAt" = NULL
+      WHERE "id" = ${id} AND "consentNoticeClaimedAt" = ${claim.claimedAt}
+    `;
+  }
+
+  /**
+   * 写点复核(在通知/卡片写入的同一个短事务里执行,抛 ConsentDeliveryAborted 则不写)。
+   *
+   * 只锁这两个人:call-user:* 对锁(与拉黑、删好友、改隐私、invite 同一把,同一
+   * localeCompare 序),再给邀请行加 FOR NO KEY UPDATE(拒绝/撤邀是对这一行的 UPDATE,
+   * 会排在写入之后;不挡通知外键的 FOR KEY SHARE)。加锁顺序:卡片写点是「会话行 →
+   * call-user → 邀请行」,通知写点是「call-user → 邀请行」,与认领事务、invite /
+   * respond 的「…→ call-user → 邀请行」同序。成员资格与圈子开关按认领时的口径重读,
+   * 但不取成员锁/策略锁(那样写点就不短了):退圈/关成员邀请与写点之间只缩窄、不互斥。
+   */
+  private async recheckConsentDelivery(
+    tx: Prisma.TransactionClient,
+    id: string,
+    claim: ConsentDeliveryClaim,
+  ): Promise<void> {
+    await lockUserRelationshipState(tx, [claim.inviterID, claim.applicantID]);
+    const [row] = await tx.$queryRaw<
+      Array<{ invited: boolean; claimed: boolean }>
+    >`
+      SELECT "status" = 'INVITED' AS "invited",
+             "consentNoticeClaimedAt" IS NOT DISTINCT FROM ${claim.claimedAt} AS "claimed"
+      FROM "CircleInvitation" WHERE "id" = ${id}
+      FOR NO KEY UPDATE
+    `;
+    if (!row?.claimed) throw new ConsentDeliveryAborted('lost');
+    if (!row.invited || !(await this.isConsentDeliverable(tx, claim)))
+      throw new ConsentDeliveryAborted('ineligible');
+  }
+
+  /**
+   * 同意制邀请此刻还能不能投:圈子在、邀请人仍是 ACTIVE 成员(成员邀请关掉时须是
+   * 圈主/管理员)、双方无拉黑、申请人的入群邀请隐私放行。认领与两个写点共用这一份口径。
+   */
+  private async isConsentDeliverable(
+    tx: Prisma.TransactionClient,
+    invitation: { circleID: string; inviterID: string; applicantID: string },
+  ): Promise<boolean> {
+    const [circle, membership, blocked, friends] = await Promise.all([
+      tx.circle.findFirst({
+        where: { id: invitation.circleID, deleted: false },
+        select: { id: true, memberCanInvite: true },
+      }),
+      tx.circleMember.findUnique({
+        where: {
+          userID_circleID: {
+            userID: invitation.inviterID,
+            circleID: invitation.circleID,
+          },
+        },
+      }),
+      tx.block.findFirst({
+        where: {
+          OR: [
+            {
+              blockerID: invitation.inviterID,
+              blockedID: invitation.applicantID,
+            },
+            {
+              blockerID: invitation.applicantID,
+              blockedID: invitation.inviterID,
+            },
+          ],
+        },
+        select: { id: true },
+      }),
+      this.areFriends(invitation.inviterID, invitation.applicantID, tx),
+    ]);
+    // 隐私读也走 tx:原来走 this.prisma,持锁事务占着一个连接时再借一个。
+    const privacyAllowed =
+      await this.privacySettings.canBeInvitedToGroupOrCircle(
+        invitation.applicantID,
+        friends,
+        tx,
+      );
+    return !(
+      !circle ||
+      membership?.status !== 'ACTIVE' ||
+      blocked ||
+      !privacyAllowed ||
+      (circle.memberCanInvite === false &&
+        !['OWNER', 'ADMIN'].includes(membership.role))
     );
+  }
+
+  /**
+   * 投递前的校验 + 认领(短事务,不做任何 IO)。返回 null = 不必投:已投/不需要/
+   * 已离开 INVITED/别人正持有未过期的认领/失格(失格时就地作废,口径与原来一致)。
+   *
+   * 获锁顺序与原来相同:先按邀请串行化投递者,再成员锁 → 策略锁 → 关系锁,最后才写
+   * 邀请行(与 invite / respond「先锁后写邀请行」同序,不成环)。
+   */
+  private async claimConsentDelivery(
+    id: string,
+  ): Promise<ConsentDeliveryClaim | null> {
+    return this.prisma.$transaction(
+      async (tx) => {
+        await tx.$executeRaw`SELECT pg_advisory_xact_lock(hashtextextended(${`circle_consent_delivery:${id}`}, 0))`;
+
+        const invitation = await this.loadInvitation(id, tx);
+        if (
+          !invitation.consentNoticeRequired ||
+          invitation.consentNoticeDeliveredAt ||
+          invitation.status !== 'INVITED'
+        )
+          return null;
+        const now = new Date();
+        const [lease] = await tx.$queryRaw<Array<{ busy: boolean }>>`
+          SELECT "consentNoticeClaimedAt" IS NOT NULL
+             AND "consentNoticeClaimedAt" > ${new Date(now.getTime() - CONSENT_DELIVERY_LEASE_MS)} AS "busy"
+          FROM "CircleInvitation" WHERE "id" = ${id}
+        `;
+        if (lease?.busy) return null;
+
+        await this.memberLock.lock(tx, invitation.circleID, [
+          invitation.inviterID,
+          invitation.applicantID,
+        ]);
+        await this.memberLock.lockPolicy(tx, invitation.circleID);
+        await lockUserRelationshipState(tx, [
+          invitation.inviterID,
+          invitation.applicantID,
+        ]);
+        if (!(await this.isConsentDeliverable(tx, invitation))) {
+          await tx.circleInvitation.updateMany({
+            where: { id, status: 'INVITED' },
+            data: {
+              status: 'CANCELLED',
+              consentNoticeDeliveredAt: new Date(),
+            },
+          });
+          return null;
+        }
+        const claimed = await tx.$executeRaw`
+          UPDATE "CircleInvitation" SET "consentNoticeClaimedAt" = ${now}
+          WHERE "id" = ${id} AND "status" = 'INVITED'
+            AND "consentNoticeDeliveredAt" IS NULL
+        `;
+        if (claimed !== 1) return null;
+        return {
+          claimedAt: now,
+          inviterID: invitation.inviterID,
+          applicantID: invitation.applicantID,
+          circleID: invitation.circleID,
+          circleName: invitation.circle.name,
+        };
+      },
+      // 事务里只剩校验(锁可能要等一个在途的批量邀请),不再给 IO 留 30 秒。
+      { maxWait: 10_000, timeout: 10_000 },
+    );
+  }
+
+  /**
+   * 批量邀请提交后逐个投递:一次只占一个连接,不在提交瞬间并发打出最多 100 个投递。
+   * 单个失败只记日志,由每分钟的补投接手。
+   */
+  private deliverConsentInvitationsInBackground(ids: string[]): void {
+    void (async () => {
+      for (const id of ids) {
+        await this.deliverConsentInvitation(id).catch(() =>
+          this.logger.warn('circle consent invitation queued for retry'),
+        );
+      }
+    })();
   }
 
   @TrackedCron(
@@ -330,23 +514,96 @@ export class CircleInvitationService {
     }
   }
 
+  /**
+   * 群邀请批量接口(GroupService.inviteGroupMembers,DTO 上限 100 人):整批一个
+   * Serializable 事务,任一目标失败整批回滚、报排在最前面的那个目标的错误 —— 这条
+   * 原子语义不变,只缩短事务:
+   * - 事务外的好友/隐私快速预检在事务之前一次 IN 查完(原来每个目标各查一遍,走
+   *   this.prisma:事务占着一个连接时每个目标再借一个);预检不过的目标仍在它按
+   *   排序轮到的位置抛同一个错误,错误优先级与原来一致;
+   * - 不再逐个回读邀请 DTO(批量接口返回 void,原来每个目标在事务里多 5~6 条查询)。
+   * 事务内的权威复核(锁后重读成员、拉黑、好友、隐私)一条没少。
+   */
   async inviteBatch(
     inviterId: string,
     applicantIds: string[],
     circleId: string,
   ): Promise<void> {
-    const invitations = await this.runInvitationTransaction(async (tx) => {
-      const rows: InvitationDto[] = [];
-      for (const applicantId of [...new Set(applicantIds)].sort())
-        rows.push(
-          await this.invite(inviterId, applicantId, circleId, undefined, tx),
+    // Code-unit ordering matches the lock services; the batch locks pairs in this order.
+    // eslint-disable-next-line sonarjs/no-alphabetical-sort
+    const targets = [...new Set(applicantIds)].sort();
+    if (targets.length === 0) return;
+    const allowed = await this.prefetchInvitePermission(inviterId, targets);
+    const invitationIds = await this.runInvitationTransaction(async (tx) => {
+      const ids: string[] = [];
+      for (const applicantId of targets) {
+        if (!allowed.get(applicantId)) throw this.inviteNotAllowed();
+        const { created } = await this.inviteInTransaction(
+          tx,
+          inviterId,
+          applicantId,
+          circleId,
         );
-      return rows;
+        ids.push(created.id);
+      }
+      return ids;
     });
-    for (const row of invitations)
-      void this.deliverConsentInvitation(row.id).catch(() =>
-        this.logger.warn('circle consent invitation queued for retry'),
+    this.deliverConsentInvitationsInBackground(invitationIds);
+  }
+
+  /**
+   * invite() 事务外那道隐私快速预检的批量版:一次查好友、一次查隐私设置,判定仍交给
+   * PrivacySettingsService(预取的行按 getSettings 的读口径喂回去,规则不在这里重写)。
+   * 按顺序查,同一时刻只占一个连接。
+   */
+  private async prefetchInvitePermission(
+    inviterId: string,
+    applicantIds: string[],
+  ): Promise<Map<string, boolean>> {
+    const friendRows = await this.prisma.friend.findMany({
+      where: {
+        state: 'ACCEPTED',
+        OR: [
+          { userID: inviterId, friendID: { in: applicantIds } },
+          { userID: { in: applicantIds }, friendID: inviterId },
+        ],
+      },
+      select: { userID: true, friendID: true },
+    });
+    const friends = new Set(
+      friendRows.map((row) =>
+        row.userID === inviterId ? row.friendID : row.userID,
+      ),
+    );
+    const settings = await this.prisma.userPrivacySetting.findMany({
+      where: { userID: { in: applicantIds } },
+    });
+    const settingsByUser = new Map(settings.map((row) => [row.userID, row]));
+    const prefetched = {
+      userPrivacySetting: {
+        findUnique: ({ where }: { where: { userID: string } }) =>
+          Promise.resolve(settingsByUser.get(where.userID) ?? null),
+      },
+    } as unknown as Pick<Prisma.TransactionClient, 'userPrivacySetting'>;
+    const allowed = new Map<string, boolean>();
+    for (const applicantId of applicantIds) {
+      allowed.set(
+        applicantId,
+        await this.privacySettings.canBeInvitedToGroupOrCircle(
+          applicantId,
+          friends.has(applicantId),
+          prefetched,
+        ),
       );
+    }
+    return allowed;
+  }
+
+  private inviteNotAllowed(): ForbiddenException {
+    return new ForbiddenException({
+      message: 'User does not allow circle invites',
+      errorCode: CircleInvitationErrorCode.NotAllowed,
+    });
   }
 
   async invite(
@@ -364,7 +621,6 @@ export class CircleInvitationService {
       /** 圈子二维码加入：在共享策略锁内复核会话的二维码门禁。 */
       requireQrJoinEnabled?: boolean;
     },
-    transaction?: Prisma.TransactionClient,
   ): Promise<InvitationDto> {
     if (!opts?.applicantConsented) {
       // Pass real friendship status: a FRIENDS_ONLY invite permission must let
@@ -376,305 +632,12 @@ export class CircleInvitationService {
           applicantId,
           inviterIsFriend,
         );
-      if (!canInviteApplicant) {
-        throw new ForbiddenException({
-          message: 'User does not allow circle invites',
-          errorCode: CircleInvitationErrorCode.NotAllowed,
-        });
-      }
+      if (!canInviteApplicant) throw this.inviteNotAllowed();
     }
 
-    // 6. Create invitation; the inviter takes the first seat only if they may vouch
-    const operation = async (tx: Prisma.TransactionClient) => {
-      // CircleInvitation has no DB-level unique constraint, so serialize
-      // concurrent invites for the same (circle, applicant) pair with a
-      // transaction-scoped advisory lock, then re-check inside the lock.
-      await this.memberLock.lock(tx, circleId, [inviterId, applicantId]);
-      // 策略快照与 PATCH /circle/:id 串行化:成员锁两边不相交,不加这把的话
-      // 收严返回成功之后,一个读到旧策略的建单仍会提交。
-      await this.memberLock.lockPolicy(tx, circleId);
-      if (opts?.requireQrJoinEnabled) {
-        const conversation = await tx.chatConversation.findUnique({
-          where: { circleID: circleId },
-          select: { qrJoinEnabled: true },
-        });
-        if (conversation?.qrJoinEnabled === false) {
-          throw new ForbiddenException({
-            message: '该群已关闭二维码入群',
-            errorCode: ChatErrorCode.GroupQrJoinDisabled,
-          });
-        }
-      }
-      // Serializable isolation alone does not guarantee a retry for one
-      // read/write anti-dependency. Share the relationship/privacy lock used
-      // by block, unfriend and privacy writes before rechecking authorization.
-      await lockUserRelationshipState(tx, [inviterId, applicantId]);
-
-      const [inviterMembership, lockedMembership, circlePolicy] =
-        await Promise.all([
-          tx.circleMember.findUnique({
-            where: {
-              userID_circleID: { userID: inviterId, circleID: circleId },
-            },
-          }),
-          tx.circleMember.findUnique({
-            where: {
-              userID_circleID: { userID: applicantId, circleID: circleId },
-            },
-          }),
-          tx.circle.findFirst({
-            where: { id: circleId, deleted: false },
-            select: { requiredVerifierCount: true, memberCanInvite: true },
-          }),
-        ]);
-      if (!inviterMembership || inviterMembership.status !== 'ACTIVE') {
-        throw new ForbiddenException({
-          message: 'You must be an active member to invite others',
-          errorCode: CircleInvitationErrorCode.InviterNotMember,
-        });
-      }
-      if (lockedMembership?.status === 'ACTIVE') {
-        throw new ConflictException({
-          message: 'User is already a member of this circle',
-          errorCode: CircleErrorCode.AlreadyMember,
-        });
-      }
-
-      // 隐私开关只看 groupInvitePermission 与好友关系,从不看拉黑。默认值是
-      // EVERYONE,所以被拉黑的人照样能把对方拉进圈子 —— requiredVerifierCount=1
-      // 且邀请人是 OWNER/ADMIN 时更是「立刻入圈」。拉黑是比邀请权限更硬的
-      // 意愿表达,两个方向都拦;错误与隐私拒绝同一条,不泄露「他拉黑了你」。
-      //
-      // 顺序在成员校验之后:放在之前的话,任何登录用户都能拿这个接口当拉黑
-      // 探针 —— 被拉黑返回 NotAllowed、没拉黑返回 InviterNotMember,两者可分,
-      // 「不泄露」就成了空话。
-      //
-      // 读仍放在事务内；上面的共享 user lock 会与并发拉黑/解除好友严格
-      // 串行。仅靠 Serializable 不够：单个 rw 反依赖不一定形成 SSI 危险结构，
-      // 事务仍可能按「邀请在先、拉黑在后」的顺序一起提交。
-      const blocked = await tx.block.findFirst({
-        where: {
-          OR: [
-            { blockerID: applicantId, blockedID: inviterId },
-            { blockerID: inviterId, blockedID: applicantId },
-          ],
-        },
-        select: { id: true },
-      });
-      if (blocked) {
-        throw new ForbiddenException({
-          message: 'User does not allow circle invites',
-          errorCode: CircleInvitationErrorCode.NotAllowed,
-        });
-      }
-      if (!circlePolicy) {
-        throw new NotFoundException({
-          message: 'Circle not found',
-          errorCode: CircleErrorCode.NotFound,
-        });
-      }
-
-      const existingInvitation = await tx.circleInvitation.findFirst({
-        where: {
-          circleID: circleId,
-          applicantID: applicantId,
-          status: { in: ['INVITED', 'PENDING'] },
-        },
-      });
-      // 本人扫码是幂等的：签发人仍在圈、申请人尚未入圈、圈仍存在且双方未
-      // 拉黑后，已有 PENDING 就是本次请求的完成结果。容量、额度和成员邀请
-      // 开关都是仅影响“能否新建”的可变门禁，不能让一次成功申请的网络重试
-      // 突然变成失败。
-      if (
-        opts?.acceptedInvitationId &&
-        (existingInvitation?.id !== opts.acceptedInvitationId ||
-          existingInvitation.status !== 'INVITED')
-      )
-        throw new ConflictException('邀请已处理');
-      if (
-        existingInvitation &&
-        opts?.acceptedInvitationId &&
-        existingInvitation.createdAt.getTime() + 7 * 86400000 <= Date.now()
-      )
-        throw new ForbiddenException({
-          message: '邀请已过期',
-          errorCode: 'CHAT_GROUP_INVITATION_INVALID',
-        });
-      if (
-        existingInvitation &&
-        (!opts?.applicantConsented || existingInvitation.status === 'PENDING')
-      ) {
-        return {
-          created: existingInvitation,
-          admission: null,
-          requiresConsent: Boolean(existingInvitation.consentNoticeRequired),
-        };
-      }
-      // 宣传期严格形态:关掉成员邀请后,只有圈主/管理员还能拉人 ——
-      // requiredVerifierCount=1 时成员邀请等于「谁都能瞬间塞人进圈」,这道闸
-      // 必须在服务端(客户端藏入口挡不住直接打接口)。
-      if (
-        !circlePolicy.memberCanInvite &&
-        inviterMembership.role !== 'OWNER' &&
-        inviterMembership.role !== 'ADMIN'
-      ) {
-        throw new ForbiddenException({
-          message: 'Only the circle owner or admin can invite new members',
-          errorCode: CircleInvitationErrorCode.MemberInviteDisabled,
-        });
-      }
-      // applicantId 是被邀请人，任何拒绝原因都会回给 inviter —— 用第三方视角
-      // 调用，避免把对方的加入额度状态泄露给邀请人。
-      await this.admissionPolicy.assertCanApply(tx, circleId, applicantId, {
-        actor: 'third-party',
-      });
-
-      if (
-        existingInvitation &&
-        !(opts?.applicantConsented && existingInvitation.status === 'INVITED')
-      ) {
-        throw new ConflictException({
-          message: 'There is already a pending invitation for this user',
-          errorCode: CircleInvitationErrorCode.AlreadyPending,
-        });
-      }
-
-      // 自动首票 = 邀请人替被邀请人担保,所以担保资格必须与申请人自己挑的验证人
-      // 同规(好友 ∩ 本圈 ACTIVE 成员)—— 否则「验证人必须是好友」这条闸从
-      // invite 这条路就绕过去了:requiredVerifierCount=1 时等于任何成员都能把
-      // 任何把入圈邀请开成 EVERYONE(默认值)的陌生人瞬间塞进圈子。
-      //
-      // OWNER/ADMIN 例外:圈子的管理者本来就是这个圈的信任根,「管理员拉人进来
-      // 就能进」正是宣传期要的形态;要连管理员也收掉就把 memberCanInvite 关掉。
-      //
-      // 好友读放在 pair 锁内,与 addVerifier / respond 同口径(锁外那次只用于
-      // 隐私开关判定,不能拿来发席位)。
-      // 事务内的好友关系是唯一可信的那份:锁外那次只用于快速失败。
-      const stillFriends = await this.areFriends(inviterId, applicantId, tx);
-
-      // 隐私开关在事务内**无条件**复核一次,读也走 tx。
-      //
-      // 只在「好友关系变了」时才复核是不够的:对方完全可以保持好友关系不变,
-      // 只把 groupInvitePermission 从 EVERYONE/FRIENDS_ONLY 改成 NONE ——
-      // 那样锁外那个 true 照样过期,而一票圈会当场把人放进来。
-      //
-      // 读用 tx 而不是 this.prisma：共享 user lock 与这次复核必须属于同一
-      // 事务，才能一直持有到邀请提交；否则仍只是缩小竞态窗口。
-      if (!opts?.applicantConsented) {
-        const stillAllowed =
-          await this.privacySettings.canBeInvitedToGroupOrCircle(
-            applicantId,
-            stillFriends,
-            tx,
-          );
-        if (!stillAllowed) {
-          throw new ForbiddenException({
-            message: 'User does not allow circle invites',
-            errorCode: CircleInvitationErrorCode.NotAllowed,
-          });
-        }
-      }
-
-      const inviterCanVouch =
-        inviterMembership.role === 'OWNER' ||
-        inviterMembership.role === 'ADMIN' ||
-        stillFriends;
-
-      const invitationData = {
-        circleID: circleId,
-        applicantID: applicantId,
-        inviterID: inviterId,
-        approvedCount: inviterCanVouch ? 1 : 0,
-        requiredCount:
-          existingInvitation?.requiredCount ??
-          circlePolicy.requiredVerifierCount,
-        status: opts?.applicantConsented
-          ? ('PENDING' as const)
-          : ('INVITED' as const),
-        consentNoticeRequired:
-          !opts?.applicantConsented ||
-          Boolean(existingInvitation?.consentNoticeRequired),
-      };
-      const selection = {
-        id: true,
-        approvedCount: true,
-        requiredCount: true,
-        circle: { select: { groupID: true } },
-      } as const;
-      const created = existingInvitation
-        ? await tx.circleInvitation.update({
-            where: { id: existingInvitation.id, status: 'INVITED' },
-            data: invitationData,
-            select: selection,
-          })
-        : await tx.circleInvitation.create({
-            data: {
-              ...invitationData,
-              // 建单那一刻圈子策略的快照:之后调 requiredVerifierCount 不影响
-              // 在途申请(进度条/成结判定读的都是 invitation.requiredCount)。
-              requiredCount: circlePolicy.requiredVerifierCount,
-            },
-            // 事务里只读这几列；响应由 fetchInvitationDto 按窄 select 另读。此前
-            // include 了整行 circle 与 applicant / inviter 的 User 全部列。
-            select: {
-              id: true,
-              approvedCount: true,
-              requiredCount: true,
-              circle: { select: { groupID: true } },
-            },
-          });
-
-      if (existingInvitation && opts?.applicantConsented) {
-        await tx.circleInvitationVerifier.deleteMany({
-          where: { invitationID: created.id, verifierID: inviterId },
-        });
-      }
-      if (
-        inviterCanVouch &&
-        (!existingInvitation || opts?.applicantConsented)
-      ) {
-        await tx.circleInvitationVerifier.create({
-          data: {
-            invitationID: created.id,
-            verifierID: inviterId,
-            addedByID: inviterId,
-            status: 'APPROVED',
-            respondedAt: new Date(),
-          },
-        });
-      }
-
-      // 宣传期形态(requiredVerifierCount=1):邀请人自动首票已经满票,建单
-      // 即成结 —— 「拉人进来就能进」。与 respond 的满票收尾同一套动作,放在
-      // 同一个事务里:席位激活失败就整单回滚,不会留下「已 APPROVED 却没进圈」
-      // 的半截状态等 reconcile 补。
-      let admission: { circleID: string; groupID: string | null } | null = null;
-      if (
-        opts?.applicantConsented &&
-        created.approvedCount >= created.requiredCount
-      ) {
-        await tx.circleInvitation.update({
-          where: { id: created.id },
-          data: { status: 'APPROVED' },
-        });
-        const admitted = await this.admissionPolicy.activateMembers(
-          tx,
-          circleId,
-          [applicantId],
-          { locksHeld: true, actor: 'third-party' },
-        );
-        if (admitted.length > 0) {
-          admission = { circleID: circleId, groupID: created.circle.groupID };
-        }
-      }
-
-      return { created, admission, requiresConsent: !opts?.applicantConsented };
-    };
-    const invitation = transaction
-      ? await operation(transaction)
-      : await this.runInvitationTransaction(operation);
-    if (transaction)
-      return this.fetchInvitationDto(invitation.created.id, transaction);
+    const invitation = await this.runInvitationTransaction((tx) =>
+      this.inviteInTransaction(tx, inviterId, applicantId, circleId, opts),
+    );
 
     if (invitation.admission) {
       this.syncCircleSeatsSoon(invitation.admission.circleID);
@@ -698,6 +661,303 @@ export class CircleInvitationService {
         this.logger.warn('circle consent invitation queued for retry'),
       );
     return this.fetchInvitationDto(invitation.created.id);
+  }
+
+  /**
+   * 建单/复用的事务部分(invite 与 inviteBatch 共用)。只用 tx,不借别的连接;
+   * 事务外的隐私快速预检由调用方做。
+   */
+  private async inviteInTransaction(
+    tx: Prisma.TransactionClient,
+    inviterId: string,
+    applicantId: string,
+    circleId: string,
+    opts?: {
+      applicantConsented?: boolean;
+      acceptedInvitationId?: string;
+      requireQrJoinEnabled?: boolean;
+    },
+  ) {
+    // 6. Create invitation; the inviter takes the first seat only if they may vouch
+    // CircleInvitation has no DB-level unique constraint, so serialize
+    // concurrent invites for the same (circle, applicant) pair with a
+    // transaction-scoped advisory lock, then re-check inside the lock.
+    await this.memberLock.lock(tx, circleId, [inviterId, applicantId]);
+    // 策略快照与 PATCH /circle/:id 串行化:成员锁两边不相交,不加这把的话
+    // 收严返回成功之后,一个读到旧策略的建单仍会提交。
+    await this.memberLock.lockPolicy(tx, circleId);
+    if (opts?.requireQrJoinEnabled) {
+      const conversation = await tx.chatConversation.findUnique({
+        where: { circleID: circleId },
+        select: { qrJoinEnabled: true },
+      });
+      if (conversation?.qrJoinEnabled === false) {
+        throw new ForbiddenException({
+          message: '该群已关闭二维码入群',
+          errorCode: ChatErrorCode.GroupQrJoinDisabled,
+        });
+      }
+    }
+    // Serializable isolation alone does not guarantee a retry for one
+    // read/write anti-dependency. Share the relationship/privacy lock used
+    // by block, unfriend and privacy writes before rechecking authorization.
+    await lockUserRelationshipState(tx, [inviterId, applicantId]);
+
+    const [inviterMembership, lockedMembership, circlePolicy] =
+      await Promise.all([
+        tx.circleMember.findUnique({
+          where: {
+            userID_circleID: { userID: inviterId, circleID: circleId },
+          },
+        }),
+        tx.circleMember.findUnique({
+          where: {
+            userID_circleID: { userID: applicantId, circleID: circleId },
+          },
+        }),
+        tx.circle.findFirst({
+          where: { id: circleId, deleted: false },
+          select: { requiredVerifierCount: true, memberCanInvite: true },
+        }),
+      ]);
+    if (!inviterMembership || inviterMembership.status !== 'ACTIVE') {
+      throw new ForbiddenException({
+        message: 'You must be an active member to invite others',
+        errorCode: CircleInvitationErrorCode.InviterNotMember,
+      });
+    }
+    if (lockedMembership?.status === 'ACTIVE') {
+      throw new ConflictException({
+        message: 'User is already a member of this circle',
+        errorCode: CircleErrorCode.AlreadyMember,
+      });
+    }
+
+    // 隐私开关只看 groupInvitePermission 与好友关系,从不看拉黑。默认值是
+    // EVERYONE,所以被拉黑的人照样能把对方拉进圈子 —— requiredVerifierCount=1
+    // 且邀请人是 OWNER/ADMIN 时更是「立刻入圈」。拉黑是比邀请权限更硬的
+    // 意愿表达,两个方向都拦;错误与隐私拒绝同一条,不泄露「他拉黑了你」。
+    //
+    // 顺序在成员校验之后:放在之前的话,任何登录用户都能拿这个接口当拉黑
+    // 探针 —— 被拉黑返回 NotAllowed、没拉黑返回 InviterNotMember,两者可分,
+    // 「不泄露」就成了空话。
+    //
+    // 读仍放在事务内；上面的共享 user lock 会与并发拉黑/解除好友严格
+    // 串行。仅靠 Serializable 不够：单个 rw 反依赖不一定形成 SSI 危险结构，
+    // 事务仍可能按「邀请在先、拉黑在后」的顺序一起提交。
+    const blocked = await tx.block.findFirst({
+      where: {
+        OR: [
+          { blockerID: applicantId, blockedID: inviterId },
+          { blockerID: inviterId, blockedID: applicantId },
+        ],
+      },
+      select: { id: true },
+    });
+    if (blocked) {
+      throw new ForbiddenException({
+        message: 'User does not allow circle invites',
+        errorCode: CircleInvitationErrorCode.NotAllowed,
+      });
+    }
+    if (!circlePolicy) {
+      throw new NotFoundException({
+        message: 'Circle not found',
+        errorCode: CircleErrorCode.NotFound,
+      });
+    }
+
+    const existingInvitation = await tx.circleInvitation.findFirst({
+      where: {
+        circleID: circleId,
+        applicantID: applicantId,
+        status: { in: ['INVITED', 'PENDING'] },
+      },
+    });
+    // 本人扫码是幂等的：签发人仍在圈、申请人尚未入圈、圈仍存在且双方未
+    // 拉黑后，已有 PENDING 就是本次请求的完成结果。容量、额度和成员邀请
+    // 开关都是仅影响“能否新建”的可变门禁，不能让一次成功申请的网络重试
+    // 突然变成失败。
+    if (
+      opts?.acceptedInvitationId &&
+      (existingInvitation?.id !== opts.acceptedInvitationId ||
+        existingInvitation.status !== 'INVITED')
+    )
+      throw new ConflictException('邀请已处理');
+    if (
+      existingInvitation &&
+      opts?.acceptedInvitationId &&
+      existingInvitation.createdAt.getTime() + 7 * 86400000 <= Date.now()
+    )
+      throw new ForbiddenException({
+        message: '邀请已过期',
+        errorCode: 'CHAT_GROUP_INVITATION_INVALID',
+      });
+    if (
+      existingInvitation &&
+      (!opts?.applicantConsented || existingInvitation.status === 'PENDING')
+    ) {
+      return {
+        created: existingInvitation,
+        admission: null,
+        requiresConsent: Boolean(existingInvitation.consentNoticeRequired),
+      };
+    }
+    // 宣传期严格形态:关掉成员邀请后,只有圈主/管理员还能拉人 ——
+    // requiredVerifierCount=1 时成员邀请等于「谁都能瞬间塞人进圈」,这道闸
+    // 必须在服务端(客户端藏入口挡不住直接打接口)。
+    if (
+      !circlePolicy.memberCanInvite &&
+      inviterMembership.role !== 'OWNER' &&
+      inviterMembership.role !== 'ADMIN'
+    ) {
+      throw new ForbiddenException({
+        message: 'Only the circle owner or admin can invite new members',
+        errorCode: CircleInvitationErrorCode.MemberInviteDisabled,
+      });
+    }
+    // applicantId 是被邀请人，任何拒绝原因都会回给 inviter —— 用第三方视角
+    // 调用，避免把对方的加入额度状态泄露给邀请人。
+    await this.admissionPolicy.assertCanApply(tx, circleId, applicantId, {
+      actor: 'third-party',
+    });
+
+    if (
+      existingInvitation &&
+      !(opts?.applicantConsented && existingInvitation.status === 'INVITED')
+    ) {
+      throw new ConflictException({
+        message: 'There is already a pending invitation for this user',
+        errorCode: CircleInvitationErrorCode.AlreadyPending,
+      });
+    }
+
+    // 自动首票 = 邀请人替被邀请人担保,所以担保资格必须与申请人自己挑的验证人
+    // 同规(好友 ∩ 本圈 ACTIVE 成员)—— 否则「验证人必须是好友」这条闸从
+    // invite 这条路就绕过去了:requiredVerifierCount=1 时等于任何成员都能把
+    // 任何把入圈邀请开成 EVERYONE(默认值)的陌生人瞬间塞进圈子。
+    //
+    // OWNER/ADMIN 例外:圈子的管理者本来就是这个圈的信任根,「管理员拉人进来
+    // 就能进」正是宣传期要的形态;要连管理员也收掉就把 memberCanInvite 关掉。
+    //
+    // 好友读放在 pair 锁内,与 addVerifier / respond 同口径(锁外那次只用于
+    // 隐私开关判定,不能拿来发席位)。
+    // 事务内的好友关系是唯一可信的那份:锁外那次只用于快速失败。
+    const stillFriends = await this.areFriends(inviterId, applicantId, tx);
+
+    // 隐私开关在事务内**无条件**复核一次,读也走 tx。
+    //
+    // 只在「好友关系变了」时才复核是不够的:对方完全可以保持好友关系不变,
+    // 只把 groupInvitePermission 从 EVERYONE/FRIENDS_ONLY 改成 NONE ——
+    // 那样锁外那个 true 照样过期,而一票圈会当场把人放进来。
+    //
+    // 读用 tx 而不是 this.prisma：共享 user lock 与这次复核必须属于同一
+    // 事务，才能一直持有到邀请提交；否则仍只是缩小竞态窗口。
+    if (!opts?.applicantConsented) {
+      const stillAllowed =
+        await this.privacySettings.canBeInvitedToGroupOrCircle(
+          applicantId,
+          stillFriends,
+          tx,
+        );
+      if (!stillAllowed) {
+        throw new ForbiddenException({
+          message: 'User does not allow circle invites',
+          errorCode: CircleInvitationErrorCode.NotAllowed,
+        });
+      }
+    }
+
+    const inviterCanVouch =
+      inviterMembership.role === 'OWNER' ||
+      inviterMembership.role === 'ADMIN' ||
+      stillFriends;
+
+    const invitationData = {
+      circleID: circleId,
+      applicantID: applicantId,
+      inviterID: inviterId,
+      approvedCount: inviterCanVouch ? 1 : 0,
+      requiredCount:
+        existingInvitation?.requiredCount ?? circlePolicy.requiredVerifierCount,
+      status: opts?.applicantConsented
+        ? ('PENDING' as const)
+        : ('INVITED' as const),
+      consentNoticeRequired:
+        !opts?.applicantConsented ||
+        Boolean(existingInvitation?.consentNoticeRequired),
+    };
+    const selection = {
+      id: true,
+      approvedCount: true,
+      requiredCount: true,
+      circle: { select: { groupID: true } },
+    } as const;
+    const created = existingInvitation
+      ? await tx.circleInvitation.update({
+          where: { id: existingInvitation.id, status: 'INVITED' },
+          data: invitationData,
+          select: selection,
+        })
+      : await tx.circleInvitation.create({
+          data: {
+            ...invitationData,
+            // 建单那一刻圈子策略的快照:之后调 requiredVerifierCount 不影响
+            // 在途申请(进度条/成结判定读的都是 invitation.requiredCount)。
+            requiredCount: circlePolicy.requiredVerifierCount,
+          },
+          // 事务里只读这几列；响应由 fetchInvitationDto 按窄 select 另读。此前
+          // include 了整行 circle 与 applicant / inviter 的 User 全部列。
+          select: {
+            id: true,
+            approvedCount: true,
+            requiredCount: true,
+            circle: { select: { groupID: true } },
+          },
+        });
+
+    if (existingInvitation && opts?.applicantConsented) {
+      await tx.circleInvitationVerifier.deleteMany({
+        where: { invitationID: created.id, verifierID: inviterId },
+      });
+    }
+    if (inviterCanVouch && (!existingInvitation || opts?.applicantConsented)) {
+      await tx.circleInvitationVerifier.create({
+        data: {
+          invitationID: created.id,
+          verifierID: inviterId,
+          addedByID: inviterId,
+          status: 'APPROVED',
+          respondedAt: new Date(),
+        },
+      });
+    }
+
+    // 宣传期形态(requiredVerifierCount=1):邀请人自动首票已经满票,建单
+    // 即成结 —— 「拉人进来就能进」。与 respond 的满票收尾同一套动作,放在
+    // 同一个事务里:席位激活失败就整单回滚,不会留下「已 APPROVED 却没进圈」
+    // 的半截状态等 reconcile 补。
+    let admission: { circleID: string; groupID: string | null } | null = null;
+    if (
+      opts?.applicantConsented &&
+      created.approvedCount >= created.requiredCount
+    ) {
+      await tx.circleInvitation.update({
+        where: { id: created.id },
+        data: { status: 'APPROVED' },
+      });
+      const admitted = await this.admissionPolicy.activateMembers(
+        tx,
+        circleId,
+        [applicantId],
+        { locksHeld: true, actor: 'third-party' },
+      );
+      if (admitted.length > 0) {
+        admission = { circleID: circleId, groupID: created.circle.groupID };
+      }
+    }
+
+    return { created, admission, requiresConsent: !opts?.applicantConsented };
   }
 
   /**
@@ -1857,10 +2117,21 @@ export class CircleInvitationService {
     }
   }
 
+  /**
+   * 邀请/入圈事务的重试预算比默认(5 次)大。
+   *
+   * 这些事务都以排圈子级 advisory 锁(成员锁里有邀请人/圈主那把、策略锁)开头,
+   * 而 Serializable 的快照在第一条语句(也就是排锁那条)开始时就定了:排过队的事务
+   * 拿着早于前一个持锁者提交的快照,一写 Circle 行(占座计数)就是 40001。同一圈子
+   * N 个人同时入圈,每一轮只有赶上锁空闲的那几个能成,最坏要 N 轮;带退避的 8 次
+   * 能吃下真库并发用例里的 8 人同时入圈(test/postgres/circle-tx-invitation)。
+   */
   private async runInvitationTransaction<T>(
     operation: (tx: Prisma.TransactionClient) => Promise<T>,
   ): Promise<T> {
-    return runSerializableTransaction(this.prisma, operation);
+    return runSerializableTransaction(this.prisma, operation, {
+      maxAttempts: INVITATION_TX_MAX_ATTEMPTS,
+    });
   }
 
   /**

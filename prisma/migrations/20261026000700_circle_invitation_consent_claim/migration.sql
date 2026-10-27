@@ -1,0 +1,12 @@
+-- 同意制邀请投递的认领租约（src/circle-invitation/circle-invitation.service.ts 的
+-- deliverConsentInvitation）。
+--
+-- 投递原来在一个持锁事务里做完全部 IO（站内通知、建私聊会话、发邀请卡片），事务最长
+-- 30 秒，期间占着邀请人/被邀请人的成员锁、圈子策略锁和 call-user:* 关系锁。现在事务里
+-- 只做校验，并把这一列写成 now() 作为「正在投递」的认领；IO 挪到提交之后，成功再写
+-- consentNoticeDeliveredAt 并清掉这一列，失败清掉这一列交给每分钟的补投。认领只在
+-- 租约期内有效：投递进程中途崩溃，过期后补投照常接手。
+--
+-- 可空、无默认值：PostgreSQL 11+ 只改目录，不重写表；存量行为 NULL = 未认领。
+-- 补投批次查询与 20261026000520 的部分索引不变（认领判断在逐条认领的条件更新里）。
+ALTER TABLE "CircleInvitation" ADD COLUMN IF NOT EXISTS "consentNoticeClaimedAt" TIMESTAMP(3);

@@ -13,6 +13,7 @@ import { createHash, randomInt } from 'crypto';
 import * as argon2 from 'argon2';
 import { LoginChallengeStatus, Prisma } from 'src/generated/prisma';
 import { PrismaService } from 'src/prisma/prisma.service';
+import { withSavepoint } from 'src/utils/prisma-savepoint';
 import { AuthErrorCode } from 'src/common/app-error-codes';
 import { RealtimeService } from 'src/realtime/realtime.service';
 import { NotificationPushService } from 'src/notification/notification-push.service';
@@ -75,6 +76,19 @@ export function hashDeviceId(raw: string | null | undefined): string | null {
 function truncate(value: string | null | undefined, max: number) {
   if (value === null || value === undefined) return null;
   return value.length > max ? value.slice(0, max) : value;
+}
+
+type DeviceTrustClient = PrismaService | Prisma.TransactionClient;
+
+/** 受信任设备又出现了一次:最近时间、来源 IP,带了设备名就更新设备名。 */
+function touchData(context: SessionContext, now: Date) {
+  return {
+    lastSeenAt: now,
+    lastIp: truncate(context.ip, MAX_IP_LENGTH),
+    ...(context.deviceName
+      ? { deviceName: truncate(context.deviceName, MAX_DEVICE_NAME_LENGTH) }
+      : {}),
+  };
 }
 
 export type LoginChallengeView = {
@@ -425,7 +439,20 @@ export class DeviceTrustService implements OnModuleDestroy {
     userId: string,
     activeDeviceKey: string,
   ): Promise<void> {
-    const cancelled = await this.prisma.loginChallenge.updateManyAndReturn({
+    const cancelled = await this.cancelRecoveries(userId, activeDeviceKey);
+    this.announceCancelledRecoveries(userId, cancelled);
+  }
+
+  /**
+   * cancelRecoveriesForActiveDevice 的写入那一半,可写进调用方事务(续签)。
+   * 返回被取消的验证单;通知要等写入提交后再发(announceCancelledRecoveries)。
+   */
+  async cancelRecoveries(
+    userId: string,
+    activeDeviceKey: string,
+    client: DeviceTrustClient = this.prisma,
+  ): Promise<string[]> {
+    const cancelled = await client.loginChallenge.updateManyAndReturn({
       where: {
         userId,
         deviceKey: { not: activeDeviceKey },
@@ -442,12 +469,17 @@ export class DeviceTrustService implements OnModuleDestroy {
       },
       select: { id: true },
     });
-    for (const { id } of cancelled) {
+    return cancelled.map(({ id }) => id);
+  }
+
+  /** 找回申请已被取消(写入已提交):通知各端并留安全日志。 */
+  announceCancelledRecoveries(userId: string, challengeIds: string[]): void {
+    for (const id of challengeIds) {
       this.broadcastResolved(userId, id, 'REJECTED');
     }
-    if (cancelled.length > 0) {
+    if (challengeIds.length > 0) {
       this.logSecurity('login_recoveries_cancelled_by_trusted_device', userId, {
-        count: cancelled.length,
+        count: challengeIds.length,
       });
     }
   }
@@ -787,39 +819,68 @@ export class DeviceTrustService implements OnModuleDestroy {
    * 注册 / 续签时的尽力而为补记（上线迁移靠这条）：只在这台设备从没有记录时新建，
    * 绝不恢复已撤销的信任 —— 否则在设备管理里移除的设备，凭另一条没撤掉的会话续签
    * 一次就「复活」了。任何错误都不能挡住续签。
+   *
+   * 返回补记之后这台设备是否受信任（续签据此决定要不要取消找回，不再单独 isTrusted
+   * 读第二次）；出错返回 null = 结论未知，调用方自己再判。传入 tx 时在调用方事务里做，
+   * 用保存点隔离：失败只回滚这一步，续签事务照常提交。
    */
   async trustOnRefresh(
     userId: string,
     deviceKey: string | null,
     context: SessionContext,
-  ): Promise<void> {
-    if (!deviceKey) return;
+    tx?: Prisma.TransactionClient,
+  ): Promise<boolean | null> {
+    if (!deviceKey) return false;
     try {
-      const now = new Date();
-      const existing = await this.prisma.trustedDevice.findUnique({
-        where: { userId_deviceKey: { userId, deviceKey } },
-        select: { revokedAt: true },
-      });
-      if (existing) {
-        if (!existing.revokedAt) {
-          await this.touch(userId, deviceKey, context, now);
-        }
-        return;
-      }
-      await this.prisma.trustedDevice.create({
-        data: {
-          userId,
-          deviceKey,
-          deviceName: truncate(context.deviceName, MAX_DEVICE_NAME_LENGTH),
-          lastIp: truncate(context.ip, MAX_IP_LENGTH),
-          lastSeenAt: now,
-        },
-      });
+      return tx
+        ? await withSavepoint(tx, 'refresh_device_trust', () =>
+            this.recordTrustOnRefresh(tx, userId, deviceKey, context),
+          )
+        : await this.recordTrustOnRefresh(
+            this.prisma,
+            userId,
+            deviceKey,
+            context,
+          );
     } catch (error) {
       this.logger.warn(
         `trustOnRefresh failed for ${userId}: ${error instanceof Error ? error.message : error}`,
       );
+      return null;
     }
+  }
+
+  /**
+   * 先按「未撤销」条件 touch：常见情况（已受信任）一条语句同时完成更新与判定。
+   * 没命中再分两种：有记录 = 已撤销，不恢复；没有记录 = 从没见过，补记。
+   */
+  private async recordTrustOnRefresh(
+    client: DeviceTrustClient,
+    userId: string,
+    deviceKey: string,
+    context: SessionContext,
+  ): Promise<boolean> {
+    const now = new Date();
+    const touched = await client.trustedDevice.updateMany({
+      where: { userId, deviceKey, revokedAt: null },
+      data: touchData(context, now),
+    });
+    if (touched.count > 0) return true;
+    const existing = await client.trustedDevice.findUnique({
+      where: { userId_deviceKey: { userId, deviceKey } },
+      select: { id: true },
+    });
+    if (existing) return false;
+    await client.trustedDevice.create({
+      data: {
+        userId,
+        deviceKey,
+        deviceName: truncate(context.deviceName, MAX_DEVICE_NAME_LENGTH),
+        lastIp: truncate(context.ip, MAX_IP_LENGTH),
+        lastSeenAt: now,
+      },
+    });
+    return true;
   }
 
   /** 设备管理里移除某台设备：撤销它的信任，下次登录要重新验证。 */
@@ -1204,13 +1265,7 @@ export class DeviceTrustService implements OnModuleDestroy {
   ) {
     await this.prisma.trustedDevice.update({
       where: { userId_deviceKey: { userId, deviceKey } },
-      data: {
-        lastSeenAt: now,
-        lastIp: truncate(context.ip, MAX_IP_LENGTH),
-        ...(context.deviceName
-          ? { deviceName: truncate(context.deviceName, MAX_DEVICE_NAME_LENGTH) }
-          : {}),
-      },
+      data: touchData(context, now),
     });
   }
 

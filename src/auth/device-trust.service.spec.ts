@@ -235,17 +235,26 @@ function setup() {
       if (lockTails.get(key) === tail) lockTails.delete(key);
     });
   };
+  // 既有标签模板调用,也有 $executeRaw(Prisma.raw('SAVEPOINT …')) 这种传 Sql 对象的。
+  const sqlText = (query: TemplateStringsArray | { sql: string }) =>
+    Array.isArray(query) ? query.join('?') : (query as { sql: string }).sql;
   (prisma as any).$executeRaw = jest.fn(
-    async (strings: TemplateStringsArray, ...values: unknown[]) => {
-      if (strings.join('?').includes('pg_advisory_xact_lock')) {
+    async (
+      query: TemplateStringsArray | { sql: string },
+      ...values: unknown[]
+    ) => {
+      if (sqlText(query).includes('pg_advisory_xact_lock')) {
         await acquireLock(`advisory:${String(values[0])}`);
       }
       return 0;
     },
   );
   (prisma as any).$queryRaw = jest.fn(
-    async (strings: TemplateStringsArray, ...values: unknown[]) => {
-      if (/FROM "User"[\s\S]*FOR UPDATE/.test(strings.join('?'))) {
+    async (
+      query: TemplateStringsArray | { sql: string },
+      ...values: unknown[]
+    ) => {
+      if (/FROM "User"[\s\S]*FOR UPDATE/.test(sqlText(query))) {
         await acquireLock(`user:${String(values[0])}`);
       }
       return [];
@@ -744,6 +753,56 @@ describe('DeviceTrustService revocation', () => {
     expect(trusted[0].revokedAt).toBe(revokedAt);
   });
 
+  it('trustOnRefresh reports the trust conclusion so refresh need not read it again', async () => {
+    const { service, trusted, trust, prisma } = setup();
+    trust('phone');
+    const revokedAt = new Date();
+    trust('removed');
+    trusted[1].revokedAt = revokedAt;
+
+    await expect(
+      service.trustOnRefresh('u1', 'phone', { ip: '203.0.113.1' }),
+    ).resolves.toBe(true);
+    await expect(service.trustOnRefresh('u1', 'removed', {})).resolves.toBe(
+      false,
+    );
+    await expect(service.trustOnRefresh('u1', 'brand-new', {})).resolves.toBe(
+      true,
+    );
+    await expect(service.trustOnRefresh('u1', null, {})).resolves.toBe(false);
+
+    expect(trusted[0].lastIp).toBe('203.0.113.1');
+    expect(trusted[1].revokedAt).toBe(revokedAt);
+    expect(trusted.map((t) => t.deviceKey)).toEqual([
+      'phone',
+      'removed',
+      'brand-new',
+    ]);
+    // 已受信任的设备一条条件 UPDATE 就完事,不先 SELECT。
+    expect(prisma.trustedDevice.updateMany).toHaveBeenNthCalledWith(1, {
+      where: { userId: 'u1', deviceKey: 'phone', revokedAt: null },
+      data: { lastSeenAt: expect.any(Date), lastIp: '203.0.113.1' },
+    });
+    expect(prisma.trustedDevice.findUnique).toHaveBeenCalledTimes(2);
+  });
+
+  it('trustOnRefresh inside a transaction isolates a failure behind a savepoint and reports it as unknown', async () => {
+    const { service, prisma } = setup();
+    const tx = prisma as any;
+    tx.trustedDevice.updateMany.mockRejectedValueOnce(
+      new Error('storage unavailable'),
+    );
+
+    await expect(
+      service.trustOnRefresh('u1', 'phone', {}, tx),
+    ).resolves.toBeNull();
+
+    expect(tx.$executeRaw.mock.calls.map(([q]: any[]) => q.sql)).toEqual([
+      'SAVEPOINT refresh_device_trust',
+      'ROLLBACK TO SAVEPOINT refresh_device_trust',
+    ]);
+  });
+
   it('trust() re-trusts a revoked device after it passes verification', async () => {
     const { service, trusted, trust } = setup();
     trust('phone');
@@ -1016,6 +1075,28 @@ describe('DeviceTrustService recovery (no trusted device available)', () => {
 
     expect(decision.kind).toBe('trusted');
     expect(challenges[0].status).toBe('REJECTED');
+    expect(realtime.broadcast).toHaveBeenCalledWith(
+      'u1',
+      expect.objectContaining({
+        type: 'auth.login.challenge.resolved',
+        payload: expect.objectContaining({ challengeId, status: 'REJECTED' }),
+      }),
+    );
+  });
+
+  it('cancelRecoveries only writes; the broadcast waits for announceCancelledRecoveries', async () => {
+    const { service, challenges, challengeId, realtime } =
+      await pendingChallenge();
+    await service.requestRecovery(challengeId, 'reinstalled');
+    realtime.broadcast.mockClear();
+
+    const cancelled = await service.cancelRecoveries('u1', 'old-install');
+
+    expect(cancelled).toEqual([challengeId]);
+    expect(challenges[0].status).toBe('REJECTED');
+    expect(realtime.broadcast).not.toHaveBeenCalled();
+
+    service.announceCancelledRecoveries('u1', cancelled);
     expect(realtime.broadcast).toHaveBeenCalledWith(
       'u1',
       expect.objectContaining({

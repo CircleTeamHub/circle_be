@@ -8,6 +8,16 @@ import { createHash } from 'crypto';
 import { PrismaService } from 'src/prisma/prisma.service';
 import { CHAT_MEDIA_KEY_FIELDS } from 'src/chat/chat.constants';
 import { UploadService } from './upload.service';
+import {
+  ChatMediaContentRow,
+  ChatMediaKeyReferenceRow,
+  NoteCardSectionsRow,
+  REGULAR_CHAT_MEDIA_KEY_PREFIX,
+  chatBurnArchiveIrregularRowsQuery,
+  chatMediaIrregularRowsQuery,
+  chatMediaKeyReferencesQuery,
+  noteCardSectionsPageQuery,
+} from './storage-audit.query';
 
 /**
  * 存量对象盘点（**只报告，不删除**）。
@@ -22,7 +32,8 @@ import { UploadService } from './upload.service';
  *
  * `chat/`（自研聊天栈起）：媒体消息 content 只存 object key
  * （字段表见 chat.constants 的 CHAT_MEDIA_KEY_FIELDS），引用完全落在 Postgres 的
- * ChatMessage 表里，纳入盘点。撤回/焚毁/清空会主动删对象但是尽力而为
+ * ChatMessage 表里，纳入盘点。ChatMessage 是全库最大的表：不把它的引用读进内存，
+ * 而是按 S3 列举的每一批 key 用表达式索引反查（见 storage-audit.query.ts）。撤回/焚毁/清空会主动删对象但是尽力而为
  * （ChatMediaService.deleteObjects 单个失败只记日志），删失败的与
  * 「上传成功但消息没发出去」的对象靠这份账兜底；presign 到发消息之间的
  * 正常窗口由 24h 宽限期覆盖。OpenIM 时代这个前缀是绝对不能扫的
@@ -91,10 +102,20 @@ export class StorageAuditService {
         do {
           const page = await this.upload.listObjects(prefix, token);
           token = page.nextContinuationToken;
+          const isFresh = (object: { lastModified: Date | null }) =>
+            Boolean(object.lastModified && object.lastModified > cutoff);
+          // 聊天媒体的规整引用不在 referenced 里：这一批还没判定的 chat/ key 一次反查。
+          const chatReferenced = await this.findReferencedChatKeys(
+            page.objects
+              .filter((object) => !isFresh(object))
+              .map((object) => object.key)
+              .filter((key) => !referenced.has(key)),
+          );
           for (const object of page.objects) {
             scanned += 1;
-            if (object.lastModified && object.lastModified > cutoff) continue;
+            if (isFresh(object)) continue;
             if (referenced.has(object.key)) continue;
+            if (chatReferenced.has(object.key)) continue;
             orphanCount += 1;
             orphanBytes += object.size;
             if (samples.length < StorageAuditService.SAMPLE_SIZE) {
@@ -139,6 +160,21 @@ export class StorageAuditService {
   }
 
   /**
+   * 这一批 key 里哪些被活消息 / 焚毁归档以规整形式（值本身就是 object key）引用。
+   * 只有 chat/ 开头的 key 可能命中，其余前缀不查库。
+   */
+  private async findReferencedChatKeys(keys: string[]): Promise<Set<string>> {
+    const chatKeys = keys.filter((key) =>
+      key.startsWith(REGULAR_CHAT_MEDIA_KEY_PREFIX),
+    );
+    if (chatKeys.length === 0) return new Set();
+    const rows = await this.prisma.$queryRaw<ChatMediaKeyReferenceRow[]>(
+      chatMediaKeyReferencesQuery(chatKeys),
+    );
+    return new Set(rows.map((row) => row.key));
+  }
+
+  /**
    * 逐批读一张表并把引用喂给 add,读完即丢 —— 不把 Prisma 行留在内存里。
    * 用 id 游标而不是 skip:大表上 OFFSET 会越翻越慢。
    */
@@ -159,7 +195,7 @@ export class StorageAuditService {
   }
 
   /**
-   * 收集 Postgres 里所有引用到的对象 key。
+   * 收集 Postgres 里引用到的对象 key（聊天媒体的规整引用除外，见 findReferencedChatKeys）。
    *
    * 存的是完整 URL（形如 https://<域名>/circle/<key>），这里统一还原成 key 再比对 ——
    * 域名会随环境变化（dev 是 IP:端口、生产是域名），拿 URL 直接比会把历史对象全判成孤儿。
@@ -303,16 +339,18 @@ export class StorageAuditService {
     );
     // Cards freeze avatars independently of the current User/Circle columns.
     // Retain durable row references, including DELETED rows, consistently with
-    // the existing NoteMedia scan.
+    // the existing NoteMedia scan. 只取 sections 里的两个名片数组，不把整列（正文、
+    // contentJson 副本、媒体条目）搬回来。
     await this.collectFrom(
       (cursor, take) =>
-        this.prisma.note.findMany({
-          select: { id: true, sections: true },
-          orderBy: { id: 'asc' },
-          take,
-          ...(cursor ? { cursor: { id: cursor }, skip: 1 } : {}),
+        this.prisma.$queryRaw<NoteCardSectionsRow[]>(
+          noteCardSectionsPageQuery(cursor, take),
+        ),
+      (row) =>
+        addCardAvatars({
+          contacts: { items: row.contactItems },
+          groups: { items: row.groupItems },
         }),
-      (row) => addCardAvatars(row.sections),
     );
     // 草稿中的媒体只保存 object key，还没有 NoteMedia 行；纳入引用盘点，避免
     // 用户离开编辑器后草稿仍可恢复，却被审计误报成孤儿对象。
@@ -368,46 +406,32 @@ export class StorageAuditService {
       (row) => row.images.forEach(add),
     );
     // 聊天媒体:content 只存裸 key(add 的 toObjectKey 对裸 key 原样放行)。
-    // 只扫字段表里有媒体的类型 —— ChatMessage 是全库最大的表,text/卡片类
-    // 没有媒体 key,全表扫一遍纯属把 05:00 的账拖慢。
+    // 活消息与焚毁归档里以 chat/ 开头的 key 由 audit 按批反查（值即 key，走表达式
+    // 索引），这里只读规整形式之外的行：带 key 的墓碑、不以 chat/ 开头的值。两条部分
+    // 索引兜着它们，正常情况下一行都没有，Set 不再随聊天媒体量增长。
+    const addChatMedia = (row: ChatMediaContentRow) => {
+      const fields = CHAT_MEDIA_KEY_FIELDS[row.type];
+      if (!fields) return;
+      const content = row.content;
+      if (typeof content !== 'object' || content === null) return;
+      for (const field of fields) {
+        add((content as Record<string, unknown>)[field.key]);
+      }
+    };
     await this.collectFrom(
       (cursor, take) =>
-        this.prisma.chatMessage.findMany({
-          where: { type: { in: Object.keys(CHAT_MEDIA_KEY_FIELDS) } },
-          select: { id: true, type: true, content: true },
-          orderBy: { id: 'asc' },
-          take,
-          ...(cursor ? { cursor: { id: cursor }, skip: 1 } : {}),
-        }),
-      (row) => {
-        const fields = CHAT_MEDIA_KEY_FIELDS[row.type];
-        if (!fields) return;
-        const content = row.content;
-        if (typeof content !== 'object' || content === null) return;
-        for (const field of fields) {
-          add((content as Record<string, unknown>)[field.key]);
-        }
-      },
+        this.prisma.$queryRaw<ChatMediaContentRow[]>(
+          chatMediaIrregularRowsQuery(cursor, take),
+        ),
+      addChatMedia,
     );
     // Burn archive media remains referenced until the retention cleanup commits.
     await this.collectFrom(
       (cursor, take) =>
-        this.prisma.chatBurnArchive.findMany({
-          where: { type: { in: Object.keys(CHAT_MEDIA_KEY_FIELDS) } },
-          select: { id: true, type: true, content: true },
-          orderBy: { id: 'asc' },
-          take,
-          ...(cursor ? { cursor: { id: cursor }, skip: 1 } : {}),
-        }),
-      (row) => {
-        const fields = CHAT_MEDIA_KEY_FIELDS[row.type];
-        if (!fields) return;
-        const content = row.content;
-        if (typeof content !== 'object' || content === null) return;
-        for (const field of fields) {
-          add((content as Record<string, unknown>)[field.key]);
-        }
-      },
+        this.prisma.$queryRaw<ChatMediaContentRow[]>(
+          chatBurnArchiveIrregularRowsQuery(cursor, take),
+        ),
+      addChatMedia,
     );
     // 充值收款码在第一次被机器人发送前还没有 ChatMessage 引用，但它已经是运营
     // 配置中的有效资产。漏掉这张表会把长期备用码误报成 chat/ 孤儿；未来若按

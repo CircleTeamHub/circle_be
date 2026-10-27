@@ -107,13 +107,22 @@ export class ChatSupportRechargeProcessor {
     private readonly broadcast: ChatBroadcastService,
   ) {}
 
-  /** WebSocket 提交后走这条，尽量即时回复；失败由持久化任务的定时扫描补偿。 */
+  /**
+   * 按消息 id 找任务再处理。只给「不知道这条消息有没有入队」的场合用(幂等重发);
+   * 首次发送由 sendMessage 带回任务 id,走 processEnqueuedJob,不再对每条消息
+   * 做一次必然落空的查找。
+   */
   async processMessage(sourceMessageID: string): Promise<void> {
     const job = await this.prisma.supportRechargeJob.findUnique({
       where: { sourceMessageID },
       select: { id: true },
     });
     if (job) await this.processJob(job.id);
+  }
+
+  /** WebSocket 提交后走这条，尽量即时回复；失败由持久化任务的定时扫描补偿。 */
+  async processEnqueuedJob(jobId: string): Promise<void> {
+    await this.processJob(jobId);
   }
 
   @TrackedCron(CronExpression.EVERY_MINUTE, 'support_recharge_jobs')

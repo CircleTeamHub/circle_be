@@ -1,6 +1,111 @@
 import { readFileSync } from 'fs';
 import { join } from 'path';
+import type { Prisma } from 'src/generated/prisma';
+import {
+  CHAT_MEDIA_KEY_FIELDS,
+  CHAT_MEDIA_KEY_PREFIX,
+} from 'src/chat/chat.constants';
 import { StorageAuditService } from './storage-audit.service';
+import {
+  REGULAR_CHAT_MEDIA_KEY_PREFIX,
+  chatBurnArchiveIrregularRowsQuery,
+  chatMediaIrregularRowsQuery,
+  chatMediaKeyReferencesQuery,
+} from './storage-audit.query';
+
+type ChatRow = {
+  id: string;
+  type: string;
+  content: unknown;
+  deleted?: boolean;
+};
+
+const isObject = (value: unknown): value is Record<string, unknown> =>
+  Boolean(value && typeof value === 'object' && !Array.isArray(value));
+const fieldValue = (row: ChatRow, field: string): unknown =>
+  isObject(row.content) ? row.content[field] : undefined;
+const typesWith = (field: string) =>
+  Object.keys(CHAT_MEDIA_KEY_FIELDS).filter((type) =>
+    CHAT_MEDIA_KEY_FIELDS[type].some((entry) => entry.key === field),
+  );
+
+/**
+ * storage-audit.query.ts 四类原生查询在单测里的替身：按 SQL 分流，用夹具行照查询的
+ * 口径（部分索引谓词、-> 链）算结果。真实 SQL 与原实现的逐 key 对照在
+ * test/postgres/storage-audit-reverse.pg-spec.ts。
+ */
+function fakeAuditRaw(referenced: Record<string, unknown[]>) {
+  const chat = (referenced.chatMessage ?? []) as ChatRow[];
+  const archive = (referenced.chatBurnArchive ?? []) as ChatRow[];
+  const notes = (referenced.note ?? []) as Array<{
+    id: string;
+    sections?: unknown;
+  }>;
+  const media = Object.keys(CHAT_MEDIA_KEY_FIELDS);
+  const irregular = (row: ChatRow, tombstones: boolean) => {
+    if (!media.includes(row.type) || !isObject(row.content)) return false;
+    const values = ['key', 'thumbKey'].map((field) => fieldValue(row, field));
+    const text = (value: unknown) =>
+      value === undefined || value === null ? null : String(value);
+    return (
+      (tombstones &&
+        row.deleted === true &&
+        values.some((value) => text(value) !== null)) ||
+      values.some((value) => {
+        const t = text(value);
+        return t !== null && !t.startsWith(REGULAR_CHAT_MEDIA_KEY_PREFIX);
+      })
+    );
+  };
+  return jest.fn(async (query: Prisma.Sql) => {
+    const sql = query.sql;
+    const firstPage = !/"id" >/.test(sql);
+    if (sql.includes('UNION')) {
+      const wanted = new Set(query.values.find(Array.isArray) as string[]);
+      const hits = new Set<string>();
+      for (const [rows, live] of [
+        [chat, true],
+        [archive, false],
+      ] as const) {
+        for (const row of rows) {
+          if (live && row.deleted) continue;
+          for (const field of ['key', 'thumbKey']) {
+            const value = fieldValue(row, field);
+            if (
+              typesWith(field).includes(row.type) &&
+              typeof value === 'string' &&
+              wanted.has(value)
+            ) {
+              hits.add(value);
+            }
+          }
+        }
+      }
+      return [...hits].map((key) => ({ key }));
+    }
+    if (sql.includes('FROM "ChatMessage"')) {
+      return firstPage ? chat.filter((row) => irregular(row, true)) : [];
+    }
+    if (sql.includes('FROM "ChatBurnArchive"')) {
+      return firstPage ? archive.filter((row) => irregular(row, false)) : [];
+    }
+    if (sql.includes('FROM "Note"')) {
+      if (!firstPage) return [];
+      const items = (sections: unknown, name: string) => {
+        const section = isObject(sections) ? sections[name] : undefined;
+        return isObject(section) && Array.isArray(section.items)
+          ? section.items
+          : null;
+      };
+      return notes.map((note) => ({
+        id: note.id,
+        contactItems: items(note.sections, 'contacts'),
+        groupItems: items(note.sections, 'groups'),
+      }));
+    }
+    throw new Error('unexpected raw query');
+  });
+}
 
 describe('StorageAuditService', () => {
   const emptyRows = () => ({ findMany: jest.fn().mockResolvedValue([]) });
@@ -13,6 +118,7 @@ describe('StorageAuditService', () => {
     referenced?: Record<string, unknown[]>;
   }) {
     const prisma = {
+      $queryRaw: fakeAuditRaw(options.referenced ?? {}),
       chatConversation: emptyRows(),
       user: emptyRows(),
       avatarFrameAsset: emptyRows(),
@@ -20,21 +126,21 @@ describe('StorageAuditService', () => {
       friend: emptyRows(),
       circle: emptyRows(),
       noteMedia: emptyRows(),
-      note: emptyRows(),
       noteDraft: emptyRows(),
       trace: emptyRows(),
       traceComment: emptyRows(),
       circlePost: emptyRows(),
-      chatMessage: emptyRows(),
-      chatBurnArchive: emptyRows(),
       supportRechargePaymentCode: emptyRows(),
       adminAdvertisement: emptyRows(),
       consoleRelease: emptyRows(),
     };
+    // note / chatMessage / chatBurnArchive 走原生 SQL（fakeAuditRaw），其余表照旧 findMany。
+    const rawModels = ['note', 'chatMessage', 'chatBurnArchive'];
     for (const [model, rows] of Object.entries(options.referenced ?? {})) {
-      (prisma as Record<string, { findMany: jest.Mock }>)[model].findMany = jest
-        .fn()
-        .mockResolvedValue(rows);
+      if (rawModels.includes(model)) continue;
+      (prisma as unknown as Record<string, { findMany: jest.Mock }>)[
+        model
+      ].findMany = jest.fn().mockResolvedValue(rows);
     }
     const listObjects = jest.fn(async (prefix: string) => ({
       objects: options.objects?.[prefix] ?? [],
@@ -459,5 +565,105 @@ describe('StorageAuditService', () => {
       },
     });
     expect(await service.audit(now)).toMatchObject({ orphanCount: 0 });
+  });
+
+  // 聊天媒体从「全表读进 Set」反转成「按列举批次反查」：规整引用（值即 key）走表达式
+  // 索引，部分索引兜住的墓碑 / 不规整值才读进内存。
+  describe('chat media reverse lookup', () => {
+    const quoted = (types: string[]) =>
+      `IN (${types.map((type) => `'${type}'`).join(', ')})`;
+
+    it('pins the regular prefix and the literal type lists to the chat field table', () => {
+      expect(REGULAR_CHAT_MEDIA_KEY_PREFIX).toBe(CHAT_MEDIA_KEY_PREFIX);
+      const lookup = chatMediaKeyReferencesQuery(['chat/a']).sql;
+      expect(lookup).toContain(quoted(typesWith('key')));
+      expect(lookup).toContain(quoted(typesWith('thumbKey')));
+      for (const query of [
+        chatMediaIrregularRowsQuery(undefined, 1000),
+        chatBurnArchiveIrregularRowsQuery(undefined, 1000),
+      ]) {
+        expect(query.sql).toContain(quoted(Object.keys(CHAT_MEDIA_KEY_FIELDS)));
+      }
+    });
+
+    it('looks up only the unresolved, out-of-grace chat keys of each listing page', async () => {
+      const fresh = new Date(now.getTime() - 60 * 1000);
+      const { service, prisma } = harness({
+        objects: {
+          'chat/': [
+            { key: 'chat/admin/code.png', size: 1, lastModified: old },
+            { key: 'chat/u1/fresh.jpg', size: 1, lastModified: fresh },
+            { key: 'chat/u1/pending.jpg', size: 1, lastModified: old },
+          ],
+          'avatars/': [{ key: 'avatars/a.jpg', size: 1, lastModified: old }],
+        },
+        referenced: {
+          supportRechargePaymentCode: [
+            { id: 'code', objectKey: 'chat/admin/code.png' },
+          ],
+        },
+      });
+
+      expect(await service.audit(now)).toMatchObject({ orphanCount: 2 });
+
+      const lookups = prisma.$queryRaw.mock.calls
+        .map(([query]) => query as Prisma.Sql)
+        .filter((query) => query.sql.includes('UNION'));
+      expect(lookups).toEqual([
+        chatMediaKeyReferencesQuery(['chat/u1/pending.jpg']),
+      ]);
+    });
+
+    it('keeps a tombstone that still carries its key, not one whose content was cleared', async () => {
+      const { service } = harness({
+        objects: {
+          'chat/': [
+            { key: 'chat/u1/tomb.jpg', size: 5, lastModified: old },
+            { key: 'chat/u1/cleared.jpg', size: 7, lastModified: old },
+          ],
+        },
+        referenced: {
+          chatMessage: [
+            {
+              id: 'm-tomb',
+              type: 'image',
+              deleted: true,
+              content: { key: 'chat/u1/tomb.jpg' },
+            },
+            { id: 'm-cleared', type: 'image', deleted: true, content: {} },
+          ],
+        },
+      });
+
+      expect(await service.audit(now)).toMatchObject({
+        orphanCount: 1,
+        orphanBytes: 7,
+      });
+    });
+
+    it('resolves irregular stored values with the same URL rules as before', async () => {
+      const { service } = harness({
+        objects: {
+          'chat/': [
+            { key: 'chat/u1/slash.jpg', size: 1, lastModified: old },
+            { key: 'chat/u1/cos.mp4', size: 1, lastModified: old },
+          ],
+        },
+        referenced: {
+          chatMessage: [
+            { id: 'm1', type: 'image', content: { key: '/chat/u1/slash.jpg' } },
+          ],
+          chatBurnArchive: [
+            {
+              id: 'a1',
+              type: 'video',
+              content: { key: 'https://bucket.cos.test/chat/u1/cos.mp4' },
+            },
+          ],
+        },
+      });
+
+      expect(await service.audit(now)).toMatchObject({ orphanCount: 0 });
+    });
   });
 });

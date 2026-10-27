@@ -75,6 +75,26 @@ export type SessionContext = {
 
 export type RefreshTokenAudience = 'APP' | 'ADMIN';
 
+export type RotatedSession = {
+  kind: 'rotated';
+  token: string;
+  userId: string;
+  sessionId: string;
+  deviceKey: string | null;
+  deviceName: string | null;
+};
+
+/** 已轮换的 token 又被拿来续签:整族已吊销(随事务提交),sessionIds 待吊销 access。 */
+export type ReplayedRotation = {
+  kind: 'reuse';
+  userId: string;
+  sessionIds: string[];
+};
+
+export type RotationOutcome = RotatedSession | ReplayedRotation;
+
+type RefreshTokenClient = PrismaService | Prisma.TransactionClient;
+
 function hashToken(token: string): string {
   return createHash('sha256').update(token).digest('hex');
 }
@@ -507,8 +527,9 @@ export class RefreshTokenService {
     userId: string,
     sessionId: string,
     expiresAt: Date,
+    client: RefreshTokenClient = this.prisma,
   ): Promise<void> {
-    const updated = await this.prisma.refreshToken.updateMany({
+    const updated = await client.refreshToken.updateMany({
       where: { id: sessionId, userId },
       data: { accessTokenExpiresAt: expiresAt },
     });
@@ -697,13 +718,7 @@ export class RefreshTokenService {
     oldToken: string,
     context?: SessionContext,
     audience: RefreshTokenAudience = 'APP',
-  ): Promise<{
-    token: string;
-    userId: string;
-    sessionId: string;
-    deviceKey: string | null;
-    deviceName: string | null;
-  }> {
+  ): Promise<RotatedSession> {
     const tokenHash = hashToken(oldToken);
     const result = await this.prisma.$transaction(async (tx) => {
       const initial = await tx.refreshToken.findUnique({
@@ -713,121 +728,162 @@ export class RefreshTokenService {
       if (!initial || initial.audience !== audience) {
         throw new UnauthorizedException('Invalid or expired refresh token');
       }
+      return this.rotateLocked(
+        tx,
+        tokenHash,
+        initial.userId,
+        context,
+        audience,
+      );
+    });
 
-      const lockKey = `auth-user:${initial.userId}`;
-      await tx.$executeRaw`SELECT pg_advisory_xact_lock(hashtext(${lockKey}))`;
+    if (result.kind === 'reuse') return this.rejectReplayedRotation(result);
+    return result;
+  }
 
-      const record = await tx.refreshToken.findUnique({
-        where: { token: tokenHash },
-        select: {
-          userId: true,
-          deviceName: true,
-          ip: true,
-          userAgent: true,
-          deviceKey: true,
-          audience: true,
-          familyId: true,
-          revokedAt: true,
-          revocationReason: true,
-          expiredAt: true,
-        },
-      });
-      if (!record || record.audience !== audience) {
+  /**
+   * 在调用方已开的事务里轮换(APP 续签:AuthService 在同一个事务里拿了账号锁,
+   * 整个续签只占一个连接)。owner 来自锁前的 ownerForToken,所以这里不再像 rotate()
+   * 那样锁前再读一遍 token;锁后的那次读取才是权威复核,照旧保留。
+   *
+   * 重放不在这里抛:整族吊销的写入要随调用方事务提交。调用方提交后把 reuse 结果交给
+   * rejectReplayedRotation,写 access 吊销标记并抛出与 rotate() 相同的错误。
+   */
+  rotateInTransaction(
+    tx: Prisma.TransactionClient,
+    oldToken: string,
+    owner: string,
+    context?: SessionContext,
+    audience: RefreshTokenAudience = 'APP',
+  ): Promise<RotationOutcome> {
+    return this.rotateLocked(tx, hashToken(oldToken), owner, context, audience);
+  }
+
+  /** 重放检测的收尾(整族吊销已提交之后):吊销这些会话的 access token 并拒绝。 */
+  async rejectReplayedRotation(result: ReplayedRotation): Promise<never> {
+    this.logger.warn(
+      `Refresh token reuse detected for user ${result.userId}; revoking the affected token family.`,
+    );
+    await this.revokeAccessSessions(result.sessionIds);
+    throw new UnauthorizedException(
+      'Refresh token reuse detected; token family revoked',
+    );
+  }
+
+  /**
+   * 拿 auth-user 锁后的权威读取与轮换。owner 是锁前从同一枚 token 读到的归属;token 行的
+   * userId 不会变,锁后对不上只可能是行已被清理、又被别人的同哈希 token 占用(碰撞),
+   * 一律按无效 token 处理 —— 绝不在别人的锁下轮换。
+   */
+  private async rotateLocked(
+    tx: Prisma.TransactionClient,
+    tokenHash: string,
+    owner: string,
+    context: SessionContext | undefined,
+    audience: RefreshTokenAudience,
+  ): Promise<RotationOutcome> {
+    const lockKey = `auth-user:${owner}`;
+    await tx.$executeRaw`SELECT pg_advisory_xact_lock(hashtext(${lockKey}))`;
+
+    const record = await tx.refreshToken.findUnique({
+      where: { token: tokenHash },
+      select: {
+        userId: true,
+        deviceName: true,
+        ip: true,
+        userAgent: true,
+        deviceKey: true,
+        audience: true,
+        familyId: true,
+        revokedAt: true,
+        revocationReason: true,
+        expiredAt: true,
+      },
+    });
+    if (!record || record.audience !== audience || record.userId !== owner) {
+      throw new UnauthorizedException('Invalid or expired refresh token');
+    }
+
+    const now = new Date();
+    if (record.expiredAt <= now) {
+      throw new UnauthorizedException('Invalid or expired refresh token');
+    }
+
+    if (record.revokedAt) {
+      if (
+        record.revocationReason !== RefreshTokenRevocationReason.ROTATED &&
+        record.revocationReason !== null
+      ) {
         throw new UnauthorizedException('Invalid or expired refresh token');
       }
-
-      const now = new Date();
-      if (record.expiredAt <= now) {
-        throw new UnauthorizedException('Invalid or expired refresh token');
-      }
-
-      if (record.revokedAt) {
-        if (
-          record.revocationReason !== RefreshTokenRevocationReason.ROTATED &&
-          record.revocationReason !== null
-        ) {
-          throw new UnauthorizedException('Invalid or expired refresh token');
-        }
-        const familySessions = await tx.refreshToken.findMany({
-          where: {
-            userId: record.userId,
-            familyId: record.familyId,
-            expiredAt: { gt: now },
-          },
-          select: { id: true },
-        });
-        await tx.refreshToken.updateMany({
-          where: {
-            userId: record.userId,
-            familyId: record.familyId,
-            revokedAt: null,
-          },
-          data: {
-            revokedAt: now,
-            revocationReason: RefreshTokenRevocationReason.TOKEN_FAMILY_REUSE,
-          },
-        });
-        await tx.user.update({
-          where: { id: record.userId },
-          data: { accessTokensRevokedAt: now },
-        });
-        return {
-          kind: 'reuse' as const,
-          userId: record.userId,
-          sessionIds: familySessions.map(({ id }) => id),
-        };
-      }
-
-      const revoked = await tx.refreshToken.updateMany({
+      const familySessions = await tx.refreshToken.findMany({
         where: {
-          token: tokenHash,
-          revokedAt: null,
+          userId: record.userId,
+          familyId: record.familyId,
           expiredAt: { gt: now },
-          audience,
+        },
+        select: { id: true },
+      });
+      await tx.refreshToken.updateMany({
+        where: {
+          userId: record.userId,
+          familyId: record.familyId,
+          revokedAt: null,
         },
         data: {
           revokedAt: now,
-          revocationReason: RefreshTokenRevocationReason.ROTATED,
+          revocationReason: RefreshTokenRevocationReason.TOKEN_FAMILY_REUSE,
         },
       });
-      if (revoked.count !== 1) {
-        throw new UnauthorizedException('Invalid or expired refresh token');
-      }
-
-      const newSession = await this.createWithClient(
-        tx,
-        record.userId,
-        {
-          deviceName: context?.deviceName ?? record.deviceName ?? null,
-          ip: context?.ip ?? record.ip ?? null,
-          userAgent: context?.userAgent ?? record.userAgent ?? null,
-          // 会话一旦绑定设备就不再改绑：换设备 ID 续签同一个 refresh token
-          // 只可能是令牌被拷走，不能借此把别的设备「洗」成受信任。
-          deviceKey: record.deviceKey ?? context?.deviceKey ?? null,
-        },
-        record.audience,
-        record.familyId,
-      );
+      await tx.user.update({
+        where: { id: record.userId },
+        data: { accessTokensRevokedAt: now },
+      });
       return {
-        kind: 'rotated' as const,
-        token: newSession.token,
+        kind: 'reuse',
         userId: record.userId,
-        sessionId: newSession.sessionId,
-        deviceKey: record.deviceKey ?? context?.deviceKey ?? null,
-        deviceName: context?.deviceName ?? record.deviceName ?? null,
+        sessionIds: familySessions.map(({ id }) => id),
       };
-    });
-
-    if (result.kind === 'reuse') {
-      this.logger.warn(
-        `Refresh token reuse detected for user ${result.userId}; revoking the affected token family.`,
-      );
-      await this.revokeAccessSessions(result.sessionIds);
-      throw new UnauthorizedException(
-        'Refresh token reuse detected; token family revoked',
-      );
     }
-    return result;
+
+    const revoked = await tx.refreshToken.updateMany({
+      where: {
+        token: tokenHash,
+        revokedAt: null,
+        expiredAt: { gt: now },
+        audience,
+      },
+      data: {
+        revokedAt: now,
+        revocationReason: RefreshTokenRevocationReason.ROTATED,
+      },
+    });
+    if (revoked.count !== 1) {
+      throw new UnauthorizedException('Invalid or expired refresh token');
+    }
+
+    const newSession = await this.createWithClient(
+      tx,
+      record.userId,
+      {
+        deviceName: context?.deviceName ?? record.deviceName ?? null,
+        ip: context?.ip ?? record.ip ?? null,
+        userAgent: context?.userAgent ?? record.userAgent ?? null,
+        // 会话一旦绑定设备就不再改绑：换设备 ID 续签同一个 refresh token
+        // 只可能是令牌被拷走，不能借此把别的设备「洗」成受信任。
+        deviceKey: record.deviceKey ?? context?.deviceKey ?? null,
+      },
+      record.audience,
+      record.familyId,
+    );
+    return {
+      kind: 'rotated',
+      token: newSession.token,
+      userId: record.userId,
+      sessionId: newSession.sessionId,
+      deviceKey: record.deviceKey ?? context?.deviceKey ?? null,
+      deviceName: context?.deviceName ?? record.deviceName ?? null,
+    };
   }
 
   async assertSessionActive(userId: string, sessionId: string): Promise<void> {
@@ -921,23 +977,47 @@ export class RefreshTokenService {
   }
 
   async revokeAll(userId: string): Promise<void> {
-    const revokedAt = new Date();
     await this.prisma.$transaction([
-      this.prisma.refreshToken.updateMany({
+      ...this.revokeAllWrites(this.prisma, userId, new Date()),
+    ]);
+    // Kill every access token this user already holds (logout-all / ban /
+    // password change / reuse detection), not just their refresh tokens (F-02).
+    await this.revocation.revokeUser(userId);
+  }
+
+  /**
+   * revokeAll 的数据库那一半,写进调用方的事务(续签里封禁 / ADMIN 分支:与刚做的
+   * 轮换一起原子提交)。access 吊销标记必须等事务提交后由调用方 revokeAllAccessMarkers 写。
+   */
+  async revokeAllInTransaction(
+    tx: Prisma.TransactionClient,
+    userId: string,
+  ): Promise<void> {
+    // 两条写按数组顺序依次执行,与 revokeAll 的批量事务同序。
+    for (const write of this.revokeAllWrites(tx, userId, new Date())) {
+      await write;
+    }
+  }
+
+  /** revokeAll 与 revokeAllInTransaction 共用的两条写,避免两份吊销逻辑走样。 */
+  private revokeAllWrites(
+    client: RefreshTokenClient,
+    userId: string,
+    revokedAt: Date,
+  ) {
+    return [
+      client.refreshToken.updateMany({
         where: { userId, revokedAt: null },
         data: {
           revokedAt,
           revocationReason: RefreshTokenRevocationReason.LOGOUT_ALL,
         },
       }),
-      this.prisma.user.update({
+      client.user.update({
         where: { id: userId },
         data: { accessTokensRevokedAt: revokedAt },
       }),
-    ]);
-    // Kill every access token this user already holds (logout-all / ban /
-    // password change / reuse detection), not just their refresh tokens (F-02).
-    await this.revocation.revokeUser(userId);
+    ] as const;
   }
 
   /** 会话绑定的设备（sha256 设备 ID）；不是本人的会话 / 没绑定返回 null。 */

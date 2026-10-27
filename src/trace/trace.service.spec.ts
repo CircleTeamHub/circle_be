@@ -22,6 +22,11 @@ import {
   traceCommentPreviewQuery,
   traceLikePreviewQuery,
 } from './trace-preview.query';
+import {
+  MomentFriendScopeRow,
+  momentFriendScopeQuery,
+  traceFeedPageQuery,
+} from './trace-feed.query';
 
 /** Minimal Trace row in the shape `getFeed`'s include produces. */
 function makeTraceRow(id: string, createdAt: Date) {
@@ -71,6 +76,12 @@ const isLikePreview = (query: unknown) =>
 const isCommentPreview = (query: unknown) =>
   typeof (query as Prisma.Sql | undefined)?.sql === 'string' &&
   (query as Prisma.Sql).sql.includes('FROM "TraceComment" AS tc');
+const isFeedPage = (query: unknown) =>
+  typeof (query as Prisma.Sql | undefined)?.sql === 'string' &&
+  (query as Prisma.Sql).sql.includes('FROM "Trace" AS t');
+const isFriendScope = (query: unknown) =>
+  typeof (query as Prisma.Sql | undefined)?.sql === 'string' &&
+  (query as Prisma.Sql).sql.includes('AS "chatOnly"');
 
 describe('TraceService', () => {
   let service: TraceService;
@@ -109,17 +120,49 @@ describe('TraceService', () => {
       Array.isArray(input) ? Promise.all(input) : input(prisma),
     ),
   };
+  /**
+   * feed 的四条原生 SQL（好友范围、这一页的 id、点赞预览、评论预览）按查询种类分流；
+   * 这一页的整行由 trace.findMany 按 id 回填（见 beforeEach）。
+   */
+  const feed = {
+    friends: [] as MomentFriendScopeRow[],
+    traces: [] as Array<{ id: string }>,
+    likes: [] as TraceLikePreviewRow[],
+    comments: [] as TraceCommentPreviewRow[],
+  };
+  const dispatchRaw = async (query: unknown) => {
+    if (isFriendScope(query)) return feed.friends;
+    if (isFeedPage(query)) return feed.traces.map(({ id }) => ({ id }));
+    if (isLikePreview(query)) return feed.likes;
+    if (isCommentPreview(query)) return feed.comments;
+    throw new Error('unexpected raw query');
+  };
   /** 点赞 / 评论预览走两条原生 SQL；按查询种类分流各自的结果行。 */
   const stubPreviews = (
     likes: TraceLikePreviewRow[],
     comments: TraceCommentPreviewRow[],
   ) => {
-    prisma.$queryRaw.mockImplementation(async (query: unknown) => {
-      if (isLikePreview(query)) return likes;
-      if (isCommentPreview(query)) return comments;
-      throw new Error('unexpected raw query');
-    });
+    feed.likes = likes;
+    feed.comments = comments;
   };
+  /** feed 的好友范围（一次 Friend 读取）：好友 id，可带「只给 viewer CHAT_ONLY」。 */
+  const stubFriendScope = (
+    ...friends: Array<string | MomentFriendScopeRow>
+  ) => {
+    feed.friends = friends.map((friend) =>
+      typeof friend === 'string'
+        ? { friendId: friend, chatOnly: false }
+        : friend,
+    );
+  };
+  /** 这一页（含游标模式多取的那一行）：原生 SQL 回 id，trace.findMany 回填整行。 */
+  const stubFeedTraces = (rows: Array<{ id: string }>) => {
+    feed.traces = rows;
+  };
+  const feedPageQueries = () =>
+    prisma.$queryRaw.mock.calls
+      .map(([query]) => query as Prisma.Sql)
+      .filter(isFeedPage);
   const notificationService = {
     createTraceCommentNotifications: jest.fn(() => Promise.resolve([])),
     createTraceLikeNotification: jest.fn(),
@@ -167,8 +210,17 @@ describe('TraceService', () => {
     notificationService.createTraceLikeNotification.mockReset();
     avatarFrames.resolvePublicAppearances.mockReset();
     avatarFrames.resolvePublicAppearances.mockResolvedValue(new Map());
+    feed.friends = [];
+    feed.traces = [];
+    feed.likes = [];
+    feed.comments = [];
     prisma.$queryRaw.mockReset();
-    prisma.$queryRaw.mockResolvedValue([]);
+    prisma.$queryRaw.mockImplementation(dispatchRaw);
+    prisma.trace.findMany.mockReset();
+    prisma.trace.findMany.mockImplementation(
+      async (args?: { where?: { id?: { in?: string[] } } }) =>
+        feed.traces.filter((row) => args?.where?.id?.in?.includes(row.id)),
+    );
     prisma.friend.findMany.mockReset();
     prisma.friend.findMany.mockResolvedValue([]);
 
@@ -1151,10 +1203,8 @@ describe('TraceService', () => {
   // 把每条动态的全部点赞、全部评论连同 user / replyTo 都读了出来。预览改成两条原生 SQL，
   // 每条动态在 SQL 里各取前 20 条。
   it('loads like and comment previews with a per-trace LIMIT instead of nested includes', async () => {
-    prisma.friend.findMany.mockResolvedValue([
-      { userID: 'viewer-1', friendID: 'friend-1' },
-    ]);
-    prisma.trace.findMany.mockResolvedValue([
+    stubFriendScope('friend-1');
+    stubFeedTraces([
       makeTraceRow('trace-1', new Date('2026-06-08T00:00:00.000Z')),
       makeTraceRow('trace-2', new Date('2026-06-07T00:00:00.000Z')),
     ]);
@@ -1166,7 +1216,8 @@ describe('TraceService', () => {
     const [feedQuery] = prisma.trace.findMany.mock.calls[0];
     expect(feedQuery.include).not.toHaveProperty('likeStats');
     expect(feedQuery.include).not.toHaveProperty('comments');
-    expect(prisma.$queryRaw).toHaveBeenCalledTimes(2);
+    // 好友范围、这一页的 id、点赞预览、评论预览：四条原生 SQL。
+    expect(prisma.$queryRaw).toHaveBeenCalledTimes(4);
     expect(prisma.$queryRaw).toHaveBeenCalledWith(
       traceLikePreviewQuery(['trace-1', 'trace-2'], 20),
     );
@@ -1175,22 +1226,21 @@ describe('TraceService', () => {
     );
   });
 
-  it('skips the preview queries when the page is empty', async () => {
-    prisma.trace.findMany.mockResolvedValue([]);
+  it('skips the preview queries and the row hydration when the page is empty', async () => {
     prisma.trace.count.mockResolvedValue(0);
     prisma.traceLikeStat.findMany.mockResolvedValue([]);
 
     await service.getFeed('viewer-1', { page: 1, limit: 20 });
 
-    expect(prisma.$queryRaw).not.toHaveBeenCalled();
+    const rawQueries = prisma.$queryRaw.mock.calls.map(([query]) => query);
+    expect(rawQueries.filter(isLikePreview)).toHaveLength(0);
+    expect(rawQueries.filter(isCommentPreview)).toHaveLength(0);
+    expect(prisma.trace.findMany).not.toHaveBeenCalled();
   });
 
   it('maps preview rows onto each trace with the mutual-friend filter and oldest-first comments', async () => {
-    prisma.friend.findMany.mockResolvedValue([
-      { userID: 'viewer-1', friendID: 'friend-1' },
-      { userID: 'friend-2', friendID: 'viewer-1' },
-    ]);
-    prisma.trace.findMany.mockResolvedValue([
+    stubFriendScope('friend-1', 'friend-2');
+    stubFeedTraces([
       makeTraceRow('trace-1', new Date('2026-06-08T00:00:00.000Z')),
       makeTraceRow('trace-2', new Date('2026-06-07T00:00:00.000Z')),
     ]);
@@ -1252,7 +1302,7 @@ describe('TraceService', () => {
   });
 
   it('drops replyTo when the parent comment row is gone', async () => {
-    prisma.trace.findMany.mockResolvedValue([
+    stubFeedTraces([
       makeTraceRow('trace-1', new Date('2026-06-08T00:00:00.000Z')),
     ]);
     prisma.trace.count.mockResolvedValue(1);
@@ -1272,32 +1322,123 @@ describe('TraceService', () => {
     expect(result.items[0].comments[0].replyTo).toBeNull();
   });
 
-  // getAcceptedFriendIds 每个 feed 页都要跑，此前不设上限。按好友业务上限（会员 5000，
-  // FriendService 的 FRIEND_LIMIT_MEMBER）收口，排序与 listFriends 一致。
-  it('bounds the accepted-friend scope query at the friend business cap', async () => {
-    prisma.friend.findMany.mockResolvedValue([]);
-    prisma.trace.findMany.mockResolvedValue([]);
+  // 好友范围每个 feed 页都要跑。按好友业务上限（会员 5000，FriendService 的
+  // FRIEND_LIMIT_MEMBER）收口，排序与 listFriends 一致；好友 id 与 CHAT_ONLY 授权
+  // 一次读出来，不再拿 5000 个 id 的 IN 列表把同一批关系行再读一遍。
+  it('reads the accepted-friend scope once, bounded at the friend business cap', async () => {
     prisma.trace.count.mockResolvedValue(0);
     prisma.traceLikeStat.findMany.mockResolvedValue([]);
 
     await service.getFeed('viewer-1', { page: 1, limit: 20 });
 
-    expect(prisma.friend.findMany).toHaveBeenCalledWith({
+    expect(prisma.$queryRaw).toHaveBeenCalledWith(
+      momentFriendScopeQuery('viewer-1', 5000),
+    );
+    expect(
+      prisma.$queryRaw.mock.calls.filter(([q]) => isFriendScope(q)),
+    ).toHaveLength(1);
+    expect(prisma.friend.findMany).not.toHaveBeenCalled();
+  });
+
+  it('hides chat-only friends from the feed scope but never the viewer', async () => {
+    stubFriendScope(
+      'friend-open',
+      { friendId: 'friend-chat-only', chatOnly: true },
+      // 自己加自己的脏行即使带着 CHAT_ONLY，本人的动态也照样可见。
+      { friendId: 'viewer-1', chatOnly: true },
+    );
+    prisma.trace.count.mockResolvedValue(0);
+    prisma.traceLikeStat.findMany.mockResolvedValue([]);
+
+    await service.getFeed('viewer-1', { page: 1, limit: 20 });
+
+    expect(prisma.$queryRaw).toHaveBeenCalledWith(
+      traceFeedPageQuery({
+        viewerId: 'viewer-1',
+        authorIds: ['viewer-1', 'friend-open', 'viewer-1'],
+        cursor: null,
+        offset: 0,
+        take: 20,
+      }),
+    );
+    // 老客户端的 count 仍按原 where（IN 列表 + 可见性 OR）计。
+    expect(prisma.trace.count).toHaveBeenCalledWith({
       where: {
-        OR: [{ userID: 'viewer-1' }, { friendID: 'viewer-1' }],
-        state: 'ACCEPTED',
+        deleted: false,
+        fromID: { in: ['viewer-1', 'friend-open', 'viewer-1'] },
+        OR: [
+          { fromID: 'viewer-1' },
+          { visibility: 'FRIENDS_ONLY' },
+          { visibility: 'PUBLIC' },
+        ],
       },
-      select: { userID: true, friendID: true },
-      orderBy: { updatedAt: 'desc' },
-      take: 5000,
+    });
+  });
+
+  it('returns the page in SQL order and drops rows soft-deleted before hydration', async () => {
+    stubFriendScope('friend-1');
+    const rows = [
+      makeTraceRow('t3', new Date('2026-06-03T00:00:00.000Z')),
+      makeTraceRow('t2', new Date('2026-06-02T00:00:00.000Z')),
+      makeTraceRow('t1', new Date('2026-06-01T00:00:00.000Z')),
+    ];
+    stubFeedTraces(rows);
+    // 回填查询不保证次序；t2 在两次读取之间被软删（where deleted=false 查不到）。
+    prisma.trace.findMany.mockResolvedValueOnce([rows[2], rows[0]]);
+    prisma.trace.count.mockResolvedValue(3);
+    prisma.traceLikeStat.findMany.mockResolvedValue([]);
+
+    const result = await service.getFeed('viewer-1', { page: 1, limit: 20 });
+
+    expect(prisma.trace.findMany).toHaveBeenCalledWith({
+      where: { id: { in: ['t3', 't2', 't1'] }, deleted: false },
+      include: {
+        from: {
+          select: {
+            id: true,
+            nickname: true,
+            avatarUrl: true,
+            vipLevel: true,
+            vipExpiresAt: true,
+          },
+        },
+      },
+    });
+    expect(result.items.map((item) => item.id)).toEqual(['t3', 't1']);
+    expect(result.total).toBe(3);
+  });
+
+  it('counts new moments over the same one-read friend scope', async () => {
+    stubFriendScope('friend-1', {
+      friendId: 'friend-chat-only',
+      chatOnly: true,
+    });
+    prisma.trace.count.mockResolvedValue(4);
+
+    const count = await service.getNewCount(
+      'viewer-1',
+      '2026-06-01T00:00:00.000Z',
+    );
+
+    expect(count).toBe(4);
+    expect(prisma.friend.findMany).not.toHaveBeenCalled();
+    expect(prisma.trace.count).toHaveBeenCalledWith({
+      where: {
+        deleted: false,
+        fromID: { in: ['viewer-1', 'friend-1'] },
+        createdAt: { gt: new Date('2026-06-01T00:00:00.000Z') },
+        OR: [
+          { fromID: 'viewer-1' },
+          { visibility: 'FRIENDS_ONLY' },
+          { visibility: 'PUBLIC' },
+        ],
+      },
     });
   });
 
   it('resolves feed author appearances in one deduped batch', async () => {
-    prisma.friend.findMany.mockResolvedValue([
-      { userID: 'viewer-1', friendID: 'friend-1' },
-    ]);
-    prisma.trace.findMany.mockResolvedValue([
+    stubFriendScope('friend-1');
+    stubFeedTraces([
       makeTraceRow('trace-1', new Date('2026-06-08T00:00:00.000Z')),
       makeTraceRow('trace-2', new Date('2026-06-07T00:00:00.000Z')),
     ]);
@@ -1339,7 +1480,6 @@ describe('TraceService', () => {
       { userID: 'viewer-1', friendID: 'friend-1' },
     ]);
     privacySettings.canViewMoments.mockResolvedValue(true);
-    prisma.trace.findMany.mockResolvedValue([]);
     prisma.trace.count.mockResolvedValue(0);
     prisma.traceLikeStat.findMany.mockResolvedValue([]);
 
@@ -1349,16 +1489,22 @@ describe('TraceService', () => {
       authorId: 'friend-1',
     });
 
-    expect(prisma.trace.findMany).toHaveBeenCalledWith(
-      expect.objectContaining({
-        where: expect.objectContaining({ fromID: 'friend-1' }),
+    expect(prisma.$queryRaw).toHaveBeenCalledWith(
+      traceFeedPageQuery({
+        viewerId: 'viewer-1',
+        authorIds: ['friend-1'],
+        cursor: null,
+        offset: 0,
+        take: 20,
       }),
     );
+    expect(prisma.trace.count).toHaveBeenCalledWith({
+      where: expect.objectContaining({ fromID: 'friend-1' }),
+    });
   });
 
   it('returns empty without querying when authorId is not visible to the viewer', async () => {
     prisma.friend.findMany.mockResolvedValue([]);
-    prisma.trace.findMany.mockResolvedValue([]);
     prisma.trace.count.mockResolvedValue(0);
     prisma.traceLikeStat.findMany.mockResolvedValue([]);
 
@@ -1371,6 +1517,7 @@ describe('TraceService', () => {
     expect(result.items).toEqual([]);
     expect(result.total).toBe(0);
     expect(result.hasMore).toBe(false);
+    expect(feedPageQueries()).toHaveLength(0);
     expect(prisma.trace.findMany).not.toHaveBeenCalled();
   });
 
@@ -1386,7 +1533,6 @@ describe('TraceService', () => {
       },
     ]);
     privacySettings.canViewMoments.mockResolvedValue(true);
-    prisma.trace.findMany.mockResolvedValue([]);
     prisma.trace.count.mockResolvedValue(0);
     prisma.traceLikeStat.findMany.mockResolvedValue([]);
 
@@ -1397,7 +1543,7 @@ describe('TraceService', () => {
     });
 
     expect(result.items).toEqual([]);
-    expect(prisma.trace.findMany).not.toHaveBeenCalled();
+    expect(feedPageQueries()).toHaveLength(0);
   });
 
   // 相册（authorId）只看一个作者：此前同样把 viewer 的全部好友（最多 5000）读出来、
@@ -1405,6 +1551,14 @@ describe('TraceService', () => {
   describe('album visibility without loading the friend list', () => {
     const albumQuery = { page: 1, limit: 20, authorId: 'friend-1' };
     const bulkFriendScope = expect.objectContaining({ take: 5000 });
+    const albumPage = (authorId: string) =>
+      traceFeedPageQuery({
+        viewerId: 'viewer-1',
+        authorIds: [authorId],
+        cursor: null,
+        offset: 0,
+        take: 20,
+      });
 
     beforeEach(() => {
       prisma.trace.count.mockResolvedValue(0);
@@ -1420,11 +1574,13 @@ describe('TraceService', () => {
           permissionB: 'FULL',
         },
       ]);
-      prisma.trace.findMany.mockResolvedValue([]);
 
       await service.getFeed('viewer-1', albumQuery);
 
       expect(prisma.friend.findMany).not.toHaveBeenCalledWith(bulkFriendScope);
+      expect(
+        prisma.$queryRaw.mock.calls.filter(([q]) => isFriendScope(q)),
+      ).toHaveLength(0);
       expect(prisma.friend.findMany).toHaveBeenCalledWith({
         where: {
           state: 'ACCEPTED',
@@ -1443,11 +1599,7 @@ describe('TraceService', () => {
       expect(privacySettings.getSettingsMany).toHaveBeenCalledWith([
         'friend-1',
       ]);
-      expect(prisma.trace.findMany).toHaveBeenCalledWith(
-        expect.objectContaining({
-          where: expect.objectContaining({ fromID: 'friend-1' }),
-        }),
-      );
+      expect(prisma.$queryRaw).toHaveBeenCalledWith(albumPage('friend-1'));
     });
 
     it.each([
@@ -1468,11 +1620,10 @@ describe('TraceService', () => {
         privacySettings.getSettingsMany.mockResolvedValue(
           new Map([['friend-1', { momentsVisibility }]]),
         );
-        prisma.trace.findMany.mockResolvedValue([]);
 
         const result = await service.getFeed('viewer-1', albumQuery);
 
-        expect(prisma.trace.findMany).toHaveBeenCalledTimes(visible ? 1 : 0);
+        expect(feedPageQueries()).toHaveLength(visible ? 1 : 0);
         expect(result.total).toBe(0);
       },
     );
@@ -1486,23 +1637,17 @@ describe('TraceService', () => {
       const result = await service.getFeed('viewer-1', albumQuery);
 
       expect(result.items).toEqual([]);
-      expect(prisma.trace.findMany).not.toHaveBeenCalled();
+      expect(feedPageQueries()).toHaveLength(0);
     });
 
     it("opens the viewer's own album without any friendship lookup for the gate", async () => {
-      prisma.trace.findMany.mockResolvedValue([]);
-
       await service.getFeed('viewer-1', {
         ...albumQuery,
         authorId: 'viewer-1',
       });
 
       expect(prisma.friend.findMany).not.toHaveBeenCalled();
-      expect(prisma.trace.findMany).toHaveBeenCalledWith(
-        expect.objectContaining({
-          where: expect.objectContaining({ fromID: 'viewer-1' }),
-        }),
-      );
+      expect(prisma.$queryRaw).toHaveBeenCalledWith(albumPage('viewer-1'));
     });
 
     it("filters album likes and comments by a friendship lookup over the page's people only", async () => {
@@ -1518,7 +1663,7 @@ describe('TraceService', () => {
         ])
         // 共同好友过滤：这一页的点赞 / 评论人里只有 mutual 是 viewer 的好友。
         .mockResolvedValueOnce([{ userID: 'viewer-1', friendID: 'mutual' }]);
-      prisma.trace.findMany.mockResolvedValue([
+      stubFeedTraces([
         makeTraceRow('trace-1', new Date('2026-06-08T00:00:00.000Z')),
       ]);
       prisma.trace.count.mockResolvedValue(1);
@@ -1560,33 +1705,32 @@ describe('TraceService', () => {
   });
 
   it('excludes a friend who hides their moments from the feed scope (batched privacy check)', async () => {
-    prisma.friend.findMany.mockResolvedValue([
-      { userID: 'viewer-1', friendID: 'friend-open' },
-      { userID: 'viewer-1', friendID: 'friend-private' },
-    ]);
+    stubFriendScope('friend-open', 'friend-private');
     // friend-private has momentsVisibility=PRIVATE; getSettingsMany surfaces it.
     privacySettings.getSettingsMany.mockResolvedValue(
       new Map([['friend-private', { momentsVisibility: 'PRIVATE' }]]),
     );
-    prisma.trace.findMany.mockResolvedValue([]);
     prisma.trace.count.mockResolvedValue(0);
     prisma.traceLikeStat.findMany.mockResolvedValue([]);
 
     await service.getFeed('viewer-1', { page: 1, limit: 20 });
 
-    const whereArg = prisma.trace.findMany.mock.calls[0][0].where;
-    expect(whereArg.fromID.in).toContain('viewer-1');
-    expect(whereArg.fromID.in).toContain('friend-open');
-    expect(whereArg.fromID.in).not.toContain('friend-private');
+    expect(prisma.$queryRaw).toHaveBeenCalledWith(
+      traceFeedPageQuery({
+        viewerId: 'viewer-1',
+        authorIds: ['viewer-1', 'friend-open'],
+        cursor: null,
+        offset: 0,
+        take: 20,
+      }),
+    );
   });
 
   it('keyset mode (cursor): no skip, no count(), fetches limit+1 with the tuple predicate', async () => {
-    prisma.friend.findMany.mockResolvedValue([
-      { userID: 'viewer-1', friendID: 'friend-1' },
-    ]);
+    stubFriendScope('friend-1');
     privacySettings.getSettingsMany.mockResolvedValue(new Map());
     // limit=2 → return 3 rows so the extra row signals a next page.
-    prisma.trace.findMany.mockResolvedValue([
+    stubFeedTraces([
       makeTraceRow('t3', new Date('2026-06-03T00:00:00.000Z')),
       makeTraceRow('t2', new Date('2026-06-02T00:00:00.000Z')),
       makeTraceRow('t1', new Date('2026-06-01T00:00:00.000Z')),
@@ -1601,11 +1745,24 @@ describe('TraceService', () => {
 
     // No count() runs on the keyset path.
     expect(prisma.trace.count).not.toHaveBeenCalled();
-    const args = prisma.trace.findMany.mock.calls[0][0];
-    expect(args.take).toBe(3); // limit + 1
-    expect(args.skip).toBeUndefined();
-    // Keyset predicate is ANDed onto the base visibility filter.
-    expect(Array.isArray(args.where.AND)).toBe(true);
+    // limit + 1 rows from the cursor on, no offset.
+    expect(prisma.$queryRaw).toHaveBeenCalledWith(
+      traceFeedPageQuery({
+        viewerId: 'viewer-1',
+        authorIds: ['viewer-1', 'friend-1'],
+        cursor: {
+          createdAt: new Date('2026-06-04T00:00:00.000Z'),
+          id: 't4',
+        },
+        offset: 0,
+        take: 3,
+      }),
+    );
+    // 多取的那一行不回填。
+    expect(prisma.trace.findMany.mock.calls[0][0].where.id.in).toEqual([
+      't3',
+      't2',
+    ]);
 
     // Only `limit` items returned; the dropped extra row drives hasMore/cursor.
     expect(result.items).toHaveLength(2);
@@ -1617,11 +1774,8 @@ describe('TraceService', () => {
   });
 
   it('keyset last page: fewer than limit+1 rows → hasMore false, nextCursor null', async () => {
-    prisma.friend.findMany.mockResolvedValue([]);
     privacySettings.getSettingsMany.mockResolvedValue(new Map());
-    prisma.trace.findMany.mockResolvedValue([
-      makeTraceRow('t1', new Date('2026-06-01T00:00:00.000Z')),
-    ]);
+    stubFeedTraces([makeTraceRow('t1', new Date('2026-06-01T00:00:00.000Z'))]);
     prisma.traceLikeStat.findMany.mockResolvedValue([]);
 
     const cursor = encodeTraceCursor(
@@ -1639,6 +1793,7 @@ describe('TraceService', () => {
     await expect(
       service.getFeed('viewer-1', { cursor: 'not a valid cursor' }),
     ).rejects.toBeInstanceOf(BadRequestException);
+    expect(prisma.$queryRaw).not.toHaveBeenCalled();
     expect(prisma.trace.findMany).not.toHaveBeenCalled();
   });
 

@@ -1562,3 +1562,138 @@ describe('circle sync durable scan progress', () => {
     }
   });
 });
+
+/**
+ * 激活后的即时座位同步按圈子在进程内合并(syncCircleSeatsCoalesced)。
+ *
+ * ensureCircleConversation 一开始就在事务里排对账锁:同一圈子 N 次激活各 fire 一次,
+ * 就是 N 个事务各占一个池连接排队,做的却是同一件事。合并后同一圈子同一时刻只跑
+ * 一次;期间再来的请求并成「结束后补跑一次」,补跑覆盖它们提交的全部变更。
+ */
+describe('ChatCircleSyncService.syncCircleSeatsCoalesced', () => {
+  const service = new ChatCircleSyncService(
+    {} as never,
+    {} as never,
+    {} as never,
+    {} as never,
+    {} as never,
+  );
+
+  type Deferred = {
+    circleId: string;
+    resolve: (value: string | null) => void;
+    reject: (error: unknown) => void;
+  };
+  let calls: Deferred[];
+  let running: Map<string, number>;
+  let peak: Map<string, number>;
+
+  beforeEach(() => {
+    calls = [];
+    running = new Map();
+    peak = new Map();
+    jest
+      .spyOn(service, 'ensureCircleConversation')
+      .mockImplementation((circleId: string) => {
+        const now = (running.get(circleId) ?? 0) + 1;
+        running.set(circleId, now);
+        peak.set(circleId, Math.max(peak.get(circleId) ?? 0, now));
+        return new Promise<string | null>((resolve, reject) => {
+          const done = () =>
+            running.set(circleId, (running.get(circleId) ?? 1) - 1);
+          calls.push({
+            circleId,
+            resolve: (value) => {
+              done();
+              resolve(value);
+            },
+            reject: (error) => {
+              done();
+              reject(error);
+            },
+          });
+        });
+      });
+  });
+
+  afterEach(() => jest.restoreAllMocks());
+
+  const flush = () => new Promise<void>((done) => setImmediate(done));
+
+  it('runs one sync per circle at a time and folds requests that arrive meanwhile into one trailing run', async () => {
+    const first = service.syncCircleSeatsCoalesced('c1');
+    await flush();
+    expect(calls).toHaveLength(1);
+
+    // 第一次还在跑:再来 7 个请求,一个都不另起。
+    const late = Array.from({ length: 7 }, () =>
+      service.syncCircleSeatsCoalesced('c1'),
+    );
+    await flush();
+    expect(calls).toHaveLength(1);
+
+    calls[0].resolve('conv-1');
+    await expect(first).resolves.toBe('conv-1');
+    await flush();
+    // 结束后恰好补跑一次,覆盖期间所有请求。
+    expect(calls).toHaveLength(2);
+    calls[1].resolve('conv-1');
+    await expect(Promise.all(late)).resolves.toEqual(Array(7).fill('conv-1'));
+    expect(peak.get('c1')).toBe(1);
+
+    // 都结束了:下一个请求重新起跑,而不是挂在旧状态上。
+    const next = service.syncCircleSeatsCoalesced('c1');
+    await flush();
+    expect(calls).toHaveLength(3);
+    calls[2].resolve('conv-1');
+    await expect(next).resolves.toBe('conv-1');
+  });
+
+  it('lets a request that arrives during the trailing run schedule exactly one more run', async () => {
+    const a = service.syncCircleSeatsCoalesced('c1');
+    await flush();
+    const b = service.syncCircleSeatsCoalesced('c1');
+    calls[0].resolve('conv');
+    await a;
+    await flush();
+    expect(calls).toHaveLength(2);
+
+    // b 的补跑已经开始,它读到的快照可能早于 c 的提交:c 必须再排一次。
+    const c = service.syncCircleSeatsCoalesced('c1');
+    const d = service.syncCircleSeatsCoalesced('c1');
+    calls[1].resolve('conv');
+    await expect(b).resolves.toBe('conv');
+    await flush();
+    expect(calls).toHaveLength(3);
+    calls[2].resolve('conv');
+    await expect(Promise.all([c, d])).resolves.toEqual(['conv', 'conv']);
+    expect(peak.get('c1')).toBe(1);
+  });
+
+  it('keeps different circles independent', async () => {
+    const one = service.syncCircleSeatsCoalesced('c1');
+    const two = service.syncCircleSeatsCoalesced('c2');
+    await flush();
+    expect(calls.map((call) => call.circleId)).toEqual(['c1', 'c2']);
+    calls[1].resolve('conv-2');
+    calls[0].resolve('conv-1');
+    await expect(Promise.all([one, two])).resolves.toEqual([
+      'conv-1',
+      'conv-2',
+    ]);
+  });
+
+  it('rejects the callers of a failed run (so they queue a retry) and still runs the trailing sync', async () => {
+    const first = service.syncCircleSeatsCoalesced('c1');
+    await flush();
+    const late = service.syncCircleSeatsCoalesced('c1');
+    const boom = new Error('db down');
+    calls[0].reject(boom);
+    await expect(first).rejects.toBe(boom);
+    await flush();
+    // 第一次失败不吞掉期间的请求:补跑照常发生,成败归它自己的等待者。
+    expect(calls).toHaveLength(2);
+    calls[1].resolve('conv-1');
+    await expect(late).resolves.toBe('conv-1');
+  });
+});

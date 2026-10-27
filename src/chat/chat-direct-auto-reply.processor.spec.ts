@@ -181,6 +181,19 @@ describe('ChatDirectAutoReplyProcessor', () => {
       }),
     );
   });
+  // 网关拿着 sendMessage 带回的任务 id 直接 kick,不再按消息 id 查一次任务表。
+  it('processes an enqueued job by id without looking it up by message', async () => {
+    await processor.processEnqueuedJob('job-1');
+
+    expect(prisma.chatDirectAutoReplyJob.findUnique).not.toHaveBeenCalled();
+    expect(prisma.chatDirectAutoReplyJob.updateMany).toHaveBeenCalledWith(
+      expect.objectContaining({
+        where: expect.objectContaining({ id: 'job-1' }),
+      }),
+    );
+    expect(prisma.chatMessage.create).toHaveBeenCalled();
+  });
+
   it('uses current active members to send a trimmed deterministic reply as the peer', async () => {
     await processor.processMessage('source-1');
 

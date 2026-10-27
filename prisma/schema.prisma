@@ -1842,6 +1842,9 @@ model NotificationPushOutbox {
   /// Immutable snapshot of the composed push payload (#88) — retries resend
   /// exactly what was originally composed instead of re-reading live rows.
   payload          Json?
+  /// 出队公平分区键(announcement:<id> / sender:<fromUserID>),由 BEFORE INSERT 触发器
+  /// circle_push_outbox_fairness_key 按 Notification 填;应用层不写。老行为 NULL。
+  fairnessKey      String?
   createdAt        DateTime                     @default(now())
   updatedAt        DateTime                     @updatedAt
 
@@ -2182,6 +2185,8 @@ model CircleInvitation {
   applicantID              String
   inviterID                String
   consentNoticeDeliveredAt DateTime?
+  /// 同意制投递的认领租约:事务里写 now(),IO 成功或失败后清空;过期后补投接手。
+  consentNoticeClaimedAt   DateTime?
   consentNoticeAttempts    Int                    @default(0)
   consentNoticeRequired    Boolean                @default(false)
   /// 默认值只在「迁移已落地、旧色还没换掉」的发布窗口里有意义:新代码两条
@@ -2552,6 +2557,8 @@ model ChatMessage {
   @@index([conversationID, deletedAt])
   /// 增量同步（GET /chat/conversations/:id/sync）按序号区间扫。
   @@index([conversationID, revision])
+  // 只在迁移里、Prisma 表达不了的对象(别当漂移清掉):部分索引 *_audit_irregular_media_idx
+  // (20261026000900)与表达式统计 *_media_key_expr_stats(20261026000910),供存储盘点按 key 反查。
 }
 
 /// 普通 DIRECT 客户端消息同事务写入的 durable inbox。服务端自动回复绕过
@@ -2841,4 +2848,6 @@ model ChatBurnArchive {
   retainUntil DateTime
   @@index([conversationID, height])
   @@index([retainUntil, id])
+  // 只在迁移里、Prisma 表达不了的对象(别当漂移清掉):部分索引 *_audit_irregular_media_idx
+  // (20261026000900)与表达式统计 *_media_key_expr_stats(20261026000910),供存储盘点按 key 反查。
 }

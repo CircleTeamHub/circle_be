@@ -97,6 +97,9 @@ describe('CircleInvitationService', () => {
       findFirst: jest.fn(),
       findMany: jest.fn(),
     },
+    userPrivacySetting: {
+      findMany: jest.fn(),
+    },
     block: {
       findFirst: jest.fn(),
     },
@@ -122,7 +125,10 @@ describe('CircleInvitationService', () => {
     activateMembers: jest.fn(),
   };
   const memberLock = { lock: jest.fn(), lockPolicy: jest.fn() };
-  const chatCircleSync = { ensureCircleConversation: jest.fn() };
+  const chatCircleSync = {
+    syncCircleSeatsCoalesced: jest.fn(),
+    scheduleRetry: jest.fn(),
+  };
   const chatService = {
     ensureDirectConversationForSettlement: jest.fn(),
     getOrCreateDirectConversation: jest.fn(),
@@ -136,7 +142,11 @@ describe('CircleInvitationService', () => {
     notificationService.createCircleInvitationNotification.mockReset();
     admissionPolicy.assertCanApply.mockResolvedValue(undefined);
     admissionPolicy.activateMembers.mockResolvedValue(['applicant-1']);
-    chatCircleSync.ensureCircleConversation.mockResolvedValue('conv-1');
+    chatCircleSync.syncCircleSeatsCoalesced.mockResolvedValue('conv-1');
+    prisma.$queryRaw.mockResolvedValue([]);
+    prisma.$executeRaw.mockResolvedValue(1);
+    prisma.friend.findMany.mockResolvedValue([]);
+    prisma.userPrivacySetting.findMany.mockResolvedValue([]);
     chatService.ensureDirectConversationForSettlement.mockResolvedValue('dm-1');
     prisma.chatConversation.findUnique.mockResolvedValue({
       qrJoinEnabled: true,
@@ -167,26 +177,10 @@ describe('CircleInvitationService', () => {
     service = module.get(CircleInvitationService);
   });
 
-  it('reads newly created batch invitation DTOs through the creating transaction', async () => {
-    const invitation = { id: 'uncommitted' };
-    const client = {
-      circleInvitation: { findUnique: jest.fn().mockResolvedValue(invitation) },
-    };
-    const mapper = jest
-      .spyOn(service as any, 'toInvitationDto')
-      .mockReturnValue(invitation);
-    await expect(
-      (service as any).fetchInvitationDto('uncommitted', client),
-    ).resolves.toBe(invitation);
-    expect(client.circleInvitation.findUnique).toHaveBeenCalled();
-    expect(prisma.circleInvitation.findUnique).not.toHaveBeenCalled();
-    mapper.mockRestore();
-  });
-
   it('returns a committed batch without waiting for card delivery', async () => {
-    const invite = jest
-      .spyOn(service, 'invite')
-      .mockResolvedValue({ id: 'created' } as any);
+    const inviteInTransaction = jest
+      .spyOn(service as any, 'inviteInTransaction')
+      .mockResolvedValue({ created: { id: 'created' } });
     const delivery = jest
       .spyOn(service as any, 'deliverConsentInvitation')
       .mockReturnValue(new Promise(() => {}));
@@ -194,14 +188,36 @@ describe('CircleInvitationService', () => {
       service.inviteBatch('inviter', ['applicant'], 'circle'),
     ).resolves.toBeUndefined();
     expect(delivery).toHaveBeenCalledWith('created');
-    invite.mockRestore();
+    inviteInTransaction.mockRestore();
     delivery.mockRestore();
   });
 
+  it('delivers batch consent cards one at a time after commit', async () => {
+    jest
+      .spyOn(service as any, 'inviteInTransaction')
+      .mockImplementation(async (...args: unknown[]) => ({
+        created: { id: `inv-${args[2] as string}` },
+      }));
+    let release!: () => void;
+    const first = new Promise<void>((done) => {
+      release = done;
+    });
+    const deliver = jest
+      .spyOn(service as any, 'deliverConsentInvitation')
+      .mockReturnValueOnce(first)
+      .mockResolvedValue(undefined);
+    await service.inviteBatch('inviter', ['b', 'a'], 'circle');
+    // 第一个还没投完,第二个不开始:批量提交后不会一下子打出最多 100 个投递。
+    expect(deliver.mock.calls).toEqual([['inv-a']]);
+    release();
+    await flush();
+    expect(deliver.mock.calls).toEqual([['inv-a'], ['inv-b']]);
+  });
+
   it('does not deliver any batch consent card when a later invite fails', async () => {
-    const invite = jest
-      .spyOn(service, 'invite')
-      .mockResolvedValueOnce({ id: 'first' } as any)
+    const inviteInTransaction = jest
+      .spyOn(service as any, 'inviteInTransaction')
+      .mockResolvedValueOnce({ created: { id: 'first' } })
       .mockRejectedValueOnce(new ForbiddenException());
     const deliver = jest
       .spyOn(service as any, 'deliverConsentInvitation')
@@ -210,38 +226,127 @@ describe('CircleInvitationService', () => {
       service.inviteBatch('inviter', ['a', 'b'], 'circle'),
     ).rejects.toThrow(ForbiddenException);
     expect(prisma.$transaction).toHaveBeenCalledTimes(1);
-    expect(invite).toHaveBeenNthCalledWith(
+    expect(inviteInTransaction).toHaveBeenNthCalledWith(
       1,
+      prisma,
       'inviter',
       'a',
       'circle',
-      undefined,
-      prisma,
     );
-    expect(invite).toHaveBeenNthCalledWith(
+    expect(inviteInTransaction).toHaveBeenNthCalledWith(
       2,
+      prisma,
       'inviter',
       'b',
       'circle',
-      undefined,
-      prisma,
     );
     expect(deliver).not.toHaveBeenCalled();
-    invite.mockRestore();
+    inviteInTransaction.mockRestore();
     deliver.mockRestore();
   });
 
-  it('serializes concurrent consent workers and emits the card only once', async () => {
-    const invitation = {
-      id: 'consent',
-      status: 'INVITED',
-      consentNoticeRequired: true,
-      consentNoticeDeliveredAt: null,
-      applicantID: 'applicant',
-      inviterID: 'inviter',
-      circleID: 'circle',
-      circle: { name: 'Circle' },
-    };
+  it('prechecks batch privacy with one friend query and one settings query before the transaction', async () => {
+    prisma.friend.findMany.mockResolvedValue([
+      { userID: 'inviter', friendID: 'friend' },
+      { userID: 'reverse-friend', friendID: 'inviter' },
+    ]);
+    const settings = [
+      { userID: 'friend', groupInvitePermission: 'FRIENDS_ONLY' },
+    ];
+    prisma.userPrivacySetting.findMany.mockResolvedValue(settings);
+    privacySettings.canBeInvitedToGroupOrCircle.mockImplementation(
+      async (userId: string, isFriend: boolean, client: any) => {
+        // 判定仍交给 PrivacySettingsService:预取的行按 findUnique 的口径喂回去。
+        const row = await client.userPrivacySetting.findUnique({
+          where: { userID: userId },
+        });
+        expect(row).toBe(userId === 'friend' ? settings[0] : null);
+        return userId !== 'stranger' || !isFriend;
+      },
+    );
+    const inviteInTransaction = jest
+      .spyOn(service as any, 'inviteInTransaction')
+      .mockImplementation(async (...args: unknown[]) => ({
+        created: { id: args[2] as string },
+      }));
+    jest
+      .spyOn(service as any, 'deliverConsentInvitation')
+      .mockResolvedValue(undefined);
+
+    await service.inviteBatch(
+      'inviter',
+      ['stranger', 'friend', 'reverse-friend', 'friend'],
+      'circle',
+    );
+
+    expect(prisma.friend.findMany).toHaveBeenCalledTimes(1);
+    expect(prisma.friend.findMany).toHaveBeenCalledWith({
+      where: {
+        state: 'ACCEPTED',
+        OR: [
+          {
+            userID: 'inviter',
+            friendID: { in: ['friend', 'reverse-friend', 'stranger'] },
+          },
+          {
+            userID: { in: ['friend', 'reverse-friend', 'stranger'] },
+            friendID: 'inviter',
+          },
+        ],
+      },
+      select: { userID: true, friendID: true },
+    });
+    expect(prisma.userPrivacySetting.findMany).toHaveBeenCalledTimes(1);
+    expect(
+      privacySettings.canBeInvitedToGroupOrCircle.mock.calls.map(
+        (call: unknown[]) => [call[0], call[1]],
+      ),
+    ).toEqual([
+      ['friend', true],
+      ['reverse-friend', true],
+      ['stranger', false],
+    ]);
+    // 预检全在事务之前;事务里逐个走同一段建单逻辑。
+    expect(
+      prisma.userPrivacySetting.findMany.mock.invocationCallOrder[0],
+    ).toBeLessThan(prisma.$transaction.mock.invocationCallOrder[0]);
+    expect(inviteInTransaction).toHaveBeenCalledTimes(3);
+    // 单个 invite 才用的逐个好友查询,批量路径一次都不发。
+    expect(prisma.friend.findFirst).not.toHaveBeenCalled();
+  });
+
+  it("throws the privacy refusal at the refused target's turn so the batch keeps its error precedence", async () => {
+    privacySettings.canBeInvitedToGroupOrCircle.mockImplementation(
+      async (userId: string) => userId !== 'b',
+    );
+    const inviteInTransaction = jest
+      .spyOn(service as any, 'inviteInTransaction')
+      .mockImplementation(async (...args: unknown[]) => ({
+        created: { id: args[2] as string },
+      }));
+
+    await expect(
+      service.inviteBatch('inviter', ['c', 'b', 'a'], 'circle'),
+    ).rejects.toMatchObject({
+      response: { errorCode: CircleInvitationErrorCode.NotAllowed },
+    });
+    // a 在 b 之前照常进了事务(随后整批回滚),c 没轮到。
+    expect(inviteInTransaction.mock.calls.map((call) => call[2])).toEqual([
+      'a',
+    ]);
+  });
+
+  const consentInvitation = (id: string) => ({
+    id,
+    status: 'INVITED',
+    consentNoticeRequired: true,
+    consentNoticeDeliveredAt: null,
+    applicantID: 'applicant',
+    inviterID: 'inviter',
+    circleID: 'circle',
+    circle: { name: 'Circle' },
+  });
+  const allowConsentDelivery = () => {
     prisma.circle.findFirst.mockResolvedValue({
       id: 'circle',
       memberCanInvite: true,
@@ -252,30 +357,217 @@ describe('CircleInvitationService', () => {
     });
     prisma.block.findFirst.mockResolvedValue(null);
     prisma.friend.findFirst.mockResolvedValue({ userID: 'inviter' });
-    prisma.circleInvitation.findUnique.mockImplementation(
-      async () => invitation,
+  };
+  const rawSql = (call: unknown[]) =>
+    Array.from(call[0] as TemplateStringsArray).join('?');
+
+  it('claims inside a short transaction and does the notice/chat IO only after it commits', async () => {
+    allowConsentDelivery();
+    prisma.circleInvitation.findUnique.mockResolvedValue(
+      consentInvitation('consent'),
     );
-    prisma.circleInvitation.update.mockImplementation(async ({ data }) => {
-      Object.assign(invitation, data);
-      return invitation;
-    });
+    let inTransaction = false;
     const original = prisma.$transaction.getMockImplementation();
-    let queue: Promise<unknown> = Promise.resolve();
-    prisma.$transaction.mockImplementation((operation: any) => {
-      const task = queue.then(() => operation(prisma));
-      queue = task.catch(() => {});
-      return task;
+    prisma.$transaction.mockImplementation(async (operation: any) => {
+      inTransaction = true;
+      try {
+        return await operation(prisma);
+      } finally {
+        inTransaction = false;
+      }
+    });
+    const seen: boolean[] = [];
+    notificationService.deliverCircleConsentNotification.mockImplementation(
+      async () => {
+        seen.push(inTransaction);
+      },
+    );
+    chatMessages.insertServerMessage.mockImplementation(async () => {
+      seen.push(inTransaction);
+      return { id: 'msg-1' };
     });
     try {
-      await Promise.all([
-        (service as any).deliverConsentInvitation('consent'),
-        (service as any).deliverConsentInvitation('consent'),
-      ]);
-      expect(prisma.$executeRaw).toHaveBeenCalledTimes(4);
-      expect(chatMessages.insertServerMessage).toHaveBeenCalledTimes(1);
+      await (service as any).deliverConsentInvitation('consent');
     } finally {
       prisma.$transaction.mockImplementation(original!);
     }
+
+    expect(seen).toEqual([false, false]);
+    expect(prisma.$transaction).toHaveBeenCalledWith(expect.any(Function), {
+      maxWait: 10_000,
+      timeout: 10_000,
+    });
+    const statements = prisma.$executeRaw.mock.calls.map(rawSql);
+    const claim = statements.findIndex((sql) =>
+      sql.includes('SET "consentNoticeClaimedAt" = ?'),
+    );
+    const done = statements.findIndex((sql) =>
+      sql.includes('SET "consentNoticeDeliveredAt" = ?'),
+    );
+    expect(claim).toBeGreaterThanOrEqual(0);
+    expect(done).toBeGreaterThan(claim);
+    expect(prisma.$executeRaw.mock.invocationCallOrder[claim]).toBeLessThan(
+      notificationService.deliverCircleConsentNotification.mock
+        .invocationCallOrder[0],
+    );
+    expect(prisma.$executeRaw.mock.invocationCallOrder[done]).toBeGreaterThan(
+      chatMessages.insertServerMessage.mock.invocationCallOrder[0],
+    );
+    expect(chatMessages.insertServerMessage).toHaveBeenCalledWith(
+      'dm-1',
+      {
+        senderID: 'inviter',
+        type: 'group-invitation',
+        content: { circleInvitationId: 'consent', groupName: 'Circle' },
+        clientMessageId: 'circle_invitation_consent',
+        rebroadcastOnReplay: true,
+      },
+      { guard: expect.any(Function) },
+    );
+    // 两个写点拿的是同一个复核。
+    expect(
+      notificationService.deliverCircleConsentNotification.mock.calls[0][1],
+    ).toEqual({
+      guard: chatMessages.insertServerMessage.mock.calls[0][2].guard,
+    });
+    // 隐私复核也走事务客户端,不在持锁事务里另借连接。
+    expect(privacySettings.canBeInvitedToGroupOrCircle).toHaveBeenCalledWith(
+      'applicant',
+      true,
+      prisma,
+    );
+  });
+
+  /** 让写点按真实实现那样在「事务」里先跑复核;复核时的库状态由 recheck 决定。 */
+  const runGuardAtWritePoints = () => {
+    notificationService.deliverCircleConsentNotification.mockImplementation(
+      async (_input: unknown, options: any) => options.guard(prisma),
+    );
+    chatMessages.insertServerMessage.mockImplementation(
+      async (_id: unknown, _input: unknown, options: any) => {
+        await options.guard(prisma);
+        return { id: 'msg-1' };
+      },
+    );
+  };
+  const claimValue = () => {
+    const claim = prisma.$executeRaw.mock.calls.find((call: unknown[]) =>
+      rawSql(call).includes('SET "consentNoticeClaimedAt" = ?'),
+    );
+    return claim?.[1] as Date;
+  };
+
+  it('rechecks under the pair lock at each write point and cancels when the applicant blocked after the claim', async () => {
+    allowConsentDelivery();
+    prisma.circleInvitation.findUnique.mockResolvedValue(
+      consentInvitation('raced'),
+    );
+    runGuardAtWritePoints();
+    // 认领时没拉黑;写点复核时(拿到 call-user 锁之后)已经拉黑。
+    prisma.$queryRaw.mockImplementation(
+      async (strings: TemplateStringsArray) =>
+        Array.from(strings).join('?').includes('FOR NO KEY UPDATE')
+          ? [{ invited: true, claimed: true }]
+          : [],
+    );
+    prisma.block.findFirst
+      .mockResolvedValueOnce(null)
+      .mockResolvedValue({ id: 'block' });
+
+    await expect(
+      (service as any).deliverConsentInvitation('raced'),
+    ).resolves.toBeUndefined();
+
+    // 复核是写点的第一件事:先取这一对人的关系锁。
+    const guardLocks = prisma.$executeRaw.mock.calls
+      .map(rawSql)
+      .filter((sql: string) => sql.includes('pg_advisory_xact_lock'));
+    expect(guardLocks.length).toBeGreaterThanOrEqual(3);
+    expect(chatService.getOrCreateDirectConversation).not.toHaveBeenCalled();
+    expect(chatMessages.insertServerMessage).not.toHaveBeenCalled();
+    // 按失格口径作废(只动自己认领的那一行),不抛错、不交给补投。
+    expect(prisma.circleInvitation.updateMany).toHaveBeenCalledWith({
+      where: {
+        id: 'raced',
+        status: 'INVITED',
+        consentNoticeClaimedAt: claimValue(),
+      },
+      data: {
+        status: 'CANCELLED',
+        consentNoticeDeliveredAt: expect.any(Date),
+        consentNoticeClaimedAt: null,
+      },
+    });
+    expect(
+      prisma.$executeRaw.mock.calls
+        .map(rawSql)
+        .some((sql: string) =>
+          sql.includes('SET "consentNoticeDeliveredAt" = ?'),
+        ),
+    ).toBe(false);
+  });
+
+  it('stops without cancelling when the claim is no longer its own at the write point', async () => {
+    allowConsentDelivery();
+    prisma.circleInvitation.findUnique.mockResolvedValue(
+      consentInvitation('taken-over'),
+    );
+    runGuardAtWritePoints();
+    prisma.$queryRaw.mockImplementation(
+      async (strings: TemplateStringsArray) =>
+        Array.from(strings).join('?').includes('FOR NO KEY UPDATE')
+          ? [{ invited: true, claimed: false }]
+          : [],
+    );
+
+    await expect(
+      (service as any).deliverConsentInvitation('taken-over'),
+    ).resolves.toBeUndefined();
+
+    expect(prisma.circleInvitation.updateMany).not.toHaveBeenCalled();
+    expect(chatMessages.insertServerMessage).not.toHaveBeenCalled();
+  });
+
+  it('skips the delivery while another worker holds a fresh claim', async () => {
+    allowConsentDelivery();
+    prisma.circleInvitation.findUnique.mockResolvedValue(
+      consentInvitation('busy'),
+    );
+    prisma.$queryRaw.mockResolvedValue([{ busy: true }]);
+
+    await (service as any).deliverConsentInvitation('busy');
+
+    expect(memberLock.lock).not.toHaveBeenCalled();
+    expect(
+      notificationService.deliverCircleConsentNotification,
+    ).not.toHaveBeenCalled();
+    expect(chatMessages.insertServerMessage).not.toHaveBeenCalled();
+  });
+
+  it('releases its own claim and rethrows when the IO fails, leaving the row to the cron', async () => {
+    allowConsentDelivery();
+    prisma.circleInvitation.findUnique.mockResolvedValue(
+      consentInvitation('flaky'),
+    );
+    chatService.getOrCreateDirectConversation.mockRejectedValue(
+      new Error('socket adapter down'),
+    );
+
+    await expect(
+      (service as any).deliverConsentInvitation('flaky'),
+    ).rejects.toThrow('socket adapter down');
+
+    const statements = prisma.$executeRaw.mock.calls.map(rawSql);
+    expect(
+      statements.some((sql) =>
+        sql.includes('SET "consentNoticeClaimedAt" = NULL'),
+      ),
+    ).toBe(true);
+    expect(
+      statements.some((sql) =>
+        sql.includes('SET "consentNoticeDeliveredAt" = ?'),
+      ),
+    ).toBe(false);
   });
 
   it.each(['blocked', 'left', 'privacy'])(
@@ -907,7 +1199,7 @@ describe('CircleInvitationService', () => {
       { locksHeld: true, actor: 'third-party' },
     );
     // 座位不等对账:激活提交后立刻触发一次幂等 ensure。
-    expect(chatCircleSync.ensureCircleConversation).toHaveBeenCalledWith(
+    expect(chatCircleSync.syncCircleSeatsCoalesced).toHaveBeenCalledWith(
       'circle-1',
     );
   });
@@ -984,7 +1276,7 @@ describe('CircleInvitationService', () => {
       { locksHeld: true, actor: 'third-party' },
     );
     // 座位不等对账:激活提交后立刻触发一次幂等 ensure。
-    expect(chatCircleSync.ensureCircleConversation).toHaveBeenCalledWith(
+    expect(chatCircleSync.syncCircleSeatsCoalesced).toHaveBeenCalledWith(
       'circle-1',
     );
   });
@@ -1045,7 +1337,7 @@ describe('CircleInvitationService', () => {
       { locksHeld: true },
     );
     // 座位不等对账:激活提交后立刻触发一次幂等 ensure。
-    expect(chatCircleSync.ensureCircleConversation).toHaveBeenCalledWith(
+    expect(chatCircleSync.syncCircleSeatsCoalesced).toHaveBeenCalledWith(
       'circle-1',
     );
   });
@@ -1068,7 +1360,7 @@ describe('CircleInvitationService', () => {
     );
 
     expect(admissionPolicy.activateMembers).not.toHaveBeenCalled();
-    expect(chatCircleSync.ensureCircleConversation).not.toHaveBeenCalled();
+    expect(chatCircleSync.syncCircleSeatsCoalesced).not.toHaveBeenCalled();
   });
 
   it('rejects admin approval when the locked admin was demoted', async () => {
@@ -1094,7 +1386,7 @@ describe('CircleInvitationService', () => {
     ]);
     expect(prisma.circleInvitation.updateMany).not.toHaveBeenCalled();
     expect(admissionPolicy.activateMembers).not.toHaveBeenCalled();
-    expect(chatCircleSync.ensureCircleConversation).not.toHaveBeenCalled();
+    expect(chatCircleSync.syncCircleSeatsCoalesced).not.toHaveBeenCalled();
   });
 
   it('addVerifier sends a circle-verification interaction message', async () => {
@@ -2079,7 +2371,7 @@ describe('CircleInvitationService', () => {
         }),
       );
       expect(admissionPolicy.activateMembers).not.toHaveBeenCalled();
-      expect(chatCircleSync.ensureCircleConversation).not.toHaveBeenCalled();
+      expect(chatCircleSync.syncCircleSeatsCoalesced).not.toHaveBeenCalled();
     });
     it('recipient acceptance upgrades the same invitation and preserves its verification policy snapshot', async () => {
       arrangeInviteFlow({ circle: { requiredVerifierCount: 1 } });
@@ -2157,7 +2449,7 @@ describe('CircleInvitationService', () => {
         { locksHeld: true, actor: 'third-party' },
       );
       // 席位同步 + 申请人通知 + 实时广播,与 respond 的满票收尾同一套。
-      expect(chatCircleSync.ensureCircleConversation).toHaveBeenCalledWith(
+      expect(chatCircleSync.syncCircleSeatsCoalesced).toHaveBeenCalledWith(
         'circle-1',
       );
       expect(

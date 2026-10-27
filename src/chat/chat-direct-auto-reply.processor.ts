@@ -54,13 +54,21 @@ export class ChatDirectAutoReplyProcessor {
     private readonly sensitiveWords: SensitiveWordService,
   ) {}
 
-  /** Low-latency post-commit kick; the cron sweep remains the durable fallback. */
+  /**
+   * 按消息 id 找任务再处理。只给「不知道这条消息有没有入队」的场合用(幂等重发);
+   * 首次发送由 sendMessage 带回任务 id,走 processEnqueuedJob。
+   */
   async processMessage(sourceMessageID: string): Promise<void> {
     const job = await this.prisma.chatDirectAutoReplyJob.findUnique({
       where: { sourceMessageID },
       select: { id: true },
     });
     if (job) await this.processJob(job.id);
+  }
+
+  /** Low-latency post-commit kick; the cron sweep remains the durable fallback. */
+  async processEnqueuedJob(jobId: string): Promise<void> {
+    await this.processJob(jobId);
   }
 
   @TrackedCron(CronExpression.EVERY_MINUTE, 'chat_direct_auto_reply_jobs')
