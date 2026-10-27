@@ -2,8 +2,11 @@ import { Prisma } from 'src/generated/prisma';
 import { chatRetentionWhere, type ChatRetentionWindow } from './chat-retention';
 import type { HistoryFilters } from './chat.types';
 
-/** 读消息不带编辑历史:contentHistory 可能很长,读路径用不到。 */
-export const MESSAGE_READ_OMIT = { contentHistory: true } as const;
+/** 读消息不带编辑历史(contentHistory 可能很长)和笔记来源索引列(sourceNoteID),读路径都用不到。 */
+export const MESSAGE_READ_OMIT = {
+  contentHistory: true,
+  sourceNoteID: true,
+} as const;
 
 /** 历史页的附加过滤(类型页签、按日期)。 */
 export function historyFilterWhere(

@@ -596,6 +596,7 @@ describe('ChatService', () => {
     expect(prisma.chatMessage.create).toHaveBeenCalledWith(
       expect.objectContaining({
         data: expect.objectContaining({
+          sourceNoteID: 'boss-note',
           content: {
             noteId: 'copy-1',
             sourceNoteId: 'boss-note',
@@ -634,6 +635,7 @@ describe('ChatService', () => {
     expect(prisma.chatMessage.create).toHaveBeenCalledWith(
       expect.objectContaining({
         data: expect.objectContaining({
+          sourceNoteID: null,
           content: { noteId: 'hidden-note' },
         }),
       }),

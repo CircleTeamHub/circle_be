@@ -20,7 +20,6 @@ import { PrismaService } from 'src/prisma/prisma.service';
 import { MembershipPolicyService } from 'src/membership/membership-policy.service';
 import { RealtimeService } from 'src/realtime/realtime.service';
 import { purgeDeletedNote } from './note-purge';
-import { noteCardConversationsQuery } from './note-card-recipients.query';
 import {
   NOTE_SUMMARY_CONTENT_HEAD,
   NoteSummaryProjectionRow,
@@ -200,6 +199,7 @@ type NoteRow = {
   mediaCount: number;
   collectedFrom?: unknown;
   collectedFromNoteID?: string | null;
+  rootSourceNoteID: string | null;
   createdAt: Date;
   updatedAt: Date;
   coverMedia: { id: string; type: NoteMediaType; url: string } | null;
@@ -308,6 +308,7 @@ const NOTE_SUMMARY_SELECT = {
   mediaCount: true,
   collectedFrom: true,
   collectedFromNoteID: true,
+  rootSourceNoteID: true,
   createdAt: true,
   updatedAt: true,
   groupMemberships: {
@@ -334,6 +335,7 @@ type NoteSummaryBase = Pick<
   | 'mediaCount'
   | 'collectedFrom'
   | 'collectedFromNoteID'
+  | 'rootSourceNoteID'
   | 'createdAt'
   | 'updatedAt'
   | 'groupMemberships'
@@ -358,7 +360,10 @@ type NoteSummaryFacts = {
 type CollectedStateFields = Pick<
   NoteRow,
   'collectedFromNoteID' | 'status' | 'available' | 'workStatus'
->;
+> & {
+  // 必填:漏 select 这一列时类型直接报错,不会静默退回逐层走收藏链。
+  rootSourceNoteID: string | null;
+};
 
 const MAX_GROUPS_PER_USER = 50;
 // Discarded IDs prevent delayed autosaves for 30 days. Published outcomes never
@@ -1221,7 +1226,11 @@ export class NoteService {
    * 读完就丢。
    */
   private async requireOwnedNote(ownerID: string, noteId: string) {
-    return this.findOwnedNoteOrThrow(ownerID, noteId, { id: true });
+    // rootSourceNoteID:状态写入要把广播排到收藏链的根上(noteRootID)。
+    return this.findOwnedNoteOrThrow(ownerID, noteId, {
+      id: true,
+      rootSourceNoteID: true,
+    });
   }
 
   /** 群设置里的来源关联和开工/打烊状态只属于老板的来源笔记。 */
@@ -1229,6 +1238,7 @@ export class NoteService {
     const note = await this.findOwnedNoteOrThrow(ownerID, noteId, {
       id: true,
       collectedFromNoteID: true,
+      rootSourceNoteID: true,
     });
     if (note.collectedFromNoteID) {
       throw new ForbiddenException(
@@ -1238,140 +1248,43 @@ export class NoteService {
     return note;
   }
 
-  /**
-   * Notify everyone who can have a local copy of a source note. Copies keep
-   * their own rows, so the event is a refetch signal rather than a mutable
-   * broadcast of note contents. The bounded walk follows the same chain limit
-   * used by overlayCollectedSourceState and includes the source owner.
-   */
-  private async broadcastSourceStatusChanged(noteID: string): Promise<void> {
-    if (!this.realtime) return;
+  private noteRootID(note: {
+    id: string;
+    rootSourceNoteID: string | null;
+  }): string {
+    return note.rootSourceNoteID ?? note.id;
+  }
 
-    try {
-      type SourceRow = {
-        id: string;
-        ownerID: string;
-        status: NoteStatus;
-        available: boolean;
-        workStatus: NoteWorkStatus | null;
-        collectedFromNoteID: string | null;
-      };
-
-      const rows = new Map<string, SourceRow>();
-      const visited = new Set<string>();
-      let frontier = [noteID];
-      for (let depth = 0; depth < 8 && frontier.length > 0; depth += 1) {
-        const ids = frontier.filter((id) => !visited.has(id));
-        if (ids.length === 0) break;
-        ids.forEach((id) => visited.add(id));
-
-        const batch = (await this.prisma.note.findMany({
-          where: { id: { in: ids } },
-          select: {
-            id: true,
-            ownerID: true,
-            status: true,
-            available: true,
-            workStatus: true,
-            collectedFromNoteID: true,
-          },
-        })) as SourceRow[];
-        batch.forEach((row) => rows.set(row.id, row));
-        frontier = batch
-          .map((row) => row.collectedFromNoteID)
-          .filter((id): id is string => Boolean(id));
-      }
-
-      const requested = rows.get(noteID);
-      if (!requested) return;
-
-      let source = requested;
-      const seen = new Set<string>();
-      while (source.collectedFromNoteID && !seen.has(source.id)) {
-        seen.add(source.id);
-        const parent = rows.get(source.collectedFromNoteID);
-        if (!parent) break;
-        source = parent;
-      }
-
-      const recipientIDs = new Set<string>([source.ownerID]);
-      const relatedNoteIDs = new Set<string>([source.id]);
-      frontier = [source.id];
-      const descendantsSeen = new Set<string>();
-      for (let depth = 0; depth < 8 && frontier.length > 0; depth += 1) {
-        const ids = frontier.filter((id) => !descendantsSeen.has(id));
-        if (ids.length === 0) break;
-        ids.forEach((id) => descendantsSeen.add(id));
-        const copies = (await this.prisma.note.findMany({
-          where: { collectedFromNoteID: { in: ids } },
-          select: { id: true, ownerID: true },
-        })) as Array<{ id: string; ownerID: string }>;
-        copies.forEach((copy) => {
-          recipientIDs.add(copy.ownerID);
-          relatedNoteIDs.add(copy.id);
-        });
-        frontier = copies.map((copy) => copy.id);
-      }
-
-      // Chat cards are pointers, so a recipient may have seen the source note
-      // without collecting it. Include active members of conversations that
-      // still contain a live card; the payload has no private note content.
-      const chatMember = (this.prisma as any).chatMember;
-      if (chatMember?.findMany) {
-        try {
-          // 走 ChatMessage 上按来源指针键建的部分表达式索引（sourceNoteId 与老卡片
-          // 的 noteId 都查）。全部 id 进一个数组参数、一条语句，不再分块串行扫表。
-          const messages = await this.prisma.$queryRaw<
-            Array<{ conversationID?: unknown }>
-          >(noteCardConversationsQuery([...relatedNoteIDs]));
-          const conversationIDs = [
-            ...new Set(
-              messages
-                .map((message) => message.conversationID)
-                .filter(
-                  (id): id is string => typeof id === 'string' && id.length > 0,
-                ),
-            ),
-          ];
-          if (conversationIDs.length > 0) {
-            const members = await chatMember.findMany({
-              where: { conversationID: { in: conversationIDs }, leftAt: null },
-              select: { userID: true },
-            });
-            (members as Array<{ userID?: unknown }>).forEach((member) => {
-              if (
-                typeof member.userID === 'string' &&
-                member.userID.length > 0
-              ) {
-                recipientIDs.add(member.userID);
-              }
-            });
-          }
-        } catch (error) {
-          this.logger.warn(
-            `Note chat recipient lookup failed: ${error instanceof Error ? error.message : String(error)}`,
-          );
-        }
-      }
-
-      await this.realtime.safeBroadcastAll(
-        [...recipientIDs].map(
-          (userID) => () =>
-            this.realtime!.broadcastNoteSourceStatusChanged(userID, {
-              sourceNoteId: source.id,
-              workStatus: source.workStatus,
-              status: source.status,
-              available: source.available,
-            }),
-        ),
-      );
-    } catch (error) {
-      // Status writes have already committed. Realtime delivery is best effort
-      // and a failed lookup must never turn a successful PATCH into a 500.
-      this.logger.warn(
-        `Note status realtime update failed: ${error instanceof Error ? error.message : String(error)}`,
-      );
-    }
+  /** Coalesce a root's latest state change inside the caller's transaction. */
+  private async enqueueSourceStatusFanout(
+    tx: Prisma.TransactionClient,
+    rootNoteID: string,
+  ): Promise<void> {
+    const queuedAt = new Date();
+    await tx.noteStatusFanoutOutbox.upsert({
+      where: { rootNoteID },
+      create: {
+        rootNoteID,
+        status: 'PENDING',
+        stage: 'OWNERS',
+        queuedAt,
+        nextAttemptAt: queuedAt,
+      },
+      update: {
+        status: 'PENDING',
+        stage: 'OWNERS',
+        generation: { increment: 1 },
+        noteCursor: null,
+        chatConversationCursor: null,
+        chatUserCursor: null,
+        attempts: 0,
+        lastError: null,
+        queuedAt,
+        nextAttemptAt: queuedAt,
+        lockedAt: null,
+        leaseToken: null,
+      },
+    });
   }
 
   /** 保留来源群名片快照，避免收录副本或已绑定来源笔记被客户端改成别的群。 */
@@ -2769,9 +2682,9 @@ export class NoteService {
 
   /**
    * A collected copy is a local editing surface, but its availability badge
-   * must follow the boss's source note. Resolve the short collect chain in one
-   * bounded set of queries so an intermediary cannot keep showing an old
-   * WORKING snapshot after the source was closed or unlisted.
+   * must follow the boss's source note. Resolve the canonical root directly;
+   * the bounded chain walk only supports legacy rows without a root key and
+   * fails closed if it cannot reach a source.
    */
   private async overlayCollectedSourceState<T extends CollectedStateFields>(
     notes: T[],
@@ -2779,7 +2692,7 @@ export class NoteService {
     const initialIDs = [
       ...new Set(
         notes
-          .map((note) => note.collectedFromNoteID)
+          .map((note) => note.rootSourceNoteID ?? note.collectedFromNoteID)
           .filter(
             (id): id is string => typeof id === 'string' && id.length > 0,
           ),
@@ -2793,6 +2706,7 @@ export class NoteService {
       available: boolean;
       workStatus: NoteWorkStatus | null;
       collectedFromNoteID: string | null;
+      rootSourceNoteID: string | null;
     };
     const states = new Map<string, SourceState>();
     const queried = new Set<string>();
@@ -2810,10 +2724,11 @@ export class NoteService {
             available: true,
             workStatus: true,
             collectedFromNoteID: true,
+            rootSourceNoteID: true,
           },
         })) ?? [];
       frontier = rows
-        .map((row) => row.collectedFromNoteID)
+        .map((row) => row.rootSourceNoteID ?? row.collectedFromNoteID)
         .filter(
           (id): id is string => typeof id === 'string' && !queried.has(id),
         );
@@ -2824,25 +2739,30 @@ export class NoteService {
     // 但 collectedFromNoteID 是普通列、仍指着它。查过却查不到的来源只能是被硬删了，
     // 按 DELETED 处理：不能因为「找不到父级」就退回副本自己的 ACTIVE 状态，
     // 让第三方在原笔记删除后还能读、分享、导出、再收藏副本。
-    // 只认「查过」的 id：超出 8 层深度没查到的不算删除。
     const purgedSource = (id: string): SourceState => ({
       id,
       status: 'DELETED',
       available: false,
       workStatus: null,
       collectedFromNoteID: null,
+      rootSourceNoteID: null,
     });
     const rootState = (id: string): SourceState | null => {
       let current = states.get(id) ?? null;
       if (!current) return queried.has(id) ? purgedSource(id) : null;
       const seen = new Set<string>();
-      while (current.collectedFromNoteID && !seen.has(current.id)) {
+      while (
+        (current.rootSourceNoteID ?? current.collectedFromNoteID) &&
+        !seen.has(current.id)
+      ) {
+        const parentID =
+          current.rootSourceNoteID ?? current.collectedFromNoteID!;
         seen.add(current.id);
-        const parent = states.get(current.collectedFromNoteID);
+        const parent = states.get(parentID);
         if (!parent) {
-          return queried.has(current.collectedFromNoteID)
-            ? purgedSource(current.collectedFromNoteID)
-            : current;
+          // A missing parent is either hard-deleted or beyond the bounded
+          // legacy walk. Neither may fall back to a local ACTIVE snapshot.
+          return purgedSource(parentID);
         }
         current = parent;
       }
@@ -2851,7 +2771,9 @@ export class NoteService {
 
     return notes.map((note) => {
       if (!note.collectedFromNoteID) return note;
-      const source = rootState(note.collectedFromNoteID);
+      const source = rootState(
+        note.rootSourceNoteID ?? note.collectedFromNoteID,
+      );
       return source
         ? {
             ...note,
@@ -4802,6 +4724,7 @@ export class NoteService {
               mediaCount: source.mediaCount,
               collectedFrom: toPrismaJson(collectedFrom),
               collectedFromNoteID: source.id,
+              rootSourceNoteID: source.rootSourceNoteID ?? source.id,
             },
           });
 
@@ -5286,18 +5209,21 @@ export class NoteService {
   }
 
   async setAvailable(ownerID: string, noteId: string, available: boolean) {
-    await this.requireOwnedNote(ownerID, noteId);
+    const owned = await this.requireOwnedNote(ownerID, noteId);
+    const rootNoteID = this.noteRootID(owned);
     // Include ownerID + status guard in the write to close the TOCTOU window.
-    const result = await this.prisma.note.update({
-      where: { id: noteId, ownerID, status: { not: 'DELETED' } },
-      data: { available },
-      select: {
-        id: true,
-        available: true,
-      },
+    return this.prisma.$transaction(async (tx) => {
+      const result = await tx.note.update({
+        where: { id: noteId, ownerID, status: { not: 'DELETED' } },
+        data: { available },
+        select: {
+          id: true,
+          available: true,
+        },
+      });
+      await this.enqueueSourceStatusFanout(tx, rootNoteID);
+      return result;
     });
-    await this.broadcastSourceStatusChanged(noteId);
-    return result;
   }
 
   async setWorkStatus(
@@ -5305,14 +5231,17 @@ export class NoteService {
     noteId: string,
     workStatus: NoteWorkStatus | null,
   ) {
-    await this.requireOwnedSourceNote(ownerID, noteId);
-    const result = await this.prisma.note.update({
-      where: { id: noteId, ownerID, status: { not: 'DELETED' } },
-      data: { workStatus },
-      select: { id: true, workStatus: true },
+    const owned = await this.requireOwnedSourceNote(ownerID, noteId);
+    const rootNoteID = this.noteRootID(owned);
+    return this.prisma.$transaction(async (tx) => {
+      const result = await tx.note.update({
+        where: { id: noteId, ownerID, status: { not: 'DELETED' } },
+        data: { workStatus },
+        select: { id: true, workStatus: true },
+      });
+      await this.enqueueSourceStatusFanout(tx, rootNoteID);
+      return result;
     });
-    await this.broadcastSourceStatusChanged(noteId);
-    return result;
   }
 
   /**
@@ -5624,18 +5553,21 @@ export class NoteService {
   }
 
   async setStatus(ownerID: string, noteId: string, status: NoteWritableStatus) {
-    await this.requireOwnedNote(ownerID, noteId);
+    const owned = await this.requireOwnedNote(ownerID, noteId);
+    const rootNoteID = this.noteRootID(owned);
     // Include ownerID + status guard in the write to close the TOCTOU window.
-    const result = await this.prisma.note.update({
-      where: { id: noteId, ownerID, status: { not: 'DELETED' } },
-      data: { status },
-      select: {
-        id: true,
-        status: true,
-      },
+    return this.prisma.$transaction(async (tx) => {
+      const result = await tx.note.update({
+        where: { id: noteId, ownerID, status: { not: 'DELETED' } },
+        data: { status },
+        select: {
+          id: true,
+          status: true,
+        },
+      });
+      await this.enqueueSourceStatusFanout(tx, rootNoteID);
+      return result;
     });
-    await this.broadcastSourceStatusChanged(noteId);
-    return result;
   }
 
   /** FE#92 回收站：已软删笔记列表（新删在前）。 */
@@ -5666,7 +5598,11 @@ export class NoteService {
     // 先查同源活跃副本，命中给可控 409。
     const target = await this.prisma.note.findFirst({
       where: { id: noteId, ownerID, status: 'DELETED' },
-      select: { id: true, collectedFromNoteID: true },
+      select: {
+        id: true,
+        collectedFromNoteID: true,
+        rootSourceNoteID: true,
+      },
     });
     if (!target) {
       throw new NotFoundException({
@@ -5700,10 +5636,14 @@ export class NoteService {
         // otherwise delete → create replacements → restore old ones grows past
         // the cap, and concurrent restores could cross the boundary together.
         await this.assertNoteStorageAvailable(tx, ownerID);
-        return tx.note.updateMany({
+        const restored = await tx.note.updateMany({
           where: { id: noteId, ownerID, status: 'DELETED' },
           data: { status: 'ACTIVE' },
         });
+        if (restored.count > 0) {
+          await this.enqueueSourceStatusFanout(tx, this.noteRootID(target));
+        }
+        return restored;
       });
     } catch (error) {
       if (prismaErrorCode(error) === 'P2002') {
@@ -5720,7 +5660,6 @@ export class NoteService {
         errorCode: NoteErrorCode.NotFound,
       });
     }
-    await this.broadcastSourceStatusChanged(noteId);
   }
 
   /**
@@ -5739,15 +5678,18 @@ export class NoteService {
   }
 
   async deleteNote(ownerID: string, noteId: string): Promise<void> {
-    await this.requireOwnedNote(ownerID, noteId);
+    const owned = await this.requireOwnedNote(ownerID, noteId);
+    const rootNoteID = this.noteRootID(owned);
     // Include ownerID + status in the write to close the TOCTOU window, for
     // parity with setPinned / setAvailable.
-    await this.prisma.note.update({
-      where: { id: noteId, ownerID, status: { not: 'DELETED' } },
-      data: { status: 'DELETED' },
-      select: { id: true },
+    await this.prisma.$transaction(async (tx) => {
+      await tx.note.update({
+        where: { id: noteId, ownerID, status: { not: 'DELETED' } },
+        data: { status: 'DELETED' },
+        select: { id: true },
+      });
+      await this.enqueueSourceStatusFanout(tx, rootNoteID);
     });
-    await this.broadcastSourceStatusChanged(noteId);
   }
 
   async listGroups(ownerID: string): Promise<NoteGroupDto[]> {

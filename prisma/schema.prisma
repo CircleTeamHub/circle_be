@@ -186,6 +186,17 @@ enum NotificationPushOutboxStatus {
   TERMINAL
 }
 
+enum NoteStatusFanoutOutboxStatus {
+  PENDING
+  PROCESSING
+  FAILED
+}
+
+enum NoteStatusFanoutStage {
+  OWNERS
+  CHAT_MEMBERS
+}
+
 /// Per-(notification, device-token) delivery state (#88).
 /// SENT = Expo accepted (ticket held); CONFIRMED = receipt ok or aged out;
 /// FAILED = retryable, the outbox sweep will resend to this token only;
@@ -1209,6 +1220,8 @@ model Note {
   // 自建笔记为 null；collectedFromNoteID 冗余成单列用于幂等去重查询。
   collectedFrom        Json?
   collectedFromNoteID  String?
+  /// 收藏链的根笔记 id。根笔记本身为 null；来源被硬删后仍保留 id，供状态失效广播。
+  rootSourceNoteID     String?
   createdAt            DateTime        @default(now())
   updatedAt            DateTime        @updatedAt
 
@@ -1227,6 +1240,29 @@ model Note {
   @@index([ownerID, pinned, updatedAt])
   @@index([groupID])
   @@index([sourceConversationID])
+  @@index([rootSourceNoteID, id])
+}
+
+/// 笔记来源状态广播的 durable/coalescing outbox。rootNoteID 不设外键：根笔记
+/// 硬删后仍要把 DELETED 失效通知送给已有聊天卡片和收藏副本。
+model NoteStatusFanoutOutbox {
+  rootNoteID             String                       @id
+  status                 NoteStatusFanoutOutboxStatus @default(PENDING)
+  stage                  NoteStatusFanoutStage        @default(OWNERS)
+  generation             Int                          @default(1)
+  noteCursor             String?
+  chatConversationCursor String?
+  chatUserCursor         String?
+  attempts               Int                          @default(0)
+  nextAttemptAt          DateTime                     @default(now())
+  lockedAt               DateTime?
+  leaseToken             String?
+  lastError              String?                      @db.VarChar(1000)
+  queuedAt               DateTime                     @default(now())
+  createdAt              DateTime                     @default(now())
+  updatedAt              DateTime                     @updatedAt
+
+  @@index([status, nextAttemptAt, queuedAt])
 }
 
 model NoteDraft {
@@ -2519,6 +2555,8 @@ model ChatMessage {
   /// 消息类型（text/image/voice/… 与各类卡片），content 形状随 type 而定。
   type            String
   content         Json
+  /// 服务端解析的笔记卡片根来源 id；客户端输入不能直接写入。
+  sourceNoteID    String?
   /// 客户端幂等键；系统消息为 null（null 不参与唯一约束冲突）。
   clientMessageId String?   @db.VarChar(128)
   /// 客户端发送请求的指纹（chatSendRequestHash，sha256 hex）。同一个 d 带着不同内容
