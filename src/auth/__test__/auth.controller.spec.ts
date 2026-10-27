@@ -1,7 +1,9 @@
 import { Test, TestingModule } from '@nestjs/testing';
 import { ThrottlerModule } from '@nestjs/throttler';
 import { ParseUUIDPipe } from '@nestjs/common';
-import { ROUTE_ARGS_METADATA } from '@nestjs/common/constants';
+import { GUARDS_METADATA, ROUTE_ARGS_METADATA } from '@nestjs/common/constants';
+import { JwtGuard } from 'src/guards/jwt.guard';
+import { UserThrottlerGuard } from 'src/guards/user-throttler.guard';
 import { AuthController } from '../auth.controller';
 import { AuthService } from '../auth.service';
 import { DeviceTrustService } from '../device-trust.service';
@@ -205,6 +207,25 @@ describe('AuthController', () => {
       (entry: { pipes?: unknown[] }) => entry.pipes ?? [],
     );
     expect(pipes).toContain(ParseUUIDPipe);
+  });
+
+  it('rate-limits login challenge rejection per account before service work', () => {
+    const handler = AuthController.prototype.rejectLoginChallenge;
+    const guards = Reflect.getMetadata(GUARDS_METADATA, handler) as unknown[];
+
+    expect(guards).toEqual([JwtGuard, UserThrottlerGuard]);
+    expect(Reflect.getMetadata('THROTTLER:LIMITdefault', handler)).toBe(10);
+    expect(Reflect.getMetadata('THROTTLER:TTLdefault', handler)).toBe(60_000);
+
+    const metadata = Reflect.getMetadata(
+      ROUTE_ARGS_METADATA,
+      AuthController,
+      'rejectLoginChallenge',
+    ) as Record<string, { data?: unknown; pipes?: unknown[] }>;
+    const challengeId = Object.values(metadata).find(
+      (entry) => entry.data === 'challengeId',
+    );
+    expect(challengeId?.pipes).toContain(ParseUUIDPipe);
   });
 
   it('logoutOtherSessions keeps the current session and revokes the rest', async () => {

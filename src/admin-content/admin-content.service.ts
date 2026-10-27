@@ -54,10 +54,21 @@ export class AdminContentService {
       }),
       this.prisma.circlePost.count({ where }),
     ]);
+    const reportCounts = posts.length
+      ? await this.prisma.circlePostReport.groupBy({
+          by: ['postID'],
+          where: { postID: { in: posts.map((post) => post.id) } },
+          _count: { _all: true },
+        })
+      : [];
+    const reportCountByPostID = new Map(
+      reportCounts.map((row) => [row.postID, row._count._all]),
+    );
     return {
       items: posts.map(({ _count, ...post }) => ({
         ...post,
         signupCount: _count.signups,
+        reportCount: reportCountByPostID.get(post.id) ?? 0,
       })),
       total,
       page: query.page,
@@ -71,8 +82,11 @@ export class AdminContentService {
       select: postSelect,
     });
     if (!post) throw new NotFoundException('Post not found');
+    const reportCount = await this.prisma.circlePostReport.count({
+      where: { postID: id },
+    });
     const { _count, ...detail } = post;
-    return { ...detail, signupCount: _count.signups };
+    return { ...detail, signupCount: _count.signups, reportCount };
   }
   async signups(id: string, query: { page: number; limit: number }) {
     if (
