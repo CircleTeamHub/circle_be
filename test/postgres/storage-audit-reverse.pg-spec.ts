@@ -33,7 +33,8 @@ import { capturePrisma, captureQueries } from './prisma-sql-capture';
 const MIGRATIONS: Array<[string, number]> = [
   ['20261019000300_burn_media_reference_indexes', 4],
   ['20261026000900_storage_audit_irregular_chat_media_indexes', 2],
-  ['20261026000910_chat_media_key_expression_statistics', 4],
+  // 两条 CREATE STATISTICS + 两条 ANALYZE,外加首尾的 SET / RESET lock_timeout。
+  ['20261026000910_chat_media_key_expression_statistics', 6],
 ];
 
 describePostgres('storage audit chat reverse lookup (PostgreSQL)', () => {
