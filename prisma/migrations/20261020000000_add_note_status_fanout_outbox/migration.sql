@@ -1,57 +1,22 @@
--- Denormalize the stable root of each collect chain. Keep the id even if the
--- root has already been purged; no foreign key is intentional.
+-- 笔记来源状态广播改走 outbox:收藏链根的反规范列 + outbox 表。
+--
+-- 这一批拆成几份,每份只在一张热表上拿表锁,回填和加列分开:
+--   0000 Note 加列 + outbox 枚举与表(本份)
+--   0010 ChatMessage 加列
+--   0020 回填 Note."rootSourceNoteID"
+--   0030 回填 ChatMessage."sourceNoteID"
+--   0100 并发建两条查询索引
+-- 加列要拿 ACCESS EXCLUSIVE,和回填放在一个事务里的话,这把锁会一直持有到回填扫完
+-- 整张表,期间所有读写都排队。分开之后加列一提交就放锁,回填只拿行锁。
+--
+-- 可空加列、无默认值:只改目录,不重写表。等不到 5 秒就整份回滚,别把读写堵在锁队列
+-- 里。失败时 _prisma_migrations 留下一条失败记录:先
+-- `npx prisma migrate resolve --rolled-back 20261020000000_add_note_status_fanout_outbox`,
+-- 避开长事务后重跑 migrate deploy。
+SET lock_timeout = '5s';
+
+-- 收藏链的稳定根。根笔记被硬删后仍保留 id,故意不建外键。
 ALTER TABLE "Note" ADD COLUMN "rootSourceNoteID" TEXT;
-
-WITH RECURSIVE ancestry AS (
-  SELECT
-    note."id" AS "descendantID",
-    note."collectedFromNoteID" AS "ancestorID",
-    note."collectedFromNoteID" AS "rootID",
-    1 AS depth,
-    ARRAY[note."id"]::TEXT[] AS path
-  FROM "Note" AS note
-  WHERE note."collectedFromNoteID" IS NOT NULL
-
-  UNION ALL
-
-  SELECT
-    ancestry."descendantID",
-    parent."collectedFromNoteID" AS "ancestorID",
-    parent."id" AS "rootID",
-    ancestry.depth + 1,
-    ancestry.path || parent."id"
-  FROM ancestry
-  JOIN "Note" AS parent ON parent."id" = ancestry."ancestorID"
-  WHERE ancestry.depth < 64
-    AND NOT parent."id" = ANY(ancestry.path)
-), resolved AS (
-  SELECT DISTINCT ON ("descendantID")
-    "descendantID",
-    "rootID"
-  FROM ancestry
-  ORDER BY "descendantID", depth DESC
-)
-UPDATE "Note" AS note
-SET "rootSourceNoteID" = resolved."rootID"
-FROM resolved
-WHERE note."id" = resolved."descendantID";
-
--- Persist server-resolved note-card provenance so fan-out never has to scan
--- arbitrary JSON paths. Existing rows prefer sourceNoteId, then resolve the
--- legacy noteId through the denormalized Note root.
-ALTER TABLE "ChatMessage" ADD COLUMN "sourceNoteID" TEXT;
-
-UPDATE "ChatMessage" AS message
-SET "sourceNoteID" = COALESCE(
-  NULLIF(message."content"->>'sourceNoteId', ''),
-  (
-    SELECT COALESCE(note."rootSourceNoteID", note."id")
-    FROM "Note" AS note
-    WHERE note."id" = NULLIF(message."content"->>'noteId', '')
-  ),
-  NULLIF(message."content"->>'noteId', '')
-)
-WHERE message."type" = 'note-card';
 
 CREATE TYPE "NoteStatusFanoutOutboxStatus" AS ENUM ('PENDING', 'PROCESSING', 'FAILED');
 CREATE TYPE "NoteStatusFanoutStage" AS ENUM ('OWNERS', 'CHAT_MEMBERS');
@@ -78,3 +43,5 @@ CREATE TABLE "NoteStatusFanoutOutbox" (
 
 CREATE INDEX "NoteStatusFanoutOutbox_status_nextAttemptAt_queuedAt_idx"
   ON "NoteStatusFanoutOutbox" ("status", "nextAttemptAt", "queuedAt");
+
+RESET lock_timeout;
