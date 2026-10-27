@@ -235,17 +235,26 @@ function setup() {
       if (lockTails.get(key) === tail) lockTails.delete(key);
     });
   };
+  // 既有标签模板调用,也有 $executeRaw(Prisma.raw('SAVEPOINT …')) 这种传 Sql 对象的。
+  const sqlText = (query: TemplateStringsArray | { sql: string }) =>
+    Array.isArray(query) ? query.join('?') : (query as { sql: string }).sql;
   (prisma as any).$executeRaw = jest.fn(
-    async (strings: TemplateStringsArray, ...values: unknown[]) => {
-      if (strings.join('?').includes('pg_advisory_xact_lock')) {
+    async (
+      query: TemplateStringsArray | { sql: string },
+      ...values: unknown[]
+    ) => {
+      if (sqlText(query).includes('pg_advisory_xact_lock')) {
         await acquireLock(`advisory:${String(values[0])}`);
       }
       return 0;
     },
   );
   (prisma as any).$queryRaw = jest.fn(
-    async (strings: TemplateStringsArray, ...values: unknown[]) => {
-      if (/FROM "User"[\s\S]*FOR UPDATE/.test(strings.join('?'))) {
+    async (
+      query: TemplateStringsArray | { sql: string },
+      ...values: unknown[]
+    ) => {
+      if (/FROM "User"[\s\S]*FOR UPDATE/.test(sqlText(query))) {
         await acquireLock(`user:${String(values[0])}`);
       }
       return [];
