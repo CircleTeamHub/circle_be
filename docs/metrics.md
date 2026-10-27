@@ -75,13 +75,29 @@ public; everything else stays internal.)
 | `circle_email_code_sends_total`                                      | counter         | `result`                         | Verification-code emails: `success` / `failure` / `unavailable` (no mailer configured) |
 | `circle_dependency_requests_total`                                   | counter         | `dependency`, `operation`, `result` | Backend requests to object storage (every HTTP attempt, presigning excluded) and LiveKit: `success` / `not_found` (missing object — normal) / `failure` |
 | `circle_object_store_up`                                             | gauge           | —                                | 1 when the object store answers HeadBucket (cached 30s, 2s timeout); only registered when storage is configured |
+| `circle_build_info`                                                  | gauge           | `version`, `commit`              | Always 1. `version` from `SENTRY_RELEASE` (stamped by release-deploy.sh), `commit` baked into the image at build time; anything malformed is `unknown`. Drives the dashboards' release annotations and `BackendVersionSkew` |
+| `circle_wallet_reconciliation_violations`                            | gauge           | `check`                          | Wallets failing `ledger_mismatch` (balance ≠ sum of that user's ledger) or `negative_balance` in the last daily reconciliation; absent until the first run |
+| `circle_wallet_reconciliation_wallets`                               | gauge           | —                                | Wallets (and ledger-only users) the last reconciliation covered |
+| `circle_call_setups_total`                                           | counter         | `kind`, `result`                 | Call starts past request validation: `started` / `busy` / `livekit_unavailable` / `failed`; `kind` is `direct` / `group` |
+| `circle_call_accepts_total`                                          | counter         | `kind`, `result`                 | Answers: `accepted` / `too_late` (call already ended or expired) / `failed` |
+| `circle_call_endings_total`                                          | counter         | `kind`, `reason`, `answered`     | Every ended call exactly once; `reason` is the lower-cased `CallEndReason` |
+| `circle_call_answered_duration_seconds`                              | histogram       | `kind`                           | How long answered calls lasted (buckets 5s … 1h; `le="10"` feeds `CallsEndingTooQuickly`) |
+| `circle_call_livekit_webhooks_total`                                 | counter         | `result`                         | LiveKit webhooks: `handled` / `ignored` / `rejected` (signature) / `failed` (processing, answered 500 so LiveKit retries) |
 
 `circle_cron_*` covers `@TrackedInterval` jobs too (`admin_group_operation`,
 `group_admission_delivery`); `circle_cron_interval_seconds` is then the interval
 in seconds. Backup self-check results (`circle_backup_check_*`) and the release-time
-off-host backup result (`circle_release_offsite_backup_*`) are **not** on
-this endpoint — the backup overlay's `backup-metrics` exporter serves them (see
-docs/backups.md).
+off-host backup result (`circle_release_offsite_backup_*`) and the weekly restore
+drill (`circle_backup_drill_*`) are **not** on this endpoint — the backup
+overlay's `backup-metrics` exporter serves them (see docs/backups.md). The
+read-only synthetic probe (`circle_synthetic_probe_*`) serves its own metrics on
+port 9464 (see docs/observability.md).
+
+Long transactions, lock waits, deadlocks and transaction-ID wraparound come from
+postgres-exporter, not from this endpoint: `pg_stat_activity_max_tx_duration` /
+`pg_stat_activity_count` (built in, grouped by `state`, `backend_type`,
+`wait_event_type`, `wait_event`), `pg_stat_database_deadlocks`, and
+`pg_database_wraparound_age_*` (enabled with `--collector.database_wraparound`).
 
 `business_events_total` increments automatically whenever a business event is
 logged (`src/logging/business-event.logger.ts`), independent of `BUSINESS_LOG_ON`

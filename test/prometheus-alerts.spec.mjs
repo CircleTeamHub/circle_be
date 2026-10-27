@@ -259,6 +259,9 @@ test('a Postgres outage inhibits every job alert it necessarily causes', () => {
     // 永久丢失(钱已结算、凭证没了)必须继续叫人,不能被一次 DB 故障顺手静音。
     'OutboxDeadLettersAppearing',
     'GiftCardPermanentlyLost',
+    // 同理:库挂着时对账跑不成、结果不会更新,产生不了新的误报;而此前已经查出的
+    // 余额与流水不一致是钱错了,不能被一次 DB 故障静音。
+    'WalletLedgerMismatch',
   ]);
 
   const missing = alertNamesInGroup('jobs').filter(
@@ -413,14 +416,27 @@ test('backup self-check results reach Prometheus through one consistent path', (
   assert.match(BACKUP_COMPOSE, new RegExp(`image: ${pinned.replace(/[.]/g, '\\.')}\\n`));
 });
 
-test('backup alerts cover a failing check, a stopped check and no backups at all', () => {
+test('backup alerts cover a failing check, a stopped check, no backups at all and the restore drill', () => {
   assert.deepEqual(alertNamesInGroup('backups'), [
     'BackupCheckFailing',
     'BackupCheckStale',
     'BackupCheckNotReporting',
     'BackupNeverCompleted',
     'ReleaseOffsiteBackupFailed',
+    'BackupRestoreDrillFailing',
+    'BackupRestoreDrillStale',
+    'BackupRestoreDrillNeverPassed',
   ]);
+  // 演练的「最近一次通过」只由通过的那一轮写，失败不会刷新它；「从没通过」只在
+  // 备份自检确实在跑的机器上才算数。
+  assert.match(
+    alertExpr('BackupRestoreDrillStale'),
+    /time\(\) - circle_backup_drill_last_success_timestamp_seconds\) > 8 \* 86400/,
+  );
+  assert.match(
+    alertExpr('BackupRestoreDrillNeverPassed'),
+    /absent\(circle_backup_drill_last_success_timestamp_seconds\)\s+and on\(\) \(time\(\) - circle_backup_check_last_run_timestamp_seconds < 3 \* 3600\)/,
+  );
   // 连续两次失败才报：gauge 一小时不变，for 去不了抖。
   assert.match(
     alertExpr('BackupCheckFailing'),

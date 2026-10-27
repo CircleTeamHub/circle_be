@@ -40,6 +40,9 @@ import { gatewayMetrics } from './metrics/gateway-metrics';
 import { processMetrics } from './metrics/process-metrics';
 import { deliveryMetrics } from './metrics/delivery-metrics';
 import { dependencyMetrics } from './metrics/dependency-metrics';
+import { createBuildInfoMetrics } from './metrics/build-info';
+import { walletMetrics } from './metrics/wallet-metrics';
+import { callMetrics } from './metrics/call-metrics';
 import { installUnhandledRejectionGuard } from './logging/unhandled-rejection-guard';
 
 /** Strict limit for sensitive auth endpoints: 10 requests / 15 min per IP. */
@@ -418,6 +421,10 @@ export const setupApp = (app: INestApplication): ErrorAggregationProvider => {
   const dbPoolMetrics = createDbPoolMetrics(() =>
     prismaForMetrics ? prismaForMetrics.getPoolStats() : null,
   );
+  const buildInfoMetrics = createBuildInfoMetrics({
+    release: config['SENTRY_RELEASE'],
+    commit: config['CIRCLE_BUILD_COMMIT'],
+  });
   app.use(
     '/metrics',
     createMetricsHandler(
@@ -434,6 +441,9 @@ export const setupApp = (app: INestApplication): ErrorAggregationProvider => {
         processMetrics.registry,
         deliveryMetrics.registry,
         dependencyMetrics.registry,
+        buildInfoMetrics.registry,
+        walletMetrics.registry,
+        callMetrics.registry,
       ]),
       { authToken: metricsAuthToken },
     ),

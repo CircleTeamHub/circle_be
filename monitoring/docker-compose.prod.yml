@@ -109,6 +109,10 @@ services:
     restart: unless-stopped
     logging: *default-logging
     mem_limit: 128m
+    # 事务 ID 回卷年龄默认不采（PostgresXidWraparound*）。长事务与锁等待不用加：
+    # 自带的 pg_stat_activity 已经按 state / wait_event_type 分组导出了最老事务年龄。
+    command:
+      - --collector.database_wraparound
     # DATA_SOURCE_NAME —— 由 sync-exporter-env.sh 从 .env.production 派生,
     # 因为 DATABASE_URL 带着 Prisma 的 ?schema=public,libpq 会直接拒绝。
     env_file:
@@ -138,6 +142,37 @@ services:
     networks:
       - default
       - circle-be
+
+  # ── 只读合成探测 ──────────────────────────────────────────────────────────
+  # 一个专用测试号每 5 分钟走一遍「刷新令牌 → 拉会话列表 → 连 /realtime 到就绪」，
+  # 走公网域名，和用户一样经过 DNS、TLS、Caddy（SyntheticProbeFailing）。不发
+  # 消息、不写数据。脚本零依赖，直接用官方 node 镜像跑；单文件挂载，发版同步时
+  # 会强制重建，新脚本随发版生效。
+  #
+  # 测试号、密码和设备号放在仓库根目录的 .env.synthetic-probe（照着
+  # .env.synthetic-probe.example 填）：发版的 rsync 原样保留根目录的 .env.*，放进
+  # monitoring/ 下会被旧版 launcher 每次发版删掉。没配时照常起，只导出
+  # configured=0（SyntheticProbeNotConfigured）。刷新令牌存在 synthetic_probe_state
+  # 卷里 —— 它是一次性轮换的，重启丢了就得重新密码登录。
+  synthetic-probe:
+    image: node:22.23.3-alpine3.24
+    container_name: circle-synthetic-probe
+    restart: unless-stopped
+    logging: *default-logging
+    mem_limit: 64m
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: ['no-new-privileges:true']
+    command: ['node', '/probe/probe.mjs']
+    env_file:
+      - path: ../.env.synthetic-probe
+        required: false
+    volumes:
+      - ./synthetic-probe/probe.mjs:/probe/probe.mjs:ro
+      - synthetic_probe_state:/var/lib/synthetic-probe
+
+volumes:
+  synthetic_probe_state:
 
 networks:
   circle-be:
