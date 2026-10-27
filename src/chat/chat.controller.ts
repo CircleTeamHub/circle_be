@@ -14,7 +14,12 @@ import {
   UseGuards,
 } from '@nestjs/common';
 import type { Response } from 'express';
-import { ApiBearerAuth, ApiOperation, ApiTags } from '@nestjs/swagger';
+import {
+  ApiBearerAuth,
+  ApiOkResponse,
+  ApiOperation,
+  ApiTags,
+} from '@nestjs/swagger';
 import { Throttle } from '@nestjs/throttler';
 import type { RequestWithUser } from 'src/auth/types';
 import { AppAudienceGuard } from 'src/guards/app-audience.guard';
@@ -66,6 +71,14 @@ import type {
 } from './chat.types';
 
 /**
+ * GET /chat/conversations 的分页信号。响应体保持数组(已装机 App 按数组解析),
+ * 「后面还有」与「下一页从哪开始」只能走响应头;网页端跨域要在 CORS
+ * exposedHeaders 里放行(src/main.ts)。
+ */
+const HAS_MORE_HEADER = 'X-Has-More';
+const NEXT_CURSOR_HEADER = 'X-Next-Cursor';
+
+/**
  * 自研聊天 REST 面:会话列表 / 建单聊 / 历史分页。
  * 实时收发走 /chat-ws socket;这里只承担冷路径(打开 App 时的全量拉取)。
  */
@@ -90,18 +103,47 @@ export class ChatController {
   @ApiOperation({
     summary: '会话列表(带末条消息与未读数)',
     description:
-      '响应体为数组(置顶优先、再按末条消息时间倒序)。默认每页 100 条,可用 limit 调到 500;被截断时响应头 X-Has-More: true。',
+      '响应体为数组。默认每页 100 条,可用 limit 调到 500。\n\n' +
+      '- 不带 cursor(旧模式,已装机 App):置顶优先、再按末条消息时间倒序;被截断时响应头 X-Has-More: true,没有办法取后面的会话。\n' +
+      '- 带 cursor(键集模式):按会话 id 升序;cursor 为空串表示从头开始,否则只返回 id 严格大于它的会话。' +
+      '还有下一页时响应头 X-Has-More: true 且 X-Next-Cursor 为本页最后一个会话 id,原样作为下一次的 cursor;' +
+      '最后一页不带 X-Next-Cursor。翻页期间来新消息不会造成漏行或重复,顺序由客户端自行重排。',
+  })
+  @ApiOkResponse({
+    headers: {
+      [HAS_MORE_HEADER]: {
+        description: '本页之后是否还有会话',
+        schema: { type: 'string', enum: ['true', 'false'] },
+      },
+      [NEXT_CURSOR_HEADER]: {
+        description:
+          '仅键集模式且还有下一页时出现:本页最后一个会话 id,作为下一次请求的 cursor',
+        schema: { type: 'string', format: 'uuid' },
+      },
+    },
   })
   async listConversations(
     @Req() req: RequestWithUser,
     @Query() query: ListConversationsQueryDto,
     @Res({ passthrough: true }) res: Response,
   ): Promise<ChatConversationDto[]> {
-    const page = await this.chatService.listConversationsPage(
+    if (query.cursor === undefined) {
+      const page = await this.chatService.listConversationsPage(
+        req.user.userId,
+        query.limit,
+      );
+      res.setHeader(HAS_MORE_HEADER, String(page.hasMore));
+      return page.conversations;
+    }
+    const page = await this.chatService.listConversationsKeysetPage(
       req.user.userId,
+      query.cursor,
       query.limit,
     );
-    res.setHeader('X-Has-More', String(page.hasMore));
+    res.setHeader(HAS_MORE_HEADER, String(page.hasMore));
+    if (page.nextCursor !== null) {
+      res.setHeader(NEXT_CURSOR_HEADER, page.nextCursor);
+    }
     return page.conversations;
   }
 
@@ -233,6 +275,20 @@ export class ChatController {
       query.keyword,
       query.limit,
     );
+  }
+
+  @Get('conversations/:id')
+  @Throttle({ default: { limit: 60, ttl: 60_000 } })
+  @ApiOperation({
+    summary: '单个会话(与会话列表每一行同形)',
+    description:
+      '客户端收到会话元信息变更事件后只刷新这一个会话,不必重拉整张列表。已退出或从未加入返回 403 CHAT_NOT_MEMBER;已从列表隐藏返回 404 CHAT_CONVERSATION_NOT_FOUND。',
+  })
+  getConversation(
+    @Req() req: RequestWithUser,
+    @Param('id', ParseUUIDPipe) conversationId: string,
+  ): Promise<ChatConversationDto> {
+    return this.chatService.getConversation(req.user.userId, conversationId);
   }
 
   @Get('conversations/:id/members')

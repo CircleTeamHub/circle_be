@@ -43,8 +43,6 @@ integration(
       CREATE TABLE "ChatConversation" (id text primary key, "type" text default 'DIRECT', "nextHeight" integer default 10, "nextRevision" integer default 10, "clearedBeforeHeight" integer default 0);
       CREATE TABLE "ChatMember" ("conversationID" text, "userID" text, "leftAt" timestamp, "joinedAt" timestamp, "lastReadHeight" integer, "clearedBeforeHeight" integer default 0);
       CREATE TABLE "ChatMessage" (id text primary key, "conversationID" text, height integer, type text default 'text', "senderID" text, "createdAt" timestamp, "burnDurationSec" integer, "burnExpiresAt" timestamp, deleted boolean default false, "revokedAt" timestamp, "editedAt" timestamp, content jsonb default '{"text":"private"}', revision integer default 0, "clientMessageId" text);
-      CREATE TABLE "E2eeRecovery" (id text primary key, purpose text, "userID" text);
-      CREATE TABLE "E2eeArchive" (id text primary key, "messageID" text, "recoveryID" text);
     `);
       await db.query(migration('20261019000000_read_started_burn_revision'));
       await db.query(
@@ -52,8 +50,6 @@ integration(
       );
       await db.query(migration('20261019000100_pending_read_burn_index'));
       await db.query(migration('20261019000200_burn_audit_archive'));
-      await db.query(`CREATE TRIGGER e2ee_message_retention AFTER UPDATE OF deleted, "revokedAt" ON "ChatMessage" FOR EACH ROW EXECUTE FUNCTION purge_e2ee_message_archive();
-      CREATE TRIGGER e2ee_conversation_retention AFTER UPDATE OF "clearedBeforeHeight" ON "ChatConversation" FOR EACH ROW EXECUTE FUNCTION purge_e2ee_cleared_archive();`);
     });
     afterAll(async () => {
       if (db) {
@@ -66,7 +62,7 @@ integration(
       }
     });
     beforeEach(async () => {
-      await db.query(`TRUNCATE "ChatBurnArchive", "E2eeArchive", "E2eeRecovery", "ChatMessage", "ChatMember", "ChatConversation";
+      await db.query(`TRUNCATE "ChatBurnArchive", "ChatMessage", "ChatMember", "ChatConversation";
       INSERT INTO "ChatConversation" (id) VALUES ('c1');
       INSERT INTO "ChatMember" ("conversationID","userID","joinedAt","lastReadHeight") VALUES ('c1','author','2020-01-01',0),('c1','reader','2020-01-01',0);
       INSERT INTO "ChatMessage" (id,"conversationID",height,"senderID","createdAt","burnDurationSec") VALUES ('m1','c1',1,'author','2021-01-01',60);`);
@@ -136,45 +132,15 @@ integration(
         0,
       );
     });
-    it('retains audit recovery while deleting app recovery, including a subsequent user clear', async () => {
-      await db.query(
-        `INSERT INTO "E2eeRecovery" VALUES ('app','APP','reader'),('audit','AUDIT','admin'); INSERT INTO "E2eeArchive" VALUES ('app-copy','m1','app'),('audit-copy','m1','audit')`,
-      );
-      await burn();
-      expect((await db.query('SELECT id FROM "E2eeArchive"')).rows).toEqual([
-        { id: 'audit-copy' },
-      ]);
-      await db.query(
-        `UPDATE "ChatConversation" SET "clearedBeforeHeight"=1 WHERE id='c1'`,
-      );
-      expect((await db.query('SELECT id FROM "E2eeArchive"')).rows).toEqual([
-        { id: 'audit-copy' },
-      ]);
-    });
-    it('preserves authorized audit recovery when clearing occurs before the burn sweep', async () => {
-      await db.query(
-        `INSERT INTO "E2eeRecovery" VALUES ('app','APP','reader'),('audit','AUDIT','admin'); INSERT INTO "E2eeArchive" VALUES ('app-copy','m1','app'),('audit-copy','m1','audit')`,
-      );
+    it('still archives a read-started message when the conversation is cleared before the burn sweep', async () => {
       await start();
       await db.query(
         `UPDATE "ChatConversation" SET "clearedBeforeHeight"=1 WHERE id='c1'`,
       );
-      expect((await db.query('SELECT id FROM "E2eeArchive"')).rows).toEqual([
-        { id: 'audit-copy' },
-      ]);
       await burn();
-      expect((await db.query('SELECT id FROM "E2eeArchive"')).rows).toEqual([
-        { id: 'audit-copy' },
-      ]);
       expect((await db.query('SELECT id FROM "ChatBurnArchive"')).rows).toEqual(
         [{ id: 'm1' }],
       );
-    });
-    it('still purges audit recovery for a globally cleared non-burn message', async () => {
-      await db.query(
-        `INSERT INTO "E2eeRecovery" VALUES ('audit','AUDIT','admin'); INSERT INTO "E2eeArchive" VALUES ('audit-copy','m1','audit'); UPDATE "ChatMessage" SET "burnDurationSec"=NULL WHERE id='m1'; UPDATE "ChatConversation" SET "clearedBeforeHeight"=1 WHERE id='c1'`,
-      );
-      expect((await db.query('SELECT id FROM "E2eeArchive"')).rows).toEqual([]);
     });
     it('only queues owned media after its last live message and retained archive references disappear', async () => {
       const code = readFileSync(
@@ -268,7 +234,7 @@ integration(
     });
     it('archives logically expired content before a later recall clears its body', async () => {
       await db.query(
-        `INSERT INTO "E2eeRecovery" VALUES ('app','APP','reader'),('audit','AUDIT','admin'); INSERT INTO "E2eeArchive" VALUES ('app-copy','m1','app'),('audit-copy','m1','audit'); UPDATE "ChatMessage" SET "burnExpiresAt"=NOW()-INTERVAL '1 second' WHERE id='m1'; UPDATE "ChatMessage" SET content='{}',"revokedAt"=NOW() WHERE id='m1'`,
+        `UPDATE "ChatMessage" SET "burnExpiresAt"=NOW()-INTERVAL '1 second' WHERE id='m1'; UPDATE "ChatMessage" SET content='{}',"revokedAt"=NOW() WHERE id='m1'`,
       );
       expect(
         (
@@ -277,9 +243,6 @@ integration(
           )
         ).rows[0].content,
       ).toEqual({ text: 'private' });
-      expect((await db.query('SELECT id FROM "E2eeArchive"')).rows).toEqual([
-        { id: 'audit-copy' },
-      ]);
       await db.query(`UPDATE "ChatMessage" SET deleted=true WHERE id='m1'`);
       expect((await db.query('SELECT id FROM "ChatBurnArchive"')).rows).toEqual(
         [{ id: 'm1' }],
