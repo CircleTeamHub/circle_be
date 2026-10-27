@@ -71,6 +71,16 @@ type ConsentDeliveryClaim = {
   circleName: string;
 };
 
+/**
+ * 写点复核不通过:ineligible = 关系/资格/邀请状态变了(作废,不重试);
+ * lost = 认领已不是自己的(租约过期被别人接手,或已投递完),什么都不做。
+ */
+class ConsentDeliveryAborted extends Error {
+  constructor(readonly reason: 'ineligible' | 'lost') {
+    super(`circle consent delivery aborted: ${reason}`);
+  }
+}
+
 type CircleInvitationNotificationData = {
   toUserID: string;
   fromUserID: string;
@@ -231,34 +241,61 @@ export class CircleInvitationService {
   private async deliverConsentInvitation(id: string): Promise<void> {
     const claim = await this.claimConsentDelivery(id);
     if (!claim) return;
+    // 两个写点各自在短事务里、拿着这一对人的 call-user:* 锁复核后才写(见
+    // recheckConsentDelivery):拉黑/删好友/改隐私拿的是同一对锁,所以它们返回成功
+    // 之后不可能再有新的通知或卡片落库。IO 本身(fetchSockets、广播)仍不持锁。
+    const guard = (tx: Prisma.TransactionClient) =>
+      this.recheckConsentDelivery(tx, id, claim);
     try {
-      await this.notificationService.deliverCircleConsentNotification({
-        id,
-        toUserID: claim.applicantID,
-        fromUserID: claim.inviterID,
-        circleId: claim.circleID,
-        content: `邀请你加入「${claim.circleName}」`,
-      });
+      await this.notificationService.deliverCircleConsentNotification(
+        {
+          id,
+          toUserID: claim.applicantID,
+          fromUserID: claim.inviterID,
+          circleId: claim.circleID,
+          content: `邀请你加入「${claim.circleName}」`,
+        },
+        { guard },
+      );
       const direct = await this.chatService.getOrCreateDirectConversation(
         claim.inviterID,
         claim.applicantID,
       );
-      await this.chatMessages.insertServerMessage(direct.id, {
-        senderID: claim.inviterID,
-        type: 'group-invitation',
-        content: {
-          circleInvitationId: id,
-          groupName: claim.circleName,
+      await this.chatMessages.insertServerMessage(
+        direct.id,
+        {
+          senderID: claim.inviterID,
+          type: 'group-invitation',
+          content: {
+            circleInvitationId: id,
+            groupName: claim.circleName,
+          },
+          clientMessageId: `circle_invitation_${id}`,
+          rebroadcastOnReplay: true,
         },
-        clientMessageId: `circle_invitation_${id}`,
-        rebroadcastOnReplay: true,
-      });
+        { guard },
+      );
     } catch (error) {
+      if (error instanceof ConsentDeliveryAborted) {
+        // 复核不过是终局,不交给补投重试:按认领时失格的同一口径作废。
+        if (error.reason === 'ineligible')
+          await this.prisma.circleInvitation.updateMany({
+            where: {
+              id,
+              status: 'INVITED',
+              consentNoticeClaimedAt: claim.claimedAt,
+            },
+            data: {
+              status: 'CANCELLED',
+              consentNoticeDeliveredAt: new Date(),
+              consentNoticeClaimedAt: null,
+            },
+          });
+        await this.releaseConsentClaim(id, claim);
+        return;
+      }
       // 放掉自己的认领,下一轮补投不必等租约过期。放不掉也无妨:租约到期自然失效。
-      await this.prisma.$executeRaw`
-        UPDATE "CircleInvitation" SET "consentNoticeClaimedAt" = NULL
-        WHERE "id" = ${id} AND "consentNoticeClaimedAt" = ${claim.claimedAt}
-      `.catch(() => undefined);
+      await this.releaseConsentClaim(id, claim).catch(() => undefined);
       throw error;
     }
     await this.prisma.$executeRaw`
@@ -267,6 +304,100 @@ export class CircleInvitationService {
           "consentNoticeClaimedAt" = NULL
       WHERE "id" = ${id} AND "consentNoticeDeliveredAt" IS NULL
     `;
+  }
+
+  private async releaseConsentClaim(
+    id: string,
+    claim: ConsentDeliveryClaim,
+  ): Promise<void> {
+    await this.prisma.$executeRaw`
+      UPDATE "CircleInvitation" SET "consentNoticeClaimedAt" = NULL
+      WHERE "id" = ${id} AND "consentNoticeClaimedAt" = ${claim.claimedAt}
+    `;
+  }
+
+  /**
+   * 写点复核(在通知/卡片写入的同一个短事务里执行,抛 ConsentDeliveryAborted 则不写)。
+   *
+   * 只锁这两个人:call-user:* 对锁(与拉黑、删好友、改隐私、invite 同一把,同一
+   * localeCompare 序),再给邀请行加 FOR NO KEY UPDATE(拒绝/撤邀是对这一行的 UPDATE,
+   * 会排在写入之后;不挡通知外键的 FOR KEY SHARE)。加锁顺序:卡片写点是「会话行 →
+   * call-user → 邀请行」,通知写点是「call-user → 邀请行」,与认领事务、invite /
+   * respond 的「…→ call-user → 邀请行」同序。成员资格与圈子开关按认领时的口径重读,
+   * 但不取成员锁/策略锁(那样写点就不短了):退圈/关成员邀请与写点之间只缩窄、不互斥。
+   */
+  private async recheckConsentDelivery(
+    tx: Prisma.TransactionClient,
+    id: string,
+    claim: ConsentDeliveryClaim,
+  ): Promise<void> {
+    await lockUserRelationshipState(tx, [claim.inviterID, claim.applicantID]);
+    const [row] = await tx.$queryRaw<
+      Array<{ invited: boolean; claimed: boolean }>
+    >`
+      SELECT "status" = 'INVITED' AS "invited",
+             "consentNoticeClaimedAt" IS NOT DISTINCT FROM ${claim.claimedAt} AS "claimed"
+      FROM "CircleInvitation" WHERE "id" = ${id}
+      FOR NO KEY UPDATE
+    `;
+    if (!row?.claimed) throw new ConsentDeliveryAborted('lost');
+    if (!row.invited || !(await this.isConsentDeliverable(tx, claim)))
+      throw new ConsentDeliveryAborted('ineligible');
+  }
+
+  /**
+   * 同意制邀请此刻还能不能投:圈子在、邀请人仍是 ACTIVE 成员(成员邀请关掉时须是
+   * 圈主/管理员)、双方无拉黑、申请人的入群邀请隐私放行。认领与两个写点共用这一份口径。
+   */
+  private async isConsentDeliverable(
+    tx: Prisma.TransactionClient,
+    invitation: { circleID: string; inviterID: string; applicantID: string },
+  ): Promise<boolean> {
+    const [circle, membership, blocked, friends] = await Promise.all([
+      tx.circle.findFirst({
+        where: { id: invitation.circleID, deleted: false },
+        select: { id: true, memberCanInvite: true },
+      }),
+      tx.circleMember.findUnique({
+        where: {
+          userID_circleID: {
+            userID: invitation.inviterID,
+            circleID: invitation.circleID,
+          },
+        },
+      }),
+      tx.block.findFirst({
+        where: {
+          OR: [
+            {
+              blockerID: invitation.inviterID,
+              blockedID: invitation.applicantID,
+            },
+            {
+              blockerID: invitation.applicantID,
+              blockedID: invitation.inviterID,
+            },
+          ],
+        },
+        select: { id: true },
+      }),
+      this.areFriends(invitation.inviterID, invitation.applicantID, tx),
+    ]);
+    // 隐私读也走 tx:原来走 this.prisma,持锁事务占着一个连接时再借一个。
+    const privacyAllowed =
+      await this.privacySettings.canBeInvitedToGroupOrCircle(
+        invitation.applicantID,
+        friends,
+        tx,
+      );
+    return !(
+      !circle ||
+      membership?.status !== 'ACTIVE' ||
+      blocked ||
+      !privacyAllowed ||
+      (circle.memberCanInvite === false &&
+        !['OWNER', 'ADMIN'].includes(membership.role))
+    );
   }
 
   /**
@@ -307,51 +438,7 @@ export class CircleInvitationService {
           invitation.inviterID,
           invitation.applicantID,
         ]);
-        const [circle, membership, blocked, friends] = await Promise.all([
-          tx.circle.findFirst({
-            where: { id: invitation.circleID, deleted: false },
-            select: { id: true, memberCanInvite: true },
-          }),
-          tx.circleMember.findUnique({
-            where: {
-              userID_circleID: {
-                userID: invitation.inviterID,
-                circleID: invitation.circleID,
-              },
-            },
-          }),
-          tx.block.findFirst({
-            where: {
-              OR: [
-                {
-                  blockerID: invitation.inviterID,
-                  blockedID: invitation.applicantID,
-                },
-                {
-                  blockerID: invitation.applicantID,
-                  blockedID: invitation.inviterID,
-                },
-              ],
-            },
-            select: { id: true },
-          }),
-          this.areFriends(invitation.inviterID, invitation.applicantID, tx),
-        ]);
-        // 隐私读也走 tx:原来走 this.prisma,持锁事务占着一个连接时再借一个。
-        const privacyAllowed =
-          await this.privacySettings.canBeInvitedToGroupOrCircle(
-            invitation.applicantID,
-            friends,
-            tx,
-          );
-        if (
-          !circle ||
-          membership?.status !== 'ACTIVE' ||
-          blocked ||
-          !privacyAllowed ||
-          (circle.memberCanInvite === false &&
-            !['OWNER', 'ADMIN'].includes(membership.role))
-        ) {
+        if (!(await this.isConsentDeliverable(tx, invitation))) {
           await tx.circleInvitation.updateMany({
             where: { id, status: 'INVITED' },
             data: {

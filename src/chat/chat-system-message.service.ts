@@ -51,6 +51,14 @@ export class ChatSystemMessageService {
   async insertServerMessage(
     conversationId: string,
     input: ServerMessageInput,
+    options: {
+      /**
+       * 拿到会话行锁之后、查重与落库之前,在同一事务里执行的复核;抛错则整笔回滚,
+       * 不落库、不广播(包括幂等重放的重广播)。调用方在里面取的锁必须排在会话行锁
+       * 之后(全仓口径:会话行 → call-user:*,见 chat-direct-auto-reply.processor)。
+       */
+      guard?: (tx: Prisma.TransactionClient) => Promise<void>;
+    } = {},
   ): Promise<ChatMessageDto> {
     const { row, reused } = await this.prisma.$transaction(async (tx) => {
       // G-05:与客户端发送同一把行锁、同一个计数器(两条发号路径必须一致,
@@ -61,6 +69,7 @@ export class ChatSystemMessageService {
       if (counter.length === 0) {
         throw new Error(`conversation ${conversationId} not found`);
       }
+      await options.guard?.(tx);
       if (input.clientMessageId && input.senderID) {
         const existing = await tx.chatMessage.findUnique({
           where: {

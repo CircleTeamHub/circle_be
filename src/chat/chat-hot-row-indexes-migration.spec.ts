@@ -72,16 +72,24 @@ describe('chat hot-row indexes migration', () => {
   it('keeps every send-path resurface update inside the partial index predicate', () => {
     // 发送、系统消息、自动回复都会让隐藏的会话浮出,三处的过滤条件必须保持
     // (conversationID 等值 + hiddenAt IS NOT NULL),部分索引才用得上。
-    const files = [
-      'src/chat/chat.service.ts',
+    const prismaForm =
+      /chatMember\.updateMany\(\{\s*where:\s*\{\s*conversationID:[^}]*?,\s*hiddenAt:\s*\{\s*not:\s*null\s*\},?\s*\},\s*data:\s*\{\s*hiddenAt:\s*null\s*\}/g;
+    for (const file of [
       'src/chat/chat-system-message.service.ts',
       'src/chat/chat-direct-auto-reply.processor.ts',
-    ];
-    const resurface =
-      /chatMember\.updateMany\(\{\s*where:\s*\{\s*conversationID:[^}]*?,\s*hiddenAt:\s*\{\s*not:\s*null\s*\},?\s*\},\s*data:\s*\{\s*hiddenAt:\s*null\s*\}/g;
-    for (const file of files) {
-      const hits = read(resolve(process.cwd(), file)).match(resurface);
+    ]) {
+      const hits = read(resolve(process.cwd(), file)).match(prismaForm);
       expect(`${file}: ${hits?.length ?? 0}`).not.toBe(`${file}: 0`);
     }
+    // 普通发送把计数器推进和浮出合成了一条原生 CTE(chat-send-lock.query.ts)。
+    const sendQuery = read(
+      resolve(process.cwd(), 'src/chat/chat-send-lock.query.ts'),
+    );
+    expect(sendQuery).toMatch(
+      /UPDATE "ChatMember" SET "hiddenAt" = NULL\s+WHERE "conversationID" = \$\{[^}]+\} AND "hiddenAt" IS NOT NULL/,
+    );
+    expect(read(resolve(process.cwd(), 'src/chat/chat.service.ts'))).toContain(
+      'advanceConversationAfterSendQuery(',
+    );
   });
 });

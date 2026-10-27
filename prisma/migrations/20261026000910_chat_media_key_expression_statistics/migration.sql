@@ -8,6 +8,12 @@
 --
 -- CREATE STATISTICS 只改目录、拿 ShareUpdateExclusiveLock，不挡读写；ANALYZE 按块
 -- 抽样（与表大小无关的固定样本量），把统计先填上，不必等 autovacuum。
+--
+-- 同一把锁会和正在跑的 autovacuum 冲突；防回卷的 autovacuum 不会被取消，没有超时就会
+-- 把部署无限期卡住。等不到 5 秒就失败：
+-- `npx prisma migrate resolve --rolled-back 20261026000910_chat_media_key_expression_statistics`
+-- 后等 autovacuum 跑完再重跑 migrate deploy。
+SET lock_timeout = '5s';
 CREATE STATISTICS IF NOT EXISTS "ChatMessage_media_key_expr_stats" (ndistinct)
 ON ("content" ->> 'key'), ("content" ->> 'thumbKey')
 FROM "ChatMessage";
@@ -19,3 +25,5 @@ FROM "ChatBurnArchive";
 ANALYZE "ChatMessage";
 
 ANALYZE "ChatBurnArchive";
+
+RESET lock_timeout;

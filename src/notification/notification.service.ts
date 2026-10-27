@@ -413,14 +413,24 @@ export class NotificationService {
     return result;
   }
 
-  async deliverCircleConsentNotification(input: {
-    id: string;
-    circleId: string;
-    toUserID: string;
-    fromUserID: string;
-    content: string;
-  }) {
+  async deliverCircleConsentNotification(
+    input: {
+      id: string;
+      circleId: string;
+      toUserID: string;
+      fromUserID: string;
+      content: string;
+    },
+    options: {
+      /**
+       * 写入前在同一事务里执行的复核(调用方的锁 + 重读);抛错则通知与 outbox 都不写、
+       * 也不广播。同意制邀请用它在 call-user:* 关系锁下复核拉黑/隐私/邀请状态。
+       */
+      guard?: (tx: Prisma.TransactionClient) => Promise<void>;
+    } = {},
+  ) {
     const row = await this.prisma.$transaction(async (tx) => {
+      await options.guard?.(tx);
       const row = await tx.notification.upsert({
         where: { id: input.id },
         create: {

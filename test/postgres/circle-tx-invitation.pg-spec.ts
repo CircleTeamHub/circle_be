@@ -15,13 +15,17 @@ import { MembershipProgramService } from 'src/membership/membership-program.serv
 import { NotificationService } from 'src/notification/notification.service';
 import { PrivacySettingsService } from 'src/privacy/privacy-settings.service';
 import { withDatabaseWorkBudget } from 'src/utils/database-work-budget';
+import { lockUserRelationshipState } from 'src/utils/user-relationship-lock';
 import {
   type CircleTxDb,
   createCircle,
   createUsers,
   openCircleTxDb,
+  backendPid,
   sleep,
+  transactionEntriesOf,
   transactionsOf,
+  waitUntilBlockedBy,
 } from './circle-tx-harness';
 import { describePostgres } from './pg-test-db';
 
@@ -370,9 +374,9 @@ describePostgres('circle invitation transactions (PostgreSQL)', () => {
       const realInsert = chatMessages.insertServerMessage.bind(chatMessages);
       const traced = build({
         notifications: {
-          deliverCircleConsentNotification: async (input: never) => {
+          deliverCircleConsentNotification: async (...args: never[]) => {
             await probe();
-            return realDeliver(input);
+            return (realDeliver as (...a: never[]) => unknown)(...args);
           },
         },
         chatMessages: {
@@ -455,10 +459,10 @@ describePostgres('circle invitation transactions (PostgreSQL)', () => {
       const realInsert = chatMessages.insertServerMessage.bind(chatMessages);
       const slow = build({
         notifications: {
-          deliverCircleConsentNotification: async (input: never) => {
+          deliverCircleConsentNotification: async (...args: never[]) => {
             notices += 1;
             await sleep(150);
-            return realDeliver(input);
+            return (realDeliver as (...a: never[]) => unknown)(...args);
           },
         },
         chatMessages: {
@@ -494,6 +498,158 @@ describePostgres('circle invitation transactions (PostgreSQL)', () => {
       });
       expect(await notices(id)).toBe(0);
       expect(await cards(id)).toBe(0);
+    });
+
+    /**
+     * 认领提交之后、IO 之前,关系/资格变了:两个写点(通知+outbox、邀请卡片)各在
+     * 一个只锁这两个人的短事务里复核,复核不过就一条都不写、释放认领并作废。
+     * 拉黑与隐私写入拿的是同一对 call-user:* 锁(FriendService / PrivacySettings),
+     * 所以「拉黑返回成功之后不可能再有新投递」重新成立。
+     */
+    const interleaveAfterClaim = (
+      service: CircleInvitationService,
+      between: () => Promise<unknown>,
+    ) => {
+      const claim = (
+        service as unknown as {
+          claimConsentDelivery: (id: string) => Promise<unknown>;
+        }
+      ).claimConsentDelivery.bind(service);
+      jest
+        .spyOn(service as never, 'claimConsentDelivery')
+        .mockImplementation((async (id: string) => {
+          const claimed = await claim(id);
+          await between();
+          return claimed;
+        }) as never);
+    };
+    /** 与 FriendService.blockUser 同一把锁、同一笔写。 */
+    const blockNow = (blockerID: string, blockedID: string) =>
+      t.prisma.$transaction(async (tx) => {
+        await lockUserRelationshipState(tx, [blockerID, blockedID]);
+        await tx.block.create({ data: { blockerID, blockedID } });
+      });
+
+    it.each([
+      ['the applicant blocks the inviter', 'block'],
+      ['the applicant declines (the invitation leaves INVITED)', 'decline'],
+      ['the applicant turns group invites off', 'privacy'],
+    ])(
+      'writes no notice, push or card when %s after the claim commits',
+      async (_label, change) => {
+        const { owner, applicant, id, service } = await pendingInvitation();
+        interleaveAfterClaim(service, async () => {
+          if (change === 'block') await blockNow(applicant, owner);
+          if (change === 'decline')
+            await service.respondToInvitation(applicant, id, false);
+          if (change === 'privacy')
+            await t.prisma.$transaction(async (tx) => {
+              await lockUserRelationshipState(tx, [applicant]);
+              await tx.userPrivacySetting.create({
+                data: { userID: applicant, groupInvitePermission: 'NONE' },
+              });
+            });
+        });
+
+        await expect(deliver(service, id)).resolves.toBeUndefined();
+
+        expect(await notices(id)).toBe(0);
+        expect(await pushes(id)).toBe(0);
+        expect(await cards(id)).toBe(0);
+        expect(await consentState(id)).toMatchObject({
+          claimed: false,
+          status: 'CANCELLED',
+        });
+      },
+    );
+
+    it('stops before the card when the block lands between the notice and the card', async () => {
+      const { owner, applicant, id } = await pendingInvitation();
+      const realDeliver =
+        notifications.deliverCircleConsentNotification.bind(notifications);
+      const traced = build({
+        notifications: {
+          deliverCircleConsentNotification: async (...args: never[]) => {
+            const done = await (realDeliver as (...a: never[]) => unknown)(
+              ...args,
+            );
+            await blockNow(applicant, owner);
+            return done;
+          },
+        },
+      });
+
+      await deliver(traced, id);
+
+      // 通知在拉黑之前提交(拉黑等过它的锁),卡片在拉黑之后:不发。
+      expect(await notices(id)).toBe(1);
+      expect(await cards(id)).toBe(0);
+      expect(await consentState(id)).toMatchObject({
+        claimed: false,
+        status: 'CANCELLED',
+      });
+    });
+
+    it('makes a block that arrives while the card is being written wait for that write', async () => {
+      const { owner, applicant, id, service } = await pendingInvitation();
+      // 把卡片事务卡在插入消息上:此时它已经过了复核、持有这一对 call-user 锁。
+      const gate = await t.rawClient();
+      let blockResolved = false;
+      try {
+        await gate.query('BEGIN');
+        await gate.query('LOCK TABLE "ChatMessage" IN SHARE MODE');
+        const delivering = deliver(service, id);
+        const [cardPid] = await waitUntilBlockedBy(
+          observer,
+          await backendPid(gate),
+        );
+        const blocking = blockNow(applicant, owner).then(() => {
+          blockResolved = true;
+        });
+        // 拉黑排在卡片事务后面,而不是插在复核与插入之间。
+        await waitUntilBlockedBy(observer, cardPid);
+        expect(blockResolved).toBe(false);
+
+        await gate.query('COMMIT');
+        await Promise.all([delivering, blocking]);
+      } finally {
+        await gate.query('ROLLBACK').catch(() => undefined);
+        await gate.end();
+      }
+      expect(await cards(id)).toBe(1);
+      expect(await consentState(id)).toMatchObject({
+        delivered: true,
+        claimed: false,
+      });
+    });
+
+    it("keeps each write-point recheck short: only the two users' relationship locks", async () => {
+      const { owner, applicant, id, service } = await pendingInvitation();
+      t.setRecording(true);
+      await deliver(service, id);
+      t.setRecording(false);
+
+      const lockKeys = (tx: Array<{ sql: string; values: unknown[] }>) =>
+        tx
+          .filter(({ sql }) => sql.includes('pg_advisory_xact_lock'))
+          .flatMap(({ values }) => values.map(String));
+      const writes = transactionEntriesOf(t.statements);
+      const notice = writes.find((tx) =>
+        tx.some(({ sql }) => /INSERT INTO "[^"]+"\."Notification"/.test(sql)),
+      );
+      const card = writes.find((tx) =>
+        tx.some(({ sql }) => /INSERT INTO "[^"]+"\."ChatMessage"/.test(sql)),
+      );
+      const pair = [owner, applicant]
+        .sort((a, b) => a.localeCompare(b))
+        .map((user) => `call-user:${user}`);
+      for (const tx of [notice, card]) {
+        expect(tx).toBeDefined();
+        expect(lockKeys(tx!)).toEqual(pair);
+        // 复核 + 写入,不含成员锁/策略锁,也不含任何外部 IO。
+        expect(tx!.length).toBeLessThan(20);
+      }
+      expect(await consentState(id)).toMatchObject({ delivered: true });
     });
 
     it('does not wait on the login database work budget', async () => {

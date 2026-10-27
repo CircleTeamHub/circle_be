@@ -13,6 +13,14 @@
 -- Notification 的 fromUserID / systemAnnouncementID 建成后从不更新,键不会过期。
 --
 -- 有函数体:整份迁移放在一个事务里执行,不能和 CONCURRENTLY 放在一起。
+--
+-- 加列和建触发器都要拿 ACCESS EXCLUSIVE 锁,而这张表每条通知都要写:撞上长查询时,
+-- 后面所有写 outbox 的事务都会排在 ALTER 后面。等不到 5 秒就整份回滚,别把写入堵在
+-- 锁队列里。失败时 _prisma_migrations 留下一条失败记录:先
+-- `npx prisma migrate resolve --rolled-back 20261026000800_push_outbox_fairness_key`,
+-- 避开长查询后重跑 migrate deploy。
+SET lock_timeout = '5s';
+
 ALTER TABLE "NotificationPushOutbox" ADD COLUMN "fairnessKey" TEXT;
 
 CREATE OR REPLACE FUNCTION circle_push_outbox_fairness_key() RETURNS trigger LANGUAGE plpgsql AS $$
@@ -31,3 +39,5 @@ END $$;
 CREATE TRIGGER push_outbox_fairness_key
 BEFORE INSERT ON "NotificationPushOutbox"
 FOR EACH ROW EXECUTE FUNCTION circle_push_outbox_fairness_key();
+
+RESET lock_timeout;

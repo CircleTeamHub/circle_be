@@ -292,9 +292,11 @@ launcher 会拒绝任何兼容级别低于 4 的 tag。
   - `20261026000200` 建 Friend 复合索引 → `0230` / `0240` 删单列索引;
   - `20261026000100` 建通知列表与稀疏外键索引 → `0110` / `0120` / `0130` 删旧索引;
   - `20261026000530` 建评论 `(traceID, createdAt)` → `0540` 删 `(traceID)`。
-- **换触发器的迁移**(`20261025000100`、`0150`)带 `lock_timeout = 5s`:撞上长事务等不到
-  表锁就整份回滚,`_prisma_migrations` 留下失败记录。处理:
-  `npx prisma migrate resolve --rolled-back <迁移名>`,避开长事务后重跑。
+- **在热表上拿表锁的迁移**带 `lock_timeout = 5s`:换触发器的 `20261025000100`、`0150`,
+  给推送 outbox 加列和建触发器的 `20261026000800`,以及要和 autovacuum 抢锁的
+  `20261026000910`(扩展统计 + ANALYZE)。撞上长事务等不到表锁就整份回滚,
+  `_prisma_migrations` 留下失败记录。处理:
+  `npx prisma migrate resolve --rolled-back <迁移名>`,避开长事务(或等 autovacuum 跑完)后重跑。
 
 ### 回滚 / 重放
 

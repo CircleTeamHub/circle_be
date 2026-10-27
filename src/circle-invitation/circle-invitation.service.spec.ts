@@ -413,12 +413,22 @@ describe('CircleInvitationService', () => {
     expect(prisma.$executeRaw.mock.invocationCallOrder[done]).toBeGreaterThan(
       chatMessages.insertServerMessage.mock.invocationCallOrder[0],
     );
-    expect(chatMessages.insertServerMessage).toHaveBeenCalledWith('dm-1', {
-      senderID: 'inviter',
-      type: 'group-invitation',
-      content: { circleInvitationId: 'consent', groupName: 'Circle' },
-      clientMessageId: 'circle_invitation_consent',
-      rebroadcastOnReplay: true,
+    expect(chatMessages.insertServerMessage).toHaveBeenCalledWith(
+      'dm-1',
+      {
+        senderID: 'inviter',
+        type: 'group-invitation',
+        content: { circleInvitationId: 'consent', groupName: 'Circle' },
+        clientMessageId: 'circle_invitation_consent',
+        rebroadcastOnReplay: true,
+      },
+      { guard: expect.any(Function) },
+    );
+    // 两个写点拿的是同一个复核。
+    expect(
+      notificationService.deliverCircleConsentNotification.mock.calls[0][1],
+    ).toEqual({
+      guard: chatMessages.insertServerMessage.mock.calls[0][2].guard,
     });
     // 隐私复核也走事务客户端,不在持锁事务里另借连接。
     expect(privacySettings.canBeInvitedToGroupOrCircle).toHaveBeenCalledWith(
@@ -426,6 +436,96 @@ describe('CircleInvitationService', () => {
       true,
       prisma,
     );
+  });
+
+  /** 让写点按真实实现那样在「事务」里先跑复核;复核时的库状态由 recheck 决定。 */
+  const runGuardAtWritePoints = () => {
+    notificationService.deliverCircleConsentNotification.mockImplementation(
+      async (_input: unknown, options: any) => options.guard(prisma),
+    );
+    chatMessages.insertServerMessage.mockImplementation(
+      async (_id: unknown, _input: unknown, options: any) => {
+        await options.guard(prisma);
+        return { id: 'msg-1' };
+      },
+    );
+  };
+  const claimValue = () => {
+    const claim = prisma.$executeRaw.mock.calls.find((call: unknown[]) =>
+      rawSql(call).includes('SET "consentNoticeClaimedAt" = ?'),
+    );
+    return claim?.[1] as Date;
+  };
+
+  it('rechecks under the pair lock at each write point and cancels when the applicant blocked after the claim', async () => {
+    allowConsentDelivery();
+    prisma.circleInvitation.findUnique.mockResolvedValue(
+      consentInvitation('raced'),
+    );
+    runGuardAtWritePoints();
+    // 认领时没拉黑;写点复核时(拿到 call-user 锁之后)已经拉黑。
+    prisma.$queryRaw.mockImplementation(
+      async (strings: TemplateStringsArray) =>
+        Array.from(strings).join('?').includes('FOR NO KEY UPDATE')
+          ? [{ invited: true, claimed: true }]
+          : [],
+    );
+    prisma.block.findFirst
+      .mockResolvedValueOnce(null)
+      .mockResolvedValue({ id: 'block' });
+
+    await expect(
+      (service as any).deliverConsentInvitation('raced'),
+    ).resolves.toBeUndefined();
+
+    // 复核是写点的第一件事:先取这一对人的关系锁。
+    const guardLocks = prisma.$executeRaw.mock.calls
+      .map(rawSql)
+      .filter((sql: string) => sql.includes('pg_advisory_xact_lock'));
+    expect(guardLocks.length).toBeGreaterThanOrEqual(3);
+    expect(chatService.getOrCreateDirectConversation).not.toHaveBeenCalled();
+    expect(chatMessages.insertServerMessage).not.toHaveBeenCalled();
+    // 按失格口径作废(只动自己认领的那一行),不抛错、不交给补投。
+    expect(prisma.circleInvitation.updateMany).toHaveBeenCalledWith({
+      where: {
+        id: 'raced',
+        status: 'INVITED',
+        consentNoticeClaimedAt: claimValue(),
+      },
+      data: {
+        status: 'CANCELLED',
+        consentNoticeDeliveredAt: expect.any(Date),
+        consentNoticeClaimedAt: null,
+      },
+    });
+    expect(
+      prisma.$executeRaw.mock.calls
+        .map(rawSql)
+        .some((sql: string) =>
+          sql.includes('SET "consentNoticeDeliveredAt" = ?'),
+        ),
+    ).toBe(false);
+  });
+
+  it('stops without cancelling when the claim is no longer its own at the write point', async () => {
+    allowConsentDelivery();
+    prisma.circleInvitation.findUnique.mockResolvedValue(
+      consentInvitation('taken-over'),
+    );
+    runGuardAtWritePoints();
+    prisma.$queryRaw.mockImplementation(
+      async (strings: TemplateStringsArray) =>
+        Array.from(strings).join('?').includes('FOR NO KEY UPDATE')
+          ? [{ invited: true, claimed: false }]
+          : [],
+    );
+
+    await expect(
+      (service as any).deliverConsentInvitation('taken-over'),
+    ).resolves.toBeUndefined();
+
+    expect(prisma.circleInvitation.updateMany).not.toHaveBeenCalled();
+    expect(chatMessages.insertServerMessage).not.toHaveBeenCalled();
   });
 
   it('skips the delivery while another worker holds a fresh claim', async () => {

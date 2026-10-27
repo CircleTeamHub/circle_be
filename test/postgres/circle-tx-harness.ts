@@ -26,7 +26,11 @@ function prismaSchemaSql(): string {
   return schemaSql;
 }
 
-export type StatementLog = Array<{ connection: number; sql: string }>;
+export type StatementLog = Array<{
+  connection: number;
+  sql: string;
+  values: unknown[];
+}>;
 
 export type CircleTxDb = {
   schema: string;
@@ -80,9 +84,16 @@ export async function openCircleTxDb(
     (client as unknown as { query: (...args: unknown[]) => unknown }).query = (
       ...args: unknown[]
     ) => {
-      const first = args[0] as string | { text?: string } | undefined;
+      const first = args[0] as
+        | string
+        | { text?: string; values?: unknown[] }
+        | undefined;
       const sql = typeof first === 'string' ? first : first?.text;
-      if (recording && sql) statements.push({ connection, sql });
+      const values =
+        typeof first === 'string'
+          ? ((args[1] as unknown[] | undefined) ?? [])
+          : (first?.values ?? []);
+      if (recording && sql) statements.push({ connection, sql, values });
       return original(...args);
     };
   });
@@ -179,6 +190,27 @@ export async function createCircle(
     select: { id: true },
   });
   return circle.id;
+}
+
+/** 同 transactionsOf,但保留每条语句的参数(断言事务里取了哪些 advisory 锁)。 */
+export function transactionEntriesOf(statements: StatementLog): StatementLog[] {
+  const open = new Map<number, StatementLog>();
+  const done: StatementLog[] = [];
+  for (const entry of statements) {
+    const head = entry.sql.trim().toUpperCase();
+    if (head.startsWith('BEGIN')) {
+      open.set(entry.connection, [entry]);
+      continue;
+    }
+    const current = open.get(entry.connection);
+    if (!current) continue;
+    current.push(entry);
+    if (head.startsWith('COMMIT') || head.startsWith('ROLLBACK')) {
+      done.push(current);
+      open.delete(entry.connection);
+    }
+  }
+  return done;
 }
 
 /** 某条连接(按 statements 里的编号)在 BEGIN … COMMIT 之间发出的语句。 */
