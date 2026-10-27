@@ -14,9 +14,16 @@ export async function lockUserRelationshipState(
   userIds: string[],
 ): Promise<void> {
   const orderedIds = [...new Set(userIds)].sort((a, b) => a.localeCompare(b));
-  for (const userId of orderedIds) {
-    await client.$executeRaw`
-      SELECT pg_advisory_xact_lock(hashtextextended(${`call-user:${userId}`}, 0))
-    `;
-  }
+  if (orderedIds.length === 0) return;
+  // One statement for every key instead of one round trip per user (a 200-member
+  // group used to send 200 lock statements while holding its transaction open).
+  // Keys and hashing are unchanged, so FriendService / CallService still contend
+  // on the same locks. PostgreSQL evaluates volatile output expressions after the
+  // ORDER BY sort, so the locks are still taken one by one in `ord` order.
+  const keys = orderedIds.map((userId) => `call-user:${userId}`);
+  await client.$executeRaw`
+    SELECT pg_advisory_xact_lock(hashtextextended(lock.key, 0))
+    FROM unnest(${keys}::text[]) WITH ORDINALITY AS lock(key, ord)
+    ORDER BY lock.ord
+  `;
 }

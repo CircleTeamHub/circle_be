@@ -71,6 +71,16 @@ const ADMIN_USER_DETAIL_SELECT = {
   creditScore: true,
 } as const;
 
+/**
+ * 状态变更事务要排在账号锁(auth_session:<userId>)后面,而持锁的登录 / 续签事务
+ * (AuthService.withAccountAuthLock)最长可以跑 30 秒。沿用 Prisma 默认的 5 秒交互
+ * 事务超时,封禁会在等锁时被中止、账号保持 ACTIVE,所以和那边用同一组上限。
+ */
+const ACCOUNT_LOCK_TRANSACTION_OPTIONS = {
+  maxWait: 10_000,
+  timeout: 30_000,
+} as const;
+
 @Injectable()
 export class AdminUserService {
   private readonly logger = new Logger(AdminUserService.name);
@@ -321,6 +331,14 @@ export class AdminUserService {
     }
 
     const result = await this.prisma.$transaction(async (tx) => {
+      // 先拿和登录 / 续签 / 设备信任同一把账号锁(AuthService.withAccountAuthLock)。
+      // 续签是「先轮换出新会话、再读 status」:不排队的话,续签读到 ACTIVE 之后、提交
+      // 之前封禁提交,下面的 updateMany 看不到那条还没提交的新会话,它就躲过吊销 ——
+      // 封禁期间被 status 拦住,解封后又能用。排队后续签要么先提交(新会话被一并吊销),
+      // 要么在封禁之后开始(读到非 ACTIVE 直接拒绝)。
+      // 账号锁在全局锁之前:等一个慢登录时不占着全局锁,别的管理员操作不被拖住。
+      // 只有这里同时拿两把锁,其余账号锁 / 全局锁的持有者都只拿其中一把,不会成环。
+      await tx.$executeRaw`SELECT pg_advisory_xact_lock(hashtextextended(${`auth_session:${targetId}`}, 0))`;
       await tx.$executeRaw`SELECT pg_advisory_xact_lock(72419930)`;
       const current = await tx.user.findUnique({
         where: { id: targetId },
@@ -449,7 +467,7 @@ export class AdminUserService {
         previousStatus: current.status,
         revokedAt,
       };
-    });
+    }, ACCOUNT_LOCK_TRANSACTION_OPTIONS);
 
     const sessionRevocationPending = result.revokedAt
       ? !(await this.completeSessionRevocation(targetId, result.revokedAt))

@@ -292,10 +292,9 @@ describe('PrivacySettingsService', () => {
     });
 
     expect(prisma.$transaction).toHaveBeenCalledTimes(1);
-    expect(prisma.$executeRaw).toHaveBeenCalledWith(
-      expect.anything(),
+    expect(prisma.$executeRaw).toHaveBeenCalledWith(expect.anything(), [
       'call-user:user-1',
-    );
+    ]);
     expect(prisma.$executeRaw.mock.invocationCallOrder[0]).toBeLessThan(
       prisma.userPrivacySetting.upsert.mock.invocationCallOrder[0],
     );
