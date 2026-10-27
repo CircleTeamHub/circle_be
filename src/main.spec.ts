@@ -191,11 +191,19 @@ describe('buildNestFactoryOptions', () => {
     expect(buildNestFactoryOptions().rawBody).toBe(true);
   });
 
-  // GET /note 与 /note/recycle-bin 用 X-Has-More 告知截断（响应体保持数组）。移动端
+  // GET /note、/note/recycle-bin 与 /chat/conversations 用 X-Has-More 告知截断（响应体保持数组）。移动端
   // 不受 CORS 约束，但浏览器跨域时读不到未列入 Access-Control-Expose-Headers 的头。
   it('exposes the X-Has-More pagination header to browser clients', () => {
     expect(buildNestFactoryOptions().cors.exposedHeaders).toEqual(
       expect.arrayContaining(['X-Has-More']),
+    );
+  });
+
+  // GET /chat/conversations 的键集分页把下一页游标放在 X-Next-Cursor（响应体同样
+  // 保持数组）。不列进来的话网页端读到的永远是 null，只能拿到第一页。
+  it('exposes the X-Next-Cursor keyset header to browser clients', () => {
+    expect(buildNestFactoryOptions().cors.exposedHeaders).toEqual(
+      expect.arrayContaining(['X-Has-More', 'X-Next-Cursor']),
     );
   });
 
@@ -410,7 +418,7 @@ describe('runBootstrap', () => {
   });
 });
 
-describe('encryption JSON payload size', () => {
+describe('JSON payload size', () => {
   it('accepts contract-sized payloads and rejects bodies above the explicit bound', async () => {
     const app = await NestFactory.create(CorsProbeModule, {
       rawBody: true,

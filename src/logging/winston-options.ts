@@ -7,6 +7,7 @@ import { createLoggingConfig } from './logging.config';
 import { getRequestContext } from './request-context';
 import { getOperationContext } from './operation-context';
 import { sanitizeLogValue } from './log-sanitizer';
+import { configureFatalLogFile } from './fatal-log-file';
 import { writeSync } from 'node:fs';
 
 interface ConfigServiceLike {
@@ -137,6 +138,11 @@ export function createWinstonOptions(
         ]
       : []),
   ];
+  // 与上面的文件同目录、同 JSON 形状；uncaughtException 退出前同步写这一行。
+  configureFatalLogFile(
+    fileOn ? 'logs/application-fatal.log' : null,
+    identifiers,
+  );
   let lastFailureAt = -Infinity;
   const reportTransportError = () => {
     const now = Date.now();

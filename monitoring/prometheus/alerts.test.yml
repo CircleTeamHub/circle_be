@@ -314,6 +314,41 @@ tests:
         exp_alerts: []
 
   - interval: 1m
+    name: Loki 的日志告警发不到 Alertmanager 时触发并在窗口过期后恢复
+    input_series:
+      - series: 'loki_prometheus_notifications_errors_total{alertmanager="http://alertmanager:9093/api/v2/alerts",user="fake"}'
+        values: '0+0x2 1+0x30'
+      - series: 'loki_prometheus_notifications_dropped_total{alertmanager="http://alertmanager:9093/api/v2/alerts",user="fake"}'
+        values: '0+0x32'
+    alert_rule_test:
+      - eval_time: 10m
+        alertname: LokiRulerNotificationsFailing
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+            exp_annotations:
+              summary: 'Loki could not deliver log-based alerts to Alertmanager in the last 10m — is Alertmanager on the logs network?'
+      - eval_time: 20m
+        alertname: LokiRulerNotificationsFailing
+        exp_alerts: []
+
+  - interval: 1m
+    name: Loki 丢弃日志告警同样触发
+    input_series:
+      - series: 'loki_prometheus_notifications_errors_total{user="fake"}'
+        values: '0+0x20'
+      - series: 'loki_prometheus_notifications_dropped_total{user="fake"}'
+        values: '0+0x2 3+0x18'
+    alert_rule_test:
+      - eval_time: 10m
+        alertname: LokiRulerNotificationsFailing
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+            exp_annotations:
+              summary: 'Loki could not deliver log-based alerts to Alertmanager in the last 10m — is Alertmanager on the logs network?'
+
+  - interval: 1m
     name: Alloy 持续重试且目标健康时触发
     input_series:
       - series: 'loki_write_batch_retries_total{component_id="loki.write.local"}'
@@ -700,3 +735,638 @@ tests:
       - eval_time: 15m
         alertname: ChatAuthFailureSpike
         exp_alerts: []
+
+  # ── 漏网的 promise rejection ─────────────────────────────────────────
+  - name: 漏网 rejection 触发告警，15 分钟没有新增就消警
+    interval: 1m
+    input_series:
+      - series: circle_unhandled_rejections_total{job="circle-be",instance="circle-be-blue"}
+        values: 0x5 1+0x40
+    alert_rule_test:
+      - eval_time: 4m
+        alertname: UnhandledRejectionsOccurring
+        exp_alerts: []
+      - eval_time: 7m
+        alertname: UnhandledRejectionsOccurring
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+            exp_annotations:
+              summary: Backend caught unhandled promise rejection(s) in the last 15m — a missing .catch; see [unhandledRejection] log lines
+      - eval_time: 30m
+        alertname: UnhandledRejectionsOccurring
+        exp_alerts: []
+
+  # increase() 不把新序列的第一个样本当作从 0 起：新颜色在第一次被抓取前就漏出的
+  # rejection，靠「15 分钟前还不存在的序列」那一段补上。
+  - name: 新进程第一次被抓取时计数已经是 1，也要告警
+    interval: 1m
+    input_series:
+      - series: circle_unhandled_rejections_total{job="circle-be",instance="circle-be-green"}
+        values: 1+0x40
+    alert_rule_test:
+      - eval_time: 2m
+        alertname: UnhandledRejectionsOccurring
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+            exp_annotations:
+              summary: Backend caught unhandled promise rejection(s) in the last 15m — a missing .catch; see [unhandledRejection] log lines
+      - eval_time: 20m
+        alertname: UnhandledRejectionsOccurring
+        exp_alerts: []
+
+  # ── 磁盘：两档各自独立触发，同盘抑制交给 Alertmanager ────────────────
+  - name: 剩不到 5% 时 critical 与 warning 都触发
+    interval: 1m
+    input_series:
+      - series: node_filesystem_avail_bytes{instance="node-exporter:9100",mountpoint="/",fstype="ext4"}
+        values: 4+0x20
+      - series: node_filesystem_size_bytes{instance="node-exporter:9100",mountpoint="/",fstype="ext4"}
+        values: 100+0x20
+      - series: node_filesystem_readonly{instance="node-exporter:9100",mountpoint="/",fstype="ext4"}
+        values: 0+0x20
+    alert_rule_test:
+      - eval_time: 15m
+        alertname: HostDiskNearlyFull
+        exp_alerts:
+          - exp_labels:
+              severity: critical
+              instance: node-exporter:9100
+              mountpoint: /
+              fstype: ext4
+            exp_annotations:
+              summary: Filesystem / below 5% free — database and log writes are about to fail
+      - eval_time: 15m
+        alertname: HostDiskFilling
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              instance: node-exporter:9100
+              mountpoint: /
+              fstype: ext4
+            exp_annotations:
+              summary: Filesystem / below 15% free
+
+  - name: 剩 10% 只有 warning；只读挂载和 squashfs 都不算
+    interval: 1m
+    input_series:
+      - series: node_filesystem_avail_bytes{instance="node-exporter:9100",mountpoint="/",fstype="ext4"}
+        values: 10+0x20
+      - series: node_filesystem_size_bytes{instance="node-exporter:9100",mountpoint="/",fstype="ext4"}
+        values: 100+0x20
+      - series: node_filesystem_readonly{instance="node-exporter:9100",mountpoint="/",fstype="ext4"}
+        values: 0+0x20
+      - series: node_filesystem_avail_bytes{instance="node-exporter:9100",mountpoint="/mnt/restore",fstype="ext4"}
+        values: 1+0x20
+      - series: node_filesystem_size_bytes{instance="node-exporter:9100",mountpoint="/mnt/restore",fstype="ext4"}
+        values: 100+0x20
+      - series: node_filesystem_readonly{instance="node-exporter:9100",mountpoint="/mnt/restore",fstype="ext4"}
+        values: 1+0x20
+      - series: node_filesystem_avail_bytes{instance="node-exporter:9100",mountpoint="/var/lib/snapd/snap/core",fstype="squashfs"}
+        values: 0+0x20
+      - series: node_filesystem_size_bytes{instance="node-exporter:9100",mountpoint="/var/lib/snapd/snap/core",fstype="squashfs"}
+        values: 100+0x20
+      - series: node_filesystem_readonly{instance="node-exporter:9100",mountpoint="/var/lib/snapd/snap/core",fstype="squashfs"}
+        values: 1+0x20
+    alert_rule_test:
+      - eval_time: 15m
+        alertname: HostDiskNearlyFull
+        exp_alerts: []
+      - eval_time: 15m
+        alertname: HostDiskFilling
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              instance: node-exporter:9100
+              mountpoint: /
+              fstype: ext4
+            exp_annotations:
+              summary: Filesystem / below 15% free
+
+  # ── 容器崩溃循环 ────────────────────────────────────────────────────
+  # 按 cAdvisor 的真实形态造数据：同一个容器重启后 container_start_time_seconds
+  # 的值（创建时间）不变，变的是 container_label_restartcount —— 每次一条新序列。
+  - name: 同一个容器 15 分钟内重启 3 次算崩溃循环，停下来后消警
+    interval: 1m
+    input_series:
+      - series: container_start_time_seconds{name="circle-be-minio-1",id="/docker/abc"}
+        values: 100 100 100 _ _ _ _ _ _ _
+      - series: container_start_time_seconds{name="circle-be-minio-1",id="/docker/abc",container_label_restartcount="1"}
+        values: _ _ _ 100 100 _ _ _ _ _
+      - series: container_start_time_seconds{name="circle-be-minio-1",id="/docker/abc",container_label_restartcount="2"}
+        values: _ _ _ _ _ 100 100 _ _ _
+      - series: container_start_time_seconds{name="circle-be-minio-1",id="/docker/abc",container_label_restartcount="3"}
+        values: _ _ _ _ _ _ _ 100 100 100 100+0x30
+    alert_rule_test:
+      - eval_time: 5m
+        alertname: ContainerRestartLoop
+        exp_alerts: []
+      - eval_time: 7m
+        alertname: ContainerRestartLoop
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              name: circle-be-minio-1
+            exp_annotations:
+              summary: Container circle-be-minio-1 restarted about 3 times in 15m (crash loop or OOM kills?)
+      - eval_time: 30m
+        alertname: ContainerRestartLoop
+        exp_alerts: []
+
+  - name: 发版重建加一次手工重启、或单纯手工重启两次，都不算崩溃循环
+    interval: 1m
+    input_series:
+      # 发版：旧容器消失、新容器是另一个 id；随后又手工 docker restart 了一次。
+      - series: container_start_time_seconds{name="circle-be-caddy-1",id="/docker/old"}
+        values: 100 100 100 _ _ _ _ _ _ _ _ _
+      - series: container_start_time_seconds{name="circle-be-caddy-1",id="/docker/new"}
+        values: _ _ _ 500 500 500 _ _ _ _ _ _
+      - series: container_start_time_seconds{name="circle-be-caddy-1",id="/docker/new",container_label_restartcount="1"}
+        values: _ _ _ _ _ _ 500 500 500 500 500 500
+      # 另一个容器只被手工重启了两次（比如重载配置）。
+      - series: container_start_time_seconds{name="circle-be-redis-1",id="/docker/r"}
+        values: 200 200 200 200 _ _ _ _ _ _ _ _
+      - series: container_start_time_seconds{name="circle-be-redis-1",id="/docker/r",container_label_restartcount="1"}
+        values: _ _ _ _ 200 200 200 _ _ _ _ _
+      - series: container_start_time_seconds{name="circle-be-redis-1",id="/docker/r",container_label_restartcount="2"}
+        values: _ _ _ _ _ _ _ 200 200 200 200 200
+    alert_rule_test:
+      - eval_time: 11m
+        alertname: ContainerRestartLoop
+        exp_alerts: []
+
+  # ── 备份自检 ────────────────────────────────────────────────────────
+  - name: 某一项备份自检失败即 critical，并标出是哪一项
+    interval: 1m
+    input_series:
+      - series: circle_backup_check_success{job="backup",instance="backup-metrics",check="postgres_archive"}
+        values: 0+0x20
+      - series: circle_backup_check_success{job="backup",instance="backup-metrics",check="destination_bucket"}
+        values: 1+0x20
+      - series: circle_backup_check_last_run_timestamp_seconds{job="backup",instance="backup-metrics"}
+        values: 0+60x20
+      - series: up{job="postgres-exporter",instance="postgres-exporter:9187"}
+        values: 1+0x20
+    alert_rule_test:
+      - eval_time: 3m
+        alertname: BackupCheckFailing
+        exp_alerts: []
+      - eval_time: 10m
+        alertname: BackupCheckFailing
+        exp_alerts:
+          - exp_labels:
+              severity: critical
+              job: backup
+              instance: backup-metrics
+              check: postgres_archive
+            exp_annotations:
+              summary: Backup self-check postgres_archive is failing — see `docker compose logs backup`
+      - eval_time: 10m
+        alertname: BackupCheckStale
+        exp_alerts: []
+      - eval_time: 10m
+        alertname: BackupCheckNotReporting
+        exp_alerts: []
+
+  - name: 自检停跑 3 小时后报 stale；一直在跑就不报
+    interval: 1m
+    input_series:
+      # 最后一次完成在 t=0，之后时间戳不再前进（调度器挂了）。
+      - series: circle_backup_check_last_run_timestamp_seconds{job="backup",instance="stopped"}
+        values: 0+0x200
+      # 每分钟都有一次完成（时间戳跟着时间走）。
+      - series: circle_backup_check_last_run_timestamp_seconds{job="backup",instance="healthy"}
+        values: 0+60x200
+    alert_rule_test:
+      - eval_time: 2h
+        alertname: BackupCheckStale
+        exp_alerts: []
+      - eval_time: 3h10m
+        alertname: BackupCheckStale
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              job: backup
+              instance: stopped
+            exp_annotations:
+              summary: Backup self-check has not completed for 3h+ — the backup scheduler may be down
+
+  - name: 生产上没有任何备份结果时，2 小时后报 not reporting
+    interval: 1m
+    input_series:
+      - series: up{job="postgres-exporter",instance="postgres-exporter:9187"}
+        values: 1+0x200
+    alert_rule_test:
+      - eval_time: 1h
+        alertname: BackupCheckNotReporting
+        exp_alerts: []
+      - eval_time: 2h10m
+        alertname: BackupCheckNotReporting
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+            exp_annotations:
+              summary: No backup self-check results in production — backups are not deployed, or check.sh cannot write its metrics
+
+  - name: 开发机（没有 postgres-exporter）上不报 not reporting
+    interval: 1m
+    input_series:
+      - series: up{job="circle-be",instance="host.docker.internal:3000"}
+        values: 1+0x200
+    alert_rule_test:
+      - eval_time: 3h
+        alertname: BackupCheckNotReporting
+        exp_alerts: []
+
+  - name: 一次瞬时失败不报；连续两次失败才报 critical
+    interval: 1m
+    input_series:
+      # 第 70 分钟那次检查碰上一次抖动，下一次就恢复了。
+      - series: circle_backup_check_success{job="backup",instance="backup-metrics",check="destination_bucket"}
+        values: 1+0x69 0+0x59 1+0x40
+      # 第 70 分钟起每次都失败。
+      - series: circle_backup_check_success{job="backup",instance="backup-metrics",check="minio_source"}
+        values: 1+0x69 0+0x100
+    alert_rule_test:
+      - eval_time: 129m
+        alertname: BackupCheckFailing
+        exp_alerts: []
+      - eval_time: 150m
+        alertname: BackupCheckFailing
+        exp_alerts:
+          - exp_labels:
+              severity: critical
+              job: backup
+              instance: backup-metrics
+              check: minio_source
+            exp_annotations:
+              summary: Backup self-check minio_source is failing — see `docker compose logs backup`
+
+  - name: 检查一直在跑、却 30 小时都没有完成过一份备份
+    interval: 2m
+    input_series:
+      - series: circle_backup_check_last_run_timestamp_seconds{job="backup",instance="never"}
+        values: 0+120x1000
+      - series: circle_backup_check_success{job="backup",instance="never",check="postgres_archive"}
+        values: 1+0x1000
+    alert_rule_test:
+      - eval_time: 29h
+        alertname: BackupNeverCompleted
+        exp_alerts: []
+      - eval_time: 30h10m
+        alertname: BackupNeverCompleted
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              check: backup_freshness
+            exp_annotations:
+              summary: Backup checks run, but the repository still has no completed backup after 30h — the base backup job is failing
+
+  - name: 已有完成的备份时不报 never completed
+    interval: 2m
+    input_series:
+      - series: circle_backup_check_last_run_timestamp_seconds{job="backup",instance="healthy"}
+        values: 0+120x1000
+      - series: circle_backup_check_success{job="backup",instance="healthy",check="backup_freshness"}
+        values: 1+0x1000
+    alert_rule_test:
+      - eval_time: 31h
+        alertname: BackupNeverCompleted
+        exp_alerts: []
+
+  # ── 外部投递通道 ────────────────────────────────────────────────────
+  - name: JPush 全部可重试失败时按 provider 报；Expo 的失效 token 不算失败
+    interval: 1m
+    input_series:
+      - series: circle_push_deliveries_total{job="circle-be",instance="circle-be-blue",provider="jpush",result="retryable"}
+        values: 0+60x40
+      - series: circle_push_deliveries_total{job="circle-be",instance="circle-be-blue",provider="jpush",result="sent"}
+        values: 0+0x40
+      - series: circle_push_deliveries_total{job="circle-be",instance="circle-be-blue",provider="expo",result="sent"}
+        values: 0+600x40
+      - series: circle_push_deliveries_total{job="circle-be",instance="circle-be-blue",provider="expo",result="dead_token"}
+        values: 0+600x40
+      - series: circle_push_deliveries_total{job="circle-be",instance="circle-be-blue",provider="expo",result="retryable"}
+        values: 0+0x40
+    alert_rule_test:
+      - eval_time: 25m
+        alertname: PushDeliveryFailing
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              provider: jpush
+            exp_annotations:
+              summary: Over 20% of jpush push deliveries are failing — credentials, quota or provider outage?
+
+  - name: 推送量太小时一两次失败不报
+    interval: 1m
+    input_series:
+      - series: circle_push_deliveries_total{job="circle-be",instance="circle-be-blue",provider="expo",result="retryable"}
+        values: 0x10 2+0x30
+      - series: circle_push_deliveries_total{job="circle-be",instance="circle-be-blue",provider="expo",result="sent"}
+        values: 0x10 3+0x30
+    alert_rule_test:
+      # 22m：跳变还在 15 分钟窗口里，且失败率超阈值已满 for 10m —— 只有
+      # 最小样本量挡着。
+      - eval_time: 22m
+        alertname: PushDeliveryFailing
+        exp_alerts: []
+
+  - name: 验证码邮件大多失败时 critical
+    interval: 1m
+    input_series:
+      - series: circle_email_code_sends_total{job="circle-be",instance="circle-be-blue",result="failure"}
+        values: 0+1x40
+      - series: circle_email_code_sends_total{job="circle-be",instance="circle-be-blue",result="success"}
+        values: 0+0x40
+      - series: circle_email_code_sends_total{job="circle-be",instance="circle-be-blue",result="unavailable"}
+        values: 0+0x40
+    alert_rule_test:
+      - eval_time: 20m
+        alertname: EmailCodeSendFailing
+        exp_alerts:
+          - exp_labels:
+              severity: critical
+            exp_annotations:
+              summary: Most verification-code emails are failing — users cannot register or sign in by email code
+
+  - name: 生产上没配 SMTP（unavailable）同样算失败
+    interval: 1m
+    input_series:
+      - series: circle_email_code_sends_total{job="circle-be",instance="circle-be-blue",result="unavailable"}
+        values: 0x5 4+0x30
+      - series: circle_email_code_sends_total{job="circle-be",instance="circle-be-blue",result="success"}
+        values: 0+0x35
+    alert_rule_test:
+      - eval_time: 15m
+        alertname: EmailCodeSendFailing
+        exp_alerts:
+          - exp_labels:
+              severity: critical
+            exp_annotations:
+              summary: Most verification-code emails are failing — users cannot register or sign in by email code
+
+  - name: 偶发一封失败不报（失败率 100%，但只有一封）
+    interval: 1m
+    input_series:
+      - series: circle_email_code_sends_total{job="circle-be",instance="circle-be-blue",result="failure"}
+        values: 0x10 1+0x30
+      - series: circle_email_code_sends_total{job="circle-be",instance="circle-be-blue",result="success"}
+        values: 0+0x40
+    alert_rule_test:
+      # 18m：那封失败还在窗口里，失败率已满 for 5m —— 只有最小失败数挡着。
+      - eval_time: 18m
+        alertname: EmailCodeSendFailing
+        exp_alerts: []
+
+  - name: 失败占少数时不报
+    interval: 1m
+    input_series:
+      - series: circle_email_code_sends_total{job="circle-be",instance="circle-be-green",result="failure"}
+        values: 0+1x40
+      - series: circle_email_code_sends_total{job="circle-be",instance="circle-be-green",result="success"}
+        values: 0+3x40
+    alert_rule_test:
+      - eval_time: 25m
+        alertname: EmailCodeSendFailing
+        exp_alerts: []
+
+  - name: 推送失败率 30% 就报，10% 不报
+    interval: 1m
+    input_series:
+      - series: circle_push_deliveries_total{job="circle-be",instance="circle-be-blue",provider="expo",result="retryable"}
+        values: 0+30x40
+      - series: circle_push_deliveries_total{job="circle-be",instance="circle-be-blue",provider="expo",result="sent"}
+        values: 0+70x40
+      - series: circle_push_deliveries_total{job="circle-be",instance="circle-be-blue",provider="jpush",result="rejected"}
+        values: 0+10x40
+      - series: circle_push_deliveries_total{job="circle-be",instance="circle-be-blue",provider="jpush",result="sent"}
+        values: 0+90x40
+    alert_rule_test:
+      - eval_time: 25m
+        alertname: PushDeliveryFailing
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              provider: expo
+            exp_annotations:
+              summary: Over 20% of expo push deliveries are failing — credentials, quota or provider outage?
+
+  # ── 间隔很短的任务：心跳阈值不能低于抓取与求值的粒度 ────────────────
+  # 5 秒一跑的任务，3 × 周期 = 15 秒，而抓取和求值都是 15 秒一次：正常运转时
+  # 求值看到的心跳也会滞后 12～18 秒。没有下限的话这条会周期性地连响几小时。
+  - name: 5 秒任务的正常心跳滞后不报 stalled；真停了才报
+    interval: 15s
+    input_series:
+      # 每次抓取时心跳都落后 18 秒（抓取相位最差的情况）。
+      - series: circle_cron_last_success_timestamp_seconds{job="circle-be",exported_job="admin_group_operation"}
+        values: -18+15x80
+      - series: circle_cron_interval_seconds{job="circle-be",exported_job="admin_group_operation"}
+        values: 5+0x80
+      # 另一个 10 秒任务从 t=0 起就停了。
+      - series: circle_cron_last_success_timestamp_seconds{job="circle-be",exported_job="group_admission_delivery"}
+        values: 0+0x80
+      - series: circle_cron_interval_seconds{job="circle-be",exported_job="group_admission_delivery"}
+        values: 10+0x80
+    alert_rule_test:
+      - eval_time: 19m
+        alertname: CronJobStalled
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              exported_job: group_admission_delivery
+            exp_annotations:
+              summary: Scheduled job group_admission_delivery has not succeeded in 3x its interval
+
+  # ── 第三批：发版异地备份、依赖失败率、存储可达性、磁盘趋势、inode ─────
+  - name: 发版时的异地备份失败就报，下次成功后消警
+    interval: 1m
+    input_series:
+      - series: circle_release_offsite_backup_success{job="backup",instance="backup-metrics"}
+        values: 0x20 1x20
+    alert_rule_test:
+      - eval_time: 10m
+        alertname: ReleaseOffsiteBackupFailed
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              job: backup
+              instance: backup-metrics
+            exp_annotations:
+              summary: The last release-time off-host database backup failed — see ~/circle_be_backups/.offsite-status on the host
+      - eval_time: 30m
+        alertname: ReleaseOffsiteBackupFailed
+        exp_alerts: []
+
+  - name: 对象存储服务端读写大面积失败时按依赖报；not_found 和 LiveKit 偶发失败不报
+    interval: 1m
+    input_series:
+      - series: circle_dependency_requests_total{job="circle-be",instance="circle-be-blue",dependency="object_storage",operation="PutObject",result="failure"}
+        values: 0+2x40
+      - series: circle_dependency_requests_total{job="circle-be",instance="circle-be-blue",dependency="object_storage",operation="PutObject",result="success"}
+        values: 0+2x40
+      # 大量「对象不存在」是存储审计的正常结果，不能把失败率拉高。
+      - series: circle_dependency_requests_total{job="circle-be",instance="circle-be-blue",dependency="livekit",operation="create_room",result="not_found"}
+        values: 0+50x40
+      - series: circle_dependency_requests_total{job="circle-be",instance="circle-be-blue",dependency="livekit",operation="create_room",result="failure"}
+        values: 0x10 2+0x30
+      - series: circle_dependency_requests_total{job="circle-be",instance="circle-be-blue",dependency="livekit",operation="create_room",result="success"}
+        values: 0x10 2+0x30
+    alert_rule_test:
+      - eval_time: 25m
+        alertname: DependencyRequestsFailing
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              dependency: object_storage
+            exp_annotations:
+              summary: Over 20% of backend requests to object_storage are failing — credentials, bucket policy or an outage?
+
+  - name: 任一在服务的实例连不上对象存储就 critical
+    interval: 1m
+    input_series:
+      - series: circle_object_store_up{job="circle-be",instance="circle-be-blue"}
+        values: 1+0x20
+      - series: circle_object_store_up{job="circle-be",instance="circle-be-green"}
+        values: 0+0x20
+    alert_rule_test:
+      - eval_time: 3m
+        alertname: ObjectStoreUnreachable
+        exp_alerts: []
+      - eval_time: 10m
+        alertname: ObjectStoreUnreachable
+        exp_alerts:
+          - exp_labels:
+              severity: critical
+            exp_annotations:
+              summary: Object storage is unreachable — media uploads and reads are failing for every user
+
+  - name: 按当前写入速度 24 小时内会写满就报
+    interval: 1m
+    input_series:
+      # 剩 30%，每分钟少 1 —— 24 小时后远低于 0。
+      - series: node_filesystem_avail_bytes{instance="node-exporter:9100",mountpoint="/",fstype="ext4"}
+        values: 300-1x200
+      - series: node_filesystem_size_bytes{instance="node-exporter:9100",mountpoint="/",fstype="ext4"}
+        values: 1000+0x200
+      - series: node_filesystem_readonly{instance="node-exporter:9100",mountpoint="/",fstype="ext4"}
+        values: 0+0x200
+    alert_rule_test:
+      - eval_time: 50m
+        alertname: HostDiskWillFillWithin24h
+        exp_alerts: []
+      - eval_time: 2h
+        alertname: HostDiskWillFillWithin24h
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              instance: node-exporter:9100
+              mountpoint: /
+              fstype: ext4
+            exp_annotations:
+              summary: Filesystem / is on track to fill within 24h at the current write rate
+
+  - name: 平稳的盘、和下降中但还很空的盘都不报趋势
+    interval: 1m
+    input_series:
+      - series: node_filesystem_avail_bytes{instance="node-exporter:9100",mountpoint="/",fstype="ext4"}
+        values: 300+0x200
+      - series: node_filesystem_size_bytes{instance="node-exporter:9100",mountpoint="/",fstype="ext4"}
+        values: 1000+0x200
+      - series: node_filesystem_readonly{instance="node-exporter:9100",mountpoint="/",fstype="ext4"}
+        values: 0+0x200
+      # 剩 80% 还在降：一次大文件写入就能让斜率短暂为负，不值得叫人。
+      - series: node_filesystem_avail_bytes{instance="node-exporter:9100",mountpoint="/data",fstype="ext4"}
+        values: 800-1x200
+      - series: node_filesystem_size_bytes{instance="node-exporter:9100",mountpoint="/data",fstype="ext4"}
+        values: 1000+0x200
+      - series: node_filesystem_readonly{instance="node-exporter:9100",mountpoint="/data",fstype="ext4"}
+        values: 0+0x200
+    alert_rule_test:
+      - eval_time: 2h
+        alertname: HostDiskWillFillWithin24h
+        exp_alerts: []
+
+  - name: inode 剩 5% 只报 warning；剩 2% 两档都在 Prometheus 侧触发；btrfs 不算
+    interval: 1m
+    input_series:
+      - series: node_filesystem_files_free{instance="node-exporter:9100",mountpoint="/",fstype="ext4"}
+        values: 5+0x20
+      - series: node_filesystem_files{instance="node-exporter:9100",mountpoint="/",fstype="ext4"}
+        values: 100+0x20
+      - series: node_filesystem_readonly{instance="node-exporter:9100",mountpoint="/",fstype="ext4"}
+        values: 0+0x20
+      - series: node_filesystem_files_free{instance="node-exporter:9100",mountpoint="/var/lib/docker",fstype="xfs"}
+        values: 2+0x20
+      - series: node_filesystem_files{instance="node-exporter:9100",mountpoint="/var/lib/docker",fstype="xfs"}
+        values: 100+0x20
+      - series: node_filesystem_readonly{instance="node-exporter:9100",mountpoint="/var/lib/docker",fstype="xfs"}
+        values: 0+0x20
+      # btrfs 动态分配 inode，总数报 0。
+      - series: node_filesystem_files_free{instance="node-exporter:9100",mountpoint="/srv",fstype="btrfs"}
+        values: 0+0x20
+      - series: node_filesystem_files{instance="node-exporter:9100",mountpoint="/srv",fstype="btrfs"}
+        values: 0+0x20
+      - series: node_filesystem_readonly{instance="node-exporter:9100",mountpoint="/srv",fstype="btrfs"}
+        values: 0+0x20
+    alert_rule_test:
+      - eval_time: 15m
+        alertname: HostInodesLow
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              instance: node-exporter:9100
+              mountpoint: /
+              fstype: ext4
+            exp_annotations:
+              summary: Filesystem / has less than 10% of its inodes left
+          - exp_labels:
+              severity: warning
+              instance: node-exporter:9100
+              mountpoint: /var/lib/docker
+              fstype: xfs
+            exp_annotations:
+              summary: Filesystem /var/lib/docker has less than 10% of its inodes left
+      - eval_time: 15m
+        alertname: HostInodesNearlyExhausted
+        exp_alerts:
+          - exp_labels:
+              severity: critical
+              instance: node-exporter:9100
+              mountpoint: /var/lib/docker
+              fstype: xfs
+            exp_annotations:
+              summary: Filesystem /var/lib/docker is almost out of inodes — new files (logs, uploads, WAL) will fail to be created
+
+  - name: LiveKit 只失败两次（失败率 100%）不报 —— 最小失败数挡着
+    interval: 1m
+    input_series:
+      - series: circle_dependency_requests_total{job="circle-be",instance="circle-be-blue",dependency="livekit",operation="create_room",result="failure"}
+        values: 0x5 2+0x30
+      - series: circle_dependency_requests_total{job="circle-be",instance="circle-be-blue",dependency="livekit",operation="create_room",result="success"}
+        values: 0+0x35
+    alert_rule_test:
+      # 18m：两次失败还在窗口里，失败率已满 for 10m。
+      - eval_time: 18m
+        alertname: DependencyRequestsFailing
+        exp_alerts: []
+
+  - name: 可达性探测的 HeadBucket 不能把服务端写入失败的比例稀释掉
+    interval: 1m
+    input_series:
+      # /readyz 和抓取每分钟约 2 次 HeadBucket，全部成功。
+      - series: circle_dependency_requests_total{job="circle-be",instance="circle-be-blue",dependency="object_storage",operation="HeadBucket",result="success"}
+        values: 0+2x40
+      # 桶策略拒掉了服务端拷贝：15 分钟里只有 6 次，次次失败。
+      - series: circle_dependency_requests_total{job="circle-be",instance="circle-be-blue",dependency="object_storage",operation="CopyObject",result="failure"}
+        values: 0x5 6+0x35
+    alert_rule_test:
+      - eval_time: 18m
+        alertname: DependencyRequestsFailing
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              dependency: object_storage
+            exp_annotations:
+              summary: Over 20% of backend requests to object_storage are failing — credentials, bucket policy or an outage?

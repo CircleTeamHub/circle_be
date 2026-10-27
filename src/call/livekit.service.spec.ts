@@ -1,6 +1,7 @@
 import { ServiceUnavailableException, Logger } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { LiveKitCallService } from './livekit.service';
+import { dependencyMetrics } from 'src/metrics/dependency-metrics';
 
 describe('LiveKitCallService', () => {
   function decodeToken(token: string): Record<string, any> {
@@ -166,5 +167,51 @@ describe('LiveKitCallService external-call logging', () => {
       }),
       'ExternalService',
     );
+  });
+});
+
+// 通话建房/拆房失败此前只有日志：LiveKit 凭证错、服务挂了时没有任何告警。
+// DependencyRequestsFailing 读这里的计数。
+describe('LiveKitCallService dependency metrics', () => {
+  const env: Record<string, string> = {
+    LIVEKIT_URL: 'wss://livekit.example.com',
+    LIVEKIT_API_KEY: 'key',
+    LIVEKIT_API_SECRET: 'secret',
+  };
+  function configuredService(): LiveKitCallService {
+    return new LiveKitCallService({
+      get: jest.fn((key: string) => env[key]),
+    } as unknown as ConfigService);
+  }
+
+  afterEach(() => jest.restoreAllMocks());
+
+  it('records create/delete outcomes, counting an already-existing room as success', async () => {
+    jest.spyOn(Logger.prototype, 'warn').mockImplementation(() => undefined);
+    const record = jest.spyOn(dependencyMetrics, 'record');
+    const service = configuredService();
+    const roomService = (service as any).roomService;
+    jest
+      .spyOn(roomService, 'createRoom')
+      .mockResolvedValueOnce({})
+      .mockRejectedValueOnce(new Error('room already exists'))
+      .mockRejectedValueOnce(new Error('connect ECONNREFUSED 10.0.0.1:7880'));
+    jest
+      .spyOn(roomService, 'deleteRoom')
+      .mockRejectedValueOnce(new Error('connect ECONNREFUSED 10.0.0.1:7880'));
+
+    await service.createRoom({ name: 'r1', maxParticipants: 2 });
+    await service.createRoom({ name: 'r1', maxParticipants: 2 });
+    await expect(
+      service.createRoom({ name: 'r2', maxParticipants: 2 }),
+    ).rejects.toThrow(ServiceUnavailableException);
+    await service.deleteRoom('r2');
+
+    expect(record.mock.calls).toEqual([
+      ['livekit', 'create_room', 'success'],
+      ['livekit', 'create_room', 'success'],
+      ['livekit', 'create_room', 'failure'],
+      ['livekit', 'delete_room', 'failure'],
+    ]);
   });
 });

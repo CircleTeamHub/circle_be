@@ -70,6 +70,18 @@ public; everything else stays internal.)
 | `circle_outbox_last_probe_timestamp_seconds`                         | gauge           | `queue`                          | Freshness of that queue's reading — goes stale when its probe keeps failing |
 | `circle_db_pool_waiting`                                             | gauge           | —                                | Requests queued for a pg connection — the pool, not Postgres, is the bottleneck |
 | `circle_db_pool_total` / `circle_db_pool_idle` / `circle_db_pool_max` | gauge          | —                                | pg pool occupancy against its configured `DATABASE_POOL_MAX`       |
+| `circle_unhandled_rejections_total`                                  | counter         | —                                | Promise rejections caught by the process guard (a missing `.catch`); the matching `[unhandledRejection]` log line names the call chain |
+| `circle_push_deliveries_total`                                       | counter         | `provider`, `result`             | Per-token push outcome: `sent` / `retryable` / `dead_token` (normal churn, not a failure) / `rejected`. Expo receipt-stage failures are counted again — expired APNs/FCM credentials only show up there |
+| `circle_email_code_sends_total`                                      | counter         | `result`                         | Verification-code emails: `success` / `failure` / `unavailable` (no mailer configured) |
+| `circle_dependency_requests_total`                                   | counter         | `dependency`, `operation`, `result` | Backend requests to object storage (every HTTP attempt, presigning excluded) and LiveKit: `success` / `not_found` (missing object — normal) / `failure` |
+| `circle_object_store_up`                                             | gauge           | —                                | 1 when the object store answers HeadBucket (cached 30s, 2s timeout); only registered when storage is configured |
+
+`circle_cron_*` covers `@TrackedInterval` jobs too (`admin_group_operation`,
+`group_admission_delivery`); `circle_cron_interval_seconds` is then the interval
+in seconds. Backup self-check results (`circle_backup_check_*`) and the release-time
+off-host backup result (`circle_release_offsite_backup_*`) are **not** on
+this endpoint — the backup overlay's `backup-metrics` exporter serves them (see
+docs/backups.md).
 
 `business_events_total` increments automatically whenever a business event is
 logged (`src/logging/business-event.logger.ts`), independent of `BUSINESS_LOG_ON`
@@ -99,7 +111,7 @@ entry and the backend `ChatGateway` lifecycle entry.
 docker logs --since 10m circle-be-caddy-1 2>&1 | grep ws_proxy_access
 
 # Gateway view: upgrade/auth/admission/ready/closed stage and bounded reason.
-docker logs --since 10m circle-be-blue 2>&1 | grep -E 'ws_(auth|connection)'
+docker logs --since 10m circle-be-blue 2>&1 | grep -E '(ws|realtime)_(auth|connection)'
 ```
 
 Search the copied trace ID in both outputs. Expected event names are
@@ -109,7 +121,10 @@ sampled per reason per minute; when some were dropped, a
 `ws_auth_rejected_suppressed` summary carries the suppressed count (the
 Prometheus counter always counts every rejection). Rejection reason values are
 closed enums; raw exception messages and handshake credentials are deliberately
-excluded.
+excluded. `/realtime` connections log the same lifecycle as `realtime_*` events
+(`realtime_connection_rejected`, `realtime_auth_rejected`,
+`realtime_connection_ready`, `realtime_connection_closed`) under the trace ID
+Caddy sets for that path too; see docs/logging.md.
 
 **Routes are normalized** to keep cardinality bounded: dynamic segments (UUIDs,
 Mongo ObjectIds, numeric ids) collapse to `:id`, e.g.

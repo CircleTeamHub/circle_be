@@ -99,7 +99,22 @@ sudo install -o root -g root -m 0555 \
 ```
 
 When these two root-owned files change, upgrade them atomically before enabling
-the matching release workflow. The workflow now calls `circle-release capabilities`
+the matching release workflow. Releases do not replace the installed launcher, so
+a change to `deploy/release-launcher.sh` reaches the server only through this
+step — for example, keeping host-local configuration (`.env.backup`, the
+monitoring stack's `.env*`, `*.url`, `metrics_token`, probe targets) across
+releases and restoring 0755/0644 modes below the active tree while keeping its root 0700 throughout the transfer. Until it is upgraded,
+`deploy/sync-ops-stacks.sh` leaves the ops stacks alone. The older launcher
+deleted those files on every release, so after upgrading it, check that they
+still exist and recreate any that are gone before the next release —
+`.env.backup` (docs/backups.md), `monitoring/.env`, `monitoring/.env.exporters`
+(`monitoring/sync-exporter-env.sh`), `monitoring/alertmanager/*.url`,
+`monitoring/prometheus/metrics_token` (`monitoring/sync-metrics-token.sh`) and
+`monitoring/prometheus/probe-targets/public.yml`. The running containers still
+hold the old copies, which is why nothing looks broken until they are
+recreated. The sync skips itself when a mount source or the exporters'
+connection strings are missing, but it cannot tell a deleted webhook or token
+file that the stack mounts as a directory. The workflow now calls `circle-release capabilities`
 before uploading anything, so an old installation fails without touching the live tree.
 
 ```bash

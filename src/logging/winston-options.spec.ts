@@ -2,6 +2,7 @@ import { WinstonModule } from 'nest-winston';
 import fs from 'node:fs';
 import * as winston from 'winston';
 import { createWinstonOptions } from './winston-options';
+import { fatalLogFilePath } from './fatal-log-file';
 import { runWithRequestContext } from './request-context';
 import { runWithOperationContext } from './operation-context';
 
@@ -184,6 +185,23 @@ describe('createWinstonOptions', () => {
   it('lets stdout deployments disable files while other logging stays enabled', () => {
     const { options } = capture({ LOG_ON: 'true', LOG_FILE_ON: 'false' });
     expect(options.transports).toHaveLength(1);
+  });
+
+  it('points the synchronous fatal log at the collected logs dir only when files are on', () => {
+    // 文件名必须落在 Alloy 的 application-*.log* 采集范围内，否则崩溃前的
+    // 最后一行进不了 Loki。
+    openedLoggers.push(
+      winston.createLogger(
+        createWinstonOptions(
+          new ConfigServiceLike({ LOG_ON: 'true', LOG_FILE_ON: 'true' }),
+          'production',
+        ),
+      ),
+    );
+    expect(fatalLogFilePath()).toBe('logs/application-fatal.log');
+
+    capture({ LOG_ON: 'true', LOG_FILE_ON: 'false' });
+    expect(fatalLogFilePath()).toBeNull();
   });
 
   it('preserves legacy LOG_ON file behavior when no explicit flag is present', () => {

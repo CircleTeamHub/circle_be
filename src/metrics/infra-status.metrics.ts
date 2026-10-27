@@ -20,6 +20,11 @@ import {
 export interface InfraStatusDeps {
   /** UploadService.objectStoreStatus；对象存储未启用时传 null。 */
   objectStoreStatus?: (() => ObjectStoreStatus) | null;
+  /**
+   * UploadService.objectStoreReachable（带 30 秒缓存与 2 秒超时，抓取不会被它
+   * 拖住）；对象存储未启用时传 null（不注册该指标，避免误报）。
+   */
+  objectStoreReachable?: (() => Promise<boolean | null>) | null;
   /** RedisService.ping；Redis 未配置时传 null（不注册该指标，避免误报）。 */
   redisPing?: (() => Promise<boolean>) | null;
   /** 固定验证码旁路状态。默认读 process.env；注入只为测试。 */
@@ -47,6 +52,26 @@ export function createInfraStatusMetrics(deps: InfraStatusDeps): {
             ? 1
             : 0,
         );
+      },
+    });
+  }
+
+  if (deps.objectStoreReachable) {
+    const objectStoreReachable = deps.objectStoreReachable;
+    new Gauge({
+      name: 'circle_object_store_up',
+      help:
+        '1 when the object store answers HeadBucket (cached 30s, 2s timeout). ' +
+        'While 0, media uploads and reads fail for every user.',
+      registers: [registry],
+      async collect() {
+        let up = false;
+        try {
+          up = (await objectStoreReachable()) === true;
+        } catch {
+          up = false;
+        }
+        this.set(up ? 1 : 0);
       },
     });
   }

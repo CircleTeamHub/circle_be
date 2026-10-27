@@ -15,6 +15,10 @@ import { AuthErrorCode } from 'src/common/app-error-codes';
 import { MAILER, Mailer } from './mailer/mailer.interface';
 import { reportOperationalError } from 'src/logging/error-aggregation.service';
 import {
+  deliveryMetrics,
+  type EmailCodeSendResult,
+} from 'src/metrics/delivery-metrics';
+import {
   describeEmailCodeBypass,
   resolveEmailBypassCode,
 } from './email-code-bypass';
@@ -48,6 +52,18 @@ function describeMailerError(error: unknown): string {
 const CODE_TTL_MS = 10 * 60 * 1000; // 10 分钟
 const RESEND_COOLDOWN_MS = 60 * 1000; // 60 秒
 const MAX_ATTEMPTS = 5;
+
+/**
+ * 发码结果计数（EmailCodeSendFailing 告警读它）。只在真正尝试发信时计：
+ * 防枚举的静默跳过不算。计数失败不能改变发码结果。
+ */
+function recordEmailCodeSend(result: EmailCodeSendResult): void {
+  try {
+    deliveryMetrics.recordEmailCodeSend(result);
+  } catch {
+    // Metrics are best effort.
+  }
+}
 
 @Injectable()
 export class EmailVerificationService implements OnModuleInit {
@@ -105,6 +121,7 @@ export class EmailVerificationService implements OnModuleInit {
     // register 对已注册邮箱静默 201、login 对未注册邮箱静默 201，
     // fail-closed 反而变成账号存在性 oracle。
     if (this.mailer.isAvailable && !this.mailer.isAvailable()) {
+      recordEmailCodeSend('unavailable');
       throw new ServiceUnavailableException('邮件服务暂不可用，请稍后再试');
     }
     const email = normalizeEmail(rawEmail);
@@ -182,6 +199,7 @@ export class EmailVerificationService implements OnModuleInit {
 
     try {
       await this.mailer.sendVerificationCode(email, code, purpose);
+      recordEmailCodeSend('success');
       // 送达成功才作废旧码：同 email+purpose 只留刚送达的这一条未消费行。
       // round 3 review ×2：
       // - 只删 createdAt 更早的行 —— 本清理若被拖过冷却窗口，`id != created`
@@ -207,6 +225,7 @@ export class EmailVerificationService implements OnModuleInit {
           );
         });
     } catch (error) {
+      recordEmailCodeSend('failure');
       // review 修复（投递失败回滚）：不回滚的话这条没送达的行会占住 60s
       // 冷却 —— 用户立刻重试只会得到 CodeRateLimited，且不会再发一封。
       // 删行让重试立即可用（滥用防护由 setup 层 emailCodeLimiter 兜底），

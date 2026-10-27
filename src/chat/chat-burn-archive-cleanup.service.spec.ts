@@ -9,7 +9,6 @@ describe('180-day burn archive cleanup', () => {
       findUnique: jest.fn(),
       delete: jest.fn(),
     },
-    e2eeArchive: { deleteMany: jest.fn() },
   };
   const media: any = {
     queueDeletions: jest.fn(),
@@ -80,7 +79,7 @@ describe('180-day burn archive cleanup', () => {
       run.mockRestore();
     }
   });
-  it('durably schedules attachment cleanup before erasing expired snapshots and audit recovery', async () => {
+  it('durably schedules attachment cleanup before erasing expired snapshots', async () => {
     await service.sweep();
     expect(media.queueDeletions).toHaveBeenCalledWith(
       prisma,
@@ -92,9 +91,6 @@ describe('180-day burn archive cleanup', () => {
       ['m1'],
       [],
     );
-    expect(prisma.e2eeArchive.deleteMany).toHaveBeenCalledWith({
-      where: { messageID: 'm1', recovery: { purpose: 'AUDIT' } },
-    });
     expect(prisma.chatBurnArchive.delete).toHaveBeenCalledWith({
       where: { id: 'm1' },
     });

@@ -121,6 +121,12 @@ Chat WebSocket lifecycle events (`ChatGateway`, correlated by Caddy's random `ws
 - `ws_connection_rejected`: an authenticated socket was refused admission (global or per-user cap, join failure); `reason` is a bounded enum.
 - `ws_connection_ready`: the socket joined its rooms and is fully admitted.
 - `ws_connection_closed`: the socket closed; `stage` says whether it had reached `ready`.
+- `realtime_connection_rejected`: a `/realtime` upgrade was refused (`origin_forbidden`, `capacity`, `admission_full`) before it became a WebSocket; sampled per reason per minute, never carries the origin.
+- `realtime_auth_rejected`: a `/realtime` socket was closed before or during admission; `reason` is a bounded enum (`auth_timeout`, `invalid_message`, `invalid_token`, `revoked`, `session_unverifiable`, `too_many_connections`, `token_expired`, `error`). Client-triggerable reasons are sampled like `ws_auth_rejected`; `error` is a server fault, logged at error level and never sampled. `*_suppressed` summaries carry the sampled-away count.
+- `realtime_connection_ready` / `realtime_connection_closed`: the `/realtime` counterparts of `ws_connection_ready` / `ws_connection_closed`. The close line's `reason` is what the server first closed it for (one of the above, `token_expired_while_open`, `revoked_while_open`, `heartbeat_timeout`, `shutdown`) or `peer_or_network`; `closeCode` is the RFC 6455 code, and the peer's close text is never logged. Closes of sockets that never reached `ready` are sampled per reason like the rejections (auth is message-based, so a client reconnecting with a dead token completes every upgrade); `ready` closes are always logged.
+- Every `*_suppressed` summary is emitted when its window ends, even if no later event of that kind arrives; `/realtime` has no rejection counter, so these summaries are the only record of what sampling dropped.
+
+Both gateways carry the same `traceId` per connection: Caddy sets `X-Connection-Trace-Id: ws-<uuid>` on `/chat-ws` and `/realtime` upgrades (`deploy/Caddyfile.admin`), and `src/logging/connection-trace-id.ts` accepts only that shape, replacing anything else with a server-side ID. Values a client sends in its auth frame are never used for correlation.
 
 Database and job diagnostics:
 
@@ -256,6 +262,12 @@ the request context and a sanitized `reason`:
 - `login_challenge_security_code_budget_exhausted` — the account used up its
   daily failure budget for the security-code fallback.
 
+With the logs overlay on, Loki alerts on bursts of these events
+(`SecurityCodeGuessing`, `SecurityCodeLockouts`, `RevokedSessionTokenReplay`,
+`InvalidTokenSpike`; see `monitoring/logs.md`). Renaming an event or the
+`metadata.authFailureReason` field silently disables its rule —
+`test/logs-pipeline.spec.mjs` checks the names against the code.
+
 The security-log call in `AllExceptionFilter` and `ErrorLoggingInterceptor`
 is wrapped like the Sentry capture: if the log transport throws, an
 error-level `security_event_log_failed` is attempted (with `requestId`) and the
@@ -272,6 +284,7 @@ and never the payload:
 | `livekit`   | `create_room`, `delete_room`                            | `LiveKitCallService`           |
 | `smtp`      | `send_verification_code`                                | `SmtpMailer`                   |
 | `expo_push` | `send`, `get_receipts`                                  | `NotificationPushService`      |
+| `jpush`     | `send`                                                  | `NotificationPushService`      |
 | `redis`     | `connect`                                               | `RedisService`                 |
 
 Persistent failures of these dependencies are also forwarded to error
@@ -366,9 +379,18 @@ Loki collection is separate and does not use this exception-only interface.
   friend chat replay), the sensitive-word filter failing open, the private
   media bucket policy not applying, Expo / SMTP / Redis / LiveKit outages.
 - **Startup/process failures** have one application-owned capture boundary.
-  Unhandled rejections report with `handled: false` and continue running;
-  uncaught exceptions report with `handled: false`, emit a fixed stderr message,
-  wait at most 2 seconds for flush, then exit 1. An independent referenced
+  Unhandled rejections report with `handled: false` and continue running.
+  Because reporting is a no-op while the provider is `none`, each one is also
+  counted (`circle_unhandled_rejections_total`, alert
+  `UnhandledRejectionsOccurring`) and logged through Winston as a sanitized
+  `[unhandledRejection] errorName=… source=at a.js:1:2 <- at b.js:3:4 …` line
+  (up to four `file:line:col` frames, so a rejection raised inside Prisma or
+  ioredis still names the calling service) — at most one per call chain per
+  minute (the next line for that chain carries `suppressedSinceLast=N`), so a
+  storm cannot fill the disk. Uncaught exceptions report with `handled: false`, emit a fixed stderr message
+  and append the same sanitized line synchronously to `logs/application-fatal.log`
+  (collected by Alloy; `BackendFatalExit` alerts on it), wait at most 2 seconds
+  for flush, then exit 1. An independent referenced
   deadline also covers a provider that never settles. Bootstrap failures use
   the same bounded flush/exit policy. SDK default process listeners are disabled
   to avoid duplicate capture and raw exception output.
@@ -378,6 +400,15 @@ Loki collection is separate and does not use this exception-only interface.
   Account IDs are dropped; correlation IDs never enter fingerprints.
   Never request bodies, headers, cookies, or tokens — the Safe Logging Policy
   above applies.
+- **Correlating with logs**: every captured event carries the `requestId` tag —
+  the same value as the `requestId` field in the JSON logs and the client's
+  `X-Request-Id`. Copy it from the event into
+  `{service="circle-be"} | json | requestId="…"` in Grafana Explore, or the
+  other way round with Sentry's `requestId:` search.
+- **Readable stacks without uploads**: `source-map-support` is the first import
+  (`src/startup-instrumentation.ts`) and the image ships the `.js.map` files, so
+  captured stacks already point at the TypeScript sources and lines. Uploading
+  source maps to Sentry would only add the surrounding code lines.
 
 ### How to enable in production
 

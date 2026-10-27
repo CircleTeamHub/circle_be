@@ -52,6 +52,41 @@ loki.process "circle" {
   forward_to = [loki.write.local.receiver]
 }
 
+// Caddy 自己落盘的脱敏副本（deploy/Caddyfile.admin 全局块的 log collected）。
+// 只跟活动文件：滚动出去的旧文件换了名字，再匹配一次就会整份重读、重复入库。
+loki.source.file "caddy" {
+  targets = [{
+    __path__    = "/var/log/caddy/collected.log",
+    service     = "caddy",
+    environment = sys.env("LOG_ENVIRONMENT"),
+  }]
+  file_match {
+    enabled     = true
+    sync_period = "5s"
+  }
+  forward_to = [loki.process.caddy.receiver]
+}
+
+loki.process "caddy" {
+  stage.json {
+    expressions = { level = "level", ts = "ts" }
+    drop_malformed = false
+  }
+  stage.labels {
+    values = { level = "level" }
+  }
+  stage.timestamp {
+    source            = "ts"
+    format            = "Unix"
+    action_on_failure = "skip"
+  }
+  // 与应用日志同一套索引标签；logger、traceId 等留在行里，用 `| json` 查。
+  stage.label_keep {
+    values = ["service", "environment", "level"]
+  }
+  forward_to = [loki.write.local.receiver]
+}
+
 loki.write "local" {
   endpoint {
     url = "http://loki:3100/loki/api/v1/push"

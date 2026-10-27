@@ -6,6 +6,7 @@ import {
   Injectable,
   Logger,
   NotFoundException,
+  OnModuleDestroy,
   Optional,
 } from '@nestjs/common';
 import { createHash, randomInt } from 'crypto';
@@ -49,6 +50,15 @@ export const LOGIN_RECOVERY_DELAY_MS = 24 * 60 * 60 * 1000;
 export const LOGIN_RECOVERY_COMPLETION_WINDOW_MS = 7 * 24 * 60 * 60 * 1000;
 /** 同一账号同时进行中的找回申请上限（别人抢先占满会挡住本人，所以不设成 1）。 */
 export const LOGIN_RECOVERY_MAX_ACTIVE = 3;
+/**
+ * 应用关闭时最多等在途的登录提醒推送这么久。推送只是加速通道（受信任设备回到
+ * 前台会自己拉待处理请求），不能为它拖住发版切流；但也别在发出去的半路上把进程
+ * 关掉。容器没配 stop_grace_period，Docker 默认 10 秒后 SIGKILL，聊天推送的
+ * flush、连接池关闭、HTTP 收尾和 Sentry flush 都在这 10 秒里，所以只给它 2 秒。
+ */
+export const LOGIN_ALERT_SHUTDOWN_GRACE_MS = 2_000;
+/** 锁内只做一次令牌查询；这个上限只防锁被别的认证事务长时间占住。 */
+const LOGIN_ALERT_LOCK_TX_TIMEOUT_MS = 10_000;
 
 // 客户端设备 ID：安全存储里的随机串（UUID / base64url）。只收这个字符集，
 // 不合规就当没带 —— 它会被哈希后入库，不做任何拼接。
@@ -100,9 +110,12 @@ export type LoginChallengePublicStatus =
   | 'CONSUMED';
 
 @Injectable()
-export class DeviceTrustService {
+export class DeviceTrustService implements OnModuleDestroy {
   private readonly logger = new Logger(DeviceTrustService.name);
   private readonly loggingConfig = createLoggingConfig();
+  /** 后台发出、尚未结束的登录提醒推送；onModuleDestroy 在连接池关闭前收尾。 */
+  private readonly pendingPushes = new Set<Promise<void>>();
+  private shuttingDown = false;
 
   constructor(
     private readonly prisma: PrismaService,
@@ -344,7 +357,7 @@ export class DeviceTrustService {
       type: 'auth.login.challenge.created',
       payload: { challengeId: challenge.id, changedAt: now.toISOString() },
     });
-    void this.pushToUser(
+    this.dispatchPush(
       challenge.userId,
       {
         title: '有设备在申请找回你的账号',
@@ -747,7 +760,7 @@ export class DeviceTrustService {
     await this.trust(userId, deviceKey, context);
     this.logSecurity('login_challenge_consumed', userId, { challengeId });
     this.broadcastResolved(userId, challengeId, 'CONSUMED');
-    void this.pushToUser(userId, {
+    this.dispatchPush(userId, {
       title: '新设备已登录',
       body: `你的账号已在 ${context.deviceName ?? '新设备'} 上登录。如果不是你本人，请立即在「登录设备管理」中移除并修改密码。`,
       data: { type: 'auth.login.device.added' },
@@ -1007,7 +1020,7 @@ export class DeviceTrustService {
       type: 'auth.login.challenge.created',
       payload: { challengeId, changedAt: now.toISOString() },
     });
-    void this.pushToUser(userId, {
+    this.dispatchPush(userId, {
       title: '陌生设备登录验证',
       body: `${deviceName ?? '一台新设备'} 正在尝试登录你的账号，点击查看并确认是否是你本人。`,
       data: { type: 'auth.login.challenge', challengeId },
@@ -1272,28 +1285,86 @@ export class DeviceTrustService {
     });
   }
 
+  /**
+   * 登录提醒是「发出去就不管」的后台任务：请求不等它，但要登记在案 ——
+   * onModuleDestroy 据此在连接池关闭前等它收尾，关闭开始后也不再起新的。
+   */
+  private dispatchPush(
+    userId: string,
+    payload: { title: string; body: string; data: Record<string, unknown> },
+    ttlSeconds?: number,
+  ): void {
+    if (this.shuttingDown) {
+      // 关闭期间进来的请求不再推送；受信任设备回到前台照样能拉到待处理请求。
+      this.logger.debug(
+        `login alert push skipped during shutdown (${String(payload.data.type)})`,
+      );
+      return;
+    }
+    const task: Promise<void> = this.pushToUser(
+      userId,
+      payload,
+      ttlSeconds,
+    ).finally(() => this.pendingPushes.delete(task));
+    this.pendingPushes.add(task);
+  }
+
+  /**
+   * 等在途的登录提醒结束再让连接池关闭。AuthModule 和 PrismaModule 都是全局
+   * 模块，Nest 对同一距离的模块按扫描顺序倒序调用 onModuleDestroy；AppModule
+   * 先导入 PrismaModule 再导入 AuthModule，所以这里先跑
+   * （src/auth/shutdown-order.spec.ts 钉住）。就算顺序哪天被打乱，连接池也只会
+   * 等锁内那一次令牌查询，不会再被外部推送的 HTTP 拖住。等待有上限：推送服务
+   * 卡住时照样关闭。
+   */
+  async onModuleDestroy(): Promise<void> {
+    this.shuttingDown = true;
+    if (this.pendingPushes.size === 0) return;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const graceOver = new Promise<void>((resolve) => {
+      timer = setTimeout(resolve, LOGIN_ALERT_SHUTDOWN_GRACE_MS);
+    });
+    await Promise.race([
+      Promise.allSettled([...this.pendingPushes]),
+      graceOver,
+    ]);
+    clearTimeout(timer);
+    if (this.pendingPushes.size > 0) {
+      this.logger.warn(
+        `${this.pendingPushes.size} login alert push(es) still running after ${LOGIN_ALERT_SHUTDOWN_GRACE_MS}ms; shutting down without them`,
+      );
+    }
+  }
+
   private async pushToUser(
     userId: string,
     payload: { title: string; body: string; data: Record<string, unknown> },
     ttlSeconds: number = Math.floor(LOGIN_CHALLENGE_DECISION_MS / 1000),
   ): Promise<void> {
     if (!this.push) return;
+    const push = this.push;
     try {
-      await withDatabaseWorkBudget(this.prisma, () =>
+      // 账号锁只罩住「谁还有资格收」这一次查询：与设备移除、推送地址注册串行，
+      // 移除提交之后的提醒读不到被移除的设备（device-bound-push.e2e-spec）。
+      // 发送是外部 HTTP，可能要好几秒，放在锁和事务之外 —— 否则这段时间这个用户
+      // 的登录、刷新都排在锁后面，还占着一条连接，应用关闭也得等它。代价是读完
+      // 令牌、发出之前那一瞬间移除的设备仍可能收到这条提醒，等同于「移除前一刻
+      // 发出的提醒」：它的会话已吊销，收到了也批准不了。
+      const tokens = await withDatabaseWorkBudget(this.prisma, () =>
         this.prisma.$transaction(
           async (tx) => {
             await tx.$executeRaw`SELECT pg_advisory_xact_lock(hashtextextended(${`auth_session:${userId}`}, 0))`;
-            const tokens = await this.push!.listLoginAlertTokens(userId, tx);
-            if (tokens.length === 0) return;
-            await this.push!.sendToTokens(tokens, {
-              ...payload,
-              priority: 'high',
-              ttl: ttlSeconds,
-            });
+            return push.listLoginAlertTokens(userId, tx);
           },
-          { maxWait: 10000, timeout: 30000 },
+          { maxWait: 10000, timeout: LOGIN_ALERT_LOCK_TX_TIMEOUT_MS },
         ),
       );
+      if (tokens.length === 0) return;
+      await push.sendToTokens(tokens, {
+        ...payload,
+        priority: 'high',
+        ttl: ttlSeconds,
+      });
     } catch (error) {
       // 推送是加速通道：受信任设备回到前台会主动拉待处理请求。
       this.logger.warn(

@@ -14,6 +14,7 @@ import type { CallType } from 'src/generated/prisma';
 import { createLoggingConfig } from 'src/logging/logging.config';
 import { logExternalCallFailure } from 'src/logging/external-service.logger';
 import { logExternalCallSlow } from 'src/logging/performance-event.logger';
+import { recordDependencyRequest } from 'src/metrics/dependency-metrics';
 
 type MintJoinTokenInput = {
   identity: string;
@@ -132,6 +133,7 @@ export class LiveKitCallService {
       }
       throw new ServiceUnavailableException('LiveKit room creation failed');
     } finally {
+      recordDependencyRequest('livekit', 'create_room', result);
       logExternalCallSlow(this.logger, {
         enabled: this.loggingConfig.performanceLogOn,
         service: 'livekit',
@@ -168,6 +170,7 @@ export class LiveKitCallService {
         }`,
       );
     } finally {
+      recordDependencyRequest('livekit', 'delete_room', result);
       logExternalCallSlow(this.logger, {
         enabled: this.loggingConfig.performanceLogOn,
         service: 'livekit',

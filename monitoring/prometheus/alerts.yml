@@ -33,6 +33,29 @@ groups:
         annotations:
           summary: 'Backend event-loop lag p99 > 250ms for 5m (process is blocking)'
 
+      # 漏掉 .catch 的 promise 被进程级兜底接住（src/logging/unhandled-rejection-guard.ts），
+      # 进程不死，5xx / TargetDown 都看不到它。错误聚合默认关闭，那时这是唯一的叫醒
+      # 机制；具体是哪一处，看同一时刻日志里的 `[unhandledRejection]` 行。
+      #
+      # increase 而不是存量 > 0：计数器只增不减，按存量会在第一条之后永久 firing。
+      # 15 分钟内没有新增就自动消警。sum：蓝绿期间两个颜色各数各的。
+      #
+      # 第二段补 increase() 的盲点：它不把新序列的第一个样本当作从 0 起，新进程在
+      # 第一次被抓取之前就漏出的那条会被吃掉 —— 而启动阶段 Redis / DB 还没就绪，
+      # 恰恰最容易漏 .catch。15 分钟前还不存在的序列，现值本身就是新增。
+      - alert: UnhandledRejectionsOccurring
+        expr: |
+          sum(increase(circle_unhandled_rejections_total{job="circle-be"}[15m])) > 0
+            or
+          sum(
+            circle_unhandled_rejections_total{job="circle-be"}
+              unless circle_unhandled_rejections_total{job="circle-be"} offset 15m
+          ) > 0
+        labels:
+          severity: warning
+        annotations:
+          summary: 'Backend caught unhandled promise rejection(s) in the last 15m — a missing .catch; see [unhandledRejection] log lines'
+
       - alert: TargetDown
         expr: up == 0
         for: 2m
@@ -119,10 +142,11 @@ groups:
 
   # 定时任务与 outbox 队列 —— 「什么都没发生」这一类故障。
   #
-  # 这一组补的是此前完全无信号的盲区：Sentry 的 captureError 只在
-  # ErrorLoggingInterceptor 里被调用，即只覆盖 HTTP 5xx；而 4 个 outbox 处理器
-  # 都自己 catch 异常、写进行上的 lastError 然后继续，异常永远不逃出去。队列
-  # 堵死时 RED 大盘一切正常、Sentry 一片安静。
+  # 这一组补的是错误监控天然看不见的盲区：outbox 处理器都自己 catch 异常、写进
+  # 行上的 lastError 然后继续，异常永远不逃出去；调度器停了更是什么都不发生。
+  # 错误聚合默认关闭，就算打开也只收到显式上报的那几处。队列堵死时 RED 大盘
+  # 一切正常、Sentry 一片安静。覆盖 @TrackedCron 与 @TrackedInterval 的全部任务、
+  # OUTBOX_QUEUES 的全部队列。
   - name: jobs
     rules:
       # 阈值不写死：每分钟任务和每天 4 点的任务共用这一条规则，各自的预期周期
@@ -132,10 +156,14 @@ groups:
       # max by (exported_job)：蓝绿发布期间两个颜色同时在跑，只要有一个实例把活干了就
       # 不该响。心跳在进程启动时就播种（不是等第一次成功），所以新容器不会
       # 立刻误报，一个从开机起就没跑过的任务也不会因为序列不存在而逃过告警。
+      #
+      # 阈值下限 120 秒：@TrackedInterval 的任务 5～10 秒一跑，3 × 周期只有 15～30
+      # 秒，而抓取和求值都是 15 秒一次 —— 正常运转时求值看到的心跳也会滞后十几
+      # 秒，没有下限就会周期性地连响几小时。现有定时任务最短 1 分钟，不受影响。
       - alert: CronJobStalled
         expr: |
           time() - max by (exported_job) (circle_cron_last_success_timestamp_seconds)
-            > 3 * max by (exported_job) (circle_cron_interval_seconds)
+            > clamp_min(3 * max by (exported_job) (circle_cron_interval_seconds), 120)
         for: 5m
         labels:
           severity: warning
@@ -240,6 +268,145 @@ groups:
         annotations:
           summary: 'A settled coin gift permanently lost its transfer card — manual reconciliation required'
 
+  # 备份自检（deploy/backup/check.sh，每小时第 17 分钟）。结果由 check.sh 写成
+  # textfile，备份 overlay 里的 backup-metrics 导出（prometheus.prod.yml 的
+  # backup job）。在此之前它只写容器 stdout：备份坏了没有任何人会知道，直到
+  # 需要恢复的那一天。
+  - name: backups
+    rules:
+      # 每项检查一条（postgres_archive / backup_freshness / destination_bucket /
+      # minio_source），告警里直接看得出坏的是哪一环。
+      #
+      # 连续两次失败才报（70 分钟内全是 0）：gauge 一整小时保持上一次的结果，for
+      # 去不了抖，整点碰上一次离机 S3 抖动就会发一小时的 critical。代价是真故障晚
+      # 一小时多才叫；部署后第一次检查就失败时窗口里只有 0，5 分钟就响。修好后
+      # 下一次检查一通过就消警，急的话手动跑一次
+      # `docker compose ... run --rm backup run check`（它写的是同一个卷）。
+      #
+      # critical：WAL 归档停了 RPO 就在无限增长，归档失败时 pg_wal 还会一直堆到
+      # 撑满磁盘。
+      - alert: BackupCheckFailing
+        expr: max_over_time(circle_backup_check_success[70m]) == 0
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: 'Backup self-check {{ $labels.check }} is failing — see `docker compose logs backup`'
+
+      # 检查本身停了：调度器挂了，或 check.sh 在写指标之前就退出（比如缺环境变量）。
+      # textfile 还在，时间戳不再前进。3 小时 = 至少漏了两次。同一个容器还负责
+      # 每天的全量/差异备份和对象镜像，所以这也意味着它们大概率没在跑。
+      - alert: BackupCheckStale
+        expr: time() - circle_backup_check_last_run_timestamp_seconds > 3 * 3600
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: 'Backup self-check has not completed for 3h+ — the backup scheduler may be down'
+
+      # 生产上根本没有备份结果：备份 overlay 没叠上（docs/backups.md「Turning it
+      # on」），或者 check.sh 从没成功写出过指标。只在有 postgres-exporter 的环境里
+      # 判断 —— 那个 job 只存在于生产 overlay，开发机上这条不会响。
+      # for 2h：首次部署后，第一次检查最晚一小时后才跑。
+      - alert: BackupCheckNotReporting
+        expr: |
+          absent(circle_backup_check_last_run_timestamp_seconds)
+            and on() (up{job="postgres-exporter"} == 1)
+        for: 2h
+        labels:
+          severity: warning
+        annotations:
+          summary: 'No backup self-check results in production — backups are not deployed, or check.sh cannot write its metrics'
+
+      # 仓库里一份完成的备份都没有：check.sh 对此只警告、不导出 backup_freshness
+      # （刚启用时第一份还没跑，不算失败）。可要是全量从第一天起就一直失败（OOM、
+      # 超时），而 WAL 归档和桶都正常，上面三条都不会响 —— 只有 WAL、没有基础备份，
+      # 照样恢复不出来。差异备份每天都跑，没有全量时 pgBackRest 会把它升级成全量，
+      # 所以检查一直在正常完成、却 30 小时都拿不到 freshness 结果，就是这种情况。
+      - alert: BackupNeverCompleted
+        expr: |
+          absent(circle_backup_check_success{check="backup_freshness"})
+            and on() (time() - circle_backup_check_last_run_timestamp_seconds < 3 * 3600)
+        for: 30h
+        labels:
+          severity: warning
+        annotations:
+          summary: 'Backup checks run, but the repository still has no completed backup after 30h — the base backup job is failing'
+
+      # 发版时那份加密 pg_dump 没传到主机之外（deploy/offsite-backup.sh）。发版本身
+      # 照常完成 —— 本地 dump 已就位 —— 所以此前只有横幅、Actions annotation 和
+      # ~/circle_be_backups/.offsite-status，没有任何东西在看。结果由发版脚本经
+      # docker exec 写进 backup_metrics 卷，一直保持到下一次发版。warning：持续
+      # 备份（上面那组）才是主防线，这一份是它之外的第二份异地副本。
+      - alert: ReleaseOffsiteBackupFailed
+        expr: circle_release_offsite_backup_success == 0
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: 'The last release-time off-host database backup failed — see ~/circle_be_backups/.offsite-status on the host'
+
+  # 外部投递通道与依赖（src/metrics/delivery-metrics.ts、dependency-metrics.ts）。
+  # 失败时业务代码只写 external_call_failed 日志：推送凭证过期、JPush 没配 key、
+  # SMTP 被限流、存储或 LiveKit 出问题时，此前指标和告警一片安静。都带最小样本量，
+  # 低流量时一两次失败不叫人。
+  - name: deliveries
+    rules:
+      # 按 provider 分开算：Expo 和 JPush 的凭证、配额、故障互不相干。分子只算
+      # retryable / rejected；dead_token（卸载 App、注册 ID 失效）是正常流失，
+      # 算进去的话一批老设备就能把失败率拉过阈值。
+      - alert: PushDeliveryFailing
+        expr: |
+          (
+            sum by (provider) (rate(circle_push_deliveries_total{job="circle-be",result=~"retryable|rejected"}[15m]))
+              / sum by (provider) (rate(circle_push_deliveries_total{job="circle-be"}[15m]))
+          ) > 0.2
+          and sum by (provider) (increase(circle_push_deliveries_total{job="circle-be"}[15m])) >= 20
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: 'Over 20% of {{ $labels.provider }} push deliveries are failing — credentials, quota or provider outage?'
+
+      # 验证码邮件发不出去 = 没人能注册、也没人能用验证码登录。unavailable 是
+      # 生产上根本没配 SMTP（UnconfiguredMailer），同样算失败。中继型 SMTP 对错误
+      # 收件人是事后退信而不是当场拒收，所以这里的失败基本都是通道本身的问题。
+      - alert: EmailCodeSendFailing
+        expr: |
+          sum(increase(circle_email_code_sends_total{job="circle-be",result=~"failure|unavailable"}[15m])) >= 3
+          and (
+            sum(rate(circle_email_code_sends_total{job="circle-be",result=~"failure|unavailable"}[15m]))
+              / sum(rate(circle_email_code_sends_total{job="circle-be"}[15m]))
+          ) > 0.5
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: 'Most verification-code emails are failing — users cannot register or sign in by email code'
+
+      # 后端直接调用的依赖（src/metrics/dependency-metrics.ts）：对象存储的服务端
+      # 读写、LiveKit 建房/拆房。按依赖分开算；not_found（对象不存在）不进分子。
+      # 对象存储按 HTTP 请求计，SDK 重试的每一次都算，所以最小失败数取 5 —— 一次
+      # 带重试的失败调用不叫人。存储整个连不上时由 ObjectStoreUnreachable 报，
+      # 这条被它抑制。
+      #
+      # 排除 HeadBucket：/readyz 和抓取每分钟都在做可达性探测（它归
+      # circle_object_store_up 管），每 15 分钟固定贡献约 30 次成功。算进分母的话，
+      # 「凭证还能 HeadBucket、桶策略却拒掉服务端写入」这种这条告警最该抓的情况，
+      # 几次失败就被稀释掉了。
+      - alert: DependencyRequestsFailing
+        expr: |
+          sum by (dependency) (increase(circle_dependency_requests_total{job="circle-be",operation!="HeadBucket",result="failure"}[15m])) >= 5
+          and (
+            sum by (dependency) (rate(circle_dependency_requests_total{job="circle-be",operation!="HeadBucket",result="failure"}[15m]))
+              / sum by (dependency) (rate(circle_dependency_requests_total{job="circle-be",operation!="HeadBucket"}[15m]))
+          ) > 0.2
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: 'Over 20% of backend requests to {{ $labels.dependency }} are failing — credentials, bucket policy or an outage?'
+
   # 监控自身的存活证明。
   - name: meta
     rules:
@@ -287,6 +454,20 @@ groups:
           severity: warning
         annotations:
           summary: 'Alloy has continuously retried log delivery for at least 15m'
+
+      # Loki 的日志告警（monitoring/loki/rules/fake/*.yml）由 Loki 自己的 ruler 直接
+      # 发给 Alertmanager，不经过 Prometheus。Alertmanager 没加入 logs 网络、或拒收时，
+      # 这几条告警会一直发不出去，而 Loki 和 Alloy 的抓取照样健康。两个计数只在启用
+      # 了日志 overlay 时存在。
+      - alert: LokiRulerNotificationsFailing
+        expr: |
+          sum(increase(loki_prometheus_notifications_errors_total[10m])) > 0
+          or sum(increase(loki_prometheus_notifications_dropped_total[10m])) > 0
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: 'Loki could not deliver log-based alerts to Alertmanager in the last 10m — is Alertmanager on the logs network?'
 
       # 永远 firing，专门路由到**外部**心跳服务（healthchecks.io 等）。
       #
@@ -408,6 +589,25 @@ groups:
         annotations:
           summary: 'Container {{ $labels.name }} is at >90% of its memory limit'
 
+      # 崩溃循环：restart: unless-stopped 会把挂掉的容器一遍遍拉起来，每次都短暂
+      # 存活，按抓取时刻看的 up / 健康检查常常是绿的。被 OOM killer 反复杀掉也一样。
+      #
+      # 不能用 changes(container_start_time_seconds)：cAdvisor 导出的是 docker inspect
+      # 的 Created（创建时间），同一个容器重启时不变。能用的是 cAdvisor 给重启过的
+      # 容器打的 restartcount 标签（container_label_restartcount，见 v0.52.1 的
+      # container/docker/handler.go）：每重启一次就换一条新序列。所以数 15 分钟里
+      # 同一个名字出现过几条序列，减 1 就是重启次数。发版重建容器只多一条，手工
+      # docker restart 一两次也不到阈值。
+      #
+      # 盲区：存活不到一个抓取间隔（15s）的那几次抓不到 —— 启动即崩的服务主要靠
+      # 各自的 Down / NoTarget / PublicEndpointDown 兜。
+      - alert: ContainerRestartLoop
+        expr: count by (name) (count_over_time(container_start_time_seconds{name!=""}[15m])) - 1 >= 3
+        labels:
+          severity: warning
+        annotations:
+          summary: 'Container {{ $labels.name }} restarted about {{ $value }} times in 15m (crash loop or OOM kills?)'
+
       # Containers without a configured limit do not trigger the rule above;
       # use host CPU as a fallback for runaway workloads.
       - alert: HostCpuSaturated
@@ -435,6 +635,62 @@ groups:
           severity: warning
         annotations:
           summary: 'Filesystem {{ $labels.mountpoint }} below 15% free'
+
+      # 剩 5% 时只差一次日志风暴或一次大迁移：Postgres 写不进 WAL 会直接停库，
+      # winston 的日志轮转也没有总量上限。选择器与上面那条完全相同。
+      # 两档用不同的告警名（文件末尾那条通用的同名抑制管不到），同一块盘的
+      # warning 由 alertmanager.yml 里按 instance + mountpoint 配对的抑制压掉。
+      - alert: HostDiskNearlyFull
+        expr: |
+          node_filesystem_avail_bytes{fstype=~"ext4|xfs|btrfs|zfs|ext3", mountpoint!~"/(boot|snap)(/.*)?"}
+            / node_filesystem_size_bytes{fstype=~"ext4|xfs|btrfs|zfs|ext3", mountpoint!~"/(boot|snap)(/.*)?"} < 0.05
+          and on(instance, mountpoint) node_filesystem_readonly == 0
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: 'Filesystem {{ $labels.mountpoint }} below 5% free — database and log writes are about to fail'
+
+      # 趋势：按最近 6 小时的斜率，24 小时内会写满。阈值告警只在快满时才响，
+      # 一次失控的日志或一张暴涨的表在那之前就能看出来。只看剩余不到 40% 的盘：
+      # 空盘上一次大文件写入也会让斜率短暂为负，那不值得叫人。
+      - alert: HostDiskWillFillWithin24h
+        expr: |
+          predict_linear(node_filesystem_avail_bytes{fstype=~"ext4|xfs|btrfs|zfs|ext3", mountpoint!~"/(boot|snap)(/.*)?"}[6h], 24 * 3600) < 0
+          and on(instance, mountpoint)
+            node_filesystem_avail_bytes{fstype=~"ext4|xfs|btrfs|zfs|ext3", mountpoint!~"/(boot|snap)(/.*)?"}
+              / node_filesystem_size_bytes{fstype=~"ext4|xfs|btrfs|zfs|ext3", mountpoint!~"/(boot|snap)(/.*)?"} < 0.4
+          and on(instance, mountpoint) node_filesystem_readonly == 0
+        for: 1h
+        labels:
+          severity: warning
+        annotations:
+          summary: 'Filesystem {{ $labels.mountpoint }} is on track to fill within 24h at the current write rate'
+
+      # inode 用完和磁盘写满后果一样（写不进任何新文件），但 df 的百分比看不出来：
+      # 大量小文件（日志切片、上传缓存）能在空间充足时先耗尽 inode。btrfs/zfs
+      # 动态分配 inode、报告总数为 0，用 > 0 排除。两档、两个告警名，同盘抑制同上。
+      - alert: HostInodesLow
+        expr: |
+          node_filesystem_files_free{fstype=~"ext4|xfs|btrfs|zfs|ext3", mountpoint!~"/(boot|snap)(/.*)?"}
+            / (node_filesystem_files{fstype=~"ext4|xfs|btrfs|zfs|ext3", mountpoint!~"/(boot|snap)(/.*)?"} > 0) < 0.10
+          and on(instance, mountpoint) node_filesystem_readonly == 0
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: 'Filesystem {{ $labels.mountpoint }} has less than 10% of its inodes left'
+
+      - alert: HostInodesNearlyExhausted
+        expr: |
+          node_filesystem_files_free{fstype=~"ext4|xfs|btrfs|zfs|ext3", mountpoint!~"/(boot|snap)(/.*)?"}
+            / (node_filesystem_files{fstype=~"ext4|xfs|btrfs|zfs|ext3", mountpoint!~"/(boot|snap)(/.*)?"} > 0) < 0.03
+          and on(instance, mountpoint) node_filesystem_readonly == 0
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: 'Filesystem {{ $labels.mountpoint }} is almost out of inodes — new files (logs, uploads, WAL) will fail to be created'
 
   # 数据库与缓存。指标名与标签均已对着 postgres-exporter v0.19.0 /
   # redis_exporter v1.83.0 的真实输出核对过。
@@ -535,6 +791,18 @@ groups:
           severity: warning
         annotations:
           summary: 'Redis rejected connections in the last 10m (maxclients reached)'
+
+      # 对象存储连不上（UploadService.objectStoreReachable：HeadBucket，30 秒缓存、
+      # 2 秒超时）。/readyz 有意不因它变红 —— 存储故障在每个副本上都一样，拿它
+      # 判 not-ready 会把聊天、登录这些不依赖存储的功能一起摘掉。所有用户发图、
+      # 看图都会失败，所以 critical。min：只要有一个在服务的实例连不上就响。
+      - alert: ObjectStoreUnreachable
+        expr: min(circle_object_store_up) == 0
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: 'Object storage is unreachable — media uploads and reads are failing for every user'
 
   - name: host
     rules:

@@ -6,4 +6,6 @@ Registration returns `deviceBound`. The client upgrades cached registrations onc
 
 `test/device-bound-push.e2e-spec.ts` runs in the normal fresh-database CI harness. It covers the HTTP session binding, legacy/expired exclusions, remote removal, re-registration denial and a concurrent removal/push/registration barrier.
 
+Eligibility is read under the account lock, but the provider is called after that transaction commits: an outbound HTTP request must not hold the user's lock (blocking their login and refresh) or a pool connection (blocking shutdown). A device removed in the instant between the read and the send can therefore still receive that one alert; its session is already revoked, so it cannot act on it. Application shutdown waits up to 2s for alerts already being sent and starts no new ones.
+
 Revoking trust and disabling addresses commit atomically. Expired session rows cannot register addresses; a rotated row additionally requires a live same-device session in its token family. Eligibility reads reuse the account-lock transaction connection during application shutdown.

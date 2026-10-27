@@ -335,8 +335,6 @@ export class AdminImService {
     value: Prisma.JsonValue,
   ): Record<string, unknown> {
     if (!value || typeof value !== 'object' || Array.isArray(value)) return {};
-    if (type === 'encrypted-text')
-      return { envelope: value.envelope, signature: value.signature };
     const fields =
       type === 'text'
         ? ['text']
