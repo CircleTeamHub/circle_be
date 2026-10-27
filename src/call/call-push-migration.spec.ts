@@ -17,7 +17,7 @@ describe('call push token columns', () => {
       schema.indexOf('}', schema.indexOf('model DevicePushToken {')),
     );
     const sql = read(
-      'prisma/migrations/20261026120000_call_push_tokens/migration.sql',
+      'prisma/migrations/20261027120000_call_push_tokens/migration.sql',
     );
 
     expect(model).toMatch(/\n\s+callPushVersion\s+Int\?\n/);
