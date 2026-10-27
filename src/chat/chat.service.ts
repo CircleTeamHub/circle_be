@@ -236,7 +236,7 @@ const NOTE_CARD_GROUP_SNAPSHOT_KEY = 'sourceGroupCardSnapshot';
  * 长文本,就是几 MB 无人使用的 JSON 在热接口上来回搬运和解析。写路径要用它的
  * 地方(editMessage)单独把它读回来。
  */
-type MessageRow = Omit<ChatMessage, 'contentHistory'>;
+type MessageRow = Omit<ChatMessage, 'contentHistory' | 'sourceNoteID'>;
 
 /** 多会话消息列表里每条消息的发送者座位(系统消息 senderID 为空,跳过)。 */
 function senderSeatRefs(
@@ -852,6 +852,12 @@ export class ChatService {
         type: effectivePayload.type,
         content,
       });
+      const sourceNoteID =
+        effectivePayload.type === 'note-card' &&
+        typeof content.sourceNoteId === 'string' &&
+        content.sourceNoteId.trim().length > 0
+          ? content.sourceNoteId.trim()
+          : null;
       const created = await this.prisma.$transaction(async (tx) => {
         // G-05:会话行锁替 advisory lock —— 同会话串行,跨会话零互扰
         // (hashtext 碰撞让无关会话互等的问题消失),也不再做 MAX(height) 聚合扫描。
@@ -918,6 +924,7 @@ export class ChatService {
             senderID: senderUserId,
             type: effectivePayload.type,
             content,
+            sourceNoteID,
             clientMessageId: effectivePayload.d,
             replyToID: replyToId,
             requestHash,

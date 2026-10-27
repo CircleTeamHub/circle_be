@@ -24,6 +24,7 @@ export interface OutboxDepthSource {
   sessionRevocationOutbox: OutboxDelegateLike;
   notificationPushOutbox: OutboxDelegateLike;
   friendChatReplayOutbox: OutboxDelegateLike;
+  noteStatusFanoutOutbox: OutboxDelegateLike;
   coinGift: OutboxDelegateLike;
   circleInvitationVerifier: OutboxDelegateLike;
   chatDirectAutoReplyJob: OutboxDelegateLike;
@@ -41,7 +42,7 @@ interface OutboxQueueSpec {
   /** 仍会被重试的行。 */
   pendingWhere: unknown | ((now: Date) => unknown);
   /** 用哪一列计算最老待办；绝大多数队列用 createdAt。 */
-  oldestField?: 'createdAt' | 'accessRevokedAt';
+  oldestField?: 'createdAt' | 'accessRevokedAt' | 'queuedAt';
   /**
    * 已放弃、不会再被重试的行。留空表示该队列没有终态 —— 不要为了「对称」
    * 编一个出来，那只会让一条永远为 0 的告警训练人忽略它。
@@ -99,6 +100,12 @@ export const OUTBOX_QUEUES: readonly OutboxQueueSpec[] = [
     name: 'friend_chat_replay',
     model: 'friendChatReplayOutbox',
     pendingWhere: { status: { in: ['PENDING', 'PROCESSING', 'FAILED'] } },
+  },
+  {
+    name: 'note_status_fanout',
+    model: 'noteStatusFanoutOutbox',
+    pendingWhere: { status: { in: ['PENDING', 'PROCESSING', 'FAILED'] } },
+    oldestField: 'queuedAt',
   },
   {
     name: 'verification_card',

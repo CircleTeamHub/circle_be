@@ -261,6 +261,7 @@ describePostgres('note list summaries (PostgreSQL)', () => {
       remark?: string | null;
       collectedFrom?: unknown;
       collectedFromNoteID?: string | null;
+      rootSourceNoteID?: string | null;
       sourceConversationID?: string | null;
       counts?: [number, number, number, number];
     } = {},
@@ -273,11 +274,11 @@ describePostgres('note list summaries (PostgreSQL)', () => {
       `INSERT INTO "Note" (id, "ownerID", title, content, "contentJson", sections, status,
          available, "workStatus", pinned, "coverMediaID", remark, "collectedFrom",
          "collectedFromNoteID", "sourceConversationID", "mediaCount", "imageCount",
-         "videoCount", "audioCount", "createdAt", "updatedAt")
+         "videoCount", "audioCount", "createdAt", "updatedAt", "rootSourceNoteID")
        VALUES ($1, $2, $3, $4, $5::jsonb, $6::jsonb, $7, $8, $9, $10, $11, $12, $13::jsonb,
                $14, $15, $16, $17, $18, $19,
                TIMESTAMP '2026-01-01' + ($20 || ' minutes')::interval,
-               TIMESTAMP '2026-02-01' + ($20 || ' minutes')::interval)`,
+               TIMESTAMP '2026-02-01' + ($20 || ' minutes')::interval, $21)`,
       [
         id,
         fields.ownerID ?? 'u1',
@@ -303,6 +304,10 @@ describePostgres('note list summaries (PostgreSQL)', () => {
         videoCount,
         audioCount,
         String(order),
+        // 收藏副本的根:写路径和回填都会填,这里默认跟直接来源一致(单层收藏)。
+        fields.rootSourceNoteID === undefined
+          ? (fields.collectedFromNoteID ?? null)
+          : fields.rootSourceNoteID,
       ],
     );
   };
@@ -360,6 +365,7 @@ describePostgres('note list summaries (PostgreSQL)', () => {
         remark text,
         "collectedFrom" jsonb,
         "collectedFromNoteID" text,
+        "rootSourceNoteID" text,
         "createdAt" timestamp(3) NOT NULL,
         "updatedAt" timestamp(3) NOT NULL
       );
@@ -798,6 +804,7 @@ describePostgres('note list summaries (PostgreSQL)', () => {
         mediaCount: true,
         collectedFrom: true,
         collectedFromNoteID: true,
+        rootSourceNoteID: true,
         createdAt: true,
         updatedAt: true,
         groupMemberships: {
