@@ -65,6 +65,12 @@ RUN npm prune --omit=dev \
     && rm -rf /usr/local/lib/node_modules/npm \
     && rm -f /usr/local/bin/npm /usr/local/bin/npx
 
+# 构建这个镜像的提交，进 circle_build_info 的 commit 标签（大盘发版标记、
+# BackendVersionSkew）。放在最后一层之前：每次提交都变的 ARG 若放得靠前，会让
+# 后面所有 RUN 层的缓存都失效。build-image.yml 传 github.sha；本地构建没传就是 unknown。
+ARG CIRCLE_BUILD_COMMIT=unknown
+ENV CIRCLE_BUILD_COMMIT=$CIRCLE_BUILD_COMMIT
+
 USER app
 
 EXPOSE 3000

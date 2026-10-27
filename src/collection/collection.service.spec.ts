@@ -177,12 +177,51 @@ describe('CollectionService', () => {
     expect(prisma.userCollection.create).not.toHaveBeenCalled();
   };
 
-  // 转发那条 CHAT_FORWARD_FORBIDDEN 的理由在这里一字不差地成立，但收藏走的是
-  // 另一扇门：客户端拼好快照直接 POST，服务端从头到尾没看过那条消息，于是
-  // chat.service 里那道闸完全够不着它。
-  it('refuses to collect a peer message from a burn-after-reading conversation', async () => {
+  it('collects a peer message without row-owned expiry even when the conversation has a burn duration', async () => {
     chat.requireVisibleMessage.mockResolvedValue(
-      visible({ senderID: 'peer-1' }, { burnDurationSec: 60 }),
+      visible(
+        {
+          senderID: 'peer-1',
+          burnDurationSec: null,
+          burnExpiresAt: null,
+        },
+        { burnDurationSec: 60 },
+      ),
+    );
+
+    await service.create('user-1', messageCollection('msg-1'));
+
+    expect(prisma.userCollection.create).toHaveBeenCalled();
+  });
+
+  it('refuses to collect a peer message with a sender-owned burn policy', async () => {
+    chat.requireVisibleMessage.mockResolvedValue(
+      visible(
+        { senderID: 'peer-1', burnDurationSec: 60 },
+        { burnDurationSec: null },
+      ),
+    );
+
+    await expect(
+      service.create('user-1', messageCollection('msg-1')),
+    ).rejects.toMatchObject({
+      response: expect.objectContaining({
+        errorCode: 'COLLECTION_EPHEMERAL_FORBIDDEN',
+      }),
+    });
+    expect(prisma.userCollection.create).not.toHaveBeenCalled();
+  });
+
+  it('refuses to collect a peer message with a row-owned burn expiry', async () => {
+    chat.requireVisibleMessage.mockResolvedValue(
+      visible(
+        {
+          senderID: 'peer-1',
+          burnDurationSec: null,
+          burnExpiresAt: new Date('2026-09-08T08:01:00.000Z'),
+        },
+        { burnDurationSec: null },
+      ),
     );
 
     await expect(
@@ -196,9 +235,13 @@ describe('CollectionService', () => {
   });
 
   // 与转发口径一致：自己的内容重发一次效果完全一样，拦下来不保护任何人。
-  it('still collects your own message from a burn conversation', async () => {
+  it('still collects your own message with row-owned burn expiry', async () => {
     chat.requireVisibleMessage.mockResolvedValue(
-      visible({ senderID: 'user-1' }, { burnDurationSec: 60 }),
+      visible({
+        senderID: 'user-1',
+        burnDurationSec: 60,
+        burnExpiresAt: new Date('2026-09-08T08:01:00.000Z'),
+      }),
     );
 
     await service.create('user-1', messageCollection('msg-1'));

@@ -35,6 +35,10 @@ _schedule_for() {
     pg-incr) printf '%s' "${BACKUP_CRON_PG_INCR:-0 3 * * 1-6}" ;;
     minio)   printf '%s' "${BACKUP_CRON_MINIO:-*/15 * * * *}" ;;
     check)   printf '%s' "${BACKUP_CRON_CHECK:-17 * * * *}" ;;
+    # Weekly, in the users' night: the container runs in UTC, so 19:30 Tuesday
+    # is 03:30 Wednesday in China. The drill restores a full second copy of the
+    # database and reads every live table, so it gets a quiet hour of its own.
+    drill)   printf '%s' "${BACKUP_CRON_DRILL:-30 19 * * 2}" ;;
     *) die "unknown job in BACKUP_JOBS: '$1'" ;;
   esac
 }
@@ -54,12 +58,12 @@ install_crontab() {
     # `docker compose logs`. Otherwise busybox crond tries to mail it and, with
     # no MTA in the image, every backup log line is silently discarded.
     local IFS=,
-    for job in ${BACKUP_JOBS:-pg-full,pg-diff,minio,check}; do
+    for job in ${BACKUP_JOBS:-pg-full,pg-diff,minio,check,drill}; do
       printf '%s %s run %s >/proc/1/fd/1 2>/proc/1/fd/2\n' "$(_schedule_for "$job")" "$0" "$job"
     done
   } > "$file"
 
-  log "scheduling jobs: ${BACKUP_JOBS:-pg-full,pg-diff,minio,check}"
+  log "scheduling jobs: ${BACKUP_JOBS:-pg-full,pg-diff,minio,check,drill}"
   sed 's/^/  /' "$file"
   exec crond -f -l 8 -c "$dir"
 }

@@ -274,7 +274,8 @@ export class AuthController {
   }
 
   @Post('login-challenges/:challengeId/reject')
-  @UseGuards(JwtGuard)
+  @UseGuards(JwtGuard, UserThrottlerGuard)
+  @Throttle({ default: { limit: 10, ttl: 60_000 } })
   @ApiBearerAuth()
   @ApiOperation({ summary: 'Trusted device: reject the login request' })
   async rejectLoginChallenge(

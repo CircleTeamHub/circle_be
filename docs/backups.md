@@ -348,10 +348,35 @@ docker compose -f docker-compose.prod.yml -f docker-compose.backup.yml \
 It is **non-destructive** and safe against production. It:
 
 1. reads exact per-table row counts from the **live** database,
-2. restores the latest backup from the off-host repo into a **scratch** PGDATA,
-3. starts a throwaway postmaster on port 5433 and replays WAL,
-4. compares exact row counts table by table,
-5. exits non-zero if the restore is not usable.
+2. refuses to start unless the scratch disk can hold a second copy and still keep
+   `DRILL_MIN_FREE_PERCENT` (default 20%, above `HostDiskFilling`'s 15%) free —
+   the scratch volume shares the disk with the live cluster,
+3. restores the latest backup from the off-host repo into a **scratch** PGDATA,
+4. starts a throwaway postmaster on port 5433 with `hot_standby=off`, so nothing
+   is read until WAL replay has finished and the cluster has promoted,
+5. compares exact row counts table by table, and checks that replay reached the
+   newest WAL segment that was archived when the drill started,
+6. exits non-zero if the restore is not usable.
+
+**The backup scheduler runs it weekly** (`BACKUP_JOBS` includes `drill`;
+schedule `BACKUP_CRON_DRILL`, default `30 19 * * 2` — the container runs in UTC,
+so that is 03:30 Wednesday in China). Every run
+writes `circle_backup_drill_*` to the `backup_metrics` volume, which
+`backup-metrics` exports: `BackupRestoreDrillFailing` (critical, with the
+`stage` it stopped at), `BackupRestoreDrillStale` (no pass in 8 days) and
+`BackupRestoreDrillNeverPassed`. Only a passing drill moves
+`circle_backup_drill_last_success_timestamp_seconds`. A drill that finds another
+one already holding `/tmp/.drill.lock` exits 75 and writes nothing. A drill that
+was killed mid-way (the container recreated by a release, OOM, a host restart)
+leaves its restore in `backup_scratch`; the next run recognises it by the
+`.circle-restore-drill` marker and removes it first. Otherwise the drill only
+takes over a `DRILL_ROOT` that does not exist yet or is an empty directory, at
+least two levels deep (`/tmp/drill`, never `/tmp`), with the lock file outside
+it. Anything else — a `PG_VERSION` without the marker, a shared directory with
+other files in it — is treated as someone else's: the drill refuses, touches
+nothing and reports `stage="preflight"`. Its queries run
+as `application_name=circle-restore-drill`, which `PostgresLongTransaction`
+ignores.
 
 The scratch cluster is always started with `archive_mode=off`. Without that it
 would push its own WAL into the repo it was just restored from, fork the
@@ -362,12 +387,17 @@ timeline, and corrupt the live backup set. Every restore path here does this.
 when the drill exits. (That volume is deliberately not tmpfs: a RAM-backed copy
 of production is an OOM waiting to happen.)
 
-Reading the output: on a busy database `live > restored` is expected drift
-(writes landed while the drill ran). `restored > live`, a missing table, or a
-table that comes back **empty** when live has rows are all hard failures.
+Reading the output: the restore replays WAL to within about `archive_timeout`
+(60s) of now, so counts drift **both** ways — writes since the restore point make
+`live > restored`, and the retention sweepers deleting rows make
+`restored > live`. Neither fails the drill. A missing table, or a table with at
+least `DRILL_EMPTY_TABLE_MIN_ROWS` (default 1000) live rows that comes back
+**empty**, are hard failures.
 
-**Run it monthly, and after any change to backup config or credentials.** Put it
-in a calendar; a drill nobody runs is the same as no drill.
+Besides the weekly schedule, **run it by hand after any change to backup config
+or credentials.** The `backup` image tag (`circle-backup:2`) goes up whenever the
+scripts learn a new job name: an old image does not know `drill` and its
+scheduler would exit on start.
 
 ### Full round-trip proof (destructive, throwaway stack)
 
