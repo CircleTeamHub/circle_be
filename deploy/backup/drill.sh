@@ -30,19 +30,7 @@ LOG_TAG=drill
 . "$(dirname "$0")/lib.sh"
 
 DRILL_ROOT="${DRILL_ROOT:-/tmp/drill}"
-
-# This script calls `rm -rf "$DRILL_ROOT"` twice, and it runs in a container that
-# mounts the LIVE pg_data volume read-write (pgbackrest has to read the data
-# files it backs up). A mistyped DRILL_ROOT is therefore a delete-production
-# button. Refuse anything that is not clearly scratch space.
-case "$DRILL_ROOT" in
-  /*) ;;
-  *) die "DRILL_ROOT must be an absolute path (got: '$DRILL_ROOT')" ;;
-esac
-case "$DRILL_ROOT" in
-  /|/var|/var/lib|/var/lib/postgresql|/var/lib/postgresql/data|/var/lib/postgresql/data/*|/etc|/etc/*|/opt|/opt/*)
-    die "DRILL_ROOT='$DRILL_ROOT' is at or inside a system/live-data path — refusing to rm -rf it" ;;
-esac
+while [ "${DRILL_ROOT%/}" != "$DRILL_ROOT" ]; do DRILL_ROOT="${DRILL_ROOT%/}"; done
 
 DRILL_DIR="$DRILL_ROOT/data"
 DRILL_SOCK="$DRILL_ROOT/sock"
@@ -164,6 +152,24 @@ on_exit() {
 }
 trap on_exit EXIT
 
+# This script rm -rf's DRILL_ROOT, and it runs in a container that mounts the
+# LIVE pg_data volume read-write (pgbackrest has to read the data files it backs
+# up). A mistyped DRILL_ROOT is therefore a delete-production button. Refuse
+# anything that is not clearly a dedicated scratch directory — after the trap,
+# so a misconfigured schedule fails loudly (stage="preflight") every week
+# instead of exiting without a trace until BackupRestoreDrillStale.
+case "$DRILL_ROOT" in
+  /*/*) ;;
+  *) die "DRILL_ROOT must be a dedicated absolute subdirectory such as /tmp/drill (got: '$DRILL_ROOT')" ;;
+esac
+case "$DRILL_ROOT" in
+  /var|/var/lib|/var/lib/postgresql|/var/lib/postgresql/data|/var/lib/postgresql/data/*|/etc|/etc/*|/opt|/opt/*|/usr/*|/home/*|/root/*|/run/*|/proc/*|/sys/*|/dev/*)
+    die "DRILL_ROOT='$DRILL_ROOT' is at or inside a system/live-data path — refusing to rm -rf it" ;;
+esac
+case "$DRILL_LOCK" in
+  "$DRILL_ROOT"|"$DRILL_ROOT"/*) die "DRILL_LOCK_FILE must live outside DRILL_ROOT — the drill deletes DRILL_ROOT" ;;
+esac
+
 # Single-flight. A second drill exits 75 without touching the first one's files
 # or metrics — the run in progress reports for both. Every child that can
 # outlive this shell (the scratch postmaster) is started with fd 9 closed, so
@@ -190,8 +196,15 @@ fi
 for probe in "$DRILL_ROOT" "$DRILL_ROOT/data"; do
   [ -f "$probe/PG_VERSION" ] && die "DRILL_ROOT='$DRILL_ROOT' contains a real PGDATA ($probe/PG_VERSION) — refusing to destroy it. If it is a restore an older drill left behind, remove it by hand."
 done
+# Only a DRILL_ROOT that does not exist yet, or is an empty directory, becomes
+# the drill's own. Anything else — /tmp itself pointed at by mistake, a shared
+# directory, an older drill's unmarked leftover — is not ours to rm -rf.
+if [ -e "$DRILL_ROOT" ]; then
+  [ -d "$DRILL_ROOT" ] || die "DRILL_ROOT='$DRILL_ROOT' exists and is not a directory — refusing to touch it"
+  entries="$(ls -A "$DRILL_ROOT")" || die "cannot list DRILL_ROOT='$DRILL_ROOT' — refusing to touch it"
+  [ -z "$entries" ] || die "DRILL_ROOT='$DRILL_ROOT' is not empty and is not a drill's own scratch space — refusing to delete it. Point DRILL_ROOT at a dedicated directory (default /tmp/drill), or empty it by hand."
+fi
 OWN_ROOT=1
-rm -rf "$DRILL_ROOT"
 mkdir -p "$DRILL_ROOT"
 : > "$DRILL_MARKER"
 

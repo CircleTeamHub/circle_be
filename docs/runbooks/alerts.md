@@ -370,7 +370,7 @@
 - 修好后手动再跑一次确认：`<备份栈> run --rm backup run drill`（结果同样写进指标）。
 
 **常见原因与处置**：
-- `preflight`：`DRILL_ROOT`（默认 `/tmp/drill`，在 `backup_scratch` 卷里）里有一个不是演练自己留下的 `PG_VERSION`，演练拒绝动它。确认是旧版演练的残留后手动删掉，否则查清是谁的数据。被杀掉的演练留下的副本（带 `.circle-restore-drill` 标记）下一轮会自动清掉，不会走到这里。
+- `preflight`：演练拒绝接管 `DRILL_ROOT`（默认 `/tmp/drill`，在 `backup_scratch` 卷里）。可能是里面有不带演练标记的文件或 `PG_VERSION`，或者路径配成了 `/tmp` 这类太浅的目录，又或者锁文件放进了这个目录里，日志里的 `FATAL` 行写明了是哪一种。如果是旧版演练的残留，确认后手动删掉；否则先查清那是谁的数据。被杀掉的演练留下的副本（带 `.circle-restore-drill` 标记）下一轮会自动清掉，不会走到这里。
 - `space`：`backup_scratch` 卷所在的盘放不下第二份数据库（要留 `DRILL_MIN_FREE_PERCENT`，默认 20%，高于 `HostDiskFilling` 的 15%）。先清盘或给备份 overlay 换一块盘，别为了让演练通过把余量调小 —— 演练会和线上库争同一块盘。
 - `restore`：pgbackrest 拿不到仓库（凭证、目标桶、加密口令），通常 `BackupCheckFailing` 也在响，按它处理。
 - `start` / `query`：恢复出来的集簇起不来或查不了，缺 WAL、配置不兼容，看日志里 scratch postgres 的输出。`start` 会等到 WAL 回放完（`DRILL_START_TIMEOUT`，默认 3600 秒），一周的 WAL 很多时可以调大。

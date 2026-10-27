@@ -369,9 +369,12 @@ writes `circle_backup_drill_*` to the `backup_metrics` volume, which
 one already holding `/tmp/.drill.lock` exits 75 and writes nothing. A drill that
 was killed mid-way (the container recreated by a release, OOM, a host restart)
 leaves its restore in `backup_scratch`; the next run recognises it by the
-`.circle-restore-drill` marker and removes it first. A `PG_VERSION` in
-`DRILL_ROOT` *without* that marker is treated as someone's real cluster: the
-drill refuses, touches nothing and reports `stage="preflight"`. Its queries run
+`.circle-restore-drill` marker and removes it first. Otherwise the drill only
+takes over a `DRILL_ROOT` that does not exist yet or is an empty directory, at
+least two levels deep (`/tmp/drill`, never `/tmp`), with the lock file outside
+it. Anything else — a `PG_VERSION` without the marker, a shared directory with
+other files in it — is treated as someone else's: the drill refuses, touches
+nothing and reports `stage="preflight"`. Its queries run
 as `application_name=circle-restore-drill`, which `PostgresLongTransaction`
 ignores.
 

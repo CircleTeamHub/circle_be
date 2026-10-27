@@ -69,6 +69,8 @@ exit "${STUB_DU_RC:-0}"
 SH
 cat > "$fake_bin/df" <<'SH'
 #!/usr/bin/env bash
+# 与真的 df 一样：路径不存在就报错。演练必须先建好 DRILL_ROOT 再量它所在的盘。
+[ -e "${@: -1}" ] || { echo "df: ${@: -1}: No such file or directory" >&2; exit 1; }
 printf 'Filesystem 1024-blocks Used Available Capacity Mounted on\n'
 printf '/dev/vda1 %s 0 %s 50%% /tmp\n' "${STUB_DF_TOTAL_KB:-104857600}" "${STUB_DF_AVAIL_KB:-52428800}"
 SH
@@ -232,6 +234,34 @@ rc="$(run_drill "$dir")"
 [ -f "$dir/scratch/drill/data/PG_VERSION" ] || fail 'the drill deleted a PGDATA it did not create'
 assert_metric "$dir/metrics/backup_drill.prom" 'circle_backup_drill_success\{stage="preflight"\} 0'
 if grep -q 'pgbackrest' "$dir/calls"; then fail 'restore ran over a real PGDATA'; fi
+
+# ── DRILL_ROOT 指到了一个有别的东西的共享目录：一个文件都不删，落成失败 ─────────
+dir="$tmp_dir/shared-root"
+mkdir -p "$dir/shared"
+echo keep > "$dir/shared/unrelated"
+rc="$(run_drill "$dir" DRILL_ROOT="$dir/shared")"
+[ "$rc" = 1 ] || fail "a drill pointed at a non-empty shared directory exited $rc, want 1"
+[ -f "$dir/shared/unrelated" ] || fail 'the drill deleted files in a directory it did not create'
+assert_metric "$dir/metrics/backup_drill.prom" 'circle_backup_drill_success\{stage="preflight"\} 0'
+if grep -q 'pgbackrest' "$dir/calls"; then fail 'restore ran in a shared directory'; fi
+
+# 已经存在、但是空的专用目录照常接管。
+dir="$tmp_dir/empty-root"
+mkdir -p "$dir/scratch/drill"
+rc="$(run_drill "$dir")"
+[ "$rc" = 0 ] || { cat "$dir/err" >&2; fail "a drill with an existing empty DRILL_ROOT exited $rc, want 0"; }
+
+# 太浅的路径（/tmp 这一级）直接拒绝，也要留下失败指标，不能悄悄退出。
+dir="$tmp_dir/shallow-root"
+rc="$(run_drill "$dir" DRILL_ROOT=/circle-drill-spec-not-a-real-dir/)"
+[ "$rc" = 1 ] || fail "a top-level DRILL_ROOT exited $rc, want 1"
+assert_metric "$dir/metrics/backup_drill.prom" 'circle_backup_drill_success\{stage="preflight"\} 0'
+
+# 锁文件放进 DRILL_ROOT 里：演练会把自己的锁删掉，另一轮就能同时跑起来。
+dir="$tmp_dir/lock-inside-root"
+rc="$(run_drill "$dir" DRILL_LOCK_FILE="$dir/scratch/drill/.drill.lock")"
+[ "$rc" = 1 ] || fail "a lock inside DRILL_ROOT exited $rc, want 1"
+assert_metric "$dir/metrics/backup_drill.prom" 'circle_backup_drill_success\{stage="preflight"\} 0'
 
 # ── 另一轮演练持有锁：退出 75，什么都不写 ──────────────────────────────────
 dir="$tmp_dir/busy"
