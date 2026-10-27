@@ -14,6 +14,7 @@ groups:
         labels:
           severity: warning
         annotations:
+          runbook_url: https://github.com/CircleTeamHub/circle_be/blob/main/docs/runbooks/alerts.md#backendfatalexit
           summary: 'The backend exited on an uncaught exception in the last 10m — see the [fatal] line in Loki'
 
       # 兜底：error 级日志突增。阈值按单机量级取，宁可迟报；具体是哪一类，在
@@ -27,6 +28,7 @@ groups:
         labels:
           severity: warning
         annotations:
+          runbook_url: https://github.com/CircleTeamHub/circle_be/blob/main/docs/runbooks/alerts.md#backenderrorlogspike
           summary: 'Backend has kept writing more than 50 error-level log lines per 5m for 10m'
 
       # Caddy 反代失败（上游连不上、读写中断）。只算 error 级：客户端自己断开
@@ -39,6 +41,7 @@ groups:
         labels:
           severity: warning
         annotations:
+          runbook_url: https://github.com/CircleTeamHub/circle_be/blob/main/docs/runbooks/alerts.md#caddyproxyerrors
           summary: 'Caddy has kept failing to proxy more than 10 requests per 5m for 10m — is an upstream down or restarting?'
 
       # 证书签发/续期出错。TlsCertificateExpiringSoon 要等到剩 14 天才响，这条在
@@ -49,6 +52,7 @@ groups:
         labels:
           severity: warning
         annotations:
+          runbook_url: https://github.com/CircleTeamHub/circle_be/blob/main/docs/runbooks/alerts.md#caddycertificateerrors
           summary: 'Caddy logged a TLS certificate error in the last 30m — renewal may be failing'
 
   # 安全事件（docs/logging.md 的 Security Event Catalogue）：warn 级 JSON 行，
@@ -66,6 +70,7 @@ groups:
         labels:
           severity: warning
         annotations:
+          runbook_url: https://github.com/CircleTeamHub/circle_be/blob/main/docs/runbooks/alerts.md#securitycodeguessing
           summary: 'Over 20 wrong security / login-challenge codes per 5m for 10m — someone may be guessing codes'
 
       # 锁定是 5 次输错之后的结果。30 分钟里好几个账号被锁，比单个账号的反复输错
@@ -76,6 +81,7 @@ groups:
         labels:
           severity: warning
         annotations:
+          runbook_url: https://github.com/CircleTeamHub/circle_be/blob/main/docs/runbooks/alerts.md#securitycodelockouts
           summary: '3 or more accounts hit the security-code lockout in 30m — possible credential stuffing'
 
       # 签名有效、会话已被吊销（全部登出、封号、改密）的令牌还在被用：令牌泄露
@@ -91,6 +97,7 @@ groups:
         labels:
           severity: warning
         annotations:
+          runbook_url: https://github.com/CircleTeamHub/circle_be/blob/main/docs/runbooks/alerts.md#revokedsessiontokenreplay
           summary: 'A revoked session was used 20+ times in 15m, or revoked sessions of 5+ users were replayed — leaked tokens or a client that ignores logout'
 
       # 伪造、签名不对、audience/issuer 不对的令牌（token_invalid）。过期和缺失的
@@ -104,4 +111,5 @@ groups:
         labels:
           severity: warning
         annotations:
+          runbook_url: https://github.com/CircleTeamHub/circle_be/blob/main/docs/runbooks/alerts.md#invalidtokenspike
           summary: 'Over 50 invalid (forged or mis-signed) tokens per 5m for 10m — forged tokens, or instances disagreeing on JWT signing settings'

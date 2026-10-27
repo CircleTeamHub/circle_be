@@ -2,6 +2,7 @@ import {
   BadRequestException,
   ConflictException,
   ForbiddenException,
+  HttpException,
   Injectable,
   Logger,
   NotFoundException,
@@ -29,6 +30,14 @@ import { CreateDirectCallDto, CreateGroupCallDto } from './dto/call.dto';
 import { LiveKitCallService } from './livekit.service';
 import { createLoggingConfig } from 'src/logging/logging.config';
 import { logBusinessEvent } from 'src/logging/business-event.logger';
+import {
+  recordCallAccept,
+  recordCallEnding,
+  recordCallSetup,
+  type CallAcceptResult,
+  type CallKind,
+  type CallSetupResult,
+} from 'src/metrics/call-metrics';
 
 const GROUP_SESSION_TYPE = 3;
 // OpenIM 单聊 sessionType。toCallDto 一直会把非 GROUP 映射成 'single'（此前是死分支）。
@@ -75,6 +84,74 @@ type LiveKitWebhookEvent = {
   event?: string;
   room?: { name?: string };
 };
+
+/** handled = 已知通话的 room_finished 已处理（含条件写落空的重投）；其余验签通过的事件为 ignored。 */
+export type LiveKitWebhookOutcome = 'handled' | 'ignored';
+
+type StartCallParams = {
+  initiatorID: string;
+  conversationID: string;
+  sessionType: number;
+  callType: CallType;
+  inviteeIDs: string[];
+  users: Map<string, UserLite>;
+  idempotencyKey?: string;
+  /** 参与者锁内、create 之前的最终授权复检（如 1:1 的好友/拉黑）。 */
+  revalidate?: (tx: Prisma.TransactionClient) => Promise<void>;
+};
+
+/** replayed = 幂等回放（含锁内复查到的回放），不计入 circle_call_setups_total。 */
+type CallSetupTrace = { replayed: boolean };
+/** replayed = 双击竞态的输家，赢家那次已经计过 accepted。 */
+type CallAcceptTrace = { replayed: boolean };
+
+/** 与 toCallDto / 留痕的 single|group 判定同一条：只有 sessionType 3 是群呼。 */
+function callKindOf(sessionType: number | undefined): CallKind {
+  return sessionType === GROUP_SESSION_TYPE ? 'group' : 'direct';
+}
+
+function hasCallErrorCode(error: unknown, errorCode: string): boolean {
+  if (!(error instanceof HttpException)) return false;
+  const body = error.getResponse();
+  return (
+    typeof body === 'object' &&
+    body !== null &&
+    (body as { errorCode?: unknown }).errorCode === errorCode
+  );
+}
+
+/**
+ * 4xx = 授权/状态类拒绝。发起与接听里除了占线、已结束/已超时之外的 4xx，都是锁内或
+ * 签 token 前复检到的好友/拉黑/成员资格变化 —— 与入口校验同一批错误码，不算服务端失败。
+ */
+function isClientRejection(error: unknown): boolean {
+  return error instanceof HttpException && error.getStatus() < 500;
+}
+
+/** null = 不计数（见 isClientRejection）。 */
+/**
+ * 只按错误类型归类，不按走到哪一步：签 token 是本地算 JWT，那一步真正能抛的服务端
+ * 错误是 LiveKit 没配置（503）和访问复检里的数据库错误。按步骤归类会把数据库故障
+ * 记成 livekit_unavailable，把值班的人指到 LiveKit 那边去。建房失败一律是 503。
+ */
+function callSetupFailureResult(error: unknown): CallSetupResult | null {
+  if (hasCallErrorCode(error, CallErrorCode.Busy)) return 'busy';
+  if (isClientRejection(error)) return null;
+  return error instanceof ServiceUnavailableException
+    ? 'livekit_unavailable'
+    : 'failed';
+}
+
+/** null = 不计数（未被邀请、复检拒绝这类客户端错误）。 */
+function callAcceptFailureResult(error: unknown): CallAcceptResult | null {
+  if (
+    hasCallErrorCode(error, CallErrorCode.Ended) ||
+    hasCallErrorCode(error, CallErrorCode.Expired)
+  ) {
+    return 'too_late';
+  }
+  return isClientRejection(error) ? null : 'failed';
+}
 
 const userLiteSelect = {
   id: true,
@@ -243,17 +320,28 @@ export class CallService {
     };
   }
 
-  private async startCall(params: {
-    initiatorID: string;
-    conversationID: string;
-    sessionType: number;
-    callType: CallType;
-    inviteeIDs: string[];
-    users: Map<string, UserLite>;
-    idempotencyKey?: string;
-    /** 参与者锁内、create 之前的最终授权复检（如 1:1 的好友/拉黑）。 */
-    revalidate?: (tx: Prisma.TransactionClient) => Promise<void>;
-  }) {
+  /**
+   * circle_call_setups_total 在这里计：入口校验已经过了，每次尝试恰好一条；
+   * 幂等回放（含锁内复查到的回放）不计。
+   */
+  private async startCall(params: StartCallParams) {
+    const kind = callKindOf(params.sessionType);
+    const trace: CallSetupTrace = { replayed: false };
+    try {
+      const started = await this.createCallSession(params, trace);
+      if (!trace.replayed) recordCallSetup(kind, 'started');
+      return started;
+    } catch (error) {
+      const result = trace.replayed ? null : callSetupFailureResult(error);
+      if (result) recordCallSetup(kind, result);
+      throw error;
+    }
+  }
+
+  private async createCallSession(
+    params: StartCallParams,
+    trace: CallSetupTrace,
+  ) {
     const {
       initiatorID,
       conversationID,
@@ -271,6 +359,7 @@ export class CallService {
       idempotencyKey,
     );
     if (existing) {
+      trace.replayed = true;
       const token = await this.mintToken(existing, users.get(initiatorID)!);
       return {
         call: this.toCallDto(existing),
@@ -348,7 +437,8 @@ export class CallService {
 
     if (replayed) {
       // 回放路径：本请求预建的 LiveKit 房间成了孤儿，补偿删除；
-      // 不再广播邀请（首建请求已广播过）。
+      // 不再广播邀请（首建请求已广播过）。事务提交后才记回放：提交失败仍算一次发起失败。
+      trace.replayed = true;
       await this.livekit.deleteRoom(livekitRoomName);
       const token = await this.mintToken(call, users.get(initiatorID)!);
       return {
@@ -437,7 +527,28 @@ export class CallService {
       });
     }
 
+    // circle_call_accepts_total 只计「被邀请人第一次接」：上面已 JOINED 的重复接听
+    // 与未被邀请都不计。
     const call = participant.call as CallWithParticipants;
+    const kind = callKindOf(call.sessionType);
+    const trace: CallAcceptTrace = { replayed: false };
+    try {
+      const accepted = await this.joinInvitedCall(userID, callId, call, trace);
+      if (!trace.replayed) recordCallAccept(kind, 'accepted');
+      return accepted;
+    } catch (error) {
+      const result = trace.replayed ? null : callAcceptFailureResult(error);
+      if (result) recordCallAccept(kind, result);
+      throw error;
+    }
+  }
+
+  private async joinInvitedCall(
+    userID: string,
+    callId: string,
+    call: CallWithParticipants,
+    trace: CallAcceptTrace,
+  ) {
     if (
       call.status !== CallStatus.RINGING &&
       call.status !== CallStatus.ACTIVE
@@ -494,6 +605,7 @@ export class CallService {
             errorCode: CallErrorCode.Ended,
           });
         }
+        trace.replayed = true;
       }
       const transition = await tx.callSession.updateMany({
         where: { id: callId, status: CallStatus.RINGING },
@@ -948,13 +1060,15 @@ export class CallService {
     return staleCalls.length;
   }
 
-  async handleLiveKitWebhook(event: LiveKitWebhookEvent): Promise<void> {
+  async handleLiveKitWebhook(
+    event: LiveKitWebhookEvent,
+  ): Promise<LiveKitWebhookOutcome> {
     if (event.event !== 'room_finished') {
-      return;
+      return 'ignored';
     }
     const roomName = event.room?.name?.trim();
     if (!roomName) {
-      return;
+      return 'ignored';
     }
     const call = (await this.prisma.callSession.findUnique({
       where: { livekitRoomName: roomName },
@@ -962,9 +1076,10 @@ export class CallService {
     })) as CallWithParticipants | null;
     if (!call) {
       this.logger.warn(`call.webhook_unknown_room room=${roomName}`);
-      return;
+      return 'ignored';
     }
     await this.endLiveKitFinishedCall(call, new Date());
+    return 'handled';
   }
 
   private async findParticipantForUser(callId: string, userID: string) {
@@ -1534,6 +1649,9 @@ export class CallService {
    * 自定义消息进会话（data.type='call_record'），客户端渲染可点击的通话记录行。
    * fire-and-forget：留痕失败绝不能反过来阻断通话收尾（teardown 的
    * 广播/删房都在留痕之前完成）。只有未接（NO_ANSWER）带离线推送。
+   *
+   * 六个终局写入都是条件写，只有赢家走到这里 —— 所以通话结束计数也在这里记，
+   * 每通恰好一次；同步记在留痕之前，留痕早退（缺会话等）不影响计数。
    */
   private emitCallRecordMessage(
     call: CallWithParticipants,
@@ -1541,6 +1659,12 @@ export class CallService {
     endedAt: Date,
     options: { suppressOfflinePush?: boolean } = {},
   ): void {
+    recordCallEnding({
+      kind: callKindOf(call.sessionType),
+      reason: endReason,
+      startedAt: call.startedAt,
+      endedAt,
+    });
     void (async () => {
       const initiator =
         call.initiator ??

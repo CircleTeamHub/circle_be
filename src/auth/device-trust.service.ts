@@ -595,22 +595,34 @@ export class DeviceTrustService implements OnModuleDestroy {
     approverDeviceKey: string | null,
     challengeId: string,
   ): Promise<void> {
-    await this.assertTrustedApprover(userId, approverDeviceKey);
-    const updated = await this.prisma.loginChallenge.updateMany({
-      where: {
-        id: challengeId,
-        userId,
-        status: {
-          in: [LoginChallengeStatus.PENDING, LoginChallengeStatus.APPROVED],
+    const accountLockKey = `auth_session:${userId}`;
+    const updated = await withDatabaseWorkBudget(this.prisma, () =>
+      this.prisma.$transaction(
+        async (tx) => {
+          await tx.$executeRaw`SELECT pg_advisory_xact_lock(hashtextextended(${accountLockKey}, 0))`;
+          await this.assertTrustedApprover(userId, approverDeviceKey, tx);
+          return tx.loginChallenge.updateMany({
+            where: {
+              id: challengeId,
+              userId,
+              status: {
+                in: [
+                  LoginChallengeStatus.PENDING,
+                  LoginChallengeStatus.APPROVED,
+                ],
+              },
+            },
+            data: {
+              status: LoginChallengeStatus.REJECTED,
+              codeHash: null,
+              codeExpiresAt: null,
+              decidedAt: new Date(),
+            },
+          });
         },
-      },
-      data: {
-        status: LoginChallengeStatus.REJECTED,
-        codeHash: null,
-        codeExpiresAt: null,
-        decidedAt: new Date(),
-      },
-    });
+        { maxWait: 10000, timeout: 30000 },
+      ),
+    );
     // 已被别的设备处理掉 / 已过期都按成功返回：结果一样是「这次登录进不来」。
     if (updated.count === 1) {
       this.logSecurity('login_challenge_rejected', userId, { challengeId });
@@ -954,7 +966,7 @@ export class DeviceTrustService implements OnModuleDestroy {
   async isTrusted(
     userId: string,
     deviceKey: string | null,
-    client: DeviceTrustClient = this.prisma,
+    client: Pick<Prisma.TransactionClient, 'trustedDevice'> = this.prisma,
   ): Promise<boolean> {
     if (!deviceKey) return false;
     const row = await client.trustedDevice.findUnique({
@@ -1260,8 +1272,9 @@ export class DeviceTrustService implements OnModuleDestroy {
   private async assertTrustedApprover(
     userId: string,
     approverDeviceKey: string | null,
+    client: Pick<Prisma.TransactionClient, 'trustedDevice'> = this.prisma,
   ): Promise<void> {
-    if (!(await this.isTrusted(userId, approverDeviceKey))) {
+    if (!(await this.isTrusted(userId, approverDeviceKey, client))) {
       throw new ForbiddenException({
         message: '当前设备不是受信任设备，无法处理登录请求',
         errorCode: AuthErrorCode.DeviceNotTrusted,

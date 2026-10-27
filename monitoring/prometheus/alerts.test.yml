@@ -31,6 +31,7 @@ tests:
           - exp_labels:
               severity: critical
             exp_annotations:
+              runbook_url: https://github.com/CircleTeamHub/circle_be/blob/main/docs/runbooks/alerts.md#dbpoolexhausted
               summary: 'pg connection pool is deeply saturated — requests are about to hit the 10s acquire timeout and fail'
 
   - interval: 1m
@@ -51,6 +52,7 @@ tests:
           - exp_labels:
               severity: warning
             exp_annotations:
+              runbook_url: https://github.com/CircleTeamHub/circle_be/blob/main/docs/runbooks/alerts.md#dbpoolqueueing
               summary: 'Requests are queueing for a pg connection — the pool, not Postgres, is the bottleneck'
 
   - interval: 1m
@@ -72,6 +74,7 @@ tests:
               severity: critical
               instance: blue
             exp_annotations:
+              runbook_url: https://github.com/CircleTeamHub/circle_be/blob/main/docs/runbooks/alerts.md#dbpoolexhausted
               summary: 'pg connection pool is deeply saturated — requests are about to hit the 10s acquire timeout and fail'
 
   # ── 定时任务失败：必须与执行频率无关 ─────────────────────────────────
@@ -91,6 +94,7 @@ tests:
               severity: warning
               exported_job: storage_audit
             exp_annotations:
+              runbook_url: https://github.com/CircleTeamHub/circle_be/blob/main/docs/runbooks/alerts.md#cronjobfailing
               summary: 'Scheduled job storage_audit last run failed (including handled failures it swallowed)'
 
   - interval: 1m
@@ -130,6 +134,7 @@ tests:
               severity: warning
               exported_job: storage_audit
             exp_annotations:
+              runbook_url: https://github.com/CircleTeamHub/circle_be/blob/main/docs/runbooks/alerts.md#cronjobfailing
               summary: 'Scheduled job storage_audit last run failed (including handled failures it swallowed)'
 
   # ── 心跳：阈值按各任务自己的周期缩放 ─────────────────────────────────
@@ -153,6 +158,7 @@ tests:
               severity: warning
               exported_job: per_minute
             exp_annotations:
+              runbook_url: https://github.com/CircleTeamHub/circle_be/blob/main/docs/runbooks/alerts.md#cronjobstalled
               summary: 'Scheduled job per_minute has not succeeded in 3x its interval'
 
   - interval: 1m
@@ -174,6 +180,7 @@ tests:
               severity: warning
               exported_job: stalled
             exp_annotations:
+              runbook_url: https://github.com/CircleTeamHub/circle_be/blob/main/docs/runbooks/alerts.md#cronjobstalled
               summary: 'Scheduled job stalled has not succeeded in 3x its interval'
 
   - interval: 1m
@@ -207,6 +214,7 @@ tests:
               integration: webhook
               reason: clientError
             exp_annotations:
+              runbook_url: https://github.com/CircleTeamHub/circle_be/blob/main/docs/runbooks/alerts.md#alertmanagernotificationfailures
               summary: 'Alertmanager failed to deliver one or more notifications in the last 10m'
       - eval_time: 20m
         alertname: AlertmanagerNotificationFailures
@@ -224,6 +232,7 @@ tests:
           - exp_labels:
               severity: critical
             exp_annotations:
+              runbook_url: https://github.com/CircleTeamHub/circle_be/blob/main/docs/runbooks/alerts.md#alertmanagerconfigreloadfailed
               summary: 'Alertmanager rejected its most recent configuration reload'
       - eval_time: 12m
         alertname: AlertmanagerConfigReloadFailed
@@ -242,6 +251,7 @@ tests:
               severity: critical
               rule_group: /etc/prometheus/alerts.yml;meta
             exp_annotations:
+              runbook_url: https://github.com/CircleTeamHub/circle_be/blob/main/docs/runbooks/alerts.md#prometheusruleevaluationfailures
               summary: 'Prometheus failed to evaluate one or more rules in the last 10m'
       - eval_time: 20m
         alertname: PrometheusRuleEvaluationFailures
@@ -287,12 +297,14 @@ tests:
               instance: alloy:12345
               component: alloy
             exp_annotations:
+              runbook_url: https://github.com/CircleTeamHub/circle_be/blob/main/docs/runbooks/alerts.md#targetdown
               summary: 'Scrape target logs-pipeline is down'
           - exp_labels:
               severity: critical
               job: grafana
               instance: grafana:3000
             exp_annotations:
+              runbook_url: https://github.com/CircleTeamHub/circle_be/blob/main/docs/runbooks/alerts.md#targetdown
               summary: 'Scrape target grafana is down'
 
   - interval: 1m
@@ -308,6 +320,7 @@ tests:
               severity: warning
               component_id: loki.write.local
             exp_annotations:
+              runbook_url: https://github.com/CircleTeamHub/circle_be/blob/main/docs/runbooks/alerts.md#logpipelinedroppedentries
               summary: 'Alloy permanently dropped log entries in the last 10m'
       - eval_time: 20m
         alertname: LogPipelineDroppedEntries
@@ -327,6 +340,7 @@ tests:
           - exp_labels:
               severity: warning
             exp_annotations:
+              runbook_url: https://github.com/CircleTeamHub/circle_be/blob/main/docs/runbooks/alerts.md#lokirulernotificationsfailing
               summary: 'Loki could not deliver log-based alerts to Alertmanager in the last 10m — is Alertmanager on the logs network?'
       - eval_time: 20m
         alertname: LokiRulerNotificationsFailing
@@ -346,6 +360,7 @@ tests:
           - exp_labels:
               severity: warning
             exp_annotations:
+              runbook_url: https://github.com/CircleTeamHub/circle_be/blob/main/docs/runbooks/alerts.md#lokirulernotificationsfailing
               summary: 'Loki could not deliver log-based alerts to Alertmanager in the last 10m — is Alertmanager on the logs network?'
 
   - interval: 1m
@@ -367,6 +382,7 @@ tests:
               severity: warning
               component_id: loki.write.local
             exp_annotations:
+              runbook_url: https://github.com/CircleTeamHub/circle_be/blob/main/docs/runbooks/alerts.md#logpipelinedeliverystalled
               summary: 'Alloy has continuously retried log delivery for at least 15m'
 
   # ── outbox 探测新鲜度 ────────────────────────────────────────────────
@@ -387,6 +403,7 @@ tests:
               severity: warning
               queue: gift_card
             exp_annotations:
+              runbook_url: https://github.com/CircleTeamHub/circle_be/blob/main/docs/runbooks/alerts.md#outboxprobestale
               summary: 'Outbox gift_card depth has not been read for 10m — its pending/dead gauges are stale, not healthy'
 
   - interval: 1m
@@ -418,6 +435,7 @@ tests:
               severity: critical
               queue: gift_card
             exp_annotations:
+              runbook_url: https://github.com/CircleTeamHub/circle_be/blob/main/docs/runbooks/alerts.md#giftcardpermanentlylost
               summary: 'A settled coin gift permanently lost its transfer card — manual reconciliation required'
 
   - interval: 1m
@@ -435,6 +453,7 @@ tests:
               severity: warning
               queue: notification_push
             exp_annotations:
+              runbook_url: https://github.com/CircleTeamHub/circle_be/blob/main/docs/runbooks/alerts.md#outboxdeadlettersappearing
               summary: 'Outbox notification_push produced new dead letters in the last hour (never retried again)'
       # 存量原地不动满一小时:自动消,不留一条永远红的告警。
       - eval_time: 90m
@@ -457,6 +476,7 @@ tests:
               severity: critical
               queue: gift_card
             exp_annotations:
+              runbook_url: https://github.com/CircleTeamHub/circle_be/blob/main/docs/runbooks/alerts.md#giftcardpermanentlylost
               summary: 'A settled coin gift permanently lost its transfer card — manual reconciliation required'
 
   # ── 公网可达性：blackbox-exporter 从用户的路径探测 ─────────────────────
@@ -479,6 +499,7 @@ tests:
               instance: https://api.example.com/healthz
               component: api
             exp_annotations:
+              runbook_url: https://github.com/CircleTeamHub/circle_be/blob/main/docs/runbooks/alerts.md#publicendpointdown
               summary: 'Public endpoint https://api.example.com/healthz is failing its probe (DNS, TLS, Caddy or the service behind it)'
 
   - interval: 1m
@@ -511,6 +532,7 @@ tests:
               instance: https://api.example.com/healthz
               component: api
             exp_annotations:
+              runbook_url: https://github.com/CircleTeamHub/circle_be/blob/main/docs/runbooks/alerts.md#tlscertificateexpiringsoon
               summary: 'TLS certificate for https://api.example.com/healthz expires in less than 14 days — automatic renewal has been failing'
           - exp_labels:
               severity: warning
@@ -518,6 +540,7 @@ tests:
               instance: https://admin.example.com/
               component: admin
             exp_annotations:
+              runbook_url: https://github.com/CircleTeamHub/circle_be/blob/main/docs/runbooks/alerts.md#tlscertificateexpiringsoon
               summary: 'TLS certificate for https://admin.example.com/ expires in less than 14 days — automatic renewal has been failing'
       # 只有剩 2 天的那张升级。Alertmanager 按 instance 用它压掉同一张证书的
       # warning；api 那张的 warning 照常发出，不会被别的域名连带静音。
@@ -530,6 +553,7 @@ tests:
               instance: https://admin.example.com/
               component: admin
             exp_annotations:
+              runbook_url: https://github.com/CircleTeamHub/circle_be/blob/main/docs/runbooks/alerts.md#tlscertificateexpiryimminent
               summary: 'TLS certificate for https://admin.example.com/ expires in less than 3 days — renew it now or clients will refuse to connect'
 
   - interval: 1m
@@ -545,6 +569,7 @@ tests:
               severity: warning
               job: blackbox-http
             exp_annotations:
+              runbook_url: https://github.com/CircleTeamHub/circle_be/blob/main/docs/runbooks/alerts.md#publicprobenotconfigured
               summary: 'blackbox-exporter is running but nothing is being probed — create monitoring/prometheus/probe-targets/public.yml'
 
   - interval: 1m
@@ -594,6 +619,7 @@ tests:
               instance: blue
               pool: chat_connections
             exp_annotations:
+              runbook_url: https://github.com/CircleTeamHub/circle_be/blob/main/docs/runbooks/alerts.md#gatewaycapacitynearlimit
               summary: Gateway blue chat_connections budget above 80% for 2m
       - eval_time: 15m
         alertname: GatewayCapacityNearLimit
@@ -615,6 +641,7 @@ tests:
               instance: blue
               pool: http
             exp_annotations:
+              runbook_url: https://github.com/CircleTeamHub/circle_be/blob/main/docs/runbooks/alerts.md#gatewaycapacityrejecting
               summary: Gateway blue http rejects more than 1 request or connection per second for 2m
       - eval_time: 25m
         alertname: GatewayCapacityRejecting
@@ -636,6 +663,7 @@ tests:
               instance: blue
               pool: realtime_pending
             exp_annotations:
+              runbook_url: https://github.com/CircleTeamHub/circle_be/blob/main/docs/runbooks/alerts.md#gatewayauthtimeoutspike
               summary: Gateway blue realtime_pending authentication timeouts exceed 5/s for 5m
       - eval_time: 25m
         alertname: GatewayAuthTimeoutSpike
@@ -655,6 +683,7 @@ tests:
           - exp_labels:
               severity: warning
             exp_annotations:
+              runbook_url: https://github.com/CircleTeamHub/circle_be/blob/main/docs/runbooks/alerts.md#apiauthfailurespike
               summary: API 401/403 responses exceed 10/s for 5m; investigate abuse or a client authentication regression
       - eval_time: 25m
         alertname: ApiAuthFailureSpike
@@ -674,6 +703,7 @@ tests:
           - exp_labels:
               severity: warning
             exp_annotations:
+              runbook_url: https://github.com/CircleTeamHub/circle_be/blob/main/docs/runbooks/alerts.md#apiratelimitspike
               summary: API rate-limited responses exceed 5/s for 5m; check shared NAT and abusive clients
       - eval_time: 25m
         alertname: ApiRateLimitSpike
@@ -693,6 +723,7 @@ tests:
           - exp_labels:
               severity: warning
             exp_annotations:
+              runbook_url: https://github.com/CircleTeamHub/circle_be/blob/main/docs/runbooks/alerts.md#chatauthfailurespike
               summary: Chat authentication failures exceed 5/s for 5m; investigate abuse or a client authentication regression
       - eval_time: 25m
         alertname: ChatAuthFailureSpike
@@ -752,6 +783,7 @@ tests:
           - exp_labels:
               severity: warning
             exp_annotations:
+              runbook_url: https://github.com/CircleTeamHub/circle_be/blob/main/docs/runbooks/alerts.md#unhandledrejectionsoccurring
               summary: Backend caught unhandled promise rejection(s) in the last 15m — a missing .catch; see [unhandledRejection] log lines
       - eval_time: 30m
         alertname: UnhandledRejectionsOccurring
@@ -771,6 +803,7 @@ tests:
           - exp_labels:
               severity: warning
             exp_annotations:
+              runbook_url: https://github.com/CircleTeamHub/circle_be/blob/main/docs/runbooks/alerts.md#unhandledrejectionsoccurring
               summary: Backend caught unhandled promise rejection(s) in the last 15m — a missing .catch; see [unhandledRejection] log lines
       - eval_time: 20m
         alertname: UnhandledRejectionsOccurring
@@ -796,6 +829,7 @@ tests:
               mountpoint: /
               fstype: ext4
             exp_annotations:
+              runbook_url: https://github.com/CircleTeamHub/circle_be/blob/main/docs/runbooks/alerts.md#hostdisknearlyfull
               summary: Filesystem / below 5% free — database and log writes are about to fail
       - eval_time: 15m
         alertname: HostDiskFilling
@@ -806,6 +840,7 @@ tests:
               mountpoint: /
               fstype: ext4
             exp_annotations:
+              runbook_url: https://github.com/CircleTeamHub/circle_be/blob/main/docs/runbooks/alerts.md#hostdiskfilling
               summary: Filesystem / below 15% free
 
   - name: 剩 10% 只有 warning；只读挂载和 squashfs 都不算
@@ -842,6 +877,7 @@ tests:
               mountpoint: /
               fstype: ext4
             exp_annotations:
+              runbook_url: https://github.com/CircleTeamHub/circle_be/blob/main/docs/runbooks/alerts.md#hostdiskfilling
               summary: Filesystem / below 15% free
 
   # ── 容器崩溃循环 ────────────────────────────────────────────────────
@@ -869,6 +905,7 @@ tests:
               severity: warning
               name: circle-be-minio-1
             exp_annotations:
+              runbook_url: https://github.com/CircleTeamHub/circle_be/blob/main/docs/runbooks/alerts.md#containerrestartloop
               summary: Container circle-be-minio-1 restarted about 3 times in 15m (crash loop or OOM kills?)
       - eval_time: 30m
         alertname: ContainerRestartLoop
@@ -921,6 +958,7 @@ tests:
               instance: backup-metrics
               check: postgres_archive
             exp_annotations:
+              runbook_url: https://github.com/CircleTeamHub/circle_be/blob/main/docs/runbooks/alerts.md#backupcheckfailing
               summary: Backup self-check postgres_archive is failing — see `docker compose logs backup`
       - eval_time: 10m
         alertname: BackupCheckStale
@@ -950,6 +988,7 @@ tests:
               job: backup
               instance: stopped
             exp_annotations:
+              runbook_url: https://github.com/CircleTeamHub/circle_be/blob/main/docs/runbooks/alerts.md#backupcheckstale
               summary: Backup self-check has not completed for 3h+ — the backup scheduler may be down
 
   - name: 生产上没有任何备份结果时，2 小时后报 not reporting
@@ -967,6 +1006,7 @@ tests:
           - exp_labels:
               severity: warning
             exp_annotations:
+              runbook_url: https://github.com/CircleTeamHub/circle_be/blob/main/docs/runbooks/alerts.md#backupchecknotreporting
               summary: No backup self-check results in production — backups are not deployed, or check.sh cannot write its metrics
 
   - name: 开发机（没有 postgres-exporter）上不报 not reporting
@@ -1001,6 +1041,7 @@ tests:
               instance: backup-metrics
               check: minio_source
             exp_annotations:
+              runbook_url: https://github.com/CircleTeamHub/circle_be/blob/main/docs/runbooks/alerts.md#backupcheckfailing
               summary: Backup self-check minio_source is failing — see `docker compose logs backup`
 
   - name: 检查一直在跑、却 30 小时都没有完成过一份备份
@@ -1021,6 +1062,7 @@ tests:
               severity: warning
               check: backup_freshness
             exp_annotations:
+              runbook_url: https://github.com/CircleTeamHub/circle_be/blob/main/docs/runbooks/alerts.md#backupnevercompleted
               summary: Backup checks run, but the repository still has no completed backup after 30h — the base backup job is failing
 
   - name: 已有完成的备份时不报 never completed
@@ -1057,6 +1099,7 @@ tests:
               severity: warning
               provider: jpush
             exp_annotations:
+              runbook_url: https://github.com/CircleTeamHub/circle_be/blob/main/docs/runbooks/alerts.md#pushdeliveryfailing
               summary: Over 20% of jpush push deliveries are failing — credentials, quota or provider outage?
 
   - name: 推送量太小时一两次失败不报
@@ -1089,6 +1132,7 @@ tests:
           - exp_labels:
               severity: critical
             exp_annotations:
+              runbook_url: https://github.com/CircleTeamHub/circle_be/blob/main/docs/runbooks/alerts.md#emailcodesendfailing
               summary: Most verification-code emails are failing — users cannot register or sign in by email code
 
   - name: 生产上没配 SMTP（unavailable）同样算失败
@@ -1105,6 +1149,7 @@ tests:
           - exp_labels:
               severity: critical
             exp_annotations:
+              runbook_url: https://github.com/CircleTeamHub/circle_be/blob/main/docs/runbooks/alerts.md#emailcodesendfailing
               summary: Most verification-code emails are failing — users cannot register or sign in by email code
 
   - name: 偶发一封失败不报（失败率 100%，但只有一封）
@@ -1151,6 +1196,7 @@ tests:
               severity: warning
               provider: expo
             exp_annotations:
+              runbook_url: https://github.com/CircleTeamHub/circle_be/blob/main/docs/runbooks/alerts.md#pushdeliveryfailing
               summary: Over 20% of expo push deliveries are failing — credentials, quota or provider outage?
 
   # ── 间隔很短的任务：心跳阈值不能低于抓取与求值的粒度 ────────────────
@@ -1177,6 +1223,7 @@ tests:
               severity: warning
               exported_job: group_admission_delivery
             exp_annotations:
+              runbook_url: https://github.com/CircleTeamHub/circle_be/blob/main/docs/runbooks/alerts.md#cronjobstalled
               summary: Scheduled job group_admission_delivery has not succeeded in 3x its interval
 
   # ── 第三批：发版异地备份、依赖失败率、存储可达性、磁盘趋势、inode ─────
@@ -1194,6 +1241,7 @@ tests:
               job: backup
               instance: backup-metrics
             exp_annotations:
+              runbook_url: https://github.com/CircleTeamHub/circle_be/blob/main/docs/runbooks/alerts.md#releaseoffsitebackupfailed
               summary: The last release-time off-host database backup failed — see ~/circle_be_backups/.offsite-status on the host
       - eval_time: 30m
         alertname: ReleaseOffsiteBackupFailed
@@ -1221,6 +1269,7 @@ tests:
               severity: warning
               dependency: object_storage
             exp_annotations:
+              runbook_url: https://github.com/CircleTeamHub/circle_be/blob/main/docs/runbooks/alerts.md#dependencyrequestsfailing
               summary: Over 20% of backend requests to object_storage are failing — credentials, bucket policy or an outage?
 
   - name: 任一在服务的实例连不上对象存储就 critical
@@ -1240,6 +1289,7 @@ tests:
           - exp_labels:
               severity: critical
             exp_annotations:
+              runbook_url: https://github.com/CircleTeamHub/circle_be/blob/main/docs/runbooks/alerts.md#objectstoreunreachable
               summary: Object storage is unreachable — media uploads and reads are failing for every user
 
   - name: 按当前写入速度 24 小时内会写满就报
@@ -1265,6 +1315,7 @@ tests:
               mountpoint: /
               fstype: ext4
             exp_annotations:
+              runbook_url: https://github.com/CircleTeamHub/circle_be/blob/main/docs/runbooks/alerts.md#hostdiskwillfillwithin24h
               summary: Filesystem / is on track to fill within 24h at the current write rate
 
   - name: 平稳的盘、和下降中但还很空的盘都不报趋势
@@ -1320,6 +1371,7 @@ tests:
               mountpoint: /
               fstype: ext4
             exp_annotations:
+              runbook_url: https://github.com/CircleTeamHub/circle_be/blob/main/docs/runbooks/alerts.md#hostinodeslow
               summary: Filesystem / has less than 10% of its inodes left
           - exp_labels:
               severity: warning
@@ -1327,6 +1379,7 @@ tests:
               mountpoint: /var/lib/docker
               fstype: xfs
             exp_annotations:
+              runbook_url: https://github.com/CircleTeamHub/circle_be/blob/main/docs/runbooks/alerts.md#hostinodeslow
               summary: Filesystem /var/lib/docker has less than 10% of its inodes left
       - eval_time: 15m
         alertname: HostInodesNearlyExhausted
@@ -1337,6 +1390,7 @@ tests:
               mountpoint: /var/lib/docker
               fstype: xfs
             exp_annotations:
+              runbook_url: https://github.com/CircleTeamHub/circle_be/blob/main/docs/runbooks/alerts.md#hostinodesnearlyexhausted
               summary: Filesystem /var/lib/docker is almost out of inodes — new files (logs, uploads, WAL) will fail to be created
 
   - name: LiveKit 只失败两次（失败率 100%）不报 —— 最小失败数挡着
@@ -1369,4 +1423,374 @@ tests:
               severity: warning
               dependency: object_storage
             exp_annotations:
+              runbook_url: https://github.com/CircleTeamHub/circle_be/blob/main/docs/runbooks/alerts.md#dependencyrequestsfailing
               summary: Over 20% of backend requests to object_storage are failing — credentials, bucket policy or an outage?
+
+  # ── 版本、合成探测、钱包对账、恢复演练、Postgres 锁与回卷、通话 ──────────────
+  - name: 蓝绿两色跑不同构建超过 30 分钟才报，发版切换时的短暂并存不报
+    interval: 1m
+    input_series:
+      - series: circle_build_info{job="circle-be",instance="circle-be-blue",version="v1.0.0",commit="aaaaaaaaaaaa"}
+        values: 1x60
+      - series: circle_build_info{job="circle-be",instance="circle-be-green",version="v1.0.1",commit="bbbbbbbbbbbb"}
+        values: 1x60
+      - series: circle_build_info{job="circle-be",instance="circle-be-blue",version="v1.1.0",commit="cccccccccccc"}
+        values: _x70 1x60
+      - series: circle_build_info{job="circle-be",instance="circle-be-green",version="v1.1.1",commit="dddddddddddd"}
+        values: _x70 1x10
+    alert_rule_test:
+      - eval_time: 31m
+        alertname: BackendVersionSkew
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+            exp_annotations:
+              runbook_url: https://github.com/CircleTeamHub/circle_be/blob/main/docs/runbooks/alerts.md#backendversionskew
+              summary: Backend instances have been running different builds for 30m — a blue-green release did not finish
+      - eval_time: 100m
+        alertname: BackendVersionSkew
+        exp_alerts: []
+
+  - name: 合成探测 15 分钟没有一轮走通就报；重启后从未成功也照样报
+    interval: 1m
+    input_series:
+      - series: circle_synthetic_probe_configured{job="synthetic-probe",instance="synthetic-probe"}
+        values: 1x30
+      # 进程启动时播种的 last_success（时刻 0），之后再没成功过。
+      - series: circle_synthetic_probe_last_success_timestamp_seconds{job="synthetic-probe",instance="synthetic-probe"}
+        values: 0x30
+    alert_rule_test:
+      - eval_time: 14m
+        alertname: SyntheticProbeFailing
+        exp_alerts: []
+      - eval_time: 18m
+        alertname: SyntheticProbeFailing
+        exp_alerts:
+          - exp_labels:
+              severity: critical
+              job: synthetic-probe
+              instance: synthetic-probe
+            exp_annotations:
+              runbook_url: https://github.com/CircleTeamHub/circle_be/blob/main/docs/runbooks/alerts.md#syntheticprobefailing
+              summary: The synthetic probe account has not completed login → API → realtime for 15m
+              description: 'Failing step and reason: circle_synthetic_probe_failures_total; probe logs: event synthetic_probe_run.'
+
+  - name: 合成探测每轮都成功不报；没配测试号一小时后提醒
+    interval: 1m
+    input_series:
+      - series: circle_synthetic_probe_configured{job="synthetic-probe",instance="synthetic-probe"}
+        values: 1x40
+      - series: circle_synthetic_probe_last_success_timestamp_seconds{job="synthetic-probe",instance="synthetic-probe"}
+        values: 0+60x40
+      - series: circle_synthetic_probe_configured{job="synthetic-probe",instance="probe-unconfigured"}
+        values: 0x70
+    alert_rule_test:
+      - eval_time: 40m
+        alertname: SyntheticProbeFailing
+        exp_alerts: []
+      - eval_time: 61m
+        alertname: SyntheticProbeNotConfigured
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              job: synthetic-probe
+              instance: probe-unconfigured
+            exp_annotations:
+              runbook_url: https://github.com/CircleTeamHub/circle_be/blob/main/docs/runbooks/alerts.md#syntheticprobenotconfigured
+              summary: The synthetic probe is running without credentials — fill in .env.synthetic-probe and restart it
+
+  - name: 钱包对账发现不一致后，进程重启导致序列消失也不误恢复；对账恢复一致才消警
+    interval: 1m
+    input_series:
+      - series: circle_wallet_reconciliation_violations{job="circle-be",instance="circle-be-blue",check="ledger_mismatch"}
+        values: 2 _x119 0x10
+      - series: circle_wallet_reconciliation_violations{job="circle-be",instance="circle-be-blue",check="negative_balance"}
+        values: 0 _x119 0x10
+    alert_rule_test:
+      - eval_time: 1m
+        alertname: WalletLedgerMismatch
+        exp_alerts:
+          - exp_labels:
+              severity: critical
+              check: ledger_mismatch
+            exp_annotations:
+              runbook_url: https://github.com/CircleTeamHub/circle_be/blob/main/docs/runbooks/alerts.md#walletledgermismatch
+              summary: Wallet reconciliation found 2 wallet(s) failing ledger_mismatch — balances disagree with the coin ledger
+      # 中间两小时没有样本（重启后还没到下一次对账）：仍在报。
+      - eval_time: 90m
+        alertname: WalletLedgerMismatch
+        exp_alerts:
+          - exp_labels:
+              severity: critical
+              check: ledger_mismatch
+            exp_annotations:
+              runbook_url: https://github.com/CircleTeamHub/circle_be/blob/main/docs/runbooks/alerts.md#walletledgermismatch
+              summary: Wallet reconciliation found 2 wallet(s) failing ledger_mismatch — balances disagree with the coin ledger
+      - eval_time: 125m
+        alertname: WalletLedgerMismatch
+        exp_alerts: []
+
+  - name: 演练失败立即 critical 并标出停在哪一步；太久没通过另报 warning
+    interval: 1m
+    input_series:
+      - series: circle_backup_drill_success{job="backup",instance="backup-metrics",stage="restore"}
+        values: 0x80
+      # 上一次通过是 8 天又 100 秒之前。
+      - series: circle_backup_drill_last_success_timestamp_seconds{job="backup",instance="backup-metrics"}
+        values: -691300+0x80
+    alert_rule_test:
+      - eval_time: 1m
+        alertname: BackupRestoreDrillFailing
+        exp_alerts:
+          - exp_labels:
+              severity: critical
+              job: backup
+              instance: backup-metrics
+              stage: restore
+            exp_annotations:
+              runbook_url: https://github.com/CircleTeamHub/circle_be/blob/main/docs/runbooks/alerts.md#backuprestoredrillfailing
+              summary: The last restore drill failed at stage restore — see `docker compose logs backup`
+      - eval_time: 61m
+        alertname: BackupRestoreDrillStale
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              job: backup
+              instance: backup-metrics
+            exp_annotations:
+              runbook_url: https://github.com/CircleTeamHub/circle_be/blob/main/docs/runbooks/alerts.md#backuprestoredrillstale
+              summary: No restore drill has passed for 8 days — is the drill scheduled (BACKUP_JOBS) and running?
+
+  - name: 开了 5 分钟以上的事务持续 5 分钟才报；autovacuum 与空闲连接不算
+    interval: 1m
+    input_series:
+      - series: pg_stat_activity_max_tx_duration{datname="circle",state="idle in transaction",usename="circle",application_name="",backend_type="client backend",wait_event_type="Client",wait_event="ClientRead"}
+        values: 400+60x20
+      - series: pg_stat_activity_max_tx_duration{datname="circle",state="active",usename="postgres",application_name="",backend_type="autovacuum worker",wait_event_type="",wait_event=""}
+        values: 9000x20
+      - series: pg_stat_activity_max_tx_duration{datname="circle",state="idle",usename="circle",application_name="",backend_type="client backend",wait_event_type="Client",wait_event="ClientRead"}
+        values: 9000x20
+      # 发版前的 pg_dump 与恢复演练的计数查询本来就是长事务。
+      - series: pg_stat_activity_max_tx_duration{datname="circle",state="active",usename="circle",application_name="pg_dump",backend_type="client backend",wait_event_type="",wait_event=""}
+        values: 9000x20
+      - series: pg_stat_activity_max_tx_duration{datname="circle",state="active",usename="circle",application_name="circle-restore-drill",backend_type="client backend",wait_event_type="",wait_event=""}
+        values: 9000x20
+    alert_rule_test:
+      - eval_time: 3m
+        alertname: PostgresLongTransaction
+        exp_alerts: []
+      - eval_time: 6m
+        alertname: PostgresLongTransaction
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              datname: circle
+              state: idle in transaction
+            exp_annotations:
+              runbook_url: https://github.com/CircleTeamHub/circle_be/blob/main/docs/runbooks/alerts.md#postgreslongtransaction
+              summary: A transaction in circle (idle in transaction) has been open for more than 5m
+
+  - name: 卡在锁上一分钟以上、持续两分钟才报；短暂的咨询锁排队不报
+    interval: 1m
+    input_series:
+      - series: pg_stat_activity_max_tx_duration{datname="circle",state="active",usename="circle",application_name="",backend_type="client backend",wait_event_type="Lock",wait_event="advisory"}
+        values: 90+60x10
+      - series: pg_stat_activity_count{datname="circle",state="active",usename="circle",application_name="",backend_type="client backend",wait_event_type="Lock",wait_event="advisory"}
+        values: 2 6x10
+      - series: pg_stat_activity_max_tx_duration{datname="circle",state="active",usename="circle",application_name="",backend_type="client backend",wait_event_type="Lock",wait_event="transactionid"}
+        # 只在一次抓取里出现：下一次抓取时这组会话已经没了，序列立即失效。
+        values: 70 stale
+    alert_rule_test:
+      - eval_time: 3m
+        alertname: PostgresLockWaitStuck
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              datname: circle
+              wait_event: advisory
+            exp_annotations:
+              runbook_url: https://github.com/CircleTeamHub/circle_be/blob/main/docs/runbooks/alerts.md#postgreslockwaitstuck
+              summary: Sessions in circle have been waiting on a advisory lock for over a minute
+      - eval_time: 5m
+        alertname: PostgresLockPileUp
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              datname: circle
+            exp_annotations:
+              runbook_url: https://github.com/CircleTeamHub/circle_be/blob/main/docs/runbooks/alerts.md#postgreslockpileup
+              summary: 6 sessions in circle are queued on locks
+
+  - name: 回卷两档与采集项缺失
+    interval: 1m
+    input_series:
+      - series: pg_database_wraparound_age_datfrozenxid_seconds{datname="circle"}
+        values: 600000000x70
+      - series: pg_database_wraparound_age_datminmxid_seconds{datname="circle"}
+        values: 1000x70
+      - series: pg_database_wraparound_age_datfrozenxid_seconds{datname="template1"}
+        values: 1600000000x70
+      - series: pg_database_wraparound_age_datminmxid_seconds{datname="template1"}
+        values: 1000x70
+      - series: pg_up{instance="postgres-exporter"}
+        values: 1x70
+    alert_rule_test:
+      - eval_time: 61m
+        alertname: PostgresXidWraparoundRisk
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              datname: circle
+            exp_annotations:
+              runbook_url: https://github.com/CircleTeamHub/circle_be/blob/main/docs/runbooks/alerts.md#postgresxidwraparoundrisk
+              summary: Transaction ID age in circle is far above the autovacuum freeze threshold
+          - exp_labels:
+              severity: warning
+              datname: template1
+            exp_annotations:
+              runbook_url: https://github.com/CircleTeamHub/circle_be/blob/main/docs/runbooks/alerts.md#postgresxidwraparoundrisk
+              summary: Transaction ID age in template1 is far above the autovacuum freeze threshold
+      - eval_time: 11m
+        alertname: PostgresXidWraparoundImminent
+        exp_alerts:
+          - exp_labels:
+              severity: critical
+              datname: template1
+            exp_annotations:
+              runbook_url: https://github.com/CircleTeamHub/circle_be/blob/main/docs/runbooks/alerts.md#postgresxidwraparoundimminent
+              summary: Transaction ID age in template1 is approaching wraparound — Postgres will stop accepting writes
+      - eval_time: 61m
+        alertname: PostgresWraparoundMetricsMissing
+        exp_alerts: []
+
+  - name: exporter 在跑却没有回卷指标，一小时后报
+    interval: 1m
+    input_series:
+      - series: pg_up{instance="postgres-exporter"}
+        values: 1x70
+    alert_rule_test:
+      - eval_time: 61m
+        alertname: PostgresWraparoundMetricsMissing
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+            exp_annotations:
+              runbook_url: https://github.com/CircleTeamHub/circle_be/blob/main/docs/runbooks/alerts.md#postgreswraparoundmetricsmissing
+              summary: postgres-exporter is up but exports no wraparound metrics — recreate it with --collector.database_wraparound
+
+  - name: 死锁出现即报
+    interval: 1m
+    input_series:
+      - series: pg_stat_database_deadlocks{datid="16384",datname="circle"}
+        values: 0x5 1x10
+    alert_rule_test:
+      - eval_time: 7m
+        alertname: PostgresDeadlocks
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              datname: circle
+            exp_annotations:
+              runbook_url: https://github.com/CircleTeamHub/circle_be/blob/main/docs/runbooks/alerts.md#postgresdeadlocks
+              summary: Postgres detected deadlocks in circle in the last 15m
+
+  - name: 通话发起与接听的服务端失败超过两成才报，且要有最低通话量
+    interval: 1m
+    input_series:
+      - series: circle_call_setups_total{kind="direct",result="started"}
+        values: 0+1x30
+      - series: circle_call_setups_total{kind="direct",result="livekit_unavailable"}
+        values: 0+1x30
+      - series: circle_call_setups_total{kind="direct",result="busy"}
+        values: 0x30
+      - series: circle_call_accepts_total{kind="direct",result="accepted"}
+        values: 0+1x30
+      - series: circle_call_accepts_total{kind="direct",result="failed"}
+        values: 0x30
+    alert_rule_test:
+      - eval_time: 20m
+        alertname: CallSetupFailing
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+            exp_annotations:
+              runbook_url: https://github.com/CircleTeamHub/circle_be/blob/main/docs/runbooks/alerts.md#callsetupfailing
+              summary: Over 20% of call starts and answers are failing on the server (LiveKit unavailable or errors)
+
+  - name: 低通话量下一两通失败不报
+    interval: 1m
+    input_series:
+      - series: circle_call_setups_total{kind="direct",result="started"}
+        values: 0x10 1+0x20
+      - series: circle_call_setups_total{kind="direct",result="failed"}
+        values: 0x10 2+0x20
+      - series: circle_call_accepts_total{kind="direct",result="accepted"}
+        values: 0x30
+    alert_rule_test:
+      - eval_time: 20m
+        alertname: CallSetupFailing
+        exp_alerts: []
+
+  - name: 接通的电话大多 10 秒内结束才报
+    interval: 1m
+    input_series:
+      - series: circle_call_answered_duration_seconds_bucket{kind="direct",le="10"}
+        values: 0+1x40
+      - series: circle_call_answered_duration_seconds_count{kind="direct"}
+        values: 0+1x40
+      - series: circle_call_answered_duration_seconds_bucket{kind="group",le="10"}
+        values: 0x40
+      - series: circle_call_answered_duration_seconds_count{kind="group"}
+        values: 0+1x40
+    alert_rule_test:
+      # 两种通话合计：一半 10 秒内结束，不到六成，不报。
+      - eval_time: 25m
+        alertname: CallsEndingTooQuickly
+        exp_alerts: []
+
+  - name: 接通的电话几乎全在 10 秒内结束
+    interval: 1m
+    input_series:
+      - series: circle_call_answered_duration_seconds_bucket{kind="direct",le="10"}
+        values: 0+1x40
+      - series: circle_call_answered_duration_seconds_count{kind="direct"}
+        values: 0+1x40
+    alert_rule_test:
+      - eval_time: 25m
+        alertname: CallsEndingTooQuickly
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+            exp_annotations:
+              runbook_url: https://github.com/CircleTeamHub/circle_be/blob/main/docs/runbooks/alerts.md#callsendingtooquickly
+              summary: Most answered calls in the last 30m ended within 10s — media connections are probably failing
+
+  - name: LiveKit 回调全被拒才报；有正常回调时的零星被拒是扫描器
+    interval: 1m
+    input_series:
+      - series: circle_call_livekit_webhooks_total{result="rejected"}
+        values: 0+1x40
+      - series: circle_call_livekit_webhooks_total{result="handled"}
+        values: 0x20 0+1x20
+      - series: circle_call_livekit_webhooks_total{result="failed"}
+        values: 0x20 1+0x20
+    alert_rule_test:
+      - eval_time: 10m
+        alertname: LiveKitWebhookRejected
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+            exp_annotations:
+              runbook_url: https://github.com/CircleTeamHub/circle_be/blob/main/docs/runbooks/alerts.md#livekitwebhookrejected
+              summary: Every LiveKit webhook in the last 30m failed signature checks — do LIVEKIT_API_KEY / LIVEKIT_API_SECRET match the LiveKit project?
+      - eval_time: 40m
+        alertname: LiveKitWebhookRejected
+        exp_alerts: []
+      - eval_time: 22m
+        alertname: LiveKitWebhookFailing
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+            exp_annotations:
+              runbook_url: https://github.com/CircleTeamHub/circle_be/blob/main/docs/runbooks/alerts.md#livekitwebhookfailing
+              summary: Signed LiveKit webhooks are failing to process — room_finished events are being lost
