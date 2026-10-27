@@ -453,12 +453,18 @@ export class CirclePlazaService {
   /**
    * Resolve a deterministic, capped set of ACTIVE recipients before the post
    * transaction. Bidirectional blocks are excluded by the database query.
+   *
+   * groupBy rather than findMany + distinct: Prisma applies `take` to a
+   * `distinct` query in memory (the SQL has no LIMIT), so a post to 50 circles
+   * of 3000 members read every row back. groupBy compiles to
+   * `GROUP BY "userID" ORDER BY "userID" LIMIT n`.
    */
   private async getCirclePostPublishRecipientIds(
     authorId: string,
     circleIds: string[],
   ): Promise<string[]> {
-    const members = await this.prisma.circleMember.findMany({
+    const members = await this.prisma.circleMember.groupBy({
+      by: ['userID'],
       where: {
         circleID: { in: circleIds },
         status: 'ACTIVE',
@@ -468,8 +474,6 @@ export class CirclePlazaService {
           blocksReceived: { none: { blockerID: authorId } },
         },
       },
-      select: { userID: true },
-      distinct: ['userID'],
       orderBy: { userID: 'asc' },
       take: CIRCLE_POST_PUBLISH_FANOUT_CAP + 1,
     });

@@ -1,5 +1,7 @@
 import { CHAT_PUSH_COALESCE_MS, ChatPushService } from './chat-push.service';
 import type { ChatMessageDto } from './chat.types';
+import { UNREAD_COUNT_CAP } from './chat.constants';
+import { Prisma } from 'src/generated/prisma';
 
 function msg(overrides: Partial<ChatMessageDto> = {}): ChatMessageDto {
   return {
@@ -40,7 +42,23 @@ function seat(
 }
 
 function sqlText(call: unknown[]): string {
-  return (call[0] as TemplateStringsArray).join('?');
+  const query = call[0] as TemplateStringsArray | Prisma.Sql;
+  return 'strings' in query ? query.strings.join('?') : query.join('?');
+}
+
+/** 角标查询(Prisma.sql 对象)的绑定参数。 */
+function badgeQueryValues(calls: unknown[][]): Array<Prisma.Sql['values']> {
+  return calls
+    .map((call) => call[0])
+    .filter(
+      (query): query is Prisma.Sql =>
+        typeof query === 'object' &&
+        query !== null &&
+        'strings' in query &&
+        'values' in query,
+    )
+    .filter((query) => query.strings.join('?').includes('"lastReadHeight"'))
+    .map((query) => query.values);
 }
 
 describe('ChatPushService', () => {
@@ -180,6 +198,88 @@ describe('ChatPushService', () => {
     const badgeQuery = prisma.$queryRaw.mock.calls.map(sqlText).join('\n');
     expect(badgeQuery).toContain('m."revokedAt" IS NULL');
     expect(badgeQuery).toContain('cm."muted" = false');
+  });
+
+  it('stops counting each conversation at the unread cap the conversation list uses', async () => {
+    // 不封顶时成本 = 收件人所有未读之和:积压上万条的人每来一条推送就回表上万行。
+    // 会话列表每会话也只数到 UNREAD_COUNT_CAP,app 的 tab 角标就是这些封顶值之和。
+    prisma.chatMember.findMany.mockResolvedValue([seat('u-peer')]);
+
+    await pushNow(msg());
+
+    const badgeQuery = prisma.$queryRaw.mock.calls.map(sqlText).join('\n');
+    expect(badgeQuery).toContain('CROSS JOIN LATERAL');
+    expect(badgeQuery).toMatch(/LIMIT \?\s*\) AS capped/);
+    expect(badgeQuery).toContain('HAVING SUM(unread.count) > 0');
+    expect(badgeQueryValues(prisma.$queryRaw.mock.calls)).toEqual([
+      [UNREAD_COUNT_CAP, ['u-peer']],
+    ]);
+  });
+
+  it('computes badges only for recipients a push will actually reach', async () => {
+    // 正开着 App 的设备不推、没有 token 的人推不到 —— 给他们算全局未读纯属浪费,
+    // 而活跃群里这两类恰恰占多数。
+    prisma.chatMember.findMany.mockResolvedValue([
+      seat('u-offline'),
+      seat('u-on-screen'),
+      seat('u-no-token'),
+    ]);
+    broadcast.getForegroundPushTokensInConversation.mockResolvedValue(
+      new Map([['u-on-screen', new Set(['ExponentPushToken[a]'])]]),
+    );
+    push.listActiveTokensForUsers.mockImplementation((userIds: string[]) =>
+      Promise.resolve(
+        new Map(
+          userIds
+            .filter((userId) => userId !== 'u-no-token')
+            .map((userId) => [
+              userId,
+              [{ token: 'ExponentPushToken[a]', projectId: null }],
+            ]),
+        ),
+      ),
+    );
+
+    await pushNow(msg());
+
+    expect(badgeQueryValues(prisma.$queryRaw.mock.calls)).toEqual([
+      [UNREAD_COUNT_CAP, ['u-offline']],
+    ]);
+    expect(push.listActiveTokensForUsers).toHaveBeenCalledTimes(1);
+  });
+
+  it('keeps skipping badges for fan-outs above the cap even if few are reachable', async () => {
+    // 门槛仍按全部收件人算:300 人的群原来不算角标,不能因为「能推到的人」少于
+    // 上限就多出一条每秒级的聚合查询 —— 能推到的恰恰是未读积压最多的那批。
+    const seats = Array.from({ length: 250 }, (_, i) => seat(`u${i}`));
+    prisma.chatMember.findMany.mockResolvedValue(seats);
+    push.listActiveTokensForUsers.mockImplementation((userIds: string[]) =>
+      Promise.resolve(
+        new Map(
+          userIds
+            .filter((_, index) => index < 150)
+            .map((userId) => [
+              userId,
+              [{ token: `ExponentPushToken[${userId}]`, projectId: null }],
+            ]),
+        ),
+      ),
+    );
+
+    await pushNow(msg());
+
+    expect(badgeQueryValues(prisma.$queryRaw.mock.calls)).toEqual([]);
+    expect(sentPayloads()).toHaveLength(150);
+  });
+
+  it('skips the badge query entirely when nobody is reachable', async () => {
+    prisma.chatMember.findMany.mockResolvedValue([seat('u-no-token')]);
+    push.listActiveTokensForUsers.mockResolvedValue(new Map());
+
+    await pushNow(msg());
+
+    expect(badgeQueryValues(prisma.$queryRaw.mock.calls)).toEqual([]);
+    expect(push.sendMessages).not.toHaveBeenCalled();
   });
 
   it('fetches every seat in one bounded query instead of paging (G-06)', async () => {

@@ -10,6 +10,7 @@ import {
   type RevocationState,
 } from 'src/auth/session-revocation.service';
 import { SessionVerifier } from 'src/auth/session-verifier.service';
+import { sessionVerificationRow } from 'src/auth/__test__/session-verification-row.fixture';
 import { SESSION_REVOCATION_CHANNEL } from 'src/auth/session-revocation.broadcast';
 import { RealtimeGateway } from './realtime.gateway';
 import { RealtimeService } from './realtime.service';
@@ -100,12 +101,13 @@ function createPrismaStub() {
 /**
  * The database view SessionVerifier falls back to when Redis cannot answer.
  * Defaults to an ACTIVE account whose session row was already cleaned up.
+ * 回落判定是一条合并查询($queryRaw),这里直接给它那一行。
  */
 function createVerifierPrismaStub() {
   return {
-    user: { findUnique: jest.fn().mockResolvedValue({ status: 'ACTIVE' }) },
-    refreshToken: { findUnique: jest.fn().mockResolvedValue(null) },
-    sessionScopeGeneration: { findMany: jest.fn().mockResolvedValue([]) },
+    $queryRaw: jest
+      .fn()
+      .mockResolvedValue([sessionVerificationRow({ status: 'ACTIVE' }, null)]),
   };
 }
 
@@ -770,7 +772,9 @@ describe('RealtimeGateway session revocation', () => {
     });
 
     it('rejects a banned account at connect time with the revoked frame', async () => {
-      verifierPrisma.user.findUnique.mockResolvedValue({ status: 'BANNED' });
+      verifierPrisma.$queryRaw.mockResolvedValue([
+        sessionVerificationRow({ status: 'BANNED' }, null),
+      ]);
 
       await expect(
         authenticate({
@@ -787,7 +791,7 @@ describe('RealtimeGateway session revocation', () => {
     // 登录态保留；若这里发撤销帧，一次 Redis+数据库同时抖动会把所有在线用户登出。
     it('closes with a retryable 1013 when the session cannot be verified', async () => {
       jest.spyOn(Logger.prototype, 'warn').mockImplementation(() => undefined);
-      verifierPrisma.user.findUnique.mockRejectedValue(new Error('db down'));
+      verifierPrisma.$queryRaw.mockRejectedValue(new Error('db down'));
 
       await expect(
         authenticate({

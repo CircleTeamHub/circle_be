@@ -5,6 +5,11 @@ import { PrismaService } from '../../prisma/prisma.service';
 import { RefreshTokenService } from '../refresh-token.service';
 import { SessionRevocationService } from '../session-revocation.service';
 import { SessionVerifier } from '../session-verifier.service';
+import { sessionVerificationQuery } from '../session-verification.query';
+import {
+  matchingScopeGenerations,
+  sessionVerificationRow,
+} from './session-verification-row.fixture';
 import { jobMetrics } from '../../metrics/job-metrics';
 
 function metricValue(
@@ -441,28 +446,33 @@ describe('RefreshTokenService', () => {
       expect.objectContaining({ scope: 'FAMILY' }),
     );
 
+    // 回落判定是一条合并查询:用内存里的会话行和 scope generation 拼出那一行。
+    const ancestorRow = records.find(
+      (record) => record.id === ancestorSessionId,
+    );
+    const $queryRaw = jest
+      .fn()
+      .mockResolvedValue([
+        sessionVerificationRow(
+          { status: 'ACTIVE', accessTokensRevokedAt: null },
+          ancestorRow ?? null,
+          matchingScopeGenerations(
+            'user-1',
+            ancestorRow ?? null,
+            scopeGenerations.values(),
+          ),
+        ),
+      ]);
     const verifier = new SessionVerifier(
       { checkRevocation: jest.fn().mockResolvedValue('unknown') } as any,
-      {
-        user: {
-          findUnique: jest.fn().mockResolvedValue({
-            status: 'ACTIVE',
-            accessTokensRevokedAt: null,
-          }),
-        },
-        refreshToken: {
-          findUnique: jest.fn(({ where }) =>
-            Promise.resolve(
-              records.find((record) => record.id === where.id) ?? null,
-            ),
-          ),
-        },
-        sessionScopeGeneration: prisma.sessionScopeGeneration,
-      } as any,
+      { $queryRaw } as any,
     );
     await expect(
       verifier.verify({ sub: 'user-1', sid: ancestorSessionId }),
     ).resolves.toBe('revoked');
+    expect($queryRaw).toHaveBeenCalledWith(
+      sessionVerificationQuery('user-1', ancestorSessionId),
+    );
   });
 
   it('revokes a rotated family by incrementing one scope generation without rewriting history', async () => {

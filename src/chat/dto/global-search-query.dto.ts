@@ -12,7 +12,10 @@ import {
 import { HISTORY_PAGE_MAX } from '../chat.constants';
 
 export class GlobalSearchQueryDto {
-  @ApiProperty({ description: '关键词(跨本人全部会话搜文本消息)' })
+  @ApiProperty({
+    description:
+      '关键词(跨本人全部会话搜文本消息)。单个字只搜每个会话最近 500 条 —— 单字用不上索引;两个字及以上搜全部历史',
+  })
   @IsString()
   @MinLength(1)
   @MaxLength(100)

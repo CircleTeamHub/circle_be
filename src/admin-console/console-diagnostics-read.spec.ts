@@ -1,5 +1,6 @@
 import { FAILED_AUDIT_WHERE } from '../admin-operations/audit-record-kind';
 import { PrismaService } from 'src/prisma/prisma.service';
+import { RedisService } from 'src/redis/redis.service';
 import { ConsoleInsightsService } from './console-insights.service';
 
 describe('readable console diagnostics', () => {
@@ -18,7 +19,10 @@ describe('readable console diagnostics', () => {
     };
     return {
       prisma,
-      service: new ConsoleInsightsService(prisma as unknown as PrismaService),
+      service: new ConsoleInsightsService(
+        prisma as unknown as PrismaService,
+        {} as RedisService,
+      ),
     };
   }
   it('resolves visible actors in one bounded lookup and never returns raw metadata', async () => {
