@@ -6,7 +6,6 @@ import { JwtModule } from '@nestjs/jwt';
 import { ConfigModule, ConfigService } from '@nestjs/config';
 import { ConfigEnum } from 'src/enum/config.enum';
 import { JwtStrategy } from './auth.strategy';
-import { CaslAbilityService } from './casl-ability.service';
 import { RefreshTokenService } from './refresh-token.service';
 import { RefreshTokenCleanup } from './refresh-token.cleanup';
 import { SessionRevocationService } from './session-revocation.service';
@@ -75,7 +74,6 @@ import { DeviceTrustService } from './device-trust.service';
       },
     },
     JwtStrategy,
-    CaslAbilityService,
   ],
   controllers: [AuthController],
   // RefreshTokenService is exported so other modules (e.g. UserService when
@@ -83,11 +81,6 @@ import { DeviceTrustService } from './device-trust.service';
   // AuthService. SessionRevocationService and SessionVerifier are exported so
   // the WebSocket gateways reach the same revocation verdict on connect that
   // HTTP reaches per request (including the database fallback without Redis).
-  exports: [
-    CaslAbilityService,
-    RefreshTokenService,
-    SessionRevocationService,
-    SessionVerifier,
-  ],
+  exports: [RefreshTokenService, SessionRevocationService, SessionVerifier],
 })
 export class AuthModule {}

@@ -307,6 +307,20 @@ describe('CreateNoteShareLinkDto', () => {
     expect(validateSync(dto)).toHaveLength(0);
   });
 
+  it('counts the title limit in code points, so 120 emoji are accepted and 121 are not', () => {
+    const accepted = plainToInstance(CreateNoteShareLinkDto, {
+      title: '😀'.repeat(120),
+    });
+    const rejected = plainToInstance(CreateNoteShareLinkDto, {
+      title: '😀'.repeat(121),
+    });
+
+    expect(validateSync(accepted)).toHaveLength(0);
+    expect(
+      validateSync(rejected).some((error) => error.property === 'title'),
+    ).toBe(true);
+  });
+
   it('rejects deleted status and non-uuid note ids', () => {
     const dto = plainToInstance(CreateNoteShareLinkDto, {
       title: '我的笔记',

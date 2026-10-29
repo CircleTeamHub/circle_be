@@ -497,18 +497,4 @@ export class UserService {
 
   // updateStatus 已移除：管理端状态变更统一走 AdminUserService（#121），那里带
   // 事务、状态机校验、删除确认和 AdminAuditLog 留痕，这里的无审计版本是后门。
-
-  async updateBasicProfile(id: string, input: UpdateUserInput) {
-    // Same storage-origin guard as `update` — an off-origin avatarUrl/cover
-    // would otherwise become a stored tracking / phishing vector.
-    this.assertUrlsAreSafe(input);
-    const user = await this.prisma.user.update({
-      where: { id },
-      data: normalizeUpdateInput(input),
-      select: PUBLIC_SELECT,
-    });
-    await this.realtimeService.invalidateUserProfileSummaryCache(id);
-    await this.realtimeService.broadcastUserProfileSummary(id);
-    return user;
-  }
 }

@@ -18,7 +18,6 @@ import PDFDocument from 'pdfkit';
 import { Prisma } from 'src/generated/prisma';
 import { PrismaService } from 'src/prisma/prisma.service';
 import { MembershipPolicyService } from 'src/membership/membership-policy.service';
-import { RealtimeService } from 'src/realtime/realtime.service';
 import { purgeDeletedNote } from './note-purge';
 import {
   NOTE_SUMMARY_CONTENT_HEAD,
@@ -578,7 +577,6 @@ export class NoteService {
     private readonly membershipPolicy: MembershipPolicyService,
     private readonly chat: ChatService,
     @Optional() private readonly uploadService?: UploadService,
-    @Optional() private readonly realtime?: RealtimeService,
     @Optional() private readonly circleSync?: ChatCircleSyncService,
   ) {
     this.storagePublicObjectBases = storagePublicObjectBasesFromConfig(
@@ -3595,8 +3593,9 @@ export class NoteService {
     // 不再有 `|| '我的笔记'` 兜底：CreateNoteShareLinkDto 现在会 trim 并拒掉空白
     // 标题，空串到不了这里（docs 第 5 节）。硬编码中文兜底既绕不开 i18n
     // （它是内容不是报错，服务端也不知道调用方 locale），又会把「客户端传了个
-    // 空标题」这个 bug 悄悄盖掉。trim/slice 保留为纵深防御。
-    const title = dto.title.trim().slice(0, 120);
+    // 空标题」这个 bug 悄悄盖掉。trim 与 @MaxLength(120) 都在 DTO 上，这里
+    // 不再按 UTF-16 码元 slice：那会把 120 个码点的 emoji 标题截短或劈开代理对。
+    const title = dto.title;
     const search = dto.search?.trim() || null;
     const expiresAt =
       dto.expiresInDays != null

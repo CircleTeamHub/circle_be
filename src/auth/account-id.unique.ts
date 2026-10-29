@@ -62,12 +62,6 @@ export function isRegistrationCodeUniqueCollision(error: unknown): boolean {
   );
 }
 
-export function isInviteCodeUniqueCollision(error: unknown): boolean {
-  return uniqueCollisionTargets(error).some((target) =>
-    target.includes('inviteCode'),
-  );
-}
-
 /**
  * User_account_identifier_prepare 触发器在标识符被别人占用时 `RAISE EXCEPTION
  * 'account identifier collision: <value>'`。它走的是 plpgsql 的 P0001,不是

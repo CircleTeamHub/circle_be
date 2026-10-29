@@ -403,19 +403,6 @@ export class RefreshTokenService {
     return sessionIds.length;
   }
 
-  private async notifyPendingAccessRevocationsBestEffort(
-    where: Prisma.RefreshTokenWhereInput,
-  ): Promise<void> {
-    try {
-      await this.notifyPendingAccessRevocations(where);
-    } catch (error) {
-      this.logger.warn({
-        event: 'access_revocation_delivery_deferred',
-        errorType: error instanceof Error ? error.name : typeof error,
-      });
-    }
-  }
-
   private async notifyScopeRevocationBestEffort(event: {
     userId: string;
     scope: 'ACCOUNT' | 'AUDIENCE' | 'DEVICE' | 'FAMILY';
