@@ -87,7 +87,6 @@ describe('ChatPushService', () => {
         messages.map((message) => message.payload),
     );
   const broadcast = { getForegroundPushTokensInConversation: jest.fn() };
-  const privacySettings = { getSelfDestructPoliciesForUsers: jest.fn() };
 
   let service: ChatPushService;
 
@@ -103,7 +102,6 @@ describe('ChatPushService', () => {
       prisma as never,
       push as never,
       broadcast as never,
-      privacySettings as never,
     );
     prisma.$queryRaw.mockResolvedValue([]);
     prisma.chatConversation.findUnique.mockResolvedValue({
@@ -135,14 +133,6 @@ describe('ChatPushService', () => {
         messages.map((message) => ({ token: message.token, status: 'SENT' })),
       ),
     );
-    privacySettings.getSelfDestructPoliciesForUsers.mockImplementation(
-      (userIds: string[]) =>
-        Promise.resolve(
-          new Map(
-            userIds.map((userId) => [userId, { sec: 0, startedAt: null }]),
-          ),
-        ),
-    );
   });
 
   afterEach(() => {
@@ -159,33 +149,6 @@ describe('ChatPushService', () => {
     await pushNow(msg());
 
     expect(sentPayloads()).toEqual([expect.objectContaining({ badge: 7 })]);
-  });
-
-  it('redacts preview and caps TTL only for recipients with an active global burn window', async () => {
-    prisma.chatMember.findMany.mockResolvedValue([
-      seat('u-private'),
-      seat('u-plain'),
-    ]);
-    privacySettings.getSelfDestructPoliciesForUsers.mockResolvedValue(
-      new Map([
-        [
-          'u-private',
-          { sec: 300, startedAt: new Date('2026-08-06T11:00:00.000Z') },
-        ],
-        ['u-plain', { sec: 0, startedAt: null }],
-      ]),
-    );
-
-    await pushNow(msg());
-
-    expect(
-      privacySettings.getSelfDestructPoliciesForUsers,
-    ).not.toHaveBeenCalled();
-    expect(sentPayloads()).toEqual(
-      expect.arrayContaining([
-        expect.objectContaining({ body: 'hello world', ttl: 86400 }),
-      ]),
-    );
   });
 
   it('counts neither recalled messages nor muted conversations in the badge', async () => {

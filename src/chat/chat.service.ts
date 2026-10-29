@@ -1615,11 +1615,6 @@ export class ChatService {
     }));
   }
 
-  /** 会话列表:最近活跃前 N 个,带对端信息 / 末条消息 / 未读数;隐藏的不出。 */
-  async listConversations(userId: string): Promise<ChatConversationDto[]> {
-    return (await this.listConversationsPage(userId)).conversations;
-  }
-
   /**
    * 会话列表一页：置顶优先、再按末条消息时间倒序，取前 limit 条。多取一条判断是否被
    * 截断 —— 响应体保持数组（已装机 App 按数组解析），hasMore 由控制器写进 X-Has-More。
@@ -1992,27 +1987,6 @@ export class ChatService {
     return this.buildConversationDto(userId, conversation.id);
   }
 
-  /** 独立群聊邀请:任一在座成员可拉自己的好友(微信语义);圈子群走圈子成员管理。 */
-  /** Legacy internal entry points must not grant membership without consent. */
-  async inviteToGroupConversation(
-    _userId: string,
-    _conversationId: string,
-    _memberIds: string[],
-  ): Promise<ChatConversationDto> {
-    throw new ForbiddenException({
-      message: '请通过群邀请流程发送邀请',
-      errorCode: 'CHAT_GROUP_ACCEPT_REQUIRED',
-    });
-  }
-  async joinStandaloneGroupViaQr(
-    _userId: string,
-    _conversationId: string,
-  ): Promise<ChatConversationDto> {
-    throw new ForbiddenException({
-      message: '请先接受二维码邀请',
-      errorCode: 'CHAT_GROUP_ACCEPT_REQUIRED',
-    });
-  }
   async getGroupConversationForMember(
     userId: string,
     id: string,
@@ -2533,7 +2507,7 @@ export class ChatService {
     return this.buildConversationDto(userId, conversationId);
   }
 
-  /** 单会话 DTO(与 listConversations 同形):get-or-create / 偏好接口复用。 */
+  /** 单会话 DTO(与 listConversationsPage 同形):get-or-create / 偏好接口复用。 */
   private async buildConversationDto(
     userId: string,
     conversationId: string,
@@ -2748,7 +2722,6 @@ export class ChatService {
     beforeHeight?: number,
     limit: number = HISTORY_PAGE_DEFAULT,
     filters: HistoryFilters = {},
-    _options: { applyViewerRetention?: boolean } = {},
   ): Promise<ChatHistoryPageDto> {
     const { conversation, member } = await this.requireMembershipSeat(
       conversationId,

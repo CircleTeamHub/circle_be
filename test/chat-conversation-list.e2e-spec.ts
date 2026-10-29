@@ -109,7 +109,8 @@ describePostgres('Chat conversation list queries e2e', () => {
       },
     });
 
-    const aliceList = await chat.listConversations(alice.id);
+    const aliceList = (await chat.listConversationsPage(alice.id))
+      .conversations;
     const busyForAlice = aliceList.find((row) => row.id === busy.id);
     expect(busyForAlice?.lastMessage).toMatchObject({
       height: 151,
@@ -126,7 +127,7 @@ describePostgres('Chat conversation list queries e2e', () => {
       where: { conversationID: busy.id, userID: bob.id },
       data: { lastReadHeight: 150 },
     });
-    const bobList = await chat.listConversations(bob.id);
+    const bobList = (await chat.listConversationsPage(bob.id)).conversations;
     // 自己发的、已焚毁的都不算:只剩 alice 那一条。
     expect(bobList.find((row) => row.id === busy.id)?.unreadCount).toBe(1);
   });
@@ -166,7 +167,7 @@ describePostgres('Chat conversation list queries e2e', () => {
       ],
     });
 
-    const row = (await chat.listConversations(alice.id)).find(
+    const row = (await chat.listConversationsPage(alice.id)).conversations.find(
       (candidate) => candidate.id === burning.id,
     );
     expect(row?.lastMessage).toMatchObject({

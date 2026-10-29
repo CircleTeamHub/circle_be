@@ -9,7 +9,6 @@ import {
 import { ChatErrorCode, QrErrorCode } from 'src/common/app-error-codes';
 import { PrismaService } from 'src/prisma/prisma.service';
 import { GroupAdmissionService } from 'src/chat/group-admission.service';
-import { ChatService } from 'src/chat/chat.service';
 import { CircleInvitationService } from 'src/circle-invitation/circle-invitation.service';
 import type { Prisma, QrToken } from 'src/generated/prisma';
 import type {
@@ -37,7 +36,6 @@ const ROTATE_BELOW_REMAINING_MS = 24 * 60 * 60 * 1000;
 export class QrService {
   constructor(
     private readonly prisma: PrismaService,
-    private readonly chatService: ChatService,
     private readonly circleInvitation: CircleInvitationService,
     private readonly admissions: GroupAdmissionService,
   ) {}

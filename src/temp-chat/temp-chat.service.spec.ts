@@ -556,7 +556,6 @@ describe('TempChatService', () => {
         10,
         20,
         { afterHeight: undefined },
-        { applyViewerRetention: false },
       );
       expect(page).toEqual({
         messages: [

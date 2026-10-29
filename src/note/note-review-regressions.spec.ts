@@ -125,7 +125,6 @@ describe('note review regressions', () => {
       policy as any,
       {} as any,
       upload as any,
-      undefined,
       circleSync as any,
     );
     return { service, prisma, policy, upload, circleSync };

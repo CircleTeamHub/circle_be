@@ -2913,10 +2913,6 @@ describe('NoteService', () => {
   });
 
   it('atomically enqueues source status fan-out without scanning or broadcasting in the request', async () => {
-    const realtime = {
-      safeBroadcastAll: jest.fn(),
-      broadcastNoteSourceStatusChanged: jest.fn(),
-    };
     const configured = new NoteService(
       prisma as any,
       {
@@ -2925,7 +2921,6 @@ describe('NoteService', () => {
       new MembershipPolicyService(prisma as any),
       chatService as any,
       uploadService as any,
-      realtime as any,
     );
     prisma.note.findFirst.mockResolvedValueOnce({
       id: 'copy-note',
@@ -2970,8 +2965,6 @@ describe('NoteService', () => {
       }),
     });
     expect(prisma.note.findMany).not.toHaveBeenCalled();
-    expect(realtime.safeBroadcastAll).not.toHaveBeenCalled();
-    expect(realtime.broadcastNoteSourceStatusChanged).not.toHaveBeenCalled();
   });
 
   it('updates note status for the owner only', async () => {
@@ -3386,6 +3379,33 @@ describe('NoteService', () => {
     } finally {
       jest.useRealTimers();
     }
+  });
+
+  it('stores a DTO-valid emoji title unchanged instead of re-slicing it by UTF-16 units', async () => {
+    // @MaxLength(120) 按码点计数，120 个 emoji 是合法标题（240 个 UTF-16 码元）。
+    // 服务里曾经再 `.slice(0, 120)` 一次，会把它截成 60 个、或劈开代理对。
+    const title = '😀'.repeat(120);
+    prisma.noteShareLink.create.mockResolvedValueOnce({
+      id: 'share-emoji',
+      ownerID: 'user-1',
+      token: 'token-emoji',
+      title,
+      status: null,
+      group: null,
+      groupID: null,
+      search: null,
+      noteIDs: [],
+      expiresAt: null,
+      revokedAt: null,
+      createdAt: new Date('2026-06-08T10:00:00.000Z'),
+      updatedAt: new Date('2026-06-08T10:00:00.000Z'),
+    });
+
+    await service.createShareLink('user-1', { title });
+
+    expect(prisma.noteShareLink.create).toHaveBeenCalledWith({
+      data: expect.objectContaining({ title }),
+    });
   });
 
   it('retries token generation on a unique-token collision', async () => {

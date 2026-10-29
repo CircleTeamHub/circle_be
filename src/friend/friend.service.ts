@@ -44,7 +44,6 @@ import { isBlockedByStandaloneGroupPolicy } from 'src/chat/standalone-group-poli
 const BLOCKED_PAGE_SIZE = 1000;
 const FRIEND_LIMIT_USER = 1_000;
 const FRIEND_LIMIT_MEMBER = 5_000;
-const FRIEND_ACCEPTED_REPLY_MESSAGE = '我通过了你的好友请求，现在开始聊天吧';
 
 // 好友申请留言:纯文本上限 + 发起方在对方回复前的连发软上限(防刷)。
 const FRIEND_REQUEST_MESSAGE_MAX_LENGTH = 500;

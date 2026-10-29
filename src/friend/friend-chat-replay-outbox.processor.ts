@@ -87,7 +87,7 @@ export class FriendChatReplayOutboxProcessor {
         });
       }
 
-      const [request, thread, requester, accepter] = await Promise.all([
+      const [request, thread, requester] = await Promise.all([
         this.prisma.friend.findUnique({
           where: { id: job.requestId },
           select: { message: true },
@@ -101,13 +101,8 @@ export class FriendChatReplayOutboxProcessor {
           where: { id: job.requesterUserID },
           select: { nickname: true, accountId: true, avatarUrl: true },
         }),
-        this.prisma.user.findUnique({
-          where: { id: job.accepterUserID },
-          select: { nickname: true, accountId: true, avatarUrl: true },
-        }),
       ]);
       const requesterName = this.displayName(requester, job.requesterUserID);
-      const accepterName = this.displayName(accepter, job.accepterUserID);
 
       if (stage === 2) {
         const replay = thread ?? [];

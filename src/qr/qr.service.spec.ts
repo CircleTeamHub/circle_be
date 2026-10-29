@@ -25,7 +25,6 @@ describe('QrService', () => {
     $transaction: jest.fn(),
     $queryRaw: jest.fn(),
   };
-  const chatService = { joinStandaloneGroupViaQr: jest.fn() };
   const circleInvitation = { invite: jest.fn() };
 
   let service: QrService;
@@ -36,12 +35,7 @@ describe('QrService', () => {
       async (cb: (tx: typeof prisma) => unknown) => cb(prisma),
     );
     prisma.$queryRaw.mockResolvedValue([{ locked: null }]);
-    service = new QrService(
-      prisma as any,
-      chatService as any,
-      circleInvitation as any,
-      {} as any,
-    );
+    service = new QrService(prisma as any, circleInvitation as any, {} as any);
   });
 
   describe('issueToken', () => {
@@ -427,7 +421,6 @@ describe('QrService', () => {
       await expect(service.joinByToken('u1', 'tok')).rejects.toMatchObject({
         response: { errorCode: 'CHAT_GROUP_ACCEPT_REQUIRED' },
       });
-      expect(chatService.joinStandaloneGroupViaQr).not.toHaveBeenCalled();
     });
 
     it('refuses circle QR joins once the circle conversation switched QR joining off', async () => {

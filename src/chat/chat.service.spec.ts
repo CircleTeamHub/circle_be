@@ -274,16 +274,7 @@ describe('ChatService', () => {
     prisma.chatMember.findUnique.mockResolvedValue(membership());
     prisma.chatMessage.findMany.mockResolvedValue([]);
 
-    await service.getHistory(
-      'guest-1',
-      'conv-1',
-      undefined,
-      50,
-      {},
-      {
-        applyViewerRetention: false,
-      },
-    );
+    await service.getHistory('guest-1', 'conv-1', undefined, 50, {});
 
     const [[args]] = prisma.chatMessage.findMany.mock.calls as [
       [{ where: Record<string, unknown> }],
@@ -3286,7 +3277,7 @@ describe('ChatService', () => {
     });
   });
 
-  describe('listConversations', () => {
+  describe('listConversationsPage', () => {
     // 一页最多 limit 条（默认 100）：多取一条判断截断，响应体仍是数组，由控制器写
     // X-Has-More。此前超过 100 个会话的用户在 App 里静默少一截。
     it('reports hasMore when more conversations exist than the page limit', async () => {
@@ -3387,7 +3378,7 @@ describe('ChatService', () => {
       ]);
       prisma.$queryRaw.mockResolvedValue([]);
 
-      await service.listConversations('u1');
+      await service.listConversationsPage('u1');
 
       expect(privacySettings.getSelfDestructPolicy).not.toHaveBeenCalled();
       for (const [query] of prisma.$queryRaw.mock.calls as [Prisma.Sql][]) {
@@ -3430,7 +3421,7 @@ describe('ChatService', () => {
         { id: 'u2', nickname: '对方', avatarUrl: null },
       ]);
 
-      const list = await service.listConversations('u1');
+      const list = (await service.listConversationsPage('u1')).conversations;
 
       expect(list).toHaveLength(1);
       expect(list[0]).toMatchObject({
@@ -3462,7 +3453,7 @@ describe('ChatService', () => {
       ]);
       prisma.$queryRaw.mockResolvedValue([]);
 
-      const list = await service.listConversations('u1');
+      const list = (await service.listConversationsPage('u1')).conversations;
 
       expect(list[0]).toMatchObject({ readHeight: 12, clearedBeforeHeight: 8 });
     });
@@ -3471,7 +3462,7 @@ describe('ChatService', () => {
       prisma.chatMember.findMany.mockResolvedValueOnce([membership()]);
       prisma.$queryRaw.mockResolvedValue([]);
 
-      await service.listConversations('u1');
+      await service.listConversationsPage('u1');
 
       const unreadSql = (prisma.$queryRaw.mock.calls as [Prisma.Sql][])
         .map(([query]) => query.sql)
@@ -3500,7 +3491,7 @@ describe('ChatService', () => {
         { id: 'tc-1', title: '周末临时群' },
       ]);
 
-      const list = await service.listConversations('u1');
+      const list = (await service.listConversationsPage('u1')).conversations;
 
       expect(list[0]).toMatchObject({
         id: 'conv-temp',
@@ -3539,7 +3530,7 @@ describe('ChatService', () => {
       ]);
       prisma.$queryRaw.mockResolvedValue([]);
 
-      const list = await service.listConversations('u1');
+      const list = (await service.listConversationsPage('u1')).conversations;
 
       expect(list[0]).toMatchObject({
         id: 'conv-1',
@@ -3571,7 +3562,7 @@ describe('ChatService', () => {
       prisma.chatMember.findMany.mockResolvedValueOnce(rows);
       prisma.$queryRaw.mockResolvedValue([]);
 
-      await service.listConversations('u1');
+      await service.listConversationsPage('u1');
 
       // 60 个会话 → 2 次集合查询(末条 + 未读),而不是 120 次往返。
       expect(prisma.$queryRaw).toHaveBeenCalledTimes(2);
@@ -4017,7 +4008,7 @@ describe('ChatService', () => {
         .mockResolvedValueOnce([createdRow])
         .mockResolvedValue([]);
 
-      const list = await service.listConversations('u1');
+      const list = (await service.listConversationsPage('u1')).conversations;
 
       expect(list[0]).toMatchObject({
         id: 'conv-1',
@@ -4045,7 +4036,7 @@ describe('ChatService', () => {
         { id: 'u2', nickname: '对方', avatarUrl: null },
       ]);
 
-      const list = await service.listConversations('u1');
+      const list = (await service.listConversationsPage('u1')).conversations;
 
       expect(list[0]).toMatchObject({
         type: 'DIRECT',
@@ -7473,7 +7464,7 @@ describe('ChatService', () => {
         .mockResolvedValueOnce([]);
       prisma.$queryRaw.mockResolvedValueOnce([peerRow]).mockResolvedValue([]);
 
-      const list = await service.listConversations('u1');
+      const list = (await service.listConversationsPage('u1')).conversations;
 
       expect(list[0].lastMessage).toHaveProperty('d', null);
     });
@@ -7494,7 +7485,7 @@ describe('ChatService', () => {
         .mockResolvedValueOnce([createdRow])
         .mockResolvedValue([]);
 
-      const list = await service.listConversations('u1');
+      const list = (await service.listConversationsPage('u1')).conversations;
 
       expect(list[0].lastMessage?.d).toBe('client-msg-1');
     });

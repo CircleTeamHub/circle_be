@@ -86,7 +86,6 @@ export class PrismaService
   private readonly pool: Pool | null;
   /** 配置上限。pg.Pool 不暴露 max，只能自己记着。 */
   private readonly poolMax: number;
-  private isConnected = false;
 
   constructor() {
     const config = getServerConfig();
@@ -165,11 +164,8 @@ export class PrismaService
 
     try {
       await this.$connect();
-      this.isConnected = true;
       this.logger.log('PrismaClient connected to database successfully');
     } catch (error) {
-      this.isConnected = false;
-
       if (this.allowStartWithoutDb) {
         this.logger.error(
           `Database connection error: ${error instanceof Error ? error.message : String(error)}`,
@@ -184,7 +180,6 @@ export class PrismaService
 
   async onModuleDestroy() {
     await this.$disconnect();
-    this.isConnected = false;
     // @prisma/adapter-pg 只在**自己**创建池时负责销毁它（内部用 externalPool
     // 区分）。既然改成由这里建池，关闭责任也一并转移过来 —— 漏掉这一步，每次
     // 优雅重启都会留下一把不归还的 Postgres 连接，蓝绿发布下尤其明显。
@@ -198,36 +193,6 @@ export class PrismaService
           error instanceof Error ? error.message : String(error)
         }`,
       );
-    }
-  }
-
-  isDatabaseConnected(): boolean {
-    return this.isConnected;
-  }
-
-  async connectIfNeeded(): Promise<boolean> {
-    if (this.isConnected) {
-      return true;
-    }
-
-    if (!this.connectionString) {
-      this.logger.warn(
-        'Database connection requested but DATABASE_URL is not configured.',
-      );
-      return false;
-    }
-
-    try {
-      await this.$connect();
-      this.isConnected = true;
-      this.logger.log('PrismaClient connected to database successfully');
-      return true;
-    } catch (error) {
-      this.isConnected = false;
-      this.logger.error(
-        `Failed to connect to database: ${error instanceof Error ? error.message : String(error)}`,
-      );
-      return false;
     }
   }
 
