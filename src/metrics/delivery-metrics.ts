@@ -7,8 +7,9 @@ import { Counter, Registry } from 'prom-client';
  * JPush 没配 key、SMTP 被限流时，指标和告警一片安静。PushDeliveryFailing /
  * EmailCodeSendFailing 读的就是这里。
  *
- * 推送按单 token 的结论计，Expo 的异步回执失败会再计一次（ok 回执不计）——
- * APNs/FCM 凭证失效、限流主要只出现在回执里，同步 ticket 照样是 ok：
+ * circle_push_deliveries_total 保留 provider 每次上报的原始结果，便于诊断；
+ * circle_push_delivery_terminal_total 则按单 token、单次投递尝试只记录一个终态。
+ * Expo ticket 为 ok 时要等异步回执再写终态，避免 ticket 与失败回执同时进入失败率分母：
  * - sent：provider 同步收下了；
  * - retryable：凭证、限流、网络、未配置这类会重试的失败；
  * - dead_token：令牌已死（卸载 App、注册 ID 失效）。这是正常流失，**不算**
@@ -35,6 +36,7 @@ export type EmailCodeSendResult = (typeof EMAIL_CODE_SEND_RESULTS)[number];
 export interface DeliveryMetrics {
   readonly registry: Registry;
   recordPushDelivery(provider: PushProvider, result: PushDeliveryResult): void;
+  recordPushTerminal(provider: PushProvider, result: PushDeliveryResult): void;
   recordEmailCodeSend(result: EmailCodeSendResult): void;
 }
 
@@ -43,6 +45,12 @@ export function createDeliveryMetrics(): DeliveryMetrics {
   const pushDeliveries = new Counter({
     name: 'circle_push_deliveries_total',
     help: 'Push deliveries by provider and synchronous per-token outcome.',
+    labelNames: ['provider', 'result'],
+    registers: [registry],
+  });
+  const pushDeliveryTerminals = new Counter({
+    name: 'circle_push_delivery_terminal_total',
+    help: 'Terminal push outcomes by provider, counted once per token delivery attempt.',
     labelNames: ['provider', 'result'],
     registers: [registry],
   });
@@ -58,6 +66,7 @@ export function createDeliveryMetrics(): DeliveryMetrics {
   for (const provider of PUSH_PROVIDERS) {
     for (const result of PUSH_DELIVERY_RESULTS) {
       pushDeliveries.labels({ provider, result }).inc(0);
+      pushDeliveryTerminals.labels({ provider, result }).inc(0);
     }
   }
   for (const result of EMAIL_CODE_SEND_RESULTS) {
@@ -68,6 +77,9 @@ export function createDeliveryMetrics(): DeliveryMetrics {
     registry,
     recordPushDelivery(provider, result) {
       pushDeliveries.inc({ provider, result });
+    },
+    recordPushTerminal(provider, result) {
+      pushDeliveryTerminals.inc({ provider, result });
     },
     recordEmailCodeSend(result) {
       emailCodeSends.inc({ result });

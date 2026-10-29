@@ -466,16 +466,16 @@ groups:
   # 低流量时一两次失败不叫人。
   - name: deliveries
     rules:
-      # 按 provider 分开算：Expo 和 JPush 的凭证、配额、故障互不相干。分子只算
-      # retryable / rejected；dead_token（卸载 App、注册 ID 失效）是正常流失，
-      # 算进去的话一批老设备就能把失败率拉过阈值。
+      # 按 provider 分开算：Expo 和 JPush 的凭证、配额、故障互不相干。终态指标
+      # 每个 token 的一次投递尝试只计一次，避免 Expo ticket sent + receipt failure
+      # 把失败样本在分母里重复计数。dead_token 是正常流失，不进分子。
       - alert: PushDeliveryFailing
         expr: |
           (
-            sum by (provider) (rate(circle_push_deliveries_total{job="circle-be",result=~"retryable|rejected"}[15m]))
-              / sum by (provider) (rate(circle_push_deliveries_total{job="circle-be"}[15m]))
+            sum by (provider) (rate(circle_push_delivery_terminal_total{job="circle-be",result=~"retryable|rejected"}[15m]))
+              / sum by (provider) (rate(circle_push_delivery_terminal_total{job="circle-be"}[15m]))
           ) > 0.2
-          and sum by (provider) (increase(circle_push_deliveries_total{job="circle-be"}[15m])) >= 20
+          and sum by (provider) (increase(circle_push_delivery_terminal_total{job="circle-be"}[15m])) >= 20
         for: 10m
         labels:
           severity: warning
