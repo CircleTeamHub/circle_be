@@ -1245,6 +1245,12 @@ export class NotificationPushService {
     ticket: ExpoPushTicket,
   ): TokenDeliveryOutcome {
     if (ticket.status === 'ok') {
+      // Expo's success ticket must carry an id so the receipt poller can settle
+      // this delivery. Treat a malformed success ticket as retryable instead of
+      // leaving a SENT row with no receipt lookup key forever.
+      if (!ticket.id) {
+        return { token, status: 'RETRYABLE', error: 'MissingExpoPushTicket' };
+      }
       return { token, status: 'SENT', ticketId: ticket.id };
     }
     if (ticket.status !== 'error') {

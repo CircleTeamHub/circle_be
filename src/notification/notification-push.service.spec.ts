@@ -148,6 +148,19 @@ describe('NotificationPushService (#88 per-token delivery)', () => {
       });
     });
 
+    it('retries a success ticket without an id so it cannot get stuck awaiting a receipt', async () => {
+      fetchMock.mockResolvedValue({
+        ok: true,
+        json: async () => ({ data: [{ status: 'ok' }] }),
+      });
+
+      await expect(
+        service.sendToTokens([{ token: 'tok-a', projectId: null }], payload),
+      ).resolves.toEqual([
+        { token: 'tok-a', status: 'RETRYABLE', error: 'MissingExpoPushTicket' },
+      ]);
+    });
+
     it('does NOT disable tokens on message-level terminal errors (MessageTooBig)', async () => {
       fetchMock.mockResolvedValue({
         ok: true,
