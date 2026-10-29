@@ -157,16 +157,32 @@ function recordPushDelivery(
   }
 }
 
+/** 每个 token 的一次投递尝试只在最终结论确定时计数。 */
+function recordPushTerminal(
+  provider: PushProvider,
+  result: PushDeliveryResult,
+): void {
+  try {
+    deliveryMetrics.recordPushTerminal(provider, result);
+  } catch {
+    // Metrics are best effort.
+  }
+}
+
 /** 结论与入参同下标。 */
 function recordPushOutcomes(
   messages: ReadonlyArray<Pick<PushTokenTarget, 'provider'>>,
   outcomes: readonly TokenDeliveryOutcome[],
 ): void {
   outcomes.forEach((outcome, index) => {
-    recordPushDelivery(
-      messages[index]?.provider === 'jpush' ? 'jpush' : 'expo',
-      pushDeliveryResult(outcome),
-    );
+    const provider = messages[index]?.provider === 'jpush' ? 'jpush' : 'expo';
+    const result = pushDeliveryResult(outcome);
+    recordPushDelivery(provider, result);
+    // Expo 的 SENT ticket 仍在等异步 receipt；其余同步失败，以及没有异步
+    // receipt 阶段的渠道，已经得到这次尝试的唯一终态。
+    if (outcome.status !== 'SENT' || outcome.receiptFinal === true) {
+      recordPushTerminal(provider, result);
+    }
   });
 }
 
@@ -458,7 +474,11 @@ export class NotificationPushService {
     outcomes: readonly TokenDeliveryOutcome[],
   ): Promise<void> {
     for (const outcome of outcomes) {
-      recordPushDelivery(provider, pushDeliveryResult(outcome));
+      const result = pushDeliveryResult(outcome);
+      recordPushDelivery(provider, result);
+      if (outcome.status !== 'SENT' || outcome.receiptFinal === true) {
+        recordPushTerminal(provider, result);
+      }
     }
     await this.disableDeadTokens(outcomes);
   }
@@ -641,14 +661,21 @@ export class NotificationPushService {
         d.sentAt && d.sentAt.getTime() < now.getTime() - RECEIPT_MAX_AGE_MS,
     );
     if (expired.length > 0) {
-      await this.prisma.notificationPushDelivery.updateMany({
-        where: { id: { in: expired.map((d) => d.id) } },
-        data: {
-          status: 'CONFIRMED',
-          receiptCheckedAt: now,
-          lastError: 'receipt-expired-assumed-delivered',
-        },
-      });
+      const transitioned =
+        await this.prisma.notificationPushDelivery.updateMany({
+          where: {
+            id: { in: expired.map((d) => d.id) },
+            status: 'SENT',
+          },
+          data: {
+            status: 'CONFIRMED',
+            receiptCheckedAt: now,
+            lastError: 'receipt-expired-assumed-delivered',
+          },
+        });
+      for (let index = 0; index < transitioned.count; index += 1) {
+        recordPushTerminal('expo', 'sent');
+      }
     }
     const settledOutboxIDs = new Set(expired.map((d) => d.outboxID));
     const pending = deliveries.filter((d) => !expired.includes(d));
@@ -722,8 +749,8 @@ export class NotificationPushService {
         confirmedIDs.push(delivery.id);
         continue;
       }
-      // 回执阶段的失败再计一次（ok 回执不计，ticket 阶段已经记过 sent）：
-      // APNs/FCM 凭证失效、限流主要只出现在这里，同步 ticket 照样是 ok。
+      // 原始 provider 结果在回执失败时再计一次；终态指标则只在 SENT 状态转换
+      // 成功后计一次。APNs/FCM 凭证失效、限流主要只出现在这里。
       const errorCode = receipt.details?.error ?? 'UnknownExpoReceiptError';
       if (TERMINAL_TOKEN_ERRORS.has(errorCode)) {
         recordPushDelivery('expo', 'dead_token');
@@ -736,39 +763,50 @@ export class NotificationPushService {
       // round 3 review：FAILED 标记与 outbox 重开必须同事务 —— 行改成
       // FAILED 后 outbox 若没能拉回 PENDING（写失败），这条可重试失败就
       // 永远没有下一次 sweep。
-      await this.prisma.$transaction([
-        this.prisma.notificationPushDelivery.update({
-          where: { id: delivery.id },
+      const transitioned = await this.prisma.$transaction(async (tx) => {
+        const result = await tx.notificationPushDelivery.updateMany({
+          where: { id: delivery.id, status: 'SENT' },
           data: {
             status: 'FAILED',
             receiptCheckedAt: now,
             lastError: errorCode,
           },
-        }),
-        this.prisma.notificationPushOutbox.updateMany({
+        });
+        if (result.count === 0) return false;
+        await tx.notificationPushOutbox.updateMany({
           where: { id: delivery.outboxID, status: 'COMPLETED' },
           data: { status: 'PENDING', nextAttemptAt: now },
-        }),
-      ]);
+        });
+        return true;
+      });
+      if (transitioned) recordPushTerminal('expo', 'retryable');
     }
 
     // 必须排在 reconcileCompletedOutboxes 之前：它按「还有没有 SENT 行」判定 outbox
     // 能否终结，这些行得先离开 SENT。
     if (confirmedIDs.length > 0) {
-      await this.prisma.notificationPushDelivery.updateMany({
-        where: { id: { in: confirmedIDs } },
-        data: { status: 'CONFIRMED', receiptCheckedAt: now, lastError: null },
-      });
+      const transitioned =
+        await this.prisma.notificationPushDelivery.updateMany({
+          where: { id: { in: confirmedIDs }, status: 'SENT' },
+          data: { status: 'CONFIRMED', receiptCheckedAt: now, lastError: null },
+        });
+      for (let index = 0; index < transitioned.count; index += 1) {
+        recordPushTerminal('expo', 'sent');
+      }
     }
     for (const [errorCode, ids] of terminalIDsByError) {
-      await this.prisma.notificationPushDelivery.updateMany({
-        where: { id: { in: ids } },
-        data: {
-          status: 'TERMINAL',
-          receiptCheckedAt: now,
-          lastError: errorCode,
-        },
-      });
+      const transitioned =
+        await this.prisma.notificationPushDelivery.updateMany({
+          where: { id: { in: ids }, status: 'SENT' },
+          data: {
+            status: 'TERMINAL',
+            receiptCheckedAt: now,
+            lastError: errorCode,
+          },
+        });
+      for (let index = 0; index < transitioned.count; index += 1) {
+        recordPushTerminal('expo', 'dead_token');
+      }
     }
 
     if (deadTokens.length > 0) {

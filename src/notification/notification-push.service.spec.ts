@@ -48,6 +48,11 @@ describe('NotificationPushService (#88 per-token delivery)', () => {
     // reconcileCompletedOutboxes 默认无 outbox 需终结（两次分组聚合都空）。
     // 具体用例用 mockResolvedValueOnce 覆盖。
     prisma.notificationPushDelivery.groupBy.mockResolvedValue([]);
+    prisma.notificationPushDelivery.updateMany.mockImplementation(
+      async ({ where }: any) => ({
+        count: Array.isArray(where?.id?.in) ? where.id.in.length : 1,
+      }),
+    );
   });
 
   const payload = { title: 'T', body: 'B', data: { notificationId: 'n1' } };
@@ -315,6 +320,13 @@ describe('NotificationPushService (#88 per-token delivery)', () => {
       // 失效 token（卸载 App）是正常流失，不能算进推送失败率；凭证/限流/
       // 未配置这类可重试错误和消息级终态才是。
       const record = jest.spyOn(deliveryMetrics, 'recordPushDelivery');
+      expect(typeof (deliveryMetrics as any).recordPushTerminal).toBe(
+        'function',
+      );
+      const recordTerminal = jest.spyOn(
+        deliveryMetrics as any,
+        'recordPushTerminal',
+      );
       fetchMock.mockResolvedValue({
         ok: true,
         json: async () => ({
@@ -346,7 +358,13 @@ describe('NotificationPushService (#88 per-token delivery)', () => {
         ['expo', 'rejected'],
         ['jpush', 'retryable'],
       ]);
+      expect(recordTerminal.mock.calls).toEqual([
+        ['expo', 'dead_token'],
+        ['expo', 'rejected'],
+        ['jpush', 'retryable'],
+      ]);
       record.mockRestore();
+      recordTerminal.mockRestore();
     });
 
     it('still returns outcomes when recording metrics throws', async () => {
@@ -915,28 +933,27 @@ describe('NotificationPushService (#88 per-token delivery)', () => {
 
       expect(processed).toBe(3);
       expect(prisma.notificationPushDelivery.updateMany).toHaveBeenCalledWith({
-        where: { id: { in: ['d1'] } },
+        where: { id: { in: ['d1'] }, status: 'SENT' },
         data: { status: 'CONFIRMED', receiptCheckedAt: now, lastError: null },
       });
       expect(prisma.notificationPushDelivery.updateMany).toHaveBeenCalledWith({
-        where: { id: { in: ['d2'] } },
+        where: { id: { in: ['d2'] }, status: 'SENT' },
         data: {
           status: 'TERMINAL',
           receiptCheckedAt: now,
           lastError: 'DeviceNotRegistered',
         },
       });
-      // 逐行 update 只剩可重试那一条（它要和 outbox 重开同事务）。
-      expect(prisma.notificationPushDelivery.update).toHaveBeenCalledTimes(1);
+      // 逐行条件 updateMany 只剩可重试那一条（它要和 outbox 重开同事务）。
+      expect(prisma.notificationPushDelivery.updateMany).toHaveBeenCalledWith({
+        where: { id: 'd3', status: 'SENT' },
+        data: expect.objectContaining({ status: 'FAILED' }),
+      });
       expect(prisma.devicePushToken.updateMany).toHaveBeenCalledWith({
         where: { token: { in: ['tok-b'] } },
         data: { disabledAt: expect.any(Date) },
       });
       // 可重试错误：投递行 FAILED + outbox 拉回 PENDING 由 sweep 补发
-      expect(prisma.notificationPushDelivery.update).toHaveBeenCalledWith({
-        where: { id: 'd3' },
-        data: expect.objectContaining({ status: 'FAILED' }),
-      });
       // round 3：requeue 与行状态同事务，形状从批量 in 改为逐条 id
       expect(prisma.notificationPushOutbox.updateMany).toHaveBeenCalledWith({
         where: { id: 'o3', status: 'COMPLETED' },
@@ -971,15 +988,15 @@ describe('NotificationPushService (#88 per-token delivery)', () => {
         .mockResolvedValueOnce([{ outboxID: 'o0' }]);
       const order: string[] = [];
       prisma.notificationPushDelivery.updateMany.mockImplementation(
-        async ({ data }: any) => {
-          order.push(`delivery:${data.status}`);
-          return { count: 1 };
-        },
-      );
-      prisma.notificationPushDelivery.update.mockImplementation(
-        async ({ data }: any) => {
-          order.push(`delivery-row:${data.status}`);
-          return {};
+        async ({ where, data }: any) => {
+          order.push(
+            typeof where.id === 'string'
+              ? `delivery-row:${data.status}`
+              : `delivery:${data.status}`,
+          );
+          return {
+            count: Array.isArray(where?.id?.in) ? where.id.in.length : 1,
+          };
         },
       );
       prisma.notificationPushOutbox.updateMany.mockImplementation(
@@ -992,10 +1009,14 @@ describe('NotificationPushService (#88 per-token delivery)', () => {
       const processed = await service.pollReceipts(now);
 
       expect(processed).toBe(6);
-      expect(prisma.notificationPushDelivery.updateMany.mock.calls).toEqual([
+      const batchedTransitions =
+        prisma.notificationPushDelivery.updateMany.mock.calls.filter(
+          ([{ where }]: any[]) => Array.isArray(where?.id?.in),
+        );
+      expect(batchedTransitions).toEqual([
         [
           {
-            where: { id: { in: ['d0', 'd1', 'd2'] } },
+            where: { id: { in: ['d0', 'd1', 'd2'] }, status: 'SENT' },
             data: {
               status: 'CONFIRMED',
               receiptCheckedAt: now,
@@ -1005,7 +1026,7 @@ describe('NotificationPushService (#88 per-token delivery)', () => {
         ],
         [
           {
-            where: { id: { in: ['d3', 'd4'] } },
+            where: { id: { in: ['d3', 'd4'] }, status: 'SENT' },
             data: {
               status: 'TERMINAL',
               receiptCheckedAt: now,
@@ -1016,9 +1037,8 @@ describe('NotificationPushService (#88 per-token delivery)', () => {
       ]);
       // 可重试那条仍是「行改 FAILED + outbox 拉回 PENDING」同一个事务。
       expect(prisma.$transaction).toHaveBeenCalledTimes(1);
-      expect(prisma.notificationPushDelivery.update).toHaveBeenCalledTimes(1);
-      expect(prisma.notificationPushDelivery.update).toHaveBeenCalledWith({
-        where: { id: 'd5' },
+      expect(prisma.notificationPushDelivery.updateMany).toHaveBeenCalledWith({
+        where: { id: 'd5', status: 'SENT' },
         data: {
           status: 'FAILED',
           receiptCheckedAt: now,
@@ -1046,6 +1066,13 @@ describe('NotificationPushService (#88 per-token delivery)', () => {
     // 对凭证失效完全看不见。回执阶段的失败按同一套结果再计一次。
     it('counts receipt-stage failures, which is where expired credentials show up', async () => {
       const record = jest.spyOn(deliveryMetrics, 'recordPushDelivery');
+      expect(typeof (deliveryMetrics as any).recordPushTerminal).toBe(
+        'function',
+      );
+      const recordTerminal = jest.spyOn(
+        deliveryMetrics as any,
+        'recordPushTerminal',
+      );
       prisma.notificationPushDelivery.findMany.mockResolvedValue([
         { id: 'd1', ticketID: 't1', token: 'tok-a', outboxID: 'o1', sentAt },
         { id: 'd2', ticketID: 't2', token: 'tok-b', outboxID: 'o2', sentAt },
@@ -1069,7 +1096,39 @@ describe('NotificationPushService (#88 per-token delivery)', () => {
         ['expo', 'dead_token'],
         ['expo', 'retryable'],
       ]);
+      expect(recordTerminal).toHaveBeenCalledTimes(3);
+      expect(recordTerminal.mock.calls).toEqual(
+        expect.arrayContaining([
+          ['expo', 'sent'],
+          ['expo', 'dead_token'],
+          ['expo', 'retryable'],
+        ]),
+      );
       record.mockRestore();
+      recordTerminal.mockRestore();
+    });
+
+    it('records a terminal outcome only when this poller wins the SENT transition', async () => {
+      const recordTerminal = jest.spyOn(
+        deliveryMetrics as any,
+        'recordPushTerminal',
+      );
+      prisma.notificationPushDelivery.findMany.mockResolvedValue([
+        { id: 'd1', ticketID: 't1', token: 'tok-a', outboxID: 'o1', sentAt },
+      ]);
+      fetchMock.mockResolvedValue({
+        ok: true,
+        json: async () => ({ data: { t1: { status: 'ok' } } }),
+      });
+      // 另一副本已经结算了同一条 SENT 行。
+      prisma.notificationPushDelivery.updateMany.mockResolvedValueOnce({
+        count: 0,
+      });
+
+      await service.pollReceipts(now);
+
+      expect(recordTerminal).not.toHaveBeenCalled();
+      recordTerminal.mockRestore();
     });
 
     it('marks a completed outbox terminal after its last receipt settles with an exhausted failure', async () => {
@@ -1159,8 +1218,8 @@ describe('NotificationPushService (#88 per-token delivery)', () => {
 
       await service.pollReceipts(now);
 
-      expect(prisma.notificationPushDelivery.update).toHaveBeenCalledWith({
-        where: { id: 'd1' },
+      expect(prisma.notificationPushDelivery.updateMany).toHaveBeenCalledWith({
+        where: { id: 'd1', status: 'SENT' },
         data: {
           status: 'FAILED',
           receiptCheckedAt: now,
@@ -1216,6 +1275,13 @@ describe('NotificationPushService (#88 per-token delivery)', () => {
     });
 
     it('assumes delivery for receipts older than the 24h Expo retention', async () => {
+      expect(typeof (deliveryMetrics as any).recordPushTerminal).toBe(
+        'function',
+      );
+      const recordTerminal = jest.spyOn(
+        deliveryMetrics as any,
+        'recordPushTerminal',
+      );
       const ancient = new Date(now.getTime() - 25 * 60 * 60 * 1000);
       prisma.notificationPushDelivery.findMany.mockResolvedValue([
         {
@@ -1231,10 +1297,12 @@ describe('NotificationPushService (#88 per-token delivery)', () => {
 
       expect(processed).toBe(1);
       expect(prisma.notificationPushDelivery.updateMany).toHaveBeenCalledWith({
-        where: { id: { in: ['d-old'] } },
+        where: { id: { in: ['d-old'] }, status: 'SENT' },
         data: expect.objectContaining({ status: 'CONFIRMED' }),
       });
       expect(fetchMock).not.toHaveBeenCalled();
+      expect(recordTerminal.mock.calls).toEqual([['expo', 'sent']]);
+      recordTerminal.mockRestore();
     });
 
     it('leaves state untouched when the receipt endpoint is unreachable', async () => {
