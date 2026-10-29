@@ -405,7 +405,7 @@
 
 ### PushDeliveryFailing
 
-**含义**：（warning）某个推送通道（`provider`：`expo` / `jpush`）近 15 分钟超过 20% 的投递失败（`retryable` + `rejected`），且 15 分钟内至少 20 次投递，持续 10 分钟。`dead_token`（卸载、注册 ID 失效）是正常流失，不计入。
+**含义**：（warning）某个推送通道（`provider`：`expo` / `jpush`）近 15 分钟超过 20% 的终态投递失败（`retryable` + `rejected`），且 15 分钟内至少 20 次终态投递，持续 10 分钟。每个 token 的每次投递尝试只进入一次 `circle_push_delivery_terminal_total`；Expo 的成功 ticket 会等回执后再计入，避免 ticket 与失败回执重复进入分母。`dead_token`（卸载、注册 ID 失效）是正常流失，不计入。
 
 **先看**：
 - Deliveries「Push failure ratio by provider (15m)」「Push deliveries by provider and result」：是 `retryable` 还是 `rejected`。

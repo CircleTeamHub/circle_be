@@ -1081,15 +1081,15 @@ tests:
   - name: JPush 全部可重试失败时按 provider 报；Expo 的失效 token 不算失败
     interval: 1m
     input_series:
-      - series: circle_push_deliveries_total{job="circle-be",instance="circle-be-blue",provider="jpush",result="retryable"}
+      - series: circle_push_delivery_terminal_total{job="circle-be",instance="circle-be-blue",provider="jpush",result="retryable"}
         values: 0+60x40
-      - series: circle_push_deliveries_total{job="circle-be",instance="circle-be-blue",provider="jpush",result="sent"}
+      - series: circle_push_delivery_terminal_total{job="circle-be",instance="circle-be-blue",provider="jpush",result="sent"}
         values: 0+0x40
-      - series: circle_push_deliveries_total{job="circle-be",instance="circle-be-blue",provider="expo",result="sent"}
+      - series: circle_push_delivery_terminal_total{job="circle-be",instance="circle-be-blue",provider="expo",result="sent"}
         values: 0+600x40
-      - series: circle_push_deliveries_total{job="circle-be",instance="circle-be-blue",provider="expo",result="dead_token"}
+      - series: circle_push_delivery_terminal_total{job="circle-be",instance="circle-be-blue",provider="expo",result="dead_token"}
         values: 0+600x40
-      - series: circle_push_deliveries_total{job="circle-be",instance="circle-be-blue",provider="expo",result="retryable"}
+      - series: circle_push_delivery_terminal_total{job="circle-be",instance="circle-be-blue",provider="expo",result="retryable"}
         values: 0+0x40
     alert_rule_test:
       - eval_time: 25m
@@ -1105,9 +1105,9 @@ tests:
   - name: 推送量太小时一两次失败不报
     interval: 1m
     input_series:
-      - series: circle_push_deliveries_total{job="circle-be",instance="circle-be-blue",provider="expo",result="retryable"}
+      - series: circle_push_delivery_terminal_total{job="circle-be",instance="circle-be-blue",provider="expo",result="retryable"}
         values: 0x10 2+0x30
-      - series: circle_push_deliveries_total{job="circle-be",instance="circle-be-blue",provider="expo",result="sent"}
+      - series: circle_push_delivery_terminal_total{job="circle-be",instance="circle-be-blue",provider="expo",result="sent"}
         values: 0x10 3+0x30
     alert_rule_test:
       # 22m：跳变还在 15 分钟窗口里，且失败率超阈值已满 for 10m —— 只有
@@ -1180,13 +1180,13 @@ tests:
   - name: 推送失败率 30% 就报，10% 不报
     interval: 1m
     input_series:
-      - series: circle_push_deliveries_total{job="circle-be",instance="circle-be-blue",provider="expo",result="retryable"}
+      - series: circle_push_delivery_terminal_total{job="circle-be",instance="circle-be-blue",provider="expo",result="retryable"}
         values: 0+30x40
-      - series: circle_push_deliveries_total{job="circle-be",instance="circle-be-blue",provider="expo",result="sent"}
+      - series: circle_push_delivery_terminal_total{job="circle-be",instance="circle-be-blue",provider="expo",result="sent"}
         values: 0+70x40
-      - series: circle_push_deliveries_total{job="circle-be",instance="circle-be-blue",provider="jpush",result="rejected"}
+      - series: circle_push_delivery_terminal_total{job="circle-be",instance="circle-be-blue",provider="jpush",result="rejected"}
         values: 0+10x40
-      - series: circle_push_deliveries_total{job="circle-be",instance="circle-be-blue",provider="jpush",result="sent"}
+      - series: circle_push_delivery_terminal_total{job="circle-be",instance="circle-be-blue",provider="jpush",result="sent"}
         values: 0+90x40
     alert_rule_test:
       - eval_time: 25m

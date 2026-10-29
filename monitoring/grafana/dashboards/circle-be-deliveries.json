@@ -333,7 +333,7 @@
       "id": 6,
       "type": "timeseries",
       "title": "Push failure ratio by provider (15m)",
-      "description": "retryable + rejected over all outcomes — the same ratio PushDeliveryFailing alerts on above 20%.",
+      "description": "retryable + rejected over terminal outcomes, counted once per token attempt — the same ratio PushDeliveryFailing alerts on above 20%.",
       "datasource": {
         "type": "prometheus",
         "uid": "prometheus"
@@ -372,7 +372,7 @@
             "type": "prometheus",
             "uid": "prometheus"
           },
-          "expr": "sum by (provider) (rate(circle_push_deliveries_total{job=\"circle-be\",result=~\"retryable|rejected\"}[15m])) / sum by (provider) (rate(circle_push_deliveries_total{job=\"circle-be\"}[15m]))",
+          "expr": "sum by (provider) (rate(circle_push_delivery_terminal_total{job=\"circle-be\",result=~\"retryable|rejected\"}[15m])) / sum by (provider) (rate(circle_push_delivery_terminal_total{job=\"circle-be\"}[15m]))",
           "legendFormat": "{{provider}}"
         }
       ]

@@ -14,6 +14,9 @@ const ALERTMANAGER = readFileSync(
 const PROMETHEUS = readText(join(ROOT, 'monitoring/prometheus/prometheus.yml'));
 const PROMETHEUS_PROD = readText(join(ROOT, 'monitoring/prometheus/prometheus.prod.yml'));
 const JOBS_DASHBOARD = readText(join(ROOT, 'monitoring/grafana/dashboards/circle-be-jobs.json'));
+const DELIVERIES_DASHBOARD = readText(
+  join(ROOT, 'monitoring/grafana/dashboards/circle-be-deliveries.json'),
+);
 const LOGS_COMPOSE = readText(join(ROOT, 'monitoring/docker-compose.logs.yml'));
 const LOGS_DOC = readText(join(ROOT, 'monitoring/logs.md'));
 const RULE_TESTS = readText(join(ROOT, 'monitoring/prometheus/alerts.test.yml'));
@@ -469,16 +472,40 @@ test('delivery alerts measure real channel failures with a minimum volume', () =
     'DependencyRequestsFailing',
   ]);
   const push = alertExpr('PushDeliveryFailing');
+  assert.match(push, /circle_push_delivery_terminal_total/);
+  assert.doesNotMatch(push, /circle_push_deliveries_total/);
   // 失效 token 是正常流失：进分子的话一批老设备就能把失败率拉过阈值。
   assert.match(push, /result=~"retryable\|rejected"/);
   assert.doesNotMatch(push, /dead_token/);
   // 两个 provider 的凭证/配额互不相干，必须分开算。
-  assert.match(push, /sum by \(provider\) \(increase\(circle_push_deliveries_total\{job="circle-be"\}\[15m\]\)\) >= 20/);
+  assert.match(
+    push,
+    /sum by \(provider\) \(increase\(circle_push_delivery_terminal_total\{job="circle-be"\}\[15m\]\)\) >= 20/,
+  );
   const email = alertExpr('EmailCodeSendFailing');
   // 生产上没配 SMTP 时 mailer 直接不可用，同样意味着没人能收到验证码。
   assert.match(email, /result=~"failure\|unavailable"/);
   assert.match(email, /\[15m\]\)\) >= 3/);
   assert.match(email, /severity: critical/);
+});
+
+test('push failure dashboard uses exactly-once terminal outcomes', () => {
+  const dashboard = JSON.parse(DELIVERIES_DASHBOARD);
+  const panel = dashboard.panels.find(
+    (candidate) => candidate.title === 'Push failure ratio by provider (15m)',
+  );
+  assert.ok(panel, 'push failure ratio panel not found');
+  const expressions = panel.targets.map((target) => target.expr ?? '');
+  assert.ok(
+    expressions.every((expression) =>
+      expression.includes('circle_push_delivery_terminal_total'),
+    ),
+  );
+  assert.ok(
+    expressions.every(
+      (expression) => !expression.includes('circle_push_deliveries_total'),
+    ),
+  );
 });
 
 test('CronJobStalled never judges a heartbeat finer than scrape and evaluation can see', () => {

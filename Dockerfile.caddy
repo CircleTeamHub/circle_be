@@ -11,8 +11,8 @@ RUN xcaddy build \
     --replace golang.org/x/net=golang.org/x/net@v0.60.0 \
     --replace golang.org/x/text=golang.org/x/text@v0.42.0 \
     --replace golang.org/x/crypto=golang.org/x/crypto@v0.57.0 \
-    --replace google.golang.org/grpc=google.golang.org/grpc@v1.83.2 \
-    --replace github.com/go-jose/go-jose/v4=github.com/go-jose/go-jose/v4@v4.1.6
+    --replace github.com/go-jose/go-jose/v4=github.com/go-jose/go-jose/v4@v4.1.6 \
+    --replace google.golang.org/grpc=google.golang.org/grpc@v1.83.2
 
 # 运行阶段有名字，CI 才能对它关掉层缓存（ci.yml 的 no-cache-filters）：基础镜像
 # 没更新时，带缓存的构建会一直沿用旧的 apk upgrade 结果，Alpine 已经修好的漏洞照样

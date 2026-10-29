@@ -12,6 +12,11 @@ describe('createDeliveryMetrics', () => {
             `circle_push_deliveries_total\\{provider="${provider}",result="${result}"\\} 0`,
           ),
         );
+        expect(output).toMatch(
+          new RegExp(
+            `circle_push_delivery_terminal_total\\{provider="${provider}",result="${result}"\\} 0`,
+          ),
+        );
       }
     }
     for (const result of ['success', 'failure', 'unavailable']) {
@@ -27,6 +32,9 @@ describe('createDeliveryMetrics', () => {
     metrics.recordPushDelivery('jpush', 'retryable');
     metrics.recordPushDelivery('jpush', 'retryable');
     metrics.recordPushDelivery('expo', 'sent');
+    expect(typeof (metrics as any).recordPushTerminal).toBe('function');
+    (metrics as any).recordPushTerminal('expo', 'sent');
+    (metrics as any).recordPushTerminal('expo', 'retryable');
     metrics.recordEmailCodeSend('failure');
 
     const output = await metrics.registry.metrics();
@@ -35,6 +43,12 @@ describe('createDeliveryMetrics', () => {
     );
     expect(output).toMatch(
       /circle_push_deliveries_total\{provider="expo",result="sent"\} 1/,
+    );
+    expect(output).toMatch(
+      /circle_push_delivery_terminal_total\{provider="expo",result="sent"\} 1/,
+    );
+    expect(output).toMatch(
+      /circle_push_delivery_terminal_total\{provider="expo",result="retryable"\} 1/,
     );
     expect(output).toMatch(
       /circle_email_code_sends_total\{result="failure"\} 1/,
