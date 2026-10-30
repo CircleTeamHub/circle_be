@@ -130,6 +130,8 @@ export const SERVER_MESSAGE_TYPES: readonly string[] = [
   'verification-card',
   'group-invitation',
   'call-record',
+  'assistant-note-status',
+  'assistant-info-alert',
 ];
 
 /**

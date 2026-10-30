@@ -661,6 +661,37 @@ describe('ChatPushService', () => {
     ]);
   });
 
+  it('routes assistant note alerts with a useful title and deep-link metadata', async () => {
+    prisma.chatMember.findMany.mockResolvedValue([seat('u-peer')]);
+    prisma.chatConversation.findUnique.mockResolvedValue({
+      type: 'SUPPORT',
+      circleID: null,
+      tempChatID: null,
+      name: '风信助手',
+    });
+
+    await pushNow(
+      msg({
+        sender: null,
+        type: 'assistant-note-status',
+        content: { kind: 'note-status', status: 'UNLISTED' },
+      }),
+    );
+
+    expect(sentPayloads()).toEqual([
+      expect.objectContaining({
+        title: '风信助手',
+        body: '你的笔记状态有变化，请打开风信助手查看。',
+        data: expect.objectContaining({
+          conversationId: 'conv-1',
+          sourceID: 'conv-1',
+          conversationType: 'private',
+          conversationKind: 'support',
+        }),
+      }),
+    ]);
+  });
+
   it('never throws upward even when the pipeline fails', async () => {
     prisma.chatMember.findMany.mockRejectedValue(new Error('db down'));
     await expect(pushNow(msg())).resolves.toBeUndefined();

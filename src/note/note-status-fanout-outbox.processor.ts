@@ -1,4 +1,4 @@
-import { Injectable, Logger } from '@nestjs/common';
+import { Injectable, Logger, Optional } from '@nestjs/common';
 import { CronExpression } from '@nestjs/schedule';
 import { randomUUID } from 'crypto';
 import { reportOperationalError } from 'src/logging/error-aggregation.service';
@@ -6,6 +6,7 @@ import { sanitizeLogValue } from 'src/logging/log-sanitizer';
 import { TrackedCron } from 'src/metrics/tracked-cron.decorator';
 import { PrismaService } from 'src/prisma/prisma.service';
 import { RealtimeService } from 'src/realtime/realtime.service';
+import { AssistantService } from 'src/assistant/assistant.service';
 
 const JOB_BATCH_SIZE = 20;
 const RECIPIENT_PAGE_SIZE = 100;
@@ -26,9 +27,12 @@ type FanoutJob = {
 
 type SourcePayload = {
   sourceNoteId: string;
+  ownerID: string | null;
+  title: string;
   workStatus: 'WORKING' | 'CLOSED' | null;
   status: 'ACTIVE' | 'UNLISTED' | 'DELETED';
   available: boolean;
+  changedAt: string;
 };
 
 @Injectable()
@@ -38,6 +42,7 @@ export class NoteStatusFanoutOutboxProcessor {
   constructor(
     private readonly prisma: PrismaService,
     private readonly realtime: RealtimeService,
+    @Optional() private readonly assistant?: AssistantService,
   ) {}
 
   @TrackedCron(CronExpression.EVERY_MINUTE, 'note_status_fanout_outbox')
@@ -123,23 +128,35 @@ export class NoteStatusFanoutOutboxProcessor {
       where: { id: rootNoteID },
       select: {
         id: true,
+        ownerID: true,
+        title: true,
         status: true,
         available: true,
         workStatus: true,
+        updatedAt: true,
       },
     });
     return source
       ? {
           sourceNoteId: rootNoteID,
+          ownerID: source.ownerID,
+          title: typeof source.title === 'string' ? source.title : '',
           workStatus: source.workStatus,
           status: source.status,
           available: source.available,
+          changedAt:
+            source.updatedAt instanceof Date
+              ? source.updatedAt.toISOString()
+              : new Date().toISOString(),
         }
       : {
           sourceNoteId: rootNoteID,
+          ownerID: null,
+          title: '',
           workStatus: null,
           status: 'DELETED',
           available: false,
+          changedAt: new Date().toISOString(),
         };
   }
 
@@ -159,6 +176,10 @@ export class NoteStatusFanoutOutboxProcessor {
     });
     const page = rows.slice(0, RECIPIENT_PAGE_SIZE);
     await this.broadcast(
+      page.map((row) => row.ownerID),
+      payload,
+    );
+    await this.sendAssistantAlerts(
       page.map((row) => row.ownerID),
       payload,
     );
@@ -229,6 +250,10 @@ export class NoteStatusFanoutOutboxProcessor {
       page.map((row) => row.userID),
       payload,
     );
+    await this.sendAssistantAlerts(
+      page.map((row) => row.userID),
+      payload,
+    );
 
     if (rows.length > RECIPIENT_PAGE_SIZE) {
       const last = page[page.length - 1];
@@ -256,10 +281,41 @@ export class NoteStatusFanoutOutboxProcessor {
     payload: SourcePayload,
   ): Promise<void> {
     const uniqueRecipientIDs = [...new Set(recipientIDs)];
+    const realtimePayload = {
+      sourceNoteId: payload.sourceNoteId,
+      workStatus: payload.workStatus,
+      status: payload.status,
+      available: payload.available,
+    };
     await this.realtime.safeBroadcastAll(
       uniqueRecipientIDs.map(
         (userID) => () =>
-          this.realtime.broadcastNoteSourceStatusChanged(userID, payload),
+          this.realtime.broadcastNoteSourceStatusChanged(
+            userID,
+            realtimePayload,
+          ),
+      ),
+    );
+  }
+
+  private async sendAssistantAlerts(
+    recipientIDs: string[],
+    payload: SourcePayload,
+  ): Promise<void> {
+    if (!this.assistant || payload.status === 'ACTIVE') return;
+    const recipients = [
+      ...new Set(recipientIDs.filter((id) => id && id !== payload.ownerID)),
+    ];
+    if (recipients.length === 0) return;
+    const status = payload.status === 'DELETED' ? 'DELETED' : 'UNLISTED';
+    await Promise.all(
+      recipients.map((userId) =>
+        this.assistant.sendNoteStatusAlert(userId, {
+          sourceNoteId: payload.sourceNoteId,
+          title: payload.title,
+          status,
+          changedAt: payload.changedAt,
+        }),
       ),
     );
   }
