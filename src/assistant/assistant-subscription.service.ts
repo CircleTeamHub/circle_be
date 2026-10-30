@@ -30,10 +30,12 @@ export type AssistantSubscriptionDto = {
   circleName: string;
   circleCities: string[];
   cities: string[];
+  keywords: string[];
   followsCircleCities: boolean;
   sourceTypes: string[];
   enabled: boolean;
   pushEnabled: boolean;
+  noteStatusAlerts: boolean;
   createdAt: string;
   updatedAt: string;
 };
@@ -48,9 +50,11 @@ type SubscriptionWithCircle = {
   id: string;
   circleID: string;
   cities: string[];
+  keywords: string[];
   sourceTypes: string[];
   enabled: boolean;
   pushEnabled: boolean;
+  noteStatusAlerts: boolean;
   createdAt: Date;
   updatedAt: Date;
   circle: AccessibleCircle;
@@ -108,6 +112,7 @@ export class AssistantSubscriptionService {
   ): Promise<AssistantSubscriptionDto> {
     const circle = await this.requireAccessibleCircle(userId, dto.circleId);
     const cities = this.validateSelectedCities(dto.cities, circle.cities);
+    const keywords = this.normalizeKeywords(dto.keywords);
     const row = await this.prisma.assistantSubscription.upsert({
       where: {
         userID_assistantKey_circleID: {
@@ -121,16 +126,22 @@ export class AssistantSubscriptionService {
         assistantKey: ASSISTANT_KEY,
         circleID: circle.id,
         cities,
+        keywords,
         sourceTypes: [ASSISTANT_INFO_SOURCE_PLAZA_POST],
         pushEnabled: dto.pushEnabled ?? true,
+        noteStatusAlerts: dto.noteStatusAlerts ?? true,
       },
       update: {
         cities,
+        keywords,
         sourceTypes: [ASSISTANT_INFO_SOURCE_PLAZA_POST],
         enabled: true,
         ...(dto.pushEnabled === undefined
           ? {}
           : { pushEnabled: dto.pushEnabled }),
+        ...(dto.noteStatusAlerts === undefined
+          ? {}
+          : { noteStatusAlerts: dto.noteStatusAlerts }),
       },
       include: {
         circle: { select: { id: true, name: true, cities: true } },
@@ -157,14 +168,22 @@ export class AssistantSubscriptionService {
       dto.cities === undefined
         ? existing.cities
         : this.validateSelectedCities(dto.cities, existing.circle.cities);
+    const keywords =
+      dto.keywords === undefined
+        ? existing.keywords
+        : this.normalizeKeywords(dto.keywords);
     const row = await this.prisma.assistantSubscription.update({
       where: { id },
       data: {
         cities,
+        keywords,
         ...(dto.enabled === undefined ? {} : { enabled: dto.enabled }),
         ...(dto.pushEnabled === undefined
           ? {}
           : { pushEnabled: dto.pushEnabled }),
+        ...(dto.noteStatusAlerts === undefined
+          ? {}
+          : { noteStatusAlerts: dto.noteStatusAlerts }),
       },
       include: {
         circle: { select: { id: true, name: true, cities: true } },
@@ -199,6 +218,7 @@ export class AssistantSubscriptionService {
       select: {
         id: true,
         content: true,
+        tags: true,
         city: true,
         cities: true,
         authorID: true,
@@ -220,6 +240,7 @@ export class AssistantSubscriptionService {
         userID: true,
         circleID: true,
         cities: true,
+        keywords: true,
         sourceTypes: true,
         pushEnabled: true,
         circle: { select: { id: true, name: true, cities: true } },
@@ -255,6 +276,7 @@ export class AssistantSubscriptionService {
 
     for (const subscription of subscriptions) {
       if (!postCircleIds.has(subscription.circleID)) continue;
+      if (!this.matchesKeywords(post, subscription.keywords)) continue;
       const scopeCities = this.normalizeList(
         subscription.cities.length > 0
           ? subscription.cities
@@ -385,10 +407,12 @@ export class AssistantSubscriptionService {
       circleName: row.circle.name,
       circleCities,
       cities: selectedCities.length > 0 ? selectedCities : circleCities,
+      keywords: this.normalizeKeywords(row.keywords),
       followsCircleCities: selectedCities.length === 0,
       sourceTypes: row.sourceTypes,
       enabled: row.enabled,
       pushEnabled: row.pushEnabled,
+      noteStatusAlerts: row.noteStatusAlerts,
       createdAt: row.createdAt.toISOString(),
       updatedAt: row.updatedAt.toISOString(),
     };
@@ -396,6 +420,24 @@ export class AssistantSubscriptionService {
 
   private normalizeList(values: readonly string[]): string[] {
     return [...new Set(values.map((value) => value.trim()).filter(Boolean))];
+  }
+
+  private normalizeKeywords(values: readonly string[] | undefined): string[] {
+    return this.normalizeList(values ?? []).slice(0, 20);
+  }
+
+  private matchesKeywords(
+    post: { content: string; tags: string[] },
+    keywords: readonly string[],
+  ): boolean {
+    const normalized = this.normalizeKeywords(keywords).map((value) =>
+      value.toLocaleLowerCase(),
+    );
+    if (normalized.length === 0) return true;
+    const haystack = [post.content, ...post.tags]
+      .join('\n')
+      .toLocaleLowerCase();
+    return normalized.some((keyword) => haystack.includes(keyword));
   }
 
   private firstLine(value: string): string {

@@ -35,6 +35,9 @@ function createHarness(
       findUnique: jest.fn().mockResolvedValue(sourceState),
       findMany: jest.fn().mockResolvedValue([]),
     },
+    assistantSubscription: {
+      findMany: jest.fn().mockResolvedValue([]),
+    },
     $queryRaw: jest.fn().mockResolvedValue([]),
   };
   const realtime = {
@@ -74,6 +77,9 @@ describe('NoteStatusFanoutOutboxProcessor', () => {
       { id: 'source-note', ownerID: 'owner-1' },
       { id: 'copy-note', ownerID: 'viewer-1' },
     ]);
+    prisma.assistantSubscription.findMany.mockResolvedValue([
+      { userID: 'viewer-1' },
+    ]);
 
     await processor.processPending();
 
@@ -83,6 +89,39 @@ describe('NoteStatusFanoutOutboxProcessor', () => {
       status: 'UNLISTED',
       changedAt: '2026-10-29T12:00:00.000Z',
     });
+  });
+
+  it('skips assistant alerts when the recipient has not opted in', async () => {
+    const assistant = {
+      sendNoteStatusAlert: jest.fn().mockResolvedValue(undefined),
+    };
+    const { prisma, processor } = createHarness(pendingJob(), assistant);
+    prisma.note.findUnique.mockResolvedValue({
+      id: 'source-note',
+      ownerID: 'owner-1',
+      title: '北京租房攻略',
+      status: 'UNLISTED',
+      available: false,
+      workStatus: null,
+      updatedAt: new Date('2026-10-29T12:00:00.000Z'),
+    });
+    prisma.note.findMany.mockResolvedValue([
+      { id: 'source-note', ownerID: 'owner-1' },
+      { id: 'copy-note', ownerID: 'viewer-1' },
+    ]);
+
+    await processor.processPending();
+
+    expect(prisma.assistantSubscription.findMany).toHaveBeenCalledWith({
+      where: {
+        userID: { in: ['viewer-1'] },
+        enabled: true,
+        noteStatusAlerts: true,
+      },
+      select: { userID: true },
+      distinct: ['userID'],
+    });
+    expect(assistant.sendNoteStatusAlert).not.toHaveBeenCalled();
   });
 
   it('broadcasts only one bounded owner page and persists its cursor', async () => {

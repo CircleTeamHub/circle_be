@@ -26,10 +26,27 @@ export class CreateAssistantSubscriptionDto {
   @IsOptional()
   cities?: string[];
 
+  @ApiPropertyOptional({
+    type: [String],
+    description: '动态关键词；省略或空数组表示关注全部动态',
+  })
+  @IsArray()
+  @IsString({ each: true })
+  @ArrayUnique()
+  @ArrayMaxSize(20)
+  @MaxLength(100, { each: true })
+  @IsOptional()
+  keywords?: string[];
+
   @ApiPropertyOptional({ default: true })
   @IsBoolean()
   @IsOptional()
   pushEnabled?: boolean;
+
+  @ApiPropertyOptional({ default: true })
+  @IsBoolean()
+  @IsOptional()
+  noteStatusAlerts?: boolean;
 }
 
 export class UpdateAssistantSubscriptionDto {
@@ -42,6 +59,15 @@ export class UpdateAssistantSubscriptionDto {
   @IsOptional()
   cities?: string[];
 
+  @ApiPropertyOptional({ type: [String] })
+  @IsArray()
+  @IsString({ each: true })
+  @ArrayUnique()
+  @ArrayMaxSize(20)
+  @MaxLength(100, { each: true })
+  @IsOptional()
+  keywords?: string[];
+
   @ApiPropertyOptional()
   @IsBoolean()
   @IsOptional()
@@ -51,4 +77,9 @@ export class UpdateAssistantSubscriptionDto {
   @IsBoolean()
   @IsOptional()
   pushEnabled?: boolean;
+
+  @ApiPropertyOptional()
+  @IsBoolean()
+  @IsOptional()
+  noteStatusAlerts?: boolean;
 }

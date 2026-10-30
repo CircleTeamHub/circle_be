@@ -2175,9 +2175,12 @@ model AssistantSubscription {
   circleID     String
   /// 可选的城市子集；空数组表示跟随圈子最新城市范围。
   cities       String[] @default([])
+  /// 关键词为空表示关注该圈子下全部城市信息；否则匹配动态正文或标签。
+  keywords     String[] @default([])
   sourceTypes  String[] @default(["PLAZA_POST"])
   enabled      Boolean  @default(true)
   pushEnabled  Boolean  @default(true)
+  noteStatusAlerts Boolean @default(true)
   createdAt    DateTime @default(now())
   updatedAt    DateTime @updatedAt
 

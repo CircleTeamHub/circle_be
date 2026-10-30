@@ -303,9 +303,20 @@ export class NoteStatusFanoutOutboxProcessor {
     payload: SourcePayload,
   ): Promise<void> {
     if (!this.assistant || payload.status === 'ACTIVE') return;
-    const recipients = [
+    const candidates = [
       ...new Set(recipientIDs.filter((id) => id && id !== payload.ownerID)),
     ];
+    if (candidates.length === 0) return;
+    const optedIn = await this.prisma.assistantSubscription.findMany({
+      where: {
+        userID: { in: candidates },
+        enabled: true,
+        noteStatusAlerts: true,
+      },
+      select: { userID: true },
+      distinct: ['userID'],
+    });
+    const recipients = optedIn.map((row) => row.userID);
     if (recipients.length === 0) return;
     const status = payload.status === 'DELETED' ? 'DELETED' : 'UNLISTED';
     await Promise.all(
