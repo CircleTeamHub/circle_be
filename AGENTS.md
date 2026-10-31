@@ -108,3 +108,10 @@ Do not rewrite code or propose broad architectural rewrites during review. Recom
 - Avoid speculative comments. If a concern depends on an assumption, state the assumption.
 - Prefer one precise comment over many overlapping comments.
 
+## 补充开发原则
+
+1. **防过度防御**：对于几乎不会发生的边界或并发问题，先讲清发生概率并经用户确认后再加处理，严禁为了“理论上更稳”而自行膨胀代码。
+2. **入口单次校验**：外部数据只在边界处校验一次，进入内部后依靠类型系统流转，禁止在各层重复判断。
+3. **拒绝提前抽象**：单次使用的逻辑就近内联，不要随意提前拆分出无意义的 helper。
+4. **控制复杂度**：非必要不使用 `try/catch`；能由单个函数清晰完成的逻辑，不要强行拆分。
+
