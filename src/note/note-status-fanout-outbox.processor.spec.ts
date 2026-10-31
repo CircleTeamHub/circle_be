@@ -10,6 +10,7 @@ const pendingJob = (overrides: Record<string, unknown> = {}) => ({
   chatUserCursor: null,
   attempts: 0,
   lockedAt: null,
+  workStatusChanged: false,
   ...overrides,
 });
 
@@ -35,7 +36,7 @@ function createHarness(
       findUnique: jest.fn().mockResolvedValue(sourceState),
       findMany: jest.fn().mockResolvedValue([]),
     },
-    assistantSubscription: {
+    assistantPreference: {
       findMany: jest.fn().mockResolvedValue([]),
     },
     $queryRaw: jest.fn().mockResolvedValue([]),
@@ -58,69 +59,129 @@ function createHarness(
   };
 }
 
+const sourceRow = (overrides: Record<string, unknown> = {}) => ({
+  id: 'source-note',
+  ownerID: 'owner-1',
+  title: '北京租房攻略',
+  status: 'ACTIVE',
+  available: true,
+  workStatus: 'WORKING',
+  updatedAt: new Date('2026-10-29T12:00:00.000Z'),
+  ...overrides,
+});
+
+const libraryPage = [
+  { id: 'source-note', ownerID: 'owner-1' },
+  { id: 'copy-note', ownerID: 'viewer-1' },
+];
+
 describe('NoteStatusFanoutOutboxProcessor', () => {
-  it('sends one assistant alert to collected-note owners when a source is unlisted', async () => {
-    const assistant = {
-      sendNoteStatusAlert: jest.fn().mockResolvedValue(undefined),
-    };
-    const { prisma, processor } = createHarness(pendingJob(), assistant);
-    prisma.note.findUnique.mockResolvedValue({
-      id: 'source-note',
-      ownerID: 'owner-1',
-      title: '北京租房攻略',
-      status: 'UNLISTED',
-      available: false,
-      workStatus: null,
-      updatedAt: new Date('2026-10-29T12:00:00.000Z'),
-    });
-    prisma.note.findMany.mockResolvedValue([
-      { id: 'source-note', ownerID: 'owner-1' },
-      { id: 'copy-note', ownerID: 'viewer-1' },
-    ]);
-    prisma.assistantSubscription.findMany.mockResolvedValue([
-      { userID: 'viewer-1' },
-    ]);
+  const workStatusJob = () => pendingJob({ workStatusChanged: true });
+
+  it('reminds library holders when the owner closes the source (打烊)', async () => {
+    const { prisma, processor, assistant } = createHarness(workStatusJob());
+    prisma.note.findUnique.mockResolvedValue(
+      sourceRow({ workStatus: 'CLOSED' }),
+    );
+    prisma.note.findMany.mockResolvedValue(libraryPage);
 
     await processor.processPending();
 
+    expect(assistant.sendNoteStatusAlert).toHaveBeenCalledTimes(1);
     expect(assistant.sendNoteStatusAlert).toHaveBeenCalledWith('viewer-1', {
       sourceNoteId: 'source-note',
       title: '北京租房攻略',
-      status: 'UNLISTED',
+      status: 'CLOSED',
       changedAt: '2026-10-29T12:00:00.000Z',
     });
   });
 
-  it('skips assistant alerts when the recipient has not opted in', async () => {
-    const assistant = {
-      sendNoteStatusAlert: jest.fn().mockResolvedValue(undefined),
-    };
-    const { prisma, processor } = createHarness(pendingJob(), assistant);
-    prisma.note.findUnique.mockResolvedValue({
-      id: 'source-note',
-      ownerID: 'owner-1',
-      title: '北京租房攻略',
-      status: 'UNLISTED',
-      available: false,
-      workStatus: null,
-      updatedAt: new Date('2026-10-29T12:00:00.000Z'),
-    });
+  it('reminds library holders when the owner reopens the source (开业)', async () => {
+    const { prisma, processor, assistant } = createHarness(workStatusJob());
+    prisma.note.findUnique.mockResolvedValue(sourceRow());
+    prisma.note.findMany.mockResolvedValue(libraryPage);
+
+    await processor.processPending();
+
+    expect(assistant.sendNoteStatusAlert).toHaveBeenCalledWith(
+      'viewer-1',
+      expect.objectContaining({ status: 'WORKING' }),
+    );
+  });
+
+  it('does not remind when only the listing changed, even for an open shop', async () => {
+    const { prisma, realtime, processor, assistant } = createHarness();
+    prisma.note.findUnique.mockResolvedValue(
+      sourceRow({ status: 'UNLISTED', available: false }),
+    );
+    prisma.note.findMany.mockResolvedValue(libraryPage);
+
+    await processor.processPending();
+
+    expect(realtime.broadcastNoteSourceStatusChanged).toHaveBeenCalled();
+    expect(prisma.assistantPreference.findMany).not.toHaveBeenCalled();
+    expect(assistant.sendNoteStatusAlert).not.toHaveBeenCalled();
+  });
+
+  it('does not remind about a source that was deleted', async () => {
+    const { prisma, processor, assistant } = createHarness(workStatusJob());
+    prisma.note.findUnique.mockResolvedValue(
+      sourceRow({ status: 'DELETED', workStatus: 'CLOSED' }),
+    );
+    prisma.note.findMany.mockResolvedValue(libraryPage);
+
+    await processor.processPending();
+
+    expect(assistant.sendNoteStatusAlert).not.toHaveBeenCalled();
+  });
+
+  it('skips library holders who turned the reminder off', async () => {
+    const { prisma, processor, assistant } = createHarness(workStatusJob());
+    prisma.note.findUnique.mockResolvedValue(
+      sourceRow({ workStatus: 'CLOSED' }),
+    );
     prisma.note.findMany.mockResolvedValue([
-      { id: 'source-note', ownerID: 'owner-1' },
-      { id: 'copy-note', ownerID: 'viewer-1' },
+      ...libraryPage,
+      { id: 'copy-note-2', ownerID: 'viewer-2' },
+    ]);
+    prisma.assistantPreference.findMany.mockResolvedValue([
+      { userID: 'viewer-2' },
     ]);
 
     await processor.processPending();
 
-    expect(prisma.assistantSubscription.findMany).toHaveBeenCalledWith({
+    expect(prisma.assistantPreference.findMany).toHaveBeenCalledWith({
       where: {
-        userID: { in: ['viewer-1'] },
-        enabled: true,
-        noteStatusAlerts: true,
+        userID: { in: ['viewer-1', 'viewer-2'] },
+        assistantKey: 'windnote-assistant',
+        noteStatusAlerts: false,
       },
       select: { userID: true },
-      distinct: ['userID'],
     });
+    expect(assistant.sendNoteStatusAlert).toHaveBeenCalledTimes(1);
+    expect(assistant.sendNoteStatusAlert).toHaveBeenCalledWith(
+      'viewer-1',
+      expect.anything(),
+    );
+  });
+
+  it('only refreshes the card for chat members who never saved the note', async () => {
+    const { prisma, realtime, processor, assistant } = createHarness(
+      pendingJob({ stage: 'CHAT_MEMBERS', workStatusChanged: true }),
+    );
+    prisma.note.findUnique.mockResolvedValue(
+      sourceRow({ workStatus: 'CLOSED' }),
+    );
+    prisma.$queryRaw.mockResolvedValue([
+      { conversationID: 'conversation-1', userID: 'chat-member-1' },
+    ]);
+
+    await processor.processPending();
+
+    expect(realtime.broadcastNoteSourceStatusChanged).toHaveBeenCalledWith(
+      'chat-member-1',
+      expect.anything(),
+    );
     expect(assistant.sendNoteStatusAlert).not.toHaveBeenCalled();
   });
 

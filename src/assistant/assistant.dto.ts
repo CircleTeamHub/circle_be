@@ -8,7 +8,7 @@ import {
   IsUUID,
   MaxLength,
 } from 'class-validator';
-import { ApiPropertyOptional } from '@nestjs/swagger';
+import { ApiProperty, ApiPropertyOptional } from '@nestjs/swagger';
 
 export class CreateAssistantSubscriptionDto {
   @IsUUID()
@@ -42,11 +42,6 @@ export class CreateAssistantSubscriptionDto {
   @IsBoolean()
   @IsOptional()
   pushEnabled?: boolean;
-
-  @ApiPropertyOptional({ default: true })
-  @IsBoolean()
-  @IsOptional()
-  noteStatusAlerts?: boolean;
 }
 
 export class UpdateAssistantSubscriptionDto {
@@ -77,9 +72,12 @@ export class UpdateAssistantSubscriptionDto {
   @IsBoolean()
   @IsOptional()
   pushEnabled?: boolean;
+}
 
-  @ApiPropertyOptional()
+export class UpdateAssistantPreferencesDto {
+  @ApiProperty({
+    description: '笔记库里的笔记被来源作者打烊、下架或删除时提醒',
+  })
   @IsBoolean()
-  @IsOptional()
-  noteStatusAlerts?: boolean;
+  noteStatusAlerts: boolean;
 }

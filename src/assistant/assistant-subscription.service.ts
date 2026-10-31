@@ -35,7 +35,6 @@ export type AssistantSubscriptionDto = {
   sourceTypes: string[];
   enabled: boolean;
   pushEnabled: boolean;
-  noteStatusAlerts: boolean;
   createdAt: string;
   updatedAt: string;
 };
@@ -54,7 +53,6 @@ type SubscriptionWithCircle = {
   sourceTypes: string[];
   enabled: boolean;
   pushEnabled: boolean;
-  noteStatusAlerts: boolean;
   createdAt: Date;
   updatedAt: Date;
   circle: AccessibleCircle;
@@ -129,7 +127,6 @@ export class AssistantSubscriptionService {
         keywords,
         sourceTypes: [ASSISTANT_INFO_SOURCE_PLAZA_POST],
         pushEnabled: dto.pushEnabled ?? true,
-        noteStatusAlerts: dto.noteStatusAlerts ?? true,
       },
       update: {
         cities,
@@ -139,9 +136,6 @@ export class AssistantSubscriptionService {
         ...(dto.pushEnabled === undefined
           ? {}
           : { pushEnabled: dto.pushEnabled }),
-        ...(dto.noteStatusAlerts === undefined
-          ? {}
-          : { noteStatusAlerts: dto.noteStatusAlerts }),
       },
       include: {
         circle: { select: { id: true, name: true, cities: true } },
@@ -181,9 +175,6 @@ export class AssistantSubscriptionService {
         ...(dto.pushEnabled === undefined
           ? {}
           : { pushEnabled: dto.pushEnabled }),
-        ...(dto.noteStatusAlerts === undefined
-          ? {}
-          : { noteStatusAlerts: dto.noteStatusAlerts }),
       },
       include: {
         circle: { select: { id: true, name: true, cities: true } },
@@ -412,7 +403,6 @@ export class AssistantSubscriptionService {
       sourceTypes: row.sourceTypes,
       enabled: row.enabled,
       pushEnabled: row.pushEnabled,
-      noteStatusAlerts: row.noteStatusAlerts,
       createdAt: row.createdAt.toISOString(),
       updatedAt: row.updatedAt.toISOString(),
     };

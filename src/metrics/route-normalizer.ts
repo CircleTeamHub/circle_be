@@ -91,6 +91,7 @@ export const STATIC_ROUTES = new Set([
   '/api/v1/auth/sessions',
   '/api/v1/auth/single-device-login',
   '/api/v1/assistant/bootstrap',
+  '/api/v1/assistant/preferences',
   '/api/v1/assistant/subscriptions',
   '/api/v1/calls/group',
   '/api/v1/calls/current',

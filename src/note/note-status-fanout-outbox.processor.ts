@@ -6,6 +6,7 @@ import { sanitizeLogValue } from 'src/logging/log-sanitizer';
 import { TrackedCron } from 'src/metrics/tracked-cron.decorator';
 import { PrismaService } from 'src/prisma/prisma.service';
 import { RealtimeService } from 'src/realtime/realtime.service';
+import { ASSISTANT_KEY } from 'src/assistant/assistant.constants';
 import { AssistantService } from 'src/assistant/assistant.service';
 
 const JOB_BATCH_SIZE = 20;
@@ -23,6 +24,7 @@ type FanoutJob = {
   chatUserCursor: string | null;
   attempts: number;
   lockedAt: Date | null;
+  workStatusChanged: boolean;
 };
 
 type SourcePayload = {
@@ -34,6 +36,15 @@ type SourcePayload = {
   available: boolean;
   changedAt: string;
 };
+
+/** 只提醒开工/打烊的真实切换;上下架、删除只刷新名片。 */
+function alertStatus(
+  job: FanoutJob,
+  payload: SourcePayload,
+): 'CLOSED' | 'WORKING' | null {
+  if (!job.workStatusChanged || payload.status === 'DELETED') return null;
+  return payload.workStatus;
+}
 
 @Injectable()
 export class NoteStatusFanoutOutboxProcessor {
@@ -181,6 +192,7 @@ export class NoteStatusFanoutOutboxProcessor {
     );
     await this.sendAssistantAlerts(
       page.map((row) => row.ownerID),
+      alertStatus(job, payload),
       payload,
     );
 
@@ -246,11 +258,8 @@ export class NoteStatusFanoutOutboxProcessor {
       ORDER BY conversation."conversationID" ASC, member."userID" ASC
       LIMIT ${RECIPIENT_PAGE_SIZE + 1}`;
     const page = rows.slice(0, RECIPIENT_PAGE_SIZE);
+    // 只是在聊天里见过名片、没收进自己笔记库的人:名片状态照刷,不发助手提醒。
     await this.broadcast(
-      page.map((row) => row.userID),
-      payload,
-    );
-    await this.sendAssistantAlerts(
       page.map((row) => row.userID),
       payload,
     );
@@ -300,35 +309,35 @@ export class NoteStatusFanoutOutboxProcessor {
 
   private async sendAssistantAlerts(
     recipientIDs: string[],
+    status: 'CLOSED' | 'WORKING' | null,
     payload: SourcePayload,
   ): Promise<void> {
-    if (!this.assistant || payload.status === 'ACTIVE') return;
+    if (!this.assistant || !status) return;
     const candidates = [
       ...new Set(recipientIDs.filter((id) => id && id !== payload.ownerID)),
     ];
     if (candidates.length === 0) return;
-    const optedIn = await this.prisma.assistantSubscription.findMany({
+    // 默认开启:没有设置行的人照发,只跳过明确关掉的。
+    const optedOut = await this.prisma.assistantPreference.findMany({
       where: {
         userID: { in: candidates },
-        enabled: true,
-        noteStatusAlerts: true,
+        assistantKey: ASSISTANT_KEY,
+        noteStatusAlerts: false,
       },
       select: { userID: true },
-      distinct: ['userID'],
     });
-    const recipients = optedIn.map((row) => row.userID);
-    if (recipients.length === 0) return;
-    const status = payload.status === 'DELETED' ? 'DELETED' : 'UNLISTED';
-    await Promise.all(
-      recipients.map((userId) =>
-        this.assistant.sendNoteStatusAlert(userId, {
-          sourceNoteId: payload.sourceNoteId,
-          title: payload.title,
-          status,
-          changedAt: payload.changedAt,
-        }),
-      ),
-    );
+    const muted = new Set(optedOut.map((row) => row.userID));
+    // 收藏的人多时一页就是 100 条提醒,逐条发,不让一页同时占满连接池;
+    // 整页失败重试时,已发的那些按 clientMessageId 去重,不会重复。
+    for (const userId of candidates) {
+      if (muted.has(userId)) continue;
+      await this.assistant.sendNoteStatusAlert(userId, {
+        sourceNoteId: payload.sourceNoteId,
+        title: payload.title,
+        status,
+        changedAt: payload.changedAt,
+      });
+    }
   }
 
   private claimedWhere(job: FanoutJob, leaseToken: string) {

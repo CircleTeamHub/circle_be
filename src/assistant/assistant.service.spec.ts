@@ -9,6 +9,10 @@ describe('AssistantService', () => {
     chatMember: {
       updateMany: jest.fn().mockResolvedValue({ count: 1 }),
     },
+    assistantPreference: {
+      findUnique: jest.fn(),
+      upsert: jest.fn(),
+    },
   };
   const broadcast = {
     joinUserToConversation: jest.fn().mockResolvedValue(undefined),
@@ -71,7 +75,7 @@ describe('AssistantService', () => {
     await service.sendNoteStatusAlert('user-1', {
       sourceNoteId: 'source-note',
       title: '北京租房攻略',
-      status: 'UNLISTED',
+      status: 'CLOSED',
       changedAt: '2026-10-29T12:00:00.000Z',
     });
 
@@ -81,13 +85,13 @@ describe('AssistantService', () => {
         senderID: 'system:windnote-assistant',
         type: 'assistant-note-status',
         clientMessageId:
-          'windnote-assistant:note-status:user-1:source-note:UNLISTED:2026-10-29T12:00:00.000Z',
+          'windnote-assistant:note-status:user-1:source-note:CLOSED:2026-10-29T12:00:00.000Z',
         push: true,
         content: expect.objectContaining({
           kind: 'note-status',
           sourceNoteId: 'source-note',
           title: '北京租房攻略',
-          status: 'UNLISTED',
+          status: 'CLOSED',
         }),
       }),
     );
@@ -131,5 +135,46 @@ describe('AssistantService', () => {
         push: true,
       }),
     );
+  });
+  it('treats a user with no preference row as opted in to note alerts', async () => {
+    prisma.assistantPreference.findUnique.mockResolvedValue(null);
+
+    await expect(service.getPreferences('user-1')).resolves.toEqual({
+      noteStatusAlerts: true,
+    });
+    expect(prisma.assistantPreference.findUnique).toHaveBeenCalledWith({
+      where: {
+        userID_assistantKey: {
+          userID: 'user-1',
+          assistantKey: 'windnote-assistant',
+        },
+      },
+      select: { noteStatusAlerts: true },
+    });
+  });
+
+  it('stores the note alert switch per user, not per circle', async () => {
+    prisma.assistantPreference.upsert.mockResolvedValue({
+      noteStatusAlerts: false,
+    });
+
+    await expect(
+      service.updatePreferences('user-1', { noteStatusAlerts: false }),
+    ).resolves.toEqual({ noteStatusAlerts: false });
+    expect(prisma.assistantPreference.upsert).toHaveBeenCalledWith({
+      where: {
+        userID_assistantKey: {
+          userID: 'user-1',
+          assistantKey: 'windnote-assistant',
+        },
+      },
+      create: {
+        userID: 'user-1',
+        assistantKey: 'windnote-assistant',
+        noteStatusAlerts: false,
+      },
+      update: { noteStatusAlerts: false },
+      select: { noteStatusAlerts: true },
+    });
   });
 });

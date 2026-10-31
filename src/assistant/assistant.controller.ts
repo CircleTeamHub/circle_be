@@ -14,6 +14,7 @@ import { ApiOperation, ApiTags } from '@nestjs/swagger';
 import type { RequestWithUser } from 'src/auth/types';
 import {
   CreateAssistantSubscriptionDto,
+  UpdateAssistantPreferencesDto,
   UpdateAssistantSubscriptionDto,
 } from './assistant.dto';
 import { AssistantService } from './assistant.service';
@@ -38,16 +39,27 @@ export class AssistantController {
       this.assistant.bootstrap(req.user.userId),
       this.subscriptions.list(req.user.userId),
       this.subscriptions.getContextCircle(req.user.userId, contextCircleId),
-    ]).then(([base, subscriptions, contextCircle]) => ({
+      this.assistant.getPreferences(req.user.userId),
+    ]).then(([base, subscriptions, contextCircle, preferences]) => ({
       ...base,
       subscriptions,
       contextCircle,
+      preferences,
       capabilities: {
         infoSubscriptions: true,
         noteStatusAlerts: true,
         dailyDigest: false,
       },
     }));
+  }
+
+  @Patch('preferences')
+  @ApiOperation({ summary: '更新助手的用户级设置(与圈子订阅无关)' })
+  updatePreferences(
+    @Req() req: RequestWithUser,
+    @Body() dto: UpdateAssistantPreferencesDto,
+  ) {
+    return this.assistant.updatePreferences(req.user.userId, dto);
   }
 
   @Get('subscriptions')

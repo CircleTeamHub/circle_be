@@ -15,10 +15,14 @@ import {
 } from './assistant.constants';
 import type { InfoAlertPayload } from './assistant-subscription.service';
 
+export type AssistantPreferences = {
+  noteStatusAlerts: boolean;
+};
+
 type NoteStatusAlert = {
   sourceNoteId: string;
   title: string;
-  status: 'UNLISTED' | 'DELETED' | 'MODERATION_REMOVED';
+  status: 'CLOSED' | 'WORKING';
   changedAt: string;
 };
 
@@ -108,6 +112,35 @@ export class AssistantService {
     });
     await this.joinUser(userId, conversationId);
     return conversationId;
+  }
+
+  /** 没有设置行 = 默认值(提醒开启)。 */
+  async getPreferences(userId: string): Promise<AssistantPreferences> {
+    const row = await this.prisma.assistantPreference.findUnique({
+      where: {
+        userID_assistantKey: { userID: userId, assistantKey: ASSISTANT_KEY },
+      },
+      select: { noteStatusAlerts: true },
+    });
+    return { noteStatusAlerts: row?.noteStatusAlerts ?? true };
+  }
+
+  updatePreferences(
+    userId: string,
+    preferences: AssistantPreferences,
+  ): Promise<AssistantPreferences> {
+    return this.prisma.assistantPreference.upsert({
+      where: {
+        userID_assistantKey: { userID: userId, assistantKey: ASSISTANT_KEY },
+      },
+      create: {
+        userID: userId,
+        assistantKey: ASSISTANT_KEY,
+        noteStatusAlerts: preferences.noteStatusAlerts,
+      },
+      update: { noteStatusAlerts: preferences.noteStatusAlerts },
+      select: { noteStatusAlerts: true },
+    });
   }
 
   async sendNoteStatusAlert(

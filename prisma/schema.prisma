@@ -506,6 +506,7 @@ model User {
   circlePosts                       CirclePost[]
   assistantSubscriptions           AssistantSubscription[]
   assistantAlertDeliveries          AssistantAlertDelivery[]
+  assistantPreferences              AssistantPreference[]
   circleInvitationsAsApplicant      CircleInvitation[]          @relation("invitationApplicant")
   circleInvitationsAsInviter        CircleInvitation[]          @relation("invitationInviter")
   circleVerifications               CircleInvitationVerifier[]  @relation("verifierUser")
@@ -1272,6 +1273,9 @@ model NoteStatusFanoutOutbox {
   lockedAt               DateTime?
   leaseToken             String?
   lastError              String?                      @db.VarChar(1000)
+  /// 这一批里开工/打烊真的切换过:只有这时才给收藏者发助手提醒。
+  /// 合并后续变更时只会置 true,任务完成删行后归零。
+  workStatusChanged      Boolean                      @default(false)
   queuedAt               DateTime                     @default(now())
   createdAt              DateTime                     @default(now())
   updatedAt              DateTime                     @updatedAt
@@ -2180,7 +2184,6 @@ model AssistantSubscription {
   sourceTypes  String[] @default(["PLAZA_POST"])
   enabled      Boolean  @default(true)
   pushEnabled  Boolean  @default(true)
-  noteStatusAlerts Boolean @default(true)
   createdAt    DateTime @default(now())
   updatedAt    DateTime @updatedAt
 
@@ -2190,6 +2193,20 @@ model AssistantSubscription {
   @@unique([userID, assistantKey, circleID])
   @@index([userID, enabled])
   @@index([circleID, enabled])
+}
+
+/// 助手的用户级设置,和圈子订阅无关。没有行 = 全取默认值,所以只有关掉过的人才有行。
+model AssistantPreference {
+  userID           String
+  assistantKey     String   @default("windnote-assistant")
+  /// 笔记库里的笔记被来源作者打烊、下架或删除时提醒。
+  noteStatusAlerts Boolean  @default(true)
+  createdAt        DateTime @default(now())
+  updatedAt        DateTime @updatedAt
+
+  user User @relation(fields: [userID], references: [id], onDelete: Cascade)
+
+  @@id([userID, assistantKey])
 }
 
 /// 内容发布提醒的可靠投递记录。dedupeKey 保护重复 outbox/cron/请求重试不重复发消息。
