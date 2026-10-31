@@ -189,6 +189,7 @@ export const TempChatErrorCode = {
   CreatorOnly: 'TEMP_CHAT_CREATOR_ONLY',
   JoinFailed: 'TEMP_CHAT_JOIN_FAILED',
   UploadQuotaExceeded: 'TEMP_CHAT_UPLOAD_QUOTA_EXCEEDED',
+  DailyCreateLimit: 'TEMP_CHAT_DAILY_CREATE_LIMIT',
 } as const;
 
 // 圈子广场:发帖 / 报名 / 合作认可(战绩)。帖子不存在统一用 PostNotFound;

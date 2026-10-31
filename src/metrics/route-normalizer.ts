@@ -348,6 +348,7 @@ export const DYNAMIC_ROUTE_TEMPLATES = [
   '/api/v1/qr/tokens/:token',
   '/api/v1/qr/tokens/:token/join',
   '/api/v1/qr/tokens/:token/accept',
+  '/api/v1/temp-chat/:id',
   '/api/v1/temp-chat/:id/end',
   '/api/v1/temp-chat/by-token/:token/join',
   '/api/v1/temp-chat/by-token/:token/meta',

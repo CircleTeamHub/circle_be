@@ -3,6 +3,7 @@ import {
   BadRequestException,
   Body,
   Controller,
+  Delete,
   HttpCode,
   HttpStatus,
   Get,
@@ -188,5 +189,18 @@ export class TempChatController {
   @ApiOperation({ summary: '发起人手动结束' })
   end(@Req() req: any, @Param('id') id: string) {
     return this.service.end(req.user.userId, id);
+  }
+
+  @Delete(':id')
+  @UseGuards(JwtGuard, AppAudienceGuard)
+  @ApiBearerAuth()
+  @HttpCode(HttpStatus.NO_CONTENT)
+  @ApiOperation({
+    summary: '发起人删除临时聊天',
+    description:
+      '进行中的房间先结束(访客移出、链接失效)再删除;已删除的再删照样 204。',
+  })
+  remove(@Req() req: any, @Param('id', ParseUUIDPipe) id: string) {
+    return this.service.remove(req.user.userId, id);
   }
 }

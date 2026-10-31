@@ -88,6 +88,24 @@ export interface JoinTempChatResult {
 const MAX_ACTIVE_ROOMS_PER_HOST = 200;
 
 /**
+ * 每人每天最多新建的临时聊天数。删掉的房间照样算(软删行还在),否则建了删、
+ * 删了建就能无限开房。
+ *
+ * 「天」按北京时间自然日(UTC+8,无夏令时)零点重置:用户在国内,UTC 日界落在
+ * 北京时间早上八点,和「每天」的直觉对不上。滚动 24 小时窗口同样不好解释
+ * 「什么时候能再建」。
+ */
+const DAILY_CREATE_LIMIT = 5;
+const QUOTA_DAY_OFFSET_MS = 8 * 60 * 60 * 1000;
+const DAY_MS = 24 * 60 * 60 * 1000;
+
+/** now 所在北京时间自然日的零点(返回的是对应的 UTC 时刻)。 */
+function startOfQuotaDay(now: Date): Date {
+  const shifted = now.getTime() + QUOTA_DAY_OFFSET_MS;
+  return new Date(shifted - (shifted % DAY_MS) - QUOTA_DAY_OFFSET_MS);
+}
+
+/**
  * 临时聊天(自研栈版):房间 ←→ ChatConversation(type=TEMP) 一一对应,
  * 访客以 TempChatGuest 身份(非 User 行)入座 ChatMember;凭证与实时通道
  * 全部走自研 chat —— OpenIM 的注册/建群/发token/强退在本模块已出清。
@@ -134,6 +152,7 @@ export class TempChatService {
 
     // round 3 review:/mine 有 200 条护栏 —— 上限与护栏对齐;count+create 在
     // 同一把 per-host advisory 锁里,防两个 199→200 的并发请求落成 201。
+    // 每日配额同理:两个并发的第 5 个请求在锁里排队,后一个看得到前一个的行。
     // (原先「先建 OpenIM 群再落库」的两段式与回滚补偿随 OpenIM 一并移除:
     // 会话行与房间行现在同事务原子创建,不存在孤儿群问题。)
     const quotaLockKey = `temp-chat:${hostUserId}`;
@@ -141,6 +160,18 @@ export class TempChatService {
     const { row, conversationId } = await this.prisma.$transaction(
       async (tx) => {
         await tx.$executeRaw`SELECT pg_advisory_xact_lock(hashtext(${quotaLockKey}))`;
+        const createdToday = await tx.tempChat.count({
+          where: {
+            hostUserId,
+            createdAt: { gte: startOfQuotaDay(new Date()) },
+          },
+        });
+        if (createdToday >= DAILY_CREATE_LIMIT) {
+          throw new BadRequestException({
+            message: `每天最多创建 ${DAILY_CREATE_LIMIT} 个临时聊天，今天的次数已用完`,
+            errorCode: TempChatErrorCode.DailyCreateLimit,
+          });
+        }
         const active = await tx.tempChat.count({
           where: { hostUserId, endedAt: null, expiresAt: { gt: new Date() } },
         });
@@ -230,6 +261,7 @@ export class TempChatService {
     const activeRows = await this.prisma.tempChat.findMany({
       where: {
         hostUserId,
+        deletedAt: null,
         status: TempChatStatus.ACTIVE,
         expiresAt: { gt: new Date() },
       },
@@ -244,6 +276,7 @@ export class TempChatService {
         ? await this.prisma.tempChat.findMany({
             where: {
               hostUserId,
+              deletedAt: null,
               ...(activeIds.length > 0 ? { id: { notIn: activeIds } } : {}),
             },
             orderBy: [{ createdAt: 'desc' }],
@@ -503,6 +536,78 @@ export class TempChatService {
       entityId: id,
     });
     return { status: finalStatus };
+  }
+
+  /**
+   * 房主删除房间(软删)。进行中的房间先走 end 那条 teardown —— 访客离座断线,
+   * 分享链接随 status 不再是 ACTIVE 一并失效(访客页看到的是「已结束」);
+   * 然后打 deletedAt、房主座位离座:房间从房主的临时聊天列表和消息列表里
+   * 同时消失。聊天记录不物理删除,与结束后的房间一样留在库里。
+   * 幂等:已经删过的直接返回;teardown 之后中途失败,重试会跳过 teardown 补完删除。
+   */
+  async remove(hostUserId: string, id: string): Promise<void> {
+    const room = await this.prisma.tempChat.findUniqueOrThrow({
+      where: { id },
+    });
+    if (room.hostUserId !== hostUserId) {
+      throw new ForbiddenException({
+        message: '只有创建者可以删除',
+        errorCode: TempChatErrorCode.CreatorOnly,
+      });
+    }
+    if (room.deletedAt) return;
+    if (room.status === TempChatStatus.ACTIVE) {
+      await this.teardown(room, TempChatStatus.ENDED);
+    }
+    const deletedAt = new Date();
+    const { deleted, conversationId } = await this.prisma.$transaction(
+      async (tx) => {
+        const marked = await tx.tempChat.updateMany({
+          where: { id, deletedAt: null },
+          data: { deletedAt },
+        });
+        const conversation = await tx.chatConversation.findUnique({
+          where: { tempChatID: id },
+          select: { id: true },
+        });
+        if (conversation) {
+          await tx.chatMember.updateMany({
+            where: {
+              conversationID: conversation.id,
+              userID: hostUserId,
+              leftAt: null,
+            },
+            data: { leftAt: deletedAt },
+          });
+        }
+        return {
+          deleted: marked.count > 0,
+          conversationId: conversation?.id ?? null,
+        };
+      },
+    );
+    // 并发的另一次删除已经做完了收尾。
+    if (!deleted) return;
+    if (conversationId) {
+      // 房主其他设备靠这条个人事件把会话从列表里收走。
+      void this.chatBroadcast
+        .removeUserFromConversation(hostUserId, conversationId)
+        .catch(() => undefined);
+      this.chatBroadcast.emitConversationChange(hostUserId, {
+        kind: 'left',
+        conversationId,
+        userId: hostUserId,
+      });
+    }
+    logBusinessEvent(this.logger, {
+      enabled: this.loggingConfig.businessLogOn,
+      businessEvent: 'temp_chat_deleted',
+      actorId: hostUserId,
+      result: 'success',
+      entityType: 'temp_chat',
+      entityId: id,
+      metadata: { wasActive: room.status === TempChatStatus.ACTIVE },
+    });
   }
 
   /**

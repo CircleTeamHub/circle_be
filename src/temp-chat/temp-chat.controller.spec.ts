@@ -96,3 +96,22 @@ describe('TempChatController guest history', () => {
     expect(service.getGuestHistory).toHaveBeenCalledWith(tempChatGuest, query);
   });
 });
+
+describe('TempChatController remove', () => {
+  it('deletes as the signed-in host and answers 204', async () => {
+    const service = { remove: jest.fn().mockResolvedValue(undefined) };
+    const controller = new TempChatController(
+      service as never,
+      {} as never,
+      {} as never,
+    );
+
+    await expect(
+      controller.remove({ user: { userId: 'host-1' } }, 'tc-1'),
+    ).resolves.toBeUndefined();
+    expect(service.remove).toHaveBeenCalledWith('host-1', 'tc-1');
+    expect(
+      Reflect.getMetadata('__httpCode__', TempChatController.prototype.remove),
+    ).toBe(204);
+  });
+});

@@ -2378,6 +2378,9 @@ model TempChat {
   cleanupLockedAt         DateTime?
   cleanupGroupDismissedAt DateTime?
   cleanupCompletedAt      DateTime?
+  /// 房主把房间从自己的临时聊天列表里删掉的时刻。软删:行留着,每日创建配额照样把它算进去
+  /// (否则建了删、删了建就能绕过上限);删之前一定先结束(status 非 ACTIVE)。
+  deletedAt               DateTime?
   createdAt               DateTime       @default(now())
   updatedAt               DateTime       @updatedAt
 
