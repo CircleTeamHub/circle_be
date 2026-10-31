@@ -8,10 +8,13 @@ import {
   Post,
   Query,
   Req,
+  UseGuards,
 } from '@nestjs/common';
 import { Throttle } from '@nestjs/throttler';
 import { ApiOperation, ApiTags } from '@nestjs/swagger';
 import type { RequestWithUser } from 'src/auth/types';
+import { AppAudienceGuard } from 'src/guards/app-audience.guard';
+import { JwtGuard } from 'src/guards/jwt.guard';
 import {
   CreateAssistantSubscriptionDto,
   UpdateAssistantPreferencesDto,
@@ -21,6 +24,9 @@ import { AssistantService } from './assistant.service';
 import { AssistantSubscriptionService } from './assistant-subscription.service';
 
 @ApiTags('assistant')
+// AppAudienceGuard:小助手会话和订阅是普通用户能力,管理台的 ADMIN token 同样能过
+// JwtGuard,不该能建助手会话或改用户的订阅与偏好。
+@UseGuards(JwtGuard, AppAudienceGuard)
 @Controller('assistant')
 export class AssistantController {
   constructor(

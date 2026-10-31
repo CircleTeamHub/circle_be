@@ -234,12 +234,33 @@ export class AssistantSubscriptionService {
         keywords: true,
         sourceTypes: true,
         pushEnabled: true,
-        circle: { select: { id: true, name: true, cities: true } },
+        circle: {
+          select: { id: true, name: true, cities: true, ownerID: true },
+        },
       },
       orderBy: { id: 'asc' },
       take: MAX_INFO_DELIVERIES_PER_POST + 1,
     });
     if (subscriptions.length === 0) return 0;
+    if (subscriptions.length > MAX_INFO_DELIVERIES_PER_POST) {
+      this.logger.warn(
+        `assistant info candidates capped at ${MAX_INFO_DELIVERIES_PER_POST} before matching (post=${postId})`,
+      );
+    }
+
+    // 成员身份只在订阅创建时校验过；退圈或被移出后订阅行还在，按当前身份再筛一次，
+    // 否则前成员会继续通过小助手收到圈内帖子。群主不一定有成员行，单独放行。
+    const memberships = await tx.circleMember.findMany({
+      where: {
+        circleID: { in: linkedCircleIds },
+        userID: { in: [...new Set(subscriptions.map((sub) => sub.userID))] },
+        status: 'ACTIVE',
+      },
+      select: { circleID: true, userID: true },
+    });
+    const activeMembers = new Set(
+      memberships.map((member) => `${member.circleID}:${member.userID}`),
+    );
 
     const postCircleIds = new Set(
       post.circleLinks.map((link) => link.circleID),
@@ -267,6 +288,12 @@ export class AssistantSubscriptionService {
 
     for (const subscription of subscriptions) {
       if (!postCircleIds.has(subscription.circleID)) continue;
+      if (
+        subscription.circle.ownerID !== subscription.userID &&
+        !activeMembers.has(`${subscription.circleID}:${subscription.userID}`)
+      ) {
+        continue;
+      }
       if (!this.matchesKeywords(post, subscription.keywords)) continue;
       const scopeCities = this.normalizeList(
         subscription.cities.length > 0
@@ -297,11 +324,6 @@ export class AssistantSubscriptionService {
 
     const rows = [...grouped.values()];
     if (rows.length === 0) return 0;
-    if (rows.length > MAX_INFO_DELIVERIES_PER_POST) {
-      this.logger.warn(
-        `assistant info delivery capped at ${MAX_INFO_DELIVERIES_PER_POST} (post=${postId})`,
-      );
-    }
     const sourceVersion = '1';
     const title = this.firstLine(post.content) || '圈子有新的城市信息';
     const summary = this.clamp(post.content.trim(), 240);

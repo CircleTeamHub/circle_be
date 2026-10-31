@@ -1,5 +1,16 @@
 import { AssistantSubscriptionService } from './assistant-subscription.service';
 
+// 默认每个订阅人都还在圈内:按查询条件原样回显 (circleID, userID) 组合。
+function activeMembersOf(args: {
+  where: { circleID: { in: string[] }; userID: { in: string[] } };
+}) {
+  return Promise.resolve(
+    args.where.circleID.in.flatMap((circleID) =>
+      args.where.userID.in.map((userID) => ({ circleID, userID })),
+    ),
+  );
+}
+
 describe('AssistantSubscriptionService', () => {
   it('matches a post against the current circle cities and skips other cities', async () => {
     const tx = {
@@ -36,6 +47,9 @@ describe('AssistantSubscriptionService', () => {
             circle: { id: 'circle-1', name: '上海生活圈', cities: ['上海'] },
           },
         ]),
+      },
+      circleMember: {
+        findMany: jest.fn().mockImplementation(activeMembersOf),
       },
       assistantAlertDelivery: {
         createMany: jest.fn().mockResolvedValue({ count: 1 }),
@@ -93,6 +107,9 @@ describe('AssistantSubscriptionService', () => {
           },
         ]),
       },
+      circleMember: {
+        findMany: jest.fn().mockImplementation(activeMembersOf),
+      },
       assistantAlertDelivery: {
         createMany: jest.fn().mockResolvedValue({ count: 1 }),
       },
@@ -144,6 +161,9 @@ describe('AssistantSubscriptionService', () => {
           },
         ]),
       },
+      circleMember: {
+        findMany: jest.fn().mockImplementation(activeMembersOf),
+      },
       assistantAlertDelivery: {
         createMany: jest.fn().mockResolvedValue({ count: 1 }),
       },
@@ -161,5 +181,66 @@ describe('AssistantSubscriptionService', () => {
         data: [expect.objectContaining({ userID: 'user-match' })],
       }),
     );
+  });
+
+  it('skips subscribers who left the circle but keeps the owner without a member row', async () => {
+    const post = {
+      id: 'post-left',
+      content: '圈内新活动',
+      tags: [],
+      city: null,
+      cities: [],
+      authorID: 'author-1',
+      createdAt: new Date('2026-10-31T10:00:00.000Z'),
+      circleLinks: [{ circleID: 'circle-1' }],
+    };
+    const subscription = (userID: string) => ({
+      id: `sub-${userID}`,
+      userID,
+      circleID: 'circle-1',
+      cities: [],
+      keywords: [],
+      sourceTypes: ['PLAZA_POST'],
+      pushEnabled: true,
+      circle: { id: 'circle-1', name: '圈子', cities: [], ownerID: 'owner-1' },
+    });
+    const tx = {
+      circlePost: { findUnique: jest.fn().mockResolvedValue(post) },
+      assistantSubscription: {
+        findMany: jest
+          .fn()
+          .mockResolvedValue([
+            subscription('member-1'),
+            subscription('left-1'),
+            subscription('owner-1'),
+          ]),
+      },
+      circleMember: {
+        // left-1 退圈后订阅行还在,但已不是 ACTIVE 成员;群主没有成员行。
+        findMany: jest
+          .fn()
+          .mockResolvedValue([{ circleID: 'circle-1', userID: 'member-1' }]),
+      },
+      assistantAlertDelivery: {
+        createMany: jest.fn().mockResolvedValue({ count: 2 }),
+      },
+    };
+    const service = new AssistantSubscriptionService({} as never);
+
+    await service.enqueueCirclePost(tx as never, 'post-left', 'author-1', [
+      'circle-1',
+    ]);
+
+    expect(tx.circleMember.findMany).toHaveBeenCalledWith(
+      expect.objectContaining({
+        where: expect.objectContaining({ status: 'ACTIVE' }),
+      }),
+    );
+    const [{ data }] = tx.assistantAlertDelivery.createMany.mock.calls[0] as [
+      { data: Array<{ userID: string }> },
+    ];
+    expect(
+      data.map((row) => row.userID).sort((a, b) => a.localeCompare(b)),
+    ).toEqual(['member-1', 'owner-1']);
   });
 });
