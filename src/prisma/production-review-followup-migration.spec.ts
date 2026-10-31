@@ -26,7 +26,8 @@ describe('production review follow-up migration', () => {
     // 三张 OpenIM 同步 outbox 表已在 20260806 拆栈迁移中删除;当年 3 处
     // leaseToken 只保留在仍需跨实例租约保护的 3 个异步 outbox 中，
     // generation 列随已移除的 OpenIM membership outbox 一起消失。
-    expect(schema.match(/leaseToken\s+String\?/g)).toHaveLength(3);
+    // 第 4 处是后来的 AssistantAlertDelivery 投递队列，自带同样的租约列。
+    expect(schema.match(/leaseToken\s+String\?/g)).toHaveLength(4);
     expect(schema).toContain('isPublic');
   });
 });
