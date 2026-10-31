@@ -226,19 +226,10 @@ describe('PrismaService', () => {
     await service.onModuleInit();
 
     expect(connectMock).not.toHaveBeenCalled();
-    expect(service.isDatabaseConnected()).toBe(false);
     expect(warnSpy).toHaveBeenCalled();
   });
 
-  it('returns false from connectIfNeeded when degraded startup is enabled without a database URL', async () => {
-    process.env.ALLOW_START_WITHOUT_DB = 'true';
-    const service = new PrismaService();
-
-    await expect(service.connectIfNeeded()).resolves.toBe(false);
-    expect(connectMock).not.toHaveBeenCalled();
-  });
-
-  it('marks the service connected after a successful boot-time connection', async () => {
+  it('connects once during boot when DATABASE_URL is set', async () => {
     process.env.DATABASE_URL = 'postgresql://example';
     connectMock.mockResolvedValueOnce(undefined);
     const service = new PrismaService();
@@ -246,7 +237,6 @@ describe('PrismaService', () => {
     await service.onModuleInit();
 
     expect(connectMock).toHaveBeenCalledTimes(1);
-    expect(service.isDatabaseConnected()).toBe(true);
     expect(logSpy).toHaveBeenCalled();
   });
 

@@ -340,8 +340,11 @@ export class TempChatService {
     const displayName = this.resolveGuestDisplayName(dto.displayName);
     const guestId = newGuestId();
 
-    // 原子占座：Serializable 事务内复查房间状态 + 人数后建 guest 行与座位。
+    // 原子占座：在房间级 advisory 锁里复查房间状态 + 人数后建 guest 行与座位。
     // 既防并发超员,也关上「加入与销毁同时发生」的竞态 —— 销毁后占不到座。
+    // 用默认的 READ COMMITTED:每条语句在拿到锁之后才取快照。Serializable 的
+    // 快照在取锁那条语句开始时就固定了,排队拿到锁的事务读到旧人数、写入被判
+    // 40001,同时点开链接的访客会直接失败。
     const { room, conversationId } = await this.prisma.$transaction(
       async (tx) => {
         const roomLockKey = `temp-chat:${tcId}`;
@@ -385,7 +388,6 @@ export class TempChatService {
         });
         return { room, conversationId: conversation.id };
       },
-      { isolationLevel: 'Serializable' },
     );
 
     const remainingSeconds = Math.max(
@@ -474,9 +476,6 @@ export class TempChatService {
       query.limit,
       // afterHeight 是重连增量补拉的游标:访客断线期间的消息靠它追平。
       { afterHeight: query.afterHeight },
-      // 访客没有 User 行,套用户级「消息自动销毁」只会吃到 2 天默认值,
-      // 把 3 天/7 天房间里的历史凭空砍掉。访客的保留边界是房间寿命。
-      { applyViewerRetention: false },
     );
     return {
       ...page,

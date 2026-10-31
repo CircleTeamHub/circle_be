@@ -2,7 +2,6 @@ import { Injectable, NotFoundException } from '@nestjs/common';
 import { Prisma } from 'src/generated/prisma';
 import { PrismaService } from 'src/prisma/prisma.service';
 import { RealtimeService } from 'src/realtime/realtime.service';
-import { runSerializableTransaction } from 'src/utils/prisma-tx';
 import { CreditEventDto } from './dto/credit-event.dto';
 
 type CreditClient = Prisma.TransactionClient | PrismaService;
@@ -71,14 +70,6 @@ export class CreditService {
     }));
   }
 
-  async applyDelta(input: CreditDeltaInput): Promise<CreditDeltaResult> {
-    const result = await runSerializableTransaction(this.prisma, (tx) =>
-      this.applyDeltaInTransaction(tx, input),
-    );
-    await this.broadcastCreditProfileChanged(input.userId);
-    return result;
-  }
-
   async applyDeltaInTransaction(
     client: CreditClient,
     input: CreditDeltaInput,
@@ -142,9 +133,9 @@ export class CreditService {
   }
 
   async broadcastCreditProfileChanged(userId: string) {
-    // Post-commit hook: every score-change path (applyDelta / friend-report
-    // approval) calls this after its transaction commits. Invalidate the cached
-    // profile summary first (synchronous, immediate) then broadcast the change.
+    // Post-commit hook: every score-change path (friend-report approval) calls
+    // this after its transaction commits. Invalidate the cached profile
+    // summary first (synchronous, immediate) then broadcast the change.
     await this.realtimeService.safeBroadcastAll([
       // 失效方法现返回 boolean（供会员发放路径复检）；credit 这里不关心结果，包一层丢弃成 void。
       async () => {

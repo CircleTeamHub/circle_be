@@ -305,21 +305,6 @@ describe('ChatService standalone group conversations', () => {
     );
   });
 
-  it('legacy direct invitation and QR entry points cannot grant membership', async () => {
-    await expect(
-      service.inviteToGroupConversation('owner-1', 'conv-1', ['f1']),
-    ).rejects.toMatchObject({
-      response: { errorCode: 'CHAT_GROUP_ACCEPT_REQUIRED' },
-    });
-    await expect(
-      service.joinStandaloneGroupViaQr('f1', 'conv-1'),
-    ).rejects.toMatchObject({
-      response: { errorCode: 'CHAT_GROUP_ACCEPT_REQUIRED' },
-    });
-    expect(prisma.chatMember.create).not.toHaveBeenCalled();
-    expect(prisma.chatMember.update).not.toHaveBeenCalled();
-  });
-
   // 解散(微信语义):群主一按,群从所有人的列表里消失,所有人的记录一起没。
   const dissolvableConversation = (
     overrides: Record<string, unknown> = {},

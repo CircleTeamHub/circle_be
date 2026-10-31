@@ -15,9 +15,6 @@ describe('CreditService', () => {
     },
   };
   const prisma = {
-    $transaction: jest.fn(async (callback: (client: typeof tx) => unknown) =>
-      callback(tx),
-    ),
     creditEvent: {
       findMany: jest.fn(),
     },
@@ -39,7 +36,7 @@ describe('CreditService', () => {
     );
   });
 
-  it('applies a credit delta, clamps score, writes an event, and broadcasts profile summary', async () => {
+  it('applies a credit delta, clamps score, and writes an event', async () => {
     tx.creditEvent.findUnique.mockResolvedValue(null);
     tx.$queryRaw.mockResolvedValue([{ creditScore: 3 }]);
     tx.user.update.mockResolvedValue({ id: 'user-1', creditScore: 0 });
@@ -50,7 +47,7 @@ describe('CreditService', () => {
     });
 
     await expect(
-      service.applyDelta({
+      service.applyDeltaInTransaction(tx as never, {
         userId: 'user-1',
         delta: -5,
         reason: 'FRIEND_REPORT',
@@ -88,6 +85,11 @@ describe('CreditService', () => {
       },
       select: { id: true, scoreBefore: true, scoreAfter: true },
     });
+  });
+
+  it('invalidates and broadcasts the profile summary after a score change', async () => {
+    await service.broadcastCreditProfileChanged('user-1');
+
     expect(
       realtimeService.invalidateUserProfileSummaryCache,
     ).toHaveBeenCalledWith('user-1');
@@ -104,7 +106,7 @@ describe('CreditService', () => {
     });
 
     await expect(
-      service.applyDelta({
+      service.applyDeltaInTransaction(tx as never, {
         userId: 'user-1',
         delta: -5,
         reason: 'FRIEND_REPORT',

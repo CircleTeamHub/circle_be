@@ -10,7 +10,6 @@ import { unreadBadgeQuery } from './chat-push-badge.query';
 import { CHAT_PUSH_CHANNEL_ID } from './chat.constants';
 import type { ChatMessageDto } from './chat.types';
 import { reportOperationalError } from 'src/logging/error-aggregation.service';
-import { PrivacySettingsService } from 'src/privacy/privacy-settings.service';
 
 /**
  * 聊天离线推送(best-effort):socket 广播覆盖在线端,本服务只管离线成员。
@@ -129,7 +128,6 @@ export class ChatPushService implements OnModuleDestroy {
     private readonly prisma: PrismaService,
     private readonly push: NotificationPushService,
     private readonly broadcast: ChatBroadcastService,
-    private readonly privacySettings: PrivacySettingsService,
   ) {}
 
   /**
