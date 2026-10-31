@@ -3000,6 +3000,7 @@ describe('NoteService', () => {
       collectedFromNoteID: null,
       rootSourceNoteID: null,
     });
+    prisma.note.findUnique.mockResolvedValueOnce({ workStatus: 'WORKING' });
     prisma.note.update.mockResolvedValueOnce({
       id: 'source-note',
       workStatus: 'CLOSED',
@@ -3008,8 +3009,50 @@ describe('NoteService', () => {
     await service.setWorkStatus('boss', 'source-note', 'CLOSED');
 
     expect(prisma.$transaction).toHaveBeenCalledWith(expect.any(Function));
-    expect(prisma.noteStatusFanoutOutbox.upsert).toHaveBeenCalledWith(
-      expect.objectContaining({ where: { rootNoteID: 'source-note' } }),
+    expect(prisma.noteStatusFanoutOutbox.upsert).toHaveBeenCalledWith({
+      where: { rootNoteID: 'source-note' },
+      create: expect.objectContaining({ workStatusChanged: true }),
+      update: expect.objectContaining({ workStatusChanged: true }),
+    });
+  });
+
+  it('does not flag a holder reminder when the work status is set to its current value', async () => {
+    prisma.note.findFirst.mockResolvedValueOnce({
+      id: 'source-note',
+      ownerID: 'boss',
+      collectedFromNoteID: null,
+      rootSourceNoteID: null,
+    });
+    prisma.note.findUnique.mockResolvedValueOnce({ workStatus: 'CLOSED' });
+    prisma.note.update.mockResolvedValueOnce({
+      id: 'source-note',
+      workStatus: 'CLOSED',
+    });
+
+    await service.setWorkStatus('boss', 'source-note', 'CLOSED');
+
+    const [upsert] = prisma.noteStatusFanoutOutbox.upsert.mock.calls[0];
+    expect(upsert.create).toEqual(
+      expect.objectContaining({ workStatusChanged: false }),
+    );
+    // 合并进已排队的任务时不能把之前那次真实切换的标记清掉。
+    expect(upsert.update).not.toHaveProperty('workStatusChanged');
+  });
+
+  it('reads an assistant card summary only from the holder own, undeleted note', async () => {
+    prisma.note.findFirst.mockResolvedValueOnce(null);
+
+    await expect(
+      service.ownedNoteSummary('viewer-1', 'copy-note'),
+    ).resolves.toBeNull();
+    expect(prisma.note.findFirst).toHaveBeenCalledWith(
+      expect.objectContaining({
+        where: {
+          id: 'copy-note',
+          ownerID: 'viewer-1',
+          status: { not: 'DELETED' },
+        },
+      }),
     );
   });
 

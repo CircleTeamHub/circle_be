@@ -564,6 +564,22 @@ export class ChatPushService implements OnModuleDestroy {
         },
       };
     }
+    if (conversation.type === 'SUPPORT') {
+      const title = conversation.name?.trim() || '风信助手';
+      return {
+        title,
+        body: preview,
+        data: {
+          type: 'chat',
+          conversationId: message.conversationId,
+          messageId: message.id,
+          sourceID: message.conversationId,
+          conversationType: 'private',
+          conversationKind: 'support',
+          title,
+        },
+      };
+    }
     if (conversation.type === 'GROUP') {
       // 独立群聊:标题用群名(空群名退化到发送者);sourceID = 会话 id。
       const title = conversation.name?.trim() || senderName || '群聊';
@@ -625,6 +641,10 @@ export class ChatPushService implements OnModuleDestroy {
         return '[笔记]';
       case 'qr-card':
         return '[二维码]';
+      case 'assistant-note-status':
+        return '你的笔记状态有变化，请打开风信助手查看。';
+      case 'assistant-info-alert':
+        return '风信助手有一条新的城市信息提醒。';
       default:
         return '[消息]';
     }

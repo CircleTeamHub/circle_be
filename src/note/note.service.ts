@@ -1257,6 +1257,7 @@ export class NoteService {
   private async enqueueSourceStatusFanout(
     tx: Prisma.TransactionClient,
     rootNoteID: string,
+    workStatusChanged = false,
   ): Promise<void> {
     const queuedAt = new Date();
     await tx.noteStatusFanoutOutbox.upsert({
@@ -1265,10 +1266,13 @@ export class NoteService {
         rootNoteID,
         status: 'PENDING',
         stage: 'OWNERS',
+        workStatusChanged,
         queuedAt,
         nextAttemptAt: queuedAt,
       },
       update: {
+        // 只置 true:后续的上下架合并进来时不能清掉还没发出的开工/打烊提醒。
+        ...(workStatusChanged ? { workStatusChanged: true } : {}),
         status: 'PENDING',
         stage: 'OWNERS',
         generation: { increment: 1 },
@@ -3536,6 +3540,20 @@ export class NoteService {
     return this.toSummaryPage(notes, limit, ownerID);
   }
 
+  /** 助手提醒附带名片用:只读收藏者自己、未删除的那份;没有就返回 null。 */
+  async ownedNoteSummary(
+    ownerID: string,
+    noteId: string,
+  ): Promise<NoteSummaryDto | null> {
+    const note = await this.prisma.note.findFirst({
+      where: { id: noteId, ownerID, status: { not: 'DELETED' } },
+      select: NOTE_SUMMARY_SELECT,
+    });
+    if (!note) return null;
+    const [summary] = await this.mapSummaryListResolved([note], ownerID);
+    return summary ?? null;
+  }
+
   /** 多取的那一行先截掉再映射：它不返回，也不必为它签名媒体 URL。 */
   private async toSummaryPage(
     notes: Array<NoteSummaryBase & { sections?: unknown }>,
@@ -5233,12 +5251,19 @@ export class NoteService {
     const owned = await this.requireOwnedSourceNote(ownerID, noteId);
     const rootNoteID = this.noteRootID(owned);
     return this.prisma.$transaction(async (tx) => {
+      const before = await tx.note.findUnique({
+        where: { id: noteId },
+        select: { workStatus: true },
+      });
+      // 收藏者只在开工/打烊真的切换时收到助手提醒;原样再设一遍或清成 null 不算。
+      const workStatusChanged =
+        workStatus !== null && workStatus !== before?.workStatus;
       const result = await tx.note.update({
         where: { id: noteId, ownerID, status: { not: 'DELETED' } },
         data: { workStatus },
         select: { id: true, workStatus: true },
       });
-      await this.enqueueSourceStatusFanout(tx, rootNoteID);
+      await this.enqueueSourceStatusFanout(tx, rootNoteID, workStatusChanged);
       return result;
     });
   }

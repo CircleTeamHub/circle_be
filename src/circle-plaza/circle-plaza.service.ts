@@ -4,6 +4,7 @@ import {
   Injectable,
   Logger,
   NotFoundException,
+  Optional,
 } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import {
@@ -51,6 +52,8 @@ import {
 import { createLoggingConfig } from 'src/logging/logging.config';
 import { logBusinessEvent } from 'src/logging/business-event.logger';
 import { buildImageMedia } from 'src/media/image-media';
+import { AssistantAlertDeliveryProcessor } from 'src/assistant/assistant-alert-delivery.processor';
+import { AssistantSubscriptionService } from 'src/assistant/assistant-subscription.service';
 
 // The relations every DTO mapping needs, narrowed to the columns it reads.
 // `include: { author: true }` pulled the whole User row (passwordHash, email,
@@ -119,6 +122,10 @@ export class CirclePlazaService {
     private readonly iconService: IconService,
     private readonly membershipPolicy: MembershipPolicyService,
     private readonly avatarFrames: AvatarFrameService,
+    @Optional()
+    private readonly assistantSubscriptions?: AssistantSubscriptionService,
+    @Optional()
+    private readonly assistantAlerts?: AssistantAlertDeliveryProcessor,
   ) {
     this.storagePublicObjectBases = storagePublicObjectBasesFromConfig(
       this.config,
@@ -390,6 +397,13 @@ export class CirclePlazaService {
             },
           );
 
+        await this.assistantSubscriptions?.enqueueCirclePost(
+          tx,
+          created.id,
+          userId,
+          circleIds,
+        );
+
         // 每个圈子的 postCount 都 +1。必须是事务里最后一条写:这条 UPDATE 给 Circle
         // 行加的行锁要持有到提交,而入圈占座、改设置、别人发帖都要写这一行。排在
         // 扇出(≤500 条通知 + ≤500 条推送 outbox)之前的话,整段扇出期间这一行都被占着。
@@ -413,6 +427,18 @@ export class CirclePlazaService {
           }`,
         );
       }
+    }
+
+    if (this.assistantAlerts) {
+      void this.assistantAlerts
+        .processPendingForSource(post.id)
+        .catch((error: unknown) => {
+          this.logger.warn(
+            `assistant city alert delivery failed after post publication (post=${post.id}): ${
+              error instanceof Error ? error.name : 'unknown'
+            }`,
+          );
+        });
     }
 
     const displayIconsByAuthor = await this.getDisplayIconsByAuthorIds([

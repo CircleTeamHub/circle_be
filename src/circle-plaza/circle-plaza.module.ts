@@ -6,6 +6,7 @@ import { CirclePlazaController } from './circle-plaza.controller';
 import { CirclePlazaCleanup } from './circle-plaza.cleanup';
 import { CirclePlazaService } from './circle-plaza.service';
 import { AvatarFrameModule } from 'src/avatar-frame/avatar-frame.module';
+import { AssistantModule } from 'src/assistant/assistant.module';
 
 @Module({
   imports: [
@@ -13,6 +14,7 @@ import { AvatarFrameModule } from 'src/avatar-frame/avatar-frame.module';
     NotificationModule,
     MembershipPolicyModule,
     AvatarFrameModule,
+    AssistantModule,
   ],
   controllers: [CirclePlazaController],
   providers: [CirclePlazaService, CirclePlazaCleanup],

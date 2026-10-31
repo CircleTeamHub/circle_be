@@ -205,7 +205,7 @@ Content:
 - `plaza_post_created`
 - `moment_created`
 - `note_share_link_created`, `note_share_link_revoked`
-- `temp_chat_created`, `temp_chat_ended`
+- `temp_chat_created`, `temp_chat_ended`, `temp_chat_deleted`
 
 Calls:
 

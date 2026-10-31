@@ -59,6 +59,7 @@ import { AdminOperationsModule } from './admin-operations/admin-operations.modul
 import { AdminCommerceModule } from './admin-commerce/admin-commerce.module';
 import { AdminContentModule } from './admin-content/admin-content.module';
 import { AdminImModule } from './admin-im/admin-im.module';
+import { AssistantModule } from './assistant/assistant.module';
 
 const nodeEnv = process.env.NODE_ENV || 'development';
 const envFilePath = `.env.${nodeEnv}`;
@@ -123,6 +124,7 @@ const envFilePath = `.env.${nodeEnv}`;
     AdminCommerceModule,
     AdminContentModule,
     AdminImModule,
+    AssistantModule,
     ConsoleModule,
   ],
   controllers: [],

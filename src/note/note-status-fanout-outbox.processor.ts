@@ -1,4 +1,4 @@
-import { Injectable, Logger } from '@nestjs/common';
+import { Injectable, Logger, Optional } from '@nestjs/common';
 import { CronExpression } from '@nestjs/schedule';
 import { randomUUID } from 'crypto';
 import { reportOperationalError } from 'src/logging/error-aggregation.service';
@@ -6,6 +6,10 @@ import { sanitizeLogValue } from 'src/logging/log-sanitizer';
 import { TrackedCron } from 'src/metrics/tracked-cron.decorator';
 import { PrismaService } from 'src/prisma/prisma.service';
 import { RealtimeService } from 'src/realtime/realtime.service';
+import { ASSISTANT_KEY } from 'src/assistant/assistant.constants';
+import { AssistantService } from 'src/assistant/assistant.service';
+import { assistantNoteCardContent } from './assistant-note-card';
+import { NoteService } from './note.service';
 
 const JOB_BATCH_SIZE = 20;
 const RECIPIENT_PAGE_SIZE = 100;
@@ -22,14 +26,27 @@ type FanoutJob = {
   chatUserCursor: string | null;
   attempts: number;
   lockedAt: Date | null;
+  workStatusChanged: boolean;
 };
 
 type SourcePayload = {
   sourceNoteId: string;
+  ownerID: string | null;
+  title: string;
   workStatus: 'WORKING' | 'CLOSED' | null;
   status: 'ACTIVE' | 'UNLISTED' | 'DELETED';
   available: boolean;
+  changedAt: string;
 };
+
+/** 只提醒开工/打烊的真实切换;上下架、删除只刷新名片。 */
+function alertStatus(
+  job: FanoutJob,
+  payload: SourcePayload,
+): 'CLOSED' | 'WORKING' | null {
+  if (!job.workStatusChanged || payload.status === 'DELETED') return null;
+  return payload.workStatus;
+}
 
 @Injectable()
 export class NoteStatusFanoutOutboxProcessor {
@@ -38,6 +55,8 @@ export class NoteStatusFanoutOutboxProcessor {
   constructor(
     private readonly prisma: PrismaService,
     private readonly realtime: RealtimeService,
+    private readonly notes: NoteService,
+    @Optional() private readonly assistant?: AssistantService,
   ) {}
 
   @TrackedCron(CronExpression.EVERY_MINUTE, 'note_status_fanout_outbox')
@@ -123,23 +142,35 @@ export class NoteStatusFanoutOutboxProcessor {
       where: { id: rootNoteID },
       select: {
         id: true,
+        ownerID: true,
+        title: true,
         status: true,
         available: true,
         workStatus: true,
+        updatedAt: true,
       },
     });
     return source
       ? {
           sourceNoteId: rootNoteID,
+          ownerID: source.ownerID,
+          title: typeof source.title === 'string' ? source.title : '',
           workStatus: source.workStatus,
           status: source.status,
           available: source.available,
+          changedAt:
+            source.updatedAt instanceof Date
+              ? source.updatedAt.toISOString()
+              : new Date().toISOString(),
         }
       : {
           sourceNoteId: rootNoteID,
+          ownerID: null,
+          title: '',
           workStatus: null,
           status: 'DELETED',
           available: false,
+          changedAt: new Date().toISOString(),
         };
   }
 
@@ -162,6 +193,7 @@ export class NoteStatusFanoutOutboxProcessor {
       page.map((row) => row.ownerID),
       payload,
     );
+    await this.sendAssistantAlerts(page, alertStatus(job, payload), payload);
 
     if (rows.length > RECIPIENT_PAGE_SIZE) {
       await this.persistProgress(job, leaseToken, {
@@ -225,6 +257,7 @@ export class NoteStatusFanoutOutboxProcessor {
       ORDER BY conversation."conversationID" ASC, member."userID" ASC
       LIMIT ${RECIPIENT_PAGE_SIZE + 1}`;
     const page = rows.slice(0, RECIPIENT_PAGE_SIZE);
+    // 只是在聊天里见过名片、没收进自己笔记库的人:名片状态照刷,不发助手提醒。
     await this.broadcast(
       page.map((row) => row.userID),
       payload,
@@ -256,12 +289,64 @@ export class NoteStatusFanoutOutboxProcessor {
     payload: SourcePayload,
   ): Promise<void> {
     const uniqueRecipientIDs = [...new Set(recipientIDs)];
+    const realtimePayload = {
+      sourceNoteId: payload.sourceNoteId,
+      workStatus: payload.workStatus,
+      status: payload.status,
+      available: payload.available,
+    };
     await this.realtime.safeBroadcastAll(
       uniqueRecipientIDs.map(
         (userID) => () =>
-          this.realtime.broadcastNoteSourceStatusChanged(userID, payload),
+          this.realtime.broadcastNoteSourceStatusChanged(
+            userID,
+            realtimePayload,
+          ),
       ),
     );
+  }
+
+  private async sendAssistantAlerts(
+    libraryCopies: Array<{ id: string; ownerID: string }>,
+    status: 'CLOSED' | 'WORKING' | null,
+    payload: SourcePayload,
+  ): Promise<void> {
+    if (!this.assistant || !status) return;
+    // 收藏者 → 他自己那份副本;名片点开进的就是这份。
+    const copyByOwner = new Map<string, string>();
+    for (const copy of libraryCopies) {
+      if (!copy.ownerID || copy.ownerID === payload.ownerID) continue;
+      if (!copyByOwner.has(copy.ownerID))
+        copyByOwner.set(copy.ownerID, copy.id);
+    }
+    const candidates = [...copyByOwner.keys()];
+    if (candidates.length === 0) return;
+    // 默认开启:没有设置行的人照发,只跳过明确关掉的。
+    const optedOut = await this.prisma.assistantPreference.findMany({
+      where: {
+        userID: { in: candidates },
+        assistantKey: ASSISTANT_KEY,
+        noteStatusAlerts: false,
+      },
+      select: { userID: true },
+    });
+    const muted = new Set(optedOut.map((row) => row.userID));
+    // 收藏的人多时一页就是 100 条提醒,逐条发,不让一页同时占满连接池;
+    // 整页失败重试时,已发的那些按 clientMessageId 去重,不会重复。
+    for (const [userId, copyId] of copyByOwner) {
+      if (muted.has(userId)) continue;
+      const summary = await this.notes.ownedNoteSummary(userId, copyId);
+      await this.assistant.sendNoteStatusAlert(
+        userId,
+        {
+          sourceNoteId: payload.sourceNoteId,
+          title: payload.title,
+          status,
+          changedAt: payload.changedAt,
+        },
+        summary ? assistantNoteCardContent(summary, payload) : null,
+      );
+    }
   }
 
   private claimedWhere(job: FanoutJob, leaseToken: string) {

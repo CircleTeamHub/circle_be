@@ -90,6 +90,9 @@ export const STATIC_ROUTES = new Set([
   '/api/v1/auth/security-code/verify',
   '/api/v1/auth/sessions',
   '/api/v1/auth/single-device-login',
+  '/api/v1/assistant/bootstrap',
+  '/api/v1/assistant/preferences',
+  '/api/v1/assistant/subscriptions',
   '/api/v1/calls/group',
   '/api/v1/calls/current',
   '/api/v1/calls/direct',
@@ -118,6 +121,7 @@ export const STATIC_ROUTES = new Set([
   '/api/v1/coin/wallet',
   '/api/v1/collections',
   '/api/v1/conversation-groups',
+  '/api/v1/credit/events',
   '/api/v1/friend',
   '/api/v1/friend/activities',
   '/api/v1/friend/activities/unread-count',
@@ -176,6 +180,7 @@ export const STATIC_ROUTES = new Set([
   '/api/v1/user/vip-levels',
 ]);
 export const DYNAMIC_ROUTE_TEMPLATES = [
+  '/api/v1/assistant/subscriptions/:id',
   '/api/v1/admin/system-announcements/:id',
   '/api/v1/notification/profile/:id/detail',
   '/api/v1/admin/system-announcements/:id/scrolling',
@@ -344,6 +349,7 @@ export const DYNAMIC_ROUTE_TEMPLATES = [
   '/api/v1/qr/tokens/:token',
   '/api/v1/qr/tokens/:token/join',
   '/api/v1/qr/tokens/:token/accept',
+  '/api/v1/temp-chat/:id',
   '/api/v1/temp-chat/:id/end',
   '/api/v1/temp-chat/by-token/:token/join',
   '/api/v1/temp-chat/by-token/:token/meta',

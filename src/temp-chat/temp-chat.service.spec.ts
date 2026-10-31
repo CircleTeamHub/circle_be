@@ -48,6 +48,8 @@ describe('TempChatService', () => {
   const chatBroadcast = {
     joinUserToConversation: jest.fn().mockResolvedValue(undefined),
     disconnectUser: jest.fn().mockResolvedValue(undefined),
+    removeUserFromConversation: jest.fn().mockResolvedValue(undefined),
+    emitConversationChange: jest.fn(),
   };
   const chatService = {
     listMembers: jest.fn().mockResolvedValue([]),
@@ -87,6 +89,7 @@ describe('TempChatService', () => {
     });
     chatBroadcast.joinUserToConversation.mockResolvedValue(undefined);
     chatBroadcast.disconnectUser.mockResolvedValue(undefined);
+    chatBroadcast.removeUserFromConversation.mockResolvedValue(undefined);
     chatService.listMembers.mockResolvedValue([]);
     chatService.getNoteCardNoteId.mockResolvedValue('note-1');
     noteService.getSharedNoteForGuest.mockResolvedValue({ id: 'note-1' });
@@ -167,11 +170,93 @@ describe('TempChatService', () => {
     });
 
     it('enforces the active-room quota under the advisory lock', async () => {
-      prisma.tempChat.count.mockResolvedValue(200);
+      // 第一次 count 是每日配额,第二次才是活跃房间数。
+      prisma.tempChat.count.mockResolvedValueOnce(0).mockResolvedValueOnce(200);
       await expect(service.create('host-1', {})).rejects.toThrow(
         BadRequestException,
       );
       expect(prisma.tempChat.create).not.toHaveBeenCalled();
+    });
+  });
+
+  describe('create daily limit', () => {
+    let createdAt: Date[];
+
+    const createErrorCode = async (): Promise<unknown> => {
+      const error = await service.create('host-1', {}).catch((e) => e);
+      expect(error).toBeInstanceOf(BadRequestException);
+      return (error as BadRequestException).getResponse();
+    };
+
+    beforeEach(() => {
+      jest.useFakeTimers();
+      createdAt = [];
+      // 按 where.createdAt.gte 真实过滤内存里的建房时刻,日界算错就会数错。
+      prisma.tempChat.count.mockImplementation(
+        ({ where }: { where: { createdAt?: { gte: Date } } }) =>
+          Promise.resolve(
+            where.createdAt
+              ? createdAt.filter((at) => at >= where.createdAt!.gte).length
+              : 0,
+          ),
+      );
+      prisma.tempChat.create.mockImplementation(() => {
+        createdAt.push(new Date());
+        return Promise.resolve({
+          id: `tc-${createdAt.length}`,
+          groupId: `g-${createdAt.length}`,
+          title: '临时聊天',
+          maxMembers: 50,
+          expiresAt: new Date(Date.now() + 60 * 60 * 1000),
+        });
+      });
+      prisma.chatConversation.create.mockResolvedValue({ id: 'conv-1' });
+    });
+
+    afterEach(() => {
+      jest.useRealTimers();
+    });
+
+    it('allows five rooms a day and rejects the sixth with a dedicated code', async () => {
+      jest.setSystemTime(Date.parse('2026-10-31T01:00:00Z'));
+      for (let i = 0; i < 5; i += 1) {
+        await expect(service.create('host-1', {})).resolves.toMatchObject({
+          id: `tc-${i + 1}`,
+        });
+      }
+
+      await expect(createErrorCode()).resolves.toMatchObject({
+        errorCode: 'TEMP_CHAT_DAILY_CREATE_LIMIT',
+      });
+      expect(prisma.tempChat.create).toHaveBeenCalledTimes(5);
+    });
+
+    // 日界是北京时间零点(UTC 16:00),删掉的房间也照样计数(count 不带 deletedAt)。
+    it('resets at Beijing midnight and still counts deleted rooms', async () => {
+      jest.setSystemTime(Date.parse('2026-10-31T15:00:00Z')); // 北京 23:00
+      for (let i = 0; i < 5; i += 1) {
+        await service.create('host-1', {});
+      }
+      const [dailyQuery] = prisma.tempChat.count.mock.calls[0] as [
+        { where: { hostUserId: string; createdAt: { gte: Date } } },
+      ];
+      expect(Object.keys(dailyQuery.where)).toEqual([
+        'hostUserId',
+        'createdAt',
+      ]);
+      expect(dailyQuery.where.createdAt.gte.getTime()).toBe(
+        Date.parse('2026-10-30T16:00:00Z'),
+      );
+
+      jest.setSystemTime(Date.parse('2026-10-31T15:59:59Z')); // 北京 23:59:59
+      await expect(createErrorCode()).resolves.toMatchObject({
+        errorCode: 'TEMP_CHAT_DAILY_CREATE_LIMIT',
+      });
+
+      jest.setSystemTime(Date.parse('2026-10-31T16:00:00Z')); // 北京次日 00:00
+      await expect(service.create('host-1', {})).resolves.toMatchObject({
+        id: 'tc-6',
+      });
     });
   });
 
@@ -239,6 +324,7 @@ describe('TempChatService', () => {
         expect.objectContaining({
           where: {
             hostUserId: 'host-1',
+            deletedAt: null,
             status: 'ACTIVE',
             expiresAt: { gt: expect.any(Date) },
           },
@@ -250,6 +336,7 @@ describe('TempChatService', () => {
         expect.objectContaining({
           where: {
             hostUserId: 'host-1',
+            deletedAt: null,
             id: { notIn: [activeRoom.id] },
           },
           take: 199,
@@ -436,6 +523,111 @@ describe('TempChatService', () => {
       await service.end('host-1', 'tc-1');
       expect(prisma.chatMember.updateMany).not.toHaveBeenCalled();
       expect(chatBroadcast.disconnectUser).not.toHaveBeenCalled();
+    });
+  });
+
+  describe('remove', () => {
+    const activeRoom = {
+      id: 'tc-1',
+      groupId: 'g-1',
+      hostUserId: 'host-1',
+      status: 'ACTIVE',
+      deletedAt: null,
+    };
+
+    beforeEach(() => {
+      prisma.tempChat.updateMany.mockResolvedValue({ count: 1 });
+      prisma.chatConversation.findUnique.mockResolvedValue({ id: 'conv-1' });
+      prisma.tempChatGuest.findMany.mockResolvedValue([]);
+    });
+
+    it('only the host can delete the room', async () => {
+      prisma.tempChat.findUniqueOrThrow.mockResolvedValue(activeRoom);
+
+      await expect(service.remove('intruder', 'tc-1')).rejects.toThrow(
+        ForbiddenException,
+      );
+      expect(prisma.$transaction).not.toHaveBeenCalled();
+      expect(prisma.tempChat.updateMany).not.toHaveBeenCalled();
+    });
+
+    it('ends an active room through teardown, then hides it from the host', async () => {
+      prisma.tempChat.findUniqueOrThrow.mockResolvedValue(activeRoom);
+      prisma.tempChat.findUnique.mockResolvedValue({
+        ...activeRoom,
+        endedAt: null,
+        cleanupCompletedAt: null,
+        cleanupLockedAt: null,
+      });
+      prisma.tempChatGuest.findMany.mockResolvedValue([{ imUserId: 'g-a' }]);
+
+      await expect(service.remove('host-1', 'tc-1')).resolves.toBeUndefined();
+
+      // 结束:访客离座断线、状态落成 ENDED(链接随之失效)。
+      expect(prisma.tempChat.update).toHaveBeenCalledWith(
+        expect.objectContaining({
+          data: expect.objectContaining({ status: 'ENDED' }),
+        }),
+      );
+      expect(chatBroadcast.disconnectUser).toHaveBeenCalledWith('g-a');
+      // 删除:软删打标 + 房主座位离座 + 通知房主其他设备收走会话。
+      expect(prisma.tempChat.updateMany).toHaveBeenCalledWith({
+        where: { id: 'tc-1', deletedAt: null },
+        data: { deletedAt: expect.any(Date) },
+      });
+      expect(prisma.chatMember.updateMany).toHaveBeenCalledWith({
+        where: { conversationID: 'conv-1', userID: 'host-1', leftAt: null },
+        data: { leftAt: expect.any(Date) },
+      });
+      expect(chatBroadcast.removeUserFromConversation).toHaveBeenCalledWith(
+        'host-1',
+        'conv-1',
+      );
+      expect(chatBroadcast.emitConversationChange).toHaveBeenCalledWith(
+        'host-1',
+        { kind: 'left', conversationId: 'conv-1', userId: 'host-1' },
+      );
+    });
+
+    it('deletes an ended room without tearing it down again', async () => {
+      prisma.tempChat.findUniqueOrThrow.mockResolvedValue({
+        ...activeRoom,
+        status: 'ENDED',
+      });
+
+      await service.remove('host-1', 'tc-1');
+
+      expect(prisma.tempChat.update).not.toHaveBeenCalled();
+      expect(prisma.tempChatGuest.findMany).not.toHaveBeenCalled();
+      expect(prisma.tempChat.updateMany).toHaveBeenCalledWith({
+        where: { id: 'tc-1', deletedAt: null },
+        data: { deletedAt: expect.any(Date) },
+      });
+      expect(chatBroadcast.emitConversationChange).toHaveBeenCalledTimes(1);
+    });
+
+    it('is idempotent: deleting an already deleted room is a no-op', async () => {
+      prisma.tempChat.findUniqueOrThrow.mockResolvedValue({
+        ...activeRoom,
+        status: 'ENDED',
+        deletedAt: new Date('2026-10-30T00:00:00Z'),
+      });
+
+      await expect(service.remove('host-1', 'tc-1')).resolves.toBeUndefined();
+      expect(prisma.$transaction).not.toHaveBeenCalled();
+      expect(chatBroadcast.emitConversationChange).not.toHaveBeenCalled();
+    });
+
+    it('leaves the side effects to a concurrent delete that already won', async () => {
+      prisma.tempChat.findUniqueOrThrow.mockResolvedValue({
+        ...activeRoom,
+        status: 'ENDED',
+      });
+      prisma.tempChat.updateMany.mockResolvedValue({ count: 0 });
+
+      await expect(service.remove('host-1', 'tc-1')).resolves.toBeUndefined();
+      expect(chatBroadcast.removeUserFromConversation).not.toHaveBeenCalled();
+      expect(chatBroadcast.emitConversationChange).not.toHaveBeenCalled();
     });
   });
 
