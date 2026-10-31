@@ -121,6 +121,7 @@ export const STATIC_ROUTES = new Set([
   '/api/v1/coin/wallet',
   '/api/v1/collections',
   '/api/v1/conversation-groups',
+  '/api/v1/credit/events',
   '/api/v1/friend',
   '/api/v1/friend/activities',
   '/api/v1/friend/activities/unread-count',

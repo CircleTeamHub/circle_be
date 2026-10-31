@@ -3,6 +3,7 @@ import { Prisma } from 'src/generated/prisma';
 import { PrismaService } from 'src/prisma/prisma.service';
 import { RealtimeService } from 'src/realtime/realtime.service';
 import { runSerializableTransaction } from 'src/utils/prisma-tx';
+import { CreditEventDto } from './dto/credit-event.dto';
 
 type CreditClient = Prisma.TransactionClient | PrismaService;
 
@@ -25,9 +26,20 @@ export type CreditDeltaResult = {
 
 const MIN_CREDIT_SCORE = 0;
 const MAX_CREDIT_SCORE = 100;
+// 信誉值页「近期记录」只展示最近这些条，与积分流水同一口径。
+const RECENT_EVENTS_LIMIT = 50;
 
 function clampCreditScore(score: number) {
   return Math.max(MIN_CREDIT_SCORE, Math.min(MAX_CREDIT_SCORE, score));
+}
+
+// metadata 是各写入方自带的 JSON；对用户只透出举报分类，其余字段留在服务端。
+function readCategory(metadata: Prisma.JsonValue): string | null {
+  if (!metadata || typeof metadata !== 'object' || Array.isArray(metadata)) {
+    return null;
+  }
+  const category = metadata.category;
+  return typeof category === 'string' ? category : null;
 }
 
 @Injectable()
@@ -36,6 +48,28 @@ export class CreditService {
     private readonly prisma: PrismaService,
     private readonly realtimeService: RealtimeService,
   ) {}
+
+  async getRecentEvents(userId: string): Promise<CreditEventDto[]> {
+    const events = await this.prisma.creditEvent.findMany({
+      where: { userID: userId },
+      orderBy: { createdAt: 'desc' },
+      take: RECENT_EVENTS_LIMIT,
+      // 只取用户自己该看的列：actorID 是审核的管理员，sourceID / idempotencyKey
+      // 指向举报单，都不属于用户契约，被举报人拿到它们就能去猜举报人。
+      select: {
+        id: true,
+        delta: true,
+        scoreAfter: true,
+        reason: true,
+        metadata: true,
+        createdAt: true,
+      },
+    });
+    return events.map(({ metadata, ...event }) => ({
+      ...event,
+      category: readCategory(metadata),
+    }));
+  }
 
   async applyDelta(input: CreditDeltaInput): Promise<CreditDeltaResult> {
     const result = await runSerializableTransaction(this.prisma, (tx) =>
