@@ -3542,6 +3542,20 @@ export class NoteService {
     return this.toSummaryPage(notes, limit, ownerID);
   }
 
+  /** 助手提醒附带名片用:只读收藏者自己、未删除的那份;没有就返回 null。 */
+  async ownedNoteSummary(
+    ownerID: string,
+    noteId: string,
+  ): Promise<NoteSummaryDto | null> {
+    const note = await this.prisma.note.findFirst({
+      where: { id: noteId, ownerID, status: { not: 'DELETED' } },
+      select: NOTE_SUMMARY_SELECT,
+    });
+    if (!note) return null;
+    const [summary] = await this.mapSummaryListResolved([note], ownerID);
+    return summary ?? null;
+  }
+
   /** 多取的那一行先截掉再映射：它不返回，也不必为它签名媒体 URL。 */
   private async toSummaryPage(
     notes: Array<NoteSummaryBase & { sections?: unknown }>,

@@ -8,6 +8,8 @@ import { PrismaService } from 'src/prisma/prisma.service';
 import { RealtimeService } from 'src/realtime/realtime.service';
 import { ASSISTANT_KEY } from 'src/assistant/assistant.constants';
 import { AssistantService } from 'src/assistant/assistant.service';
+import { assistantNoteCardContent } from './assistant-note-card';
+import { NoteService } from './note.service';
 
 const JOB_BATCH_SIZE = 20;
 const RECIPIENT_PAGE_SIZE = 100;
@@ -53,6 +55,7 @@ export class NoteStatusFanoutOutboxProcessor {
   constructor(
     private readonly prisma: PrismaService,
     private readonly realtime: RealtimeService,
+    private readonly notes: NoteService,
     @Optional() private readonly assistant?: AssistantService,
   ) {}
 
@@ -190,11 +193,7 @@ export class NoteStatusFanoutOutboxProcessor {
       page.map((row) => row.ownerID),
       payload,
     );
-    await this.sendAssistantAlerts(
-      page.map((row) => row.ownerID),
-      alertStatus(job, payload),
-      payload,
-    );
+    await this.sendAssistantAlerts(page, alertStatus(job, payload), payload);
 
     if (rows.length > RECIPIENT_PAGE_SIZE) {
       await this.persistProgress(job, leaseToken, {
@@ -308,14 +307,19 @@ export class NoteStatusFanoutOutboxProcessor {
   }
 
   private async sendAssistantAlerts(
-    recipientIDs: string[],
+    libraryCopies: Array<{ id: string; ownerID: string }>,
     status: 'CLOSED' | 'WORKING' | null,
     payload: SourcePayload,
   ): Promise<void> {
     if (!this.assistant || !status) return;
-    const candidates = [
-      ...new Set(recipientIDs.filter((id) => id && id !== payload.ownerID)),
-    ];
+    // 收藏者 → 他自己那份副本;名片点开进的就是这份。
+    const copyByOwner = new Map<string, string>();
+    for (const copy of libraryCopies) {
+      if (!copy.ownerID || copy.ownerID === payload.ownerID) continue;
+      if (!copyByOwner.has(copy.ownerID))
+        copyByOwner.set(copy.ownerID, copy.id);
+    }
+    const candidates = [...copyByOwner.keys()];
     if (candidates.length === 0) return;
     // 默认开启:没有设置行的人照发,只跳过明确关掉的。
     const optedOut = await this.prisma.assistantPreference.findMany({
@@ -329,14 +333,19 @@ export class NoteStatusFanoutOutboxProcessor {
     const muted = new Set(optedOut.map((row) => row.userID));
     // 收藏的人多时一页就是 100 条提醒,逐条发,不让一页同时占满连接池;
     // 整页失败重试时,已发的那些按 clientMessageId 去重,不会重复。
-    for (const userId of candidates) {
+    for (const [userId, copyId] of copyByOwner) {
       if (muted.has(userId)) continue;
-      await this.assistant.sendNoteStatusAlert(userId, {
-        sourceNoteId: payload.sourceNoteId,
-        title: payload.title,
-        status,
-        changedAt: payload.changedAt,
-      });
+      const summary = await this.notes.ownedNoteSummary(userId, copyId);
+      await this.assistant.sendNoteStatusAlert(
+        userId,
+        {
+          sourceNoteId: payload.sourceNoteId,
+          title: payload.title,
+          status,
+          changedAt: payload.changedAt,
+        },
+        summary ? assistantNoteCardContent(summary, payload) : null,
+      );
     }
   }
 

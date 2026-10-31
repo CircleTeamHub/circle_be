@@ -24,6 +24,7 @@ const sourceState = {
 function createHarness(
   job = pendingJob(),
   assistant = { sendNoteStatusAlert: jest.fn().mockResolvedValue(undefined) },
+  notes = { ownedNoteSummary: jest.fn().mockResolvedValue(null) },
 ) {
   const updateMany = jest.fn().mockResolvedValue({ count: 1 });
   const prisma = {
@@ -53,9 +54,11 @@ function createHarness(
     processor: new NoteStatusFanoutOutboxProcessor(
       prisma as any,
       realtime as any,
+      notes as any,
       assistant as any,
     ),
     assistant,
+    notes,
   };
 }
 
@@ -88,12 +91,55 @@ describe('NoteStatusFanoutOutboxProcessor', () => {
     await processor.processPending();
 
     expect(assistant.sendNoteStatusAlert).toHaveBeenCalledTimes(1);
-    expect(assistant.sendNoteStatusAlert).toHaveBeenCalledWith('viewer-1', {
-      sourceNoteId: 'source-note',
+    expect(assistant.sendNoteStatusAlert).toHaveBeenCalledWith(
+      'viewer-1',
+      {
+        sourceNoteId: 'source-note',
+        title: '北京租房攻略',
+        status: 'CLOSED',
+        changedAt: '2026-10-29T12:00:00.000Z',
+      },
+      null,
+    );
+  });
+
+  it('attaches a card of the holder own copy so tapping opens their note', async () => {
+    const { prisma, processor, assistant, notes } =
+      createHarness(workStatusJob());
+    prisma.note.findUnique.mockResolvedValue(
+      sourceRow({ workStatus: 'CLOSED' }),
+    );
+    prisma.note.findMany.mockResolvedValue(libraryPage);
+    notes.ownedNoteSummary.mockResolvedValue({
+      id: 'copy-note',
+      ownerId: 'viewer-1',
       title: '北京租房攻略',
-      status: 'CLOSED',
-      changedAt: '2026-10-29T12:00:00.000Z',
+      contentPreview: null,
+      cover: null,
+      imageCount: 0,
+      videoCount: 0,
+      hasText: false,
+      showcaseCount: 0,
+      hasLocation: false,
     });
+
+    await processor.processPending();
+
+    expect(notes.ownedNoteSummary).toHaveBeenCalledWith(
+      'viewer-1',
+      'copy-note',
+    );
+    expect(assistant.sendNoteStatusAlert).toHaveBeenCalledWith(
+      'viewer-1',
+      expect.objectContaining({ status: 'CLOSED' }),
+      expect.objectContaining({
+        noteId: 'copy-note',
+        ownerId: 'viewer-1',
+        sourceNoteId: 'source-note',
+        workStatus: 'CLOSED',
+        publicationStatus: 'ACTIVE',
+      }),
+    );
   });
 
   it('reminds library holders when the owner reopens the source (开业)', async () => {
@@ -106,6 +152,7 @@ describe('NoteStatusFanoutOutboxProcessor', () => {
     expect(assistant.sendNoteStatusAlert).toHaveBeenCalledWith(
       'viewer-1',
       expect.objectContaining({ status: 'WORKING' }),
+      null,
     );
   });
 
@@ -162,6 +209,7 @@ describe('NoteStatusFanoutOutboxProcessor', () => {
     expect(assistant.sendNoteStatusAlert).toHaveBeenCalledWith(
       'viewer-1',
       expect.anything(),
+      null,
     );
   });
 

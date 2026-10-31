@@ -3046,6 +3046,23 @@ describe('NoteService', () => {
     expect(upsert.update).not.toHaveProperty('workStatusChanged');
   });
 
+  it('reads an assistant card summary only from the holder own, undeleted note', async () => {
+    prisma.note.findFirst.mockResolvedValueOnce(null);
+
+    await expect(
+      service.ownedNoteSummary('viewer-1', 'copy-note'),
+    ).resolves.toBeNull();
+    expect(prisma.note.findFirst).toHaveBeenCalledWith(
+      expect.objectContaining({
+        where: {
+          id: 'copy-note',
+          ownerID: 'viewer-1',
+          status: { not: 'DELETED' },
+        },
+      }),
+    );
+  });
+
   it('soft deletes a note', async () => {
     prisma.note.count.mockResolvedValue(51);
     prisma.note.findFirst.mockResolvedValueOnce({

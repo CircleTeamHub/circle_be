@@ -97,6 +97,41 @@ describe('AssistantService', () => {
     );
   });
 
+  it('follows the reminder with a silent card of the note', async () => {
+    prisma.chatConversation.findUnique.mockResolvedValueOnce({
+      id: 'assistant-conversation',
+    });
+    const card = {
+      noteId: 'copy-note',
+      ownerId: 'user-1',
+      title: '北京租房攻略',
+    };
+
+    await service.sendNoteStatusAlert(
+      'user-1',
+      {
+        sourceNoteId: 'source-note',
+        title: '北京租房攻略',
+        status: 'CLOSED',
+        changedAt: '2026-10-29T12:00:00.000Z',
+      },
+      card,
+    );
+
+    expect(systemMessages.insertServerMessage).toHaveBeenCalledTimes(2);
+    expect(systemMessages.insertServerMessage).toHaveBeenLastCalledWith(
+      'assistant-conversation',
+      {
+        senderID: 'system:windnote-assistant',
+        type: 'note-card',
+        clientMessageId:
+          'windnote-assistant:note-status:user-1:source-note:CLOSED:2026-10-29T12:00:00.000Z:card',
+        push: false,
+        content: card,
+      },
+    );
+  });
+
   it('writes a city info alert with the stable delivery key', async () => {
     prisma.chatConversation.findUnique.mockResolvedValueOnce({
       id: 'assistant-conversation',

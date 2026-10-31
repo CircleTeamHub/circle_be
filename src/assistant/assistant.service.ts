@@ -143,9 +143,14 @@ export class AssistantService {
     });
   }
 
+  /**
+   * 先发提醒文字(带推送),再静默附上笔记名片;名片点开就是收藏者自己那份笔记。
+   * 两条各有幂等键,整批重试不会重复。
+   */
   async sendNoteStatusAlert(
     userId: string,
     alert: NoteStatusAlert,
+    noteCard: Record<string, unknown> | null = null,
   ): Promise<void> {
     const conversationId = await this.ensureConversation(userId);
     const alertKey = [
@@ -170,6 +175,14 @@ export class AssistantService {
         changedAt: alert.changedAt,
         text: '风信助手有一条笔记状态提醒。',
       },
+    });
+    if (!noteCard) return;
+    await this.systemMessages.insertServerMessage(conversationId, {
+      senderID: ASSISTANT_SYSTEM_SENDER_ID,
+      type: 'note-card',
+      clientMessageId: `${alertKey}:card`,
+      push: false,
+      content: noteCard,
     });
   }
 
