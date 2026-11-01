@@ -6,14 +6,17 @@ import { PrismaService } from 'src/prisma/prisma.service';
 import { TrackedCron } from 'src/metrics/tracked-cron.decorator';
 import { AssistantService } from './assistant.service';
 import type { InfoAlertPayload } from './assistant-subscription.service';
+import { ASSISTANT_INFO_SOURCE_PLAZA_POST } from './assistant.constants';
 
 const JOB_BATCH_SIZE = 50;
 const STALE_LOCK_MS = 5 * 60 * 1000;
 const MAX_BACKOFF_MS = 30 * 60 * 1000;
+const CIRCLE_POST_AUTO_END_MS = 24 * 60 * 60 * 1000;
 
 type DeliveryJob = {
   id: string;
   userID: string;
+  subscriptionIDs: string[];
   dedupeKey: string;
   status: 'PENDING' | 'PROCESSING' | 'FAILED';
   attempts: number;
@@ -82,6 +85,60 @@ export class AssistantAlertDeliveryProcessor {
 
     try {
       const payload = this.parsePayload(job.payloadSnapshot);
+      const now = new Date();
+      const legacyCutoff = new Date(now.getTime() - CIRCLE_POST_AUTO_END_MS);
+      const activeSubscription =
+        await this.prisma.assistantSubscription.findFirst({
+          where: {
+            id: { in: job.subscriptionIDs },
+            userID: job.userID,
+            enabled: true,
+            sourceTypes: { has: ASSISTANT_INFO_SOURCE_PLAZA_POST },
+            circle: {
+              deleted: false,
+              OR: [
+                { ownerID: job.userID },
+                {
+                  members: {
+                    some: { userID: job.userID, status: 'ACTIVE' },
+                  },
+                },
+              ],
+              postLinks: {
+                some: {
+                  postID: payload.sourceId,
+                  post: {
+                    status: 'ACTIVE',
+                    OR: [
+                      { expiresAt: { gt: now } },
+                      {
+                        expiresAt: null,
+                        createdAt: { gt: legacyCutoff },
+                      },
+                    ],
+                  },
+                },
+              },
+            },
+          },
+          select: { id: true },
+        });
+      if (!activeSubscription) {
+        const skipped = await this.prisma.assistantAlertDelivery.updateMany({
+          where: {
+            id: job.id,
+            status: 'PROCESSING',
+            leaseToken,
+          },
+          data: {
+            status: 'SKIPPED',
+            lockedAt: null,
+            leaseToken: null,
+            lastError: null,
+          },
+        });
+        return skipped.count > 0;
+      }
       const message = await this.assistant.sendInfoAlert(
         job.userID,
         payload,
