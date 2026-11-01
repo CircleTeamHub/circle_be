@@ -336,6 +336,7 @@ export class NoteStatusFanoutOutboxProcessor {
     for (const [userId, copyId] of copyByOwner) {
       if (muted.has(userId)) continue;
       const summary = await this.notes.ownedNoteSummary(userId, copyId);
+      if (!summary) continue;
       await this.assistant.sendNoteStatusAlert(
         userId,
         {
@@ -344,7 +345,7 @@ export class NoteStatusFanoutOutboxProcessor {
           status,
           changedAt: payload.changedAt,
         },
-        summary ? assistantNoteCardContent(summary, payload) : null,
+        assistantNoteCardContent(summary, payload),
       );
     }
   }
