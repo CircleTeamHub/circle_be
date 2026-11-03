@@ -3,11 +3,12 @@ import { RedisModule } from 'src/redis/redis.module';
 import { UploadService } from './upload.service';
 import { UploadController } from './upload.controller';
 import { StorageAuditService } from './storage-audit.service';
+import { UploadLimitService } from './upload-limit.service';
 
 @Module({
   imports: [RedisModule],
-  providers: [UploadService, StorageAuditService],
+  providers: [UploadService, StorageAuditService, UploadLimitService],
   controllers: [UploadController],
-  exports: [UploadService],
+  exports: [UploadService, UploadLimitService],
 })
 export class UploadModule {}

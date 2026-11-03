@@ -3,6 +3,7 @@ import { uploadMetrics } from 'src/metrics/upload-metrics';
 import { RedisService } from 'src/redis/redis.service';
 import { UPLOAD_FOLDERS } from './dto/presign.dto';
 import { UploadController } from './upload.controller';
+import { UploadLimitService } from './upload-limit.service';
 import { PUBLIC_READ_UPLOAD_FOLDERS } from './upload.service';
 
 jest.mock('src/metrics/upload-metrics', () => ({
@@ -47,7 +48,7 @@ describe('UploadController', () => {
   it('uses Redis to enforce a per-user presign limit when configured', async () => {
     const controller = new UploadController(
       uploadService as any,
-      redisService as unknown as RedisService,
+      new UploadLimitService(redisService as unknown as RedisService),
     );
 
     await controller.presign(dto, req);
@@ -69,7 +70,7 @@ describe('UploadController', () => {
     redisService.incrementWithTtl.mockResolvedValue(21);
     const controller = new UploadController(
       uploadService as any,
-      redisService as unknown as RedisService,
+      new UploadLimitService(redisService as unknown as RedisService),
     );
 
     await expect(controller.presign(dto, req)).rejects.toMatchObject({
@@ -85,7 +86,7 @@ describe('UploadController', () => {
     redisService.incrementWithTtl.mockResolvedValue(null);
     const controller = new UploadController(
       uploadService as any,
-      redisService as unknown as RedisService,
+      new UploadLimitService(redisService as unknown as RedisService),
     );
 
     for (let index = 0; index < 20; index += 1) {
@@ -104,7 +105,7 @@ describe('UploadController', () => {
     redisService.isEnabled.mockReturnValue(false);
     const controller = new UploadController(
       uploadService as any,
-      redisService as unknown as RedisService,
+      new UploadLimitService(redisService as unknown as RedisService),
     );
 
     for (let index = 0; index < 20; index += 1) {
@@ -122,7 +123,7 @@ describe('UploadController', () => {
     redisService.incrementWithTtl.mockResolvedValue(null);
     const controller = new UploadController(
       uploadService as any,
-      redisService as unknown as RedisService,
+      new UploadLimitService(redisService as unknown as RedisService),
     );
 
     const results = await Promise.allSettled(
@@ -142,7 +143,7 @@ describe('UploadController', () => {
     redisService.incrementWithTtl.mockResolvedValue(null);
     const controller = new UploadController(
       uploadService as any,
-      redisService as unknown as RedisService,
+      new UploadLimitService(redisService as unknown as RedisService),
     );
 
     await controller.presign(dto, req);
@@ -160,7 +161,7 @@ describe('UploadController', () => {
       .mockResolvedValueOnce(1);
     const controller = new UploadController(
       uploadService as any,
-      redisService as unknown as RedisService,
+      new UploadLimitService(redisService as unknown as RedisService),
     );
 
     await controller.presign(dto, req);
@@ -179,7 +180,7 @@ describe('UploadController', () => {
       .mockResolvedValueOnce(1024 * 1024 * 1024 + 1);
     const controller = new UploadController(
       uploadService as any,
-      redisService as unknown as RedisService,
+      new UploadLimitService(redisService as unknown as RedisService),
     );
 
     await expect(controller.presign(dto, req)).rejects.toMatchObject({

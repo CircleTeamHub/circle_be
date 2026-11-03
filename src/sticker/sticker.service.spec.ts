@@ -1,6 +1,8 @@
 import { ForbiddenException, NotFoundException } from '@nestjs/common';
 import { StickerService } from './sticker.service';
 import { ChatMediaService } from 'src/chat/chat-media.service';
+import { UploadController } from 'src/upload/upload.controller';
+import { UploadLimitService } from 'src/upload/upload-limit.service';
 
 describe('StickerService', () => {
   function harness() {
@@ -46,6 +48,7 @@ describe('StickerService', () => {
       return task;
     });
     const upload = {
+      presign: jest.fn().mockResolvedValue({ uploadUrl: 'signed:upload' }),
       headObject: jest
         .fn()
         .mockResolvedValue({ contentType: 'image/png', size: 1024 }),
@@ -66,8 +69,15 @@ describe('StickerService', () => {
         },
       }),
     };
+    const uploadLimit = new UploadLimitService();
     return {
-      service: new StickerService(prisma, upload as never, chat as never),
+      service: new StickerService(
+        prisma,
+        upload as never,
+        chat as never,
+        uploadLimit,
+      ),
+      controller: new UploadController(upload as never, uploadLimit),
       rows,
       stickers,
       prisma,
@@ -206,6 +216,7 @@ describe('StickerService', () => {
   it('cannot remove or send a different account sticker', async () => {
     const h = harness();
     await h.service.create('alice', { objectKey: 'stickers/alice/a.png' });
+    h.upload.headObject.mockClear();
     await expect(h.service.prepareMessage('bob', 's0')).rejects.toThrow(
       NotFoundException,
     );
@@ -213,6 +224,78 @@ describe('StickerService', () => {
       NotFoundException,
     );
     expect(h.rows).toHaveLength(1);
+    expect(h.upload.headObject).not.toHaveBeenCalled();
+    expect(h.upload.copyObjectToKey).not.toHaveBeenCalled();
+  });
+
+  it('limits repeated sticker copies to the daily upload byte budget across minute windows', async () => {
+    const h = harness();
+    await h.service.create('alice', { objectKey: 'stickers/alice/a.png' });
+    h.upload.headObject.mockResolvedValue({
+      contentType: 'image/png',
+      size: 5 * 1024 * 1024,
+    });
+    let now = Date.now();
+    const nowSpy = jest.spyOn(Date, 'now').mockImplementation(() => now);
+    try {
+      for (let index = 0; index < 204; index += 1) {
+        if (index > 0 && index % 20 === 0) now += 60_000;
+        await h.service.prepareMessage('alice', 's0');
+      }
+      await expect(
+        h.service.prepareMessage('alice', 's0'),
+      ).rejects.toMatchObject({
+        status: 429,
+      });
+      expect(h.upload.copyObjectToKey).toHaveBeenCalledTimes(204);
+    } finally {
+      nowSpy.mockRestore();
+    }
+  });
+
+  it('shares the byte budget with ordinary uploads without consuming another account budget', async () => {
+    const h = harness();
+    await h.service.create('alice', { objectKey: 'stickers/alice/a.png' });
+    await h.service.create('bob', { objectKey: 'stickers/bob/b.png' });
+    h.upload.headObject.mockResolvedValue({
+      contentType: 'image/png',
+      size: 5 * 1024 * 1024,
+    });
+    const dto = {
+      filename: 'clip.mp4',
+      contentType: 'video/mp4',
+      sizeBytes: 100 * 1024 * 1024,
+      folder: 'chat',
+    } as const;
+    const req = { user: { userId: 'alice' } } as never;
+    for (let index = 0; index < 10; index += 1) {
+      await h.controller.presign(dto, req);
+    }
+    for (let index = 0; index < 4; index += 1) {
+      await h.service.prepareMessage('alice', 's0');
+    }
+    await expect(h.service.prepareMessage('alice', 's0')).rejects.toMatchObject(
+      {
+        status: 429,
+      },
+    );
+    await expect(
+      h.controller.presign({ ...dto, sizeBytes: 5 * 1024 * 1024 }, req),
+    ).rejects.toMatchObject({ status: 429 });
+    await expect(h.service.prepareMessage('bob', 's1')).resolves.toMatchObject({
+      key: expect.stringMatching(/^chat\/bob\//),
+    });
+    expect(h.upload.copyObjectToKey).toHaveBeenCalledTimes(5);
+    expect(h.upload.presign).toHaveBeenCalledTimes(10);
+  });
+
+  it('does not copy when current sticker metadata cannot be read', async () => {
+    const h = harness();
+    await h.service.create('alice', { objectKey: 'stickers/alice/a.png' });
+    h.upload.headObject.mockRejectedValueOnce(new Error('missing'));
+    await expect(h.service.prepareMessage('alice', 's0')).rejects.toThrow(
+      'missing',
+    );
     expect(h.upload.copyObjectToKey).not.toHaveBeenCalled();
   });
 

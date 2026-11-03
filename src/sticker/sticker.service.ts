@@ -8,6 +8,7 @@ import { createHash, randomUUID } from 'crypto';
 import type { CustomSticker } from 'src/generated/prisma';
 import { PrismaService } from 'src/prisma/prisma.service';
 import { UploadService } from 'src/upload/upload.service';
+import { UploadLimitService } from 'src/upload/upload-limit.service';
 import { ChatService } from 'src/chat/chat.service';
 import { CreateStickerDto } from './sticker.dto';
 
@@ -28,6 +29,7 @@ export class StickerService {
     private readonly prisma: PrismaService,
     private readonly upload: UploadService,
     private readonly chat: ChatService,
+    private readonly uploadLimit: UploadLimitService,
   ) {}
 
   private async present(row: CustomSticker) {
@@ -154,6 +156,8 @@ export class StickerService {
       where: { id, userID },
     });
     if (!row) throw new NotFoundException('Sticker not found');
+    const metadata = await this.upload.headObject(row.objectKey);
+    await this.uploadLimit.check(userID, metadata.size);
     const extension = row.objectKey.split('.').pop() || 'bin';
     const key = `chat/${userID}/${randomUUID()}.${extension}`;
     // Like an ordinary presigned chat upload, abandoned copies are visible to
