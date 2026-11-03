@@ -258,7 +258,9 @@ services:
       retries: 3
       start_period: 20s
     volumes:
-      - ./deploy/Caddyfile.admin:/etc/caddy/Caddyfile:ro
+      # Keep host-specific COS/proxy configuration under .release so the
+      # signed source sync cannot delete it during a backend release.
+      - ${CADDY_CONFIG_PATH:-./deploy/Caddyfile.admin}:/etc/caddy/Caddyfile:ro
       - ./deploy/caddy-entrypoint.sh:/usr/local/bin/caddy-entrypoint.sh:ro
       - caddy_data:/data
       - caddy_config:/config
