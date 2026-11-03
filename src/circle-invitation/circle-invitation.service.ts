@@ -188,7 +188,15 @@ export class CircleInvitationService {
         message: '只有被邀请人可以接受或拒绝',
         errorCode: 'CHAT_GROUP_ACCEPT_REQUIRED',
       });
-    if (invitation.status !== 'INVITED')
+    if (
+      invitation.status !== 'INVITED' &&
+      !(
+        accept &&
+        invitation.status === 'PENDING' &&
+        invitation.approvedCount === 0 &&
+        invitation.inviterID !== invitation.applicantID
+      )
+    )
       return this.toInvitationDto(invitation);
     if (!accept) {
       await this.prisma.circleInvitation.updateMany({
@@ -197,7 +205,10 @@ export class CircleInvitationService {
       });
       return this.fetchInvitationDto(id);
     }
-    if (invitation.createdAt.getTime() + 7 * 86400000 <= Date.now())
+    if (
+      invitation.status === 'INVITED' &&
+      invitation.createdAt.getTime() + 7 * 86400000 <= Date.now()
+    )
       throw new ForbiddenException({
         message: '邀请已过期',
         errorCode: 'CHAT_GROUP_INVITATION_INVALID',
@@ -678,7 +689,7 @@ export class CircleInvitationService {
       requireQrJoinEnabled?: boolean;
     },
   ) {
-    // 6. Create invitation; the inviter takes the first seat only if they may vouch
+    // 6. Create invitation; an authorized active inviter takes the first seat.
     // CircleInvitation has no DB-level unique constraint, so serialize
     // concurrent invites for the same (circle, applicant) pair with a
     // transaction-scoped advisory lock, then re-check inside the lock.
@@ -774,6 +785,16 @@ export class CircleInvitationService {
         status: { in: ['INVITED', 'PENDING'] },
       },
     });
+    // 旧担保单可能漏掉邀请人首票。只在本人再次接受时补缺席，不改已有投票。
+    const repairPendingInviter =
+      opts?.applicantConsented &&
+      existingInvitation?.status === 'PENDING' &&
+      existingInvitation.approvedCount === 0 &&
+      existingInvitation.inviterID === inviterId &&
+      inviterId !== applicantId &&
+      !(await tx.circleInvitationVerifier.findFirst({
+        where: { invitationID: existingInvitation.id, verifierID: inviterId },
+      }));
     // 本人扫码是幂等的：签发人仍在圈、申请人尚未入圈、圈仍存在且双方未
     // 拉黑后，已有 PENDING 就是本次请求的完成结果。容量、额度和成员邀请
     // 开关都是仅影响“能否新建”的可变门禁，不能让一次成功申请的网络重试
@@ -781,11 +802,12 @@ export class CircleInvitationService {
     if (
       opts?.acceptedInvitationId &&
       (existingInvitation?.id !== opts.acceptedInvitationId ||
-        existingInvitation.status !== 'INVITED')
+        (existingInvitation.status !== 'INVITED' &&
+          existingInvitation.status !== 'PENDING'))
     )
       throw new ConflictException('邀请已处理');
     if (
-      existingInvitation &&
+      existingInvitation?.status === 'INVITED' &&
       opts?.acceptedInvitationId &&
       existingInvitation.createdAt.getTime() + 7 * 86400000 <= Date.now()
     )
@@ -795,7 +817,8 @@ export class CircleInvitationService {
       });
     if (
       existingInvitation &&
-      (!opts?.applicantConsented || existingInvitation.status === 'PENDING')
+      (!opts?.applicantConsented || existingInvitation.status === 'PENDING') &&
+      !repairPendingInviter
     ) {
       return {
         created: existingInvitation,
@@ -824,7 +847,8 @@ export class CircleInvitationService {
 
     if (
       existingInvitation &&
-      !(opts?.applicantConsented && existingInvitation.status === 'INVITED')
+      !(opts?.applicantConsented && existingInvitation.status === 'INVITED') &&
+      !repairPendingInviter
     ) {
       throw new ConflictException({
         message: 'There is already a pending invitation for this user',
@@ -832,17 +856,8 @@ export class CircleInvitationService {
       });
     }
 
-    // 自动首票 = 邀请人替被邀请人担保,所以担保资格必须与申请人自己挑的验证人
-    // 同规(好友 ∩ 本圈 ACTIVE 成员)—— 否则「验证人必须是好友」这条闸从
-    // invite 这条路就绕过去了:requiredVerifierCount=1 时等于任何成员都能把
-    // 任何把入圈邀请开成 EVERYONE(默认值)的陌生人瞬间塞进圈子。
-    //
-    // OWNER/ADMIN 例外:圈子的管理者本来就是这个圈的信任根,「管理员拉人进来
-    // 就能进」正是宣传期要的形态;要连管理员也收掉就把 memberCanInvite 关掉。
-    //
-    // 好友读放在 pair 锁内,与 addVerifier / respond 同口径(锁外那次只用于
-    // 隐私开关判定,不能拿来发席位)。
-    // 事务内的好友关系是唯一可信的那份:锁外那次只用于快速失败。
+    // 邀请行为本身就是邀请人的首票担保；成员身份、邀请开关和双方拉黑已在上面复核。
+    // 好友关系仍供邀请隐私判定使用，额外验证人继续遵循好友 ∩ 本圈 ACTIVE 成员规则。
     const stillFriends = await this.areFriends(inviterId, applicantId, tx);
 
     // 隐私开关在事务内**无条件**复核一次,读也走 tx。
@@ -868,16 +883,11 @@ export class CircleInvitationService {
       }
     }
 
-    const inviterCanVouch =
-      inviterMembership.role === 'OWNER' ||
-      inviterMembership.role === 'ADMIN' ||
-      stillFriends;
-
     const invitationData = {
       circleID: circleId,
       applicantID: applicantId,
       inviterID: inviterId,
-      approvedCount: inviterCanVouch ? 1 : 0,
+      approvedCount: 1,
       requiredCount:
         existingInvitation?.requiredCount ?? circlePolicy.requiredVerifierCount,
       status: opts?.applicantConsented
@@ -895,7 +905,10 @@ export class CircleInvitationService {
     } as const;
     const created = existingInvitation
       ? await tx.circleInvitation.update({
-          where: { id: existingInvitation.id, status: 'INVITED' },
+          where: {
+            id: existingInvitation.id,
+            status: existingInvitation.status,
+          },
           data: invitationData,
           select: selection,
         })
@@ -921,7 +934,7 @@ export class CircleInvitationService {
         where: { invitationID: created.id, verifierID: inviterId },
       });
     }
-    if (inviterCanVouch && (!existingInvitation || opts?.applicantConsented)) {
+    if (!existingInvitation || opts?.applicantConsented) {
       await tx.circleInvitationVerifier.create({
         data: {
           invitationID: created.id,

@@ -58,6 +58,7 @@ describePostgres('friend indexes (PostgreSQL)', () => {
     {} as never,
     {} as never,
     { get: () => null } as unknown as ConfigService,
+    {} as never,
   );
 
   /** 只读的 EXPLAIN 放进事务,DELETE 的计划也不会真删。 */

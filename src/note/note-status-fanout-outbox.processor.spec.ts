@@ -1,3 +1,5 @@
+import { SCHEDULE_CRON_OPTIONS } from '@nestjs/schedule/dist/schedule.constants';
+import { intervalSecondsFor } from 'src/metrics/tracked-cron.decorator';
 import { NoteStatusFanoutOutboxProcessor } from './note-status-fanout-outbox.processor';
 
 const pendingJob = (overrides: Record<string, unknown> = {}) => ({
@@ -79,6 +81,15 @@ const libraryPage = [
 ];
 
 describe('NoteStatusFanoutOutboxProcessor', () => {
+  it('dispatches status pages every second without overlapping local runs', () => {
+    const options = Reflect.getMetadata(
+      SCHEDULE_CRON_OPTIONS,
+      NoteStatusFanoutOutboxProcessor.prototype.processPending,
+    );
+    expect(intervalSecondsFor(options.cronTime)).toBe(1);
+    expect(options.waitForCompletion).toBe(true);
+  });
+
   const workStatusJob = () => pendingJob({ workStatusChanged: true });
 
   it('reminds library holders when the owner closes the source (打烊)', async () => {

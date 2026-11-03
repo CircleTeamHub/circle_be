@@ -59,7 +59,9 @@ export class NoteStatusFanoutOutboxProcessor {
     @Optional() private readonly assistant?: AssistantService,
   ) {}
 
-  @TrackedCron(CronExpression.EVERY_MINUTE, 'note_status_fanout_outbox')
+  @TrackedCron(CronExpression.EVERY_SECOND, 'note_status_fanout_outbox', {
+    waitForCompletion: true,
+  })
   async processPending(): Promise<void> {
     const now = new Date();
     const staleBefore = new Date(now.getTime() - STALE_LOCK_MS);

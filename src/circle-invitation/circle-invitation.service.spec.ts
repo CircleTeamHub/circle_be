@@ -1901,6 +1901,27 @@ describe('CircleInvitationService', () => {
       expect(chatMessages.insertServerMessage).not.toHaveBeenCalled();
     });
 
+    it('does not allow the applicant to add the approved inviter again', async () => {
+      arrangePendingInvitation();
+      prisma.circleInvitation.findUnique.mockResolvedValue({
+        id: 'inv-1',
+        circleID: 'circle-1',
+        applicantID: 'applicant-1',
+        status: 'PENDING',
+        requiredCount: 10,
+        approvedCount: 1,
+        verifiers: [{ verifierID: 'inviter-1', status: 'APPROVED' }],
+      });
+
+      await expect(
+        service.addVerifier('applicant-1', 'inv-1', 'inviter-1'),
+      ).rejects.toMatchObject({
+        response: { errorCode: CircleInvitationErrorCode.AlreadyVerifier },
+      });
+      expect(prisma.circleInvitationVerifier.create).not.toHaveBeenCalled();
+      expect(prisma.circleInvitation.updateMany).not.toHaveBeenCalled();
+    });
+
     it('addVerifier takes the shared user lock before reading friendship', async () => {
       arrangePendingInvitation();
       notificationService.createCircleInvitationNotification.mockResolvedValue({
@@ -2250,12 +2271,9 @@ describe('CircleInvitationService', () => {
       });
     }
 
-    it.each([
-      ['MEMBER', false],
-      ['ADMIN', true],
-    ])(
-      'reconciles the original vote when the inviter is now %s',
-      async (role, eligible) => {
+    it.each(['MEMBER', 'OWNER', 'ADMIN'])(
+      'keeps exactly one original vote when the inviter is now %s and not a friend',
+      async (role) => {
         arrangeInviteFlow({ inviterRole: role });
         prisma.friend.findFirst.mockResolvedValue(null);
         prisma.circleInvitation.findFirst.mockResolvedValue({
@@ -2267,7 +2285,7 @@ describe('CircleInvitationService', () => {
         });
         prisma.circleInvitation.update.mockResolvedValue({
           id: 'inv-new',
-          approvedCount: eligible ? 1 : 0,
+          approvedCount: 1,
           requiredCount: 1,
           circle: { groupID: 'circle-1' },
         });
@@ -2278,9 +2296,116 @@ describe('CircleInvitationService', () => {
         expect(prisma.circleInvitationVerifier.deleteMany).toHaveBeenCalledWith(
           { where: { invitationID: 'inv-new', verifierID: 'inviter-1' } },
         );
-        expect(prisma.circleInvitationVerifier.create).toHaveBeenCalledTimes(
-          eligible ? 1 : 0,
+        expect(prisma.circleInvitationVerifier.create).toHaveBeenCalledTimes(1);
+        expect(prisma.circleInvitation.update).toHaveBeenCalledWith(
+          expect.objectContaining({
+            data: expect.objectContaining({ approvedCount: 1 }),
+          }),
         );
+      },
+    );
+
+    async function arrangeMissingPendingInviterSeat() {
+      arrangeInviteFlow();
+      const pending = {
+        ...(await prisma.circleInvitation.findUnique()),
+        approvedCount: 0,
+      };
+      prisma.circleInvitation.findUnique.mockResolvedValue(pending);
+      prisma.circleInvitation.findFirst.mockResolvedValue(pending);
+      prisma.circleInvitationVerifier.findFirst.mockResolvedValue(null);
+      prisma.circleInvitation.update.mockResolvedValue({
+        ...pending,
+        approvedCount: 1,
+        circle: { groupID: 'circle-1' },
+      });
+      prisma.friend.findFirst.mockResolvedValue(null);
+      return pending;
+    }
+
+    it('repairs the missing actual inviter vote when accepting an old pending invitation again', async () => {
+      const pending = await arrangeMissingPendingInviterSeat();
+      const corrected = {
+        ...pending,
+        approvedCount: 1,
+        verifiers: [
+          {
+            id: 'inviter-seat',
+            verifierID: 'inviter-1',
+            status: 'APPROVED',
+            verifier: pending.inviter,
+          },
+        ],
+      };
+      prisma.circleInvitation.findUnique
+        .mockResolvedValueOnce(pending)
+        .mockResolvedValue(corrected);
+
+      const result = await service.respondToInvitation(
+        'applicant-1',
+        'inv-new',
+        true,
+      );
+
+      expect(prisma.circleInvitation.update).toHaveBeenCalledWith(
+        expect.objectContaining({
+          where: { id: 'inv-new', status: 'PENDING' },
+          data: expect.objectContaining({
+            approvedCount: 1,
+            inviterID: 'inviter-1',
+            status: 'PENDING',
+          }),
+        }),
+      );
+      expect(prisma.circleInvitationVerifier.create).toHaveBeenCalledWith({
+        data: expect.objectContaining({
+          invitationID: 'inv-new',
+          verifierID: 'inviter-1',
+          status: 'APPROVED',
+        }),
+      });
+      expect(result.approvedCount).toBe(1);
+      expect(result.verifiers).toHaveLength(1);
+      await service.respondToInvitation('applicant-1', 'inv-new', true);
+      expect(prisma.circleInvitationVerifier.create).toHaveBeenCalledTimes(1);
+      expect(admissionPolicy.activateMembers).not.toHaveBeenCalled();
+    });
+
+    it('does not repair a self-invited pending application', async () => {
+      const pending = await arrangeMissingPendingInviterSeat();
+      prisma.circleInvitation.findUnique.mockResolvedValue({
+        ...pending,
+        inviterID: pending.applicantID,
+      });
+      await service.respondToInvitation('applicant-1', 'inv-new', true);
+      expect(prisma.circleInvitationVerifier.create).not.toHaveBeenCalled();
+      expect(prisma.circleInvitation.update).not.toHaveBeenCalled();
+    });
+
+    it('does not override an existing rejected inviter seat during pending acceptance', async () => {
+      await arrangeMissingPendingInviterSeat();
+      prisma.circleInvitationVerifier.findFirst.mockResolvedValue({
+        status: 'REJECTED',
+      });
+      await service.respondToInvitation('applicant-1', 'inv-new', true);
+      expect(prisma.circleInvitationVerifier.create).not.toHaveBeenCalled();
+      expect(prisma.circleInvitation.update).not.toHaveBeenCalled();
+    });
+
+    it.each(['departed', 'disabled'])(
+      'does not repair a missing pending vote when the inviter is %s',
+      async (gate) => {
+        await arrangeMissingPendingInviterSeat();
+        if (gate === 'departed')
+          prisma.circleMember.findUnique.mockResolvedValue(null);
+        else
+          prisma.circle.findFirst.mockResolvedValue({
+            requiredVerifierCount: 10,
+            memberCanInvite: false,
+          });
+        await service.respondToInvitation('applicant-1', 'inv-new', true);
+        expect(prisma.circleInvitationVerifier.create).not.toHaveBeenCalled();
+        expect(prisma.circleInvitation.update).not.toHaveBeenCalled();
       },
     );
 
@@ -2363,6 +2488,24 @@ describe('CircleInvitationService', () => {
       expect(admissionPolicy.activateMembers).not.toHaveBeenCalled();
       expect(chatCircleSync.syncCircleSeatsCoalesced).not.toHaveBeenCalled();
     });
+    it('allows the applicant to decline without activating membership or adding another vote', async () => {
+      arrangeInviteFlow();
+      const invited = {
+        ...(await prisma.circleInvitation.findUnique()),
+        status: 'INVITED',
+      };
+      prisma.circleInvitation.findUnique.mockResolvedValue(invited);
+
+      await service.respondToInvitation('applicant-1', 'inv-new', false);
+
+      expect(prisma.circleInvitation.updateMany).toHaveBeenCalledWith({
+        where: { id: 'inv-new', applicantID: 'applicant-1', status: 'INVITED' },
+        data: { status: 'CANCELLED' },
+      });
+      expect(prisma.circleInvitationVerifier.create).not.toHaveBeenCalled();
+      expect(admissionPolicy.activateMembers).not.toHaveBeenCalled();
+    });
+
     it('recipient acceptance upgrades the same invitation and preserves its verification policy snapshot', async () => {
       arrangeInviteFlow({ circle: { requiredVerifierCount: 1 } });
       const existing = {
@@ -2460,44 +2603,63 @@ describe('CircleInvitationService', () => {
       });
     });
 
-    // 自动首票 = 邀请人替被邀请人担保,资格与申请人自己挑的验证人同规,
-    // 否则「验证人必须是好友」这条闸从 invite 这条路整条绕过去。
-    it('invite withholds the first vote when a plain member is not the friend', async () => {
-      arrangeInviteFlow({
-        circle: { requiredVerifierCount: 1 },
-        created: { requiredCount: 1, approvedCount: 0 },
-      });
-      prisma.friend.findFirst.mockResolvedValue(null);
-      privacySettings.canBeInvitedToGroupOrCircle.mockResolvedValue(true);
+    it.each(['MEMBER', 'OWNER', 'ADMIN'])(
+      'counts a non-friend %s inviter once toward ten validators',
+      async (inviterRole) => {
+        arrangeInviteFlow({ inviterRole });
+        prisma.friend.findFirst.mockResolvedValue(null);
 
-      await service.invite('inviter-1', 'applicant-1', 'circle-1');
+        await service.invite('inviter-1', 'applicant-1', 'circle-1');
+
+        expect(prisma.circleInvitation.create).toHaveBeenCalledWith(
+          expect.objectContaining({
+            data: expect.objectContaining({
+              inviterID: 'inviter-1',
+              approvedCount: 1,
+              requiredCount: 10,
+              status: 'INVITED',
+            }),
+          }),
+        );
+        expect(prisma.circleInvitationVerifier.create).toHaveBeenCalledTimes(1);
+        expect(prisma.circleInvitationVerifier.create).toHaveBeenCalledWith({
+          data: expect.objectContaining({
+            invitationID: 'inv-new',
+            verifierID: 'inviter-1',
+            addedByID: 'inviter-1',
+            status: 'APPROVED',
+          }),
+        });
+        expect(admissionPolicy.activateMembers).not.toHaveBeenCalled();
+      },
+    );
+
+    it('counts the ordinary non-friend QR issuer as the first validator', async () => {
+      arrangeInviteFlow();
+      prisma.friend.findFirst.mockResolvedValue(null);
+
+      await service.invite('inviter-1', 'applicant-1', 'circle-1', {
+        applicantConsented: true,
+        requireQrJoinEnabled: true,
+      });
 
       expect(prisma.circleInvitation.create).toHaveBeenCalledWith(
         expect.objectContaining({
-          data: expect.objectContaining({ approvedCount: 0 }),
+          data: expect.objectContaining({
+            inviterID: 'inviter-1',
+            approvedCount: 1,
+            requiredCount: 10,
+            status: 'PENDING',
+          }),
         }),
       );
-      expect(prisma.circleInvitationVerifier.create).not.toHaveBeenCalled();
-      // 没有首票就没满票:陌生人不会被瞬间塞进圈子。
+      expect(prisma.circleInvitationVerifier.create).toHaveBeenCalledWith({
+        data: expect.objectContaining({
+          verifierID: 'inviter-1',
+          status: 'APPROVED',
+        }),
+      });
       expect(admissionPolicy.activateMembers).not.toHaveBeenCalled();
-    });
-
-    it('invite keeps the first vote for a non-friend owner or admin', async () => {
-      arrangeInviteFlow({
-        circle: { requiredVerifierCount: 10 },
-        inviterRole: 'ADMIN',
-      });
-      prisma.friend.findFirst.mockResolvedValue(null);
-      privacySettings.canBeInvitedToGroupOrCircle.mockResolvedValue(true);
-
-      await service.invite('inviter-1', 'applicant-1', 'circle-1');
-
-      expect(prisma.circleInvitation.create).toHaveBeenCalledWith(
-        expect.objectContaining({
-          data: expect.objectContaining({ approvedCount: 1 }),
-        }),
-      );
-      expect(prisma.circleInvitationVerifier.create).toHaveBeenCalledTimes(1);
     });
 
     // 隐私开关只看 groupInvitePermission 与好友关系,默认 EVERYONE 之下

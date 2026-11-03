@@ -4690,6 +4690,22 @@ describe('ChatService', () => {
       });
     });
 
+    it.each(['🤔', '✌️', '💜', '🐼', '🍕', '🚀'])(
+      'accepts the chat palette reaction %s and can remove it',
+      async (emoji) => {
+        prisma.chatMember.findUnique.mockResolvedValue(membership());
+        prisma.chatMessage.findUnique.mockResolvedValue(reactableRow);
+        prisma.chatMessageReaction.createMany.mockResolvedValue({ count: 1 });
+        prisma.chatMessageReaction.deleteMany.mockResolvedValue({ count: 1 });
+        await expect(
+          service.toggleReaction('u1', 'conv-1', 'm1', emoji, 'add'),
+        ).resolves.toEqual({ changed: true, revision: 12 });
+        await expect(
+          service.toggleReaction('u1', 'conv-1', 'm1', emoji, 'remove'),
+        ).resolves.toEqual({ changed: true, revision: 12 });
+      },
+    );
+
     it('adds once and treats duplicate adds as no-change', async () => {
       prisma.chatMember.findUnique.mockResolvedValue(membership());
       prisma.chatMessage.findUnique.mockResolvedValue(reactableRow);

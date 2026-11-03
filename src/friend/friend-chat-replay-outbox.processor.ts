@@ -37,6 +37,13 @@ export class FriendChatReplayOutboxProcessor {
     private readonly sensitiveWords: SensitiveWordService,
   ) {}
 
+  async processRequest(requestId: string): Promise<void> {
+    const job = await this.prisma.friendChatReplayOutbox.findFirst({
+      where: { requestId, status: 'PENDING' },
+    });
+    if (job) await this.processJob(job as ReplayJob);
+  }
+
   @TrackedCron(CronExpression.EVERY_MINUTE, 'friend_chat_replay_outbox')
   async processPending(): Promise<void> {
     const now = new Date();

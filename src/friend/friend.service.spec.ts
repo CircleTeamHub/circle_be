@@ -17,6 +17,7 @@ import { CreditService } from 'src/credit/credit.service';
 import { SendFriendRequestDto } from './dto/friend.dto';
 import { FriendController } from './friend.controller';
 import { FriendService } from './friend.service';
+import { FriendChatReplayOutboxProcessor } from './friend-chat-replay-outbox.processor';
 import {
   AvatarFrameService,
   PUBLIC_APPEARANCE_USER_SELECT,
@@ -24,6 +25,7 @@ import {
 
 describe('FriendService', () => {
   let service: FriendService;
+  const replay = { processRequest: jest.fn().mockResolvedValue(undefined) };
 
   const prisma = {
     user: {
@@ -194,6 +196,7 @@ describe('FriendService', () => {
     const module: TestingModule = await Test.createTestingModule({
       providers: [
         FriendService,
+        { provide: FriendChatReplayOutboxProcessor, useValue: replay },
         { provide: PrismaService, useValue: prisma },
         { provide: RealtimeService, useValue: realtimeService },
         { provide: NotificationService, useValue: notificationService },
@@ -1927,6 +1930,7 @@ describe('FriendService', () => {
         privacySettings as any,
         avatarFrames as any,
         { get: jest.fn(() => null) } as any,
+        replay as any,
       );
 
       await report(['https://cdn.example/proof.png'], unguarded);
@@ -2246,6 +2250,26 @@ describe('FriendService', () => {
     ).resolves.toBeUndefined();
   });
 
+  it('keeps an accepted request durable when immediate replay fails', async () => {
+    prisma.friend.findUnique.mockResolvedValue({
+      id: 'request-1',
+      userID: 'user-1',
+      friendID: 'user-2',
+      state: FriendState.PENDING,
+      message: 'hello',
+    });
+    prisma.user.findUnique.mockResolvedValue({ status: 'ACTIVE' });
+    prisma.friend.count.mockResolvedValue(0);
+    prisma.pendingFriendTagOnRequest.findMany.mockResolvedValue([]);
+    replay.processRequest.mockRejectedValueOnce(
+      new Error('database unavailable'),
+    );
+
+    await expect(
+      service.handleRequest('user-2', 'request-1', FriendState.ACCEPTED),
+    ).resolves.toBeUndefined();
+  });
+
   it('rejects a losing concurrent decision without running side effects', async () => {
     prisma.friend.findUnique.mockResolvedValue({
       id: 'request-1',
@@ -2269,6 +2293,7 @@ describe('FriendService', () => {
   });
 
   it('queues the message thread for durable replay on accept', async () => {
+    replay.processRequest.mockClear();
     prisma.friend.findUnique.mockResolvedValue({
       id: 'request-1',
       userID: 'user-1',
@@ -2306,6 +2331,7 @@ describe('FriendService', () => {
     await expect(
       service.handleRequest('user-2', 'request-1', FriendState.ACCEPTED),
     ).resolves.toBeUndefined();
+    expect(replay.processRequest).toHaveBeenCalledWith('request-1');
     expect(prisma.friendChatReplayOutbox.upsert).toHaveBeenCalledWith(
       expect.objectContaining({
         where: { requestId: 'request-1' },

@@ -220,7 +220,7 @@ describePostgres('circle invitation transactions (PostgreSQL)', () => {
       expect(new Set(delivered).size).toBe(100);
     });
 
-    it('keeps the per-target outcome: friendship decides the vouch, pending invitations are reused', async () => {
+    it('counts each actual inviter once and reuses pending invitations without changing the inviter', async () => {
       const [owner, inviter, friend, stranger, alreadyInvited] =
         await createUsers(t.prisma, 5);
       const circleId = await createCircle(t.prisma, owner, [inviter], {
@@ -255,10 +255,10 @@ describePostgres('circle invitation transactions (PostgreSQL)', () => {
       expect(rows.get(stranger)).toEqual({
         applicantID: stranger,
         status: 'INVITED',
-        approvedCount: 0,
+        approvedCount: 1,
         requiredCount: 2,
         consentNoticeRequired: true,
-        verifiers: [],
+        verifiers: [{ verifierID: inviter, status: 'APPROVED' }],
       });
       // 已有在途邀请:原样复用,不改、不加第二张。
       expect(rows.get(alreadyInvited)).toEqual(before[0]);
@@ -302,6 +302,79 @@ describePostgres('circle invitation transactions (PostgreSQL)', () => {
       },
     );
   });
+
+  it.each(['direct', 'QR'])(
+    'keeps one ordinary non-friend inviter seat across %s acceptance and retries',
+    async (path) => {
+      const [owner, inviter, applicant, otherVerifier] = await createUsers(
+        t.prisma,
+        4,
+      );
+      const circleId = await createCircle(
+        t.prisma,
+        owner,
+        [inviter, otherVerifier],
+        {
+          requiredVerifierCount: 10,
+        },
+      );
+      const service = build();
+      jest
+        .spyOn(service as never, 'deliverConsentInvitation')
+        .mockImplementation((async () => undefined) as never);
+      const options =
+        path === 'QR'
+          ? { applicantConsented: true, requireQrJoinEnabled: true }
+          : undefined;
+      let invitation = await service.invite(
+        inviter,
+        applicant,
+        circleId,
+        options,
+      );
+      expect(invitation.approvedCount).toBe(1);
+      expect(invitation.verifiers).toEqual([
+        expect.objectContaining({
+          status: 'APPROVED',
+          verifier: expect.objectContaining({ id: inviter }),
+        }),
+      ]);
+      expect(
+        await t.prisma.circleMember.findUnique({
+          where: { userID_circleID: { userID: applicant, circleID: circleId } },
+        }),
+      ).toBeNull();
+      if (path === 'direct') {
+        expect(invitation.status).toBe('INVITED');
+        invitation = await service.respondToInvitation(
+          applicant,
+          invitation.id,
+          true,
+        );
+      }
+      expect(invitation.status).toBe('PENDING');
+      // Becoming friends later must not offer or count the original inviter again.
+      await befriend(applicant, inviter);
+      await befriend(applicant, otherVerifier);
+      expect(
+        (await service.getEligibleVerifiers(applicant, invitation.id)).map(
+          (user) => user.id,
+        ),
+      ).toEqual([otherVerifier]);
+      await expect(
+        service.addVerifier(applicant, invitation.id, inviter),
+      ).rejects.toMatchObject({
+        response: { errorCode: CircleInvitationErrorCode.AlreadyVerifier },
+      });
+      await service.invite(inviter, applicant, circleId, options);
+      const [stored] = await invitationsOf(circleId);
+      expect(stored.approvedCount).toBe(1);
+      expect(stored.requiredCount).toBe(10);
+      expect(stored.verifiers).toEqual([
+        { verifierID: inviter, status: 'APPROVED' },
+      ]);
+    },
+  );
 
   describe('consent delivery', () => {
     const pendingInvitation = async () => {
