@@ -195,6 +195,39 @@ describe('NoteStatusFanoutOutboxProcessor', () => {
     expect(assistant.sendNoteStatusAlert).not.toHaveBeenCalled();
   });
 
+  it('uses a live recollected copy when an older deleted copy sorts first', async () => {
+    const liveSummary = { ...librarySummary, id: 'copy-live' };
+    const { prisma, processor, assistant, notes } = createHarness(
+      workStatusJob(),
+      undefined,
+      { ownedNoteSummary: jest.fn().mockResolvedValue(liveSummary) },
+    );
+    prisma.note.findUnique.mockResolvedValue(
+      sourceRow({ workStatus: 'CLOSED' }),
+    );
+    prisma.note.findMany.mockResolvedValue([
+      { id: 'source-note', ownerID: 'owner-1', status: 'ACTIVE' },
+      { id: 'copy-deleted', ownerID: 'viewer-1', status: 'DELETED' },
+      { id: 'copy-live', ownerID: 'viewer-1', status: 'ACTIVE' },
+    ]);
+
+    await processor.processPending();
+
+    expect(notes.ownedNoteSummary).toHaveBeenCalledWith(
+      'viewer-1',
+      'copy-live',
+    );
+    expect(notes.ownedNoteSummary).not.toHaveBeenCalledWith(
+      'viewer-1',
+      'copy-deleted',
+    );
+    expect(assistant.sendNoteStatusAlert).toHaveBeenCalledWith(
+      'viewer-1',
+      expect.objectContaining({ status: 'CLOSED' }),
+      expect.objectContaining({ noteId: 'copy-live' }),
+    );
+  });
+
   it('does not remind when only the listing changed, even for an open shop', async () => {
     const { prisma, realtime, processor, assistant } = createHarness();
     prisma.note.findUnique.mockResolvedValue(
@@ -293,7 +326,7 @@ describe('NoteStatusFanoutOutboxProcessor', () => {
       },
       orderBy: { id: 'asc' },
       take: 101,
-      select: { id: true, ownerID: true },
+      select: { id: true, ownerID: true, status: true },
     });
     expect(realtime.broadcastNoteSourceStatusChanged).toHaveBeenCalledTimes(
       100,

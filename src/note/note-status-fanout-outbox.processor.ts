@@ -186,7 +186,7 @@ export class NoteStatusFanoutOutboxProcessor {
       },
       orderBy: { id: 'asc' },
       take: RECIPIENT_PAGE_SIZE + 1,
-      select: { id: true, ownerID: true },
+      select: { id: true, ownerID: true, status: true },
     });
     const page = rows.slice(0, RECIPIENT_PAGE_SIZE);
     await this.broadcast(
@@ -307,7 +307,11 @@ export class NoteStatusFanoutOutboxProcessor {
   }
 
   private async sendAssistantAlerts(
-    libraryCopies: Array<{ id: string; ownerID: string }>,
+    libraryCopies: Array<{
+      id: string;
+      ownerID: string;
+      status: 'ACTIVE' | 'UNLISTED' | 'DELETED';
+    }>,
     status: 'CLOSED' | 'WORKING' | null,
     payload: SourcePayload,
   ): Promise<void> {
@@ -315,7 +319,13 @@ export class NoteStatusFanoutOutboxProcessor {
     // 收藏者 → 他自己那份副本;名片点开进的就是这份。
     const copyByOwner = new Map<string, string>();
     for (const copy of libraryCopies) {
-      if (!copy.ownerID || copy.ownerID === payload.ownerID) continue;
+      if (
+        copy.status === 'DELETED' ||
+        !copy.ownerID ||
+        copy.ownerID === payload.ownerID
+      ) {
+        continue;
+      }
       if (!copyByOwner.has(copy.ownerID))
         copyByOwner.set(copy.ownerID, copy.id);
     }
