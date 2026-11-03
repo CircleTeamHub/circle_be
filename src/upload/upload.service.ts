@@ -19,6 +19,7 @@ import {
   GetBucketCorsCommand,
   GetBucketLifecycleConfigurationCommand,
   HeadBucketCommand,
+  HeadObjectCommand,
   PutBucketPolicyCommand,
   ListObjectsV2Command,
   type BucketLocationConstraint,
@@ -463,6 +464,19 @@ export class UploadService implements OnModuleInit {
 
     // 语音/文件只对 chat 目录开放。DTO 的白名单是全局的,只放宽它等于让头像、
     // 封面、圈子帖目录也能收 pdf/zip —— 目录收口必须在这里再做一次。
+    if (
+      folder === 'stickers' &&
+      ![
+        'image/jpeg',
+        'image/png',
+        'image/webp',
+        'image/gif',
+        'image/heic',
+        'image/heif',
+      ].includes(contentType)
+    ) {
+      throw new BadRequestException('Stickers only accept images');
+    }
     const isAudio = contentType.startsWith('audio/');
     if (
       CHAT_ONLY_UPLOAD_TYPES.includes(contentType) &&
@@ -476,13 +490,16 @@ export class UploadService implements OnModuleInit {
 
     // 按类分档:视频 100 MiB 照旧;语音是几十秒的片段,给 20 MiB 已经很宽;
     // 文件给 50 MiB —— 比视频紧,避免 chat 目录变成通用网盘。
-    const maxBytes = contentType.startsWith('video/')
-      ? 100 * 1024 * 1024
-      : contentType.startsWith('audio/')
-        ? 20 * 1024 * 1024
-        : CHAT_ONLY_UPLOAD_TYPES.includes(contentType)
-          ? 50 * 1024 * 1024
-          : 20 * 1024 * 1024;
+    const maxBytes =
+      folder === 'stickers'
+        ? 5 * 1024 * 1024
+        : contentType.startsWith('video/')
+          ? 100 * 1024 * 1024
+          : contentType.startsWith('audio/')
+            ? 20 * 1024 * 1024
+            : CHAT_ONLY_UPLOAD_TYPES.includes(contentType)
+              ? 50 * 1024 * 1024
+              : 20 * 1024 * 1024;
     if (
       !Number.isSafeInteger(sizeBytes) ||
       sizeBytes < 1 ||
@@ -678,6 +695,20 @@ export class UploadService implements OnModuleInit {
    * 且两侧生命周期独立(删笔记不影响聊天消息,撤回聊天不影响笔记)。
    * 来源 key 的读取授权由调用方负责,这里只做搬运。
    */
+  async headObject(
+    key: string,
+  ): Promise<{ contentType: string; size: number }> {
+    if (!this.enabled)
+      throw new ServiceUnavailableException('File upload is not configured');
+    const result = await this.client.send(
+      new HeadObjectCommand({ Bucket: this.bucket, Key: key }),
+    );
+    return {
+      contentType: result.ContentType ?? '',
+      size: result.ContentLength ?? 0,
+    };
+  }
+
   async copyObjectToKey(sourceKey: string, destKey: string): Promise<void> {
     if (!this.enabled) {
       throw new ServiceUnavailableException('File upload is not configured');

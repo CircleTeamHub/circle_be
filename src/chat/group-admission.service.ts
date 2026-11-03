@@ -488,6 +488,15 @@ export class GroupAdmissionService {
           ),
         },
       });
+      await tx.chatGroupEvent.create({
+        data: {
+          conversationID: g.id,
+          kind: 'member-joined',
+          actorID: a.kind === 'INVITE' ? a.inviterID : null,
+          targetIDs: [a.applicantID],
+          payload: { via: a.kind.toLowerCase() },
+        },
+      });
     }
     const joined = await tx.groupAdmission.update({
       where: { id: a.id },
@@ -776,7 +785,8 @@ export class GroupAdmissionService {
           { inviterID: user },
           {
             conversationID: { in: manageable.map((g) => g.id) },
-            status: 'PENDING',
+            // 群日志保留已处理记录；收件箱仍只给审核人列出待处理申请。
+            ...(!groupId ? { status: 'PENDING' } : {}),
           },
         ],
       },

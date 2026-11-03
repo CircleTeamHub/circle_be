@@ -71,6 +71,7 @@ export const UPLOAD_FOLDERS = [
   'notes',
   'chat',
   'friends',
+  'stickers',
 ] as const;
 export type UploadFolder = (typeof UPLOAD_FOLDERS)[number];
 

@@ -396,6 +396,7 @@ enum AdminGroupOperationStatus {
 // ─── Core Models ──────────────────────────────────────────────────────────────
 
 model User {
+  customStickers CustomSticker[]
   consoleEvents                ConsoleEvent[]
   consoleInstallations         AppInstallation[]
   consoleApiKeys               ConsoleApiKey[]
@@ -568,6 +569,22 @@ model AvatarFrameAsset {
   grants          UserAvatarFrameGrant[]
 
   @@index([isActive, sortOrder, id])
+}
+
+model CustomSticker {
+  id              String   @id @default(uuid())
+  userID          String
+  objectKey       String
+  width           Int?
+  height          Int?
+  // No message relation: collection survives source deletion.
+  sourceMessageID String?
+  createdAt       DateTime @default(now())
+  user            User     @relation(fields: [userID], references: [id], onDelete: Cascade)
+
+  @@unique([userID, objectKey])
+  @@unique([userID, sourceMessageID])
+  @@index([userID, createdAt, id])
 }
 
 model UserAvatarFrameGrant {
@@ -1549,6 +1566,7 @@ model Trace {
   deleted    Boolean         @default(false)
   visibility TraceVisibility @default(PUBLIC)
   images     String[]        @default([])
+  attachments Json?
   type       TraceType
   fromID     String
   likeCount  Int             @default(0)
@@ -1651,6 +1669,8 @@ model UserPrivacySetting {
   addMeByGroup                  Boolean   @default(true)
   callPermission                String    @default("EVERYONE")
   groupInvitePermission         String    @default("EVERYONE")
+  /// Explicit consent for accepted friends to seat this user during new standalone group creation.
+  allowFriendGroupDirectJoin    Boolean   @default(false)
   directMessageAutoReplyEnabled Boolean   @default(false)
   directMessageAutoReplyText    String    @default("") @db.VarChar(200)
   /// 是否让别人看到我的在线状态与最近在线时间(chat:presence 查询/上下线广播、

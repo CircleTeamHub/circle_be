@@ -65,6 +65,7 @@ describe('UpdatePrivacySettingsDto null handling', () => {
     'addMeByGroup',
     'callPermission',
     'groupInvitePermission',
+    'allowFriendGroupDirectJoin',
     'directMessageAutoReplyEnabled',
     'directMessageAutoReplyText',
     'shareOnlineStatus',
@@ -88,6 +89,26 @@ describe('UpdatePrivacySettingsDto null handling', () => {
     );
     expect(target?.constraints).toHaveProperty('isDefined');
   });
+
+  it.each(['false', 'true', '0', '1', 0, 1, ''])(
+    'rejects coerced direct-join consent %p',
+    (value) => {
+      expect(
+        validateLikePipe({ allowFriendGroupDirectJoin: value }).some(
+          (error) => error.property === 'allowFriendGroupDirectJoin',
+        ),
+      ).toBe(true);
+    },
+  );
+
+  it.each([true, false])(
+    'accepts explicit boolean direct-join consent %s',
+    (value) => {
+      expect(
+        validateLikePipe({ allowFriendGroupDirectJoin: value }),
+      ).toHaveLength(0);
+    },
+  );
 
   it('lists every property UpdatePrivacySettingsDto declares', () => {
     // 新增设置项时这条会红：它要么是非空列（进上面的清单、用 @IsOptionalNotNull），

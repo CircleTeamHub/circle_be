@@ -30,6 +30,7 @@ function harness(approval = true) {
   ]);
   const admissions = new Map<string, any>();
   const deliveries = new Map<string, any>();
+  const events = new Map<string, any>();
   const qr: any = {
     token: 'token',
     issuerID: 'owner',
@@ -47,6 +48,7 @@ function harness(approval = true) {
       findMany: jest.fn().mockResolvedValue([{ id: 'g' }]),
     },
     chatMember: {
+      groupBy: jest.fn().mockResolvedValue([]),
       findUnique: jest
         .fn()
         .mockImplementation(
@@ -184,17 +186,43 @@ function harness(approval = true) {
     },
     block: { findFirst: jest.fn().mockResolvedValue(null) },
     userPrivacySetting: { findMany: jest.fn().mockResolvedValue([]) },
-    notification: { findMany: jest.fn().mockResolvedValue([]) },
+    notification: {
+      findMany: jest.fn().mockResolvedValue([]),
+      groupBy: jest.fn().mockResolvedValue([]),
+    },
     notificationPushOutbox: { updateMany: jest.fn() },
     chatMessage: {
       aggregate: jest.fn().mockResolvedValue({ _max: { height: 10 } }),
+    },
+    chatGroupEvent: {
+      create: jest.fn().mockImplementation(({ data }: any) => {
+        const event = {
+          id: `event-${events.size}`,
+          createdAt: new Date(),
+          ...data,
+        };
+        events.set(event.id, event);
+        return event;
+      }),
     },
     qrToken: { findUnique: jest.fn().mockImplementation(() => qr) },
   };
   const prisma: any = {
     ...tx,
     $transaction: jest.fn().mockImplementation((fn: any) => {
-      const task = serial.then(() => fn(tx));
+      const task = serial.then(async () => {
+        const state = [seats, admissions, deliveries, events];
+        const snapshots = state.map((rows) => structuredClone(rows));
+        try {
+          return await fn(tx);
+        } catch (error) {
+          state.forEach((rows, i) => {
+            rows.clear();
+            for (const [id, row] of snapshots[i]) rows.set(id, row);
+          });
+          throw error;
+        }
+      });
       serial = task.catch(() => {});
       return task;
     }),
@@ -232,6 +260,7 @@ function harness(approval = true) {
     seats,
     admissions,
     deliveries,
+    events,
     group,
     qr,
     broadcast,
@@ -241,6 +270,34 @@ function harness(approval = true) {
 }
 
 describe('Group admission consent and authorization', () => {
+  it('includes decided admissions in a scoped manager history while keeping the inbox pending-only', async () => {
+    const h = harness();
+    h.tx.groupAdmission.findMany.mockResolvedValue([]);
+    await h.service.list('owner', undefined, 'g');
+    const scoped = h.tx.groupAdmission.findMany.mock.calls[0][0].where;
+    expect(scoped.conversationID).toBe('g');
+    expect(scoped.OR[2]).toEqual({ conversationID: { in: ['g'] } });
+    await h.service.list('owner');
+    const inbox = h.tx.groupAdmission.findMany.mock.calls[1][0].where;
+    expect(inbox.OR[2]).toEqual({
+      conversationID: { in: ['g'] },
+      status: 'PENDING',
+    });
+  });
+  it('does not grant a scoped non-manager access to other applicants history', async () => {
+    const h = harness();
+    h.tx.chatConversation.findMany.mockResolvedValue([]);
+    h.tx.groupAdmission.findMany.mockResolvedValue([]);
+    await h.service.list('guest', undefined, 'g');
+    expect(h.tx.groupAdmission.findMany.mock.calls[0][0].where).toMatchObject({
+      conversationID: 'g',
+      OR: [
+        { applicantID: 'guest' },
+        { inviterID: 'guest' },
+        { conversationID: { in: [] } },
+      ],
+    });
+  });
   it('viewing a group does not join or create an application', async () => {
     const h = harness();
     await h.service.preview('guest', 'g');
@@ -315,6 +372,62 @@ describe('Group admission consent and authorization', () => {
       ).toBe(false);
     },
   );
+  it('records an approved invitation join once and attributes the original inviter', async () => {
+    const h = harness();
+    h.seats.set('member', { userID: 'member', role: 'MEMBER', leftAt: null });
+    h.tx.friend.findMany.mockResolvedValue([
+      { userID: 'member', friendID: 'guest' },
+    ]);
+    await h.service.invite('member', 'g', ['guest']);
+    await h.service.act('guest', 'a0', 'accept');
+    expect(h.events.size).toBe(0);
+    await Promise.all([
+      h.service.act('owner', 'a0', 'approve'),
+      h.service.act('owner', 'a0', 'approve'),
+    ]);
+    expect([...h.events.values()]).toEqual([
+      expect.objectContaining({
+        conversationID: 'g',
+        kind: 'member-joined',
+        actorID: 'member',
+        targetIDs: ['guest'],
+        payload: { via: 'invite' },
+        createdAt: expect.any(Date),
+      }),
+    ]);
+  });
+  it('records QR membership with its join method and no invented inviter', async () => {
+    const h = harness(false);
+    await h.service.acceptQr('guest', 'token');
+    expect([...h.events.values()]).toEqual([
+      expect.objectContaining({
+        conversationID: 'g',
+        kind: 'member-joined',
+        actorID: null,
+        targetIDs: ['guest'],
+        payload: { via: 'qr' },
+      }),
+    ]);
+  });
+  it('rolls back acceptance and membership if writing the join ledger fails', async () => {
+    const h = harness(false);
+    await h.service.invite('owner', 'g', ['guest']);
+    h.tx.chatGroupEvent.create.mockRejectedValueOnce(
+      new Error('ledger unavailable'),
+    );
+    await expect(h.service.act('guest', 'a0', 'accept')).rejects.toThrow(
+      'ledger unavailable',
+    );
+    expect(h.seats.has('guest')).toBe(false);
+    expect(h.admissions.get('a0')).toMatchObject({
+      status: 'INVITED',
+      acceptedAt: null,
+    });
+    expect(
+      [...h.deliveries.values()].some((job) => job.event === 'JOINED'),
+    ).toBe(false);
+    expect(h.events.size).toBe(0);
+  });
   it('a demoted admin invitation returns to review at acceptance', async () => {
     const h = harness();
     h.seats.set('admin', { userID: 'admin', role: 'ADMIN', leftAt: null });

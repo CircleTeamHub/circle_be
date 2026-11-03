@@ -44,6 +44,7 @@ describePostgres('storage audit chat reverse lookup (PostgreSQL)', () => {
   const old = new Date('2026-01-01T00:00:00.000Z');
   const now = new Date('2026-10-26T00:00:00.000Z');
   const userAvatars = ['https://api.test/circle/avatars/u-avatar.jpg'];
+  const savedStickerKey = 'stickers/u1/saved.png';
 
   const run = async <T>(sql: string, values: unknown[]): Promise<T[]> =>
     (await s.db.query(sql, values)).rows as T[];
@@ -76,6 +77,7 @@ describePostgres('storage audit chat reverse lookup (PostgreSQL)', () => {
       trace: empty,
       traceComment: empty,
       circlePost: empty,
+      customSticker: { findMany: capturedFindMany('customSticker') },
       supportRechargePaymentCode: empty,
       consoleRelease: empty,
     };
@@ -110,9 +112,9 @@ describePostgres('storage audit chat reverse lookup (PostgreSQL)', () => {
       upload as never,
     );
 
-  /** 原 Prisma 调用现场编译成 SQL 再到隔离 schema 执行。 */
-  const oldFindMany =
-    (model: 'chatMessage' | 'chatBurnArchive' | 'note') =>
+  /** Prisma 调用现场编译成 SQL 再到隔离 schema 执行。 */
+  const capturedFindMany =
+    (model: 'chatMessage' | 'chatBurnArchive' | 'note' | 'customSticker') =>
     async (args: Record<string, unknown>) => {
       const [query] = await captureQueries(capture.queries, () =>
         (
@@ -129,9 +131,9 @@ describePostgres('storage audit chat reverse lookup (PostgreSQL)', () => {
     new StorageAuditService(
       {
         ...unchangedModels(),
-        chatMessage: { findMany: oldFindMany('chatMessage') },
-        chatBurnArchive: { findMany: oldFindMany('chatBurnArchive') },
-        note: { findMany: oldFindMany('note') },
+        chatMessage: { findMany: capturedFindMany('chatMessage') },
+        chatBurnArchive: { findMany: capturedFindMany('chatBurnArchive') },
+        note: { findMany: capturedFindMany('note') },
       } as unknown as PrismaService,
       upload as never,
     );
@@ -156,6 +158,7 @@ describePostgres('storage audit chat reverse lookup (PostgreSQL)', () => {
       if (key) keys.add(key);
     };
     for (const avatarUrl of userAvatars) add(avatarUrl);
+    add(savedStickerKey);
     const addCardAvatars = (sections: unknown) => {
       if (!sections || typeof sections !== 'object' || Array.isArray(sections))
         return;
@@ -185,7 +188,7 @@ describePostgres('storage audit chat reverse lookup (PostgreSQL)', () => {
     const notePage = pageArgs({ id: true, sections: true });
     await service.collectFrom(
       async (cursor, take) =>
-        (await oldFindMany('note')(notePage(cursor, take))) as Array<{
+        (await capturedFindMany('note')(notePage(cursor, take))) as Array<{
           id: string;
           sections: unknown;
         }>,
@@ -211,7 +214,7 @@ describePostgres('storage audit chat reverse lookup (PostgreSQL)', () => {
       );
       await service.collectFrom(
         async (cursor, take) =>
-          (await oldFindMany(model)(chatPage(cursor, take))) as Array<{
+          (await capturedFindMany(model)(chatPage(cursor, take))) as Array<{
             id: string;
             type: string;
             content: unknown;
@@ -245,6 +248,7 @@ describePostgres('storage audit chat reverse lookup (PostgreSQL)', () => {
       'notes/',
       'friends/',
       'chat/',
+      'stickers/',
     ]) {
       let token: string | undefined;
       do {
@@ -282,7 +286,12 @@ describePostgres('storage audit chat reverse lookup (PostgreSQL)', () => {
         content jsonb NOT NULL
       );
       CREATE TABLE "Note" (id text PRIMARY KEY, sections jsonb);
+      CREATE TABLE "CustomSticker" (id text PRIMARY KEY, "objectKey" text NOT NULL);
     `);
+    await s.db.query(
+      `INSERT INTO "CustomSticker" (id, "objectKey") VALUES ($1, $2)`,
+      ['sticker-saved', savedStickerKey],
+    );
     for (const [name, count] of MIGRATIONS) {
       const statements = readFileSync(
         join(process.cwd(), 'prisma/migrations', name, 'migration.sql'),
@@ -432,6 +441,8 @@ describePostgres('storage audit chat reverse lookup (PostgreSQL)', () => {
       'avatars/card-bad.jpg',
       'avatars/card-arr.jpg',
       'avatars/orphan.jpg',
+      savedStickerKey,
+      'stickers/u1/orphan.png',
     ]) {
       object(key);
     }
@@ -471,6 +482,7 @@ describePostgres('storage audit chat reverse lookup (PostgreSQL)', () => {
         'avatars/card-arr.jpg',
         'avatars/orphan.jpg',
         'avatars/bulk-99999.jpg',
+        'stickers/u1/orphan.png',
       ]),
     );
     for (const kept of [
@@ -487,6 +499,7 @@ describePostgres('storage audit chat reverse lookup (PostgreSQL)', () => {
       'avatars/card-group.jpg',
       'chat/tomb/00001.m4a',
       'avatars/bulk-1099.jpg',
+      savedStickerKey,
     ]) {
       expect(expected).not.toContain(kept);
     }

@@ -234,6 +234,7 @@ describePostgres('trace feed lateral page (PostgreSQL)', () => {
         deleted boolean NOT NULL DEFAULT false,
         visibility "TraceVisibility" NOT NULL DEFAULT 'PUBLIC',
         images text[] NOT NULL DEFAULT '{}',
+        attachments jsonb,
         type "TraceType" NOT NULL DEFAULT 'MOMENT',
         "fromID" text NOT NULL,
         "likeCount" integer NOT NULL DEFAULT 0,

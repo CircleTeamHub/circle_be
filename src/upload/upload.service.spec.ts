@@ -12,6 +12,32 @@ jest.mock('@aws-sdk/s3-request-presigner', () => ({
 }));
 
 describe('UploadService', () => {
+  it('HEAD reads private object metadata without downloading or exposing a URL', async () => {
+    const service = new UploadService({ get: () => null } as any);
+    const send = jest
+      .fn()
+      .mockResolvedValue({ ContentType: 'image/png', ContentLength: 100 });
+    Object.assign(service, { enabled: true, client: { send } });
+    await expect(service.headObject('stickers/alice/a.png')).resolves.toEqual({
+      contentType: 'image/png',
+      size: 100,
+    });
+    expect(send.mock.calls[0][0].constructor.name).toBe('HeadObjectCommand');
+    expect(send.mock.calls[0][0].input.Key).toBe('stickers/alice/a.png');
+  });
+  it.each([
+    ['video/mp4', 100],
+    ['image/png', 5 * 1024 * 1024 + 1],
+  ])('rejects unsupported sticker upload %s/%d', async (contentType, size) => {
+    const service = new UploadService({ get: () => null } as any);
+    Object.assign(service, {
+      enabled: true,
+      ensureReady: jest.fn().mockResolvedValue(true),
+    });
+    await expect(
+      service.presign('sticker.png', contentType, size, 'stickers', 'alice'),
+    ).rejects.toThrow();
+  });
   const privateMinioHost = ['10', '0', '0', '195'].join('.');
   const privateMinioUrl = `http://${privateMinioHost}:9000`;
 

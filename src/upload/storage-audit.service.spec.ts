@@ -127,6 +127,7 @@ describe('StorageAuditService', () => {
       circle: emptyRows(),
       noteMedia: emptyRows(),
       noteDraft: emptyRows(),
+      customSticker: emptyRows(),
       trace: emptyRows(),
       traceComment: emptyRows(),
       circlePost: emptyRows(),
@@ -158,6 +159,51 @@ describe('StorageAuditService', () => {
 
   const old = new Date('2020-01-01T00:00:00.000Z');
   const now = new Date('2020-02-01T00:00:00.000Z');
+
+  it('keeps private saved stickers referenced independently of their original chat message', async () => {
+    const { service } = harness({
+      objects: {
+        'stickers/': [
+          { key: 'stickers/alice/saved.png', size: 100, lastModified: old },
+        ],
+      },
+      referenced: {
+        customSticker: [{ id: 's1', objectKey: 'stickers/alice/saved.png' }],
+      },
+    });
+    expect(await service.audit(now)).toMatchObject({
+      scanned: 1,
+      orphanCount: 0,
+    });
+  });
+
+  it('counts mixed moment videos and posters as referenced objects', async () => {
+    const { service } = harness({
+      objects: {
+        'posts/': ['clip.mp4', 'poster.jpg'].map((name) => ({
+          key: `posts/user-1/${name}`,
+          size: 1,
+          lastModified: old,
+        })),
+      },
+      referenced: {
+        trace: [
+          {
+            id: 'mixed',
+            images: [],
+            attachments: [
+              {
+                type: 'video',
+                key: 'posts/user-1/clip.mp4',
+                posterKey: 'posts/user-1/poster.jpg',
+              },
+            ],
+          },
+        ],
+      },
+    });
+    expect(await service.audit(now)).toMatchObject({ orphanCount: 0 });
+  });
 
   it('keeps published and draft card avatar snapshots referenced after avatar rotation', async () => {
     const { service } = harness({

@@ -1925,7 +1925,12 @@ export class ChatService {
     }
     const conversation = await this.prisma.$transaction(async (tx) => {
       await lockUserRelationshipState(tx, [userId, ...memberIds]);
-      await this.assertInviteTargetsAllowed(tx, userId, memberIds);
+      const directMemberIds = await this.assertInviteTargetsAllowed(
+        tx,
+        userId,
+        memberIds,
+      );
+      const directMembers = new Set(directMemberIds);
       const activeCount = await tx.user.count({
         where: { id: { in: memberIds }, status: 'ACTIVE' },
       });
@@ -1945,7 +1950,7 @@ export class ChatService {
           membersCanViewRoster: true,
           membersCanViewProfiles: true,
           members: {
-            create: [{ userID: userId }],
+            create: [userId, ...directMemberIds].map((userID) => ({ userID })),
           },
         },
         select: { id: true },
@@ -1953,25 +1958,37 @@ export class ChatService {
       // 全新的群:没有座位、没有旧邀请要查,直接批量写。原来每人两次 INSERT
       // (最多 199 人约 400 条),全程持有上面那组关系锁。
       const expiresAt = new Date(Date.now() + 7 * 86400000);
+      const acceptedAt = new Date();
       const admissions = await tx.groupAdmission.createManyAndReturn({
         data: memberIds.map((applicantID) => ({
           conversationID: group.id,
           applicantID,
           inviterID: userId,
           kind: 'INVITE',
-          status: 'INVITED',
+          status: directMembers.has(applicantID) ? 'JOINED' : 'INVITED',
+          ...(directMembers.has(applicantID)
+            ? { acceptedAt, decidedByID: userId }
+            : {}),
           expiresAt,
         })),
-        select: { id: true, applicantID: true },
+        select: { id: true, applicantID: true, status: true },
       });
       await tx.groupAdmissionDelivery.createMany({
         data: admissions.map((admission) => ({
           admissionID: admission.id,
           recipientID: admission.applicantID,
           actorID: userId,
-          event: 'INVITED',
+          event: admission.status,
         })),
       });
+      if (directMemberIds.length) {
+        await this.groupEvents.recordInTx(tx, group.id, {
+          kind: 'member-joined',
+          actorId: userId,
+          targetIds: directMemberIds,
+          payload: { via: 'invite' },
+        });
+      }
       return group;
     });
     await this.seatMembersIntoRoom(conversation.id, [userId]);
@@ -2289,15 +2306,16 @@ export class ChatService {
   }
 
   /**
-   * 独立群邀请的共同授权边界:目标仍是好友,且其群邀请隐私允许当前关系。
+   * 建群授权边界:目标是未拉黑的好友,且其群邀请隐私允许当前关系。
+   * 返回明确同意建群时直接入群的好友;邀请权限本身不代表免确认。
    * 调用方必须先拿 call-user 关系锁,这样好友/隐私切换不能在检查与落座之间穿插。
    */
   private async assertInviteTargetsAllowed(
     tx: Prisma.TransactionClient,
     userId: string,
     memberIds: string[],
-  ): Promise<void> {
-    const [rows, privacyRows] = await Promise.all([
+  ): Promise<string[]> {
+    const [rows, privacyRows, blocked] = await Promise.all([
       tx.friend.findMany({
         where: {
           state: 'ACCEPTED',
@@ -2310,15 +2328,27 @@ export class ChatService {
       }),
       tx.userPrivacySetting.findMany({
         where: { userID: { in: memberIds } },
-        select: { userID: true, groupInvitePermission: true },
+        select: {
+          userID: true,
+          groupInvitePermission: true,
+          allowFriendGroupDirectJoin: true,
+        },
+      }),
+      tx.block.findFirst({
+        where: {
+          OR: [
+            { blockerID: userId, blockedID: { in: memberIds } },
+            { blockedID: userId, blockerID: { in: memberIds } },
+          ],
+        },
       }),
     ]);
     const friendIds = new Set(
       rows.map((r) => (r.userID === userId ? r.friendID : r.userID)),
     );
-    if (memberIds.some((id) => !friendIds.has(id))) {
+    if (blocked || memberIds.some((id) => !friendIds.has(id))) {
       throw new ForbiddenException({
-        message: '只能邀请好友进群',
+        message: '只能邀请未拉黑的好友进群',
         errorCode: ChatErrorCode.GroupFriendsOnly,
       });
     }
@@ -2343,6 +2373,9 @@ export class ChatService {
         errorCode: GroupErrorCode.InviteNotAllowed,
       });
     }
+    return privacyRows
+      .filter((row) => row.allowFriendGroupDirectJoin === true)
+      .map((row) => row.userID);
   }
 
   /** 座位落库后入房 + 个人事件(与圈子同步/单聊同一套广播语义;尽力而为)。 */

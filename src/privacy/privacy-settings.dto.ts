@@ -70,6 +70,7 @@ export class PrivacySettingsDto {
   addMeByGroup: boolean;
   callPermission: PrivacyPermission;
   groupInvitePermission: PrivacyPermission;
+  allowFriendGroupDirectJoin: boolean;
   directMessageAutoReplyEnabled: boolean;
   directMessageAutoReplyText: string;
   /** 对他人显示在线状态与最近在线时间(在线点 / 「N 分钟前在线」)。 */
@@ -153,6 +154,16 @@ export class UpdatePrivacySettingsDto {
   @IsOptionalNotNull()
   @IsIn(PERMISSION_OPTIONS)
   groupInvitePermission?: PrivacyPermission;
+
+  @ApiPropertyOptional({ default: false })
+  @IsOptionalNotNull()
+  @Transform(
+    ({ obj }: { obj: Record<string, unknown> }) =>
+      obj.allowFriendGroupDirectJoin,
+    { toClassOnly: true },
+  )
+  @IsBoolean()
+  allowFriendGroupDirectJoin?: boolean;
 
   @ApiPropertyOptional({ default: false })
   @IsOptionalNotNull()

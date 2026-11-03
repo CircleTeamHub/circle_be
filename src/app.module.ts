@@ -60,6 +60,7 @@ import { AdminCommerceModule } from './admin-commerce/admin-commerce.module';
 import { AdminContentModule } from './admin-content/admin-content.module';
 import { AdminImModule } from './admin-im/admin-im.module';
 import { AssistantModule } from './assistant/assistant.module';
+import { StickerModule } from './sticker/sticker.module';
 
 const nodeEnv = process.env.NODE_ENV || 'development';
 const envFilePath = `.env.${nodeEnv}`;
@@ -125,6 +126,7 @@ const envFilePath = `.env.${nodeEnv}`;
     AdminContentModule,
     AdminImModule,
     AssistantModule,
+    StickerModule,
     ConsoleModule,
   ],
   controllers: [],

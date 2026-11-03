@@ -24,6 +24,8 @@ import {
   TraceCommentDto,
   TraceDto,
   TraceFeedQueryDto,
+  TraceAttachmentDto,
+  TraceAttachmentInputDto,
 } from './dto/trace.dto';
 import {
   AvatarFramePublicAppearance,
@@ -33,6 +35,7 @@ import { createLoggingConfig } from 'src/logging/logging.config';
 import { logBusinessEvent } from 'src/logging/business-event.logger';
 import { buildImageMedia } from 'src/media/image-media';
 import { normalizeUserIdAlias } from 'src/user/user-id-alias';
+import type { Prisma } from 'src/generated/prisma';
 import {
   TraceCommentPreviewRow,
   TraceLikePreviewRow,
@@ -371,11 +374,34 @@ export class TraceService {
   // ─── Create / Delete ───────────────────────────────────────────────────────
 
   async createTrace(userId: string, dto: CreateTraceDto): Promise<TraceDto> {
-    assertUrlsFromStorage(
-      dto.images ?? [],
-      this.storagePublicObjectBases,
-      'trace image',
-    );
+    const attachments = dto.attachments;
+    if (attachments?.length) {
+      const prefix = `posts/${userId}/`;
+      for (const attachment of attachments) {
+        const extension =
+          attachment.type === 'video'
+            ? /\.(mp4|mov|m4v)$/i
+            : /\.(jpe?g|png|webp|gif|heic|heif)$/i;
+        if (
+          !attachment.key.startsWith(prefix) ||
+          !extension.test(attachment.key) ||
+          (attachment.posterKey &&
+            (!attachment.posterKey.startsWith(prefix) ||
+              !/\.(jpe?g|png|webp)$/i.test(attachment.posterKey)))
+        ) {
+          throw new BadRequestException('Invalid moment attachment key');
+        }
+      }
+      if (!this.storagePublicObjectBases[0])
+        throw new BadRequestException('Media storage is not configured');
+    }
+    const projected = this.projectAttachments(attachments);
+    const images = attachments
+      ? projected
+          .filter((item) => item.type === 'image')
+          .map((item) => item.url)
+      : (dto.images ?? []);
+    assertUrlsFromStorage(images, this.storagePublicObjectBases, 'trace image');
 
     // Resolve this fallible projection before the non-idempotent write. If the
     // lookup fails, the client can safely retry without creating a duplicate.
@@ -386,7 +412,10 @@ export class TraceService {
     const trace = await this.prisma.trace.create({
       data: {
         content: dto.content,
-        images: dto.images ?? [],
+        images,
+        ...(attachments
+          ? { attachments: attachments as unknown as Prisma.InputJsonValue }
+          : {}),
         visibility: dto.visibility ?? 'FRIENDS_ONLY',
         type: 'MOMENT',
         fromID: userId,
@@ -422,6 +451,7 @@ export class TraceService {
       content: trace.content,
       images: trace.images,
       media: buildImageMedia(trace.images, this.imageTransformTemplate),
+      attachments: this.projectAttachments(trace.attachments),
       visibility: trace.visibility,
       author: {
         id: trace.from.id,
@@ -1271,6 +1301,16 @@ export class TraceService {
     });
   }
 
+  private projectAttachments(value: unknown): TraceAttachmentDto[] {
+    const base = this.storagePublicObjectBases[0];
+    if (!value || !base) return [];
+    return (value as TraceAttachmentInputDto[]).map((item) => ({
+      ...item,
+      url: `${base}/${item.key}`,
+      ...(item.posterKey ? { posterUrl: `${base}/${item.posterKey}` } : {}),
+    }));
+  }
+
   private toTraceDto(
     trace: any,
     viewerId: string,
@@ -1326,6 +1366,7 @@ export class TraceService {
       content: trace.content,
       images: trace.images,
       media: buildImageMedia(trace.images, this.imageTransformTemplate),
+      attachments: this.projectAttachments(trace.attachments),
       visibility: trace.visibility,
       author: {
         id: trace.from.id,
