@@ -278,6 +278,94 @@ test('backend release never rebuilds tags and deploys immutable digests', () => 
   );
 });
 
+test('single-platform promotion preserves the source digest for each requested alias', () => {
+  const { script } = workflowRunScript(
+    read('.github/workflows/release.yml').replaceAll('\r\n', '\n'),
+    'Tag release image',
+    '\n  deploy:',
+  );
+  // Model Buildx's default single-manifest wrapping, without Docker or a registry.
+  const registry = `
+declare -A manifests
+docker() {
+  [ "$1 $2" = "buildx imagetools" ] || return 2
+  shift 2
+  local command="$1" target preserve=false
+  shift
+  case "$command" in
+    create)
+      if [ "$1" = "--prefer-index=false" ]; then preserve=true; shift; fi
+      [ "$1" = "-t" ] && [ "$3" = "$SHA_IMAGE" ] && [ "$#" = 3 ] || return 2
+      target="$2"
+      if [ "$preserve" = true ] && [ "$CORRUPT_PROMOTION" = false ]; then
+        manifests["$target"]="$SOURCE_DIGEST"
+      else
+        manifests["$target"]="sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+      fi
+      printf 'created:%s\\n' "$target"
+      ;;
+    inspect)
+      [ "$#" = 3 ] && [ "$2" = "--format" ] && [ "$3" = '{{json .Manifest}}' ] || return 2
+      printf '{"digest":"%s"}\\n' "\${manifests[$1]}"
+      ;;
+    *) return 2 ;;
+  esac
+}
+jq() {
+  [ "$1" = "-er" ] && [ "$2" = '.digest' ] && [ "$#" = 2 ] || return 2
+  local open key colon digest close
+  IFS='"' read -r open key colon digest close
+  [ "$key" = digest ] || return 2
+  printf '%s\\n' "$digest"
+}
+`;
+  const sourceDigest = `sha256:${'a'.repeat(64)}`;
+  const run = (primary, legacy, corrupt = false) =>
+    spawnSync(
+      process.platform === 'win32'
+        ? 'C:/Program Files/Git/bin/bash.exe'
+        : '/bin/bash',
+      ['-c', registry + script],
+      {
+        encoding: 'utf8',
+        timeout: 5000,
+        env: {
+          ...process.env,
+          SOURCE_DIGEST: sourceDigest,
+          EXPECTED_DIGEST: sourceDigest,
+          SHA_IMAGE: 'ghcr.io/example/backend:sha-test-amd64',
+          RELEASE_IMAGE: 'ghcr.io/example/backend:v1.2.3-amd64',
+          LEGACY_RELEASE_IMAGE: 'ghcr.io/example/backend:v1.2.3',
+          NEEDS_PROMOTION: String(primary),
+          NEEDS_LEGACY_PROMOTION: String(legacy),
+          CORRUPT_PROMOTION: String(corrupt),
+        },
+      },
+    );
+
+  for (const [primary, legacy] of [
+    [true, true],
+    [true, false],
+    [false, true],
+    [false, false],
+  ]) {
+    const result = run(primary, legacy);
+    assert.equal(result.status, 0, result.stderr || result.error?.message);
+    assert.equal(
+      result.stdout.includes('created:ghcr.io/example/backend:v1.2.3-amd64\n'),
+      primary,
+    );
+    assert.equal(
+      result.stdout.includes('created:ghcr.io/example/backend:v1.2.3\n'),
+      legacy,
+    );
+  }
+  const mismatch = run(true, true, true);
+  assert.equal(mismatch.status, 1, mismatch.stderr);
+  assert.match(mismatch.stderr, /Promoted digest mismatch/);
+  assert.doesNotMatch(mismatch.stdout, /created:ghcr.io\/example\/backend:v1\.2\.3\n/);
+});
+
 test('backend release gate actions are pinned to full commit SHAs', () => {
   for (const filename of ['build-image.yml', 'ci.yml', 'release.yml']) {
     const workflow = read(`.github/workflows/${filename}`);

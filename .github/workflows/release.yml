@@ -383,7 +383,7 @@ jobs:
             "$NEEDS_LEGACY_PROMOTION:$LEGACY_RELEASE_IMAGE"; do
             [ "${promotion%%:*}" = "true" ] || continue
             target="${promotion#*:}"
-            docker buildx imagetools create -t "$target" "$SHA_IMAGE"
+            docker buildx imagetools create --prefer-index=false -t "$target" "$SHA_IMAGE"
             actual="$(docker buildx imagetools inspect "$target" --format '{{json .Manifest}}' | jq -er '.digest')"
             if [ "$actual" != "$EXPECTED_DIGEST" ]; then
               echo "Promoted digest mismatch for $target: $actual != $EXPECTED_DIGEST" >&2
