@@ -182,13 +182,16 @@ test('server approval is protected, fixed-path and checked before migration or t
   let result = launch();
   assert.equal(result.status, 0, result.stderr);
   assert.equal(fs.existsSync(path.join(root, 'effects-started')), true);
+  fs.writeFileSync(approvalFile, approved);
+  result = launch();
+  assert.equal(result.status, 0, '64-byte digest without a newline must remain valid');
   for (const extra of [{ TEST_OWNER: '1000' }, { TEST_MODE: '666' }, { TEST_WRITABLE: '1' }]) {
     assert.notEqual(launch(extra).status, 0, JSON.stringify(extra));
     assert.equal(fs.existsSync(path.join(root, 'effects-started')), false);
   }
-  for (const approval of ['bad\n', approved + '\n\n', '0'.repeat(64) + '\n']) {
+  for (const approval of ['bad\n', approved + '\n\n', '0'.repeat(64) + '\n', approved + '\0']) {
     fs.writeFileSync(approvalFile, approval);
-    assert.notEqual(launch().status, 0, approval);
+    assert.notEqual(launch().status, 0, JSON.stringify(approval));
     assert.equal(fs.existsSync(path.join(root, 'effects-started')), false);
   }
   fs.writeFileSync(approvalFile, approved + '\n');

@@ -129,12 +129,15 @@ if [ "${RELEASE_IRREVERSIBLE_MIGRATION:-0}" != "1" ]; then
       echo 'Migration baseline approval must be a regular file not writable by the deployment user.' >&2
       exit 1
     fi
-    approved_digest="$(cat -- "$migration_baseline_file")"
     baseline_bytes="$(wc -c < "$migration_baseline_file")"
-    if [ "$baseline_bytes" -ne 64 ] && [ "$baseline_bytes" -ne 65 ]; then
+    # Validate the original bytes before Bash command substitution can discard
+    # NULs or trailing newlines from an otherwise malformed approval file.
+    if { [ "$baseline_bytes" -ne 64 ] && [ "$baseline_bytes" -ne 65 ]; } ||
+      ! LC_ALL=C grep -a -x -E '[0-9a-f]{64}' "$migration_baseline_file" >/dev/null; then
       echo 'Migration baseline approval must contain one lowercase SHA-256 digest, optionally followed by LF.' >&2
       exit 1
     fi
+    approved_digest="$(cat -- "$migration_baseline_file")"
     . deploy/migration-baseline.sh
     migration_baseline_matches . "$approved_digest"
     approved_migration_baseline=1
