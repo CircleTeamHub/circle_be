@@ -55,6 +55,7 @@ export class StorageAuditService {
     'notes/',
     'friends/',
     'chat/',
+    'stickers/',
   ] as const;
 
   /**
@@ -378,12 +379,26 @@ export class StorageAuditService {
     await this.collectFrom(
       (cursor, take) =>
         this.prisma.trace.findMany({
-          select: { id: true, images: true },
+          select: { id: true, images: true, attachments: true },
           orderBy: { id: 'asc' },
           take,
           ...(cursor ? { cursor: { id: cursor }, skip: 1 } : {}),
         }),
-      (row) => row.images.forEach(add),
+      (row) => {
+        row.images.forEach(add);
+        if (Array.isArray(row.attachments)) {
+          for (const attachment of row.attachments) {
+            if (
+              attachment &&
+              typeof attachment === 'object' &&
+              !Array.isArray(attachment)
+            ) {
+              add(attachment.key);
+              add(attachment.posterKey);
+            }
+          }
+        }
+      },
     );
     await this.collectFrom(
       (cursor, take) =>
@@ -404,6 +419,16 @@ export class StorageAuditService {
           ...(cursor ? { cursor: { id: cursor }, skip: 1 } : {}),
         }),
       (row) => row.images.forEach(add),
+    );
+    await this.collectFrom(
+      (cursor, take) =>
+        this.prisma.customSticker.findMany({
+          select: { id: true, objectKey: true },
+          orderBy: { id: 'asc' },
+          take,
+          ...(cursor ? { cursor: { id: cursor }, skip: 1 } : {}),
+        }),
+      (row) => add(row.objectKey),
     );
     // 聊天媒体:content 只存裸 key(add 的 toObjectKey 对裸 key 原样放行)。
     // 活消息与焚毁归档里以 chat/ 开头的 key 由 audit 按批反查（值即 key，走表达式

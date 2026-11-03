@@ -1,0 +1,13 @@
+# Synced Custom Stickers Implementation Plan
+
+**Goal:** Add private, account-owned custom image stickers synchronized across devices, including saving eligible chat images.
+
+**Architecture:** Keep permanent object keys in a CustomSticker table; sign URLs only on reads. Copy eligible chat images into independent private sticker objects; copy selected stickers back into ordinary chat media before using the existing image-message sender.
+
+**Constraints:** No dependencies, commits, deployment, migration application, signed-URL persistence, arbitrary URL fetching, or changes to burn-message rules. Preserve earlier Trace.attachments and group privacy work. Maximum 200 stickers/account and 5 MiB/image.
+
+1. Write backend service/DTO/upload/audit tests first and observe failures: owner-scoped reads/removal, deduplication, quota, unauthorized media access, burn denial, failed copy/upload, private image-only uploads, durable object references.
+2. Add CustomSticker schema and additive migration; register a small StickerModule. GET /stickers reads at most 200 and signs current URLs; POST /stickers accepts exactly one owned uploaded key or authorized source message ID; DELETE /stickers/:id removes only the current owner's collection entry. POST /stickers/:id/message-media copies an owned sticker to a unique ordinary chat key, returning image content. Abandoned prepared copies follow the existing ordinary-upload storage-audit lifecycle: a deletion reservation would reject the subsequent ordinary send.
+3. Add image-only private stickers/ presigns and HEAD metadata verification through UploadService; include the prefix and CustomSticker keys in StorageAuditService. Generate only the isolated private Prisma client after both schema owners finish.
+4. Write frontend behavior tests first for refresh/account isolation, upload failure, picker actions, image sending, and long-press save denial. Add a small API and memory store, picker custom section with add/remove actions and foreground refresh, guarded sticker send hook, and eligible image save menu action. Static photos are re-encoded to strip metadata (PNG/WebP preserve alpha, GIF preserves animation); thumbnails resize early and cache only in memory. A bounded owner/delivery-ID preview registry keeps pending images visible without persisting signed URLs; existing no-echo reconciliation fetches authoritative messages.
+5. Run focused backend/frontend tests, typechecks, targeted no-fix lint, and diff checks. Report deployment order (migration/backend before frontend), translation keys, verification results, and any unavailable external integration checks. Verify temporary tool processes have exited.

@@ -254,6 +254,99 @@ describe('TraceService', () => {
     );
   });
 
+  it('persists ordered mixed attachments and projects canonical image/video URLs', async () => {
+    Object.assign(service, {
+      storagePublicObjectBases: ['https://cdn.example.com'],
+    });
+    const attachments = [
+      {
+        type: 'video' as const,
+        key: 'posts/actor-1/clip.mp4',
+        posterKey: 'posts/actor-1/poster.jpg',
+      },
+      { type: 'image' as const, key: 'posts/actor-1/photo.jpg' },
+      { type: 'video' as const, key: 'posts/actor-1/clip2.mov' },
+    ];
+    prisma.trace.create.mockImplementationOnce(async ({ data }) => ({
+      id: 'mixed',
+      ...data,
+      createdAt: new Date(),
+      from: { id: 'actor-1', nickname: 'Actor', avatarUrl: null },
+    }));
+    const result = await service.createTrace('actor-1', {
+      content: 'mixed',
+      attachments,
+    } as never);
+    expect(prisma.trace.create).toHaveBeenCalledWith(
+      expect.objectContaining({
+        data: expect.objectContaining({
+          attachments,
+          images: ['https://cdn.example.com/posts/actor-1/photo.jpg'],
+        }),
+      }),
+    );
+    expect(result).toMatchObject({
+      attachments: [
+        {
+          ...attachments[0],
+          url: 'https://cdn.example.com/posts/actor-1/clip.mp4',
+          posterUrl: 'https://cdn.example.com/posts/actor-1/poster.jpg',
+        },
+        {
+          ...attachments[1],
+          url: 'https://cdn.example.com/posts/actor-1/photo.jpg',
+        },
+        {
+          ...attachments[2],
+          url: 'https://cdn.example.com/posts/actor-1/clip2.mov',
+        },
+      ],
+    });
+  });
+
+  it('reads persisted mixed attachments through the existing moment detail visibility flow', async () => {
+    Object.assign(service, {
+      storagePublicObjectBases: ['https://cdn.example.com'],
+    });
+    prisma.trace.findFirst.mockResolvedValue({
+      ...makeTraceRow('mixed', new Date()),
+      attachments: [
+        { type: 'video', key: 'posts/friend-1/clip.mp4' },
+        { type: 'image', key: 'posts/friend-1/photo.jpg' },
+      ],
+    });
+    prisma.friend.findMany.mockResolvedValue([]);
+    const result = await service.getTraceById('friend-1', 'mixed');
+    expect(result.attachments?.map((item) => item.url)).toEqual([
+      'https://cdn.example.com/posts/friend-1/clip.mp4',
+      'https://cdn.example.com/posts/friend-1/photo.jpg',
+    ]);
+  });
+
+  it.each([
+    { type: 'video', key: 'posts/other/clip.mp4' },
+    {
+      type: 'video',
+      key: 'posts/actor-1/clip.mp4',
+      posterKey: 'posts/other/poster.jpg',
+    },
+    { type: 'image', key: 'posts/actor-1/clip.mp4' },
+  ])(
+    'rejects foreign or wrongly typed attachment keys before writing',
+    async (attachment) => {
+      Object.assign(service, {
+        storagePublicObjectBases: ['https://cdn.example.com'],
+      });
+      await expect(
+        service.createTrace('actor-1', {
+          content: 'bad',
+          attachments: [attachment],
+        } as never),
+      ).rejects.toThrow(BadRequestException);
+      expect(prisma.trace.create).not.toHaveBeenCalled();
+    },
+  );
+
   it('blocks access to a public trace when the author hides moments from the viewer', async () => {
     prisma.trace.findFirst.mockResolvedValue({
       id: 'trace-1',

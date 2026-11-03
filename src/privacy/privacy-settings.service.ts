@@ -41,6 +41,7 @@ const DEFAULT_PRIVACY_SETTINGS: PrivacySettingsDto = {
   addMeByGroup: true,
   callPermission: 'EVERYONE',
   groupInvitePermission: 'EVERYONE',
+  allowFriendGroupDirectJoin: false,
   directMessageAutoReplyEnabled: false,
   directMessageAutoReplyText: '',
   // 在线状态与「正在输入」默认照旧外露 —— 这三项上线前本来就对所有会话成员
@@ -571,6 +572,9 @@ export class PrivacySettingsService {
       groupInvitePermission:
         settings.groupInvitePermission ??
         DEFAULT_PRIVACY_SETTINGS.groupInvitePermission,
+      allowFriendGroupDirectJoin:
+        settings.allowFriendGroupDirectJoin ??
+        DEFAULT_PRIVACY_SETTINGS.allowFriendGroupDirectJoin,
       directMessageAutoReplyEnabled:
         settings.directMessageAutoReplyEnabled ??
         DEFAULT_PRIVACY_SETTINGS.directMessageAutoReplyEnabled,

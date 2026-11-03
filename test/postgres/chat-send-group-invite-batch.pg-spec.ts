@@ -1,5 +1,6 @@
 import { ChatService } from 'src/chat/chat.service';
 import { GroupAdmissionService } from 'src/chat/group-admission.service';
+import { ChatGroupEventService } from 'src/chat/chat-group-event.service';
 import { describePostgres } from './pg-test-db';
 import {
   type LiveSchema,
@@ -35,6 +36,8 @@ describePostgres('group invite and create-group batching', () => {
   beforeAll(async () => {
     live = await openLiveSchema('chat_group_invite');
     const resolved = () => jest.fn().mockResolvedValue(undefined);
+    const groupEvents = new ChatGroupEventService(live.prisma as never);
+    jest.spyOn(groupEvents, 'record').mockResolvedValue(undefined);
     chat = new ChatService(
       live.prisma as never,
       { check: jest.fn().mockReturnValue({ blocked: false }) } as never,
@@ -48,7 +51,7 @@ describePostgres('group invite and create-group batching', () => {
       { emit: resolved() } as never,
       { isSupportAgent: jest.fn().mockResolvedValue(false) } as never,
       { lock: resolved() } as never,
-      { record: resolved(), recordInTx: resolved() } as never,
+      groupEvents,
     );
     // 建群返回值要拼会话 DTO(另一套读路径),这里只关心事务里的写。
     jest
@@ -229,6 +232,80 @@ describePostgres('group invite and create-group batching', () => {
   });
 
   describe('createGroupConversation', () => {
+    it('seats only explicitly opted-in friends with matching admission, delivery, and audit rows', async () => {
+      const members = invitees.slice(0, 3);
+      await live.prisma.userPrivacySetting.createMany({
+        data: [
+          { userID: members[0], allowFriendGroupDirectJoin: true },
+          { userID: members[1], allowFriendGroupDirectJoin: false },
+        ],
+      });
+      await chat.createGroupConversation('owner', {
+        name: '新群',
+        memberIds: members,
+      });
+      expect(
+        await live.prisma.chatMember.findMany({
+          select: { userID: true },
+          orderBy: { userID: 'asc' },
+        }),
+      ).toEqual([{ userID: 'owner' }, { userID: members[0] }]);
+      const admissions = await live.prisma.groupAdmission.findMany({
+        orderBy: { applicantID: 'asc' },
+        include: { deliveries: true },
+      });
+      expect(
+        admissions.map((a) => ({
+          applicantID: a.applicantID,
+          status: a.status,
+          events: a.deliveries.map((d) => d.event),
+        })),
+      ).toEqual(
+        members.map((applicantID, i) => ({
+          applicantID,
+          status: i === 0 ? 'JOINED' : 'INVITED',
+          events: [i === 0 ? 'JOINED' : 'INVITED'],
+        })),
+      );
+      expect(admissions[0].acceptedAt).toBeInstanceOf(Date);
+      expect(admissions[0].decidedByID).toBe('owner');
+      expect(admissions[1].acceptedAt).toBeNull();
+      expect(
+        await live.prisma.chatGroupEvent.findMany({
+          select: { kind: true, actorID: true, targetIDs: true },
+        }),
+      ).toEqual([
+        { kind: 'member-joined', actorID: 'owner', targetIDs: [members[0]] },
+      ]);
+    });
+
+    it('rolls back seats, admissions, and logs when joined delivery insertion fails', async () => {
+      const members = invitees.slice(0, 2);
+      await live.prisma.userPrivacySetting.create({
+        data: { userID: members[0], allowFriendGroupDirectJoin: true },
+      });
+      await live.db.query(
+        'ALTER TABLE "GroupAdmissionDelivery" ADD CONSTRAINT "deny_joined_delivery" CHECK (event <> \'JOINED\')',
+      );
+      try {
+        await expect(
+          chat.createGroupConversation('owner', {
+            name: '新群',
+            memberIds: members,
+          }),
+        ).rejects.toThrow();
+        expect(await live.prisma.chatConversation.count()).toBe(0);
+        expect(await live.prisma.chatMember.count()).toBe(0);
+        expect(await live.prisma.groupAdmission.count()).toBe(0);
+        expect(await live.prisma.groupAdmissionDelivery.count()).toBe(0);
+        expect(await live.prisma.chatGroupEvent.count()).toBe(0);
+      } finally {
+        await live.db.query(
+          'ALTER TABLE "GroupAdmissionDelivery" DROP CONSTRAINT "deny_joined_delivery"',
+        );
+      }
+    });
+
     it('invites every member with one admission and one delivery each, in constant statements', async () => {
       const members = invitees.slice(0, 60);
       await chat.createGroupConversation('owner', {

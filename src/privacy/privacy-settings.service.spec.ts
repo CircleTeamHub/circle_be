@@ -56,6 +56,7 @@ describe('PrivacySettingsService', () => {
       addMeByGroup: true,
       callPermission: 'EVERYONE',
       groupInvitePermission: 'EVERYONE',
+      allowFriendGroupDirectJoin: false,
       directMessageAutoReplyEnabled: false,
       directMessageAutoReplyText: '',
       // 在线状态与输入状态默认外露 —— 上线前本来就对所有会话成员可见。
@@ -102,6 +103,42 @@ describe('PrivacySettingsService', () => {
         }),
       }),
     );
+  });
+
+  it.each([true, false])(
+    'persists explicit direct-join consent %s under the relationship lock',
+    async (consent) => {
+      prisma.userPrivacySetting.upsert.mockResolvedValue({
+        userID: 'user-1',
+        allowFriendGroupDirectJoin: consent,
+      });
+      await expect(
+        service.updateSettings('user-1', {
+          allowFriendGroupDirectJoin: consent,
+        } as UpdatePrivacySettingsDto),
+      ).resolves.toMatchObject({ allowFriendGroupDirectJoin: consent });
+      expect(prisma.userPrivacySetting.upsert).toHaveBeenCalledWith(
+        expect.objectContaining({
+          create: expect.objectContaining({
+            allowFriendGroupDirectJoin: consent,
+          }),
+          update: { allowFriendGroupDirectJoin: consent },
+        }),
+      );
+      expect(prisma.$executeRaw.mock.invocationCallOrder[0]).toBeLessThan(
+        prisma.userPrivacySetting.upsert.mock.invocationCallOrder[0],
+      );
+    },
+  );
+
+  it('does not infer direct-join consent from a legacy EVERYONE privacy row', async () => {
+    prisma.userPrivacySetting.findUnique.mockResolvedValue({
+      userID: 'user-1',
+      groupInvitePermission: 'EVERYONE',
+    });
+    await expect(service.getSettings('user-1')).resolves.toMatchObject({
+      allowFriendGroupDirectJoin: false,
+    });
   });
 
   it('validates direct-message auto reply text at both DTO and service boundaries', async () => {

@@ -100,6 +100,38 @@ describe('CreateTraceDto images', () => {
   });
 });
 
+describe('CreateTraceDto mixed attachments', () => {
+  const input = (attachments: unknown[]) =>
+    plainToInstance(CreateTraceDto, { content: 'mixed', attachments });
+  it('accepts ordered images and multiple videos', () => {
+    expect(
+      validateSync(
+        input([
+          {
+            type: 'video',
+            key: 'posts/user-1/clip.mp4',
+            posterKey: 'posts/user-1/poster.jpg',
+            duration: 3,
+          },
+          { type: 'image', key: 'posts/user-1/photo.jpg' },
+          { type: 'video', key: 'posts/user-1/clip2.mov' },
+        ]),
+      ),
+    ).toHaveLength(0);
+  });
+  it.each([
+    [{ type: 'file', key: 'posts/user-1/file.pdf' }],
+    [{ type: 'video', key: 'chat/other/private.mp4' }],
+    [{ type: 'image', key: 'posts/user-1/../secret.jpg' }],
+    Array.from({ length: 10 }, (_, n) => ({
+      type: 'video',
+      key: `posts/user-1/${n}.mp4`,
+    })),
+  ])('rejects invalid mixed attachments %#', (...attachments) => {
+    expect(validateSync(input(attachments)).length).toBeGreaterThan(0);
+  });
+});
+
 describe('TraceFeedQueryDto authorId', () => {
   it('accepts persisted user IDs that are UUID-shaped but not RFC UUIDs', () => {
     const dto = plainToInstance(TraceFeedQueryDto, {

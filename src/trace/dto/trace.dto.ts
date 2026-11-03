@@ -6,6 +6,8 @@ import {
   IsEnum,
   IsISO8601,
   IsInt,
+  IsIn,
+  IsNumber,
   IsNotEmpty,
   IsOptional,
   IsString,
@@ -14,6 +16,7 @@ import {
   MaxLength,
   Matches,
   Min,
+  ValidateNested,
 } from 'class-validator';
 import { ApiProperty, ApiPropertyOptional } from '@nestjs/swagger';
 import { AvatarFrameAppearanceDto } from 'src/user/dto/public-user.dto';
@@ -22,6 +25,48 @@ import { ImageMediaVariantDto } from 'src/media/image-media.dto';
 import { USER_ID_OR_ALIAS_PATTERN } from 'src/user/user-id-alias';
 
 const TRACE_VISIBILITY = ['FRIENDS_ONLY', 'PRIVATE'] as const;
+
+export class TraceAttachmentInputDto {
+  @ApiProperty({ enum: ['image', 'video'] })
+  @IsIn(['image', 'video'])
+  type: 'image' | 'video';
+
+  @ApiProperty()
+  @IsString()
+  @MaxLength(500)
+  @Matches(/^posts\/[\w-]+\/[\w-]+\.[A-Za-z0-9]+$/)
+  key: string;
+
+  @ApiPropertyOptional()
+  @IsOptional()
+  @IsString()
+  @MaxLength(500)
+  @Matches(/^posts\/[\w-]+\/[\w-]+\.[A-Za-z0-9]+$/)
+  posterKey?: string;
+
+  @ApiPropertyOptional()
+  @IsOptional()
+  @IsInt()
+  @Min(1)
+  width?: number;
+
+  @ApiPropertyOptional()
+  @IsOptional()
+  @IsInt()
+  @Min(1)
+  height?: number;
+
+  @ApiPropertyOptional({ description: 'Video duration in seconds' })
+  @IsOptional()
+  @IsNumber()
+  @Min(0)
+  duration?: number;
+}
+
+export class TraceAttachmentDto extends TraceAttachmentInputDto {
+  @ApiProperty() url: string;
+  @ApiPropertyOptional() posterUrl?: string;
+}
 
 // ── Request DTOs ─────────────────────────────────────────────────────────────
 
@@ -42,6 +87,15 @@ export class CreateTraceDto {
   @ArrayUnique()
   @IsOptional()
   images?: string[];
+
+  @ApiPropertyOptional({ type: [TraceAttachmentInputDto], maxItems: 9 })
+  @IsOptional()
+  @IsArray()
+  @ArrayMaxSize(9)
+  @ArrayUnique((item: TraceAttachmentInputDto) => item?.key)
+  @ValidateNested({ each: true })
+  @Type(() => TraceAttachmentInputDto)
+  attachments?: TraceAttachmentInputDto[];
 
   @ApiPropertyOptional({ enum: TRACE_VISIBILITY, default: 'FRIENDS_ONLY' })
   @IsEnum(TRACE_VISIBILITY)
@@ -163,6 +217,8 @@ export class TraceDto {
   id: string;
   content: string;
   images: string[];
+  @ApiPropertyOptional({ type: [TraceAttachmentDto] })
+  attachments?: TraceAttachmentDto[];
   @ApiPropertyOptional({ type: [ImageMediaVariantDto] })
   media?: ImageMediaVariantDto[];
   visibility: string;
