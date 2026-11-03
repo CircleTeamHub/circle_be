@@ -12,8 +12,8 @@ name: Auto Release
 #   - vars.AUTO_RELEASE == 'off': 临时停用自动发版
 #   - 该 commit 已不是 main 顶端: 让更新的提交去发,不发陈旧版本
 #   - 该 commit 的 CI 不是绿的(含等待超时)
-#   - 存在 deploy/REQUIRES_IRREVERSIBLE_MIGRATION: 不可逆迁移按设计必须人工确认
-#     downtime + irreversible,只能手动跑 Release
+#   - 未审批的 deploy/REQUIRES_IRREVERSIBLE_MIGRATION: 需要人工确认
+#     downtime + irreversible; 已审批的历史数据库契约允许普通自动发版
 #
 # 为什么派发 workflow_dispatch 而不是靠 tag push 触发: 用 GITHUB_TOKEN 推的 tag 不会
 # 触发别的工作流(GitHub 防递归),而 workflow_dispatch 是官方例外。代价是自动发版不
@@ -57,6 +57,7 @@ jobs:
         env:
           DEPLOY_HOST: ${{ vars.DEPLOY_HOST }}
           AUTO_RELEASE: ${{ vars.AUTO_RELEASE }}
+          AUTO_RELEASE_MIGRATIONS_SHA256: ${{ vars.AUTO_RELEASE_MIGRATIONS_SHA256 }}
           SHA: ${{ github.event.workflow_run.head_sha }}
           GH_TOKEN: ${{ github.token }}
         run: |
@@ -71,7 +72,10 @@ jobs:
           [ -n "$DEPLOY_HOST" ] || skip "vars.DEPLOY_HOST 未配置,还没有部署目标(见 DEPLOY.md §6)"
           [ "${AUTO_RELEASE:-on}" != "off" ] || skip "vars.AUTO_RELEASE=off,自动发版已停用"
 
-          if [ -e deploy/REQUIRES_IRREVERSIBLE_MIGRATION ]; then
+          if [ -n "$AUTO_RELEASE_MIGRATIONS_SHA256" ]; then
+            . deploy/migration-baseline.sh
+            migration_baseline_matches . "$AUTO_RELEASE_MIGRATIONS_SHA256"
+          elif [ -e deploy/REQUIRES_IRREVERSIBLE_MIGRATION ] || [ -L deploy/REQUIRES_IRREVERSIBLE_MIGRATION ]; then
             echo "::warning::存在 deploy/REQUIRES_IRREVERSIBLE_MIGRATION,需要人工在 Actions → Release 勾选 downtime + irreversible_migration 发版"
             skip "该版本带不可逆迁移标记"
           fi

@@ -222,10 +222,21 @@ Alertmanager 的 `*.url`、`metrics_token`、`probe-targets/*.yml`)被 rsync 排
 勾选 `downtime: true`(先停旧版本再迁移,接受短暂停机;此模式下若失败,
 回滚可能还需恢复迁移前备份)。
 
-**不可逆迁移**:仓库存在 `deploy/REQUIRES_IRREVERSIBLE_MIGRATION` 时,tag push 会
+**不可逆迁移**:未审批的数据库契约存在 `deploy/REQUIRES_IRREVERSIBLE_MIGRATION` 时,tag push 会
 fail closed,不会连接服务器。必须从 Actions 手动运行 Release,同时勾选
 `downtime: true` 和 `irreversible_migration: true`。服务器也会二次校验
 `RELEASE_IRREVERSIBLE_MIGRATION=1` 必须与 `RELEASE_DOWNTIME=1` 同时启用。
+
+**历史迁移审批后自动发版**:管理员可以审批一个已审计的数据库契约,让保留历史标记的
+代码更新通过普通 Release/Auto Release。仓库变量 `AUTO_RELEASE_MIGRATIONS_SHA256`
+和服务器 `/etc/circle-release/migration-baseline.sha256` 必须使用同一个摘要。变量格式是
+恰好 64 个小写十六进制字符;服务器文件只包含该摘要,可带一个结尾 LF。摘要涵盖
+`prisma/migrations` 下全部常规文件的相对路径和内容、`prisma/schema.prisma`、
+`deploy/SCHEMA_COMPATIBILITY`、以及标记的存在与内容;符号链接和缺失必需路径会被拒绝。
+具体审批步骤见 [数据库契约审批操作手册](docs/operations/migration-approval.md)。
+每次新增、删除、重命名或修改迁移、schema、兼容级别或标记,都必须重新人工审计并审批。
+审批不会自动勾选停机或不可逆确认,不会降低 schema 回滚下限,也不会自动批准新迁移。
+未设置变量/文件时保持原有保守行为;已设置后,即使删除标记,普通发布的摘要不匹配仍被拒绝。
 
 不可逆迁移命令返回非零时,脚本会通过发布镜像连接目标数据库,直接检查 User、Circle
 和 CirclePost 的四个会员等级约束。只有四个约束都不存在时,才能证明事务未应用并恢复

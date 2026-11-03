@@ -13,6 +13,7 @@ fi
 
 mkdir -p "$TARGET_ROOT/deploy" "$TARGET_ROOT/monitoring"
 install -m 0755 "$SOURCE_ROOT/deploy/release-deploy.sh" "$TARGET_ROOT/deploy/release-deploy.sh"
+install -m 0644 "$SOURCE_ROOT/deploy/migration-baseline.sh" "$TARGET_ROOT/deploy/migration-baseline.sh"
 install -m 0755 "$SOURCE_ROOT/deploy/gen-env.sh" "$TARGET_ROOT/deploy/gen-env.sh"
 install -m 0755 "$SOURCE_ROOT/deploy/admin-web-deploy.sh" "$TARGET_ROOT/deploy/admin-web-deploy.sh"
 install -m 0755 "$SOURCE_ROOT/deploy/caddy-entrypoint.sh" "$TARGET_ROOT/deploy/caddy-entrypoint.sh"

@@ -51,7 +51,7 @@ jobs:
       - name: Verify release contracts
         run: |
           node --test scripts/release-hardening.test.mjs scripts/check-gateway-exposure.test.mjs
-          node --test test/release-workflow.test.js
+          node --test test/release-workflow.test.js test/migration-baseline.test.mjs
           bash test/release-deploy.spec.sh
           bash test/release-launcher.spec.sh
           bash test/app-env-primitives.spec.sh
