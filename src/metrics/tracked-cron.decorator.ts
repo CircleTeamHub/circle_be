@@ -15,6 +15,7 @@ import { runWithOperationContext } from '../logging/operation-context';
  * @TrackedCron 调用点把漏配钉住。
  */
 const INTERVAL_SECONDS: ReadonlyMap<string, number> = new Map([
+  [CronExpression.EVERY_SECOND, 1],
   [CronExpression.EVERY_MINUTE, 60],
   [CronExpression.EVERY_5_MINUTES, 5 * 60],
   [CronExpression.EVERY_10_MINUTES, 10 * 60],

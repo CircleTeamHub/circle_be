@@ -38,6 +38,7 @@ import {
   AvatarFrameService,
   PUBLIC_APPEARANCE_USER_SELECT,
 } from 'src/avatar-frame/avatar-frame.service';
+import { FriendChatReplayOutboxProcessor } from './friend-chat-replay-outbox.processor';
 import { isBlockedByStandaloneGroupPolicy } from 'src/chat/standalone-group-policy-gate';
 
 // Members (paid) get 5 000, regular users get 1 000.
@@ -203,6 +204,7 @@ export class FriendService {
     private readonly privacySettings: PrivacySettingsService,
     private readonly avatarFrames: AvatarFrameService,
     private readonly config: ConfigService,
+    private readonly chatReplay: FriendChatReplayOutboxProcessor,
   ) {
     this.storagePublicObjectBases = storagePublicObjectBasesFromConfig(
       this.config,
@@ -720,6 +722,12 @@ export class FriendService {
 
       return nextRequest;
     });
+    if (decision === FriendState.ACCEPTED) {
+      // The transaction durably queued this job; a failed eager attempt is retried by cron.
+      await this.chatReplay.processRequest(nextRequest.id).catch(() => {
+        this.logger.warn({ event: 'friend_chat_replay_deferred' });
+      });
+    }
     await this.broadcastFriendUnreadUpdates([recipientId, record.userID]);
     // Notify the requester first — it's the user-facing signal and only touches
     // the DB + realtime channel, so it stays fast.
@@ -733,8 +741,7 @@ export class FriendService {
       content: nextRequest.message ?? '',
       requestId: nextRequest.id,
     });
-    // Accepted-thread replay is handled by the durable outbox processor; accept
-    // itself never makes external OpenIM calls.
+    // Replay uses the same leased, idempotent outbox path as the scheduled retry.
     logBusinessEvent(this.logger, {
       enabled: this.loggingConfig.businessLogOn,
       businessEvent:
