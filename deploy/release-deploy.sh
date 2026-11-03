@@ -106,7 +106,45 @@ if [ "${RELEASE_IRREVERSIBLE_MIGRATION:-0}" = "1" ] && [ "${RELEASE_DOWNTIME:-0}
   echo "RELEASE_IRREVERSIBLE_MIGRATION=1 requires RELEASE_DOWNTIME=1" >&2
   exit 1
 fi
-if [ -e "$RELEASE_MARKER_PATH" ] && [ "${RELEASE_IRREVERSIBLE_MIGRATION:-0}" != "1" ]; then
+approved_migration_baseline=0
+# This approval belongs to the host administrator. Never accept its path or
+# value from the checkout, environment, or a signed release manifest.
+if [ "${RELEASE_IRREVERSIBLE_MIGRATION:-0}" != "1" ]; then
+  migration_baseline_file=/etc/circle-release/migration-baseline.sha256
+  if [ -e "$migration_baseline_file" ] || [ -L "$migration_baseline_file" ]; then
+    for baseline_path in /etc /etc/circle-release "$migration_baseline_file"; do
+      if [ -L "$baseline_path" ]; then
+        echo "Migration baseline approval path must not be a symlink: $baseline_path" >&2
+        exit 1
+      fi
+      baseline_owner="$(stat -c '%u' -- "$baseline_path")"
+      baseline_mode="$(stat -c '%a' -- "$baseline_path")"
+      if [ "$baseline_owner" != 0 ] || [[ ! "$baseline_mode" =~ ^[0-7]{3,4}$ ]] ||
+        (( (8#$baseline_mode & 022) != 0 )); then
+        echo "Migration baseline approval must be root-owned and non-writable by group/others: $baseline_path" >&2
+        exit 1
+      fi
+    done
+    if [ ! -f "$migration_baseline_file" ] || [ -w "$migration_baseline_file" ]; then
+      echo 'Migration baseline approval must be a regular file not writable by the deployment user.' >&2
+      exit 1
+    fi
+    baseline_bytes="$(wc -c < "$migration_baseline_file")"
+    # Validate the original bytes before Bash command substitution can discard
+    # NULs or trailing newlines from an otherwise malformed approval file.
+    if { [ "$baseline_bytes" -ne 64 ] && [ "$baseline_bytes" -ne 65 ]; } ||
+      ! LC_ALL=C grep -a -x -E '[0-9a-f]{64}' "$migration_baseline_file" >/dev/null; then
+      echo 'Migration baseline approval must contain one lowercase SHA-256 digest, optionally followed by LF.' >&2
+      exit 1
+    fi
+    approved_digest="$(cat -- "$migration_baseline_file")"
+    . deploy/migration-baseline.sh
+    migration_baseline_matches . "$approved_digest"
+    approved_migration_baseline=1
+  fi
+fi
+if { [ -e "$RELEASE_MARKER_PATH" ] || [ -L "$RELEASE_MARKER_PATH" ]; } &&
+  [ "${RELEASE_IRREVERSIBLE_MIGRATION:-0}" != "1" ] && [ "$approved_migration_baseline" != 1 ]; then
   echo "$RELEASE_MARKER_PATH requires RELEASE_IRREVERSIBLE_MIGRATION=1" >&2
   exit 1
 fi

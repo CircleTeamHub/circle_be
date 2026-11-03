@@ -30,6 +30,7 @@ test('release workflow signs and stages the exact immutable release manifest', (
 test('manual rollback keeps current trusted deploy tooling with the historical application tag', () => {
   const operationalFiles = [
     'deploy/release-deploy.sh',
+    'deploy/migration-baseline.sh',
     'deploy/gen-env.sh',
     'deploy/admin-web-deploy.sh',
     'deploy/caddy-entrypoint.sh',
@@ -226,6 +227,7 @@ test('the overlay marks a tree only when its tooling comes from another commit',
     git(directory, 'clone', '-q', target, trusted);
     for (const file of [
       'deploy/release-deploy.sh',
+      'deploy/migration-baseline.sh',
       'deploy/gen-env.sh',
       'deploy/admin-web-deploy.sh',
       'deploy/caddy-entrypoint.sh',

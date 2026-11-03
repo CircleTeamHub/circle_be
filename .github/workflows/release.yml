@@ -123,10 +123,27 @@ jobs:
           EVENT_NAME: ${{ github.event_name }}
           DOWNTIME: ${{ inputs.downtime || false }}
           IRREVERSIBLE: ${{ inputs.irreversible_migration || false }}
+          AUTO_RELEASE_MIGRATIONS_SHA256: ${{ vars.AUTO_RELEASE_MIGRATIONS_SHA256 }}
         run: |
           set -euo pipefail
           marker=deploy/REQUIRES_IRREVERSIBLE_MIGRATION
-          if [ -e "$marker" ]; then
+          approved=false
+          if [ "$IRREVERSIBLE" = "true" ] && [ "$DOWNTIME" != "true" ]; then
+            echo "irreversible_migration=true requires downtime=true." >&2
+            exit 1
+          fi
+          if [ -n "${AUTO_RELEASE_MIGRATIONS_SHA256:-}" ] &&
+            { [ "$EVENT_NAME" != workflow_dispatch ] || [ "$DOWNTIME" != true ] || [ "$IRREVERSIBLE" != true ]; }; then
+            # Historical tags may predate this helper. Load current operational
+            # tooling without overwriting any target-tag database metadata.
+            baseline_helper="$(mktemp)"
+            trap 'rm -f -- "$baseline_helper"' EXIT
+            git show origin/main:deploy/migration-baseline.sh > "$baseline_helper"
+            . "$baseline_helper"
+            migration_baseline_matches . "$AUTO_RELEASE_MIGRATIONS_SHA256"
+            approved=true
+          fi
+          if { [ -e "$marker" ] || [ -L "$marker" ]; } && [ "$approved" != true ]; then
             if [ "$EVENT_NAME" != "workflow_dispatch" ]; then
               echo "$marker blocks tag-push deployment; use manual workflow_dispatch with both confirmations." >&2
               exit 1
@@ -135,10 +152,6 @@ jobs:
               echo "$marker requires downtime=true and irreversible_migration=true." >&2
               exit 1
             fi
-          fi
-          if [ "$IRREVERSIBLE" = "true" ] && [ "$DOWNTIME" != "true" ]; then
-            echo "irreversible_migration=true requires downtime=true." >&2
-            exit 1
           fi
 
       - name: Notify release start
@@ -411,6 +424,7 @@ jobs:
           path: .trusted-release-tooling
           sparse-checkout: |
             deploy/release-deploy.sh
+            deploy/migration-baseline.sh
             deploy/gen-env.sh
             deploy/admin-web-deploy.sh
             deploy/caddy-entrypoint.sh
