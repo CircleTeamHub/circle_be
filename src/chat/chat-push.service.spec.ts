@@ -577,6 +577,27 @@ describe('ChatPushService', () => {
     });
   });
 
+  it.each([
+    { label: 'direct', conversation: { type: 'DIRECT', circleID: null } },
+    { label: 'circle', conversation: { type: 'GROUP', circleID: 'circle-1' } },
+    { label: 'group', conversation: { type: 'GROUP', circleID: null } },
+    { label: 'temporary', conversation: { type: 'TEMP', circleID: null } },
+    { label: 'support', conversation: { type: 'SUPPORT', circleID: null } },
+  ])(
+    'includes the message height in $label pushes for partial-read notification cleanup',
+    async ({ conversation }) => {
+      prisma.chatMember.findMany.mockResolvedValue([seat('u-peer')]);
+      prisma.chatConversation.findUnique.mockResolvedValue(conversation);
+      prisma.circle.findUnique.mockResolvedValue({ name: 'circle' });
+      await pushNow(msg({ height: 17 }));
+      expect(sentPayloads()).toEqual([
+        expect.objectContaining({
+          data: expect.objectContaining({ messageId: 'msg-1', height: 17 }),
+        }),
+      ]);
+    },
+  );
+
   it('titles group pushes with the circle name and prefixes the sender', async () => {
     prisma.chatMember.findMany.mockResolvedValue([seat('u-peer')]);
     prisma.chatConversation.findUnique.mockResolvedValue({
