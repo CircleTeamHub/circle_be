@@ -3,6 +3,7 @@ import { StickerService } from './sticker.service';
 import { ChatMediaService } from 'src/chat/chat-media.service';
 import { UploadController } from 'src/upload/upload.controller';
 import { UploadLimitService } from 'src/upload/upload-limit.service';
+import * as errorAggregation from 'src/logging/error-aggregation.service';
 
 describe('StickerService', () => {
   function harness() {
@@ -53,6 +54,7 @@ describe('StickerService', () => {
         .fn()
         .mockResolvedValue({ contentType: 'image/png', size: 1024 }),
       copyObjectToKey: jest.fn().mockResolvedValue(undefined),
+      deleteObjectByKey: jest.fn().mockResolvedValue(undefined),
       createPresignedGetUrl: jest.fn(async (key) => ({
         url: `signed:${key}`,
         expiresAt: new Date(),
@@ -82,6 +84,7 @@ describe('StickerService', () => {
       stickers,
       prisma,
       upload,
+      uploadLimit,
       chat,
     };
   }
@@ -163,12 +166,120 @@ describe('StickerService', () => {
     ]);
     expect(a.id).toBe(b.id);
     expect(h.rows).toHaveLength(1);
-    expect(h.rows[0].objectKey).toMatch(/^stickers\/alice\/[a-f0-9]+\.png$/);
+    expect(h.rows[0].objectKey).toMatch(
+      /^stickers\/alice\/[a-f0-9-]{36}\.png$/,
+    );
     expect(h.rows[0].sourceMessageID).toBe('m1');
     expect(h.upload.copyObjectToKey).toHaveBeenCalledWith(
       'chat/sender/photo.png',
       h.rows[0].objectKey,
     );
+    const copiedKeys = h.upload.copyObjectToKey.mock.calls.map(
+      ([, key]) => key,
+    );
+    expect(new Set(copiedKeys).size).toBe(2);
+    expect(h.upload.deleteObjectByKey).toHaveBeenCalledTimes(1);
+    expect(h.upload.deleteObjectByKey).toHaveBeenCalledWith(
+      copiedKeys.find((key) => key !== h.rows[0].objectKey),
+    );
+    expect(h.upload.deleteObjectByKey).not.toHaveBeenCalledWith(
+      h.rows[0].objectKey,
+    );
+  });
+
+  it('rejects a full collection before copying or consuming upload allowance', async () => {
+    const h = harness();
+    h.stickers.count.mockResolvedValue(200);
+    const limit = jest.spyOn(h.uploadLimit, 'check');
+    await expect(
+      h.service.create('alice', { messageId: 'overflow' }),
+    ).rejects.toMatchObject({
+      response: { errorCode: 'STICKER_LIMIT_REACHED' },
+    });
+    expect(h.upload.copyObjectToKey).not.toHaveBeenCalled();
+    expect(limit).not.toHaveBeenCalled();
+  });
+
+  it('returns an existing chat sticker without copying or charging it again', async () => {
+    const h = harness();
+    const limit = jest.spyOn(h.uploadLimit, 'check');
+    const first = await h.service.create('alice', { messageId: 'm1' });
+    expect(await h.service.create('alice', { messageId: 'm1' })).toEqual(first);
+    expect(h.upload.copyObjectToKey).toHaveBeenCalledTimes(1);
+    expect(h.upload.headObject).toHaveBeenCalledTimes(1);
+    expect(limit).toHaveBeenCalledTimes(1);
+  });
+
+  it('charges chat sticker imports to the same byte budget as ordinary uploads before copying', async () => {
+    const h = harness();
+    h.upload.headObject.mockResolvedValue({
+      contentType: 'image/png',
+      size: 5 * 1024 * 1024,
+    });
+    const dto = {
+      filename: 'clip.mp4',
+      contentType: 'video/mp4',
+      sizeBytes: 100 * 1024 * 1024,
+      folder: 'chat',
+    } as const;
+    const req = { user: { userId: 'alice' } } as never;
+    for (let index = 0; index < 10; index += 1) {
+      await h.controller.presign(dto, req);
+    }
+    for (let index = 0; index < 4; index += 1) {
+      await h.service.create('alice', { messageId: `m${index}` });
+    }
+    await expect(
+      h.service.create('alice', { messageId: 'over-budget' }),
+    ).rejects.toMatchObject({ status: 429 });
+    await expect(
+      h.controller.presign({ ...dto, sizeBytes: 5 * 1024 * 1024 }, req),
+    ).rejects.toMatchObject({ status: 429 });
+    expect(h.upload.copyObjectToKey).toHaveBeenCalledTimes(4);
+    expect(h.rows).toHaveLength(4);
+  });
+
+  it.each([false, true])(
+    'compensates a failed sticker write and preserves its error when cleanup fails=%s',
+    async (cleanupFails) => {
+      const h = harness();
+      const writeError = new Error('database write failed');
+      const cleanupError = new Error('storage delete failed');
+      h.stickers.create.mockRejectedValueOnce(writeError);
+      if (cleanupFails)
+        h.upload.deleteObjectByKey.mockRejectedValueOnce(cleanupError);
+      const report = jest
+        .spyOn(errorAggregation, 'reportOperationalError')
+        .mockImplementation(() => undefined);
+      try {
+        await expect(
+          h.service.create('alice', { messageId: 'm1' }),
+        ).rejects.toBe(writeError);
+        expect(h.upload.deleteObjectByKey).toHaveBeenCalledWith(
+          h.upload.copyObjectToKey.mock.calls[0][1],
+        );
+        expect(h.rows).toHaveLength(0);
+        if (cleanupFails) {
+          expect(report).toHaveBeenCalledWith(cleanupError, {
+            component: 'StickerService',
+            operation: 'cleanupCopiedSticker',
+          });
+        }
+      } finally {
+        report.mockRestore();
+      }
+    },
+  );
+
+  it('does not delete an existing album upload when its sticker write fails', async () => {
+    const h = harness();
+    const writeError = new Error('database write failed');
+    h.stickers.create.mockRejectedValueOnce(writeError);
+    await expect(
+      h.service.create('alice', { objectKey: 'stickers/alice/a.png' }),
+    ).rejects.toBe(writeError);
+    expect(h.upload.copyObjectToKey).not.toHaveBeenCalled();
+    expect(h.upload.deleteObjectByKey).not.toHaveBeenCalled();
   });
 
   it('enforces source-message visibility and burning-message denial', async () => {

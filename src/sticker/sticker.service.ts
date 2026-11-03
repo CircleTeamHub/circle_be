@@ -4,12 +4,13 @@ import {
   Injectable,
   NotFoundException,
 } from '@nestjs/common';
-import { createHash, randomUUID } from 'crypto';
+import { randomUUID } from 'crypto';
 import type { CustomSticker } from 'src/generated/prisma';
 import { PrismaService } from 'src/prisma/prisma.service';
 import { UploadService } from 'src/upload/upload.service';
 import { UploadLimitService } from 'src/upload/upload-limit.service';
 import { ChatService } from 'src/chat/chat.service';
+import { reportOperationalError } from 'src/logging/error-aggregation.service';
 import { CreateStickerDto } from './sticker.dto';
 
 const MAX_STICKERS = 200;
@@ -88,7 +89,7 @@ export class StickerService {
           .pop()
           ?.replace(/[^a-zA-Z0-9]/g, '')
           .slice(0, 12) || 'bin';
-      objectKey = `stickers/${userID}/${createHash('sha256').update(dto.messageId).digest('hex')}.${extension}`;
+      objectKey = `stickers/${userID}/${randomUUID()}.${extension}`;
       width = typeof content.width === 'number' ? content.width : null;
       height = typeof content.height === 'number' ? content.height : null;
     } else if (
@@ -108,6 +109,14 @@ export class StickerService {
       where: sourceWhere,
     });
     if (existing) return this.present(existing);
+    if (
+      (await this.prisma.customSticker.count({ where: { userID } })) >=
+      MAX_STICKERS
+    )
+      throw new BadRequestException({
+        message: 'Sticker limit reached',
+        errorCode: 'STICKER_LIMIT_REACHED',
+      });
     const metadata = await this.upload.headObject(sourceKey ?? objectKey);
     if (
       !IMAGE_TYPES.has(metadata.contentType) ||
@@ -118,30 +127,58 @@ export class StickerService {
         message: 'Sticker must be an image of at most 5 MiB',
         errorCode: 'STICKER_INVALID_IMAGE',
       });
-    if (sourceKey) await this.upload.copyObjectToKey(sourceKey, objectKey);
-    const row = await this.prisma.$transaction(async (tx) => {
-      const lock = `stickers:${userID}`;
-      await tx.$queryRaw`SELECT pg_advisory_xact_lock(hashtext(${lock}))::text`;
-      const duplicate = await tx.customSticker.findFirst({
-        where: sourceWhere,
-      });
-      if (duplicate) return duplicate;
-      if ((await tx.customSticker.count({ where: { userID } })) >= MAX_STICKERS)
-        throw new BadRequestException({
-          message: 'Sticker limit reached',
-          errorCode: 'STICKER_LIMIT_REACHED',
+    let copiedKey: string | undefined;
+    let row: CustomSticker;
+    try {
+      if (sourceKey) {
+        await this.uploadLimit.check(userID, metadata.size);
+        // Each attempt owns its copy, so a failed or duplicate write can remove
+        // it without deleting the object retained by a concurrent winner.
+        copiedKey = objectKey;
+        await this.upload.copyObjectToKey(sourceKey, copiedKey);
+      }
+      row = await this.prisma.$transaction(async (tx) => {
+        const lock = `stickers:${userID}`;
+        await tx.$queryRaw`SELECT pg_advisory_xact_lock(hashtext(${lock}))::text`;
+        const duplicate = await tx.customSticker.findFirst({
+          where: sourceWhere,
         });
-      return tx.customSticker.create({
-        data: {
-          userID,
-          objectKey,
-          width,
-          height,
-          sourceMessageID: dto.messageId ?? null,
-        },
+        if (duplicate) return duplicate;
+        if (
+          (await tx.customSticker.count({ where: { userID } })) >= MAX_STICKERS
+        )
+          throw new BadRequestException({
+            message: 'Sticker limit reached',
+            errorCode: 'STICKER_LIMIT_REACHED',
+          });
+        return tx.customSticker.create({
+          data: {
+            userID,
+            objectKey,
+            width,
+            height,
+            sourceMessageID: dto.messageId ?? null,
+          },
+        });
       });
-    });
+    } catch (error) {
+      if (copiedKey) await this.cleanupCopiedSticker(copiedKey);
+      throw error;
+    }
+    if (copiedKey && row.objectKey !== copiedKey)
+      await this.cleanupCopiedSticker(copiedKey);
     return this.present(row);
+  }
+
+  private async cleanupCopiedSticker(key: string): Promise<void> {
+    try {
+      await this.upload.deleteObjectByKey(key);
+    } catch (error) {
+      reportOperationalError(error, {
+        component: 'StickerService',
+        operation: 'cleanupCopiedSticker',
+      });
+    }
   }
 
   async remove(userID: string, id: string): Promise<void> {
