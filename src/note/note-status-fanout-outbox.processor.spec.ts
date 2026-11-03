@@ -78,11 +78,28 @@ const libraryPage = [
   { id: 'copy-note', ownerID: 'viewer-1' },
 ];
 
+const librarySummary = {
+  id: 'copy-note',
+  ownerId: 'viewer-1',
+  title: '北京租房攻略',
+  contentPreview: null,
+  cover: null,
+  imageCount: 0,
+  videoCount: 0,
+  hasText: false,
+  showcaseCount: 0,
+  hasLocation: false,
+};
+
 describe('NoteStatusFanoutOutboxProcessor', () => {
   const workStatusJob = () => pendingJob({ workStatusChanged: true });
 
   it('reminds library holders when the owner closes the source (打烊)', async () => {
-    const { prisma, processor, assistant } = createHarness(workStatusJob());
+    const { prisma, processor, assistant } = createHarness(
+      workStatusJob(),
+      undefined,
+      { ownedNoteSummary: jest.fn().mockResolvedValue(librarySummary) },
+    );
     prisma.note.findUnique.mockResolvedValue(
       sourceRow({ workStatus: 'CLOSED' }),
     );
@@ -99,7 +116,7 @@ describe('NoteStatusFanoutOutboxProcessor', () => {
         status: 'CLOSED',
         changedAt: '2026-10-29T12:00:00.000Z',
       },
-      null,
+      expect.objectContaining({ noteId: 'copy-note' }),
     );
   });
 
@@ -143,7 +160,11 @@ describe('NoteStatusFanoutOutboxProcessor', () => {
   });
 
   it('reminds library holders when the owner reopens the source (开业)', async () => {
-    const { prisma, processor, assistant } = createHarness(workStatusJob());
+    const { prisma, processor, assistant } = createHarness(
+      workStatusJob(),
+      undefined,
+      { ownedNoteSummary: jest.fn().mockResolvedValue(librarySummary) },
+    );
     prisma.note.findUnique.mockResolvedValue(sourceRow());
     prisma.note.findMany.mockResolvedValue(libraryPage);
 
@@ -152,7 +173,58 @@ describe('NoteStatusFanoutOutboxProcessor', () => {
     expect(assistant.sendNoteStatusAlert).toHaveBeenCalledWith(
       'viewer-1',
       expect.objectContaining({ status: 'WORKING' }),
-      null,
+      expect.objectContaining({ noteId: 'copy-note' }),
+    );
+  });
+
+  it('does not remind a former holder after their library copy was deleted', async () => {
+    const { prisma, processor, assistant, notes } =
+      createHarness(workStatusJob());
+    prisma.note.findUnique.mockResolvedValue(
+      sourceRow({ workStatus: 'CLOSED' }),
+    );
+    prisma.note.findMany.mockResolvedValue(libraryPage);
+    notes.ownedNoteSummary.mockResolvedValue(null);
+
+    await processor.processPending();
+
+    expect(notes.ownedNoteSummary).toHaveBeenCalledWith(
+      'viewer-1',
+      'copy-note',
+    );
+    expect(assistant.sendNoteStatusAlert).not.toHaveBeenCalled();
+  });
+
+  it('uses a live recollected copy when an older deleted copy sorts first', async () => {
+    const liveSummary = { ...librarySummary, id: 'copy-live' };
+    const { prisma, processor, assistant, notes } = createHarness(
+      workStatusJob(),
+      undefined,
+      { ownedNoteSummary: jest.fn().mockResolvedValue(liveSummary) },
+    );
+    prisma.note.findUnique.mockResolvedValue(
+      sourceRow({ workStatus: 'CLOSED' }),
+    );
+    prisma.note.findMany.mockResolvedValue([
+      { id: 'source-note', ownerID: 'owner-1', status: 'ACTIVE' },
+      { id: 'copy-deleted', ownerID: 'viewer-1', status: 'DELETED' },
+      { id: 'copy-live', ownerID: 'viewer-1', status: 'ACTIVE' },
+    ]);
+
+    await processor.processPending();
+
+    expect(notes.ownedNoteSummary).toHaveBeenCalledWith(
+      'viewer-1',
+      'copy-live',
+    );
+    expect(notes.ownedNoteSummary).not.toHaveBeenCalledWith(
+      'viewer-1',
+      'copy-deleted',
+    );
+    expect(assistant.sendNoteStatusAlert).toHaveBeenCalledWith(
+      'viewer-1',
+      expect.objectContaining({ status: 'CLOSED' }),
+      expect.objectContaining({ noteId: 'copy-live' }),
     );
   });
 
@@ -183,7 +255,11 @@ describe('NoteStatusFanoutOutboxProcessor', () => {
   });
 
   it('skips library holders who turned the reminder off', async () => {
-    const { prisma, processor, assistant } = createHarness(workStatusJob());
+    const { prisma, processor, assistant } = createHarness(
+      workStatusJob(),
+      undefined,
+      { ownedNoteSummary: jest.fn().mockResolvedValue(librarySummary) },
+    );
     prisma.note.findUnique.mockResolvedValue(
       sourceRow({ workStatus: 'CLOSED' }),
     );
@@ -209,7 +285,7 @@ describe('NoteStatusFanoutOutboxProcessor', () => {
     expect(assistant.sendNoteStatusAlert).toHaveBeenCalledWith(
       'viewer-1',
       expect.anything(),
-      null,
+      expect.objectContaining({ noteId: 'copy-note' }),
     );
   });
 
@@ -250,7 +326,7 @@ describe('NoteStatusFanoutOutboxProcessor', () => {
       },
       orderBy: { id: 'asc' },
       take: 101,
-      select: { id: true, ownerID: true },
+      select: { id: true, ownerID: true, status: true },
     });
     expect(realtime.broadcastNoteSourceStatusChanged).toHaveBeenCalledTimes(
       100,

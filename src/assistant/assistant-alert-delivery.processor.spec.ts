@@ -3,11 +3,15 @@ import { AssistantAlertDeliveryProcessor } from './assistant-alert-delivery.proc
 describe('AssistantAlertDeliveryProcessor', () => {
   it('claims a pending delivery, sends the assistant message, and marks it sent', async () => {
     const prisma = {
+      assistantSubscription: {
+        findFirst: jest.fn().mockResolvedValue({ id: 'subscription-1' }),
+      },
       assistantAlertDelivery: {
         findMany: jest.fn().mockResolvedValue([
           {
             id: 'delivery-1',
             userID: 'user-1',
+            subscriptionIDs: ['subscription-1'],
             dedupeKey: 'windnote-assistant:info:user-1:post-1:1',
             status: 'PENDING',
             attempts: 0,
@@ -53,6 +57,84 @@ describe('AssistantAlertDeliveryProcessor', () => {
           status: 'SENT',
           conversationID: 'conversation-1',
           messageID: 'message-1',
+        }),
+      }),
+    );
+  });
+
+  it('skips a delayed delivery when the recipient no longer has access to the source circle', async () => {
+    const prisma = {
+      assistantSubscription: {
+        findFirst: jest.fn().mockResolvedValue(null),
+      },
+      assistantAlertDelivery: {
+        findMany: jest.fn().mockResolvedValue([
+          {
+            id: 'delivery-1',
+            userID: 'user-1',
+            subscriptionIDs: ['subscription-1'],
+            dedupeKey: 'windnote-assistant:info:user-1:post-1:1',
+            status: 'PENDING',
+            attempts: 0,
+            lockedAt: null,
+            nextAttemptAt: new Date(),
+            payloadSnapshot: {
+              kind: 'info-alert',
+              alertKey: 'windnote-assistant:info:user-1:post-1:1',
+              sourceId: 'post-1',
+              title: '北京活动',
+              summary: '周末活动',
+              target: { route: 'plaza-post-detail', id: 'post-1' },
+            },
+          },
+        ]),
+        updateMany: jest
+          .fn()
+          .mockResolvedValueOnce({ count: 1 })
+          .mockResolvedValueOnce({ count: 1 }),
+      },
+    };
+    const assistant = {
+      sendInfoAlert: jest.fn(),
+    };
+    const processor = new AssistantAlertDeliveryProcessor(
+      prisma as never,
+      assistant as never,
+    );
+
+    await expect(processor.processPending()).resolves.toBe(1);
+
+    expect(prisma.assistantSubscription.findFirst).toHaveBeenCalledWith({
+      where: expect.objectContaining({
+        id: { in: ['subscription-1'] },
+        userID: 'user-1',
+        enabled: true,
+        sourceTypes: { has: 'PLAZA_POST' },
+        circle: expect.objectContaining({
+          deleted: false,
+          OR: [
+            { ownerID: 'user-1' },
+            {
+              members: {
+                some: { userID: 'user-1', status: 'ACTIVE' },
+              },
+            },
+          ],
+          postLinks: expect.objectContaining({
+            some: expect.objectContaining({ postID: 'post-1' }),
+          }),
+        }),
+      }),
+      select: { id: true },
+    });
+    expect(assistant.sendInfoAlert).not.toHaveBeenCalled();
+    expect(prisma.assistantAlertDelivery.updateMany).toHaveBeenNthCalledWith(
+      2,
+      expect.objectContaining({
+        data: expect.objectContaining({
+          status: 'SKIPPED',
+          lockedAt: null,
+          leaseToken: null,
         }),
       }),
     );
