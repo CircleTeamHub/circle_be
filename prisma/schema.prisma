@@ -1007,6 +1007,9 @@ model TrustedDevice {
   createdAt  DateTime  @default(now())
   lastSeenAt DateTime  @default(now())
   revokedAt  DateTime?
+  /// 老安卓安装的 deviceKey 来自随机 ID，重装后会换成 ANDROID_ID 推导的稳定 ID。
+  /// 续签时把稳定 ID 的 sha256 记在这里，重装后的同一台手机凭它免验证。
+  stableDeviceKey String?
   user       User      @relation(fields: [userId], references: [id], onDelete: Cascade)
 
   @@unique([userId, deviceKey])

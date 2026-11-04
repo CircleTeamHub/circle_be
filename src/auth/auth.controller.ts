@@ -47,7 +47,11 @@ import {
 } from './dto/login-security-code.dto';
 import { SingleDeviceLoginDto } from './dto/single-device-login.dto';
 import { LoginChallengeCodeDto } from './dto/login-challenge.dto';
-import { DeviceTrustService, hashDeviceId } from './device-trust.service';
+import {
+  DeviceTrustService,
+  hashDeviceId,
+  hashStableDeviceId,
+} from './device-trust.service';
 import { RefreshTokenService } from './refresh-token.service';
 import { SelfUserDto } from 'src/user/dto/public-user.dto';
 import { Serialize } from 'src/decorators/serialize.decorator';
@@ -75,6 +79,9 @@ function getSessionContext(req?: Request): SessionContext {
     userAgent: getHeaderValue(req.headers['user-agent']),
     // 客户端安全存储里的随机设备 ID，只以哈希形式进入服务端。
     deviceKey: hashDeviceId(getHeaderValue(req.headers['x-device-id'])),
+    stableDeviceKey: hashStableDeviceId(
+      getHeaderValue(req.headers['x-stable-device-id']),
+    ),
   };
 }
 
@@ -319,6 +326,12 @@ export class AuthController {
     name: 'x-device-name',
     required: false,
     description: 'Optional device name to update for the rotated session',
+  })
+  @ApiHeader({
+    name: 'x-stable-device-id',
+    required: false,
+    description:
+      'Android only: the ANDROID_ID-derived device id this install would use after a reinstall',
   })
   @ApiCreatedResponse({
     description: 'Token refreshed successfully',
