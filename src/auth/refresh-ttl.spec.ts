@@ -97,15 +97,26 @@ describe('RefreshTokenService TTL wiring (#84 #91)', () => {
 
   it('revoke() only attributes the session when a row was actually revoked (double-logout)', async () => {
     const config = { get: () => undefined } as unknown as ConfigService;
-    const revocation = { revokeSession: jest.fn(), revokeUser: jest.fn() };
+    const revocation = {
+      revokeSession: jest.fn(),
+      revokeUser: jest.fn(),
+      revokeScope: jest.fn().mockResolvedValue(true),
+    };
     let alreadyRevoked = false;
     const prisma = {
+      $transaction: jest.fn((callback) => callback(prisma)),
+      $executeRaw: jest.fn(),
+      sessionScopeGeneration: {
+        upsert: jest.fn().mockResolvedValue({ generation: 1 }),
+        updateMany: jest.fn(),
+      },
       refreshToken: {
         findUnique: jest.fn().mockResolvedValue({
           id: 'session-1',
           userId: 'admin-1',
           audience: 'ADMIN',
         }),
+        findFirst: jest.fn().mockResolvedValue({ familyId: 'family-1' }),
         updateMany: jest.fn(() =>
           // 第一次撤销 1 行；重放（超时重试/旧 token）撤销 0 行
           Promise.resolve({
@@ -136,14 +147,25 @@ describe('RefreshTokenService TTL wiring (#84 #91)', () => {
 
   it('revoke() ignores expired-but-never-revoked tokens (no phantom logout audit)', async () => {
     const config = { get: () => undefined } as unknown as ConfigService;
-    const revocation = { revokeSession: jest.fn(), revokeUser: jest.fn() };
+    const revocation = {
+      revokeSession: jest.fn(),
+      revokeUser: jest.fn(),
+      revokeScope: jest.fn().mockResolvedValue(true),
+    };
     const prisma = {
+      $transaction: jest.fn((callback) => callback(prisma)),
+      $executeRaw: jest.fn(),
+      sessionScopeGeneration: {
+        upsert: jest.fn().mockResolvedValue({ generation: 1 }),
+        updateMany: jest.fn(),
+      },
       refreshToken: {
         findUnique: jest.fn().mockResolvedValue({
           id: 'session-old',
           userId: 'admin-1',
           audience: 'ADMIN',
         }),
+        findFirst: jest.fn().mockResolvedValue({ familyId: 'family-old' }),
         // where 带 expiredAt > now：过期行匹配 0 条
         updateMany: jest.fn().mockResolvedValue({ count: 0 }),
       },

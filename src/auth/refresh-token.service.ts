@@ -889,7 +889,7 @@ export class RefreshTokenService {
   }
 
   /**
-   * 撤销单枚 refresh token。返回被撤销会话的归属（无匹配时 null），
+   * 撤销 refresh token 所在的会话族。返回实际结束了活跃会话的归属（否则 null），
    * 供调用方补审计日志（#90 —— admin 登出此前完全无痕）。
    */
   async revoke(token: string): Promise<{
@@ -898,35 +898,25 @@ export class RefreshTokenService {
     sessionId: string;
   } | null> {
     const tokenHash = hashToken(token);
-    // The row id is the session id carried in the access token's `sid` claim;
-    // fetch it so we can revoke the matching access token too (F-02), not just
-    // the refresh token.
+    // Resolve the immutable owner/id before taking the same account lock as
+    // rotation. Family revocation re-reads the row under that lock.
     const existing = await this.prisma.refreshToken.findUnique({
       where: { token: tokenHash },
       select: { id: true, userId: true, audience: true },
     });
-    const revoked = await this.prisma.refreshToken.updateMany({
-      // review 修复（round 2）：过期未撤销的行同样不算「真撤销」——旧 ADMIN
-      // refresh token 过期后被拿来「登出」，不该再记一条成功审计（会话早已
-      // 自然死亡，什么都没被结束）。
-      where: {
-        token: tokenHash,
-        revokedAt: null,
-        expiredAt: { gt: new Date() },
-      },
-      data: {
-        revokedAt: new Date(),
-        revocationReason: RefreshTokenRevocationReason.LOGOUT,
-      },
-    });
+    if (!existing) return null;
+    const revoked = await this.revokeSessionFamily(
+      existing.userId,
+      existing.id,
+      RefreshTokenRevocationReason.LOGOUT,
+    );
     // round 3 review：refresh TTL 可配得比 access TTL 短 —— 行过期不代表
     // 对应 access token 已死。只要行存在就写会话吊销标记（幂等且便宜），
     // 让登出语义对 access token 始终成立；归属/审计仍只在真撤销时返回。
-    if (existing) {
-      await this.revocation.revokeSession(existing.id);
-    }
-    // token 已被撤销过 / 已过期（updateMany 0 行）时不返回归属。
-    if (existing && revoked.count > 0) {
+    await this.revocation.revokeSession(existing.id);
+    // A rotated/expired ancestor may still end a live descendant. Attribute that
+    // logout once; repeated logout and an entirely expired family remain no-ops.
+    if (revoked) {
       return {
         userId: existing.userId,
         audience: existing.audience as RefreshTokenAudience,
@@ -1036,8 +1026,15 @@ export class RefreshTokenService {
     }
   }
 
-  async revokeSessionFamily(userId: string, sessionId: string): Promise<void> {
-    const scopeRevocation = await this.prisma.$transaction(async (tx) => {
+  /** Returns whether this call newly revoked a refresh row (for logout audit). */
+  async revokeSessionFamily(
+    userId: string,
+    sessionId: string,
+    reason:
+      | typeof RefreshTokenRevocationReason.SESSION_REVOKED
+      | typeof RefreshTokenRevocationReason.LOGOUT = RefreshTokenRevocationReason.SESSION_REVOKED,
+  ): Promise<boolean> {
+    const result = await this.prisma.$transaction(async (tx) => {
       const lockKey = `auth-user:${userId}`;
       await tx.$executeRaw`SELECT pg_advisory_xact_lock(hashtext(${lockKey}))`;
       const session = await tx.refreshToken.findFirst({
@@ -1054,24 +1051,34 @@ export class RefreshTokenService {
         SessionRevocationScope.FAMILY,
         session.familyId,
       );
-      await tx.refreshToken.updateMany({
-        where: { ...target, revokedAt: null },
+      const revoked = await tx.refreshToken.updateMany({
+        where: {
+          ...target,
+          revokedAt: null,
+          ...(reason === RefreshTokenRevocationReason.LOGOUT
+            ? { expiredAt: { gt: now } }
+            : {}),
+        },
         data: {
           revokedAt: now,
-          revocationReason: RefreshTokenRevocationReason.SESSION_REVOKED,
+          revocationReason: reason,
         },
       });
       return {
-        userId,
-        scope: SessionRevocationScope.FAMILY,
-        scopeKey: session.familyId,
-        exemptFamilyId: null,
-        generation: scopeState.generation,
+        revoked: revoked.count > 0,
+        scopeRevocation: {
+          userId,
+          scope: SessionRevocationScope.FAMILY,
+          scopeKey: session.familyId,
+          exemptFamilyId: null,
+          generation: scopeState.generation,
+        },
       };
     });
-    if (scopeRevocation) {
-      await this.notifyScopeRevocationBestEffort(scopeRevocation);
+    if (result) {
+      await this.notifyScopeRevocationBestEffort(result.scopeRevocation);
     }
+    return result?.revoked ?? false;
   }
 
   /** 撤销绑定到某台设备的全部会话（设备管理里移除设备时用）。 */
