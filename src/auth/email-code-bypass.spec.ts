@@ -61,6 +61,18 @@ describe('describeEmailCodeBypass', () => {
     ).toEqual({ status: 'non-production', identities: 0 });
   });
 
+  it('reports the explicitly configured preproduction bypass as non-production', () => {
+    const env = {
+      NODE_ENV: 'production',
+      APP_DEPLOY_ENV: 'preproduction',
+      EMAIL_CODE_DEV_BYPASS: '999999',
+    };
+    expect(describeEmailCodeBypass(env)).toEqual({
+      status: 'non-production',
+      identities: 0,
+    });
+  });
+
   it('reports off in production without the second opt-in', () => {
     expect(
       describeEmailCodeBypass({
@@ -113,6 +125,62 @@ describe('resolveEmailBypassCode', () => {
       );
     }
   });
+
+  it('accepts the configured code for every email and purpose in explicit preproduction', () => {
+    const env = {
+      NODE_ENV: 'production',
+      APP_DEPLOY_ENV: 'preproduction',
+      EMAIL_CODE_DEV_BYPASS: '999999',
+    };
+
+    for (const email of ['one@example.com', 'two@example.com']) {
+      for (const purpose of ['REGISTER', 'LOGIN', 'RESET_PASSWORD']) {
+        expect(resolveEmailBypassCode(email, purpose, env)).toBe('999999');
+      }
+    }
+  });
+
+  it.each([undefined, '', 'off'])(
+    'does not invent a preproduction code when configured as %s',
+    (code) => {
+      const env = {
+        NODE_ENV: 'production',
+        APP_DEPLOY_ENV: 'preproduction',
+        EMAIL_CODE_DEV_BYPASS: code,
+      };
+      expect(
+        resolveEmailBypassCode('anyone@example.com', 'LOGIN', env),
+      ).toBeNull();
+      expect(describeEmailCodeBypass(env).status).toBe('off');
+    },
+  );
+
+  it.each([
+    ['production', undefined],
+    ['production', 'production'],
+    ['production', 'preprod'],
+    ['production', 'PREPRODUCTION'],
+    ['production', ' preproduction '],
+    [undefined, 'preproduction'],
+    ['test', 'preproduction'],
+    ['staging', 'preproduction'],
+  ])(
+    'refuses the short code for NODE_ENV=%s and APP_DEPLOY_ENV=%s',
+    (nodeEnv, deployEnv) => {
+      const env = {
+        NODE_ENV: nodeEnv,
+        APP_DEPLOY_ENV: deployEnv,
+        EMAIL_CODE_DEV_BYPASS: '999999',
+        EMAIL_CODE_ALLOW_PRODUCTION_BYPASS: 'true',
+        EMAIL_CODE_PRODUCTION_BYPASS_ALLOWLIST: 'LOGIN:anyone@example.com',
+      };
+
+      expect(
+        resolveEmailBypassCode('anyone@example.com', 'LOGIN', env),
+      ).toBeNull();
+      expect(describeEmailCodeBypass(env).status).toBe('misconfigured');
+    },
+  );
 
   it('bypasses every purpose in a jest process, which is how the e2e suite registers', () => {
     // e2e 把 Nest 应用起在 jest 进程里，CI 的 E2E 任务就靠固定码注册。

@@ -63,6 +63,40 @@ describe('createEnvValidationSchema', () => {
     expect(error).toBeUndefined();
   });
 
+  it('accepts a configured short code for a production runtime explicitly marked preproduction', () => {
+    const env = {
+      ...productionBypassEnv,
+      APP_DEPLOY_ENV: 'preproduction',
+      EMAIL_CODE_DEV_BYPASS: '999999',
+      EMAIL_CODE_ALLOW_PRODUCTION_BYPASS: undefined,
+      EMAIL_CODE_PRODUCTION_BYPASS_ALLOWLIST: undefined,
+    };
+
+    const { error, value } = createEnvValidationSchema(env).validate(env);
+
+    expect(error).toBeUndefined();
+    expect(value.APP_DEPLOY_ENV).toBe('preproduction');
+  });
+
+  it('defaults the deployment stage to production', () => {
+    const env = { ...productionBypassEnv };
+    const { error, value } = createEnvValidationSchema(env).validate(env);
+
+    expect(error).toBeUndefined();
+    expect(value.APP_DEPLOY_ENV).toBe('production');
+  });
+
+  it.each(['preprod', 'staging', 'PREPRODUCTION', ' preproduction ', ''])(
+    'rejects a misconfigured deployment stage %s',
+    (deployEnv) => {
+      const env = { ...productionBypassEnv, APP_DEPLOY_ENV: deployEnv };
+
+      const { error } = createEnvValidationSchema(env).validate(env);
+
+      expect(error?.message).toContain('APP_DEPLOY_ENV');
+    },
+  );
+
   it('requires DATABASE_URL by default', () => {
     const { error } = createEnvValidationSchema({
       ...baseEnv,

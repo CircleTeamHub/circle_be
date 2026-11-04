@@ -158,6 +158,50 @@ describe('EmailVerificationService', () => {
     expect(codes[0].codeHash).not.toMatch(/^\d{6}$/); // hashed, not plaintext
   });
 
+  it.each(['REGISTER', 'LOGIN', 'RESET_PASSWORD'] as const)(
+    'accepts the configured preproduction code for %s without an email request',
+    async (purpose) => {
+      await withProcessEnv(
+        {
+          NODE_ENV: 'production',
+          APP_DEPLOY_ENV: 'preproduction',
+          EMAIL_CODE_DEV_BYPASS: '999999',
+          EMAIL_CODE_ALLOW_PRODUCTION_BYPASS: undefined,
+          EMAIL_CODE_PRODUCTION_BYPASS_ALLOWLIST: undefined,
+        },
+        async () => {
+          await expect(
+            service.verifyCode('test-only@example.com', purpose, '999999'),
+          ).resolves.toBe(true);
+          expect(
+            mockPrisma.emailVerificationCode.findFirst,
+          ).not.toHaveBeenCalled();
+          expect(mailer.sendVerificationCode).not.toHaveBeenCalled();
+        },
+      );
+    },
+  );
+
+  it.each([undefined, 'production', 'preprod'])(
+    'rejects the short code in the real production runtime with deployment stage %s',
+    async (deployEnv) => {
+      await withProcessEnv(
+        {
+          NODE_ENV: 'production',
+          APP_DEPLOY_ENV: deployEnv,
+          EMAIL_CODE_DEV_BYPASS: '999999',
+          EMAIL_CODE_ALLOW_PRODUCTION_BYPASS: 'true',
+          EMAIL_CODE_PRODUCTION_BYPASS_ALLOWLIST: 'LOGIN:test-only@example.com',
+        },
+        async () => {
+          await expect(
+            service.verifyCode('test-only@example.com', 'LOGIN', '999999'),
+          ).resolves.toBe(false);
+        },
+      );
+    },
+  );
+
   it('requestCode(register) is silent for an already-registered email (F-07 anti-enumeration)', async () => {
     usersByEmail.add('a@b.com');
     // Must not reveal that the email is taken: no error, no code sent/stored.

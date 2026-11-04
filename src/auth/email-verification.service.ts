@@ -107,7 +107,7 @@ export class EmailVerificationService implements OnModuleInit {
     }
     if (bypass.status === 'non-production') {
       this.logger.warn(
-        '[DEV] a fixed email verification code is enabled for every purpose in this non-production environment',
+        'A fixed email verification code is enabled for every purpose in this non-production environment',
       );
     }
   }
@@ -269,9 +269,7 @@ export class EmailVerificationService implements OnModuleInit {
     // 显式开启时，固定码可直接通过（无需先请求验证码）。
     const bypass = resolveEmailBypassCode(email, purpose);
     if (bypass && code === bypass) {
-      this.logger.warn(
-        `[DEV] email code bypass used (${purpose}) — disable in production`,
-      );
+      this.logger.warn(`Fixed email verification bypass used (${purpose})`);
       return true;
     }
 

@@ -16,6 +16,7 @@ function setup(boundKey: string | null) {
     {} as never,
     deviceTrust as never,
     refreshTokens as never,
+    {} as never,
   );
   const req = {
     user: { userId: 'u1', sessionId: 's1' },
@@ -65,6 +66,7 @@ describe('login challenge approver identity', () => {
       authService as never,
       {} as never,
       {} as never,
+      {} as never,
     );
     await controller.login(
       { identifier: 'a@b.c', password: 'secret12' } as never,
@@ -78,6 +80,36 @@ describe('login challenge approver identity', () => {
       expect.objectContaining({
         ip: '203.0.113.9',
         deviceKey: createHash('sha256').update(RAW_DEVICE_ID).digest('hex'),
+      }),
+    );
+  });
+});
+
+describe('refresh session context', () => {
+  it('passes the hashed stable Android id along with the device id', async () => {
+    const authService = { refresh: jest.fn().mockResolvedValue({}) };
+    const controller = new AuthController(
+      authService as never,
+      {} as never,
+      {} as never,
+      {} as never,
+    );
+    const stable = `a1-${'ab'.repeat(32)}`;
+    const sha = (raw: string) => createHash('sha256').update(raw).digest('hex');
+
+    await controller.refresh(
+      { refreshToken: 'rt' } as never,
+      {
+        headers: { 'x-device-id': RAW_DEVICE_ID, 'x-stable-device-id': stable },
+        ip: '127.0.0.1',
+      } as never,
+    );
+
+    expect(authService.refresh).toHaveBeenCalledWith(
+      'rt',
+      expect.objectContaining({
+        deviceKey: sha(RAW_DEVICE_ID),
+        stableDeviceKey: sha(stable),
       }),
     );
   });

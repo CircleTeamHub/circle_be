@@ -71,6 +71,8 @@ export type SessionContext = {
   userAgent?: string | null;
   /** sha256(x-device-id)；绑定会话与受信任设备。 */
   deviceKey?: string | null;
+  /** sha256(x-stable-device-id)：老安卓安装重装后会用的设备 ID，只在续签时登记。 */
+  stableDeviceKey?: string | null;
 };
 
 export type RefreshTokenAudience = 'APP' | 'ADMIN';

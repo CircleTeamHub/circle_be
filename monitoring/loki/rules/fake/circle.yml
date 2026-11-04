@@ -61,17 +61,18 @@ groups:
   - name: circle-security-logs
     interval: 1m
     rules:
-      # 安全码、新设备验证码连续输错：一个人记错只会是零星几次，持续成批出现像是
-      # 在猜码（撞库拿到密码之后的第二道门）。for 比窗口长，一阵手滑撑不满。
+      # 安全码、新设备验证码、密保答案连续输错（含额度用完后还在试）：一个人记错只会
+      # 是零星几次，持续成批出现像是在猜码（撞库拿到密码之后的第二道门）。for 比窗口
+      # 长，一阵手滑撑不满。
       - alert: SecurityCodeGuessing
         expr: |
-          sum(count_over_time({service="circle-be"} |= "security_event" | json | securityEvent=~"security_code_invalid|login_challenge_code_invalid" [5m])) > 20
+          sum(count_over_time({service="circle-be"} |= "security_event" | json | securityEvent=~"security_code_invalid|login_challenge_code_invalid|login_challenge_security_answers_invalid|login_challenge_security_code_budget_exhausted" [5m])) > 20
         for: 10m
         labels:
           severity: warning
         annotations:
           runbook_url: https://github.com/CircleTeamHub/circle_be/blob/main/docs/runbooks/alerts.md#securitycodeguessing
-          summary: 'Over 20 wrong security / login-challenge codes per 5m for 10m — someone may be guessing codes'
+          summary: 'Over 20 wrong security codes / login-challenge codes / security answers per 5m for 10m — someone may be guessing'
 
       # 锁定是 5 次输错之后的结果。30 分钟里好几个账号被锁，比单个账号的反复输错
       # 更像撞库；单个用户记不住安全码不会到这个量。

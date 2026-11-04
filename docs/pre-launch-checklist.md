@@ -142,9 +142,23 @@ program 未启用期间,一个 `maxMembers` 落在 **401–3000** 的建圈请�
 
 ## 4. 预生产测试窗口结束后,固定验证码旁路必须确认关闭
 
+隔离的预生产部署保持 `NODE_ENV=production`, 显式设置
+`APP_DEPLOY_ENV=preproduction` 和 `EMAIL_CODE_DEV_BYPASS=999999`。
+这时固定码对任意邮箱的 `REGISTER`、`LOGIN`、`RESET_PASSWORD` 都有效,
+不需要生产旁路开关或允许名单。开发环境仍可用
+`NODE_ENV=development` + `EMAIL_CODE_DEV_BYPASS=999999`。
+未配置固定码(或设为空/`off`)时不会出现默认万能码。
+
+可以在前端「忘记密码」页直接填写固定码并提交, 不必先点发送验证码。
+发送邮件的 SMTP 检查保持不变: 预生产也用 `NODE_ENV=production`,
+未配置 SMTP 时发送接口仍返回 503。预生产必须使用独立测试账号和数据,
+不能把真实生产部署标成预生产。`APP_DEPLOY_ENV` 默认是 `production`,
+只接受 `production` / `preproduction`, 拼错会在启动时拒绝。
+
 **当前**:预生产窗口内可控开启。**上线后**:P0 —— 允许名单里的每个 `LOGIN` 条目
 都等于那个账号可以免密登录。
 
+真实生产(`APP_DEPLOY_ENV=production` 或未设置)保留原有受限机制:
 `EMAIL_CODE_DEV_BYPASS` + `EMAIL_CODE_ALLOW_PRODUCTION_BYPASS=true` +
 `EMAIL_CODE_PRODUCTION_BYPASS_ALLOWLIST` 三者齐备时,允许名单里的
 `(用途, 邮箱)` 只要提交那个固定码就通过验证,**不需要请求验证码、不需要密码**。
@@ -156,6 +170,7 @@ program 未启用期间,一个 `maxMembers` 落在 **401–3000** 的建圈请�
 
 **上线前逐条确认:**
 
+- [ ] 真实生产的 `APP_DEPLOY_ENV` 为 `production` 或未设置。
 - [ ] 生产 `.env.production` 里三个 `EMAIL_CODE_*` 全部删除(不是设成空字符串)。
 - [ ] 启动日志中**没有** `event=production_email_bypass_active` 结构化事件。
 - [ ] `circle_email_code_bypass_active` 为 `0`,且 `EmailCodeBypassActive` 告警未触发。

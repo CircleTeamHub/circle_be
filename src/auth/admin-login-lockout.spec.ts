@@ -77,6 +77,7 @@ function buildService(user: UserRow | null) {
     {
       evaluateLogin: jest.fn().mockResolvedValue({ kind: 'trusted' }),
     } as never,
+    {} as never,
   );
   return { service, prisma, updates, updateManyCalls, counter, jwt };
 }
