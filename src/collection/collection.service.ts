@@ -39,12 +39,30 @@ export class CollectionService {
     });
   }
 
-  list(userId: string, type?: CollectionType): Promise<UserCollectionDto[]> {
-    return this.prisma.userCollection.findMany({
+  async list(
+    userId: string,
+    type?: CollectionType,
+  ): Promise<UserCollectionDto[]> {
+    const collections = await this.prisma.userCollection.findMany({
       where: { userID: userId, ...(type ? { type } : {}) },
       orderBy: { createdAt: 'desc' },
       take: 100,
     });
+    const sources = collections.map((collection) => {
+      const payload = collection.payload as Record<string, unknown> | null;
+      return collection.type !== CollectionType.NOTE ||
+        payload?.kind === 'openim-message'
+        ? collection.sourceID
+        : null;
+    });
+    const messageIds = [...new Set(sources.filter((id): id is string => !!id))];
+    const messages = messageIds.length
+      ? await this.chat.resolveCollectionMessages(userId, messageIds)
+      : new Map();
+    return collections.map((collection, index) => ({
+      ...collection,
+      message: messages.get(sources[index]) ?? null,
+    }));
   }
 
   /**
@@ -181,10 +199,21 @@ export class CollectionService {
       // 临时地址(存下来必然过期),能长期指回这张图的只有 key。
       const image: Record<string, unknown> = {};
       if (typeof content['key'] === 'string') image.key = content['key'];
+      if (typeof content['thumbKey'] === 'string')
+        image.thumbKey = content['thumbKey'];
       if (typeof content['width'] === 'number') image.width = content['width'];
       if (typeof content['height'] === 'number')
         image.height = content['height'];
       payload.image = image;
+    } else if (row.type === 'video') {
+      const video: Record<string, unknown> = {};
+      for (const field of ['key', 'thumbKey']) {
+        if (typeof content[field] === 'string') video[field] = content[field];
+      }
+      for (const field of ['width', 'height', 'duration', 'size']) {
+        if (typeof content[field] === 'number') video[field] = content[field];
+      }
+      payload.video = video;
     } else if (row.type === 'voice') {
       // 语音 content 只有 {key,duration}(url 同样是读时现签)。此前这里还从
       // content.size 映射 dataSize —— 语音消息从来没有这个字段,是条死分支。

@@ -1087,15 +1087,105 @@ export class ChatService {
       row.conversationID,
       userId,
     );
-    const viewer = NO_VIEWER_RETENTION;
-    const retention = buildChatRetentionWindow(conversation, viewer);
-    if (
-      row.height <= (member.clearedBeforeHeight ?? 0) ||
-      !isChatMessageVisible(row.createdAt, retention, row.burnExpiresAt)
-    ) {
+    if (!this.isMessageVisible(row, conversation, member)) {
       throw this.messageNotFound();
     }
     return { row, conversation, member };
+  }
+
+  private isMessageVisible(
+    row: MessageRow,
+    conversation: ChatConversation,
+    member: ChatMember,
+  ): boolean {
+    const floor = Math.max(
+      member.clearedBeforeHeight ?? 0,
+      conversation.clearedBeforeHeight ?? 0,
+    );
+    return (
+      !row.deleted &&
+      !row.revokedAt &&
+      row.height > floor &&
+      isChatMessageVisible(
+        row.createdAt,
+        buildChatRetentionWindow(conversation, NO_VIEWER_RETENTION),
+        row.burnExpiresAt,
+      )
+    );
+  }
+
+  /**
+   * 收藏读时从源消息重建 DTO,只给当前仍可访问且允许收藏的内容签媒体 URL。
+   * 按集合取消息和座位,不信收藏快照里的对象 key,也不逐条查询来源。
+   * 不可访问的来源缺省;数据库故障仍向上传递,不能伪装成权限拒绝。
+   */
+  async resolveCollectionMessages(
+    userId: string,
+    messageIds: string[],
+  ): Promise<Map<string, ChatMessageDto>> {
+    if (messageIds.length === 0) return new Map();
+    const rows = await this.prisma.chatMessage.findMany({
+      where: { id: { in: [...new Set(messageIds)] } },
+      omit: MESSAGE_READ_OMIT,
+    });
+    if (rows.length === 0) return new Map();
+    const memberships = await this.prisma.chatMember.findMany({
+      where: {
+        userID: userId,
+        leftAt: null,
+        conversationID: {
+          in: [...new Set(rows.map((row) => row.conversationID))],
+        },
+      },
+      include: { conversation: true },
+    });
+    const byConversation = new Map(
+      memberships.map((member) => [member.conversationID, member]),
+    );
+    const visible = rows.filter((row) => {
+      const member = byConversation.get(row.conversationID);
+      if (
+        !member ||
+        member.leftAt ||
+        !this.isMessageVisible(row, member.conversation, member)
+      )
+        return false;
+      // 同创建收藏的规则:不能把别人阅后即焚的消息变成可保存/转发的收藏。
+      return (
+        row.senderID === userId ||
+        ((row.burnDurationSec ?? 0) <= 0 && !row.burnExpiresAt)
+      );
+    });
+    if (visible.length === 0) return new Map();
+    const [senders, aliases] = await Promise.all([
+      this.resolveSenders(
+        visible
+          .map((row) => row.senderID)
+          .filter((id): id is string => id !== null),
+        null,
+      ),
+      loadSeatAliases(this.prisma, senderSeatRefs(visible)),
+    ]);
+    const messages = visible.map((row) =>
+      this.toMessageDto(
+        row,
+        this.senderFor(row, senders, aliases),
+        byConversation.get(row.conversationID)!.conversation,
+        userId,
+      ),
+    );
+    const heightFloors = new Map(
+      memberships.map((member) => [
+        member.conversationID,
+        Math.max(
+          member.clearedBeforeHeight ?? 0,
+          member.conversation.clearedBeforeHeight ?? 0,
+        ),
+      ]),
+    );
+    await this.attachReplyTo(messages, { heightFloors });
+    await this.media.attachMediaUrls(messages);
+    return new Map(messages.map((message) => [message.id, message]));
   }
 
   private messageNotFound(): NotFoundException {
