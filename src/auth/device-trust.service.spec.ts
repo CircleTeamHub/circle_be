@@ -330,7 +330,9 @@ describe('hashStableDeviceId', () => {
   it('only accepts the ANDROID_ID-derived format and hashes it like a device id', () => {
     const stable = `a1-${'0f'.repeat(32)}`;
     expect(hashStableDeviceId(stable)).toBe(hashDeviceId(stable));
-    expect(hashStableDeviceId('a1b2c3d4-e5f6-4a7b-8c9d-0e1f2a3b4c5d')).toBeNull();
+    expect(
+      hashStableDeviceId('a1b2c3d4-e5f6-4a7b-8c9d-0e1f2a3b4c5d'),
+    ).toBeNull();
     expect(hashStableDeviceId(`a1-${'0F'.repeat(32)}`)).toBeNull();
     expect(hashStableDeviceId(`a1-${'0f'.repeat(31)}`)).toBeNull();
     expect(hashStableDeviceId(undefined)).toBeNull();
@@ -367,7 +369,10 @@ describe('DeviceTrustService stable Android id alias', () => {
       stableDeviceKey: 'stable',
     });
     expect(trusted).toEqual([
-      expect.objectContaining({ deviceKey: 'legacy', stableDeviceKey: 'stable' }),
+      expect.objectContaining({
+        deviceKey: 'legacy',
+        stableDeviceKey: 'stable',
+      }),
     ]);
   });
 

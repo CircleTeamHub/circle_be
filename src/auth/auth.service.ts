@@ -40,6 +40,7 @@ import {
 } from './refresh-token.service';
 import { accessTokenTtlSeconds } from './session-revocation.service';
 import { DeviceTrustService, LoginChallengeView } from './device-trust.service';
+import { SecurityQuestionsService } from './security-questions.service';
 import { ConfigService } from '@nestjs/config';
 import { createLoggingConfig } from 'src/logging/logging.config';
 import { logBusinessEvent } from 'src/logging/business-event.logger';
@@ -159,6 +160,7 @@ export class AuthService {
     private fancyNumberService: FancyNumberService,
     private avatarFrames: AvatarFrameService,
     private deviceTrust: DeviceTrustService,
+    private securityQuestions: SecurityQuestionsService,
   ) {
     this.referralRules = readReferralRules(configService);
   }
@@ -535,6 +537,70 @@ export class AuthService {
         throw new ForbiddenException({
           message: '安全码错误',
           errorCode: AuthErrorCode.SecurityCodeInvalid,
+        });
+      }
+      return this.finishChallengeLogin(
+        challenge.userId,
+        challenge.id,
+        challenge.deviceKey,
+        sessionContext,
+      );
+    });
+  }
+
+  /** 新设备：这个账号设置的密保问题（只给发起这张验证单的设备看）。 */
+  async loginChallengeSecurityQuestions(
+    challengeId: string,
+    deviceKey: string | null,
+  ) {
+    const challenge = await this.deviceTrust.loadForSecurityCode(
+      challengeId,
+      deviceKey,
+    );
+    return {
+      questionKeys: await this.securityQuestions.questionKeys(challenge.userId),
+    };
+  }
+
+  /**
+   * 新设备：受信任设备不在身边时回答密保问题。与安全码兜底同一套约束：共用验证单的
+   * 次数上限和账号每日额度，通过后照常提醒其他设备「新设备已登录」。
+   */
+  async verifyLoginChallengeSecurityQuestions(
+    challengeId: string,
+    answers: string[],
+    sessionContext: SessionContext,
+  ) {
+    const challenge = await this.deviceTrust.loadForSecurityCode(
+      challengeId,
+      sessionContext.deviceKey ?? null,
+    );
+    return this.withAccountAuthLock(challenge.userId, async () => {
+      const questionKeys = await this.securityQuestions.questionKeys(
+        challenge.userId,
+      );
+      if (questionKeys.length === 0) {
+        throw new ForbiddenException({
+          message: '未设置密保问题，请在受信任设备上确认登录',
+          errorCode: AuthErrorCode.SecurityQuestionsNotSet,
+        });
+      }
+      const ok = await this.deviceTrust.verifySecurityCodeFallback(
+        challenge.id,
+        sessionContext.deviceKey ?? null,
+        () => this.securityQuestions.verifyAnswers(challenge.userId, answers),
+      );
+      if (!ok) {
+        logSecurityEvent(this.logger, {
+          enabled: this.loggingConfig.securityLogOn,
+          securityEvent: 'login_challenge_security_answers_invalid',
+          statusCode: 403,
+          userId: challenge.userId,
+          metadata: { challengeId: challenge.id },
+        });
+        throw new ForbiddenException({
+          message: '密保答案不正确',
+          errorCode: AuthErrorCode.SecurityAnswersInvalid,
         });
       }
       return this.finishChallengeLogin(

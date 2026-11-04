@@ -19,6 +19,7 @@ import { FancyNumberModule } from 'src/fancy-number/fancy-number.module';
 import { AvatarFrameModule } from 'src/avatar-frame/avatar-frame.module';
 import { RealtimeModule } from 'src/realtime/realtime.module';
 import { DeviceTrustService } from './device-trust.service';
+import { SecurityQuestionsService } from './security-questions.service';
 
 @Global()
 @Module({
@@ -46,6 +47,7 @@ import { DeviceTrustService } from './device-trust.service';
     AuthService,
     RefreshTokenService,
     DeviceTrustService,
+    SecurityQuestionsService,
     RefreshTokenCleanup,
     SessionRevocationService,
     SessionVerifier,

@@ -457,6 +457,7 @@ model User {
   refreshTokens                     RefreshToken[]
   sessionScopeGenerations           SessionScopeGeneration[]
   trustedDevices                    TrustedDevice[]
+  securityQuestions                 UserSecurityQuestion[]
   loginChallenges                   LoginChallenge[]
   qrLoginApprovals                  QrLoginSession[]            @relation("qrLoginApprover")
   invitedBy                         User?                       @relation("UserInvitations", fields: [invitedByUserId], references: [id], onDelete: SetNull)
@@ -998,22 +999,37 @@ model SessionScopeGeneration {
 /// 移除 / 退出其他设备才撤销 —— 否则用户在所有设备上退出一遍，信任清空，
 /// 拿到密码的人就能当成「首台设备」直接进来。
 model TrustedDevice {
-  id         String    @id @default(uuid())
-  userId     String
+  id              String    @id @default(uuid())
+  userId          String
   /// sha256(客户端随机设备 ID)，原值只存在设备的安全存储里。
-  deviceKey  String
-  deviceName String?
-  lastIp     String?
-  createdAt  DateTime  @default(now())
-  lastSeenAt DateTime  @default(now())
-  revokedAt  DateTime?
+  deviceKey       String
+  deviceName      String?
+  lastIp          String?
+  createdAt       DateTime  @default(now())
+  lastSeenAt      DateTime  @default(now())
+  revokedAt       DateTime?
   /// 老安卓安装的 deviceKey 来自随机 ID，重装后会换成 ANDROID_ID 推导的稳定 ID。
   /// 续签时把稳定 ID 的 sha256 记在这里，重装后的同一台手机凭它免验证。
   stableDeviceKey String?
-  user       User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  user            User      @relation(fields: [userId], references: [id], onDelete: Cascade)
 
   @@unique([userId, deviceKey])
   @@index([userId, revokedAt])
+}
+
+/// 密保问题：陌生设备登录时受信任设备都不在身边的兜底。答案只存 argon2 哈希
+/// （规范化后），问题用前后端共享的 key 表示。
+model UserSecurityQuestion {
+  id          String   @id @default(uuid())
+  userId      String
+  questionKey String
+  answerHash  String
+  /// 设置顺序，验证时按这个顺序核对答案。
+  position    Int
+  createdAt   DateTime @default(now())
+  user        User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([userId, position])
 }
 
 enum LoginChallengeStatus {

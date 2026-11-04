@@ -1096,10 +1096,10 @@ ORDER BY 2 DESC LIMIT 10;
 
 ### SecurityCodeGuessing
 
-**含义**：（warning）每 5 分钟超过 20 次输错安全码或新设备验证码（`security_code_invalid` / `login_challenge_code_invalid`），持续 10 分钟。这两道码都在密码正确之后，持续成批输错像是有人拿到密码后在猜码。
+**含义**：（warning）每 5 分钟超过 20 次输错安全码、新设备验证码或密保答案（`security_code_invalid` / `login_challenge_code_invalid` / `login_challenge_security_answers_invalid`，以及账号每日额度用完后仍在尝试的 `login_challenge_security_code_budget_exhausted`），持续 10 分钟。这几道验证都在密码正确之后，持续成批输错像是有人拿到密码后在猜。密保答案比安全码好猜（出生城市、小学名），分散在很多账号时尤其要当撞库处理。
 
 **先看**：
-- 按账号看是否集中：`sum by (userId) (count_over_time({service="circle-be"} |= "security_event" | json | securityEvent=~"security_code_invalid|login_challenge_code_invalid" [30m]))`；具体请求按 `requestId` 查。
+- 按账号看是否集中：`sum by (userId) (count_over_time({service="circle-be"} |= "security_event" | json | securityEvent=~"security_code_invalid|login_challenge_code_invalid|login_challenge_security_answers_invalid|login_challenge_security_code_budget_exhausted" [30m]))`；具体请求按 `requestId` 查。
 - `SecurityCodeLockouts` 是否同时在响。
 
 **常见原因与处置**：

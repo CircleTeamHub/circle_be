@@ -177,7 +177,11 @@ export class DeviceTrustService implements OnModuleDestroy {
       const aliasOf = existing
         ? null
         : await this.prisma.trustedDevice.findFirst({
-            where: { userId: user.id, stableDeviceKey: deviceKey, revokedAt: null },
+            where: {
+              userId: user.id,
+              stableDeviceKey: deviceKey,
+              revokedAt: null,
+            },
             select: { id: true },
           });
       if (aliasOf) {
@@ -1239,8 +1243,14 @@ export class DeviceTrustService implements OnModuleDestroy {
         if (
           (failures._sum.attempts ?? 0) >=
           LOGIN_CHALLENGE_SECURITY_CODE_DAILY_FAILURES
-        )
+        ) {
+          this.logSecurity(
+            'login_challenge_security_code_budget_exhausted',
+            before.userId,
+            { challengeId, failures: failures._sum.attempts },
+          );
           this.throwLocked();
+        }
         if (!(await verify())) {
           const [counted] = await tx.loginChallenge.updateManyAndReturn({
             where: {
