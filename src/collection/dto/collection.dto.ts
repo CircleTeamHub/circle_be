@@ -9,6 +9,7 @@ import {
 } from 'class-validator';
 import { CollectionType } from 'src/generated/prisma';
 import { MaxJsonLength } from 'src/common/validation';
+import type { ChatMessageDto } from 'src/chat/chat.types';
 
 /**
  * JSON.stringify(payload).length 的上限。APP 拼的最大快照是一条 4000 字（聊天正文
@@ -65,6 +66,13 @@ export class UserCollectionDto {
   @ApiPropertyOptional() summary: string | null;
   @ApiPropertyOptional() sourceID: string | null;
   @ApiPropertyOptional({ type: Object }) payload: unknown;
+  @ApiPropertyOptional({
+    type: Object,
+    nullable: true,
+    description:
+      '当前仍可访问的源聊天消息,媒体地址在读取时签名;来源不可用时为 null',
+  })
+  message?: ChatMessageDto | null;
   @ApiProperty() createdAt: Date;
   @ApiProperty() updatedAt: Date;
 }

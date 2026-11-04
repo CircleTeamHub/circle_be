@@ -23,7 +23,10 @@ describe('CollectionService', () => {
     chatMessage: { findFirst: jest.fn(), findUnique: jest.fn() },
   };
 
-  const chat = { requireVisibleMessage: jest.fn() };
+  const chat = {
+    requireVisibleMessage: jest.fn(),
+    resolveCollectionMessages: jest.fn(),
+  };
 
   /** requireVisibleMessage 的返回形状(消息行 + 会话 + 座位)。 */
   const visible = (
@@ -58,6 +61,7 @@ describe('CollectionService', () => {
     prisma.userCollection.count.mockResolvedValue(0);
     prisma.userCollection.create.mockResolvedValue({ id: 'c-1' });
     chat.requireVisibleMessage.mockResolvedValue(visible());
+    chat.resolveCollectionMessages.mockResolvedValue(new Map());
 
     const module: TestingModule = await Test.createTestingModule({
       providers: [
@@ -127,6 +131,123 @@ describe('CollectionService', () => {
         payload: { noteId: 'note-1' },
       },
     });
+  });
+
+  it('resolves legacy video favorites by sourceID and ignores forged snapshot keys', async () => {
+    const message = {
+      id: 'msg-video',
+      conversationId: 'real-conversation',
+      height: 37,
+      type: 'video',
+      content: { key: 'chat/peer/video.mp4', url: 'https://fresh/video' },
+    };
+    prisma.userCollection.findMany.mockResolvedValue([
+      {
+        id: 'video',
+        type: 'VIDEO',
+        sourceID: 'msg-video',
+        payload: { image: { key: 'chat/victim/private.jpg' } },
+      },
+      {
+        id: 'duplicate',
+        type: 'MESSAGE',
+        sourceID: 'msg-video',
+        payload: { kind: 'openim-message', messageID: 'forged-message' },
+      },
+      { id: 'missing', type: 'MESSAGE', sourceID: 'removed-message' },
+      {
+        id: 'note',
+        type: 'NOTE',
+        sourceID: 'note-1',
+        payload: { noteId: 'note-1' },
+      },
+    ]);
+    chat.resolveCollectionMessages.mockResolvedValue(
+      new Map([['msg-video', message]]),
+    );
+
+    const items = await service.list('user-1');
+
+    expect(chat.resolveCollectionMessages).toHaveBeenCalledTimes(1);
+    expect(chat.resolveCollectionMessages).toHaveBeenCalledWith('user-1', [
+      'msg-video',
+      'removed-message',
+    ]);
+    expect(items.map((item) => item.message)).toEqual([
+      message,
+      message,
+      null,
+      null,
+    ]);
+  });
+
+  it('resolves message-backed NOTE collections without treating a note id as a message id', async () => {
+    prisma.userCollection.findMany.mockResolvedValue([
+      {
+        id: 'message',
+        type: 'NOTE',
+        sourceID: 'msg-1',
+        payload: { kind: 'openim-message' },
+      },
+      {
+        id: 'note',
+        type: 'NOTE',
+        sourceID: 'note-1',
+        payload: { noteId: 'note-1' },
+      },
+      {
+        id: 'legacy',
+        type: 'MESSAGE',
+        sourceID: null,
+        payload: { messageID: 'forged-id' },
+      },
+    ]);
+
+    const items = await service.list('user-1');
+
+    expect(chat.resolveCollectionMessages).toHaveBeenCalledWith('user-1', [
+      'msg-1',
+    ]);
+    expect(items.every((item) => item.message === null)).toBe(true);
+  });
+
+  it('does not resolve messages for an empty collection list', async () => {
+    prisma.userCollection.findMany.mockResolvedValue([]);
+
+    await expect(service.list('user-1')).resolves.toEqual([]);
+
+    expect(chat.resolveCollectionMessages).not.toHaveBeenCalled();
+  });
+
+  it('keeps a non-message NOTE unavailable even when its sourceID matches another favorite message', async () => {
+    const message = { id: 'msg-1', type: 'text', content: { text: 'chat' } };
+    prisma.userCollection.findMany.mockResolvedValue([
+      { id: 'chat', type: 'MESSAGE', sourceID: 'msg-1' },
+      {
+        id: 'note',
+        type: 'NOTE',
+        sourceID: 'msg-1',
+        payload: { noteId: 'msg-1' },
+      },
+    ]);
+    chat.resolveCollectionMessages.mockResolvedValue(
+      new Map([['msg-1', message]]),
+    );
+
+    const items = await service.list('user-1');
+
+    expect(items[0].message).toBe(message);
+    expect(items[1].message).toBeNull();
+  });
+
+  it('does not translate operational chat lookup failures into unavailable favorites', async () => {
+    prisma.userCollection.findMany.mockResolvedValue([
+      { id: 'c-1', type: 'MESSAGE', sourceID: 'msg-1' },
+    ]);
+    const failure = new Error('database connection failed');
+    chat.resolveCollectionMessages.mockRejectedValueOnce(failure);
+
+    await expect(service.list('user-1')).rejects.toBe(failure);
   });
 
   it('deletes only collections owned by the current user', async () => {
@@ -435,7 +556,9 @@ describe('CollectionService', () => {
         type: 'image',
         content: {
           key: 'chat/peer-1/image.jpg',
+          thumbKey: 'chat/peer-1/image-thumb.jpg',
           url: 'https://signed.invalid/expires-soon',
+          thumbUrl: 'https://signed.invalid/thumb-expires-soon',
           width: 100,
           height: 200,
         },
@@ -446,9 +569,41 @@ describe('CollectionService', () => {
 
     expect(createdPayload().image).toEqual({
       key: 'chat/peer-1/image.jpg',
+      thumbKey: 'chat/peer-1/image-thumb.jpg',
       width: 100,
       height: 200,
     });
+  });
+
+  it('persists canonical video metadata without signed URLs or client paths', async () => {
+    chat.requireVisibleMessage.mockResolvedValue(
+      visible({
+        type: 'video',
+        content: {
+          key: 'chat/peer-1/video.mp4',
+          thumbKey: 'chat/peer-1/video-thumb.jpg',
+          width: 1280,
+          height: 720,
+          duration: 12,
+          size: 12345,
+          url: 'https://signed.invalid/video',
+          thumbUrl: 'https://signed.invalid/thumb',
+          videoPath: 'file:///private/video.mp4',
+        },
+      }),
+    );
+
+    await service.create('user-1', messageCollection('msg-1'));
+
+    expect(createdPayload().video).toEqual({
+      key: 'chat/peer-1/video.mp4',
+      thumbKey: 'chat/peer-1/video-thumb.jpg',
+      width: 1280,
+      height: 720,
+      duration: 12,
+      size: 12345,
+    });
+    expect(JSON.stringify(createdPayload())).not.toMatch(/https:|file:/);
   });
 
   it('mirrors the real voice content shape ({key, duration})', async () => {
