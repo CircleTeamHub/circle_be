@@ -867,6 +867,89 @@ describe('AuthService', () => {
     );
   });
 
+  it('temporarily allows and trusts new devices after password verification in preproduction', async () => {
+    jest.spyOn(service['configService'], 'get').mockImplementation((key) => {
+      if (key === 'APP_DEPLOY_ENV') return 'preproduction';
+      return key === 'LOGIN_DEVICE_VERIFICATION_BYPASS' ? true : undefined;
+    });
+    users.push({
+      id: 'uuid-bypass',
+      accountId: 'bypass1',
+      email: 'bypass@example.com',
+      passwordHash: await argon2.hash('password1'),
+      status: 'ACTIVE',
+      role: 'USER',
+    });
+    const context = { deviceKey: 'updated-device' };
+    const result = await service.login(
+      { identifier: 'bypass1', password: 'password1' } as any,
+      context,
+    );
+    expect((result as { accessToken: string }).accessToken).toBe(
+      'access-token',
+    );
+    expect(mockDeviceTrust.evaluateLogin).not.toHaveBeenCalled();
+    expect(mockDeviceTrust.trust).toHaveBeenCalledWith(
+      'uuid-bypass',
+      'updated-device',
+      context,
+    );
+    expect(
+      mockDeviceTrust.cancelRecoveriesForActiveDevice,
+    ).toHaveBeenCalledWith('uuid-bypass', 'updated-device');
+  });
+
+  it('still rejects wrong passwords while the device bypass is enabled', async () => {
+    jest.spyOn(service['configService'], 'get').mockImplementation((key) => {
+      if (key === 'APP_DEPLOY_ENV') return 'preproduction';
+      return key === 'LOGIN_DEVICE_VERIFICATION_BYPASS' ? true : undefined;
+    });
+    users.push({
+      id: 'uuid-bypass',
+      accountId: 'bypass1',
+      email: 'bypass@example.com',
+      passwordHash: await argon2.hash('password1'),
+      status: 'ACTIVE',
+      role: 'USER',
+    });
+    await expect(
+      service.login({ identifier: 'bypass1', password: 'wrongpass' } as any, {
+        deviceKey: 'updated-device',
+      }),
+    ).rejects.toThrow(ForbiddenException);
+    expect(mockDeviceTrust.trust).not.toHaveBeenCalled();
+    expect(mockJwt.signAsync).not.toHaveBeenCalled();
+  });
+
+  it('does not bypass device verification in production', async () => {
+    jest.spyOn(service['configService'], 'get').mockImplementation((key) => {
+      if (key === 'APP_DEPLOY_ENV') return 'production';
+      return key === 'LOGIN_DEVICE_VERIFICATION_BYPASS' ? true : undefined;
+    });
+    users.push({
+      id: 'uuid-bypass',
+      accountId: 'bypass1',
+      email: 'bypass@example.com',
+      passwordHash: await argon2.hash('password1'),
+      status: 'ACTIVE',
+      role: 'USER',
+    });
+    mockDeviceTrust.evaluateLogin.mockResolvedValueOnce({
+      kind: 'challenge',
+      challenge: {
+        id: 'challenge-1',
+        expiresAt: new Date(),
+        securityCodeAvailable: false,
+      },
+    } as never);
+    const result = await service.login(
+      { identifier: 'bypass1', password: 'password1' } as any,
+      { deviceKey: 'updated-device' },
+    );
+    expect(result).toHaveProperty('deviceVerificationRequired', true);
+    expect(mockDeviceTrust.trust).not.toHaveBeenCalled();
+  });
+
   it('login throws ForbiddenException for unknown email', async () => {
     await expect(
       service.login({

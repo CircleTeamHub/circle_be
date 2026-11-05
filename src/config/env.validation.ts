@@ -140,6 +140,11 @@ export function createEnvValidationSchema(
     APP_DEPLOY_ENV: Joi.string()
       .valid('production', 'preproduction')
       .default('production'),
+    LOGIN_DEVICE_VERIFICATION_BYPASS: Joi.when('APP_DEPLOY_ENV', {
+      is: 'preproduction',
+      then: Joi.boolean().default(false),
+      otherwise: Joi.boolean().valid(false).default(false),
+    }),
     DATABASE_URL: databaseUrlSchema,
     // pg connection pool. Defaults match pg's own (max 10), except the acquire
     // timeout — pg waits forever for a free slot by default, so a saturated

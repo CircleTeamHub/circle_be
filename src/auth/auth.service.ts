@@ -373,6 +373,31 @@ export class AuthService {
           errorCode: AuthErrorCode.InvalidCredentials,
         });
       }
+      // 测试环境临时恢复入口：仍先完成密码、账号状态和账号锁内的二次校验。
+      if (
+        this.configService.get<string>('APP_DEPLOY_ENV') === 'preproduction' &&
+        this.configService.get<boolean>('LOGIN_DEVICE_VERIFICATION_BYPASS') ===
+          true
+      ) {
+        if (sessionContext?.deviceKey) {
+          await this.deviceTrust.trust(
+            current.id,
+            sessionContext.deviceKey,
+            sessionContext,
+          );
+          await this.deviceTrust.cancelRecoveriesForActiveDevice(
+            current.id,
+            sessionContext.deviceKey,
+          );
+        }
+        logSecurityEvent(this.logger, {
+          enabled: this.loggingConfig.securityLogOn,
+          securityEvent: 'login_device_verification_bypassed',
+          statusCode: 200,
+          userId: current.id,
+        });
+        return this.finishLogin(current, sessionContext);
+      }
       // 密码对了也不等于能进：陌生设备必须先经受信任设备批准（只发验证单号，不发 token）。
       const decision = await this.deviceTrust.evaluateLogin(
         current,
