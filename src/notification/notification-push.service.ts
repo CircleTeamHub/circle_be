@@ -20,6 +20,9 @@ import {
 const EXPO_PUSH_URL = 'https://exp.host/--/api/v2/push/send';
 const EXPO_RECEIPT_URL = 'https://exp.host/--/api/v2/push/getReceipts';
 const JPUSH_PUSH_URL = 'https://api.jpush.cn/v3/push';
+// Native clients bundle this WAV and create the corresponding Android channel.
+export const NOTIFICATION_PUSH_SOUND = 'notification_swift_gesture.wav';
+export const NOTIFICATION_PUSH_CHANNEL_ID = 'activity_swift_gesture';
 const EXPO_BATCH_SIZE = 100;
 const JPUSH_BATCH_SIZE = 1000;
 // 一次扇出里同时在途的 Expo 请求数:3000 人的群是 30 批,串行发太慢,全并发又会
@@ -83,6 +86,7 @@ export type PushTokenTarget = {
   projectId: string | null;
   provider?: 'expo' | 'jpush';
   platform?: 'ios' | 'android' | 'web';
+  appVersion?: string | null;
 };
 
 export type ExpoPushPayload = {
@@ -91,6 +95,8 @@ export type ExpoPushPayload = {
   data: Record<string, unknown>;
   /** iOS 图标角标数(G-18);缺省不改角标。 */
   badge?: number;
+  /** Assigned per native client version immediately before delivery. */
+  sound?: string;
   /**
    * 以下是 Expo 的投递选项,缺省时不出现在消息里(沿用各平台默认)。
    * priority:安卓默认 normal,省电模式下会被延后;即时消息要 high。
@@ -296,6 +302,7 @@ export class NotificationPushService {
         projectId: true,
         provider: true,
         platform: true,
+        appVersion: true,
       },
       orderBy: { updatedAt: 'desc' },
     });
@@ -311,6 +318,7 @@ export class NotificationPushService {
       projectId: row.projectId,
       provider: row.provider as 'expo' | 'jpush',
       platform: row.platform as 'ios' | 'android' | 'web',
+      appVersion: row.appVersion,
     }));
   }
 
@@ -320,8 +328,8 @@ export class NotificationPushService {
     client: Prisma.TransactionClient = this.prisma,
   ): Promise<PushTokenTarget[]> {
     return client.$queryRaw<PushTokenTarget[]>`
-      SELECT "token", "projectId", "provider", "platform" FROM (
-        SELECT p."token", p."projectId", p."provider", p."platform",
+      SELECT "token", "projectId", "provider", "platform", "appVersion" FROM (
+        SELECT p."token", p."projectId", p."provider", p."platform", p."appVersion",
           row_number() OVER (PARTITION BY p."provider" ORDER BY p."updatedAt" DESC, p."id" DESC) AS rank
         FROM "DevicePushToken" p
         WHERE p."userID" = ${userId} AND p."disabledAt" IS NULL
@@ -354,6 +362,7 @@ export class NotificationPushService {
         projectId: string | null;
         provider: string;
         platform: string;
+        appVersion: string | null;
       }>
     >(Prisma.sql`
       WITH ranked AS (
@@ -363,6 +372,7 @@ export class NotificationPushService {
           "projectId",
           provider,
           platform,
+          "appVersion",
           ROW_NUMBER() OVER (
             PARTITION BY "userID", provider
             ORDER BY "updatedAt" DESC, id DESC
@@ -372,7 +382,7 @@ export class NotificationPushService {
           AND provider IN (${Prisma.join(providers)})
           AND "disabledAt" IS NULL
       )
-      SELECT "userID", token, "projectId", provider, platform
+      SELECT "userID", token, "projectId", provider, platform, "appVersion"
       FROM ranked
       WHERE token_rank <= ${MAX_ACTIVE_TOKENS_PER_PROVIDER}
       ORDER BY "userID", provider, token_rank
@@ -390,6 +400,7 @@ export class NotificationPushService {
         projectId: row.projectId,
         provider: row.provider as 'expo' | 'jpush',
         platform: row.platform as 'ios' | 'android' | 'web',
+        appVersion: row.appVersion,
       });
       byUser.set(row.userID, tokens);
       countsByUserProvider.set(countKey, providerCount + 1);
@@ -417,6 +428,32 @@ export class NotificationPushService {
     messages: Array<PushTokenTarget & { payload: ExpoPushPayload }>,
   ): Promise<TokenDeliveryOutcome[]> {
     if (messages.length === 0) return [];
+
+    // Old JPush builds would create the new channel without its bundled sound,
+    // permanently locking it to the system sound before the user upgrades.
+    messages = messages.map((message) => {
+      const version = (message.appVersion ?? '').split('.').map(Number);
+      const [major, minor, patch] = version;
+      const hasNativeSound =
+        version.length === 3 &&
+        version.every(Number.isInteger) &&
+        (major > 1 ||
+          (major === 1 && (minor > 0 || (minor === 0 && patch >= 2))));
+      let channelId = message.payload.channelId;
+      if (hasNativeSound) channelId ??= NOTIFICATION_PUSH_CHANNEL_ID;
+      else if (message.provider === 'jpush') channelId = undefined;
+      else if (channelId === 'chat_swift_gesture') channelId = 'chat';
+      else if (channelId === NOTIFICATION_PUSH_CHANNEL_ID)
+        channelId = undefined;
+      return {
+        ...message,
+        payload: {
+          ...message.payload,
+          sound: hasNativeSound ? NOTIFICATION_PUSH_SOUND : 'default',
+          channelId,
+        },
+      };
+    });
 
     // Expo project IDs must not be mixed in a single request when enhanced
     // security is enabled. Group first, then batch each project independently.
@@ -1036,6 +1073,10 @@ export class NotificationPushService {
             android: {
               alert: payload.body,
               title: payload.title,
+              ...(payload.channelId ? { channel_id: payload.channelId } : {}),
+              ...(payload.sound !== 'default'
+                ? { sound: NOTIFICATION_PUSH_SOUND.replace(/\.wav$/, '') }
+                : {}),
               extras: payload.data,
             },
           }
@@ -1044,7 +1085,7 @@ export class NotificationPushService {
         ? {
             ios: {
               alert: { title: payload.title, body: payload.body },
-              sound: 'default',
+              sound: payload.sound,
               ...(payload.badge !== undefined ? { badge: payload.badge } : {}),
               ...(payload.threadId ? { 'thread-id': payload.threadId } : {}),
               extras: payload.data,
@@ -1159,7 +1200,7 @@ export class NotificationPushService {
     const tokens = batch.map((entry) => entry.token);
     const messages = batch.map(({ token, payload }) => ({
       to: token,
-      sound: 'default',
+      sound: payload.sound,
       title: payload.title,
       body: payload.body,
       data: payload.data,

@@ -268,7 +268,14 @@ describe('NotificationPushService (#88 per-token delivery)', () => {
           provider: 'jpush',
           platform: 'android',
           projectId: null,
-          payload: { ...payload, badge: 7, ttl: 300, threadId: 'thread-1' },
+          appVersion: '1.0.2',
+          payload: {
+            ...payload,
+            badge: 7,
+            ttl: 300,
+            threadId: 'thread-1',
+            channelId: 'chat_swift_gesture',
+          },
         },
       ]);
 
@@ -287,7 +294,12 @@ describe('NotificationPushService (#88 per-token delivery)', () => {
           audience: { registration_id: ['1a0018970a9d4f4f8f1'] },
           notification: expect.objectContaining({
             alert: 'B',
-            android: expect.objectContaining({ title: 'T', alert: 'B' }),
+            android: expect.objectContaining({
+              title: 'T',
+              alert: 'B',
+              channel_id: 'chat_swift_gesture',
+              sound: 'notification_swift_gesture',
+            }),
           }),
           options: expect.objectContaining({
             time_to_live: 300,
@@ -302,6 +314,68 @@ describe('NotificationPushService (#88 per-token delivery)', () => {
           receiptFinal: true,
         },
       ]);
+    });
+
+    it('does not create new JPush sound channels on old or unknown clients', async () => {
+      configValues.JPUSH_APP_KEY = 'jpush-app-key';
+      configValues.JPUSH_MASTER_SECRET = 'jpush-master-secret';
+      service = new NotificationPushService(prisma as any, config as any);
+      fetchMock.mockResolvedValue({
+        ok: true,
+        status: 200,
+        json: async () => ({}),
+      });
+      await service.sendMessages([
+        {
+          token: 'old-android',
+          projectId: null,
+          provider: 'jpush',
+          platform: 'android',
+          appVersion: '1.0.1',
+          payload: { ...payload, channelId: 'chat_swift_gesture' },
+        },
+        {
+          token: 'unknown-ios',
+          projectId: null,
+          provider: 'jpush',
+          platform: 'ios',
+          payload,
+        },
+      ]);
+      const android = JSON.parse(fetchMock.mock.calls[0][1].body).notification
+        .android;
+      const ios = JSON.parse(fetchMock.mock.calls[1][1].body).notification.ios;
+      expect(android).not.toHaveProperty('channel_id');
+      expect(android).not.toHaveProperty('sound');
+      expect(ios.sound).toBe('default');
+    });
+
+    it('uses the activity channel and bundled sound for ordinary JPush notifications', async () => {
+      configValues.JPUSH_APP_KEY = 'jpush-app-key';
+      configValues.JPUSH_MASTER_SECRET = 'jpush-master-secret';
+      service = new NotificationPushService(prisma as any, config as any);
+      fetchMock.mockResolvedValue({
+        ok: true,
+        status: 200,
+        json: async () => ({}),
+      });
+      await service.sendMessages([
+        {
+          token: 'jpush-android',
+          provider: 'jpush',
+          platform: 'android',
+          projectId: null,
+          appVersion: '1.0.2',
+          payload,
+        },
+      ]);
+      const body = JSON.parse(fetchMock.mock.calls[0][1].body);
+      expect(body.notification.android).toEqual(
+        expect.objectContaining({
+          channel_id: 'activity_swift_gesture',
+          sound: 'notification_swift_gesture',
+        }),
+      );
     });
 
     it('accepts the boolean value produced by Joi for JPUSH_APNS_PRODUCTION', async () => {
@@ -321,12 +395,16 @@ describe('NotificationPushService (#88 per-token delivery)', () => {
           provider: 'jpush',
           platform: 'ios',
           projectId: null,
+          appVersion: '1.0.2',
           payload,
         },
       ]);
 
       const [, init] = fetchMock.mock.calls[0] as [string, { body: string }];
       expect(JSON.parse(init.body).options.apns_production).toBe(true);
+      expect(JSON.parse(init.body).notification.ios.sound).toBe(
+        'notification_swift_gesture.wav',
+      );
     });
 
     it('counts every outcome by provider, keeping dead tokens apart from failures', async () => {
@@ -737,6 +815,31 @@ describe('NotificationPushService (#88 per-token delivery)', () => {
     });
   });
 
+  it('carries the native app version through active token selection', async () => {
+    const row = {
+      token: 'native-1',
+      projectId: null,
+      provider: 'jpush',
+      platform: 'android',
+      appVersion: '1.0.2',
+    };
+    prisma.devicePushToken.findMany.mockResolvedValue([row]);
+    expect(await service.listActiveTokens('u1')).toEqual([row]);
+    expect(
+      prisma.devicePushToken.findMany.mock.calls[0][0].select.appVersion,
+    ).toBe(true);
+    prisma.$queryRaw.mockResolvedValue([{ ...row, userID: 'u1' }]);
+    const grouped = await service.listActiveTokensForUsers(['u1']);
+    expect(grouped.get('u1')).toEqual([row]);
+    expect(prisma.$queryRaw.mock.calls[0][0].text).toContain('"appVersion"');
+    prisma.$queryRaw.mockClear();
+    prisma.$queryRaw.mockResolvedValue([row]);
+    expect(await service.listLoginAlertTokens('u1')).toEqual([row]);
+    expect(prisma.$queryRaw.mock.calls[0][0].join('')).toContain(
+      '"appVersion"',
+    );
+  });
+
   describe('listActiveTokensForUsers', () => {
     it('caps recipient tokens per user/provider inside the database query', async () => {
       prisma.$queryRaw.mockResolvedValue([
@@ -849,6 +952,28 @@ describe('NotificationPushService (#88 per-token delivery)', () => {
       expect(outcomes.every((outcome) => outcome.status === 'SENT')).toBe(true);
     });
 
+    it('keeps legacy clients on legacy channels until the native sound is bundled', async () => {
+      okForEveryMessage();
+      const versions = ['1.0.1', null, 'invalid', '1.0.2', '1.1.0', '2.0.0'];
+      await service.sendMessages(
+        versions.map((appVersion, i) => ({
+          token: `version-${i}`,
+          projectId: null,
+          appVersion,
+          payload: { ...payload, channelId: 'chat_swift_gesture' },
+        })),
+      );
+      const sent = JSON.parse(fetchMock.mock.calls[0][1].body);
+      for (const message of sent.slice(0, 3)) {
+        expect(message.sound).toBe('default');
+        expect(message.channelId).toBe('chat');
+      }
+      for (const message of sent.slice(3)) {
+        expect(message.sound).toBe('notification_swift_gesture.wav');
+        expect(message.channelId).toBe('chat_swift_gesture');
+      }
+    });
+
     it('forwards delivery options into the Expo message only when they are set', async () => {
       okForEveryMessage();
 
@@ -856,6 +981,7 @@ describe('NotificationPushService (#88 per-token delivery)', () => {
         {
           token: 'tok-chat',
           projectId: null,
+          appVersion: '1.0.2',
           payload: {
             ...payload,
             priority: 'high',
@@ -865,7 +991,7 @@ describe('NotificationPushService (#88 per-token delivery)', () => {
             ttl: 300,
           },
         },
-        { token: 'tok-plain', projectId: null, payload },
+        { token: 'tok-plain', projectId: null, appVersion: '1.0.2', payload },
       ]);
 
       const [chat, plain] = JSON.parse(
@@ -881,8 +1007,10 @@ describe('NotificationPushService (#88 per-token delivery)', () => {
           ttl: 300,
         }),
       );
-      // 系统通知 outbox 不带这些字段,发出去的消息与原来一致。
-      for (const key of ['priority', 'channelId', 'tag', 'threadId', 'ttl']) {
+      expect(chat.sound).toBe('notification_swift_gesture.wav');
+      expect(plain.sound).toBe('notification_swift_gesture.wav');
+      expect(plain.channelId).toBe('activity_swift_gesture');
+      for (const key of ['priority', 'tag', 'threadId', 'ttl']) {
         expect(plain).not.toHaveProperty(key);
       }
     });

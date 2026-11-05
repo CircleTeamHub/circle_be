@@ -252,6 +252,7 @@ export class NotificationPushOutboxProcessor {
               projectId: target?.projectId ?? null,
               provider: target?.provider ?? 'expo',
               ...(target?.platform ? { platform: target.platform } : {}),
+              ...(target?.appVersion ? { appVersion: target.appVersion } : {}),
             };
           }),
           payload,
