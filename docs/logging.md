@@ -171,6 +171,7 @@ Auth & account:
 - `auth_logout_all_success`, `auth_session_logout`, `auth_other_sessions_logout`
 - `auth_password_reset_requested` (no actor — unauthenticated, email never logged), `auth_password_reset_success`
 - `auth_change_password_success`, `auth_change_account_id_success`
+- `auth_change_email_success` - verified mailbox change; records the account actor, never the email address or verification code
 - `auth_security_code_set`, `auth_security_code_disabled`
 - `auth_single_device_login_changed`
 - `auth_qr_login_approved`
