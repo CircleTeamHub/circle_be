@@ -59,6 +59,8 @@ export class SmtpMailer implements Mailer {
         return '【风信】注册验证码';
       case EmailCodePurpose.LOGIN:
         return '【风信】登录验证码';
+      case EmailCodePurpose.CHANGE_EMAIL:
+        return '【风信】修改邮箱验证码';
       default:
         return '【风信】验证码';
     }

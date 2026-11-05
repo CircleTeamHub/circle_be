@@ -1534,6 +1534,109 @@ export class AuthService {
     });
   }
 
+  private async emailChangeUser(
+    userId: string,
+    password: string,
+    client: Pick<Prisma.TransactionClient, 'user'> = this.prisma,
+  ) {
+    const user = await client.user.findUnique({ where: { id: userId } });
+    if (!user || user.status !== 'ACTIVE' || user.role === 'ADMIN') {
+      throw new ForbiddenException('Account cannot change email');
+    }
+    if (!(await argon2.verify(user.passwordHash, password))) {
+      throw new UnauthorizedException({
+        message: '当前密码不正确',
+        errorCode: AuthErrorCode.PasswordIncorrect,
+      });
+    }
+    return user;
+  }
+
+  async requestEmailChange(
+    userId: string,
+    rawEmail: string,
+    password: string,
+  ): Promise<void> {
+    const user = await this.emailChangeUser(userId, password);
+    const email = normalizeEmail(rawEmail);
+    if (
+      email === user.email ||
+      (await this.prisma.user.findUnique({
+        where: { email },
+        select: { id: true },
+      }))
+    ) {
+      throw new BadRequestException({
+        message: '邮箱不可用',
+        errorCode: AuthErrorCode.EmailTaken,
+      });
+    }
+    await this.emailVerification.requestCode(email, 'CHANGE_EMAIL');
+  }
+
+  async changeEmail(
+    userId: string,
+    rawEmail: string,
+    password: string,
+    code: string,
+  ): Promise<void> {
+    const email = normalizeEmail(rawEmail);
+    try {
+      await this.withAccountAuthLock(userId, async (tx) => {
+        const user = await this.emailChangeUser(userId, password, tx);
+        if (email === user.email) {
+          throw new BadRequestException({
+            message: '邮箱不可用',
+            errorCode: AuthErrorCode.EmailTaken,
+          });
+        }
+        if (
+          !(await this.emailVerification.verifyCode(
+            email,
+            'CHANGE_EMAIL',
+            code,
+          ))
+        ) {
+          throw new BadRequestException({
+            message: '验证码错误或已过期',
+            errorCode: AuthErrorCode.CodeInvalid,
+          });
+        }
+        await tx.user.update({ where: { id: userId }, data: { email } });
+        await this.refreshTokenService.revokeAllInTransaction(tx, userId);
+      });
+    } catch (error) {
+      if (
+        error instanceof Prisma.PrismaClientKnownRequestError &&
+        error.code === 'P2002'
+      ) {
+        throw new BadRequestException({
+          message: '邮箱不可用',
+          errorCode: AuthErrorCode.EmailTaken,
+        });
+      }
+      throw error;
+    }
+    // The database revocation is authoritative; Redis marker failure must not turn a committed change into a failed save.
+    try {
+      await this.refreshTokenService.revokeAllAccessMarkers(userId);
+    } catch (error) {
+      reportOperationalError(error, {
+        component: 'AuthService',
+        operation: 'changeEmail',
+        kind: 'revocation_marker',
+      });
+    }
+    logBusinessEvent(this.logger, {
+      enabled: this.loggingConfig.businessLogOn,
+      businessEvent: 'auth_change_email_success',
+      actorId: userId,
+      result: 'success',
+      entityType: 'user',
+      entityId: userId,
+    });
+  }
+
   async changeAccountId(userId: string, accountId: string): Promise<SafeUser> {
     // 统一归一为小写后存储：accountId 唯一性与好友精确查找都按大小写不敏感
     // 处理，归一到小写后简单的精确查重 / DB 唯一约束即足以保证唯一性。

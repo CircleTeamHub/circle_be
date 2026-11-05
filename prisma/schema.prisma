@@ -101,6 +101,7 @@ enum EmailCodePurpose {
   REGISTER
   LOGIN
   RESET_PASSWORD
+  CHANGE_EMAIL
 }
 
 enum UserRole {
@@ -417,6 +418,7 @@ model User {
   /// 默认 true —— 与既有行为一致（此前推送不读任何用户偏好，人人都收）。
   /// 客户端的总闸关掉时也会把这里同步成 false，服务端只认这一个值。
   circleOfflinePushEnabled     Boolean           @default(true)
+  groupOfflinePushEnabled      Boolean           @default(true)
   nickname                     String
   avatarUrl                    String?
   avatarFrame                  String?
