@@ -239,6 +239,9 @@ the request context and a sanitized `reason`:
 - `rate_limit_hit` — a named limiter rejected the request.
 - `session_revoked_token_used` — a validly signed access token whose session
   was revoked (logout-all, ban, password change) was replayed.
+- `login_device_verification_bypassed` — a password-verified login skipped
+  device approval under the explicit preproduction-only
+  `LOGIN_DEVICE_VERIFICATION_BYPASS` recovery switch.
 - `security_code_invalid` — a wrong login security code (with the running
   attempt count).
 - `security_code_locked` — the account hit the security-code lockout.
