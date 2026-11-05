@@ -37,6 +37,10 @@ export const AuthErrorCode = {
   SessionDeviceUnbound: 'AUTH_SESSION_DEVICE_UNBOUND',
   // 同一账号进行中的找回申请过多（陌生设备登录的等待期找回）。
   LoginRecoveryLimited: 'AUTH_LOGIN_RECOVERY_LIMITED',
+  // 密保问题（陌生设备登录的兜底验证）。
+  SecurityQuestionsInvalid: 'AUTH_SECURITY_QUESTIONS_INVALID',
+  SecurityQuestionsNotSet: 'AUTH_SECURITY_QUESTIONS_NOT_SET',
+  SecurityAnswersInvalid: 'AUTH_SECURITY_ANSWERS_INVALID',
 } as const;
 
 export const CoinErrorCode = {

@@ -137,6 +137,14 @@ export function createEnvValidationSchema(
     NODE_ENV: Joi.string()
       .valid('development', 'production', 'test')
       .default('development'),
+    APP_DEPLOY_ENV: Joi.string()
+      .valid('production', 'preproduction')
+      .default('production'),
+    LOGIN_DEVICE_VERIFICATION_BYPASS: Joi.when('APP_DEPLOY_ENV', {
+      is: 'preproduction',
+      then: Joi.boolean().default(false),
+      otherwise: Joi.boolean().valid(false).default(false),
+    }),
     DATABASE_URL: databaseUrlSchema,
     // pg connection pool. Defaults match pg's own (max 10), except the acquire
     // timeout — pg waits forever for a free slot by default, so a saturated
@@ -364,6 +372,7 @@ export function createEnvValidationSchema(
       // 拿着一个永远不通过的码排查半天。
       const bypass = describeEmailCodeBypass({
         NODE_ENV: value.NODE_ENV,
+        APP_DEPLOY_ENV: value.APP_DEPLOY_ENV,
         EMAIL_CODE_DEV_BYPASS: value.EMAIL_CODE_DEV_BYPASS,
         EMAIL_CODE_ALLOW_PRODUCTION_BYPASS:
           value.EMAIL_CODE_ALLOW_PRODUCTION_BYPASS,

@@ -67,6 +67,8 @@ it('keeps the anonymous HTTP surface an explicit reviewed method allowlist', () 
     'AuthController.adminLogin',
     'AuthController.verifyLoginChallenge',
     'AuthController.verifyLoginChallengeSecurityCode',
+    'AuthController.loginChallengeSecurityQuestions',
+    'AuthController.verifyLoginChallengeSecurityQuestions',
     'AuthController.resendLoginChallenge',
     'AuthController.requestLoginRecovery',
     'AuthController.loginChallengeStatus',

@@ -109,6 +109,7 @@ interface PendingPushWindow {
 interface PushSeat {
   userID: string;
   muted: boolean;
+  user: { groupOfflinePushEnabled: boolean };
 }
 
 interface PushConversation {
@@ -232,6 +233,11 @@ export class ChatPushService implements OnModuleDestroy {
     // 正开着 App 的设备不在这里排除,而是在发送时按 token 跳过(见 sendToRecipients):
     // 电脑上开着网页版不该让手机收不到推送。
     for (const member of seats) {
+      if (
+        (conversation.type === 'GROUP' || conversation.type === 'TEMP') &&
+        !member.user.groupOfflinePushEnabled
+      )
+        continue;
       const message = this.messageFor(window, member);
       if (!message || !stillVisible.has(message.id)) continue;
       if (message.sender?.id === member.userID) continue;
@@ -471,7 +477,11 @@ export class ChatPushService implements OnModuleDestroy {
         // watermark to discard a delayed delivery after history was cleared.
         clearedBeforeHeight: { lt: latestHeight },
       },
-      select: { userID: true, muted: true },
+      select: {
+        userID: true,
+        muted: true,
+        user: { select: { groupOfflinePushEnabled: true } },
+      },
       take: PUSH_TARGET_CAP,
     });
     if (seats.length >= PUSH_TARGET_CAP) {

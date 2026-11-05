@@ -18,6 +18,7 @@ import { createHash } from 'crypto';
 import {
   DeviceTrustService,
   hashDeviceId,
+  hashStableDeviceId,
   LOGIN_CHALLENGE_CODE_TTL_MS,
   LOGIN_CHALLENGE_DECISION_MS,
   LOGIN_CHALLENGE_MAX_ATTEMPTS,
@@ -36,6 +37,7 @@ type Trusted = {
   lastIp: string | null;
   revokedAt: Date | null;
   lastSeenAt: Date;
+  stableDeviceKey?: string | null;
 };
 
 type Challenge = {
@@ -97,6 +99,10 @@ function setup() {
           ) ?? null
         );
       }),
+      findFirst: jest.fn(
+        async ({ where }) =>
+          trusted.find((t) => matches(t as any, where)) ?? null,
+      ),
       count: jest.fn(
         async ({ where }) =>
           trusted.filter((t) => matches(t as any, where)).length,
@@ -317,6 +323,112 @@ describe('hashDeviceId', () => {
     expect(hashDeviceId('short')).toBeNull();
     expect(hashDeviceId('has spaces in it 1234')).toBeNull();
     expect(hashDeviceId(undefined)).toBeNull();
+  });
+});
+
+describe('hashStableDeviceId', () => {
+  it('only accepts the ANDROID_ID-derived format and hashes it like a device id', () => {
+    const stable = `a1-${'0f'.repeat(32)}`;
+    expect(hashStableDeviceId(stable)).toBe(hashDeviceId(stable));
+    expect(
+      hashStableDeviceId('a1b2c3d4-e5f6-4a7b-8c9d-0e1f2a3b4c5d'),
+    ).toBeNull();
+    expect(hashStableDeviceId(`a1-${'0F'.repeat(32)}`)).toBeNull();
+    expect(hashStableDeviceId(`a1-${'0f'.repeat(31)}`)).toBeNull();
+    expect(hashStableDeviceId(undefined)).toBeNull();
+  });
+});
+
+describe('DeviceTrustService stable Android id alias', () => {
+  it('a refresh registers the stable id, so the same phone is trusted after a reinstall', async () => {
+    const { service, trusted, trust, challenges } = setup();
+    trust('random-old');
+
+    await expect(
+      service.trustOnRefresh('u1', 'random-old', {
+        deviceKey: 'random-old',
+        stableDeviceKey: 'stable',
+      }),
+    ).resolves.toBe(true);
+    expect(trusted[0].stableDeviceKey).toBe('stable');
+
+    // 重装后安全存储清空，App 改用稳定 ID 登录。
+    await expect(
+      service.evaluateLogin(user, { deviceKey: 'stable', deviceName: 'Pixel' }),
+    ).resolves.toEqual({ kind: 'trusted' });
+    expect(challenges).toHaveLength(0);
+    expect(trusted).toContainEqual(
+      expect.objectContaining({ deviceKey: 'stable', revokedAt: null }),
+    );
+  });
+
+  it('the rollout back-fill of a never-seen device records the alias too', async () => {
+    const { service, trusted } = setup();
+    await service.trustOnRefresh('u1', 'legacy', {
+      deviceKey: 'legacy',
+      stableDeviceKey: 'stable',
+    });
+    expect(trusted).toEqual([
+      expect.objectContaining({
+        deviceKey: 'legacy',
+        stableDeviceKey: 'stable',
+      }),
+    ]);
+  });
+
+  it('ignores the stable id unless the request comes from the session device itself', async () => {
+    const { service, trusted, trust, challenges } = setup();
+    trust('random-old');
+
+    // 拷走的 refresh token 换个设备续签：请求头的设备 ID 对不上会话绑定的那台。
+    await service.trustOnRefresh('u1', 'random-old', {
+      deviceKey: 'attacker',
+      stableDeviceKey: 'attacker-stable',
+    });
+    await service.trustOnRefresh('u1', 'random-old', {
+      stableDeviceKey: 'attacker-stable',
+    });
+    expect(trusted[0].stableDeviceKey).toBeUndefined();
+
+    const decision = await service.evaluateLogin(user, {
+      deviceKey: 'attacker-stable',
+    });
+    expect(decision.kind).toBe('challenge');
+    expect(challenges).toHaveLength(1);
+  });
+
+  it('does not record an alias equal to the device id (installs already on the stable id)', async () => {
+    const { service, trusted, trust } = setup();
+    trust('stable');
+    await service.trustOnRefresh('u1', 'stable', {
+      deviceKey: 'stable',
+      stableDeviceKey: 'stable',
+    });
+    expect(trusted[0].stableDeviceKey).toBeUndefined();
+  });
+
+  it('an alias of a removed device grants nothing', async () => {
+    const { service, trusted, trust } = setup();
+    trust('random-old');
+    trusted[0].stableDeviceKey = 'stable';
+    trusted[0].revokedAt = new Date();
+    trust('tablet'); // 账号还有别的受信任设备，不走「首台设备」放行。
+
+    const decision = await service.evaluateLogin(user, { deviceKey: 'stable' });
+    expect(decision.kind).toBe('challenge');
+  });
+
+  it('a stable id removed in device management is not revived through the alias', async () => {
+    const { service, trusted, trust } = setup();
+    trust('random-old');
+    trusted[0].stableDeviceKey = 'stable';
+    trust('stable');
+    const revokedAt = new Date();
+    trusted[1].revokedAt = revokedAt;
+
+    const decision = await service.evaluateLogin(user, { deviceKey: 'stable' });
+    expect(decision.kind).toBe('challenge');
+    expect(trusted[1].revokedAt).toBe(revokedAt);
   });
 });
 

@@ -62,6 +62,7 @@ function services(prisma: PrismaClient) {
     {} as never,
     {} as never,
     new DeviceTrustService(prisma as never, realtime as never),
+    {} as never,
   );
   const admin = new AdminUserService(
     prisma as never,

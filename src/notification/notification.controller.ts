@@ -18,6 +18,7 @@ import {
   DeletePushTokenDto,
   RegisterPushTokenDto,
   UpdateCirclePushPreferenceDto,
+  UpdateGroupPushPreferenceDto,
 } from './notification.dto';
 import {
   NotificationDomainQueryDto,
@@ -66,6 +67,22 @@ export class NotificationController {
     return this.notificationService.setCirclePushPreference(
       req.user.userId,
       dto.circleOfflinePushEnabled,
+    );
+  }
+
+  @Get('group-push-preference')
+  getGroupPushPreference(@Req() req: RequestWithUser) {
+    return this.notificationService.getGroupPushPreference(req.user.userId);
+  }
+
+  @Put('group-push-preference')
+  setGroupPushPreference(
+    @Req() req: RequestWithUser,
+    @Body() dto: UpdateGroupPushPreferenceDto,
+  ) {
+    return this.notificationService.setGroupPushPreference(
+      req.user.userId,
+      dto.groupOfflinePushEnabled,
     );
   }
 

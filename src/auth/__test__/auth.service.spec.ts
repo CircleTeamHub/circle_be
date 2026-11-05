@@ -1,6 +1,7 @@
 import { Test, TestingModule } from '@nestjs/testing';
 import { AuthService } from '../auth.service';
 import { DeviceTrustService } from '../device-trust.service';
+import { SecurityQuestionsService } from '../security-questions.service';
 import { JwtService } from '@nestjs/jwt';
 import { ConfigService } from '@nestjs/config';
 import {
@@ -127,6 +128,12 @@ describe('AuthService', () => {
     requestRecovery: jest.fn(),
     logRecoveryCompleted: jest.fn(),
     releaseRecoveryClaim: jest.fn(() => Promise.resolve()),
+  };
+  const mockSecurityQuestions = {
+    questionKeys: jest.fn(() =>
+      Promise.resolve<string[]>(['bestFriendName', 'primarySchool']),
+    ),
+    verifyAnswers: jest.fn(() => Promise.resolve(true)),
   };
   const mockRefreshTokenService = {
     create: jest.fn(() =>
@@ -356,6 +363,7 @@ describe('AuthService', () => {
         { provide: FancyNumberService, useValue: mockFancyNumberService },
         { provide: AvatarFrameService, useValue: mockAvatarFrameService },
         { provide: DeviceTrustService, useValue: mockDeviceTrust },
+        { provide: SecurityQuestionsService, useValue: mockSecurityQuestions },
       ],
     }).compile();
 
@@ -857,6 +865,89 @@ describe('AuthService', () => {
     expect((result as { accessToken: string }).accessToken).toBe(
       'access-token',
     );
+  });
+
+  it('temporarily allows and trusts new devices after password verification in preproduction', async () => {
+    jest.spyOn(service['configService'], 'get').mockImplementation((key) => {
+      if (key === 'APP_DEPLOY_ENV') return 'preproduction';
+      return key === 'LOGIN_DEVICE_VERIFICATION_BYPASS' ? true : undefined;
+    });
+    users.push({
+      id: 'uuid-bypass',
+      accountId: 'bypass1',
+      email: 'bypass@example.com',
+      passwordHash: await argon2.hash('password1'),
+      status: 'ACTIVE',
+      role: 'USER',
+    });
+    const context = { deviceKey: 'updated-device' };
+    const result = await service.login(
+      { identifier: 'bypass1', password: 'password1' } as any,
+      context,
+    );
+    expect((result as { accessToken: string }).accessToken).toBe(
+      'access-token',
+    );
+    expect(mockDeviceTrust.evaluateLogin).not.toHaveBeenCalled();
+    expect(mockDeviceTrust.trust).toHaveBeenCalledWith(
+      'uuid-bypass',
+      'updated-device',
+      context,
+    );
+    expect(
+      mockDeviceTrust.cancelRecoveriesForActiveDevice,
+    ).toHaveBeenCalledWith('uuid-bypass', 'updated-device');
+  });
+
+  it('still rejects wrong passwords while the device bypass is enabled', async () => {
+    jest.spyOn(service['configService'], 'get').mockImplementation((key) => {
+      if (key === 'APP_DEPLOY_ENV') return 'preproduction';
+      return key === 'LOGIN_DEVICE_VERIFICATION_BYPASS' ? true : undefined;
+    });
+    users.push({
+      id: 'uuid-bypass',
+      accountId: 'bypass1',
+      email: 'bypass@example.com',
+      passwordHash: await argon2.hash('password1'),
+      status: 'ACTIVE',
+      role: 'USER',
+    });
+    await expect(
+      service.login({ identifier: 'bypass1', password: 'wrongpass' } as any, {
+        deviceKey: 'updated-device',
+      }),
+    ).rejects.toThrow(ForbiddenException);
+    expect(mockDeviceTrust.trust).not.toHaveBeenCalled();
+    expect(mockJwt.signAsync).not.toHaveBeenCalled();
+  });
+
+  it('does not bypass device verification in production', async () => {
+    jest.spyOn(service['configService'], 'get').mockImplementation((key) => {
+      if (key === 'APP_DEPLOY_ENV') return 'production';
+      return key === 'LOGIN_DEVICE_VERIFICATION_BYPASS' ? true : undefined;
+    });
+    users.push({
+      id: 'uuid-bypass',
+      accountId: 'bypass1',
+      email: 'bypass@example.com',
+      passwordHash: await argon2.hash('password1'),
+      status: 'ACTIVE',
+      role: 'USER',
+    });
+    mockDeviceTrust.evaluateLogin.mockResolvedValueOnce({
+      kind: 'challenge',
+      challenge: {
+        id: 'challenge-1',
+        expiresAt: new Date(),
+        securityCodeAvailable: false,
+      },
+    } as never);
+    const result = await service.login(
+      { identifier: 'bypass1', password: 'password1' } as any,
+      { deviceKey: 'updated-device' },
+    );
+    expect(result).toHaveProperty('deviceVerificationRequired', true);
+    expect(mockDeviceTrust.trust).not.toHaveBeenCalled();
   });
 
   it('login throws ForbiddenException for unknown email', async () => {
@@ -1371,6 +1462,108 @@ describe('AuthService', () => {
       (_userId: string, sessionId: string) =>
         Promise.resolve(`device-key-of-${sessionId}`),
     );
+  });
+
+  describe('security questions on the login challenge', () => {
+    beforeEach(() => {
+      users.push({
+        id: 'uuid-sq',
+        accountId: 'sq1',
+        email: 'sq@example.com',
+        passwordHash: 'x',
+        status: 'ACTIVE',
+        role: 'USER',
+        singleDeviceLoginEnabled: false,
+      });
+      mockDeviceTrust.loadForSecurityCode.mockResolvedValueOnce({
+        id: 'challenge-sq',
+        userId: 'uuid-sq',
+        deviceKey: 'new-device',
+      } as never);
+    });
+
+    it('shows the new device which questions the account set', async () => {
+      await expect(
+        service.loginChallengeSecurityQuestions('challenge-sq', 'new-device'),
+      ).resolves.toEqual({ questionKeys: ['bestFriendName', 'primarySchool'] });
+      expect(mockDeviceTrust.loadForSecurityCode).toHaveBeenCalledWith(
+        'challenge-sq',
+        'new-device',
+      );
+      expect(mockSecurityQuestions.questionKeys).toHaveBeenCalledWith(
+        'uuid-sq',
+      );
+    });
+
+    it('right answers finish the login like an approved code', async () => {
+      const result = await service.verifyLoginChallengeSecurityQuestions(
+        'challenge-sq',
+        ['张三', '阳光小学'],
+        { deviceKey: 'new-device', deviceName: 'Pixel 9' },
+      );
+
+      expect(result.accessToken).toBe('access-token');
+      // 与安全码共用验证单的次数上限和账号每日额度。
+      expect(mockDeviceTrust.verifySecurityCodeFallback).toHaveBeenCalledWith(
+        'challenge-sq',
+        'new-device',
+        expect.any(Function),
+      );
+      expect(mockSecurityQuestions.verifyAnswers).toHaveBeenCalledWith(
+        'uuid-sq',
+        ['张三', '阳光小学'],
+      );
+      expect(mockDeviceTrust.completeVerifiedLogin).toHaveBeenCalledWith(
+        'uuid-sq',
+        'challenge-sq',
+        'new-device',
+        { deviceKey: 'new-device', deviceName: 'Pixel 9' },
+      );
+    });
+
+    it('wrong answers are refused without issuing tokens', async () => {
+      mockSecurityQuestions.verifyAnswers.mockResolvedValueOnce(false);
+      // 测试环境默认关安全日志，这里打开看真实输出。
+      (service as any).loggingConfig = {
+        ...(service as any).loggingConfig,
+        securityLogOn: true,
+      };
+      const warn = jest
+        .spyOn((service as any).logger, 'warn')
+        .mockImplementation(() => undefined);
+
+      await expect(
+        service.verifyLoginChallengeSecurityQuestions(
+          'challenge-sq',
+          ['李四', '阳光小学'],
+          { deviceKey: 'new-device' },
+        ),
+      ).rejects.toMatchObject({
+        response: { errorCode: AuthErrorCode.SecurityAnswersInvalid },
+      });
+      expect(mockDeviceTrust.completeVerifiedLogin).not.toHaveBeenCalled();
+      // 监控按这个事件发现「拿到密码后在猜密保」；答案本身绝不进日志。
+      const logged = JSON.stringify(warn.mock.calls);
+      expect(logged).toContain('login_challenge_security_answers_invalid');
+      expect(logged).toContain('challenge-sq');
+      expect(logged).not.toContain('李四');
+      warn.mockRestore();
+    });
+
+    it('an account without questions is told so and no attempt is counted', async () => {
+      mockSecurityQuestions.questionKeys.mockResolvedValueOnce([]);
+
+      await expect(
+        service.verifyLoginChallengeSecurityQuestions(
+          'challenge-sq',
+          ['a', 'b'],
+          { deviceKey: 'new-device' },
+        ),
+      ).rejects.toMatchObject({
+        response: { errorCode: AuthErrorCode.SecurityQuestionsNotSet },
+      });
+      expect(mockDeviceTrust.verifySecurityCodeFallback).not.toHaveBeenCalled();
+    });
   });
 
   it('a wrong security code on the challenge path never touches the app-lock counters', async () => {

@@ -83,6 +83,7 @@ function harness(prisma: PrismaClient): Harness {
     {} as never,
     {} as never,
     deviceTrust,
+    {} as never,
   );
   return { auth, refreshTokens, revocation, realtime, jwt };
 }

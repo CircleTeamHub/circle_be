@@ -6,6 +6,30 @@ describe('createEnvValidationSchema', () => {
     SECRET: 'test-secret',
   };
 
+  it('defaults the new-device bypass to off and only enables it in preproduction', () => {
+    const schema = createEnvValidationSchema({
+      NODE_ENV: 'development',
+      ALLOW_START_WITHOUT_DB: 'true',
+    });
+    expect(
+      schema.validate(baseEnv).value.LOGIN_DEVICE_VERIFICATION_BYPASS,
+    ).toBe(false);
+    const enabled = schema.validate({
+      ...baseEnv,
+      APP_DEPLOY_ENV: 'preproduction',
+      LOGIN_DEVICE_VERIFICATION_BYPASS: 'true',
+    });
+    expect(enabled.error).toBeUndefined();
+    expect(enabled.value.LOGIN_DEVICE_VERIFICATION_BYPASS).toBe(true);
+    expect(
+      schema.validate({
+        ...baseEnv,
+        APP_DEPLOY_ENV: 'production',
+        LOGIN_DEVICE_VERIFICATION_BYPASS: 'true',
+      }).error,
+    ).toBeDefined();
+  });
+
   const productionBypassEnv = {
     NODE_ENV: 'production',
     DATABASE_URL: 'postgresql://user:pass@localhost:5432/db',
@@ -62,6 +86,40 @@ describe('createEnvValidationSchema', () => {
 
     expect(error).toBeUndefined();
   });
+
+  it('accepts a configured short code for a production runtime explicitly marked preproduction', () => {
+    const env = {
+      ...productionBypassEnv,
+      APP_DEPLOY_ENV: 'preproduction',
+      EMAIL_CODE_DEV_BYPASS: '999999',
+      EMAIL_CODE_ALLOW_PRODUCTION_BYPASS: undefined,
+      EMAIL_CODE_PRODUCTION_BYPASS_ALLOWLIST: undefined,
+    };
+
+    const { error, value } = createEnvValidationSchema(env).validate(env);
+
+    expect(error).toBeUndefined();
+    expect(value.APP_DEPLOY_ENV).toBe('preproduction');
+  });
+
+  it('defaults the deployment stage to production', () => {
+    const env = { ...productionBypassEnv };
+    const { error, value } = createEnvValidationSchema(env).validate(env);
+
+    expect(error).toBeUndefined();
+    expect(value.APP_DEPLOY_ENV).toBe('production');
+  });
+
+  it.each(['preprod', 'staging', 'PREPRODUCTION', ' preproduction ', ''])(
+    'rejects a misconfigured deployment stage %s',
+    (deployEnv) => {
+      const env = { ...productionBypassEnv, APP_DEPLOY_ENV: deployEnv };
+
+      const { error } = createEnvValidationSchema(env).validate(env);
+
+      expect(error?.message).toContain('APP_DEPLOY_ENV');
+    },
+  );
 
   it('requires DATABASE_URL by default', () => {
     const { error } = createEnvValidationSchema({

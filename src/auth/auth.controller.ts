@@ -41,13 +41,23 @@ import { RefreshTokenDto } from './dto/refresh-token.dto';
 import { RegisterDto } from './dto/register.dto';
 import { ChangePasswordDto } from './dto/change-password.dto';
 import { ChangeAccountIdDto } from './dto/change-account-id.dto';
+import { ChangeEmailDto, RequestEmailChangeDto } from './dto/change-email.dto';
 import {
   LoginSecurityCodeDto,
   SetLoginSecurityCodeDto,
 } from './dto/login-security-code.dto';
 import { SingleDeviceLoginDto } from './dto/single-device-login.dto';
 import { LoginChallengeCodeDto } from './dto/login-challenge.dto';
-import { DeviceTrustService, hashDeviceId } from './device-trust.service';
+import {
+  DeviceTrustService,
+  hashDeviceId,
+  hashStableDeviceId,
+} from './device-trust.service';
+import { SecurityQuestionsService } from './security-questions.service';
+import {
+  SetSecurityQuestionsDto,
+  VerifySecurityQuestionsDto,
+} from './dto/security-questions.dto';
 import { RefreshTokenService } from './refresh-token.service';
 import { SelfUserDto } from 'src/user/dto/public-user.dto';
 import { Serialize } from 'src/decorators/serialize.decorator';
@@ -75,6 +85,9 @@ function getSessionContext(req?: Request): SessionContext {
     userAgent: getHeaderValue(req.headers['user-agent']),
     // 客户端安全存储里的随机设备 ID，只以哈希形式进入服务端。
     deviceKey: hashDeviceId(getHeaderValue(req.headers['x-device-id'])),
+    stableDeviceKey: hashStableDeviceId(
+      getHeaderValue(req.headers['x-stable-device-id']),
+    ),
   };
 }
 
@@ -85,6 +98,7 @@ export class AuthController {
     private authService: AuthService,
     private deviceTrust: DeviceTrustService,
     private refreshTokens: RefreshTokenService,
+    private securityQuestions: SecurityQuestionsService,
   ) {}
 
   /**
@@ -184,6 +198,48 @@ export class AuthController {
     return this.authService.verifyLoginChallengeSecurityCode(
       challengeId,
       dto.securityCode,
+      getSessionContext(req),
+    );
+  }
+
+  @AnonymousAccess('Device-bound login challenge')
+  @Get('login-challenges/:challengeId/security-questions')
+  @Header('Cache-Control', 'no-store')
+  @UseGuards(ThrottlerGuard)
+  @Throttle({ default: { limit: 30, ttl: 60_000 } })
+  @ApiOperation({
+    summary: 'New device: which security questions the account has set',
+  })
+  @ApiHeader({ name: 'x-device-id', required: true })
+  loginChallengeSecurityQuestions(
+    @Param('challengeId', ParseUUIDPipe) challengeId: string,
+    @Req() req: Request,
+  ) {
+    return this.authService.loginChallengeSecurityQuestions(
+      challengeId,
+      getSessionContext(req).deviceKey ?? null,
+    );
+  }
+
+  @AnonymousAccess('Login challenge and security answers')
+  @Post('login-challenges/:challengeId/security-questions')
+  @UseGuards(ThrottlerGuard)
+  @Throttle({ default: { limit: 10, ttl: 60_000 } })
+  @ApiOperation({
+    summary:
+      'New device: pass verification by answering the security questions',
+  })
+  @ApiHeader({ name: 'x-device-id', required: true })
+  @ApiBody({ type: VerifySecurityQuestionsDto })
+  @ApiCreatedResponse({ type: AuthTokensDto })
+  verifyLoginChallengeSecurityQuestions(
+    @Param('challengeId', ParseUUIDPipe) challengeId: string,
+    @Body() dto: VerifySecurityQuestionsDto,
+    @Req() req: Request,
+  ) {
+    return this.authService.verifyLoginChallengeSecurityQuestions(
+      challengeId,
+      dto.answers,
       getSessionContext(req),
     );
   }
@@ -319,6 +375,12 @@ export class AuthController {
     name: 'x-device-name',
     required: false,
     description: 'Optional device name to update for the rotated session',
+  })
+  @ApiHeader({
+    name: 'x-stable-device-id',
+    required: false,
+    description:
+      'Android only: the ANDROID_ID-derived device id this install would use after a reinstall',
   })
   @ApiCreatedResponse({
     description: 'Token refreshed successfully',
@@ -477,6 +539,34 @@ export class AuthController {
     );
   }
 
+  @Post('email/change-request')
+  @UseGuards(JwtGuard, UserThrottlerGuard)
+  @Throttle({ default: { limit: 5, ttl: 60_000 } })
+  @ApiBearerAuth()
+  requestEmailChange(
+    @Body() dto: RequestEmailChangeDto,
+    @Req() req: RequestWithUser,
+  ) {
+    return this.authService.requestEmailChange(
+      req.user.userId,
+      dto.email,
+      dto.password,
+    );
+  }
+
+  @Post('email/change')
+  @UseGuards(JwtGuard, UserThrottlerGuard)
+  @Throttle({ default: { limit: 10, ttl: 60_000 } })
+  @ApiBearerAuth()
+  changeEmail(@Body() dto: ChangeEmailDto, @Req() req: RequestWithUser) {
+    return this.authService.changeEmail(
+      req.user.userId,
+      dto.email,
+      dto.password,
+      dto.code,
+    );
+  }
+
   @Post('change-account-id')
   @UseGuards(JwtGuard)
   @Serialize(SelfUserDto)
@@ -489,6 +579,34 @@ export class AuthController {
     @Req() req: RequestWithUser,
   ) {
     return this.authService.changeAccountId(req.user.userId, dto.accountId);
+  }
+
+  @Get('security-questions')
+  @UseGuards(JwtGuard)
+  @Header('Cache-Control', 'no-store')
+  @ApiOperation({ summary: 'Security questions the account has set' })
+  @ApiBearerAuth()
+  async getSecurityQuestions(@Req() req: RequestWithUser) {
+    return {
+      questionKeys: await this.securityQuestions.questionKeys(req.user.userId),
+    };
+  }
+
+  @Put('security-questions')
+  @UseGuards(JwtGuard, UserThrottlerGuard)
+  @Throttle({ default: { limit: 5, ttl: 60_000 } })
+  @ApiOperation({ summary: 'Set or replace the two security questions' })
+  @ApiBearerAuth()
+  @ApiBody({ type: SetSecurityQuestionsDto })
+  setSecurityQuestions(
+    @Body() dto: SetSecurityQuestionsDto,
+    @Req() req: RequestWithUser,
+  ) {
+    return this.securityQuestions.set(
+      req.user.userId,
+      dto.password,
+      dto.questions,
+    );
   }
 
   @Get('security-code')

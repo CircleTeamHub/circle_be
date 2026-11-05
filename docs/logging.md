@@ -171,6 +171,7 @@ Auth & account:
 - `auth_logout_all_success`, `auth_session_logout`, `auth_other_sessions_logout`
 - `auth_password_reset_requested` (no actor — unauthenticated, email never logged), `auth_password_reset_success`
 - `auth_change_password_success`, `auth_change_account_id_success`
+- `auth_change_email_success` - verified mailbox change; records the account actor, never the email address or verification code
 - `auth_security_code_set`, `auth_security_code_disabled`
 - `auth_single_device_login_changed`
 - `auth_qr_login_approved`
@@ -239,6 +240,9 @@ the request context and a sanitized `reason`:
 - `rate_limit_hit` — a named limiter rejected the request.
 - `session_revoked_token_used` — a validly signed access token whose session
   was revoked (logout-all, ban, password change) was replayed.
+- `login_device_verification_bypassed` — a password-verified login skipped
+  device approval under the explicit preproduction-only
+  `LOGIN_DEVICE_VERIFICATION_BYPASS` recovery switch.
 - `security_code_invalid` — a wrong login security code (with the running
   attempt count).
 - `security_code_locked` — the account hit the security-code lockout.
@@ -260,7 +264,15 @@ the request context and a sanitized `reason`:
   refreshed during the waiting period, so pending recovery requests were rejected.
 - `login_recovery_completed` — the recovery finished (see `auth_login_recovered`).
 - `login_challenge_security_code_budget_exhausted` — the account used up its
-  daily failure budget for the security-code fallback.
+  daily failure budget for the security-code / security-question fallback
+  (logged on every further attempt; challengeId and failure count only).
+- `login_challenge_security_answers_invalid` — wrong answers to the security
+  questions on a login challenge (challengeId only; answers are never logged).
+- `security_questions_set` — the user set or replaced their two security
+  questions (current password verified; answers are never logged).
+- `trusted_device_reinstalled` — a login used a stable Android device id that a
+  trusted install had registered as its alias on refresh, so the reinstalled
+  phone was trusted without a challenge (trustedDeviceId only).
 
 With the logs overlay on, Loki alerts on bursts of these events
 (`SecurityCodeGuessing`, `SecurityCodeLockouts`, `RevokedSessionTokenReplay`,

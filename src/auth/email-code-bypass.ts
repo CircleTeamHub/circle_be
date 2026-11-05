@@ -24,6 +24,8 @@ export const PRODUCTION_BYPASS_CODE_MIN_LENGTH = 16;
 
 export interface EmailCodeBypassEnv {
   NODE_ENV?: string;
+  /** production 构建的隔离预生产环境；未配置时按真实生产处理。 */
+  APP_DEPLOY_ENV?: string;
   EMAIL_CODE_DEV_BYPASS?: string;
   EMAIL_CODE_ALLOW_PRODUCTION_BYPASS?: string | boolean;
   EMAIL_CODE_PRODUCTION_BYPASS_ALLOWLIST?: string;
@@ -32,7 +34,8 @@ export interface EmailCodeBypassEnv {
 }
 
 /**
- * 无限制旁路只认两种进程：本机 development，以及跑在 jest 里的测试进程。
+ * 无限制旁路只认本机 development、jest 测试进程，以及显式标记的预生产环境。
+ * 预生产仍用 NODE_ENV=production 保留生产运行行为，APP_DEPLOY_ENV 必须精确匹配。
  *
  * 「不是 production 就放开」是 fail-open 的判法：NODE_ENV 没设的时候它同样成立，
  * 而没设恰恰是共享机器上最常见的情况 —— 裸跑一次 `node dist/main.js`，或者一个
@@ -48,13 +51,15 @@ export interface EmailCodeBypassEnv {
  */
 function isUnrestrictedBypassEnv(env: EmailCodeBypassEnv): boolean {
   if (env.NODE_ENV === 'development') return true;
+  if (env.NODE_ENV === 'production' && env.APP_DEPLOY_ENV === 'preproduction')
+    return true;
   return env.NODE_ENV === 'test' && Boolean(env.JEST_WORKER_ID);
 }
 
 export type EmailCodeBypassStatus =
   /** 未配置固定码，或受限环境缺少显式开关 —— 没有旁路。 */
   | 'off'
-  /** development 或 jest 进程：固定码对所有用途有效（含 RESET_PASSWORD）。 */
+  /** development、jest 或显式预生产：固定码对所有用途有效（含 RESET_PASSWORD）。 */
   | 'non-production'
   /** production：固定码对允许名单里的 (purpose, email) 生效。 */
   | 'active'

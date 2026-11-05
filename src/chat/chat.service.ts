@@ -100,6 +100,7 @@ import type {
 
 /** 圈子群在会话 DTO 上的展示信息(+ 成员邀请开关,策略 DTO 要用)。 */
 type CircleInfo = {
+  description: string;
   id: string;
   name: string;
   avatarUrl: string | null;
@@ -113,6 +114,7 @@ type GroupFacets = Pick<
   | 'myAlias'
   | 'muteAll'
   | 'notice'
+  | 'noticePinned'
   | 'avatarUrl'
   | 'memberLimit'
   | 'memberCount'
@@ -131,6 +133,7 @@ const NON_GROUP_FACETS: GroupFacets = {
   myAlias: null,
   muteAll: false,
   notice: null,
+  noticePinned: false,
   avatarUrl: null,
   memberLimit: null,
   memberCount: null,
@@ -2763,7 +2766,7 @@ export class ChatService {
       remark?: string | null;
       alias?: string | null;
     },
-    circle: { memberCanInvite: boolean } | null,
+    circle: { memberCanInvite: boolean; description: string } | null,
     circleRole: GroupRole | null,
     memberCount: number | null,
   ): GroupFacets {
@@ -2784,7 +2787,10 @@ export class ChatService {
       myRemark: seat.remark ?? null,
       myAlias: seat.alias ?? null,
       muteAll: conversation.muteAllAt !== null,
-      notice: standalone ? (conversation.notice ?? null) : null,
+      notice: standalone
+        ? (conversation.notice ?? null)
+        : circle?.description || null,
+      noticePinned: conversation.noticePinned ?? false,
       avatarUrl: standalone ? (conversation.avatarUrl ?? null) : null,
       memberLimit: standalone ? STANDALONE_GROUP_MAX_MEMBERS : null,
       memberCount,
@@ -4049,7 +4055,13 @@ export class ChatService {
     if (unique.length === 0) return new Map();
     const circles = await this.prisma.circle.findMany({
       where: { id: { in: unique } },
-      select: { id: true, name: true, avatarUrl: true, memberCanInvite: true },
+      select: {
+        id: true,
+        name: true,
+        description: true,
+        avatarUrl: true,
+        memberCanInvite: true,
+      },
     });
     return new Map(
       circles.map((c) => [
@@ -4059,6 +4071,7 @@ export class ChatService {
           name: c.name,
           avatarUrl: c.avatarUrl,
           memberCanInvite: c.memberCanInvite,
+          description: c.description,
         },
       ]),
     );

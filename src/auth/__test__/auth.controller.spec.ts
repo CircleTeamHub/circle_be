@@ -6,6 +6,7 @@ import { JwtGuard } from 'src/guards/jwt.guard';
 import { UserThrottlerGuard } from 'src/guards/user-throttler.guard';
 import { AuthController } from '../auth.controller';
 import { AuthService } from '../auth.service';
+import { SecurityQuestionsService } from '../security-questions.service';
 import { DeviceTrustService } from '../device-trust.service';
 import { RefreshTokenService } from '../refresh-token.service';
 import { RegisterDto } from '../dto/register.dto';
@@ -111,6 +112,7 @@ describe('AuthController', () => {
       providers: [
         { provide: AuthService, useValue: mockAuthService },
         { provide: DeviceTrustService, useValue: {} },
+        { provide: SecurityQuestionsService, useValue: {} },
         {
           provide: RefreshTokenService,
           useValue: { findSessionDeviceKey: jest.fn() },

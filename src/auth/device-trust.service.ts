@@ -73,6 +73,19 @@ export function hashDeviceId(raw: string | null | undefined): string | null {
   return createHash('sha256').update(raw).digest('hex');
 }
 
+// 安卓客户端由 ANDROID_ID 推导的稳定设备 ID：`a1-` + sha256 十六进制。
+const STABLE_DEVICE_ID_PATTERN = /^a1-[0-9a-f]{64}$/;
+
+/** 稳定设备 ID 的哈希；与 hashDeviceId 同算法，重装后用它登录时能直接对上。 */
+export function hashStableDeviceId(
+  raw: string | null | undefined,
+): string | null {
+  if (typeof raw !== 'string' || !STABLE_DEVICE_ID_PATTERN.test(raw)) {
+    return null;
+  }
+  return hashDeviceId(raw);
+}
+
 function truncate(value: string | null | undefined, max: number) {
   if (value === null || value === undefined) return null;
   return value.length > max ? value.slice(0, max) : value;
@@ -157,6 +170,26 @@ export class DeviceTrustService implements OnModuleDestroy {
         await this.touch(user.id, deviceKey, context, now);
         // 受信任设备能登录 = 本人设备就在手边，能直接批准，进行中的找回一律取消。
         await this.cancelRecoveriesForActiveDevice(user.id, deviceKey);
+        return { kind: 'trusted' };
+      }
+      // 受信任的老安装续签时登记过这个稳定 ID：同一台手机重装后回来了。只在从没
+      // 见过这个设备 ID 时认 —— 在设备管理里移除过的不借别名复活。
+      const aliasOf = existing
+        ? null
+        : await this.prisma.trustedDevice.findFirst({
+            where: {
+              userId: user.id,
+              stableDeviceKey: deviceKey,
+              revokedAt: null,
+            },
+            select: { id: true },
+          });
+      if (aliasOf) {
+        await this.trust(user.id, deviceKey, context);
+        await this.cancelRecoveriesForActiveDevice(user.id, deviceKey);
+        this.logSecurity('trusted_device_reinstalled', user.id, {
+          trustedDeviceId: aliasOf.id,
+        });
         return { kind: 'trusted' };
       }
     }
@@ -861,9 +894,18 @@ export class DeviceTrustService implements OnModuleDestroy {
     context: SessionContext,
   ): Promise<boolean> {
     const now = new Date();
+    // 老安装顺带登记重装后会用的稳定 ID。只在请求头的设备 ID 就是会话绑定的那台时
+    // 收：只拷走 refresh token 的人没有原设备 ID，不能借续签给自己的设备记信任。
+    const stableDeviceKey =
+      context.stableDeviceKey &&
+      context.deviceKey === deviceKey &&
+      context.stableDeviceKey !== deviceKey
+        ? context.stableDeviceKey
+        : null;
+    const alias = stableDeviceKey ? { stableDeviceKey } : {};
     const touched = await client.trustedDevice.updateMany({
       where: { userId, deviceKey, revokedAt: null },
-      data: touchData(context, now),
+      data: { ...touchData(context, now), ...alias },
     });
     if (touched.count > 0) return true;
     const existing = await client.trustedDevice.findUnique({
@@ -878,6 +920,7 @@ export class DeviceTrustService implements OnModuleDestroy {
         deviceName: truncate(context.deviceName, MAX_DEVICE_NAME_LENGTH),
         lastIp: truncate(context.ip, MAX_IP_LENGTH),
         lastSeenAt: now,
+        ...alias,
       },
     });
     return true;
@@ -1200,8 +1243,14 @@ export class DeviceTrustService implements OnModuleDestroy {
         if (
           (failures._sum.attempts ?? 0) >=
           LOGIN_CHALLENGE_SECURITY_CODE_DAILY_FAILURES
-        )
+        ) {
+          this.logSecurity(
+            'login_challenge_security_code_budget_exhausted',
+            before.userId,
+            { challengeId, failures: failures._sum.attempts },
+          );
           this.throwLocked();
+        }
         if (!(await verify())) {
           const [counted] = await tx.loginChallenge.updateManyAndReturn({
             where: {

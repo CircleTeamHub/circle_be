@@ -40,6 +40,7 @@ import {
 } from './refresh-token.service';
 import { accessTokenTtlSeconds } from './session-revocation.service';
 import { DeviceTrustService, LoginChallengeView } from './device-trust.service';
+import { SecurityQuestionsService } from './security-questions.service';
 import { ConfigService } from '@nestjs/config';
 import { createLoggingConfig } from 'src/logging/logging.config';
 import { logBusinessEvent } from 'src/logging/business-event.logger';
@@ -159,6 +160,7 @@ export class AuthService {
     private fancyNumberService: FancyNumberService,
     private avatarFrames: AvatarFrameService,
     private deviceTrust: DeviceTrustService,
+    private securityQuestions: SecurityQuestionsService,
   ) {
     this.referralRules = readReferralRules(configService);
   }
@@ -371,6 +373,31 @@ export class AuthService {
           errorCode: AuthErrorCode.InvalidCredentials,
         });
       }
+      // 测试环境临时恢复入口：仍先完成密码、账号状态和账号锁内的二次校验。
+      if (
+        this.configService.get<string>('APP_DEPLOY_ENV') === 'preproduction' &&
+        this.configService.get<boolean>('LOGIN_DEVICE_VERIFICATION_BYPASS') ===
+          true
+      ) {
+        if (sessionContext?.deviceKey) {
+          await this.deviceTrust.trust(
+            current.id,
+            sessionContext.deviceKey,
+            sessionContext,
+          );
+          await this.deviceTrust.cancelRecoveriesForActiveDevice(
+            current.id,
+            sessionContext.deviceKey,
+          );
+        }
+        logSecurityEvent(this.logger, {
+          enabled: this.loggingConfig.securityLogOn,
+          securityEvent: 'login_device_verification_bypassed',
+          statusCode: 200,
+          userId: current.id,
+        });
+        return this.finishLogin(current, sessionContext);
+      }
       // 密码对了也不等于能进：陌生设备必须先经受信任设备批准（只发验证单号，不发 token）。
       const decision = await this.deviceTrust.evaluateLogin(
         current,
@@ -535,6 +562,70 @@ export class AuthService {
         throw new ForbiddenException({
           message: '安全码错误',
           errorCode: AuthErrorCode.SecurityCodeInvalid,
+        });
+      }
+      return this.finishChallengeLogin(
+        challenge.userId,
+        challenge.id,
+        challenge.deviceKey,
+        sessionContext,
+      );
+    });
+  }
+
+  /** 新设备：这个账号设置的密保问题（只给发起这张验证单的设备看）。 */
+  async loginChallengeSecurityQuestions(
+    challengeId: string,
+    deviceKey: string | null,
+  ) {
+    const challenge = await this.deviceTrust.loadForSecurityCode(
+      challengeId,
+      deviceKey,
+    );
+    return {
+      questionKeys: await this.securityQuestions.questionKeys(challenge.userId),
+    };
+  }
+
+  /**
+   * 新设备：受信任设备不在身边时回答密保问题。与安全码兜底同一套约束：共用验证单的
+   * 次数上限和账号每日额度，通过后照常提醒其他设备「新设备已登录」。
+   */
+  async verifyLoginChallengeSecurityQuestions(
+    challengeId: string,
+    answers: string[],
+    sessionContext: SessionContext,
+  ) {
+    const challenge = await this.deviceTrust.loadForSecurityCode(
+      challengeId,
+      sessionContext.deviceKey ?? null,
+    );
+    return this.withAccountAuthLock(challenge.userId, async () => {
+      const questionKeys = await this.securityQuestions.questionKeys(
+        challenge.userId,
+      );
+      if (questionKeys.length === 0) {
+        throw new ForbiddenException({
+          message: '未设置密保问题，请在受信任设备上确认登录',
+          errorCode: AuthErrorCode.SecurityQuestionsNotSet,
+        });
+      }
+      const ok = await this.deviceTrust.verifySecurityCodeFallback(
+        challenge.id,
+        sessionContext.deviceKey ?? null,
+        () => this.securityQuestions.verifyAnswers(challenge.userId, answers),
+      );
+      if (!ok) {
+        logSecurityEvent(this.logger, {
+          enabled: this.loggingConfig.securityLogOn,
+          securityEvent: 'login_challenge_security_answers_invalid',
+          statusCode: 403,
+          userId: challenge.userId,
+          metadata: { challengeId: challenge.id },
+        });
+        throw new ForbiddenException({
+          message: '密保答案不正确',
+          errorCode: AuthErrorCode.SecurityAnswersInvalid,
         });
       }
       return this.finishChallengeLogin(
@@ -1465,6 +1556,109 @@ export class AuthService {
         entityType: 'user',
         entityId: userId,
       });
+    });
+  }
+
+  private async emailChangeUser(
+    userId: string,
+    password: string,
+    client: Pick<Prisma.TransactionClient, 'user'> = this.prisma,
+  ) {
+    const user = await client.user.findUnique({ where: { id: userId } });
+    if (!user || user.status !== 'ACTIVE' || user.role === 'ADMIN') {
+      throw new ForbiddenException('Account cannot change email');
+    }
+    if (!(await argon2.verify(user.passwordHash, password))) {
+      throw new UnauthorizedException({
+        message: '当前密码不正确',
+        errorCode: AuthErrorCode.PasswordIncorrect,
+      });
+    }
+    return user;
+  }
+
+  async requestEmailChange(
+    userId: string,
+    rawEmail: string,
+    password: string,
+  ): Promise<void> {
+    const user = await this.emailChangeUser(userId, password);
+    const email = normalizeEmail(rawEmail);
+    if (
+      email === user.email ||
+      (await this.prisma.user.findUnique({
+        where: { email },
+        select: { id: true },
+      }))
+    ) {
+      throw new BadRequestException({
+        message: '邮箱不可用',
+        errorCode: AuthErrorCode.EmailTaken,
+      });
+    }
+    await this.emailVerification.requestCode(email, 'CHANGE_EMAIL');
+  }
+
+  async changeEmail(
+    userId: string,
+    rawEmail: string,
+    password: string,
+    code: string,
+  ): Promise<void> {
+    const email = normalizeEmail(rawEmail);
+    try {
+      await this.withAccountAuthLock(userId, async (tx) => {
+        const user = await this.emailChangeUser(userId, password, tx);
+        if (email === user.email) {
+          throw new BadRequestException({
+            message: '邮箱不可用',
+            errorCode: AuthErrorCode.EmailTaken,
+          });
+        }
+        if (
+          !(await this.emailVerification.verifyCode(
+            email,
+            'CHANGE_EMAIL',
+            code,
+          ))
+        ) {
+          throw new BadRequestException({
+            message: '验证码错误或已过期',
+            errorCode: AuthErrorCode.CodeInvalid,
+          });
+        }
+        await tx.user.update({ where: { id: userId }, data: { email } });
+        await this.refreshTokenService.revokeAllInTransaction(tx, userId);
+      });
+    } catch (error) {
+      if (
+        error instanceof Prisma.PrismaClientKnownRequestError &&
+        error.code === 'P2002'
+      ) {
+        throw new BadRequestException({
+          message: '邮箱不可用',
+          errorCode: AuthErrorCode.EmailTaken,
+        });
+      }
+      throw error;
+    }
+    // The database revocation is authoritative; Redis marker failure must not turn a committed change into a failed save.
+    try {
+      await this.refreshTokenService.revokeAllAccessMarkers(userId);
+    } catch (error) {
+      reportOperationalError(error, {
+        component: 'AuthService',
+        operation: 'changeEmail',
+        kind: 'revocation_marker',
+      });
+    }
+    logBusinessEvent(this.logger, {
+      enabled: this.loggingConfig.businessLogOn,
+      businessEvent: 'auth_change_email_success',
+      actorId: userId,
+      result: 'success',
+      entityType: 'user',
+      entityId: userId,
     });
   }
 

@@ -180,6 +180,27 @@ export class NotificationService {
     return row;
   }
 
+  async getGroupPushPreference(
+    userId: string,
+  ): Promise<{ groupOfflinePushEnabled: boolean }> {
+    const row = await this.prisma.user.findUnique({
+      where: { id: userId },
+      select: { groupOfflinePushEnabled: true },
+    });
+    return { groupOfflinePushEnabled: row?.groupOfflinePushEnabled ?? true };
+  }
+
+  async setGroupPushPreference(
+    userId: string,
+    groupOfflinePushEnabled: boolean,
+  ) {
+    return this.prisma.user.update({
+      where: { id: userId },
+      data: { groupOfflinePushEnabled },
+      select: { groupOfflinePushEnabled: true },
+    });
+  }
+
   async registerPushToken(
     userId: string,
     dto: RegisterPushTokenDto,

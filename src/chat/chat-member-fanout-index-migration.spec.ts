@@ -53,8 +53,10 @@ describe('chat member fanout index migration', () => {
       expect(source).toMatch(/leftAt: null/);
       expect(source).toMatch(/clearedBeforeHeight: \{ lt: /);
     }
-    // 广播只取 userID，推送再要一个 muted —— 两者都在索引尾部。
+    // Member scalar fields stay covered; the user preference comes from the User relation.
     expect(broadcast).toMatch(/select: \{ userID: true \}/);
-    expect(push).toMatch(/select: \{ userID: true, muted: true \}/);
+    expect(push).toMatch(
+      /select:\s*\{\s*userID: true,\s*muted: true,\s*user: \{ select: \{ groupOfflinePushEnabled: true \} \},?\s*\}/,
+    );
   });
 });
