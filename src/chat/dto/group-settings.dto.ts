@@ -6,6 +6,7 @@ import {
   IsString,
   IsUUID,
   MaxLength,
+  ValidateIf,
 } from 'class-validator';
 
 export const GROUP_NOTICE_MAX_LENGTH = 500;
@@ -34,6 +35,12 @@ export class SetGroupNoticeDto {
   @IsString()
   @MaxLength(GROUP_NOTICE_MAX_LENGTH)
   notice!: string;
+
+  @ApiPropertyOptional({ description: '是否在群聊天顶部滚动播报公告' })
+  @Transform(({ obj }: { obj: Record<string, unknown> }) => obj.noticePinned)
+  @ValidateIf((_object, value) => value !== undefined)
+  @IsBoolean()
+  noticePinned?: boolean;
 }
 
 export class SetGroupAvatarDto {

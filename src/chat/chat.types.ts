@@ -381,6 +381,7 @@ export interface ChatConversationDto {
   myAlias: string | null;
   /** 独立群聊公告;圈子群/其他类型为 null(圈子群公告走圈子详情)。 */
   notice: string | null;
+  noticePinned?: boolean;
   /** 独立群聊头像;圈子群走 circle.avatarUrl;其他类型为 null。 */
   avatarUrl: string | null;
   /** 独立群聊的成员上限;圈子群/其他类型为 null(圈子容量走圈子详情)。 */

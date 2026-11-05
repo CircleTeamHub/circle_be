@@ -50,6 +50,7 @@ describe('ChatGroupSettingsService', () => {
   };
   const groupEvents = { recordInTx: jest.fn().mockResolvedValue(undefined) };
   const circleMemberLock = {
+    lock: jest.fn().mockResolvedValue(undefined),
     lockPolicy: jest.fn().mockResolvedValue(undefined),
   };
 
@@ -70,6 +71,7 @@ describe('ChatGroupSettingsService', () => {
     nextHeight: 10,
     muteAllAt: null,
     notice: null,
+    noticePinned: false,
     avatarUrl: null,
     memberCanInvite: true,
     qrJoinEnabled: true,
@@ -319,10 +321,11 @@ describe('ChatGroupSettingsService', () => {
         service.setNotice('admin-1', 'conv-1', '  周末爬山  '),
       ).resolves.toEqual({
         notice: '周末爬山',
+        noticePinned: false,
       });
       expect(prisma.chatConversation.update).toHaveBeenCalledWith({
         where: { id: 'conv-1' },
-        data: { notice: '周末爬山' },
+        data: { notice: '周末爬山', noticePinned: false },
       });
       expect(groupEvents.recordInTx).toHaveBeenCalledWith(prisma, 'conv-1', {
         kind: 'group-notice-updated',
@@ -343,7 +346,84 @@ describe('ChatGroupSettingsService', () => {
         service.setNotice('admin-1', 'conv-1', '   '),
       ).resolves.toEqual({
         notice: null,
+        noticePinned: false,
       });
+    });
+
+    it('saves a pin-only change and broadcasts the existing notice event', async () => {
+      arrange({
+        actor: seat('admin-1', { role: 'ADMIN' }),
+        row: { notice: '公告' },
+      });
+      await expect(
+        service.setNotice('admin-1', 'conv-1', '公告', true),
+      ).resolves.toEqual({ notice: '公告', noticePinned: true });
+      expect(prisma.chatConversation.update).toHaveBeenCalledWith({
+        where: { id: 'conv-1' },
+        data: { notice: '公告', noticePinned: true },
+      });
+      expect(systemMessage.broadcastSystemMessage).toHaveBeenCalledTimes(1);
+    });
+
+    it('turns broadcast off when the notice is cleared', async () => {
+      arrange({
+        actor: seat('owner-1'),
+        row: { notice: '公告', noticePinned: true },
+      });
+      await expect(
+        service.setNotice('owner-1', 'conv-1', '', true),
+      ).resolves.toEqual({ notice: null, noticePinned: false });
+      expect(prisma.chatConversation.update).toHaveBeenCalledWith({
+        where: { id: 'conv-1' },
+        data: { notice: null, noticePinned: false },
+      });
+    });
+
+    it('updates circle description and the shared conversation flag in one transaction', async () => {
+      arrange({
+        actor: seat('admin-1'),
+        row: { circleID: 'circle-1' },
+        circleRole: 'ADMIN',
+      });
+      prisma.circle.findUnique.mockResolvedValue({
+        description: '旧公告',
+        deleted: false,
+      });
+      await expect(
+        service.setNotice('admin-1', 'conv-1', ' 新公告 ', true),
+      ).resolves.toEqual({ notice: '新公告', noticePinned: true });
+      expect(circleMemberLock.lock).toHaveBeenCalledWith(prisma, 'circle-1', [
+        'admin-1',
+      ]);
+      expect(prisma.circle.update).toHaveBeenCalledWith({
+        where: { id: 'circle-1' },
+        data: { description: '新公告' },
+      });
+      expect(prisma.chatConversation.update).toHaveBeenCalledWith({
+        where: { id: 'conv-1' },
+        data: { noticePinned: true },
+      });
+      expect(prisma.$transaction).toHaveBeenCalledTimes(1);
+    });
+
+    it('rejects a member broadcast change before taking a group lock', async () => {
+      arrange({ actor: seat('member-1') });
+      await expect(
+        service.setNotice('member-1', 'conv-1', '公告', true),
+      ).rejects.toBeInstanceOf(ForbiddenException);
+      expect(prisma.$queryRaw).not.toHaveBeenCalled();
+    });
+
+    it('does not publish another notice for unchanged text and broadcast state', async () => {
+      arrange({
+        actor: seat('owner-1'),
+        row: { notice: '公告', noticePinned: true },
+      });
+      await expect(
+        service.setNotice('owner-1', 'conv-1', '公告', true),
+      ).resolves.toEqual({ notice: '公告', noticePinned: true });
+      expect(prisma.chatConversation.update).not.toHaveBeenCalled();
+      expect(systemMessage.broadcastSystemMessage).not.toHaveBeenCalled();
     });
 
     it('rejects avatar URLs that are not served from app storage', async () => {
