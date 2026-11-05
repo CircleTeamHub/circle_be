@@ -87,8 +87,8 @@ function describeError(error: unknown): string {
  *
  * The user-level accessTokensRevokedAt timestamp closes the gap where a rotated
  * refresh-token row remains marked ROTATED after logout-all/password change or
- * token-family reuse. It is checked before the session-row fallback so Redis
- * outages do not turn a broad revocation into a fail-open path.
+ * other account-wide revocations. It is checked before the session-row fallback
+ * so Redis outages do not turn a broad revocation into a fail-open path.
  */
 @Injectable()
 export class SessionVerifier {

@@ -2159,7 +2159,8 @@ describe('AuthService', () => {
     const replay = {
       kind: 'reuse' as const,
       userId: 'uuid-1',
-      sessionIds: ['s-1', 's-2'],
+      familyId: 'family-1',
+      generation: 1,
     };
     mockRefreshTokenService.rotateInTransaction.mockResolvedValueOnce(replay);
     let committed = false;
