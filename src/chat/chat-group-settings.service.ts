@@ -34,6 +34,7 @@ interface LockedGroupRow {
   nextHeight: number;
   muteAllAt: Date | null;
   notice: string | null;
+  noticePinned: boolean;
   avatarUrl: string | null;
   memberCanInvite: boolean;
   qrJoinEnabled: boolean;
@@ -61,7 +62,7 @@ const POLICY_KEYS: readonly GroupPolicyKey[] = [
  *
  * 与 ChatGroupAdminService 同一套锁序:先用锁外快照鉴权(非管理员碰不到会话行锁),
  * 锁后再用锁后快照重做一遍;变更、系统提示、群日志同事务,广播在提交之后。
- * 全员禁言与四个策略两种群都开放;转让/公告/头像只有独立群(圈子群的这些在圈子上)。
+ * 全员禁言、公告和策略开关两种群都开放；转让与头像仍由独立群/圈子各自入口管理。
  */
 @Injectable()
 export class ChatGroupSettingsService {
@@ -233,27 +234,51 @@ export class ChatGroupSettingsService {
     }
   }
 
-  /** 独立群聊公告(群主/管理员;空串 = 清空)。未变化时幂等。 */
+  /** 两种群的公告与播报开关同事务保存；旧客户端省略开关时沿用原值。 */
   async setNotice(
     actorId: string,
     conversationId: string,
     notice: string,
-  ): Promise<{ notice: string | null }> {
-    const trimmed = notice.trim();
-    const next = trimmed.length > 0 ? trimmed : null;
-    const preflight = await this.preflightStandalone(conversationId, actorId);
+    pinned?: boolean,
+  ): Promise<{ notice: string | null; noticePinned: boolean }> {
+    const next = notice.trim() || null;
+    const preflight = await this.preflightGroup(conversationId, actorId);
     this.assertManager(preflight.actorRole);
 
-    const message = await this.prisma.$transaction(async (tx) => {
+    const result = await this.prisma.$transaction(async (tx) => {
       const locked = await this.lockGroup(tx, conversationId);
-      this.assertStandalone(locked);
+      if (locked.circleID)
+        await this.circleMemberLock.lock(tx, locked.circleID, [actorId]);
       this.assertManager(await this.actorRoleInTx(tx, locked, actorId));
-      if ((locked.notice ?? null) === next) return null;
+      const circle = locked.circleID
+        ? await tx.circle.findUnique({
+            where: { id: locked.circleID },
+            select: { description: true, deleted: true },
+          })
+        : null;
+      if (locked.circleID && (!circle || circle.deleted)) {
+        throw new NotFoundException({
+          message: '群聊不存在',
+          errorCode: ChatErrorCode.ConversationNotFound,
+        });
+      }
+      const noticePinned = next !== null && (pinned ?? locked.noticePinned);
+      const previous = circle
+        ? circle.description || null
+        : (locked.notice ?? null);
+      if (previous === next && locked.noticePinned === noticePinned)
+        return { noticePinned, message: null };
+      if (circle && locked.circleID && previous !== next) {
+        await tx.circle.update({
+          where: { id: locked.circleID },
+          data: { description: next ?? '' },
+        });
+      }
       await tx.chatConversation.update({
         where: { id: locked.id },
-        data: { notice: next },
+        data: { ...(circle ? {} : { notice: next }), noticePinned },
       });
-      const inserted =
+      const message =
         await this.systemMessage.insertSystemMessageAfterLockedConversationInTx(
           tx,
           locked.id,
@@ -264,10 +289,10 @@ export class ChatGroupSettingsService {
         kind: 'group-notice-updated',
         actorId,
       });
-      return inserted;
+      return { noticePinned, message };
     });
-    if (message) await this.broadcastAfterCommit(message);
-    return { notice: next };
+    if (result.message) await this.broadcastAfterCommit(result.message);
+    return { notice: next, noticePinned: result.noticePinned };
   }
 
   /**
@@ -482,7 +507,7 @@ export class ChatGroupSettingsService {
     conversationId: string,
   ): Promise<LockedGroupRow> {
     const locked = await tx.$queryRaw<LockedGroupRow[]>`
-      SELECT "id", "type", "circleID", "ownerID", "nextHeight", "muteAllAt", "notice",
+      SELECT "id", "type", "circleID", "ownerID", "nextHeight", "muteAllAt", "notice", "noticePinned",
              "avatarUrl", "memberCanInvite", "qrJoinEnabled", "cardJoinEnabled", "joinApprovalRequired", "membersCanViewRoster",
              "membersCanViewProfiles", "membersCanAddFriends"
       FROM "ChatConversation"

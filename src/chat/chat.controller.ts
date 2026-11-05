@@ -459,16 +459,17 @@ export class ChatController {
 
   @Patch('conversations/:id/notice')
   @Throttle({ default: { limit: 20, ttl: 60_000 } })
-  @ApiOperation({ summary: '独立群聊:群公告(群主/管理员;空串清空)' })
+  @ApiOperation({ summary: '群公告及置顶播报(群主/管理员;空串清空)' })
   setGroupNotice(
     @Req() req: RequestWithUser,
     @Param('id', ParseUUIDPipe) conversationId: string,
     @Body() body: SetGroupNoticeDto,
-  ): Promise<{ notice: string | null }> {
+  ): Promise<{ notice: string | null; noticePinned: boolean }> {
     return this.groupSettings.setNotice(
       req.user.userId,
       conversationId,
       body.notice,
+      body.noticePinned,
     );
   }
 

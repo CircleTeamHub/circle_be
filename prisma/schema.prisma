@@ -2532,6 +2532,8 @@ model ChatConversation {
   muteAllAt              DateTime?
   /// 独立群聊公告（圈子群走 Circle.description）。
   notice                 String?
+  /// 群公告是否固定在聊天顶部滚动播报（独立群与圈子群）。
+  noticePinned           Boolean              @default(false)
   /// 独立群聊头像（圈子群走 Circle.avatarUrl）；只接受本应用存储的 URL。
   avatarUrl              String?
   /// 独立群聊:普通成员能否拉好友进群（圈子群看 Circle.memberCanInvite）。
