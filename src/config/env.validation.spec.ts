@@ -6,6 +6,30 @@ describe('createEnvValidationSchema', () => {
     SECRET: 'test-secret',
   };
 
+  it('defaults the new-device bypass to off and only enables it in preproduction', () => {
+    const schema = createEnvValidationSchema({
+      NODE_ENV: 'development',
+      ALLOW_START_WITHOUT_DB: 'true',
+    });
+    expect(
+      schema.validate(baseEnv).value.LOGIN_DEVICE_VERIFICATION_BYPASS,
+    ).toBe(false);
+    const enabled = schema.validate({
+      ...baseEnv,
+      APP_DEPLOY_ENV: 'preproduction',
+      LOGIN_DEVICE_VERIFICATION_BYPASS: 'true',
+    });
+    expect(enabled.error).toBeUndefined();
+    expect(enabled.value.LOGIN_DEVICE_VERIFICATION_BYPASS).toBe(true);
+    expect(
+      schema.validate({
+        ...baseEnv,
+        APP_DEPLOY_ENV: 'production',
+        LOGIN_DEVICE_VERIFICATION_BYPASS: 'true',
+      }).error,
+    ).toBeDefined();
+  });
+
   const productionBypassEnv = {
     NODE_ENV: 'production',
     DATABASE_URL: 'postgresql://user:pass@localhost:5432/db',
