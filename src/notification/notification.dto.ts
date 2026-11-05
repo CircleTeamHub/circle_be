@@ -437,3 +437,12 @@ export class UpdateCirclePushPreferenceDto {
   @IsBoolean()
   circleOfflinePushEnabled: boolean;
 }
+
+export class UpdateGroupPushPreferenceDto {
+  @ApiProperty({ example: true })
+  @Transform(
+    ({ obj }: { obj: Record<string, unknown> }) => obj.groupOfflinePushEnabled,
+  )
+  @IsBoolean()
+  groupOfflinePushEnabled: boolean;
+}

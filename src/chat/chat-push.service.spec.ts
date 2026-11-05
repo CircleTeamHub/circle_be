@@ -30,6 +30,7 @@ function seat(
     muted: boolean;
     lastReadHeight: number;
     clearedBeforeHeight: number;
+    user: { groupOfflinePushEnabled: boolean };
   }> = {},
 ) {
   return {
@@ -37,6 +38,7 @@ function seat(
     muted: false,
     lastReadHeight: 0,
     clearedBeforeHeight: 0,
+    user: { groupOfflinePushEnabled: true },
     ...overrides,
   };
 }
@@ -137,6 +139,30 @@ describe('ChatPushService', () => {
 
   afterEach(() => {
     jest.useRealTimers();
+  });
+
+  it.each(['GROUP', 'TEMP'])(
+    'does not send %s pushes to users who disabled offline group reminders',
+    async (type) => {
+      prisma.chatConversation.findUnique.mockResolvedValue({
+        type,
+        circleID: null,
+      });
+      prisma.chatMember.findMany.mockResolvedValue([
+        seat('disabled', { user: { groupOfflinePushEnabled: false } }),
+        seat('enabled'),
+      ]);
+      await pushNow(msg());
+      expect(pushedUserIds()).toEqual(['enabled']);
+    },
+  );
+
+  it('group offline preference does not suppress direct messages', async () => {
+    prisma.chatMember.findMany.mockResolvedValue([
+      seat('peer', { user: { groupOfflinePushEnabled: false } }),
+    ]);
+    await pushNow(msg());
+    expect(pushedUserIds()).toEqual(['peer']);
   });
 
   it('attaches a per-recipient unread badge on small fanouts (G-18)', async () => {
@@ -280,7 +306,11 @@ describe('ChatPushService', () => {
           clearedBeforeHeight: { lt: 5 },
         },
         // 只取 ChatMember_fanout_idx 覆盖的列(见 fanout index migration spec)。
-        select: { userID: true, muted: true },
+        select: {
+          userID: true,
+          muted: true,
+          user: { select: { groupOfflinePushEnabled: true } },
+        },
       }),
     );
     expect(pushedUserIds()).toEqual(['u-peer']);

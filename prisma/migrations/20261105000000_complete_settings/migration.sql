@@ -1,0 +1,2 @@
+ALTER TYPE "EmailCodePurpose" ADD VALUE 'CHANGE_EMAIL';
+ALTER TABLE "User" ADD COLUMN "groupOfflinePushEnabled" BOOLEAN NOT NULL DEFAULT true;

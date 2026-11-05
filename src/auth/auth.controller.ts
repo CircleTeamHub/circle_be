@@ -41,6 +41,7 @@ import { RefreshTokenDto } from './dto/refresh-token.dto';
 import { RegisterDto } from './dto/register.dto';
 import { ChangePasswordDto } from './dto/change-password.dto';
 import { ChangeAccountIdDto } from './dto/change-account-id.dto';
+import { ChangeEmailDto, RequestEmailChangeDto } from './dto/change-email.dto';
 import {
   LoginSecurityCodeDto,
   SetLoginSecurityCodeDto,
@@ -535,6 +536,34 @@ export class AuthController {
       dto.oldPassword,
       dto.newPassword,
       req.user.sessionId,
+    );
+  }
+
+  @Post('email/change-request')
+  @UseGuards(JwtGuard, UserThrottlerGuard)
+  @Throttle({ default: { limit: 5, ttl: 60_000 } })
+  @ApiBearerAuth()
+  requestEmailChange(
+    @Body() dto: RequestEmailChangeDto,
+    @Req() req: RequestWithUser,
+  ) {
+    return this.authService.requestEmailChange(
+      req.user.userId,
+      dto.email,
+      dto.password,
+    );
+  }
+
+  @Post('email/change')
+  @UseGuards(JwtGuard, UserThrottlerGuard)
+  @Throttle({ default: { limit: 10, ttl: 60_000 } })
+  @ApiBearerAuth()
+  changeEmail(@Body() dto: ChangeEmailDto, @Req() req: RequestWithUser) {
+    return this.authService.changeEmail(
+      req.user.userId,
+      dto.email,
+      dto.password,
+      dto.code,
     );
   }
 
