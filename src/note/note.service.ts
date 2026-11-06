@@ -572,6 +572,23 @@ export interface NoteSummaryPage {
   hasMore: boolean;
 }
 
+/**
+ * 笔记「有位置」:不是 (0,0) 又没有名称、地址的空壳。早期数据里有这种空壳,
+ * 当成有位置的话聊天卡片会亮着「位置」按钮,发出去却是一条「未知位置」。
+ * 与 note-summary.query.ts 里 hasLocation 的 SQL 同一口径。
+ */
+function isSendableNoteLocation(
+  location: NoteLocationSection | null | undefined,
+): boolean {
+  if (!location) return false;
+  return !(
+    location.latitude === 0 &&
+    location.longitude === 0 &&
+    !location.title?.trim() &&
+    !location.address?.trim()
+  );
+}
+
 @Injectable()
 export class NoteService {
   private readonly logger = new Logger(NoteService.name);
@@ -2667,7 +2684,7 @@ export class NoteService {
       showcaseCount: sections.showcase.items.length,
       contactCount: sections.contacts?.items.length ?? 0,
       groupCardCount: sections.groups?.items.length ?? 0,
-      hasLocation: Boolean(sections.location),
+      hasLocation: isSendableNoteLocation(sections.location),
     };
   }
 

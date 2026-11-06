@@ -589,6 +589,15 @@ describePostgres('note list summaries (PostgreSQL)', () => {
       content: null,
       sections: { text: { content: '　x' }, location: { title: 't' } },
     });
+    // 早期数据里的空壳位置:(0,0) 又没有名称和地址,不算有位置。
+    await note('n-location-null-island', {
+      content: 'x',
+      sections: { location: { latitude: 0, longitude: 0 } },
+    });
+    await note('n-location-null-island-titled', {
+      content: 'x',
+      sections: { location: { latitude: 0, longitude: 0, title: '公司' } },
+    });
     await note('n-section-json-null', {
       content: null,
       contentJson: [{}],
@@ -698,6 +707,12 @@ describePostgres('note list summaries (PostgreSQL)', () => {
     expect(byId.get('n-sections-text')).toMatchObject({
       hasText: false,
       showcaseCount: 2,
+      hasLocation: true,
+    });
+    expect(byId.get('n-location-null-island')).toMatchObject({
+      hasLocation: false,
+    });
+    expect(byId.get('n-location-null-island-titled')).toMatchObject({
       hasLocation: true,
     });
     expect(byId.get('n-media')!.cover).toEqual({
