@@ -1,4 +1,5 @@
-ALTER TABLE "CircleInvitation" ADD COLUMN "source" TEXT NOT NULL DEFAULT 'INVITE';
+-- Historical non-self invitations do not distinguish QR entry from direct invites.
+ALTER TABLE "CircleInvitation" ADD COLUMN "source" TEXT NOT NULL DEFAULT 'UNKNOWN';
 UPDATE "CircleInvitation" SET "source" = 'APPLICATION' WHERE "applicantID" = "inviterID";
 
 CREATE TABLE "ChatGroupJoinBan" (

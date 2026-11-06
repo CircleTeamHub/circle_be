@@ -254,7 +254,14 @@ export class GroupReviewService {
               id,
               action === 'blacklist',
             );
-        } else await this.admissions.act(actorId, id, action);
+        } else {
+          const result = await this.admissions.act(actorId, id, action);
+          if (result.status !== (action === 'approve' ? 'JOINED' : 'REJECTED'))
+            throw new BadRequestException({
+              message: '申请状态已变更，请刷新后查看',
+              errorCode: 'CHAT_GROUP_REQUEST_ALREADY_DECIDED',
+            });
+        }
         results.push({ id, ok: true });
       } catch (error) {
         const response =

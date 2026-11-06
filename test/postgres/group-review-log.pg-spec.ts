@@ -43,6 +43,7 @@ describePostgres('manager review and important group log queries', () => {
         ('foreign', 'other', 'alice', null, 'APPLICATION', 'PENDING', '', '2099-01-01', '2026-11-04', '2026-11-04');
       INSERT INTO "CircleMember" VALUES ('circle', 'alice', 'ACTIVE');
       INSERT INTO "CircleInvitation" VALUES ('circle-request', 'circle', 'alice', 'alice', 'APPROVED', '2026-11-01', '2026-11-02');
+      INSERT INTO "CircleInvitation" VALUES ('legacy-qr-or-invite', 'circle', 'bob', 'owner', 'PENDING', '2026-10-01', '2026-10-01');
       INSERT INTO "ChatGroupEvent" VALUES
         ('log-review', 'group', 'member-joined', 'owner', ARRAY['alice'],
           '{"status":"JOINED","source":"INVITE","inviterId":"owner","operatorId":"manager"}', '2026-11-03'),
@@ -160,6 +161,9 @@ describePostgres('manager review and important group log queries', () => {
       status: 'JOINED',
       inviter: null,
     });
+    expect(
+      page.items.find((item) => item.id === 'legacy-qr-or-invite')?.source,
+    ).toBe('UNKNOWN');
   });
 
   it('searches actual target or operator identities and suppresses routine edits', async () => {

@@ -2353,7 +2353,7 @@ model CircleInvitation {
   circleID                 String
   applicantID              String
   inviterID                String
-  source                   String                 @default("INVITE")
+  source                   String                 @default("UNKNOWN")
   consentNoticeDeliveredAt DateTime?
   /// 同意制投递的认领租约:事务里写 now(),IO 成功或失败后清空;过期后补投接手。
   consentNoticeClaimedAt   DateTime?

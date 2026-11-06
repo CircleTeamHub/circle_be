@@ -36,7 +36,7 @@ function harness(circle = false) {
     },
     $queryRaw: jest.fn().mockResolvedValue([]),
   };
-  const admissions = { act: jest.fn().mockResolvedValue({}) };
+  const admissions = { act: jest.fn().mockResolvedValue({ status: 'JOINED' }) };
   const invitations = {
     adminApprove: jest.fn().mockResolvedValue(undefined),
     adminReject: jest.fn().mockResolvedValue(undefined),
@@ -86,7 +86,7 @@ describe('group application management', () => {
         ? Promise.reject(
             new ForbiddenException({ errorCode: 'CHAT_GROUP_FULL' }),
           )
-        : Promise.resolve({}),
+        : Promise.resolve({ status: 'JOINED' }),
     );
     const result = await h.service.act(
       'owner',
@@ -111,5 +111,19 @@ describe('group application management', () => {
       true,
     );
     expect(h.admissions.act).not.toHaveBeenCalled();
+  });
+
+  it('does not report a stale rejection as successful after another manager approved', async () => {
+    const h = harness();
+    h.admissions.act.mockResolvedValue({ status: 'JOINED' });
+    expect(await h.service.act('owner', 'group', ['good'], 'reject')).toEqual({
+      results: [
+        {
+          id: 'good',
+          ok: false,
+          errorCode: 'CHAT_GROUP_REQUEST_ALREADY_DECIDED',
+        },
+      ],
+    });
   });
 });
