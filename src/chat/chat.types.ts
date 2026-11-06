@@ -317,7 +317,9 @@ export type ChatGroupEventKind =
   | 'policy-changed'
   | 'history-cleared'
   | 'admission-reviewed'
-  | 'member-banned';
+  | 'member-banned'
+  | 'message-pinned'
+  | 'message-unpinned';
 
 /** 群日志一条(GET /chat/conversations/:id/events)。 */
 export interface ChatGroupEventDto {
@@ -409,6 +411,8 @@ export interface ChatConversationDto {
   /** 独立群聊公告;圈子群/其他类型为 null(圈子群公告走圈子详情)。 */
   notice: string | null;
   noticePinned?: boolean;
+  /** 会话里置顶的那条消息;清空水位以下的、已撤回的都不再给。 */
+  pinnedMessage?: ChatPinnedMessageDto | null;
   /** 独立群聊头像;圈子群走 circle.avatarUrl;其他类型为 null。 */
   avatarUrl: string | null;
   /** 独立群聊的成员上限;圈子群/其他类型为 null(圈子容量走圈子详情)。 */
@@ -543,4 +547,12 @@ export interface ChatSyncPageDto {
   readHeight: number;
   /** 本人视角的清空水位 = max(座位, 会话级);水位之下的本地缓存要删掉。 */
   clearedBeforeHeight: number;
+}
+
+/** 置顶消息横幅:点它跳到这条消息。 */
+export interface ChatPinnedMessageDto {
+  messageId: string;
+  height: number;
+  preview: string;
+  pinnedAt: string;
 }

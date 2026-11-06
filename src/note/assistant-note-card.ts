@@ -3,7 +3,7 @@ import type { NoteSummaryDto } from './dto/note.dto';
 type SourceState = {
   sourceNoteId: string;
   status: 'ACTIVE' | 'UNLISTED' | 'DELETED';
-  workStatus: 'WORKING' | 'CLOSED' | null;
+  workStatus: 'WORKING' | 'CLOSED' | 'OFF_SHELF' | null;
 };
 
 /**

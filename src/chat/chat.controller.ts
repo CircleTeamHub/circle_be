@@ -28,6 +28,7 @@ import { UserThrottlerGuard } from 'src/guards/user-throttler.guard';
 import { ChatGroupAdminService } from './chat-group-admin.service';
 import { ChatGroupEventService } from './chat-group-event.service';
 import { ChatGroupSettingsService } from './chat-group-settings.service';
+import { ChatClearRequestService } from './chat-clear-request.service';
 import { GroupAdmissionService } from './group-admission.service';
 import { ChatService } from './chat.service';
 import { ClearHistoryDto } from './dto/clear-history.dto';
@@ -43,6 +44,9 @@ import {
   SetGroupMuteAllDto,
   SetGroupNoticeDto,
   SetMyGroupAliasDto,
+  SetPinnedMessageDto,
+  RequestHistoryClearDto,
+  RespondHistoryClearDto,
   SetMyGroupRemarkDto,
   TransferGroupOwnerDto,
   UpdateGroupPoliciesDto,
@@ -70,6 +74,7 @@ import type {
   ChatMemberDto,
   ChatMemberSilenceDto,
   ChatMessageDto,
+  ChatPinnedMessageDto,
   ChatSyncPageDto,
 } from './chat.types';
 
@@ -99,6 +104,7 @@ export class ChatController {
     private readonly groupAdmin: ChatGroupAdminService,
     private readonly groupEvents: ChatGroupEventService,
     private readonly groupSettings: ChatGroupSettingsService,
+    private readonly clearRequests: ChatClearRequestService,
   ) {}
 
   @Get('conversations')
@@ -492,6 +498,62 @@ export class ChatController {
       body.notice,
       body.noticePinned,
     );
+  }
+
+  @Post('conversations/:id/clear-requests')
+  @Throttle({ default: { limit: 10, ttl: 60_000 } })
+  @ApiOperation({ summary: '私聊:申请双向清空(对方同意后清对方的记录)' })
+  requestHistoryClear(
+    @Req() req: RequestWithUser,
+    @Param('id', ParseUUIDPipe) conversationId: string,
+    @Body() body: RequestHistoryClearDto,
+  ): Promise<{ requestId: string }> {
+    return this.clearRequests.requestClear(
+      req.user.userId,
+      conversationId,
+      body.targetHeight,
+    );
+  }
+
+  @Post('clear-requests/:requestId/respond')
+  @Throttle({ default: { limit: 20, ttl: 60_000 } })
+  @ApiOperation({ summary: '私聊:同意或拒绝对方的双向清空申请' })
+  respondHistoryClear(
+    @Req() req: RequestWithUser,
+    @Param('requestId', ParseUUIDPipe) requestId: string,
+    @Body() body: RespondHistoryClearDto,
+  ): Promise<{ accepted: boolean }> {
+    return this.clearRequests.respond(req.user.userId, requestId, body.accept);
+  }
+
+  @Put('conversations/:id/pinned-message')
+  @Throttle({ default: { limit: 30, ttl: 60_000 } })
+  @ApiOperation({ summary: '置顶一条消息(群主/管理员;私聊双方)' })
+  pinMessage(
+    @Req() req: RequestWithUser,
+    @Param('id', ParseUUIDPipe) conversationId: string,
+    @Body() body: SetPinnedMessageDto,
+  ): Promise<ChatPinnedMessageDto | null> {
+    return this.groupSettings.setPinnedMessage(
+      req.user.userId,
+      conversationId,
+      body.messageId,
+    );
+  }
+
+  @Delete('conversations/:id/pinned-message')
+  @Throttle({ default: { limit: 30, ttl: 60_000 } })
+  @ApiOperation({ summary: '取消置顶(群主/管理员;私聊双方)' })
+  async unpinMessage(
+    @Req() req: RequestWithUser,
+    @Param('id', ParseUUIDPipe) conversationId: string,
+  ): Promise<{ ok: true }> {
+    await this.groupSettings.setPinnedMessage(
+      req.user.userId,
+      conversationId,
+      null,
+    );
+    return { ok: true };
   }
 
   @Patch('conversations/:id/avatar')

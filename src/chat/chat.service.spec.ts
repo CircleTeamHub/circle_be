@@ -599,6 +599,56 @@ describe('ChatService', () => {
     );
   });
 
+  it('stamps note-card preview keys from the note and drops client-supplied ones', async () => {
+    prisma.chatMember.findUnique.mockResolvedValue(membership());
+    prisma.chatMessage.findUnique.mockResolvedValue(null);
+    prisma.$queryRaw.mockResolvedValue([{ nextHeight: 3 }]);
+    prisma.chatMessage.create.mockResolvedValue(createdRow);
+    prisma.chatConversation.update.mockResolvedValue({});
+    prisma.user.findUnique.mockResolvedValue(null);
+    prisma.note.findFirst
+      .mockResolvedValueOnce(null) // group snapshot
+      .mockResolvedValueOnce(null) // source state
+      .mockResolvedValueOnce({
+        media: [
+          { objectKey: 'notes/u1/a.jpg' },
+          { objectKey: 'notes/u1/b.jpg' },
+        ],
+      });
+
+    await service.sendMessage(
+      'u1',
+      sendPayload({
+        type: 'note-card',
+        content: {
+          noteId: 'note-1',
+          previewKeys: ['avatars/u2/private.jpg'],
+          previewUrls: ['https://attacker/x.jpg'],
+        },
+      }),
+    );
+
+    const previewQuery = prisma.note.findFirst.mock.calls[2][0];
+    expect(previewQuery.where).toEqual(
+      expect.objectContaining({
+        id: 'note-1',
+        OR: [{ ownerID: 'u1' }, { available: true, status: 'ACTIVE' }],
+      }),
+    );
+    expect(previewQuery.select.media.where).toEqual({ type: 'IMAGE' });
+    expect(previewQuery.select.media.take).toBe(4);
+    expect(prisma.chatMessage.create).toHaveBeenCalledWith(
+      expect.objectContaining({
+        data: expect.objectContaining({
+          content: {
+            noteId: 'note-1',
+            previewKeys: ['notes/u1/a.jpg', 'notes/u1/b.jpg'],
+          },
+        }),
+      }),
+    );
+  });
+
   it('drops client-supplied card status when the sender cannot read the note', async () => {
     prisma.chatMember.findUnique.mockResolvedValue(membership());
     prisma.chatMessage.findUnique.mockResolvedValue(null);
@@ -4510,6 +4560,11 @@ describe('ChatService', () => {
           }),
         }),
       );
+      // 撤回的消息若正被置顶,横幅随之撤下。
+      expect(prisma.chatConversation.updateMany).toHaveBeenCalledWith({
+        where: { id: 'conv-1', pinnedMessageID: 'm1' },
+        data: expect.objectContaining({ pinnedMessageID: null }),
+      });
       // The durable deletion worker rechecks shared archive references.
       expect(media.drainPendingDeletions).toHaveBeenCalled();
       expect(media.queueDeletions).toHaveBeenCalledWith(prisma, [

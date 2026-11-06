@@ -44,6 +44,10 @@ import type {
 } from 'src/generated/prisma';
 import {
   CHAT_MEDIA_KEY_PREFIX,
+  NOTE_CARD_PREVIEW_KEYS_FIELD,
+  NOTE_CARD_PREVIEW_MAX,
+  NOTE_CARD_PREVIEW_URLS_FIELD,
+  NOTE_MEDIA_KEY_PREFIX,
   CHAT_NOTE_IMPORT_SEGMENT,
   CLIENT_MESSAGE_ID_MAX_LENGTH,
   CLIENT_MESSAGE_TYPES,
@@ -96,7 +100,33 @@ import type {
   VisibleChatMessage,
   ChatSenderInfo,
   ChatSendPayload,
+  ChatPinnedMessageDto,
 } from './chat.types';
+
+/** 会话行上的置顶消息;清空水位以下的(这个人已经看不到那条)不给。 */
+function pinnedMessageOf(
+  conversation: Pick<
+    ChatConversation,
+    | 'pinnedMessageID'
+    | 'pinnedMessageHeight'
+    | 'pinnedMessagePreview'
+    | 'pinnedMessageAt'
+  >,
+  floor: number,
+): ChatPinnedMessageDto | null {
+  if (
+    !conversation.pinnedMessageID ||
+    conversation.pinnedMessageHeight === null ||
+    conversation.pinnedMessageHeight <= floor
+  )
+    return null;
+  return {
+    messageId: conversation.pinnedMessageID,
+    height: conversation.pinnedMessageHeight,
+    preview: conversation.pinnedMessagePreview ?? '',
+    pinnedAt: (conversation.pinnedMessageAt ?? new Date(0)).toISOString(),
+  };
+}
 
 /** 圈子群在会话 DTO 上的展示信息(+ 成员邀请开关,策略 DTO 要用)。 */
 type CircleInfo = {
@@ -217,7 +247,7 @@ type NoteCardPersonalSnapshot = {
 type NoteCardSourceState = {
   /** Root of the collect chain; realtime status events are keyed by it. */
   sourceNoteId: string;
-  workStatus: 'WORKING' | 'CLOSED' | 'UNSET';
+  workStatus: 'WORKING' | 'CLOSED' | 'OFF_SHELF' | 'UNSET';
   publicationStatus: 'ACTIVE' | 'UNLISTED' | 'DELETED';
 };
 
@@ -549,8 +579,29 @@ export class ChatService {
         );
       }
     }
+    // 多图预览的 key 只能由服务端从发送者读得到的笔记里取:读路径会给它们签名。
+    let previewKeys: string[] = [];
+    if (noteId) {
+      try {
+        previewKeys = await this.resolveNoteCardPreviewKeys(
+          senderUserId,
+          noteId,
+        );
+      } catch (error) {
+        this.logger.warn(
+          sanitizeLogValue({
+            event: 'chat_note_card_preview_failed',
+            operation: 'snapshotNoteCardContent',
+            noteId,
+            error,
+          }),
+        );
+      }
+    }
     const {
       [NOTE_CARD_GROUP_SNAPSHOT_KEY]: _untrustedGroup,
+      [NOTE_CARD_PREVIEW_KEYS_FIELD]: _untrustedPreviewKeys,
+      [NOTE_CARD_PREVIEW_URLS_FIELD]: _untrustedPreviewUrls,
       sourceNoteId: _untrustedSourceNoteId,
       workStatus: _untrustedWorkStatus,
       publicationStatus: _untrustedPublicationStatus,
@@ -559,6 +610,9 @@ export class ChatService {
     return {
       ...baseContent,
       ...(sourceState ?? {}),
+      ...(previewKeys.length > 0
+        ? { [NOTE_CARD_PREVIEW_KEYS_FIELD]: previewKeys }
+        : {}),
       ...(user
         ? {
             [NOTE_CARD_PERSONAL_SNAPSHOT_KEY]: {
@@ -572,6 +626,31 @@ export class ChatService {
         ? { [NOTE_CARD_GROUP_SNAPSHOT_KEY]: groupSnapshot }
         : {}),
     };
+  }
+
+  /** 发送者读得到的这条笔记的前几张图片(按笔记里的顺序),只取对象 key。 */
+  private async resolveNoteCardPreviewKeys(
+    senderUserId: string,
+    noteId: string,
+  ): Promise<string[]> {
+    const note = await this.prisma.note.findFirst({
+      where: {
+        id: noteId,
+        status: { not: 'DELETED' },
+        OR: [{ ownerID: senderUserId }, { available: true, status: 'ACTIVE' }],
+      },
+      select: {
+        media: {
+          where: { type: 'IMAGE' },
+          orderBy: { sortOrder: 'asc' },
+          take: NOTE_CARD_PREVIEW_MAX,
+          select: { objectKey: true },
+        },
+      },
+    });
+    return (note?.media ?? [])
+      .map((item) => item.objectKey)
+      .filter((key) => key.startsWith(NOTE_MEDIA_KEY_PREFIX));
   }
 
   /**
@@ -2740,6 +2819,7 @@ export class ChatService {
           : null,
         memberCounts.get(conversationId) ?? null,
       ),
+      pinnedMessage: pinnedMessageOf(member.conversation, floor),
       burnDurationSec: member.burnDurationSec ?? null,
       burnStartedAt: member.burnStartedAt?.toISOString() ?? null,
       peerReadHeight: directPeers.readHeights.get(conversationId) ?? null,
@@ -4361,6 +4441,17 @@ export class ChatService {
         data: { content: {}, revokedAt: new Date(), revokedBy: userId },
       });
       if (claimed.count > 0) {
+        // 撤回的消息不能还挂在置顶横幅上。
+        await tx.chatConversation.updateMany({
+          where: { id: conversationId, pinnedMessageID: messageId },
+          data: {
+            pinnedMessageID: null,
+            pinnedMessageHeight: null,
+            pinnedMessagePreview: null,
+            pinnedMessageAt: null,
+            pinnedMessageByID: null,
+          },
+        });
         await this.media.queueDeletions(tx, mediaKeys);
         await this.media.releaseNoteImportReferences(
           tx,
@@ -4658,6 +4749,13 @@ export class ChatService {
           errorCode: ChatErrorCode.MessageNotFound,
         });
       }
+      // 编辑过的置顶消息,横幅上的预览跟着换成新正文。
+      await tx.chatConversation.updateMany({
+        where: { id: conversationId, pinnedMessageID: messageId },
+        data: {
+          pinnedMessagePreview: messagePreviewText(current.type, nextContent),
+        },
+      });
       return tx.chatMessage.findUniqueOrThrow({
         where: { id: messageId },
         omit: MESSAGE_READ_OMIT,

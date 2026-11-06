@@ -158,6 +158,8 @@ enum NoteStatus {
 enum NoteWorkStatus {
   WORKING
   CLOSED
+  // 场地状态里的「下架」:和开工/打烊并列,只是一个标记,不影响笔记本身的上下架可见性。
+  OFF_SHELF
 }
 
 enum NoteMediaType {
@@ -2535,6 +2537,13 @@ model ChatConversation {
   notice                 String?
   /// 群公告是否固定在聊天顶部滚动播报（独立群与圈子群）。
   noticePinned           Boolean              @default(false)
+  /// 置顶的那条消息(一个会话一条,群里群主/管理员可设,私聊双方可设);撤回即清。
+  /// 预览文案置顶时算好存下,会话列表不必为它再查消息表。
+  pinnedMessageID        String?
+  pinnedMessageHeight    Int?
+  pinnedMessagePreview   String?
+  pinnedMessageAt        DateTime?
+  pinnedMessageByID      String?
   /// 独立群聊头像（圈子群走 Circle.avatarUrl）；只接受本应用存储的 URL。
   avatarUrl              String?
   /// 独立群聊:普通成员能否拉好友进群（圈子群看 Circle.memberCanInvite）。
@@ -2660,6 +2669,26 @@ model ChatMember {
 /// 改群名/公告、清空全群记录、群主转让。与 type='system' 的聊天提示成对写,
 /// 但**独立于聊天记录**:不受清空水位/焚毁影响,后入群的人也能翻到入群前的记录。
 /// userID 类字段同 ChatMessage.senderID,不建 User 外键。
+enum ChatClearRequestStatus {
+  PENDING
+  ACCEPTED
+  DECLINED
+}
+
+/// 私聊「申请双向清空」:申请人先清了自己的,对方同意后服务端把对方也清到同一水位。
+model ChatClearRequest {
+  id             String                 @id @default(uuid())
+  conversationID String
+  requesterID    String
+  /// 申请时申请人清到的位置;对方同意也只清到这里,之后的新消息不受影响。
+  targetHeight   Int
+  status         ChatClearRequestStatus @default(PENDING)
+  createdAt      DateTime               @default(now())
+  respondedAt    DateTime?
+
+  @@index([conversationID, status])
+}
+
 model ChatGroupEvent {
   id             String   @id @default(uuid())
   conversationID String

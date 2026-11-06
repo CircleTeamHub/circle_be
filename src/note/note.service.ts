@@ -10,7 +10,11 @@ import {
   ServiceUnavailableException,
 } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
-import { MembershipErrorCode, NoteErrorCode } from 'src/common/app-error-codes';
+import {
+  ChatErrorCode,
+  MembershipErrorCode,
+  NoteErrorCode,
+} from 'src/common/app-error-codes';
 import { createHash, randomBytes, randomUUID } from 'crypto';
 import { normalizeUserIdAlias } from 'src/user/user-id-alias';
 import { existsSync } from 'fs';
@@ -255,6 +259,9 @@ type NoteGroupRow = {
   name: string;
   sortOrder: number;
 };
+
+/** 一个群绑定的来源笔记一次全列出来;群主手里通常也就几十条。 */
+const GROUP_BOUND_NOTES_MAX = 200;
 
 const NOTE_INCLUDE = {
   media: {
@@ -3538,6 +3545,39 @@ export class NoteService {
     });
 
     return this.toSummaryPage(notes, limit, ownerID);
+  }
+
+  /**
+   * 群成员只读查看本群绑定的来源笔记和它们的场地状态(开工/打烊/下架)。
+   * 只给在座成员;只列上架且可见的来源笔记 —— 作者把笔记本身下架(UNLISTED)
+   * 就是不想让别人看到,这里不能绕过 readableByViewer 的口径。
+   */
+  async listGroupBoundNotes(
+    viewerID: string,
+    conversationID: string,
+  ): Promise<NoteSummaryDto[]> {
+    const seat = await this.prisma.chatMember.findUnique({
+      where: { conversationID_userID: { conversationID, userID: viewerID } },
+      select: { leftAt: true },
+    });
+    if (!seat || seat.leftAt) {
+      throw new ForbiddenException({
+        message: 'Not a member of this conversation',
+        errorCode: ChatErrorCode.NotMember,
+      });
+    }
+    const notes = await this.prisma.note.findMany({
+      where: {
+        sourceConversationID: conversationID,
+        collectedFromNoteID: null,
+        status: 'ACTIVE',
+        available: true,
+      },
+      select: NOTE_SUMMARY_SELECT,
+      orderBy: [{ updatedAt: 'desc' }],
+      take: GROUP_BOUND_NOTES_MAX,
+    });
+    return this.mapSummaryListResolved(notes, viewerID);
   }
 
   /** 助手提醒附带名片用:只读收藏者自己、未删除的那份;没有就返回 null。 */

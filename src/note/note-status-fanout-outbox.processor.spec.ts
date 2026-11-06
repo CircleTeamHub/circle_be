@@ -253,6 +253,26 @@ describe('NoteStatusFanoutOutboxProcessor', () => {
     expect(assistant.sendNoteStatusAlert).not.toHaveBeenCalled();
   });
 
+  it('refreshes cards but does not remind when the venue is marked 下架 (OFF_SHELF)', async () => {
+    const { prisma, realtime, processor, assistant } = createHarness(
+      workStatusJob(),
+      undefined,
+      { ownedNoteSummary: jest.fn().mockResolvedValue(librarySummary) },
+    );
+    prisma.note.findUnique.mockResolvedValue(
+      sourceRow({ workStatus: 'OFF_SHELF' }),
+    );
+    prisma.note.findMany.mockResolvedValue(libraryPage);
+
+    await processor.processPending();
+
+    expect(realtime.broadcastNoteSourceStatusChanged).toHaveBeenCalledWith(
+      expect.anything(),
+      expect.objectContaining({ workStatus: 'OFF_SHELF', status: 'ACTIVE' }),
+    );
+    expect(assistant.sendNoteStatusAlert).not.toHaveBeenCalled();
+  });
+
   it('does not remind about a source that was deleted', async () => {
     const { prisma, processor, assistant } = createHarness(workStatusJob());
     prisma.note.findUnique.mockResolvedValue(

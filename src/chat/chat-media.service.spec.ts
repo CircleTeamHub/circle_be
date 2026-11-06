@@ -86,6 +86,55 @@ describe('ChatMediaService', () => {
     );
   });
 
+  describe('note card previews', () => {
+    it('signs the server-stamped note image keys into preview urls', async () => {
+      const message = dto({
+        type: 'note-card',
+        content: {
+          noteId: 'n1',
+          previewKeys: ['notes/u1/a.jpg', 'notes/u1/b.jpg'],
+        },
+      });
+      await service.attachMediaUrls([message]);
+      expect(message.content.previewUrls).toEqual([
+        'https://signed/notes/u1/a.jpg',
+        'https://signed/notes/u1/b.jpg',
+      ]);
+    });
+
+    it('never signs keys outside the note media prefix, and caps the count', async () => {
+      const message = dto({
+        type: 'note-card',
+        content: {
+          previewKeys: [
+            'avatars/u2/private.jpg',
+            'notes/u1/1.jpg',
+            'notes/u1/2.jpg',
+            'notes/u1/3.jpg',
+            'notes/u1/4.jpg',
+            'notes/u1/5.jpg',
+          ],
+        },
+      });
+      await service.attachMediaUrls([message]);
+      const signedKeys = uploadService.createPresignedGetUrl.mock.calls.map(
+        ([key]) => key,
+      );
+      expect(signedKeys).not.toContain('avatars/u2/private.jpg');
+      expect(message.content.previewUrls).toHaveLength(4);
+    });
+
+    it('drops preview urls that were stored with the message', async () => {
+      const message = dto({
+        type: 'note-card',
+        content: { previewUrls: ['https://attacker/x.jpg'] },
+      });
+      await service.attachMediaUrls([message]);
+      expect(message.content.previewUrls).toBeUndefined();
+      expect(uploadService.createPresignedGetUrl).not.toHaveBeenCalled();
+    });
+  });
+
   it('bounds an issued pending-read media grant before the first read can start a timer', async () => {
     prisma.chatMessage.findMany.mockResolvedValue([
       {

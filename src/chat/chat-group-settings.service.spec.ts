@@ -14,7 +14,8 @@ describe('ChatGroupSettingsService', () => {
       findMany: jest.fn(),
       update: jest.fn(),
     },
-    chatConversation: { update: jest.fn() },
+    chatConversation: { update: jest.fn(), findUnique: jest.fn() },
+    chatMessage: { findUnique: jest.fn() },
     circleMember: { findUnique: jest.fn() },
     circle: { findUnique: jest.fn(), update: jest.fn() },
     user: { findUnique: jest.fn() },
@@ -87,6 +88,7 @@ describe('ChatGroupSettingsService', () => {
     leftAt: null,
     silencedAt: null,
     silencedUntil: null,
+    clearedBeforeHeight: 0,
     ...overrides,
   });
 
@@ -533,6 +535,176 @@ describe('ChatGroupSettingsService', () => {
         response: { errorCode: ChatErrorCode.GroupManagerOnly },
       });
       expect(prisma.$queryRaw).not.toHaveBeenCalled();
+    });
+  });
+  describe('setPinnedMessage', () => {
+    const message = (overrides: Record<string, unknown> = {}) => ({
+      id: 'msg-1',
+      conversationID: 'conv-1',
+      height: 8,
+      type: 'text',
+      content: { text: '周六上午九点集合' },
+      revokedAt: null,
+      deleted: false,
+      burnDurationSec: null,
+      burnExpiresAt: null,
+      ...overrides,
+    });
+    const arrangePin = (params: {
+      actor: ReturnType<typeof seat>;
+      row?: Record<string, unknown>;
+      current?: string | null;
+      target?: Record<string, unknown> | null;
+    }) => {
+      arrange({
+        actor: params.actor,
+        row: { clearedBeforeHeight: 0, ...params.row },
+      });
+      prisma.chatConversation.findUnique.mockResolvedValue({
+        pinnedMessageID: params.current ?? null,
+      });
+      prisma.chatMessage.findUnique.mockResolvedValue(
+        params.target === undefined ? message() : params.target,
+      );
+    };
+
+    it('a group admin pins a message for everyone and the change is announced', async () => {
+      arrangePin({ actor: seat('admin-1', { role: 'ADMIN' }) });
+      const pinned = await service.setPinnedMessage(
+        'admin-1',
+        'conv-1',
+        'msg-1',
+      );
+      expect(pinned).toEqual(
+        expect.objectContaining({
+          messageId: 'msg-1',
+          height: 8,
+          preview: '周六上午九点集合',
+        }),
+      );
+      expect(prisma.chatConversation.update).toHaveBeenCalledWith({
+        where: { id: 'conv-1' },
+        data: expect.objectContaining({
+          pinnedMessageID: 'msg-1',
+          pinnedMessageHeight: 8,
+          pinnedMessagePreview: '周六上午九点集合',
+          pinnedMessageByID: 'admin-1',
+        }),
+      });
+      expect(
+        systemMessage.insertSystemMessageAfterLockedConversationInTx,
+      ).toHaveBeenCalledWith(prisma, 'conv-1', 10, {
+        kind: 'message-pinned',
+        actorId: 'admin-1',
+      });
+      expect(groupEvents.recordInTx).toHaveBeenCalledWith(prisma, 'conv-1', {
+        kind: 'message-pinned',
+        actorId: 'admin-1',
+      });
+      expect(systemMessage.broadcastSystemMessage).toHaveBeenCalled();
+    });
+
+    it('an ordinary group member cannot pin', async () => {
+      arrangePin({ actor: seat('member-1') });
+      await expect(
+        service.setPinnedMessage('member-1', 'conv-1', 'msg-1'),
+      ).rejects.toMatchObject({
+        response: { errorCode: ChatErrorCode.GroupManagerOnly },
+      });
+      expect(prisma.chatConversation.update).not.toHaveBeenCalled();
+    });
+
+    it('either side of a private chat can pin, without a group log entry', async () => {
+      arrangePin({
+        actor: seat('peer-1'),
+        row: { type: 'DIRECT', ownerID: null },
+      });
+      prisma.$queryRaw.mockResolvedValue([{ nextHeight: 4 }]);
+      await service.setPinnedMessage('peer-1', 'conv-1', 'msg-1');
+      expect(prisma.chatConversation.update).toHaveBeenCalled();
+      expect(groupEvents.recordInTx).not.toHaveBeenCalled();
+      expect(
+        systemMessage.insertSystemMessageAfterLockedConversationInTx,
+      ).toHaveBeenCalledWith(prisma, 'conv-1', 4, {
+        kind: 'message-pinned',
+        actorId: 'peer-1',
+      });
+    });
+
+    it.each([
+      ['a revoked message', { revokedAt: new Date() }],
+      ['a deleted message', { deleted: true }],
+      ['a system notice', { type: 'system' }],
+      ['a message from another conversation', { conversationID: 'conv-2' }],
+      ['a message below the cleared history', { height: 0 }],
+      // 预览存在会话行上,焚毁后横幅里还会留着原文。
+      ['a burn-after-reading message', { burnDurationSec: 30 }],
+      ['an expiring message', { burnExpiresAt: new Date() }],
+    ])('refuses to pin %s', async (_case, overrides) => {
+      arrangePin({
+        actor: seat('admin-1', { role: 'ADMIN' }),
+        target: message(overrides),
+      });
+      await expect(
+        service.setPinnedMessage('admin-1', 'conv-1', 'msg-1'),
+      ).rejects.toMatchObject({
+        response: { errorCode: ChatErrorCode.MessageNotFound },
+      });
+      expect(prisma.$transaction).not.toHaveBeenCalled();
+    });
+
+    it('a message revoked while the pin was waiting for the lock is not pinned', async () => {
+      arrangePin({ actor: seat('admin-1', { role: 'ADMIN' }) });
+      prisma.chatMessage.findUnique
+        .mockResolvedValueOnce(message())
+        .mockResolvedValueOnce(message({ revokedAt: new Date() }));
+      await expect(
+        service.setPinnedMessage('admin-1', 'conv-1', 'msg-1'),
+      ).rejects.toMatchObject({
+        response: { errorCode: ChatErrorCode.MessageNotFound },
+      });
+      expect(prisma.chatConversation.update).not.toHaveBeenCalled();
+    });
+
+    it('pinning the already pinned message changes nothing and announces nothing', async () => {
+      arrangePin({
+        actor: seat('admin-1', { role: 'ADMIN' }),
+        current: 'msg-1',
+      });
+      await service.setPinnedMessage('admin-1', 'conv-1', 'msg-1');
+      expect(prisma.chatConversation.update).not.toHaveBeenCalled();
+      expect(systemMessage.broadcastSystemMessage).not.toHaveBeenCalled();
+    });
+
+    it('unpinning clears the pin and announces it', async () => {
+      arrangePin({
+        actor: seat('admin-1', { role: 'ADMIN' }),
+        current: 'msg-1',
+        target: null,
+      });
+      await expect(
+        service.setPinnedMessage('admin-1', 'conv-1', null),
+      ).resolves.toBeNull();
+      expect(prisma.chatConversation.update).toHaveBeenCalledWith({
+        where: { id: 'conv-1' },
+        data: expect.objectContaining({
+          pinnedMessageID: null,
+          pinnedMessageHeight: null,
+        }),
+      });
+      expect(
+        systemMessage.insertSystemMessageAfterLockedConversationInTx,
+      ).toHaveBeenCalledWith(prisma, 'conv-1', 10, {
+        kind: 'message-unpinned',
+        actorId: 'admin-1',
+      });
+    });
+
+    it('someone who left the conversation cannot pin', async () => {
+      arrangePin({ actor: seat('gone-1', { leftAt: new Date() }) });
+      await expect(
+        service.setPinnedMessage('gone-1', 'conv-1', 'msg-1'),
+      ).rejects.toBeInstanceOf(ForbiddenException);
     });
   });
 });

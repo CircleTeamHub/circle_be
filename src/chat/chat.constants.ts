@@ -295,6 +295,17 @@ export const MEDIA_MESSAGE_TYPES: readonly string[] = [
 export const CHAT_MEDIA_KEY_PREFIX = 'chat/';
 
 /**
+ * 笔记卡片的多图预览:发卡时由服务端从笔记里取前几张图片的对象 key 写进
+ * content.previewKeys(客户端带来的同名字段一律丢弃),读消息时现签成 previewUrls。
+ * 这是聊天读路径唯一会签 notes/ 对象的地方,所以只认服务端盖章写入的这个字段、
+ * 只认笔记媒体前缀、最多这么几张。
+ */
+export const NOTE_CARD_PREVIEW_KEYS_FIELD = 'previewKeys';
+export const NOTE_CARD_PREVIEW_URLS_FIELD = 'previewUrls';
+export const NOTE_CARD_PREVIEW_MAX = 4;
+export const NOTE_MEDIA_KEY_PREFIX = 'notes/';
+
+/**
  * 笔记媒体导入聊天时的目标命名空间。
  *
  * 这段路径下的对象 key 是 (viewer, note, media) 的确定性指纹,同一个人重复把
