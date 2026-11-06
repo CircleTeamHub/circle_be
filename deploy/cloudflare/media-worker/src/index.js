@@ -103,9 +103,7 @@ const worker = {
       let object =
         request.method === 'HEAD' || range
           ? await env.MEDIA.head(key)
-          : await env.MEDIA.get(key, {
-              onlyIf: readHeaders,
-            });
+          : await env.MEDIA.get(key);
       if (!object) {
         return new Response(null, {
           status: 404,
@@ -154,7 +152,6 @@ const worker = {
         }
         object = await env.MEDIA.get(key, {
           range: selected,
-          onlyIf: readHeaders,
         });
         if (!object)
           return new Response(null, {
@@ -176,6 +173,11 @@ const worker = {
           status = 206;
         }
       }
+      // Evaluate HTTP conditions locally at seconds precision. R2's date
+      // checks on raw Headers use milliseconds and can reject an equal date.
+      // A metadata-only result must never become a successful cached response.
+      if (!('body' in object) || !object.body)
+        throw new Error('R2 read returned no body');
       if (status === 200) headers.set('Content-Length', String(object.size));
       // R2 results that contain a body are R2ObjectBody instances by API contract.
       const response = new Response(/** @type {R2ObjectBody} */ (object).body, {

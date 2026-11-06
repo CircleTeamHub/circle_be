@@ -201,6 +201,30 @@ test('returns 404 for missing objects without caching the error', async () => {
   assert.equal(f.writes.length, 0);
 });
 
+for (const range of [undefined, 'bytes=2-4']) {
+  test(`does not serve or cache a metadata-only successful read (${range ?? 'full'})`, async (t) => {
+    t.mock.method(console, 'error', () => {});
+    const f = fixture();
+    f.env.MEDIA.get = async () => ({
+      size: 5,
+      httpEtag: '"metadata-only"',
+      uploaded: new Date(),
+      writeHttpMetadata(headers) { headers.set('Content-Type', 'image/png'); },
+      body: undefined,
+    });
+    const response = await worker.fetch(
+      f.request('avatars/u/a.png', { headers: range ? { Range: range } : {} }),
+      f.env,
+      f.ctx,
+    );
+    assert.equal(response.status, 503);
+    assert.equal(response.headers.get('Cache-Control'), 'no-store');
+    assert.equal(await response.text(), '');
+    await Promise.all(f.tasks);
+    assert.equal(f.writes.length, 0);
+  });
+}
+
 test('rejects malformed percent encoding without accessing storage', async () => {
   const f = fixture();
   const response = await worker.fetch(

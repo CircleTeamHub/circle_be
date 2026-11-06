@@ -88,7 +88,49 @@ before(async () => {
   assert.ok(cached, 'image must be cached before warm-path tests');
   assert.equal(await cached.text(), '0123456789');
   await bucket.put('chat/fixture/secret.txt', 'private fixture');
+  for (const [path, contentType] of [
+    ['equal-date.png', 'image/png'],
+    ['equal-date.mp4', 'video/mp4'],
+  ]) {
+    let fixture;
+    for (let attempt = 0; attempt < 3; attempt++) {
+      fixture = await bucket.put(`posts/fixture/${path}`, '0123456789', {
+        httpMetadata: { contentType },
+      });
+      if (fixture.uploaded.getUTCMilliseconds() !== 0) break;
+    }
+    assert.notEqual(fixture.uploaded.getUTCMilliseconds(), 0,
+      'equal-date regression requires a nonzero-millisecond R2 timestamp');
+  }
 });
+
+for (const [path, range, status, body] of [
+  ['equal-date.png', undefined, 200, '0123456789'],
+  ['equal-date.mp4', undefined, 200, '0123456789'],
+  ['equal-date.mp4', 'bytes=2-4', 206, '234'],
+]) {
+  test(`${path} equal If-Unmodified-Since preserves ${range ?? 'full body'} and subsequent reads`, async () => {
+    const url = `https://media.example.test/posts/fixture/${path}`;
+    const head = await runtime.dispatchFetch(url, { method: 'HEAD' });
+    assert.equal(head.status, 200);
+    const headers = { 'If-Unmodified-Since': head.headers.get('Last-Modified') };
+    if (range) headers.Range = range;
+    const response = await runtime.dispatchFetch(url, { headers });
+    assert.equal(response.status, status);
+    assert.equal(response.headers.get('Content-Length'), String(body.length));
+    assert.equal(await response.text(), body);
+    const next = await runtime.dispatchFetch(url);
+    assert.equal(next.status, 200);
+    assert.equal(next.headers.get('Content-Length'), '10');
+    assert.equal(await next.text(), '0123456789');
+    if (path.endsWith('.png')) {
+      const cached = await (await runtime.getCaches()).default.match(url);
+      assert.ok(cached, 'image must be stored in the shared cache');
+      assert.equal(cached.headers.get('Content-Length'), '10');
+      assert.equal(await cached.text(), '0123456789');
+    }
+  });
+}
 
 for (const [name, headers, status] of [
   ['failed If-Match', () => ({ 'If-Match': '"different"' }), 412],
