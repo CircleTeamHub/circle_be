@@ -153,6 +153,7 @@ function buildHarness({
     projectId: string | null;
     provider?: 'expo' | 'jpush';
     platform?: 'ios' | 'android' | 'web';
+    appVersion?: string | null;
   }>;
   circleOfflinePushEnabled?: boolean;
 }) {
@@ -456,7 +457,7 @@ describe('NotificationPushOutboxProcessor (#88 per-token)', () => {
       outcomes: [{ token: 'tok-b', status: 'SENT', ticketId: 'ticket-b' }],
       tokens: [
         { token: 'tok-a', projectId: null },
-        { token: 'tok-b', projectId: null },
+        { token: 'tok-b', projectId: null, appVersion: '1.0.2' },
       ],
     });
 
@@ -465,7 +466,14 @@ describe('NotificationPushOutboxProcessor (#88 per-token)', () => {
     expect(processed).toBe(1);
     // 发送目标只有待投行的 token
     expect(push.sendToTokens).toHaveBeenCalledWith(
-      [{ token: 'tok-b', projectId: null, provider: 'expo' }],
+      [
+        {
+          token: 'tok-b',
+          projectId: null,
+          provider: 'expo',
+          appVersion: '1.0.2',
+        },
+      ],
       { title: 'T', body: 'B', data: {} },
     );
     // ticket 落到投递行

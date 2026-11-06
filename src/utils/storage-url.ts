@@ -84,23 +84,29 @@ export function storagePublicObjectBasesFromConfig(
     config.get<string>('MINIO_PUBLIC_URL') ??
     config.get<string>('MINIO_ENDPOINT');
   const bases = canonical ? [canonical] : [];
-  if (!publicUrl) return bases;
-  const bucket = config.get<string>('MINIO_BUCKET') ?? 'circle';
-  const configuredPathStyle = config.get<boolean | string>(
-    'OBJECT_STORAGE_FORCE_PATH_STYLE',
-  );
-  let forcePathStyle = true;
-  if (typeof configuredPathStyle === 'boolean') {
-    forcePathStyle = configuredPathStyle;
-  } else if (typeof configuredPathStyle === 'string') {
-    forcePathStyle = configuredPathStyle.toLowerCase() === 'true';
+  if (publicUrl) {
+    const bucket = config.get<string>('MINIO_BUCKET') ?? 'circle';
+    const configuredPathStyle = config.get<boolean | string>(
+      'OBJECT_STORAGE_FORCE_PATH_STYLE',
+    );
+    let forcePathStyle = true;
+    if (typeof configuredPathStyle === 'boolean') {
+      forcePathStyle = configuredPathStyle;
+    } else if (typeof configuredPathStyle === 'string') {
+      forcePathStyle = configuredPathStyle.toLowerCase() === 'true';
+    }
+    const direct = buildStoragePublicObjectBase(
+      publicUrl,
+      bucket,
+      forcePathStyle,
+    );
+    if (!bases.includes(direct)) bases.push(direct);
   }
-  const direct = buildStoragePublicObjectBase(
-    publicUrl,
-    bucket,
-    forcePathStyle,
-  );
-  if (!bases.includes(direct)) bases.push(direct);
+  for (const base of config.get<string[]>(
+    'OBJECT_STORAGE_LEGACY_PUBLIC_URLS',
+  ) ?? []) {
+    if (!bases.includes(base)) bases.push(base);
+  }
   return bases;
 }
 

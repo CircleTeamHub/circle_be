@@ -413,7 +413,7 @@ describe('ChatPushService', () => {
       expect(sentPayloads()).toEqual([
         expect.objectContaining({
           priority: 'high',
-          channelId: 'chat',
+          channelId: 'chat_swift_gesture',
           tag: 'conv-1',
           threadId: 'conv-1',
           ttl: 24 * 60 * 60,

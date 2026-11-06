@@ -556,6 +556,193 @@ describe('UploadService', () => {
     expect(service.objectKeyFromPublicUrl(result.fileUrl)).toBe(result.key);
   });
 
+  describe('externally attested R2 bucket configuration', () => {
+    const endpoint = `https://${'a'.repeat(32)}.r2.cloudflarestorage.com`;
+    const config = {
+      NODE_ENV: 'production',
+      MINIO_ENDPOINT: endpoint,
+      MINIO_ACCESS_KEY: 'bucket-only-access-key',
+      MINIO_SECRET_KEY: 'bucket-only-secret-key',
+      MINIO_BUCKET: 'circle',
+      MINIO_PUBLIC_URL: endpoint,
+      OBJECT_STORAGE_REGION: 'auto',
+      OBJECT_STORAGE_FORCE_PATH_STYLE: true,
+      OBJECT_STORAGE_MANAGE_BUCKET: false,
+      OBJECT_STORAGE_BUCKET_CONFIG_VERIFIED_EXTERNALLY: true,
+      OBJECT_STORAGE_DELIVERY_URL: 'https://media.example.com',
+      ALLOWED_ORIGINS: 'https://app.example.com, https://admin.example.com',
+    };
+    const accessDenied = Object.assign(new Error('Access denied'), {
+      name: 'AccessDenied',
+      $metadata: { httpStatusCode: 403 },
+    });
+    const createService = (overrides: Record<string, unknown> = {}) => {
+      const values: Record<string, unknown> = { ...config, ...overrides };
+      const service = new UploadService({
+        get: (key: string) => values[key] ?? null,
+      } as any);
+      const send = jest.fn().mockImplementation((command) => {
+        if (command.constructor.name === 'HeadBucketCommand') return {};
+        throw accessDenied;
+      });
+      const logger = { error: jest.fn(), log: jest.fn(), warn: jest.fn() };
+      Object.assign(service, { client: { send }, logger });
+      return { service, send, logger };
+    };
+    const preflightResponse = (
+      origin: string,
+      headers: Record<string, string> = {},
+      status = 204,
+    ) =>
+      new Response(null, {
+        status,
+        headers: {
+          'access-control-allow-origin': origin,
+          'access-control-allow-methods': 'GET, PUT, HEAD',
+          'access-control-allow-headers': 'content-type, if-none-match',
+          ...headers,
+        },
+      });
+
+    afterEach(() => jest.restoreAllMocks());
+
+    it('boots with bucket-only credentials and verifies every browser origin on the signing object base', async () => {
+      const { service, send } = createService();
+      const fetchMock = jest
+        .spyOn(global, 'fetch')
+        .mockImplementation(async (_url, init) =>
+          preflightResponse((init?.headers as Record<string, string>).Origin),
+        );
+
+      await expect(service.onModuleInit()).resolves.toBeUndefined();
+
+      expect(send).toHaveBeenCalledTimes(1);
+      expect(send.mock.calls[0][0].constructor.name).toBe('HeadBucketCommand');
+      expect(fetchMock).toHaveBeenCalledTimes(2);
+      for (const [index, origin] of [
+        'https://app.example.com',
+        'https://admin.example.com',
+      ].entries()) {
+        expect(fetchMock).toHaveBeenNthCalledWith(
+          index + 1,
+          `${endpoint}/circle/uploads/__cors_probe__`,
+          {
+            method: 'OPTIONS',
+            redirect: 'error',
+            signal: expect.any(AbortSignal),
+            headers: {
+              Origin: origin,
+              'Access-Control-Request-Method': 'PUT',
+              'Access-Control-Request-Headers': 'content-type,if-none-match',
+            },
+          },
+        );
+      }
+      expect(service.objectStoreStatus()).toBe('external-unverified');
+    });
+
+    it.each([
+      { name: 'denied status', headers: {}, status: 403 },
+      {
+        name: 'wrong origin',
+        headers: { 'access-control-allow-origin': 'https://other.example.com' },
+        status: 204,
+      },
+      {
+        name: 'missing PUT',
+        headers: { 'access-control-allow-methods': 'GET' },
+        status: 204,
+      },
+      {
+        name: 'missing if-none-match',
+        headers: { 'access-control-allow-headers': 'content-type' },
+        status: 204,
+      },
+    ])(
+      'rejects a failed browser preflight: $name',
+      async ({ headers, status }) => {
+        const { service, send, logger } = createService();
+        const fetchMock = jest
+          .spyOn(global, 'fetch')
+          .mockResolvedValueOnce(preflightResponse('https://app.example.com'))
+          .mockResolvedValueOnce(
+            preflightResponse('https://admin.example.com', headers, status),
+          );
+
+        await expect(service.onModuleInit()).rejects.toMatchObject({
+          status: 503,
+        });
+
+        expect(send).toHaveBeenCalledTimes(1);
+        expect(fetchMock).toHaveBeenCalledTimes(2);
+        expect(logger.error).toHaveBeenCalledWith(
+          expect.objectContaining({
+            operation: 'verify_upload_cors',
+          }),
+        );
+        expect(service.objectStoreStatus()).toBe('external-unverified');
+      },
+    );
+
+    it('fails closed when the preflight request fails', async () => {
+      const { service, send } = createService();
+      const fetchMock = jest
+        .spyOn(global, 'fetch')
+        .mockRejectedValue(new TypeError('fetch failed'));
+
+      await expect(service.onModuleInit()).rejects.toMatchObject({
+        status: 503,
+      });
+      expect(send).toHaveBeenCalledTimes(1);
+      expect(fetchMock).toHaveBeenCalledTimes(1);
+    });
+
+    it('still requires bucket access before probing CORS', async () => {
+      const { service, send } = createService();
+      send.mockRejectedValue(accessDenied);
+      const fetchMock = jest.spyOn(global, 'fetch');
+
+      await expect(service.onModuleInit()).rejects.toMatchObject({
+        status: 503,
+      });
+      expect(fetchMock).not.toHaveBeenCalled();
+    });
+
+    it('still requires controlled delivery for external production media', async () => {
+      const { service, send } = createService({
+        OBJECT_STORAGE_DELIVERY_URL: undefined,
+      });
+      const fetchMock = jest.spyOn(global, 'fetch');
+
+      await expect(service.onModuleInit()).rejects.toMatchObject({
+        startupCode: 'OBJECT_STORAGE_DELIVERY_URL_REQUIRED',
+      });
+      expect(send).not.toHaveBeenCalled();
+      expect(fetchMock).not.toHaveBeenCalled();
+    });
+
+    it.each([endpoint, 'https://s3.us-east-1.amazonaws.com'])(
+      'does not ignore lifecycle AccessDenied without attestation on %s',
+      async (storageEndpoint) => {
+        const { service, send } = createService({
+          MINIO_ENDPOINT: storageEndpoint,
+          MINIO_PUBLIC_URL: storageEndpoint,
+          OBJECT_STORAGE_BUCKET_CONFIG_VERIFIED_EXTERNALLY: undefined,
+        });
+        const fetchMock = jest.spyOn(global, 'fetch');
+
+        await expect(service.onModuleInit()).rejects.toMatchObject({
+          status: 503,
+        });
+        expect(send).toHaveBeenCalledTimes(2);
+        expect(send.mock.calls[1][0].constructor.name).toBe(
+          'GetBucketLifecycleConfigurationCommand',
+        );
+        expect(fetchMock).not.toHaveBeenCalled();
+      },
+    );
+  });
+
   it('checks but does not mutate an externally managed COS bucket', async () => {
     const send = jest
       .fn()
@@ -1201,6 +1388,52 @@ describe('UploadService', () => {
     expect(
       service.objectKeyFromPublicUrl('https://evil.example.com/notes/u1/a.jpg'),
     ).toBeNull();
+  });
+
+  it('extracts historical COS keys after changing the signing provider and bucket', () => {
+    const service = new UploadService({
+      get: (key: string) =>
+        ({
+          MINIO_ENDPOINT: 'https://account.r2.cloudflarestorage.com',
+          MINIO_ACCESS_KEY: 'test-access-key',
+          MINIO_SECRET_KEY: 'test-secret-key',
+          MINIO_BUCKET: 'circle-media',
+          OBJECT_STORAGE_FORCE_PATH_STYLE: true,
+          OBJECT_STORAGE_DELIVERY_URL: 'https://media.example.com/circle',
+          OBJECT_STORAGE_LEGACY_PUBLIC_URLS: [
+            'https://windnote-1234567890.cos.ap-tokyo.myqcloud.com',
+          ],
+        })[key],
+    } as never);
+
+    expect(
+      service.objectKeyFromPublicUrl(
+        'https://windnote-1234567890.cos.ap-tokyo.myqcloud.com/notes/u1/a.jpg?signature=old',
+      ),
+    ).toBe('notes/u1/a.jpg');
+    expect(
+      service.objectKeyFromPublicUrl(
+        'https://windnote-1234567890.cos.ap-tokyo.myqcloud.com.attacker.test/notes/u1/a.jpg',
+      ),
+    ).toBeNull();
+    expect(
+      service.objectKeyFromPublicUrl(
+        'https://media.example.com/circle/notes/u1/a.jpg',
+      ),
+    ).toBe('notes/u1/a.jpg');
+    expect(
+      service.objectKeyFromPublicUrl(
+        'https://account.r2.cloudflarestorage.com/circle-media/notes/u1/a.jpg',
+      ),
+    ).toBe('notes/u1/a.jpg');
+  });
+
+  it('retains the relative public-base fallback when storage is unconfigured', () => {
+    const service = new UploadService({ get: () => null } as never);
+
+    expect(service.objectKeyFromPublicUrl('/circle/notes/u1/a.jpg')).toBe(
+      'notes/u1/a.jpg',
+    );
   });
 
   it.each([

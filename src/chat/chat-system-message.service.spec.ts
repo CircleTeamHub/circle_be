@@ -3,9 +3,13 @@ import { ChatSystemMessageService } from './chat-system-message.service';
 describe('ChatSystemMessageService', () => {
   const prisma = {
     user: { findUnique: jest.fn() },
-    chatMessage: { aggregate: jest.fn(), create: jest.fn() },
+    chatMessage: {
+      aggregate: jest.fn(),
+      create: jest.fn(),
+      findUnique: jest.fn(),
+    },
     chatConversation: { update: jest.fn() },
-    chatMember: { updateMany: jest.fn() },
+    chatMember: { updateMany: jest.fn(), findMany: jest.fn() },
     $executeRaw: jest.fn(),
     $queryRaw: jest.fn(),
     $transaction: jest.fn(),
@@ -26,10 +30,13 @@ describe('ChatSystemMessageService', () => {
 
   beforeEach(() => {
     jest.clearAllMocks();
+    prisma.chatMessage.create.mockReset();
+    prisma.chatMessage.findUnique.mockReset();
     prisma.$transaction.mockImplementation(
       async (cb: (tx: typeof prisma) => unknown) => cb(prisma),
     );
     prisma.$executeRaw.mockResolvedValue(1);
+    prisma.chatMessage.findUnique.mockResolvedValue(null);
     // G-05:发号走会话行计数器(SELECT..FOR UPDATE),不再做聚合扫描。
     prisma.$queryRaw.mockResolvedValue([{ nextHeight: 7 }]);
     prisma.chatMessage.aggregate.mockResolvedValue({ _max: { height: 7 } });
@@ -40,6 +47,7 @@ describe('ChatSystemMessageService', () => {
     });
     prisma.chatConversation.update.mockResolvedValue({});
     prisma.chatMember.updateMany.mockResolvedValue({ count: 1 });
+    prisma.chatMember.findMany.mockResolvedValue([]);
     prisma.user.findUnique.mockResolvedValue({
       id: 'agent-1',
       nickname: '客服',
@@ -144,6 +152,88 @@ describe('ChatSystemMessageService', () => {
       },
     });
   });
+
+  it('bounds note IDs, keeps text/card distinct and deduplicates retries', async () => {
+    const alertKey = [
+      'windnote-assistant',
+      'note-status',
+      '12345678-1234-4234-8234-123456789abc',
+      'abcdef12-1234-4234-8234-123456789abc',
+      'FROZEN',
+      '2026-11-05T12:34:56.789Z',
+    ].join(':');
+    const rows = new Map<string, Record<string, unknown>>();
+    prisma.chatMessage.findUnique.mockImplementation(({ where }) =>
+      rows.get(where.conversationID_senderID_clientMessageId.clientMessageId),
+    );
+    prisma.chatMessage.create.mockImplementation(({ data }) => {
+      expect(data.clientMessageId.length).toBeLessThanOrEqual(128);
+      const row = {
+        ...data,
+        id: `message-${rows.size}`,
+        revision: 0,
+        createdAt: new Date('2026-11-05T12:34:56.789Z'),
+      };
+      rows.set(data.clientMessageId, row);
+      return row;
+    });
+    const ids: string[] = [];
+    for (const clientMessageId of [
+      alertKey,
+      `${alertKey}:card`,
+      `${alertKey}1`,
+    ]) {
+      const input = {
+        senderID: 'agent-1',
+        type: clientMessageId.endsWith(':card')
+          ? 'note-card'
+          : 'assistant-note-status',
+        clientMessageId,
+        content: {
+          alertKey,
+          sourceNoteId: 'abcdef12-1234-4234-8234-123456789abc',
+        },
+        push: true,
+      };
+      const first = await service.insertServerMessage('conv-1', input);
+      const replay = await service.insertServerMessage('conv-1', input);
+      expect(replay).toEqual(first);
+      expect(first.content).toEqual(input.content);
+      expect(input.clientMessageId).toBe(clientMessageId);
+      ids.push(first.d!);
+    }
+    expect(new Set(ids).size).toBe(3);
+    expect(ids[0]).toBe(
+      '8b13d51e7eb1cb2ce4b0ac6712257cdeb23f8f92f1ace676d03892dd85ba3fda',
+    );
+    expect(prisma.chatMessage.create).toHaveBeenCalledTimes(3);
+    expect(broadcast.emitMessage).toHaveBeenCalledTimes(3);
+    expect(push.onMessageBroadcast).toHaveBeenCalledTimes(3);
+  });
+
+  it.each(['legacy-id', 'x'.repeat(128)])(
+    'preserves legacy ID %s',
+    async (clientMessageId) => {
+      await service.insertServerMessage('conv-1', {
+        senderID: 'agent-1',
+        type: 'text',
+        content: { text: 'hello' },
+        clientMessageId,
+      });
+      expect(prisma.chatMessage.findUnique).toHaveBeenCalledWith({
+        where: {
+          conversationID_senderID_clientMessageId: {
+            conversationID: 'conv-1',
+            senderID: 'agent-1',
+            clientMessageId,
+          },
+        },
+      });
+      expect(prisma.chatMessage.create).toHaveBeenCalledWith({
+        data: expect.objectContaining({ clientMessageId }),
+      });
+    },
+  );
 
   it('can rebroadcast an idempotently reused message after a pre-broadcast failure', async () => {
     const existing = {
