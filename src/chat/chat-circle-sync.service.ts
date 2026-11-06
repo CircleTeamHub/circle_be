@@ -484,8 +484,12 @@ export class ChatCircleSyncService {
    * 幂等:确保圈子的 GROUP 会话存在,且座位与 CircleMember(ACTIVE) 对齐。
    * 返回 conversationId;圈子不存在返回 null。
    * 集合式写法(createMany skipDuplicates / 条件 updateMany),并发重入安全。
+   * actorId:触发解散的人。离座时他收 left(客户端静默收走),其他人收 removed。
    */
-  async ensureCircleConversation(circleId: string): Promise<string | null> {
+  async ensureCircleConversation(
+    circleId: string,
+    options: { actorId?: string } = {},
+  ): Promise<string | null> {
     const circle = await this.prisma.circle.findUnique({
       where: { id: circleId },
       select: { id: true, deleted: true, adminState: true },
@@ -495,7 +499,7 @@ export class ChatCircleSyncService {
     // CircleMember 行仍是 ACTIVE —— 若照常对账,下一轮就会把 leftAt 清回去,
     // 已解散的群聊自己重新开门(建会话端点同理,它走的是同一个方法)。
     if (circle.deleted || DISABLED_ADMIN_STATES.has(circle.adminState)) {
-      await this.evictAllSeats(circleId);
+      await this.evictAllSeats(circleId, options.actorId);
       return null;
     }
 
@@ -569,7 +573,7 @@ export class ChatCircleSyncService {
       // State changed while waiting for the lock. Evict seats after the
       // transaction commits, using the same idempotent cleanup as the fast
       // path above.
-      await this.evictAllSeats(circleId);
+      await this.evictAllSeats(circleId, options.actorId);
       return null;
     }
 
@@ -830,8 +834,13 @@ export class ChatCircleSyncService {
   /**
    * 圈子被解散/停用时收回全部在座座位,并把在线 socket 踢出会话房。
    * 幂等:座位已经清干净就什么都不做,不重复广播。
+   * 发起解散的人收 left 而不是 removed,否则刚按下解散的圈主会被弹「你已被移出」
+   * (与 ChatService.dissolveGroupConversation 同一语义)。
    */
-  private async evictAllSeats(circleId: string): Promise<void> {
+  private async evictAllSeats(
+    circleId: string,
+    actorId?: string,
+  ): Promise<void> {
     const conversation = await this.prisma.chatConversation.findUnique({
       where: { circleID: circleId },
       select: { id: true },
@@ -862,7 +871,7 @@ export class ChatCircleSyncService {
           ),
         );
       this.broadcast.emitConversationChange(userID, {
-        kind: 'removed',
+        kind: userID === actorId ? 'left' : 'removed',
         conversationId: conversation.id,
         userId: userID,
       });

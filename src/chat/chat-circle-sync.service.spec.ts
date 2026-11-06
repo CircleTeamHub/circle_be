@@ -276,6 +276,32 @@ describe('ChatCircleSyncService', () => {
     expect(prisma.chatConversation.create).not.toHaveBeenCalled();
   });
 
+  it('tells the dissolving owner left and everyone else removed', async () => {
+    prisma.circle.findUnique.mockResolvedValue({
+      id: 'circle-1',
+      deleted: true,
+      adminState: 'ACTIVE',
+    });
+    prisma.chatConversation.findUnique.mockResolvedValue({ id: 'conv-1' });
+    prisma.chatMember.findMany.mockResolvedValue([
+      { userID: 'owner' },
+      { userID: 'u2' },
+    ]);
+
+    await service.ensureCircleConversation('circle-1', { actorId: 'owner' });
+
+    expect(broadcast.emitConversationChange).toHaveBeenCalledWith('owner', {
+      kind: 'left',
+      conversationId: 'conv-1',
+      userId: 'owner',
+    });
+    expect(broadcast.emitConversationChange).toHaveBeenCalledWith('u2', {
+      kind: 'removed',
+      conversationId: 'conv-1',
+      userId: 'u2',
+    });
+  });
+
   it('rechecks circle state after the lock before re-seating members', async () => {
     prisma.circle.findUnique
       .mockResolvedValueOnce({

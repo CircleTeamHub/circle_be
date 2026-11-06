@@ -495,9 +495,11 @@ describe('CircleService', () => {
       expect(prisma.userDisplayIcon.deleteMany).toHaveBeenCalledWith({
         where: { circleID: 'circle-1' },
       });
-      // 座位是派生态:deleted 落库之后靠它把全员离座并广播 removed。
+      // 座位是派生态:deleted 落库之后靠它把全员离座并广播 removed;
+      // 解散的人自己收 left,所以要把 actor 传下去。
       expect(chatCircleSync.ensureCircleConversation).toHaveBeenCalledWith(
         'circle-1',
+        { actorId: 'user-1' },
       );
     });
 
