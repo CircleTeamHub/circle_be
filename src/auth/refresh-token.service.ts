@@ -29,6 +29,10 @@ const ACCESS_REVOCATION_CLAIM_LEASE_MS = 2 * 60_000;
 // 一个刷出成千上万条会话的账号每次打开设备管理都把它们全拉回来。
 const ACTIVE_SESSION_LIST_LIMIT = 100;
 const ACCOUNT_SCOPE_KEY = '*';
+// Every transaction here waits on the auth-user advisory lock that APP refresh
+// holds for up to its own 30s budget; Prisma's 2s/5s defaults would make a
+// logout or session revoke fail while a slow refresh still holds the lock.
+const AUTH_USER_LOCK_TX_OPTIONS = { maxWait: 10_000, timeout: 30_000 };
 
 const MS_PER_MINUTE = 60_000;
 const MS_PER_HOUR = 3_600_000;
@@ -595,7 +599,7 @@ export class RefreshTokenService {
         session: await this.createWithClient(tx, userId, context, audience),
         scopeRevocation: null,
       };
-    });
+    }, AUTH_USER_LOCK_TX_OPTIONS);
     if (result.scopeRevocation) {
       await this.notifyScopeRevocationBestEffort(result.scopeRevocation);
     }
@@ -627,7 +631,7 @@ export class RefreshTokenService {
         context,
         audience,
       );
-    });
+    }, AUTH_USER_LOCK_TX_OPTIONS);
     await this.notifyScopeRevocationBestEffort(replacement.scopeRevocation);
     return replacement.session;
   }
@@ -684,7 +688,7 @@ export class RefreshTokenService {
         exemptFamilyId: current?.familyId ?? null,
         generation: scopeState.generation,
       };
-    });
+    }, AUTH_USER_LOCK_TX_OPTIONS);
     if (scopeRevocation) {
       await this.notifyScopeRevocationBestEffort(scopeRevocation);
     }
@@ -724,7 +728,7 @@ export class RefreshTokenService {
         context,
         audience,
       );
-    });
+    }, AUTH_USER_LOCK_TX_OPTIONS);
 
     if (result.kind === 'reuse') return this.rejectReplayedRotation(result);
     return result;
@@ -1076,7 +1080,7 @@ export class RefreshTokenService {
           generation: scopeState.generation,
         },
       };
-    });
+    }, AUTH_USER_LOCK_TX_OPTIONS);
     if (result) {
       await this.notifyScopeRevocationBestEffort(result.scopeRevocation);
     }
@@ -1109,7 +1113,7 @@ export class RefreshTokenService {
         exemptFamilyId: null,
         generation: scopeState.generation,
       };
-    });
+    }, AUTH_USER_LOCK_TX_OPTIONS);
     await this.notifyScopeRevocationBestEffort(scopeRevocation);
   }
 
@@ -1153,7 +1157,7 @@ export class RefreshTokenService {
         exemptFamilyId: current?.familyId ?? null,
         generation: scopeState.generation,
       };
-    });
+    }, AUTH_USER_LOCK_TX_OPTIONS);
     await this.notifyScopeRevocationBestEffort(result);
   }
 }

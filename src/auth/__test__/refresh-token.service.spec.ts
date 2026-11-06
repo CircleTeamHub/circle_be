@@ -544,6 +544,20 @@ describe('RefreshTokenService', () => {
       );
     });
 
+    it('gives logout the same lock-wait budget as the refresh that may hold the lock', async () => {
+      const initial = await service.create('user-1');
+      jest.clearAllMocks();
+
+      await service.revoke(initial.token);
+
+      // Prisma's 2s/5s defaults would fail logout behind a slow refresh while
+      // the app has already cleared its local session.
+      expect(prisma.$transaction).toHaveBeenCalledWith(expect.any(Function), {
+        maxWait: 10_000,
+        timeout: 30_000,
+      });
+    });
+
     it('does nothing for an unknown logout token', async () => {
       const initial = await service.create('user-1');
       jest.clearAllMocks();
