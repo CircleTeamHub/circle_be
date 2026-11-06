@@ -18,13 +18,22 @@ not switched, and no database URL migration has been performed by this work.
 | `OBJECT_STORAGE_FORCE_PATH_STYLE` | `true` |
 | `OBJECT_STORAGE_MANAGE_BUCKET` | `false` |
 | `OBJECT_STORAGE_BUCKET_CONFIG_VERIFIED_EXTERNALLY` | `true`, only after the manual checks below |
-| `OBJECT_STORAGE_LEGACY_PUBLIC_URLS` | `https://windnote-preprod-tokyo-1447743949.cos.ap-tokyo.myqcloud.com` |
+| `OBJECT_STORAGE_LEGACY_PUBLIC_URLS` | `https://windnote-preprod-tokyo-1447743949.cos.ap-tokyo.myqcloud.com,https://api-43-134-85-95.sslip.io/circle` |
 | `OBJECT_STORAGE_DELIVERY_URL` | Expected `https://windnote-media-preprod-delivery.yiboding1998.workers.dev`; confirm the actual deployed endpoint before activation |
 
 Both `MINIO_*URL` values above are the S3 API endpoint without a bucket suffix.
 Path-style signing appends the bucket. Uploads and authorized private reads use
 that endpoint; only permanent public reads use the separate Worker delivery base.
 The Worker URL has no bucket suffix.
+
+Read-only verification of the existing deployment found both `MINIO_ENDPOINT`
+and `MINIO_PUBLIC_URL` set to `https://cos.ap-tokyo.myqcloud.com`, bucket
+`windnote-preprod-tokyo-1447743949`, and `OBJECT_STORAGE_DELIVERY_URL` set to
+`https://api-43-134-85-95.sslip.io/circle`. Preserve both the historical
+bucket-hosted COS base and this current controlled delivery base in the legacy
+list when activating the Worker. The `/circle` path is part of that old base,
+not part of the object key. These configuration observations establish no
+database row counts or actual stored-URL distribution.
 
 The two new backend fields are opt-ins:
 
@@ -111,15 +120,33 @@ the protected operational change record:
 After separately approved publication, verify the actual Worker URL, public
 GET/HEAD, byte ranges and conditional requests. Check private-prefix and unknown
 prefix denials, including query-bearing requests and after warming the public
-cache. Keep the bucket private throughout. Ship the actual delivery origin in
-the frontend's `EXPO_PUBLIC_MEDIA_ORIGINS` before clients receive new public URLs;
-retain origins required by supported clients and rollback. Check private signed
-R2 media rendering under the client's existing media-origin policy as well.
+cache. Keep the bucket private throughout. The frontend's
+`EXPO_PUBLIC_MEDIA_ORIGINS` must include **both** additional origins before clients
+receive R2 URLs:
+
+- `https://windnote-media-preprod-delivery.yiboding1998.workers.dev` for public
+  delivery, after confirming the actual deployed Worker URL.
+- `https://0bea489023c1d8692a19dadaf15dcf95.r2.cloudflarestorage.com` for authorized
+  private signed reads against the R2 S3 API.
+
+Retain origins required by supported clients and rollback. These build-time
+settings require a rebuilt app; a backend configuration change does not update
+installed clients. Gate cutover on compatibility of the supported app versions
+and browser builds with both public Worker and private signed R2 media.
+
+Existing client caches can retain URLs under
+`https://api-43-134-85-95.sslip.io/circle` even after database URLs are rewritten.
+Require a separately reviewed delivery/proxy transition for that exact old base,
+or verified continued service there, covering cached public reads and the same
+private-prefix restrictions. Do not assume database rewriting redirects cached
+URLs or changes that proxy. **This transition is unresolved by this preparation
+work and blocks cutover until its behavior and client compatibility are verified.**
 
 ## Database URL migration preparation
 
 Changing the canonical delivery base affects newly generated public URLs.
-Historical recognition alone leaves existing stored public URLs pointing to COS.
+Historical recognition alone leaves any existing stored public URLs pointing to
+their old delivery bases. No live database inventory/counts are available yet.
 Prepare a separately reviewed, bounded database migration before changing those
 references. Derive the inventory from
 [`StorageAuditService.collectReferencedKeys`](../../src/upload/storage-audit.service.ts),
@@ -134,10 +161,17 @@ These are the mapped URL candidates to inventory, back up and dry-run:
 | Array elements | `Friend.photosA`, `Friend.photosB`, `Friend.pendingPhotosBySender`; `Trace.images`; `TraceComment.images`; `CirclePost.images` |
 | Card avatar leaves | `Note.sections.contacts.items[*].faceURL` / `.avatarUrl`, `Note.sections.groups.items[*].faceURL` / `.avatarUrl`; the same four leaves under `NoteDraft.sections` |
 
-For each candidate, change only a complete URL under the exact historical COS
-object base, with a path-boundary match and one of the five public key prefixes.
-Preserve its key and array order; replace only that source base with the verified
-Worker base. A candidate field is not automatically a public object: private
+Inventory both exact source bases:
+
+- `https://windnote-preprod-tokyo-1447743949.cos.ap-tokyo.myqcloud.com`
+- `https://api-43-134-85-95.sslip.io/circle`
+
+For each candidate, change only a complete URL under one of those exact bases,
+with a path-boundary match and one of the five public key prefixes. Remove the
+entire matched base, including `/circle` for the controlled base, and preserve
+the remaining key and array order when replacing it with the verified Worker
+base. Do not add `/circle` or a bucket suffix to the Worker URL. A candidate
+field is not automatically a public object: private
 `NoteMedia` URLs, unrelated external release URLs, nulls and other unmatched
 values remain unchanged. Flag malformed or query-bearing candidates for review
 rather than transplanting signing parameters onto the public Worker.
@@ -151,11 +185,13 @@ Only the listed card-avatar leaves are in scope for nested JSON changes. Include
 retained/deleted note rows and pending drafts in the inventory, as the storage
 audit does; do not limit the dry run to currently visible content.
 
-The dry run must produce counts by model/field, matched public prefix, unchanged
-and rejected candidates, plus the proposed changed-row count. Review anomalies
-before execution. Keep the detailed before/after mapping (primary key, field or
-array/JSON position, exact previous value) in an access-restricted, encrypted
-artifact outside Git and logs. Store only aggregate results and artifact
+The dry run must produce counts by model/field, each matched source base, public
+prefix, unchanged and rejected candidates, plus the proposed changed-row count.
+Either source-base count may be zero; do not infer it from deployed configuration.
+Review anomalies before execution. Keep the detailed before/after mapping
+(primary key, field or array/JSON position, exact previous value) in an
+access-restricted, encrypted artifact outside Git and logs. Store only aggregate
+results and artifact
 references in the PR/change record.
 
 Require a fresh full PostgreSQL backup and verified restore/recovery procedure
@@ -176,7 +212,9 @@ the code-preparation PR itself.
   Worker verification evidence. Approve the concrete Worker publication and
   cutover change separately; retain the old release and full COS configuration.
 - [ ] Verify bucket privacy, lifecycle, CORS, credential scope, deployed Worker
-  and frontend-origin prerequisites above. Capture safe aggregate evidence.
+  and both frontend-origin prerequisites above, rebuilt-client compatibility,
+  and the reviewed old `/circle` delivery/proxy transition. An unresolved old
+  cached-URL transition blocks this gate. Capture safe aggregate evidence.
 - [ ] Run an incremental source/destination inventory and copy new/changed COS
   objects to R2, preserving keys and metadata and checking full hashes. Account
   for source deletions and export expiry explicitly; do not blindly delete R2
@@ -186,9 +224,10 @@ the code-preparation PR itself.
   uploads and outstanding presigned PUTs (or wait for their expiry), then take
   final inventories, reconcile changes, and confirm zero unexplained drift.
   Keep the pause active through configuration and database validation.
-- [ ] Complete the database dry run, reviewed mapping, full backup and affected
-  field export. Activate the reviewed R2 settings through the secure deployment
-  flow and apply the approved URL mapping in the controlled window. Confirm
+- [ ] Complete the database dry run over both exact old bases, reviewed mapping,
+  full backup and affected field export. Activate the reviewed R2 settings through
+  the secure deployment flow and apply the approved URL mapping in the controlled
+  window. Confirm
   backend readiness and the expected `external-unverified` storage status.
 - [ ] From **each** allowed browser origin, verify OPTIONS and a real presigned
   PUT with `content-type` and `if-none-match`, followed by upload completion and
@@ -218,7 +257,10 @@ metadata verified; account for legitimate expiry/deletion separately. Restoring
 only old environment values would strand media uploaded after cutover. Restore
 the backed-up URL values only where they still equal the applied migration
 values; review later writes separately, including new Worker-based public URLs.
-Rebase those new public references to COS only after their objects exist there.
+Rebase those new public references to the retained COS delivery base (including
+the current controlled `/circle` base where applicable) only after their objects
+exist in COS and that delivery path has been verified. Restore any separately
+changed old-base proxy behavior as part of the reviewed rollback.
 Retain R2/Worker recognition bases as needed for remaining historical references
 and verify supported clients' origins before reopening writes. Prefer the
 reviewed targeted reverse mapping; a full database restore requires an explicit

@@ -124,3 +124,13 @@ a successful Wrangler dry run; see its [implementation plan](2026-11-05-r2-publi
 This checklist records code/documentation preparation only. PR publication is
 pending controller integration; the Worker is not deployed, storage has not
 switched, and the runbook's live-operation checkboxes remain open.
+
+Read-only deployment verification additionally found the current controlled
+delivery base `https://api-43-134-85-95.sslip.io/circle`; retain it alongside
+`https://windnote-preprod-tokyo-1447743949.cos.ap-tokyo.myqcloud.com` in legacy
+recognition and the database dry-run source-base mapping. No live database counts
+are known. The frontend requires rebuilt-client compatibility with both the
+Worker origin and the R2 S3 API origin for private signed reads. Cached old
+`/circle` URLs require a separately reviewed delivery/proxy transition or verified
+continued service; this remains an unresolved cutover prerequisite, not an
+assumed consequence of rewriting database URLs.
