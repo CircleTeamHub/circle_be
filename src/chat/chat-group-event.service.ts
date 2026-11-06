@@ -6,7 +6,7 @@ import {
 } from '@nestjs/common';
 import { ChatErrorCode } from 'src/common/app-error-codes';
 import { PrismaService } from 'src/prisma/prisma.service';
-import type { Prisma } from 'src/generated/prisma';
+import { Prisma } from 'src/generated/prisma';
 import {
   circleGroupRole,
   GROUP_EVENTS_PAGE_DEFAULT,
@@ -34,12 +34,29 @@ interface EventCursor {
   id: string;
 }
 
+export const IMPORTANT_GROUP_EVENT_KINDS = [
+  'group-created',
+  'member-joined',
+  'member-left',
+  'member-removed',
+  'member-role-changed',
+  'member-silenced',
+  'member-unsilenced',
+  'owner-transferred',
+  'history-cleared',
+  'mute-all-changed',
+  'policy-changed',
+  'admission-reviewed',
+  'member-banned',
+] as const;
+const importantKinds = new Set<string>(IMPORTANT_GROUP_EVENT_KINDS);
+
 /**
  * 群事件账本(群日志)。
  *
  * 与 type='system' 的聊天提示成对写,但它是独立的表:不受清空水位/焚毁影响,
  * 后入群的人也能翻到入群前的记录。读侧闸门与成员目录同口径 —— 圈子群只开放
- * 给圈主/管理员(目录本身就是这么限的,日志里全是成员身份),独立群聊全员可读。
+ * 给圈主/管理员；独立群聊也只允许群主/管理员查看。
  *
  * 独立成服务:GroupService / CircleService / ChatCircleSyncService 都要写它,
  * 而它们与 ChatService 之间已有依赖方向,塞进 ChatService 会成环。
@@ -59,6 +76,7 @@ export class ChatGroupEventService {
     conversationId: string,
     input: GroupEventInput,
   ): Promise<void> {
+    if (!importantKinds.has(input.kind)) return;
     await tx.chatGroupEvent.create({
       data: {
         conversationID: conversationId,
@@ -81,11 +99,11 @@ export class ChatGroupEventService {
       await this.recordInTx(this.prisma, conversationId, input);
     } catch (error) {
       // 只记错误类型:底层 message 可能带出群名、用户标识。
-      this.logger.warn(
-        `group event record failed conversation=${conversationId} kind=${input.kind} (${
-          error instanceof Error ? error.name : 'unknown error'
-        })`,
-      );
+      this.logger.warn({
+        event: 'group_event_record_failed',
+        kind: input.kind,
+        errorName: error instanceof Error ? error.name : 'unknown error',
+      });
     }
   }
 
@@ -93,7 +111,12 @@ export class ChatGroupEventService {
   async listEvents(
     userId: string,
     conversationId: string,
-    query: { cursor?: string; limit?: number },
+    query: {
+      cursor?: string;
+      limit?: number;
+      keyword?: string;
+      person?: 'target' | 'actor';
+    },
   ): Promise<ChatGroupEventsPageDto> {
     await this.assertCanViewLog(userId, conversationId);
     const limit = Math.min(
@@ -101,9 +124,35 @@ export class ChatGroupEventService {
       GROUP_EVENTS_PAGE_MAX,
     );
     const cursor = decodeCursor(query.cursor);
+    const keyword = query.keyword?.trim();
+    let matchingIds: string[] | undefined;
+    if (keyword) {
+      const pattern = `%${keyword.replace(/[\\%_]/g, '\\$&')}%`;
+      const personMatch =
+        query.person === 'actor'
+          ? Prisma.sql`u."id" = COALESCE(e."payload"->>'operatorId', e."actorID")`
+          : Prisma.sql`u."id" = ANY(e."targetIDs")`;
+      const matches = await this.prisma.$queryRaw<{ id: string }[]>(Prisma.sql`
+        SELECT e."id" FROM "ChatGroupEvent" e
+        WHERE e."conversationID" = ${conversationId}
+          AND e."kind" IN (${Prisma.join([...IMPORTANT_GROUP_EVENT_KINDS])})
+          ${cursor ? Prisma.sql`AND (e."createdAt", e."id") < (${cursor.createdAt}, ${cursor.id})` : Prisma.empty}
+          AND EXISTS (
+            SELECT 1 FROM "User" u
+            LEFT JOIN "ChatMember" m ON m."userID" = u."id" AND m."conversationID" = e."conversationID"
+            WHERE ${personMatch} AND (
+              u."nickname" ILIKE ${pattern} OR u."accountId" ILIKE ${pattern} OR m."alias" ILIKE ${pattern}
+            )
+          )
+        ORDER BY e."createdAt" DESC, e."id" DESC LIMIT ${limit + 1}
+      `);
+      matchingIds = matches.map((row) => row.id);
+    }
     const rows = await this.prisma.chatGroupEvent.findMany({
       where: {
         conversationID: conversationId,
+        kind: { in: [...IMPORTANT_GROUP_EVENT_KINDS] },
+        ...(matchingIds ? { id: { in: matchingIds } } : {}),
         ...(cursor
           ? {
               OR: [
@@ -116,12 +165,39 @@ export class ChatGroupEventService {
       orderBy: [{ createdAt: 'desc' }, { id: 'desc' }],
       take: limit + 1,
     });
-    const page = rows.slice(0, limit);
+    const page = rows.slice(0, limit).map((row) => {
+      const payload =
+        row.payload &&
+        typeof row.payload === 'object' &&
+        !Array.isArray(row.payload)
+          ? (row.payload as Record<string, unknown>)
+          : null;
+      const review =
+        typeof payload?.status === 'string' &&
+        typeof payload.source === 'string'
+          ? {
+              status: payload.status,
+              source: payload.source,
+              inviterId:
+                typeof payload.inviterId === 'string'
+                  ? payload.inviterId
+                  : null,
+              operatorId:
+                typeof payload.operatorId === 'string'
+                  ? payload.operatorId
+                  : row.actorID,
+              blacklisted: payload.blacklisted === true,
+            }
+          : null;
+      return { ...row, payload, review };
+    });
     const users = await this.resolveUsers(
       conversationId,
       page.flatMap((row) => [
         ...(row.actorID ? [row.actorID] : []),
         ...row.targetIDs,
+        ...(row.review?.inviterId ? [row.review.inviterId] : []),
+        ...(row.review?.operatorId ? [row.review.operatorId] : []),
       ]),
     );
     const events: ChatGroupEventDto[] = page.map((row) => ({
@@ -131,12 +207,24 @@ export class ChatGroupEventService {
         ? (users.get(row.actorID) ?? ghost(row.actorID))
         : null,
       targets: row.targetIDs.map((id) => users.get(id) ?? ghost(id)),
-      payload:
-        row.payload &&
-        typeof row.payload === 'object' &&
-        !Array.isArray(row.payload)
-          ? (row.payload as Record<string, unknown>)
-          : null,
+      payload: row.payload,
+      ...(row.review
+        ? {
+            review: {
+              status: row.review.status,
+              source: row.review.source,
+              inviter: row.review.inviterId
+                ? (users.get(row.review.inviterId) ??
+                  ghost(row.review.inviterId))
+                : null,
+              operator: row.review.operatorId
+                ? (users.get(row.review.operatorId) ??
+                  ghost(row.review.operatorId))
+                : null,
+              blacklisted: row.review.blacklisted,
+            },
+          }
+        : {}),
       createdAt: row.createdAt.toISOString(),
     }));
     const last = page[page.length - 1];
@@ -166,7 +254,8 @@ export class ChatGroupEventService {
       },
       select: {
         leftAt: true,
-        conversation: { select: { type: true, circleID: true } },
+        role: true,
+        conversation: { select: { type: true, circleID: true, ownerID: true } },
       },
     });
     if (!seat || seat.leftAt) {
@@ -175,7 +264,19 @@ export class ChatGroupEventService {
         errorCode: ChatErrorCode.NotMember,
       });
     }
-    if (seat.conversation.type !== 'GROUP' || !seat.conversation.circleID) {
+    if (seat.conversation.type !== 'GROUP') {
+      throw new ForbiddenException({
+        message: '不是群聊',
+        errorCode: ChatErrorCode.NotMember,
+      });
+    }
+    if (!seat.conversation.circleID) {
+      if (seat.conversation.ownerID !== userId && seat.role !== 'ADMIN') {
+        throw new ForbiddenException({
+          message: '仅群主和管理员可查看群日志',
+          errorCode: ChatErrorCode.GroupManagerOnly,
+        });
+      }
       return;
     }
     const membership = await this.prisma.circleMember.findUnique({

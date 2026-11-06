@@ -90,11 +90,12 @@ export type RotatedSession = {
   deviceName: string | null;
 };
 
-/** 已轮换的 token 又被拿来续签:整族已吊销(随事务提交),sessionIds 待吊销 access。 */
+/** 已轮换的 token 又被拿来续签:整族已吊销(随事务提交),待广播族代数。 */
 export type ReplayedRotation = {
   kind: 'reuse';
   userId: string;
-  sessionIds: string[];
+  familyId: string;
+  generation: number;
 };
 
 export type RotationOutcome = RotatedSession | ReplayedRotation;
@@ -757,7 +758,13 @@ export class RefreshTokenService {
     this.logger.warn(
       `Refresh token reuse detected for user ${result.userId}; revoking the affected token family.`,
     );
-    await this.revokeAccessSessions(result.sessionIds);
+    await this.notifyScopeRevocationBestEffort({
+      userId: result.userId,
+      scope: SessionRevocationScope.FAMILY,
+      scopeKey: result.familyId,
+      exemptFamilyId: null,
+      generation: result.generation,
+    });
     throw new UnauthorizedException(
       'Refresh token reuse detected; token family revoked',
     );
@@ -809,14 +816,14 @@ export class RefreshTokenService {
       ) {
         throw new UnauthorizedException('Invalid or expired refresh token');
       }
-      const familySessions = await tx.refreshToken.findMany({
-        where: {
-          userId: record.userId,
-          familyId: record.familyId,
-          expiredAt: { gt: now },
-        },
-        select: { id: true },
-      });
+      // Reuse compromises this family, not the account's independent sessions.
+      // A durable generation also rejects every ROTATED ancestor without Redis.
+      const scopeState = await this.advanceScopeGenerationWithClient(
+        tx,
+        record.userId,
+        SessionRevocationScope.FAMILY,
+        record.familyId,
+      );
       await tx.refreshToken.updateMany({
         where: {
           userId: record.userId,
@@ -828,14 +835,11 @@ export class RefreshTokenService {
           revocationReason: RefreshTokenRevocationReason.TOKEN_FAMILY_REUSE,
         },
       });
-      await tx.user.update({
-        where: { id: record.userId },
-        data: { accessTokensRevokedAt: now },
-      });
       return {
         kind: 'reuse',
         userId: record.userId,
-        sessionIds: familySessions.map(({ id }) => id),
+        familyId: record.familyId,
+        generation: scopeState.generation,
       };
     }
 
@@ -964,7 +968,7 @@ export class RefreshTokenService {
       ...this.revokeAllWrites(this.prisma, userId, new Date()),
     ]);
     // Kill every access token this user already holds (logout-all / ban /
-    // password change / reuse detection), not just their refresh tokens (F-02).
+    // password change), not just their refresh tokens (F-02).
     await this.revocation.revokeUser(userId);
   }
 

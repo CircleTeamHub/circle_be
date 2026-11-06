@@ -21,6 +21,7 @@ import { ChatSystemMessageService } from './chat-system-message.service';
 import { lockUserRelationshipState } from 'src/utils/user-relationship-lock';
 import { withDatabaseWorkBudget } from 'src/utils/database-work-budget';
 import { normalizeUserIdAlias } from 'src/user/user-id-alias';
+import { assertGroupJoinAllowed } from './group-join-ban';
 
 const ACTIVE = ['INVITED', 'PENDING'];
 const TTL = 7 * 24 * 60 * 60 * 1000;
@@ -151,7 +152,24 @@ export class GroupAdmissionService {
     actor: string,
     event: string,
     recipients: string[],
+    blacklisted = false,
   ) {
+    if (event === 'REJECTED') {
+      await tx.chatGroupEvent.create({
+        data: {
+          conversationID: a.conversationID,
+          kind: blacklisted ? 'member-banned' : 'admission-reviewed',
+          actorID: actor,
+          targetIDs: [a.applicantID],
+          payload: {
+            status: 'REJECTED',
+            source: a.kind,
+            inviterId: a.inviterID,
+            blacklisted,
+          },
+        },
+      });
+    }
     for (const recipient of new Set(recipients)) {
       await tx.groupAdmissionDelivery.upsert({
         where: {
@@ -226,6 +244,10 @@ export class GroupAdmissionService {
     );
     const candidates = users.filter((user) => !seated.has(user));
     if (!candidates.length) return;
+    await assertGroupJoinAllowed(tx, {
+      conversationID: group,
+      userID: { in: candidates },
+    });
     await tx.groupAdmission.updateMany({
       where: {
         conversationID: group,
@@ -386,6 +408,7 @@ export class GroupAdmissionService {
         fail('该群暂不接受名片申请', 'CHAT_GROUP_APPLICATION_DISABLED');
       const seat = await this.member(tx, id, user);
       if (seat && !seat.leftAt) return null;
+      await assertGroupJoinAllowed(tx, { conversationID: id, userID: user });
       const existing = await this.current(tx, id, user);
       if (existing) return existing;
       const a = await tx.groupAdmission.create({
@@ -413,6 +436,10 @@ export class GroupAdmissionService {
       : { status: 'JOINED', conversationId: id };
   }
   private async validateSource(tx: Tx, g: Group, a: GroupAdmission) {
+    await assertGroupJoinAllowed(tx, {
+      conversationID: g.id,
+      userID: a.applicantID,
+    });
     if (a.expiresAt <= new Date())
       fail('邀请或申请已过期', 'CHAT_GROUP_INVITATION_INVALID');
     if (a.kind === 'APPLICATION') {
@@ -494,7 +521,13 @@ export class GroupAdmissionService {
           kind: 'member-joined',
           actorID: a.kind === 'INVITE' ? a.inviterID : null,
           targetIDs: [a.applicantID],
-          payload: { via: a.kind.toLowerCase() },
+          payload: {
+            via: a.kind.toLowerCase(),
+            status: 'JOINED',
+            source: a.kind,
+            inviterId: a.inviterID,
+            operatorId: actor,
+          },
         },
       });
     }
@@ -513,6 +546,7 @@ export class GroupAdmissionService {
       const g = await this.lock(tx, row.targetID);
       const seat = await this.member(tx, g.id, user);
       if (seat && !seat.leftAt) return null;
+      await assertGroupJoinAllowed(tx, { conversationID: g.id, userID: user });
       const existing = await this.current(tx, g.id, user);
       if (existing?.status === 'PENDING') return existing;
       // A direct invitation must still be accepted on its own detail page.
@@ -553,7 +587,7 @@ export class GroupAdmissionService {
   async act(
     user: string,
     id: string,
-    action: 'accept' | 'decline' | 'approve' | 'reject',
+    action: 'accept' | 'decline' | 'approve' | 'reject' | 'blacklist',
   ) {
     const before = await this.prisma.groupAdmission.findUnique({
       where: { id },
@@ -567,6 +601,41 @@ export class GroupAdmissionService {
         selfAction ? a.applicantID !== user : !(await this.manager(tx, g, user))
       )
         fail('没有操作权限', 'CHAT_NOT_MEMBER');
+      if (action === 'blacklist') {
+        const seat = await this.member(tx, g.id, a.applicantID);
+        if (seat && !seat.leftAt)
+          throw new ConflictException('该用户已入群，请刷新申请列表');
+        if (a.status !== 'PENDING' && a.status !== 'REJECTED')
+          throw new ConflictException('申请已处理');
+        if (
+          a.status === 'REJECTED' &&
+          (await tx.chatGroupJoinBan.findFirst({
+            where: { conversationID: g.id, userID: a.applicantID },
+            select: { userID: true },
+          }))
+        )
+          return;
+        await tx.chatGroupJoinBan.upsert({
+          where: {
+            conversationID_userID: {
+              conversationID: g.id,
+              userID: a.applicantID,
+            },
+          },
+          create: {
+            conversationID: g.id,
+            userID: a.applicantID,
+            actorID: user,
+          },
+          update: {},
+        });
+        const rejected = await tx.groupAdmission.update({
+          where: { id },
+          data: { status: 'REJECTED', decidedByID: user },
+        });
+        await this.event(tx, rejected, user, 'REJECTED', [a.applicantID], true);
+        return;
+      }
       if (
         a.status === 'JOINED' ||
         (a.status === 'DECLINED' && action === 'decline') ||
@@ -621,7 +690,7 @@ export class GroupAdmissionService {
         }
       }
     });
-    if (action === 'approve' || action === 'reject')
+    if (action === 'approve' || action === 'reject' || action === 'blacklist')
       await this.finishReviewNotices(id);
     void this.flush().catch(() =>
       this.logger.warn({

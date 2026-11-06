@@ -49,7 +49,7 @@ function getIssuedAtMs(payload: RevocablePayload): number | null {
  * authenticated request:
  *
  * - per-user `revokedAfter` epoch — kills every token issued before it
- *   (logout-all, ban, password change, refresh-token reuse);
+ *   (logout-all, ban, password change);
  * - per-session flag — kills one session's access token (single logout).
  *
  * **Tri-state, not silently fail-open.** Redis is optional in this deployment

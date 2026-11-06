@@ -41,6 +41,15 @@ export class SilenceGroupMemberDto {
 }
 
 export class GroupEventsQueryDto {
+  @IsOptional()
+  @IsString()
+  @MaxLength(64)
+  keyword?: string;
+
+  @IsOptional()
+  @IsIn(['target', 'actor'])
+  person?: 'target' | 'actor';
+
   @ApiPropertyOptional({ description: '上一页返回的 nextCursor(不透明)' })
   @IsOptional()
   @IsString()

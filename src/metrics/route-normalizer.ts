@@ -296,6 +296,8 @@ export const DYNAMIC_ROUTE_TEMPLATES = [
   '/api/v1/chat/group-admissions/:id/seen',
   '/api/v1/chat/groups/:id/preview',
   '/api/v1/chat/groups/:id/applications',
+  '/api/v1/chat/groups/:id/reviews',
+  '/api/v1/chat/groups/:id/reviews/actions',
   '/api/v1/circle-invitation/:id/add-verifier',
   '/api/v1/circle-invitation/:id/admin-approve',
   '/api/v1/circle-invitation/:id/eligible-verifiers',

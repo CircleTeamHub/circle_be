@@ -32,7 +32,8 @@ function globToRegExp(pattern) {
 }
 
 function verdict(rules, path) {
-  const rule = rules.find(({ pattern }) => globToRegExp(pattern).test(path));
+  // .gitignore 的目录规则带尾部 /；rsync 的 node_modules 等规则匹配目录名本身。
+  const rule = rules.find(({ pattern }) => globToRegExp(pattern).test(path.replace(/\/$/, '')));
   return rule ? rule.kind : 'include';
 }
 
@@ -72,7 +73,7 @@ function hostLocalPaths() {
     .filter((pattern) => /^\/?\.env/.test(pattern))
     .map((pattern) => `/${pattern.replace(/^\//, '').replace(/\*/g, 'x')}`);
   for (const file of nestedGitignores()) {
-    const dir = dirname(file).slice(ROOT.length);
+    const dir = dirname(file).slice(ROOT.length).replace(/\\/g, '/');
     for (const pattern of patterns(file)) {
       paths.push(`${dir}/${pattern.replace(/^\//, '').replace(/\*/g, 'x')}`);
     }
@@ -91,6 +92,18 @@ test('the host-local file list covers the monitoring secrets', () => {
     '/monitoring/alertmanager/discord.url',
     '/monitoring/prometheus/metrics_token',
     '/monitoring/prometheus/probe-targets/x.yml',
+  ]) {
+    assert.ok(HOST_LOCAL.includes(path), `${path} missing from the derived list`);
+  }
+});
+
+test('the host-local file list covers Worker local state and build directories', () => {
+  for (const path of [
+    '/deploy/cloudflare/media-worker/node_modules/',
+    '/deploy/cloudflare/media-worker/dist/',
+    '/deploy/cloudflare/media-worker/.wrangler/',
+    '/deploy/cloudflare/media-worker/.dev.varsx',
+    '/deploy/cloudflare/media-worker/.envx',
   ]) {
     assert.ok(HOST_LOCAL.includes(path), `${path} missing from the derived list`);
   }
@@ -116,6 +129,10 @@ for (const [name, rules] of [
       '/monitoring/alertmanager/discord.url.example',
       '/monitoring/prometheus/probe-targets/public.yml.example',
       '/monitoring/prometheus/alerts.yml',
+      '/deploy/cloudflare/media-worker/.env.example',
+      '/deploy/cloudflare/media-worker/.env.production.example',
+      '/deploy/cloudflare/media-worker/.dev.vars.example',
+      '/deploy/cloudflare/media-worker/.dev.vars.production.example',
     ]) {
       assert.equal(verdict(rules, path), 'include', `${name} would not update ${path}`);
     }

@@ -394,13 +394,30 @@ describePostgres('AuthService.refresh on a real database', () => {
         `SELECT "accessTokensRevokedAt" FROM "User" WHERE id = $1`,
         [userId],
       );
-      expect(user.rows[0].accessTokensRevokedAt).not.toBeNull();
-      const byId = (a: string, b: string) => a.localeCompare(b);
-      expect(
-        h.revocation.revokeSession.mock.calls
-          .map(([id]) => String(id))
-          .sort(byId),
-      ).toEqual([replayed.id, successor.id].sort(byId));
+      expect(user.rows[0].accessTokensRevokedAt).toBeNull();
+      expect(h.revocation.revokeScope).toHaveBeenCalledWith({
+        userId,
+        scope: 'FAMILY',
+        scopeKey: familyId,
+        exemptFamilyId: null,
+        generation: 1,
+      });
+      const verifier = new SessionVerifier(
+        { checkRevocation: jest.fn().mockResolvedValue('unknown') } as never,
+        main.prisma as never,
+      );
+      const issuedAtMs = Date.now() - 60_000;
+      for (const row of [replayed, successor]) {
+        await expect(
+          verifier.verify({ sub: userId, sid: row.id, issuedAtMs }),
+        ).resolves.toBe('revoked');
+      }
+      await expect(
+        verifier.verify({ sub: userId, sid: otherFamily.id, issuedAtMs }),
+      ).resolves.toBe('active');
+      await expect(h.auth.refresh(otherFamily.raw)).resolves.toHaveProperty(
+        'accessToken',
+      );
     });
 
     it.each([

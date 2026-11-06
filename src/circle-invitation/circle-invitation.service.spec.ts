@@ -56,6 +56,8 @@ describe('CircleInvitationService', () => {
   });
 
   const prisma = {
+    chatGroupJoinBan: { findFirst: jest.fn() },
+    chatGroupEvent: { create: jest.fn() },
     circleInvitation: {
       findUnique: jest.fn(),
       findMany: jest.fn(),
@@ -137,6 +139,7 @@ describe('CircleInvitationService', () => {
 
   beforeEach(async () => {
     jest.resetAllMocks();
+    prisma.chatGroupJoinBan.findFirst.mockResolvedValue(null);
     prisma.$transaction.mockImplementation(async (input: any) => input(prisma));
     privacySettings.canBeInvitedToGroupOrCircle.mockResolvedValue(true);
     notificationService.createCircleInvitationNotification.mockReset();
@@ -1304,6 +1307,8 @@ describe('CircleInvitationService', () => {
         status: true,
         circleID: true,
         applicantID: true,
+        inviterID: true,
+        source: true,
         circle: { select: { groupID: true } },
       },
     });

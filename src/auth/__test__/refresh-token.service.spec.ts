@@ -928,11 +928,114 @@ describe('RefreshTokenService', () => {
     expect(
       records.find((record) => record.id === admin.sessionId)?.revokedAt,
     ).toBeNull();
-    expect(revocation.revokeSession).toHaveBeenCalledWith('session-1');
-    expect(revocation.revokeSession).toHaveBeenCalledWith(rotated.sessionId);
-    expect(revocation.revokeSession).not.toHaveBeenCalledWith(admin.sessionId);
+    expect(revocation.revokeScope).toHaveBeenCalledWith({
+      userId: 'user-1',
+      scope: 'FAMILY',
+      scopeKey: records[0].familyId,
+      exemptFamilyId: null,
+      generation: 1,
+    });
+    expect(revocation.revokeSession).not.toHaveBeenCalled();
     expect(revocation.revokeUser).not.toHaveBeenCalled();
   });
+
+  it.each(['active', 'unknown'])(
+    'keeps independent APP and ADMIN access valid after another family replays with Redis %s',
+    async (redisVerdict) => {
+      const compromised = await service.create('user-1');
+      const replayed = await service.rotate(compromised.token);
+      const rotated = await service.rotate(replayed.token);
+      // An ancestor's refresh TTL can end before its access token does.
+      records[0].expiredAt = new Date(Date.now() - 1);
+      records[0].accessTokenExpiresAt = new Date(Date.now() + 60_000);
+      const otherApp = await service.create('user-1');
+      const admin = await service.create('user-1', undefined, 'ADMIN');
+      jest.clearAllMocks();
+
+      await expect(service.rotate(replayed.token)).rejects.toThrow(
+        /reuse detected/i,
+      );
+
+      const accessTokensRevokedAt =
+        prisma.user.update.mock.calls.find(
+          ([args]) => args.data.accessTokensRevokedAt !== undefined,
+        )?.[0].data.accessTokensRevokedAt ?? null;
+      const verifier = new SessionVerifier(
+        { checkRevocation: jest.fn().mockResolvedValue(redisVerdict) } as any,
+        {
+          $queryRaw: jest.fn((query) => {
+            const record = records.find((row) => row.id === query.values[1]);
+            return Promise.resolve([
+              sessionVerificationRow(
+                { status: 'ACTIVE', accessTokensRevokedAt },
+                record,
+                matchingScopeGenerations(
+                  'user-1',
+                  record,
+                  scopeGenerations.values(),
+                ),
+              ),
+            ]);
+          }),
+        } as any,
+      );
+      const issuedAtMs = Date.now() - 1_000;
+      for (const session of [otherApp, admin]) {
+        await expect(
+          verifier.verify({
+            sub: 'user-1',
+            sid: session.sessionId,
+            issuedAtMs,
+          }),
+        ).resolves.toBe('active');
+      }
+      for (const session of [compromised, replayed, rotated]) {
+        await expect(
+          verifier.verify({
+            sub: 'user-1',
+            sid: session.sessionId,
+            issuedAtMs,
+          }),
+        ).resolves.toBe('revoked');
+      }
+      expect(prisma.user.update).not.toHaveBeenCalled();
+      await expect(service.rotate(otherApp.token)).resolves.toMatchObject({
+        kind: 'rotated',
+      });
+    },
+  );
+
+  it.each(['false', 'throw'])(
+    'retries a reused-family broadcast after a %s delivery failure',
+    async (failure) => {
+      const { token } = await service.create('user-1');
+      await service.rotate(token);
+      if (failure === 'false')
+        revocation.revokeScope.mockResolvedValueOnce(false);
+      else
+        revocation.revokeScope.mockRejectedValueOnce(new Error('unavailable'));
+
+      await expect(service.rotate(token)).rejects.toThrow(/reuse detected/i);
+      expect([...scopeGenerations.values()]).toEqual([
+        expect.objectContaining({
+          scope: 'FAMILY',
+          generation: 1,
+          notificationPending: true,
+        }),
+      ]);
+      expect(records[1].revocationReason).toBe('TOKEN_FAMILY_REUSE');
+
+      await service.flushPendingAccessRevocations();
+      expect([...scopeGenerations.values()]).toEqual([
+        expect.objectContaining({
+          scope: 'FAMILY',
+          generation: 1,
+          notificationPending: false,
+        }),
+      ]);
+      expect(revocation.revokeScope).toHaveBeenCalledTimes(2);
+    },
+  );
 
   it('revokes live access sessions for reused families even when refresh rows predate the current access TTL', async () => {
     const { token: oldToken } = await service.create('user-1');
@@ -943,7 +1046,12 @@ describe('RefreshTokenService', () => {
 
     await expect(service.rotate(oldToken)).rejects.toThrow(/reuse detected/i);
 
-    expect(revocation.revokeSession).toHaveBeenCalledWith(rotated.sessionId);
+    expect(revocation.revokeScope).toHaveBeenCalledWith(
+      expect.objectContaining({
+        scope: 'FAMILY',
+        scopeKey: records[0].familyId,
+      }),
+    );
   });
 
   it('rejects an expired rotated token without revoking its family again', async () => {
@@ -1458,7 +1566,12 @@ describe('RefreshTokenService', () => {
 
     await expect(service.rotate(raw)).rejects.toThrow(/reuse detected/i);
 
-    expect(revocation.revokeSession).toHaveBeenCalledWith('session-1');
+    expect(revocation.revokeScope).toHaveBeenCalledWith(
+      expect.objectContaining({
+        scope: 'FAMILY',
+        scopeKey: records[0].familyId,
+      }),
+    );
   });
 
   it('creates ADMIN sessions under the single-device lock and rechecks the setting', async () => {
@@ -1552,17 +1665,23 @@ describe('RefreshTokenService', () => {
       expect(outcome).toEqual({
         kind: 'reuse',
         userId: 'user-1',
-        sessionIds: ['session-1', 'session-2'],
+        familyId: records[0].familyId,
+        generation: 1,
       });
       expect(records[1].revocationReason).toBe('TOKEN_FAMILY_REUSE');
       // access 吊销标记要等调用方提交后由 rejectReplayedRotation 写。
-      expect(revocation.revokeSession).not.toHaveBeenCalled();
+      expect(revocation.revokeScope).not.toHaveBeenCalled();
 
       await expect(
         service.rejectReplayedRotation(outcome as never),
       ).rejects.toThrow('Refresh token reuse detected; token family revoked');
-      expect(revocation.revokeSession).toHaveBeenCalledWith('session-1');
-      expect(revocation.revokeSession).toHaveBeenCalledWith('session-2');
+      expect(revocation.revokeScope).toHaveBeenCalledWith({
+        userId: 'user-1',
+        scope: 'FAMILY',
+        scopeKey: records[0].familyId,
+        exemptFamilyId: null,
+        generation: 1,
+      });
     });
 
     it('still rejects revoked and expired tokens without writing', async () => {
