@@ -8,6 +8,7 @@ import {
 } from 'src/referral/referral.constants';
 import { parseDurationMilliseconds } from 'src/utils/duration';
 import { describeEmailCodeBypass } from 'src/auth/email-code-bypass';
+import { normalizeStorageDeliveryBase } from 'src/utils/storage-url';
 
 type EnvLike = NodeJS.ProcessEnv | Record<string, unknown>;
 
@@ -342,6 +343,20 @@ export function createEnvValidationSchema(
       then: objectDeliveryUrlSchema(['https']).optional(),
       otherwise: objectDeliveryUrlSchema(['http', 'https']).optional(),
     }),
+    OBJECT_STORAGE_LEGACY_PUBLIC_URLS: Joi.string()
+      .empty('')
+      .custom((value: string, helpers) => {
+        const bases = value
+          .split(',')
+          .map((item) => item.trim())
+          .filter(Boolean)
+          .map((item) => normalizeStorageDeliveryBase(item));
+        if (bases.some((base) => base === null)) {
+          return helpers.error('any.invalid');
+        }
+        return [...new Set(bases)];
+      })
+      .default([]),
     MEDIA_IMAGE_TRANSFORM_URL: Joi.when('NODE_ENV', {
       is: 'production',
       then: imageTransformUrlSchema(['https']).optional(),

@@ -1203,6 +1203,52 @@ describe('UploadService', () => {
     ).toBeNull();
   });
 
+  it('extracts historical COS keys after changing the signing provider and bucket', () => {
+    const service = new UploadService({
+      get: (key: string) =>
+        ({
+          MINIO_ENDPOINT: 'https://account.r2.cloudflarestorage.com',
+          MINIO_ACCESS_KEY: 'test-access-key',
+          MINIO_SECRET_KEY: 'test-secret-key',
+          MINIO_BUCKET: 'circle-media',
+          OBJECT_STORAGE_FORCE_PATH_STYLE: true,
+          OBJECT_STORAGE_DELIVERY_URL: 'https://media.example.com/circle',
+          OBJECT_STORAGE_LEGACY_PUBLIC_URLS: [
+            'https://windnote-1234567890.cos.ap-tokyo.myqcloud.com',
+          ],
+        })[key],
+    } as never);
+
+    expect(
+      service.objectKeyFromPublicUrl(
+        'https://windnote-1234567890.cos.ap-tokyo.myqcloud.com/notes/u1/a.jpg?signature=old',
+      ),
+    ).toBe('notes/u1/a.jpg');
+    expect(
+      service.objectKeyFromPublicUrl(
+        'https://windnote-1234567890.cos.ap-tokyo.myqcloud.com.attacker.test/notes/u1/a.jpg',
+      ),
+    ).toBeNull();
+    expect(
+      service.objectKeyFromPublicUrl(
+        'https://media.example.com/circle/notes/u1/a.jpg',
+      ),
+    ).toBe('notes/u1/a.jpg');
+    expect(
+      service.objectKeyFromPublicUrl(
+        'https://account.r2.cloudflarestorage.com/circle-media/notes/u1/a.jpg',
+      ),
+    ).toBe('notes/u1/a.jpg');
+  });
+
+  it('retains the relative public-base fallback when storage is unconfigured', () => {
+    const service = new UploadService({ get: () => null } as never);
+
+    expect(service.objectKeyFromPublicUrl('/circle/notes/u1/a.jpg')).toBe(
+      'notes/u1/a.jpg',
+    );
+  });
+
   it.each([
     'https://other-bucket.cos.ap-tokyo.myqcloud.com',
     'https://windnote-1234567890.cos.accelerate.myqcloud.com/media',

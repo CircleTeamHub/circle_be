@@ -198,6 +198,58 @@ describe('createEnvValidationSchema', () => {
     expect(value.OBJECT_STORAGE_REGION).toBe('us-east-1');
     expect(value.OBJECT_STORAGE_FORCE_PATH_STYLE).toBe(true);
     expect(value.OBJECT_STORAGE_MANAGE_BUCKET).toBe(true);
+    expect(value.OBJECT_STORAGE_LEGACY_PUBLIC_URLS).toEqual([]);
+  });
+
+  it('normalizes and deduplicates comma-separated historical storage bases', () => {
+    const env = {
+      ...baseEnv,
+      DATABASE_URL: 'postgresql://user:pass@localhost:5432/db',
+      OBJECT_STORAGE_LEGACY_PUBLIC_URLS:
+        ' https://WINDNOTE-1234567890.cos.ap-tokyo.myqcloud.com///, , http://minio:9000/circle/, https://windnote-1234567890.cos.ap-tokyo.myqcloud.com ',
+    };
+
+    const { error, value } = createEnvValidationSchema(env).validate(env);
+
+    expect(error).toBeUndefined();
+    expect(value.OBJECT_STORAGE_LEGACY_PUBLIC_URLS).toEqual([
+      'https://windnote-1234567890.cos.ap-tokyo.myqcloud.com',
+      'http://minio:9000/circle',
+    ]);
+  });
+
+  it.each(['', '  ,  , '])(
+    'normalizes an empty historical storage list %j to an array',
+    (legacyBases) => {
+      const env = {
+        ...baseEnv,
+        DATABASE_URL: 'postgresql://user:pass@localhost:5432/db',
+        OBJECT_STORAGE_LEGACY_PUBLIC_URLS: legacyBases,
+      };
+
+      const { error, value } = createEnvValidationSchema(env).validate(env);
+
+      expect(error).toBeUndefined();
+      expect(value.OBJECT_STORAGE_LEGACY_PUBLIC_URLS).toEqual([]);
+    },
+  );
+
+  it.each([
+    'https://user:password@old.example.com/circle',
+    'https://old.example.com/circle?token=secret',
+    'https://old.example.com/circle#fragment',
+    'ftp://old.example.com/circle',
+    'not a URL',
+  ])('rejects an unsafe historical storage base %s', (legacyBase) => {
+    const env = {
+      ...baseEnv,
+      DATABASE_URL: 'postgresql://user:pass@localhost:5432/db',
+      OBJECT_STORAGE_LEGACY_PUBLIC_URLS: `https://old.example.com,${legacyBase}`,
+    };
+
+    const { error } = createEnvValidationSchema(env).validate(env);
+
+    expect(error?.message).toContain('OBJECT_STORAGE_LEGACY_PUBLIC_URLS');
   });
 
   it('normalizes structured logging defaults', () => {

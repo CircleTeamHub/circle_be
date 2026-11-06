@@ -37,6 +37,7 @@ import { sanitizeLogValue } from 'src/logging/log-sanitizer';
 import {
   buildStoragePublicObjectBase,
   storagePublicObjectBaseFromConfig,
+  storagePublicObjectBasesFromConfig,
   type ObjectStoreStatus,
 } from 'src/utils/storage-url';
 
@@ -345,9 +346,9 @@ export class UploadService implements OnModuleInit {
     this.publicObjectBase = sharedPublicObjectBase ?? directPublicObjectBase;
     // 写入永远用 publicObjectBase；识别要连**切换之前**存下的直连地址一起认，
     // 否则开启投递域名的那一刻，所有历史 url 都会变成「不是本站存储」。
-    this.publicObjectBases = [this.publicObjectBase];
-    if (!this.publicObjectBases.includes(directPublicObjectBase)) {
-      this.publicObjectBases.push(directPublicObjectBase);
+    this.publicObjectBases = storagePublicObjectBasesFromConfig(this.config);
+    if (!this.publicObjectBases.includes(this.publicObjectBase)) {
+      this.publicObjectBases.unshift(this.publicObjectBase);
     }
     const deliveryBase = configuredDeliveryUrl ? sharedPublicObjectBase : null;
     const deliveryOrigin = deliveryBase ? storageOrigin(deliveryBase) : null;
