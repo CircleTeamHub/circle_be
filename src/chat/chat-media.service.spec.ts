@@ -34,6 +34,7 @@ describe('ChatMediaService', () => {
     $executeRaw: jest.fn().mockResolvedValue(0),
     chatMessage: { findMany: jest.fn() },
     chatBurnArchive: { findMany: jest.fn() },
+    note: { findMany: jest.fn() },
     chatMediaDeletion: {
       createMany: jest.fn(),
       upsert: jest.fn(),
@@ -59,6 +60,11 @@ describe('ChatMediaService', () => {
     jest.clearAllMocks();
     prisma.chatMessage.findMany.mockResolvedValue([]);
     prisma.chatBurnArchive.findMany.mockResolvedValue([]);
+    // 预览图的来源根笔记默认都还可分发。
+    prisma.note.findMany.mockImplementation(
+      async ({ where }: { where: { id: { in: string[] } } }) =>
+        where.id.in.map((id) => ({ id })),
+    );
     prisma.chatMediaDeletion.findFirst.mockResolvedValue(null);
     uploadService.createPresignedGetUrl.mockImplementation((key: string) =>
       Promise.resolve({ url: `https://signed/${key}`, expiresAt: new Date() }),
@@ -92,6 +98,7 @@ describe('ChatMediaService', () => {
         type: 'note-card',
         content: {
           noteId: 'n1',
+          sourceNoteId: 'n1',
           previewKeys: ['notes/u1/a.jpg', 'notes/u1/b.jpg'],
         },
       });
@@ -102,10 +109,50 @@ describe('ChatMediaService', () => {
       ]);
     });
 
+    // 作者事后下架 / 删除:已发出的卡片不再续签,一页卡片只批量查一次根笔记。
+    it('stops signing previews once the source root is no longer distributable', async () => {
+      prisma.note.findMany.mockResolvedValue([{ id: 'live' }]);
+      const live = dto({
+        id: 'm1',
+        type: 'note-card',
+        content: { sourceNoteId: 'live', previewKeys: ['notes/u1/a.jpg'] },
+      });
+      const unlisted = dto({
+        id: 'm2',
+        type: 'note-card',
+        content: { sourceNoteId: 'gone', previewKeys: ['notes/u1/b.jpg'] },
+      });
+      await service.attachMediaUrls([live, unlisted]);
+      expect(prisma.note.findMany).toHaveBeenCalledTimes(1);
+      expect(prisma.note.findMany).toHaveBeenCalledWith({
+        where: {
+          id: { in: ['live', 'gone'] },
+          status: 'ACTIVE',
+          available: true,
+        },
+        select: { id: true },
+      });
+      expect(live.content.previewUrls).toEqual([
+        'https://signed/notes/u1/a.jpg',
+      ]);
+      expect(unlisted.content.previewUrls).toBeUndefined();
+    });
+
+    it('signs no previews when the root lookup fails', async () => {
+      prisma.note.findMany.mockRejectedValue(new Error('db down'));
+      const message = dto({
+        type: 'note-card',
+        content: { sourceNoteId: 'n1', previewKeys: ['notes/u1/a.jpg'] },
+      });
+      await service.attachMediaUrls([message]);
+      expect(message.content.previewUrls).toBeUndefined();
+    });
+
     it('never signs keys outside the note media prefix, and caps the count', async () => {
       const message = dto({
         type: 'note-card',
         content: {
+          sourceNoteId: 'n1',
           previewKeys: [
             'avatars/u2/private.jpg',
             'notes/u1/1.jpg',

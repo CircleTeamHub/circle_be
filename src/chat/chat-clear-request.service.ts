@@ -38,7 +38,11 @@ export class ChatClearRequestService {
           userID: requesterId,
         },
       },
-      include: { conversation: { select: { type: true, nextHeight: true } } },
+      include: {
+        conversation: {
+          select: { type: true, nextHeight: true, directKey: true },
+        },
+      },
     });
     if (!seat || seat.leftAt) {
       throw new ForbiddenException({
@@ -52,6 +56,8 @@ export class ChatClearRequestService {
         errorCode: ChatErrorCode.ConversationNotFound,
       });
     }
+    // 拉黑不摘座位:被拉黑的一方不能再往对方会话里插申请提示。
+    await this.chat.assertDirectMutationAllowed(seat.conversation, requesterId);
     const clearThrough = Math.min(
       Math.max(0, targetHeight),
       seat.conversation.nextHeight,
@@ -61,6 +67,8 @@ export class ChatClearRequestService {
         SELECT "nextHeight" FROM "ChatConversation"
         WHERE "id" = ${conversationId} FOR UPDATE`;
       // 同一个人在这个会话里只保留一条待处理申请:重复点不会给对方刷一串提示。
+      // 申请人后来又清到了更高处,就把这条申请的水位跟着推上去(只升不降),
+      // 对方同意时清到的是申请人最后一次清到的位置。
       const pending = await tx.chatClearRequest.findFirst({
         where: {
           conversationID: conversationId,
@@ -69,7 +77,13 @@ export class ChatClearRequestService {
         },
         select: { id: true },
       });
-      if (pending) return { requestId: pending.id, notice: null };
+      if (pending) {
+        await tx.chatClearRequest.updateMany({
+          where: { id: pending.id, targetHeight: { lt: clearThrough } },
+          data: { targetHeight: clearThrough },
+        });
+        return { requestId: pending.id, notice: null };
+      }
       const created = await tx.chatClearRequest.create({
         data: {
           conversationID: conversationId,
@@ -137,6 +151,12 @@ export class ChatClearRequestService {
       );
       return { accepted: true };
     }
+    const conversation = await this.prisma.chatConversation.findUnique({
+      where: { id: request.conversationID },
+      select: { type: true, directKey: true },
+    });
+    if (conversation)
+      await this.chat.assertDirectMutationAllowed(conversation, responderId);
     const notice = await this.prisma.$transaction(async (tx) => {
       const locked = await tx.$queryRaw<Array<{ nextHeight: number }>>`
         SELECT "nextHeight" FROM "ChatConversation"

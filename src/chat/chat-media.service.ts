@@ -752,6 +752,42 @@ export class ChatMediaService implements OnModuleDestroy {
         }),
       );
     }
+    // 预览图只在来源根笔记此刻仍可分发(ACTIVE + available)时签:作者事后下架 / 删除,
+    // 已发出的卡片不再续签。本页所有卡片一次批量查;查失败按不可分发处理。
+    let previewRoots = new Set<string>();
+    const previewRootIds = [
+      ...new Set(
+        messages
+          .filter(
+            (message) =>
+              message.type === 'note-card' &&
+              typeof message.content.sourceNoteId === 'string' &&
+              noteCardPreviewKeys(message.content).length > 0,
+          )
+          .map((message) => message.content.sourceNoteId as string),
+      ),
+    ];
+    if (previewRootIds.length) {
+      try {
+        const roots = await this.prisma.note.findMany({
+          where: {
+            id: { in: previewRootIds },
+            status: 'ACTIVE',
+            available: true,
+          },
+          select: { id: true },
+        });
+        previewRoots = new Set(roots.map((root) => root.id));
+      } catch (error) {
+        this.logger.warn(
+          sanitizeLogValue({
+            event: 'chat_media_presign_failed',
+            operation: 'noteCardPreviewRoots',
+            ...diagnosticFailureDetails(error),
+          }),
+        );
+      }
+    }
     const signed = new Map<string, Promise<string | undefined>>();
     const windowDate = new Date(
       Math.floor(Date.now() / CHAT_MEDIA_URL_WINDOW_MS) *
@@ -806,7 +842,10 @@ export class ChatMediaService implements OnModuleDestroy {
             const url = await sign(key, activeGrant);
             if (url) patch[field.url] = url;
           }
-          if (isNoteCard) {
+          if (
+            isNoteCard &&
+            previewRoots.has(message.content.sourceNoteId as string)
+          ) {
             const urls = await Promise.all(
               noteCardPreviewKeys(message.content).map((key) =>
                 sign(key, activeGrant),

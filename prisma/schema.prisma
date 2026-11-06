@@ -2662,13 +2662,6 @@ model ChatMember {
   @@index([conversationID, leftAt, clearedBeforeHeight, userID, muted], map: "ChatMember_fanout_idx")
 }
 
-/// 聊天消息。height 在发送事务内于 pg_advisory_xact_lock 下分配，
-/// (conversationID, height) 唯一约束兜底乱序；
-/// (conversationID, senderID, clientMessageId) 唯一约束兜底断线重发幂等。
-/// 群事件账本(群日志):谁进群/退群/被移出、谁被设为/取消管理员、谁被禁言/解除、
-/// 改群名/公告、清空全群记录、群主转让。与 type='system' 的聊天提示成对写,
-/// 但**独立于聊天记录**:不受清空水位/焚毁影响,后入群的人也能翻到入群前的记录。
-/// userID 类字段同 ChatMessage.senderID,不建 User 外键。
 enum ChatClearRequestStatus {
   PENDING
   ACCEPTED
@@ -2689,6 +2682,13 @@ model ChatClearRequest {
   @@index([conversationID, status])
 }
 
+/// 聊天消息。height 在发送事务内于 pg_advisory_xact_lock 下分配，
+/// (conversationID, height) 唯一约束兜底乱序；
+/// (conversationID, senderID, clientMessageId) 唯一约束兜底断线重发幂等。
+/// 群事件账本(群日志):谁进群/退群/被移出、谁被设为/取消管理员、谁被禁言/解除、
+/// 改群名/公告、清空全群记录、群主转让。与 type='system' 的聊天提示成对写,
+/// 但**独立于聊天记录**:不受清空水位/焚毁影响,后入群的人也能翻到入群前的记录。
+/// userID 类字段同 ChatMessage.senderID,不建 User 外键。
 model ChatGroupEvent {
   id             String   @id @default(uuid())
   conversationID String

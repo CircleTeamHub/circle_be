@@ -631,6 +631,52 @@ describe('ChatGroupSettingsService', () => {
       });
     });
 
+    // 拉黑不摘座位:被拉黑的一方不能再改对方看到的横幅、往对方会话里插提示。
+    it('refuses a private-chat pin when either side has blocked the other', async () => {
+      arrangePin({
+        actor: seat('peer-1'),
+        row: { type: 'DIRECT', ownerID: null, directKey: 'peer-1:peer-2' },
+      });
+      prisma.$queryRaw.mockResolvedValue([{ nextHeight: 4 }]);
+      prisma.block.findFirst.mockResolvedValue({ id: 'block-1' });
+      await expect(
+        service.setPinnedMessage('peer-1', 'conv-1', null),
+      ).rejects.toMatchObject({
+        response: { errorCode: ChatErrorCode.Blocked },
+      });
+      expect(prisma.block.findFirst).toHaveBeenCalledWith({
+        where: {
+          OR: [
+            { blockerID: 'peer-1', blockedID: 'peer-2' },
+            { blockerID: 'peer-2', blockedID: 'peer-1' },
+          ],
+        },
+        select: { id: true },
+      });
+      expect(prisma.chatConversation.update).not.toHaveBeenCalled();
+      expect(
+        systemMessage.insertSystemMessageAfterLockedConversationInTx,
+      ).not.toHaveBeenCalled();
+    });
+
+    // 锁外读到之后、加锁之前刚提交了一次编辑:横幅要用锁内那份正文。
+    it('builds the banner preview from the row re-read under the lock', async () => {
+      arrangePin({ actor: seat('admin-1', { role: 'ADMIN' }) });
+      prisma.chatMessage.findUnique
+        .mockResolvedValueOnce(message())
+        .mockResolvedValueOnce(message({ content: { text: '改成十点集合' } }));
+      const pinned = await service.setPinnedMessage(
+        'admin-1',
+        'conv-1',
+        'msg-1',
+      );
+      expect(pinned?.preview).toBe('改成十点集合');
+      expect(prisma.chatConversation.update).toHaveBeenCalledWith({
+        where: { id: 'conv-1' },
+        data: expect.objectContaining({ pinnedMessagePreview: '改成十点集合' }),
+      });
+    });
+
     it.each([
       ['a revoked message', { revokedAt: new Date() }],
       ['a deleted message', { deleted: true }],

@@ -1,6 +1,8 @@
 import { plainToInstance } from 'class-transformer';
 import { validateSync } from 'class-validator';
 import {
+  RequestHistoryClearDto,
+  RespondHistoryClearDto,
   SetGroupMuteAllDto,
   SetGroupNoticeDto,
   UpdateGroupPoliciesDto,
@@ -87,5 +89,52 @@ describe('group settings boolean DTOs', () => {
 
     expect(validateSync(muteAll)).toHaveLength(0);
     expect(validateSync(policies)).toHaveLength(0);
+  });
+});
+
+// 双向清空:全局 enableImplicitConversion 会把 "false" 转成 true —— 那是一次
+// 不可逆的「同意」;false→0 会让申请悄悄变成「清到 0」。
+describe('two-way clear DTOs', () => {
+  it.each(['false', '0', 'no', 1, null])(
+    'rejects a non-boolean accept %p',
+    (value) => {
+      const dto = plainToInstance(
+        RespondHistoryClearDto,
+        { accept: value },
+        transformOptions,
+      );
+      expect(validateSync(dto).some((e) => e.property === 'accept')).toBe(true);
+    },
+  );
+
+  it.each([false, true, '3', null])(
+    'rejects a non-integer target height %p',
+    (value) => {
+      const dto = plainToInstance(
+        RequestHistoryClearDto,
+        { targetHeight: value },
+        transformOptions,
+      );
+      expect(validateSync(dto).some((e) => e.property === 'targetHeight')).toBe(
+        true,
+      );
+    },
+  );
+
+  it('accepts the real shapes', () => {
+    const respond = plainToInstance(
+      RespondHistoryClearDto,
+      { accept: false },
+      transformOptions,
+    );
+    const request = plainToInstance(
+      RequestHistoryClearDto,
+      { targetHeight: 42 },
+      transformOptions,
+    );
+    expect(validateSync(respond)).toHaveLength(0);
+    expect(respond.accept).toBe(false);
+    expect(validateSync(request)).toHaveLength(0);
+    expect(request.targetHeight).toBe(42);
   });
 });

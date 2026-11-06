@@ -9,6 +9,7 @@ import { ChatClearRequestService } from './chat-clear-request.service';
 describe('ChatClearRequestService', () => {
   const prisma = {
     chatMember: { findUnique: jest.fn() },
+    chatConversation: { findUnique: jest.fn() },
     chatClearRequest: {
       create: jest.fn(),
       findFirst: jest.fn(),
@@ -20,6 +21,7 @@ describe('ChatClearRequestService', () => {
   };
   const chat = {
     clearHistory: jest.fn().mockResolvedValue({ clearedBeforeHeight: 7 }),
+    assertDirectMutationAllowed: jest.fn(),
   };
   const systemMessage = {
     insertSystemMessageAfterLockedConversationInTx: jest
@@ -54,12 +56,23 @@ describe('ChatClearRequestService', () => {
     prisma.chatClearRequest.create.mockResolvedValue({ id: 'req-1' });
     prisma.chatClearRequest.findFirst.mockResolvedValue(null);
     prisma.chatClearRequest.updateMany.mockResolvedValue({ count: 1 });
+    prisma.chatConversation.findUnique.mockResolvedValue({
+      type: 'DIRECT',
+      directKey: 'u1:u2',
+    });
+    chat.assertDirectMutationAllowed.mockResolvedValue(undefined);
   });
+
+  const blocked = () =>
+    new ForbiddenException({
+      message: '对方不可用',
+      errorCode: ChatErrorCode.Blocked,
+    });
 
   describe('requestClear', () => {
     const directSeat = (overrides: Record<string, unknown> = {}) => ({
       leftAt: null,
-      conversation: { type: 'DIRECT', nextHeight: 12 },
+      conversation: { type: 'DIRECT', nextHeight: 12, directKey: 'u1:u2' },
       ...overrides,
     });
 
@@ -98,6 +111,36 @@ describe('ChatClearRequestService', () => {
       });
       expect(prisma.chatClearRequest.create).not.toHaveBeenCalled();
       expect(systemMessage.broadcastSystemMessage).not.toHaveBeenCalled();
+    });
+
+    // 申请人后来又清到了更高处:对方同意时要清到最后那次的位置,而不是第一次的。
+    it('raises a pending request to the newer height, never lowers it', async () => {
+      prisma.chatMember.findUnique.mockResolvedValue(directSeat());
+      prisma.chatClearRequest.findFirst.mockResolvedValue({ id: 'req-old' });
+      await service.requestClear('u1', 'conv-1', 11);
+      expect(prisma.chatClearRequest.updateMany).toHaveBeenCalledWith({
+        where: { id: 'req-old', targetHeight: { lt: 11 } },
+        data: { targetHeight: 11 },
+      });
+    });
+
+    // 拉黑不摘座位:被拉黑的一方不能再往对方会话里插申请提示。
+    it('refuses a request between blocked users before writing anything', async () => {
+      prisma.chatMember.findUnique.mockResolvedValue(directSeat());
+      chat.assertDirectMutationAllowed.mockRejectedValue(blocked());
+      await expect(
+        service.requestClear('u1', 'conv-1', 10),
+      ).rejects.toMatchObject({
+        response: { errorCode: ChatErrorCode.Blocked },
+      });
+      expect(chat.assertDirectMutationAllowed).toHaveBeenCalledWith(
+        expect.objectContaining({ type: 'DIRECT', directKey: 'u1:u2' }),
+        'u1',
+      );
+      expect(prisma.$transaction).not.toHaveBeenCalled();
+      expect(
+        systemMessage.insertSystemMessageAfterLockedConversationInTx,
+      ).not.toHaveBeenCalled();
     });
 
     it('is only for private chats', async () => {
@@ -200,6 +243,22 @@ describe('ChatClearRequestService', () => {
       await expect(service.respond('u2', 'req-1', true)).rejects.toBeInstanceOf(
         NotFoundException,
       );
+    });
+
+    it('a blocked pair cannot answer, and nothing is claimed or announced', async () => {
+      prisma.chatClearRequest.findUnique.mockResolvedValue(request);
+      prisma.chatMember.findUnique.mockResolvedValue({ leftAt: null });
+      chat.assertDirectMutationAllowed.mockRejectedValue(blocked());
+      await expect(service.respond('u2', 'req-1', true)).rejects.toMatchObject({
+        response: { errorCode: ChatErrorCode.Blocked },
+      });
+      expect(chat.assertDirectMutationAllowed).toHaveBeenCalledWith(
+        { type: 'DIRECT', directKey: 'u1:u2' },
+        'u2',
+      );
+      expect(prisma.chatClearRequest.updateMany).not.toHaveBeenCalled();
+      expect(chat.clearHistory).not.toHaveBeenCalled();
+      expect(systemMessage.broadcastSystemMessage).not.toHaveBeenCalled();
     });
   });
 });

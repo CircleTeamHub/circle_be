@@ -580,8 +580,10 @@ export class ChatService {
       }
     }
     // 多图预览的 key 只能由服务端从发送者读得到的笔记里取:读路径会给它们签名。
+    // 对外分发看来源根笔记的实时状态(同 note 的 requireDistributableForViewer):
+    // 根不是 ACTIVE + available 时,收藏副本的主人也不能把图带出去。
     let previewKeys: string[] = [];
-    if (noteId) {
+    if (noteId && sourceState?.publicationStatus === 'ACTIVE') {
       try {
         previewKeys = await this.resolveNoteCardPreviewKeys(
           senderUserId,
@@ -2025,6 +2027,7 @@ export class ChatService {
           directPeers.deliveredHeights.get(m.conversationID) ?? null,
         readHeight: m.lastReadHeight,
         clearedBeforeHeight: conversationFloor,
+        pinnedMessage: pinnedMessageOf(m.conversation, conversationFloor),
         syncRevision: conversationSyncRevision(m.conversation),
         lastMessageAt: m.conversation.lastMessageAt?.toISOString() ?? null,
         joinedAt: m.joinedAt.toISOString(),
@@ -3847,14 +3850,43 @@ export class ChatService {
   }
 
   /**
+   * 置顶横幅跟着撤回 / 编辑变了:给每个在座成员发一条 chat:conversation(kind=updated),
+   * 在线端据此重拉这个会话 —— 不发的话横幅上会一直挂着撤回前的原文。
+   * 提交后尽力而为,失败只记日志。
+   */
+  private async emitPinnedMessageChanged(
+    conversationId: string,
+  ): Promise<void> {
+    try {
+      const seats = await this.prisma.chatMember.findMany({
+        where: { conversationID: conversationId, leftAt: null },
+        select: { userID: true },
+      });
+      for (const seat of seats) {
+        this.broadcast.emitConversationChange(seat.userID, {
+          kind: 'updated',
+          conversationId,
+          userId: seat.userID,
+        });
+      }
+    } catch (error) {
+      this.logger.warn(
+        `pinned message refresh delivery failed after commit (${
+          error instanceof Error ? error.name : 'unknown error'
+        })`,
+      );
+    }
+  }
+
+  /**
    * 单聊里「改动已有消息 / 改动会话共享设置」前的拉黑复查。
    *
    * sendMessage 早就拦了拉黑,但回应、编辑、阅后即焚这些后加的写路径只查了在座 ——
    * 而拉黑**故意**不摘座位,于是被拉黑的一方照样能改消息、往对方房间推事件,
    * 甚至把整个会话设成 30 秒焚毁,替对方销毁历史。非单聊会话直接放行。
    */
-  private async assertDirectMutationAllowed(
-    conversation: ChatConversation,
+  async assertDirectMutationAllowed(
+    conversation: Pick<ChatConversation, 'type' | 'directKey'>,
     userId: string,
   ): Promise<void> {
     if (conversation.type !== 'DIRECT') return;
@@ -3863,7 +3895,7 @@ export class ChatService {
 
   /** 单聊发送前的拉黑复查(任一方向拉黑即拒发)。 */
   private async assertDirectNotBlocked(
-    conversation: ChatConversation,
+    conversation: Pick<ChatConversation, 'directKey'>,
     senderUserId: string,
   ): Promise<void> {
     const pair = conversation.directKey?.split(':') ?? [];
@@ -4430,41 +4462,45 @@ export class ChatService {
     // 双端并发撤回(或发送者与管理员同时动手)会两个都读到 null、两个都写、
     // 两个都广播,revokedBy 归后写者 —— 幂等承诺和审计归属一起破。
     // 谓词带上 revokedAt: null,只有赢家 count>0,输家走幂等分支重读。
-    const { claimed, updated } = await this.prisma.$transaction(async (tx) => {
-      // 会话行锁先拿:消息行上的触发器会去更新会话计数器。先锁消息行再等会话行,
-      // 与「先锁会话行再改消息」的编辑/回应并发时就是经典的交叉等待死锁。
-      await tx.$queryRaw`
+    const { claimed, updated, unpinned } = await this.prisma.$transaction(
+      async (tx) => {
+        // 会话行锁先拿:消息行上的触发器会去更新会话计数器。先锁消息行再等会话行,
+        // 与「先锁会话行再改消息」的编辑/回应并发时就是经典的交叉等待死锁。
+        await tx.$queryRaw`
         SELECT "id" FROM "ChatConversation"
         WHERE "id" = ${conversationId} FOR UPDATE`;
-      const claimed = await tx.chatMessage.updateMany({
-        where: { id: messageId, revokedAt: null },
-        data: { content: {}, revokedAt: new Date(), revokedBy: userId },
-      });
-      if (claimed.count > 0) {
-        // 撤回的消息不能还挂在置顶横幅上。
-        await tx.chatConversation.updateMany({
-          where: { id: conversationId, pinnedMessageID: messageId },
-          data: {
-            pinnedMessageID: null,
-            pinnedMessageHeight: null,
-            pinnedMessagePreview: null,
-            pinnedMessageAt: null,
-            pinnedMessageByID: null,
-          },
+        const claimed = await tx.chatMessage.updateMany({
+          where: { id: messageId, revokedAt: null },
+          data: { content: {}, revokedAt: new Date(), revokedBy: userId },
         });
-        await this.media.queueDeletions(tx, mediaKeys);
-        await this.media.releaseNoteImportReferences(
-          tx,
-          [messageId],
-          noteImportKeys,
-        );
-      }
-      const updated = await tx.chatMessage.findUniqueOrThrow({
-        where: { id: messageId },
-        omit: MESSAGE_READ_OMIT,
-      });
-      return { claimed, updated };
-    });
+        let unpinned = false;
+        if (claimed.count > 0) {
+          // 撤回的消息不能还挂在置顶横幅上。
+          const cleared = await tx.chatConversation.updateMany({
+            where: { id: conversationId, pinnedMessageID: messageId },
+            data: {
+              pinnedMessageID: null,
+              pinnedMessageHeight: null,
+              pinnedMessagePreview: null,
+              pinnedMessageAt: null,
+              pinnedMessageByID: null,
+            },
+          });
+          unpinned = cleared.count > 0;
+          await this.media.queueDeletions(tx, mediaKeys);
+          await this.media.releaseNoteImportReferences(
+            tx,
+            [messageId],
+            noteImportKeys,
+          );
+        }
+        const updated = await tx.chatMessage.findUniqueOrThrow({
+          where: { id: messageId },
+          omit: MESSAGE_READ_OMIT,
+        });
+        return { claimed, updated, unpinned };
+      },
+    );
     if (claimed.count === 0) {
       const senders = await this.resolveSenders(
         updated.senderID ? [updated.senderID] : [],
@@ -4488,6 +4524,7 @@ export class ChatService {
       senderId: updated.senderID,
       revision: updated.revision,
     });
+    if (unpinned) await this.emitPinnedMessageChanged(conversationId);
     const senders = await this.resolveSenders(
       updated.senderID ? [updated.senderID] : [],
       conversationId,
@@ -4690,6 +4727,7 @@ export class ChatService {
     // 或被焚毁扫走。按 id 无条件写会把正文塞回一条 revokedAt 非空的行 ——
     // 库里成了「已撤回但有内容」,随后的 chat:edit 广播还会在客户端盖掉
     // 撤回事件,搜索也能搜出那段本该消失的文本。输了就当消息不存在。
+    let pinChanged = false;
     const updated = await this.prisma.$transaction(async (tx) => {
       // Group silence changes take this same row lock before updating the seat.
       // Re-reading after the lock makes an edit and a concurrent silence obey
@@ -4750,17 +4788,19 @@ export class ChatService {
         });
       }
       // 编辑过的置顶消息,横幅上的预览跟着换成新正文。
-      await tx.chatConversation.updateMany({
+      const repinned = await tx.chatConversation.updateMany({
         where: { id: conversationId, pinnedMessageID: messageId },
         data: {
           pinnedMessagePreview: messagePreviewText(current.type, nextContent),
         },
       });
+      pinChanged = repinned.count > 0;
       return tx.chatMessage.findUniqueOrThrow({
         where: { id: messageId },
         omit: MESSAGE_READ_OMIT,
       });
     });
+    if (pinChanged) await this.emitPinnedMessageChanged(conversationId);
     // 与 sendMessage 同样的理由:写已经提交了,装饰失败不能让这次编辑
     // 「对外没发生过」—— 网关不广播,客户端还看着旧文本,而且编辑没有幂等键,
     // 重试只会再往 contentHistory 里压一层。
@@ -5048,9 +5088,9 @@ export class ChatService {
           errorCode: ChatErrorCode.NotMember,
         });
       }
-      const globalClear =
-        forEveryone &&
-        (conversation.type === 'DIRECT' || conversation.type === 'GROUP');
+      // 私聊不再接受单方面双删:清对方的记录必须走「申请双向清空」由对方授权
+      // (ChatClearRequestService)。老客户端 / 改过的客户端带 forEveryone 也只清自己。
+      const globalClear = forEveryone && conversation.type === 'GROUP';
       if (globalClear && conversation.type === 'GROUP') {
         // 独立群聊:群主或管理员(管理员标记在锁后的座位行上,与圈子群的
         // 圈主/管理员同一档);圈子群:下面按 CircleMember 判。

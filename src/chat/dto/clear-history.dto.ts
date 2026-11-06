@@ -9,7 +9,7 @@ import { IsBoolean, IsInt, IsOptional, Max, Min } from 'class-validator';
  * 用户看到的是「已清空」。做法与 circle.dto.ts / support.dto.ts 一致。
  */
 export class ClearHistoryDto {
-  /** DIRECT 任一成员可用;GROUP 仅群主/管理员可用;TEMP/SUPPORT 仍仅个人。 */
+  /** 仅 GROUP 生效且只限群主/管理员;DIRECT/TEMP/SUPPORT 一律只清自己(私聊双清走申请)。 */
   @IsOptional()
   @Transform(({ obj }: { obj: Record<string, unknown> }) => obj.forEveryone)
   @IsBoolean()

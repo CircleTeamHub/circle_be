@@ -135,9 +135,14 @@ export class SetPinnedMessageDto {
   messageId!: string;
 }
 
-/** 申请双向清空:申请人清到的位置(由刚才那次清空返回)。 */
+/**
+ * 申请双向清空:申请人清到的位置(由刚才那次清空返回)。
+ * 两个 DTO 都读转换前的原值:全局 enableImplicitConversion 会把 false→0、
+ * 任意非空字符串→true,`accept: "false"` 就成了一次不可逆的「同意」(同 ClearHistoryDto)。
+ */
 export class RequestHistoryClearDto {
   @ApiProperty({ description: '申请人已清到的水位' })
+  @Transform(({ obj }: { obj: Record<string, unknown> }) => obj.targetHeight)
   @IsInt()
   @Min(0)
   targetHeight!: number;
@@ -146,6 +151,7 @@ export class RequestHistoryClearDto {
 /** 对方同意 / 拒绝双向清空申请。 */
 export class RespondHistoryClearDto {
   @ApiProperty()
+  @Transform(({ obj }: { obj: Record<string, unknown> }) => obj.accept)
   @IsBoolean()
   accept!: boolean;
 }
