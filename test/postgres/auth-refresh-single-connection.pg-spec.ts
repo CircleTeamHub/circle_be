@@ -6,7 +6,7 @@ import {
 } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { JwtService } from '@nestjs/jwt';
-import type { Client } from 'pg';
+import { Client } from 'pg';
 import { AuthService } from 'src/auth/auth.service';
 import { DeviceTrustService } from 'src/auth/device-trust.service';
 import { RefreshTokenService } from 'src/auth/refresh-token.service';
@@ -14,6 +14,7 @@ import { SessionVerifier } from 'src/auth/session-verifier.service';
 import { AuthErrorCode } from 'src/common/app-error-codes';
 import type { PrismaClient } from 'src/generated/prisma';
 import { describePostgres } from './pg-test-db';
+import { backendPid, waitUntilBlockedBy } from './circle-tx-harness';
 import {
   openPrismaSchema,
   type PrismaHandle,
@@ -41,6 +42,7 @@ const PHONE = 'a'.repeat(64);
 
 type Harness = {
   auth: AuthService;
+  refreshTokens: RefreshTokenService;
   revocation: {
     revokeSession: jest.Mock;
     revokeUser: jest.Mock;
@@ -83,7 +85,7 @@ function harness(prisma: PrismaClient): Harness {
     deviceTrust,
     {} as never,
   );
-  return { auth, revocation, realtime, jwt };
+  return { auth, refreshTokens, revocation, realtime, jwt };
 }
 
 describePostgres('AuthService.refresh on a real database', () => {
@@ -608,6 +610,104 @@ describePostgres('AuthService.refresh on a real database', () => {
       expect(rows).toHaveLength(2);
       expect(rows.every((row) => row.revokedAt !== null)).toBe(true);
     });
+  });
+
+  describe('logout versus rotation', () => {
+    it.each(
+      (['APP', 'ADMIN'] as const).flatMap((audience) =>
+        (['rotation', 'logout'] as const).map((first) => ({ audience, first })),
+      ),
+    )(
+      'serializes $audience with $first first and kills the whole family',
+      async ({ audience, first }) => {
+        const userId = await seedUser();
+        const otherUserId = await seedUser();
+        const initial = await seedSession({ userId, audience });
+        const unrelated = await seedSession({ userId, audience });
+        const foreign = await seedSession({ userId: otherUserId, audience });
+        const verifier = new SessionVerifier(
+          { checkRevocation: jest.fn().mockResolvedValue('unknown') } as never,
+          main.prisma as never,
+        );
+        const gate = new Client({
+          connectionString: process.env.POSTGRES_TEST_DATABASE_URL,
+        });
+        await gate.connect();
+        let rotating: Promise<
+          Awaited<ReturnType<RefreshTokenService['rotate']>>
+        >;
+        let loggingOut: Promise<void>;
+        try {
+          await gate.query(`SET search_path TO "${env.schema}", public`);
+          await gate.query('BEGIN');
+          // Hold the first operation at its refresh-row write, while it owns the
+          // account advisory lock. The competing operation must wait on that lock.
+          await gate.query('LOCK TABLE "RefreshToken" IN SHARE MODE');
+          const rotate = () =>
+            h.refreshTokens.rotate(initial.raw, undefined, audience);
+          if (first === 'rotation') {
+            rotating = rotate();
+          } else {
+            loggingOut = h.auth.logout(initial.raw);
+          }
+          const [firstPid] = await waitUntilBlockedBy(
+            db,
+            await backendPid(gate),
+            1,
+            1000,
+          );
+          if (first === 'rotation') {
+            loggingOut = h.auth.logout(initial.raw);
+          } else {
+            rotating = rotate();
+          }
+          // Handle rejection immediately; logout-first deliberately rejects refresh.
+          void rotating.catch(() => undefined);
+          const [secondPid] = await waitUntilBlockedBy(db, firstPid, 1, 1000);
+          const waiting = await db.query<{ wait_event: string }>(
+            'SELECT wait_event FROM pg_stat_activity WHERE pid = $1',
+            [secondPid],
+          );
+          expect(waiting.rows[0].wait_event).toBe('advisory');
+          await gate.query('COMMIT');
+          await expect(loggingOut).resolves.toBeUndefined();
+          if (first === 'rotation') {
+            const current = await rotating;
+            expect((await session(current.token)).revocationReason).toBe(
+              'LOGOUT',
+            );
+            await expect(
+              h.refreshTokens.rotate(current.token, undefined, audience),
+            ).rejects.toThrow('Invalid or expired refresh token');
+            await expect(
+              verifier.verify({ sub: userId, sid: current.sessionId }),
+            ).resolves.toBe('revoked');
+          } else {
+            await expect(rotating).rejects.toThrow(
+              'Invalid or expired refresh token',
+            );
+            expect(await sessionsOf(userId)).toHaveLength(2);
+          }
+          await expect(
+            verifier.verify({ sub: userId, sid: initial.id }),
+          ).resolves.toBe('revoked');
+          await expect(h.auth.logout(initial.raw)).resolves.toBeUndefined();
+          await expect(
+            verifier.verify({ sub: userId, sid: unrelated.id }),
+          ).resolves.toBe('active');
+          await expect(
+            verifier.verify({ sub: otherUserId, sid: foreign.id }),
+          ).resolves.toBe('active');
+          expect((await session(unrelated.raw)).revokedAt).toBeNull();
+          expect((await session(foreign.raw)).revokedAt).toBeNull();
+          expect(h.revocation.revokeUser).not.toHaveBeenCalled();
+        } finally {
+          await gate.query('ROLLBACK');
+          await gate.end();
+          await Promise.allSettled([rotating, loggingOut].filter(Boolean));
+        }
+      },
+    );
   });
 
   describe('connection and round-trip budget', () => {

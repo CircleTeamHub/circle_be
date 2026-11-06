@@ -420,6 +420,159 @@ describe('RefreshTokenService', () => {
     expect(revocation.revokeSession).not.toHaveBeenCalledWith('session-2');
   });
 
+  describe('logout refresh-token families', () => {
+    it.each(['APP', 'ADMIN'] as const)(
+      'revokes descendants and ancestor access when logout follows %s rotation',
+      async (audience) => {
+        const initial = await service.create('user-1', undefined, audience);
+        const child = await service.rotate(initial.token, undefined, audience);
+        const current = await service.rotate(child.token, undefined, audience);
+        const otherFamily = await service.create('user-1', undefined, audience);
+        const otherAudience = await service.create(
+          'user-1',
+          undefined,
+          audience === 'APP' ? 'ADMIN' : 'APP',
+        );
+        const otherUser = await service.create('user-2', undefined, audience);
+        // A family identifier must still be scoped to its owning account.
+        records.find(({ id }) => id === otherUser.sessionId).familyId =
+          records[0].familyId;
+        jest.clearAllMocks();
+
+        // A live descendant is actually revoked, so record one logout for the family.
+        await expect(service.revoke(initial.token)).resolves.toEqual({
+          userId: 'user-1',
+          audience,
+          sessionId: initial.sessionId,
+        });
+        expect(
+          records.find(({ id }) => id === current.sessionId),
+        ).toMatchObject({
+          revokedAt: expect.any(Date),
+          revocationReason: 'LOGOUT',
+        });
+        await expect(
+          service.rotate(current.token, undefined, audience),
+        ).rejects.toThrow('Invalid or expired refresh token');
+        await expect(service.revoke(initial.token)).resolves.toBeNull();
+        expect(prisma.user.update).not.toHaveBeenCalled();
+        expect(revocation.revokeUser).not.toHaveBeenCalled();
+
+        for (const [sessionId, userId, expected] of [
+          [initial.sessionId, 'user-1', 'revoked'],
+          [child.sessionId, 'user-1', 'revoked'],
+          [current.sessionId, 'user-1', 'revoked'],
+          [otherFamily.sessionId, 'user-1', 'active'],
+          [otherAudience.sessionId, 'user-1', 'active'],
+          [otherUser.sessionId, 'user-2', 'active'],
+        ]) {
+          const row = records.find(({ id }) => id === sessionId);
+          const verifier = new SessionVerifier(
+            { checkRevocation: jest.fn().mockResolvedValue('unknown') } as any,
+            {
+              $queryRaw: jest
+                .fn()
+                .mockResolvedValue([
+                  sessionVerificationRow(
+                    { status: 'ACTIVE', accessTokensRevokedAt: null },
+                    row,
+                    matchingScopeGenerations(
+                      userId,
+                      row,
+                      scopeGenerations.values(),
+                    ),
+                  ),
+                ]),
+            } as any,
+          );
+          await expect(
+            verifier.verify({ sub: userId, sid: sessionId }),
+          ).resolves.toBe(expected);
+        }
+      },
+    );
+
+    it('rejects rotation after logout without triggering token reuse or revoking another family', async () => {
+      const initial = await service.create('user-1', undefined, 'ADMIN');
+      const other = await service.create('user-1', undefined, 'ADMIN');
+
+      await expect(service.revoke(initial.token)).resolves.toEqual({
+        userId: 'user-1',
+        audience: 'ADMIN',
+        sessionId: initial.sessionId,
+      });
+      await expect(
+        service.rotate(initial.token, undefined, 'ADMIN'),
+      ).rejects.toThrow('Invalid or expired refresh token');
+      await expect(service.revoke(initial.token)).resolves.toBeNull();
+      expect(
+        records.find(({ id }) => id === other.sessionId).revokedAt,
+      ).toBeNull();
+      expect(prisma.user.update).not.toHaveBeenCalled();
+      expect(prisma.sessionScopeGeneration.upsert).toHaveBeenCalledWith(
+        expect.objectContaining({
+          where: {
+            userId_scope_scopeKey: {
+              userId: 'user-1',
+              scope: 'FAMILY',
+              scopeKey: records[0].familyId,
+            },
+          },
+        }),
+      );
+    });
+
+    it('revokes and attributes a live family reached through a known expired ancestor', async () => {
+      const initial = await service.create('user-1');
+      const current = await service.rotate(initial.token);
+      records[0].expiredAt = new Date(Date.now() - 1000);
+
+      await expect(service.revoke(initial.token)).resolves.toEqual({
+        userId: 'user-1',
+        audience: 'APP',
+        sessionId: initial.sessionId,
+      });
+      await expect(service.rotate(current.token)).rejects.toThrow(
+        'Invalid or expired refresh token',
+      );
+      expect(revocation.revokeScope).toHaveBeenCalledWith(
+        expect.objectContaining({
+          userId: 'user-1',
+          scope: 'FAMILY',
+          scopeKey: records[0].familyId,
+        }),
+      );
+    });
+
+    it('gives logout the same lock-wait budget as the refresh that may hold the lock', async () => {
+      const initial = await service.create('user-1');
+      jest.clearAllMocks();
+
+      await service.revoke(initial.token);
+
+      // Prisma's 2s/5s defaults would fail logout behind a slow refresh while
+      // the app has already cleared its local session.
+      expect(prisma.$transaction).toHaveBeenCalledWith(expect.any(Function), {
+        maxWait: 10_000,
+        timeout: 30_000,
+      });
+    });
+
+    it('does nothing for an unknown logout token', async () => {
+      const initial = await service.create('user-1');
+      jest.clearAllMocks();
+
+      await expect(service.revoke('unknown-token')).resolves.toBeNull();
+
+      expect(
+        records.find(({ id }) => id === initial.sessionId).revokedAt,
+      ).toBeNull();
+      expect(prisma.sessionScopeGeneration.upsert).not.toHaveBeenCalled();
+      expect(revocation.revokeScope).not.toHaveBeenCalled();
+      expect(revocation.revokeSession).not.toHaveBeenCalled();
+    });
+  });
+
   it('durably revokes rotated ancestors when removing the current session family', async () => {
     const { token, sessionId: ancestorSessionId } = await service.create(
       'user-1',
