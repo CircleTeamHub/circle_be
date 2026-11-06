@@ -345,6 +345,8 @@ export function createEnvValidationSchema(
       then: objectDeliveryUrlSchema(['https']).optional(),
       otherwise: objectDeliveryUrlSchema(['http', 'https']).optional(),
     }),
+    // Validated with origins/path-style below; errors never reflect this value.
+    OBJECT_STORAGE_SIGNED_DOWNLOAD_PROXY_BASE: Joi.any().empty('').optional(),
     OBJECT_STORAGE_LEGACY_PUBLIC_URLS: Joi.string()
       .empty('')
       .custom((value: string, helpers) => {
@@ -384,6 +386,37 @@ export function createEnvValidationSchema(
   })
     .unknown(true)
     .custom((value, helpers) => {
+      const proxyBase = value.OBJECT_STORAGE_SIGNED_DOWNLOAD_PROXY_BASE;
+      if (proxyBase !== undefined) {
+        const message = {
+          custom:
+            'OBJECT_STORAGE_SIGNED_DOWNLOAD_PROXY_BASE requires an HTTPS base without credentials, query or fragment, an origin in ALLOWED_ORIGINS, and OBJECT_STORAGE_FORCE_PATH_STYLE=true',
+        };
+        let url: URL;
+        try {
+          if (typeof proxyBase !== 'string') return helpers.message(message);
+          url = new URL(proxyBase.trim());
+        } catch {
+          return helpers.message(message);
+        }
+        const allowedOrigins = (value.ALLOWED_ORIGINS ?? '')
+          .split(',')
+          .map((origin: string) => origin.trim());
+        if (
+          url.protocol !== 'https:' ||
+          url.username ||
+          url.password ||
+          proxyBase.includes('?') ||
+          proxyBase.includes('#') ||
+          !allowedOrigins.includes(url.origin) ||
+          !value.OBJECT_STORAGE_FORCE_PATH_STYLE
+        ) {
+          return helpers.message(message);
+        }
+        let normalized = url.toString();
+        while (normalized.endsWith('/')) normalized = normalized.slice(0, -1);
+        value.OBJECT_STORAGE_SIGNED_DOWNLOAD_PROXY_BASE = normalized;
+      }
       if (
         value.OBJECT_STORAGE_BUCKET_CONFIG_VERIFIED_EXTERNALLY &&
         (value.OBJECT_STORAGE_MANAGE_BUCKET ||

@@ -287,6 +287,8 @@ export class UploadService implements OnModuleInit {
   private readonly publicUrl: string;
   private readonly publicObjectBase: string;
   private readonly directPublicObjectBase: string;
+  private readonly signedDownloadProxyBase: string | undefined;
+  private readonly signedDownloadProxyObjectBase: string | undefined;
   /** 认得出 key 的所有前缀（canonical 在前，切换前的直连域名在后）。 */
   private readonly publicObjectBases: string[];
   private readonly region: string;
@@ -332,11 +334,17 @@ export class UploadService implements OnModuleInit {
       .split(',')
       .map((origin) => origin.trim())
       .filter(Boolean);
+    this.signedDownloadProxyBase = this.config.get<string>(
+      'OBJECT_STORAGE_SIGNED_DOWNLOAD_PROXY_BASE',
+    );
     this.directPublicObjectBase = buildStoragePublicObjectBase(
       this.publicUrl,
       this.bucket,
       forcePathStyle,
     );
+    this.signedDownloadProxyObjectBase = this.signedDownloadProxyBase
+      ? `${this.signedDownloadProxyBase}${new URL(this.directPublicObjectBase).pathname}`
+      : undefined;
     // 公共地址只推导一次。笔记、头像等同源校验走的是
     // storagePublicObjectBaseFromConfig，这里再推一遍的话，同一个畸形投递地址
     // 会得到两个答案：helper 返回 null（拒绝），而这里静默回落到直连域名 ——
@@ -780,7 +788,11 @@ export class UploadService implements OnModuleInit {
       ...(signingDate ? { signingDate } : {}),
     });
     return {
-      url,
+      // Sign only for the storage endpoint. Keep the signed path/query bytes;
+      // the read-only gateway removes its prefix and restores the storage Host.
+      url: this.signedDownloadProxyBase
+        ? `${this.signedDownloadProxyBase}${url.slice(url.indexOf('/', url.indexOf('://') + 3))}`
+        : url,
       expiresAt: new Date(Date.now() + expiresInSeconds * 1000),
     };
   }
@@ -792,6 +804,23 @@ export class UploadService implements OnModuleInit {
    */
   objectKeyFromPublicUrl(url: string | null | undefined): string | null {
     if (!url) return null;
+    const proxyPrefix = this.signedDownloadProxyObjectBase
+      ? `${this.signedDownloadProxyObjectBase}/`
+      : undefined;
+    if (proxyPrefix && url.startsWith(proxyPrefix)) {
+      // Match the exact proxy bucket before a potentially broader public base.
+      // SDK-encoded proxy URLs must recover the raw key for ownership checks.
+      try {
+        const decoded = decodeURIComponent(
+          url.slice(proxyPrefix.length).split('?')[0],
+        );
+        return decoded.split('/').some((part) => part === '.' || part === '..')
+          ? null
+          : decoded;
+      } catch {
+        return null;
+      }
+    }
     // 历史地址也要认：投递域名启用之前存下的 url 指向直连域名，只认 canonical
     // 会让「按 url 回收对象」在切换那一刻整片失效（旧笔记媒体删不掉，存储审计
     // 反过来把它们当成孤儿）。

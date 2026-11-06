@@ -101,6 +101,14 @@ export function storagePublicObjectBasesFromConfig(
       forcePathStyle,
     );
     if (!bases.includes(direct)) bases.push(direct);
+    const proxyBase = config.get<string>(
+      'OBJECT_STORAGE_SIGNED_DOWNLOAD_PROXY_BASE',
+    );
+    if (proxyBase) {
+      // The gateway prefixes the complete signed path, including the bucket.
+      const proxied = `${proxyBase}${new URL(direct).pathname}`;
+      if (!bases.includes(proxied)) bases.push(proxied);
+    }
   }
   for (const base of config.get<string[]>(
     'OBJECT_STORAGE_LEGACY_PUBLIC_URLS',

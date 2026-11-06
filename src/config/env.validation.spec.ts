@@ -1,6 +1,71 @@
 import { createEnvValidationSchema } from './env.validation';
 
 describe('createEnvValidationSchema', () => {
+  describe('signed download proxy configuration', () => {
+    const proxyEnv = {
+      NODE_ENV: 'development',
+      DATABASE_URL: 'postgresql://test:test@localhost:5432/test',
+      SECRET: 'test-secret',
+      ALLOWED_ORIGINS: 'https://app.example.com, https://api.example.com',
+      OBJECT_STORAGE_SIGNED_DOWNLOAD_PROXY_BASE:
+        'https://api.example.com/r2-media///',
+    };
+
+    it('normalizes the optional proxy base while preserving the path-style default', () => {
+      const { value, error } = createEnvValidationSchema().validate(proxyEnv);
+      expect(error).toBeUndefined();
+      expect(value.OBJECT_STORAGE_SIGNED_DOWNLOAD_PROXY_BASE).toBe(
+        'https://api.example.com/r2-media',
+      );
+      expect(value.OBJECT_STORAGE_FORCE_PATH_STYLE).toBe(true);
+    });
+
+    it.each([
+      'not-a-url',
+      'http://api.example.com/r2-media',
+      'https://user:synthetic-secret@api.example.com/r2-media',
+      'https://api.example.com/r2-media?secret=synthetic-secret',
+      'https://api.example.com/r2-media#synthetic-secret',
+      'https://api.example.com/r2-media?',
+      'https://api.example.com/r2-media#',
+      'https://untrusted.example.com/r2-media',
+      42,
+    ])(
+      'refuses unsafe proxy configuration without reflecting the configured value (%#)',
+      (proxy) => {
+        const { error } = createEnvValidationSchema().validate({
+          ...proxyEnv,
+          OBJECT_STORAGE_SIGNED_DOWNLOAD_PROXY_BASE: proxy,
+        });
+        expect(error?.message).toContain(
+          'OBJECT_STORAGE_SIGNED_DOWNLOAD_PROXY_BASE',
+        );
+        expect(error?.message).toContain('HTTPS');
+        expect(error?.message).not.toContain('synthetic-secret');
+        expect(error?.message).not.toContain(String(proxy));
+      },
+    );
+
+    it('requires path-style addressing when the proxy is enabled', () => {
+      const { error } = createEnvValidationSchema().validate({
+        ...proxyEnv,
+        OBJECT_STORAGE_FORCE_PATH_STYLE: 'false',
+      });
+      expect(error?.message).toContain('OBJECT_STORAGE_FORCE_PATH_STYLE=true');
+    });
+
+    it('leaves an empty or absent proxy disabled', () => {
+      const schema = createEnvValidationSchema();
+      for (const proxy of [undefined, '']) {
+        const { value, error } = schema.validate({
+          ...proxyEnv,
+          OBJECT_STORAGE_SIGNED_DOWNLOAD_PROXY_BASE: proxy,
+        });
+        expect(error).toBeUndefined();
+        expect(value.OBJECT_STORAGE_SIGNED_DOWNLOAD_PROXY_BASE).toBeUndefined();
+      }
+    });
+  });
   const baseEnv = {
     NODE_ENV: 'development',
     SECRET: 'test-secret',
