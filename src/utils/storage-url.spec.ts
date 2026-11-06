@@ -7,6 +7,41 @@ import {
 } from './storage-url';
 
 describe('storage URL helpers', () => {
+  it('recognizes the proxy bucket base alongside direct and delivery bases', () => {
+    const values = {
+      MINIO_ENDPOINT: 'https://account.r2.cloudflarestorage.com',
+      MINIO_BUCKET: 'test-media',
+      OBJECT_STORAGE_DELIVERY_URL: 'https://media.example.com',
+      OBJECT_STORAGE_SIGNED_DOWNLOAD_PROXY_BASE:
+        'https://api.example.com/r2-media',
+    };
+    const bases = storagePublicObjectBasesFromConfig({
+      get: (key: string) => values[key],
+    } as never);
+    expect(bases).toEqual([
+      'https://media.example.com',
+      'https://account.r2.cloudflarestorage.com/test-media',
+      'https://api.example.com/r2-media/test-media',
+    ]);
+    expect(
+      isUrlFromStorage(
+        'https://api.example.com/r2-media/test-media/notes/user/image.png?signature=synthetic',
+        bases,
+      ),
+    ).toBe(true);
+    expect(
+      isUrlFromStorage(
+        'https://api.example.com/r2-media/other-bucket/image.png',
+        bases,
+      ),
+    ).toBe(false);
+    expect(
+      isUrlFromStorage(
+        'https://api.example.com.attacker.test/r2-media/test-media/image.png',
+        bases,
+      ),
+    ).toBe(false);
+  });
   it('builds the same virtual-hosted public base used by COS presign', () => {
     const base = buildStoragePublicObjectBase(
       'https://cos.ap-tokyo.myqcloud.com',

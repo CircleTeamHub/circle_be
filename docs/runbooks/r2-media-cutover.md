@@ -1,5 +1,33 @@
 # Preproduction R2 media cutover
 
+## Optional signed download compatibility gateway
+
+`OBJECT_STORAGE_SIGNED_DOWNLOAD_PROXY_BASE` is disabled when unset or empty.
+To reuse an origin already trusted by installed clients, set it to an HTTPS
+base such as `https://api.example.com/r2-media` only after preparing a read-only
+API/Caddy gateway. Its origin must already be an exact `ALLOWED_ORIGINS` entry,
+and `OBJECT_STORAGE_FORCE_PATH_STYLE` must be `true`. Credentials, query strings
+and fragments in this base are rejected at startup; trailing slashes normalize
+away. This setting does not change the canonical public delivery base.
+
+The backend still signs GET against the existing R2 S3 endpoint, bucket, key,
+signing date and TTL. It only prefixes the signed path and unchanged query with
+the gateway base. The gateway must strip `/r2-media`, preserve the encoded path,
+raw signature query and Range headers, and restore the original R2 Host before
+forwarding. Do not sign for the API host, enable gateway PUT, weaken private
+authorization, or expand the five public prefixes. PUT signatures and uploads
+remain direct R2. Keep existing private-media authorization before issuing GET
+URLs; this gateway does not replace it.
+
+Every signed URL is a bearer credential: suppress full URLs and query strings
+in gateway, application, analytics and error logs. Transfer through the API uses
+the existing server traffic allowance; this is not a promise of free bandwidth.
+Verify signed GET, byte ranges and private denial through the gateway before
+enabling the variable. Unsetting it restores direct signed GET URLs without a
+storage migration or a native rebuild.
+
+Signing reference: [Cloudflare R2 presigned URLs](https://developers.cloudflare.com/r2/api/s3/presigned-urls/).
+
 Status on 2026-11-05: backend compatibility is in ready-for-review
 [PR #312](https://github.com/CircleTeamHub/circle_be/pull/312). The source copy
 contains **403 objects, 706898511 bytes**, verified with full SHA-256 hashes and
