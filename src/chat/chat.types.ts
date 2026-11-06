@@ -279,6 +279,24 @@ export interface ChatMemberSilenceDto {
   silencedUntil: string | null;
 }
 
+export type ChatAbnormalMemberReason = 'INACTIVE' | 'LOW_CREDIT';
+
+/** 异常成员一行:只回判定结果,昵称头像由客户端用成员目录补齐。 */
+export interface ChatAbnormalMemberDto {
+  userId: string;
+  reasons: ChatAbnormalMemberReason[];
+  /** 命中「长期未登录」且有在线记录时的最近在线时刻;否则 null。 */
+  lastActiveAt: string | null;
+  /** 命中「信誉值低」时的分数;否则 null(不外露正常成员的分数)。 */
+  creditScore: number | null;
+}
+
+export interface ChatAbnormalMembersDto {
+  inactiveDays: number;
+  creditThreshold: number;
+  members: ChatAbnormalMemberDto[];
+}
+
 /**
  * 群事件账本的种类。与系统消息 kind 同一词表(前端 im.notification.* /
  * 群日志文案按它分支),加种类不改表结构。

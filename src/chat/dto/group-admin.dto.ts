@@ -11,6 +11,10 @@ import {
   ValidateIf,
 } from 'class-validator';
 import {
+  ABNORMAL_INACTIVE_DAY_OPTIONS,
+  type AbnormalInactiveDays,
+} from '../chat-group-abnormal-members';
+import {
   GROUP_EVENTS_PAGE_MAX,
   SILENCE_DURATION_MAX_SEC,
   SILENCE_DURATION_MIN_SEC,
@@ -65,4 +69,15 @@ export class GroupEventsQueryDto {
   @Min(1)
   @Max(GROUP_EVENTS_PAGE_MAX)
   limit?: number;
+}
+
+export class AbnormalMembersQueryDto {
+  @ApiPropertyOptional({
+    description: '多少天没登录算「长期未登录」,默认 30',
+    enum: ABNORMAL_INACTIVE_DAY_OPTIONS,
+  })
+  @IsOptional()
+  @Type(() => Number)
+  @IsIn(ABNORMAL_INACTIVE_DAY_OPTIONS)
+  inactiveDays?: AbnormalInactiveDays;
 }

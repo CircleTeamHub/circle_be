@@ -31,7 +31,9 @@ import { ChatGroupSettingsService } from './chat-group-settings.service';
 import { GroupAdmissionService } from './group-admission.service';
 import { ChatService } from './chat.service';
 import { ClearHistoryDto } from './dto/clear-history.dto';
+import { ABNORMAL_INACTIVE_DAYS_DEFAULT } from './chat-group-abnormal-members';
 import {
+  AbnormalMembersQueryDto,
   GroupEventsQueryDto,
   SetGroupMemberRoleDto,
   SilenceGroupMemberDto,
@@ -60,6 +62,7 @@ import { ListConversationsQueryDto } from './dto/list-conversations-query.dto';
 import { MessageDaysQueryDto } from './dto/message-days-query.dto';
 import { SyncQueryDto } from './dto/sync-query.dto';
 import type {
+  ChatAbnormalMembersDto,
   ChatConversationDto,
   ChatGroupEventsPageDto,
   ChatGroupPoliciesDto,
@@ -299,6 +302,24 @@ export class ChatController {
     @Param('id', ParseUUIDPipe) conversationId: string,
   ): Promise<ChatMemberDto[]> {
     return this.chatService.listMembers(req.user.userId, conversationId);
+  }
+
+  @Get('conversations/:id/abnormal-members')
+  @Throttle({ default: { limit: 30, ttl: 60_000 } })
+  @ApiOperation({
+    summary:
+      '异常成员(长期未登录/信誉值低),仅群主/管理员;只列本人可移出的成员,不含昵称头像',
+  })
+  listAbnormalMembers(
+    @Req() req: RequestWithUser,
+    @Param('id', ParseUUIDPipe) conversationId: string,
+    @Query() query: AbnormalMembersQueryDto,
+  ): Promise<ChatAbnormalMembersDto> {
+    return this.groupAdmin.listAbnormalMembers(
+      req.user.userId,
+      conversationId,
+      query.inactiveDays ?? ABNORMAL_INACTIVE_DAYS_DEFAULT,
+    );
   }
 
   @Get('conversations/:id/events')

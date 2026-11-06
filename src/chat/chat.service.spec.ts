@@ -4620,6 +4620,75 @@ describe('ChatService', () => {
       });
     });
 
+    describe('standalone groups', () => {
+      const standalone = (ownerID: string | null) => ({
+        ...membership().conversation,
+        circleID: null,
+        ownerID,
+      });
+      const arrangeRevoke = () => {
+        prisma.chatMessage.findUnique.mockResolvedValue(
+          revokableRow({ createdAt: new Date(Date.now() - 60 * 60_000) }),
+        );
+        let revoked: Record<string, unknown> = revokableRow();
+        prisma.chatMessage.updateMany.mockImplementation(
+          async ({ data }: { data: Record<string, unknown> }) => {
+            revoked = { ...revokableRow(), ...data };
+            return { count: 1 };
+          },
+        );
+        prisma.chatMessage.findUniqueOrThrow.mockImplementation(
+          async () => revoked,
+        );
+      };
+
+      it('lets the owner revoke others messages without a window', async () => {
+        prisma.chatMember.findUnique.mockResolvedValue(
+          membership({
+            userID: 'owner-1',
+            conversation: standalone('owner-1'),
+          }),
+        );
+        arrangeRevoke();
+
+        const dto = await service.revokeMessage('owner-1', 'conv-1', 'm1');
+        expect(dto.revokedBy).toBe('owner-1');
+        expect(prisma.circleMember.findUnique).not.toHaveBeenCalled();
+      });
+
+      it('lets a seated admin revoke others messages', async () => {
+        prisma.chatMember.findUnique.mockResolvedValue(
+          membership({
+            userID: 'admin-1',
+            role: 'ADMIN',
+            conversation: standalone('owner-1'),
+          }),
+        );
+        arrangeRevoke();
+
+        const dto = await service.revokeMessage('admin-1', 'conv-1', 'm1');
+        expect(dto.revokedBy).toBe('admin-1');
+      });
+
+      it('still rejects a plain member', async () => {
+        prisma.chatMember.findUnique.mockResolvedValue(
+          membership({
+            userID: 'u2',
+            role: 'MEMBER',
+            conversation: standalone('owner-1'),
+          }),
+        );
+        prisma.chatMessage.findUnique.mockResolvedValue(revokableRow());
+
+        await expect(
+          service.revokeMessage('u2', 'conv-1', 'm1'),
+        ).rejects.toMatchObject({
+          response: { errorCode: 'CHAT_REVOKE_FORBIDDEN' },
+        });
+        expect(prisma.chatMessage.updateMany).not.toHaveBeenCalled();
+      });
+    });
+
     it('is idempotent for an already revoked message', async () => {
       prisma.chatMember.findUnique.mockResolvedValue(membership());
       prisma.chatMessage.findUnique.mockResolvedValue(

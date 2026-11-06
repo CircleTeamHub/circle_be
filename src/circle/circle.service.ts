@@ -860,7 +860,9 @@ export class CircleService {
     // 的人全部离座、踢出会话房并逐个广播 removed。放事务外与退圈/管理台停用
     // 同款做法 —— 推送失败不该回滚已经落库的解散,漏掉的座位下一轮对账收敛。
     try {
-      await this.chatCircleSync.ensureCircleConversation(circleId);
+      await this.chatCircleSync.ensureCircleConversation(circleId, {
+        actorId: userId,
+      });
     } catch (error) {
       this.logger.warn(
         `dissolve seat eviction failed circle=${circleId}: ${
