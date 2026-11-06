@@ -98,6 +98,59 @@ describe('storage URL helpers', () => {
     ]);
   });
 
+  it('appends unique historical bases after the canonical and current signing bases', () => {
+    const config = {
+      get: (key: string) =>
+        ({
+          MINIO_ENDPOINT: 'https://account.r2.cloudflarestorage.com',
+          MINIO_BUCKET: 'circle-media',
+          OBJECT_STORAGE_FORCE_PATH_STYLE: true,
+          OBJECT_STORAGE_DELIVERY_URL: 'https://media.example.com/circle',
+          OBJECT_STORAGE_LEGACY_PUBLIC_URLS: [
+            'https://windnote-1234567890.cos.ap-tokyo.myqcloud.com',
+            'https://media.example.com/circle',
+            'http://minio:9000/circle',
+            'https://windnote-1234567890.cos.ap-tokyo.myqcloud.com',
+            'https://account.r2.cloudflarestorage.com/circle-media',
+          ],
+        })[key],
+    };
+
+    const bases = storagePublicObjectBasesFromConfig(config as never);
+
+    expect(bases).toEqual([
+      'https://media.example.com/circle',
+      'https://account.r2.cloudflarestorage.com/circle-media',
+      'https://windnote-1234567890.cos.ap-tokyo.myqcloud.com',
+      'http://minio:9000/circle',
+    ]);
+    expect(
+      isUrlFromStorage(
+        'https://windnote-1234567890.cos.ap-tokyo.myqcloud.com/avatars/u1/a.jpg',
+        bases,
+      ),
+    ).toBe(true);
+    expect(
+      isUrlFromStorage(
+        'https://windnote-1234567890.cos.ap-tokyo.myqcloud.com.attacker.test/avatars/u1/a.jpg',
+        bases,
+      ),
+    ).toBe(false);
+  });
+
+  it('recognizes historical bases without a current signing endpoint', () => {
+    const config = {
+      get: (key: string) =>
+        ({
+          OBJECT_STORAGE_LEGACY_PUBLIC_URLS: ['http://minio:9000/circle'],
+        })[key],
+    };
+
+    expect(storagePublicObjectBasesFromConfig(config as never)).toEqual([
+      'http://minio:9000/circle',
+    ]);
+  });
+
   it('accepts a url served from any configured base', () => {
     const bases = [
       'https://media.example.com/circle',

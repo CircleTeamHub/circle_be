@@ -101,7 +101,8 @@ fi
 # on every deploy: the app and backup credentials (.env.*), the monitoring
 # stack's Grafana password and exporter connection strings, Alertmanager's
 # webhook URLs, Prometheus' scrape token and public probe targets (see each
-# directory's .gitignore). The tracked *.example templates still update.
+# directory's .gitignore), plus the media Worker's local Wrangler state and
+# environment files. The tracked *.example templates still update.
 #
 # The force command stages releases go-rwx so nothing else on the host can read
 # or swap them mid-flight. The active tree must not inherit that: the monitoring
@@ -129,6 +130,11 @@ rsync -a --delete \
   --exclude='/monitoring/alertmanager/*.url' \
   --exclude=/monitoring/prometheus/metrics_token \
   --exclude='/monitoring/prometheus/probe-targets/*.yml' \
+  --include='/deploy/cloudflare/media-worker/.env*.example' \
+  --include='/deploy/cloudflare/media-worker/.dev.vars*.example' \
+  --exclude=/deploy/cloudflare/media-worker/.wrangler \
+  --exclude='/deploy/cloudflare/media-worker/.dev.vars*' \
+  --exclude='/deploy/cloudflare/media-worker/.env*' \
   --exclude=/.release \
   --exclude=.git \
   --exclude=node_modules \

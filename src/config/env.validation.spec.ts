@@ -186,6 +186,88 @@ describe('createEnvValidationSchema', () => {
     },
   );
 
+  it('defaults external bucket configuration attestation to false', () => {
+    const env = {
+      ...baseEnv,
+      DATABASE_URL: 'postgresql://user:pass@localhost:5432/db',
+    };
+
+    const { error, value } = createEnvValidationSchema(env).validate(env);
+
+    expect(error).toBeUndefined();
+    expect(value.OBJECT_STORAGE_BUCKET_CONFIG_VERIFIED_EXTERNALLY).toBe(false);
+  });
+
+  it.each(['', '.eu', '.us', '.fedramp'])(
+    'accepts explicit external R2 configuration attestation for jurisdiction %s',
+    (jurisdiction) => {
+      const env = {
+        ...baseEnv,
+        DATABASE_URL: 'postgresql://user:pass@localhost:5432/db',
+        MINIO_ENDPOINT: `https://${'a'.repeat(32)}${jurisdiction}.r2.cloudflarestorage.com/`,
+        OBJECT_STORAGE_MANAGE_BUCKET: 'false',
+        OBJECT_STORAGE_BUCKET_CONFIG_VERIFIED_EXTERNALLY: 'true',
+      };
+
+      const { error, value } = createEnvValidationSchema(env).validate(env);
+
+      expect(error).toBeUndefined();
+      expect(value.OBJECT_STORAGE_BUCKET_CONFIG_VERIFIED_EXTERNALLY).toBe(true);
+    },
+  );
+
+  it.each([
+    {
+      MINIO_ENDPOINT: `https://${'a'.repeat(32)}.r2.cloudflarestorage.com`,
+      OBJECT_STORAGE_MANAGE_BUCKET: 'true',
+    },
+    {
+      MINIO_ENDPOINT: 'https://cos.ap-tokyo.myqcloud.com',
+      OBJECT_STORAGE_MANAGE_BUCKET: 'false',
+    },
+    {
+      MINIO_ENDPOINT: `http://${'a'.repeat(32)}.r2.cloudflarestorage.com`,
+      OBJECT_STORAGE_MANAGE_BUCKET: 'false',
+    },
+    {
+      MINIO_ENDPOINT: `https://${'a'.repeat(32)}.r2.cloudflarestorage.com/bucket`,
+      OBJECT_STORAGE_MANAGE_BUCKET: 'false',
+    },
+    {
+      MINIO_ENDPOINT: 'https://r2.cloudflarestorage.com',
+      OBJECT_STORAGE_MANAGE_BUCKET: 'false',
+    },
+    { OBJECT_STORAGE_MANAGE_BUCKET: 'false' },
+  ])(
+    'rejects external configuration attestation outside unmanaged HTTPS R2: %o',
+    (storage) => {
+      const env = {
+        ...baseEnv,
+        DATABASE_URL: 'postgresql://user:pass@localhost:5432/db',
+        ...storage,
+        OBJECT_STORAGE_BUCKET_CONFIG_VERIFIED_EXTERNALLY: 'true',
+      };
+
+      const { error } = createEnvValidationSchema(env).validate(env);
+
+      expect(error?.message).toContain(
+        'OBJECT_STORAGE_BUCKET_CONFIG_VERIFIED_EXTERNALLY requires an externally managed HTTPS R2 endpoint',
+      );
+    },
+  );
+
+  it('rejects a malformed external configuration attestation boolean', () => {
+    const env = {
+      ...baseEnv,
+      DATABASE_URL: 'postgresql://user:pass@localhost:5432/db',
+      OBJECT_STORAGE_BUCKET_CONFIG_VERIFIED_EXTERNALLY: 'yes',
+    };
+
+    expect(
+      createEnvValidationSchema(env).validate(env).error?.message,
+    ).toContain('OBJECT_STORAGE_BUCKET_CONFIG_VERIFIED_EXTERNALLY');
+  });
+
   it('normalizes backwards-compatible object storage defaults', () => {
     const env = {
       ...baseEnv,
@@ -198,6 +280,58 @@ describe('createEnvValidationSchema', () => {
     expect(value.OBJECT_STORAGE_REGION).toBe('us-east-1');
     expect(value.OBJECT_STORAGE_FORCE_PATH_STYLE).toBe(true);
     expect(value.OBJECT_STORAGE_MANAGE_BUCKET).toBe(true);
+    expect(value.OBJECT_STORAGE_LEGACY_PUBLIC_URLS).toEqual([]);
+  });
+
+  it('normalizes and deduplicates comma-separated historical storage bases', () => {
+    const env = {
+      ...baseEnv,
+      DATABASE_URL: 'postgresql://user:pass@localhost:5432/db',
+      OBJECT_STORAGE_LEGACY_PUBLIC_URLS:
+        ' https://WINDNOTE-1234567890.cos.ap-tokyo.myqcloud.com///, , http://minio:9000/circle/, https://windnote-1234567890.cos.ap-tokyo.myqcloud.com ',
+    };
+
+    const { error, value } = createEnvValidationSchema(env).validate(env);
+
+    expect(error).toBeUndefined();
+    expect(value.OBJECT_STORAGE_LEGACY_PUBLIC_URLS).toEqual([
+      'https://windnote-1234567890.cos.ap-tokyo.myqcloud.com',
+      'http://minio:9000/circle',
+    ]);
+  });
+
+  it.each(['', '  ,  , '])(
+    'normalizes an empty historical storage list %j to an array',
+    (legacyBases) => {
+      const env = {
+        ...baseEnv,
+        DATABASE_URL: 'postgresql://user:pass@localhost:5432/db',
+        OBJECT_STORAGE_LEGACY_PUBLIC_URLS: legacyBases,
+      };
+
+      const { error, value } = createEnvValidationSchema(env).validate(env);
+
+      expect(error).toBeUndefined();
+      expect(value.OBJECT_STORAGE_LEGACY_PUBLIC_URLS).toEqual([]);
+    },
+  );
+
+  it.each([
+    'https://user:password@old.example.com/circle',
+    'https://old.example.com/circle?token=secret',
+    'https://old.example.com/circle#fragment',
+    'ftp://old.example.com/circle',
+    'not a URL',
+  ])('rejects an unsafe historical storage base %s', (legacyBase) => {
+    const env = {
+      ...baseEnv,
+      DATABASE_URL: 'postgresql://user:pass@localhost:5432/db',
+      OBJECT_STORAGE_LEGACY_PUBLIC_URLS: `https://old.example.com,${legacyBase}`,
+    };
+
+    const { error } = createEnvValidationSchema(env).validate(env);
+
+    expect(error?.message).toContain('OBJECT_STORAGE_LEGACY_PUBLIC_URLS');
   });
 
   it('normalizes structured logging defaults', () => {

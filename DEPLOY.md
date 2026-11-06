@@ -60,6 +60,11 @@ rsync -az --delete \
   --exclude '/monitoring/alertmanager/*.url' \
   --exclude /monitoring/prometheus/metrics_token \
   --exclude '/monitoring/prometheus/probe-targets/*.yml' \
+  --include '/deploy/cloudflare/media-worker/.env*.example' \
+  --include '/deploy/cloudflare/media-worker/.dev.vars*.example' \
+  --exclude /deploy/cloudflare/media-worker/.wrangler \
+  --exclude '/deploy/cloudflare/media-worker/.dev.vars*' \
+  --exclude '/deploy/cloudflare/media-worker/.env*' \
   -e "ssh -i ~/.ssh/circle_oracle" \
   ./ ubuntu@<公网IP>:~/circle_be/
 ```
