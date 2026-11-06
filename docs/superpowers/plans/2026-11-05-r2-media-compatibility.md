@@ -113,16 +113,17 @@ failure is retained in the task evidence. No cloud or database cutover occurred.
 - [x] Document the public-prefix-only delivery Worker as a separate deployable component. It must pass deny tests for private prefixes before publishing.
 - [x] Document that legacy recognition alone does not rewrite stored public URLs. Require a database dry run and backup of affected scalar, array and card-avatar fields before changing their delivery base.
 - [x] Require a final incremental inventory check, controlled upload pause, private-media authorization tests, browser PUT preflight/upload verification, and rollback using the retained COS configuration.
-- [ ] Prepare a ready-for-review PR; keep deployment and permanent source cleanup separate from code preparation.
+- [x] Prepare a ready-for-review PR; keep deployment and permanent source cleanup separate from code preparation.
 
 Evidence: [cutover runbook](../../runbooks/r2-media-cutover.md) documents the
 reviewed resources, exact HTTPS origin set, deployment secret flow, mapped-field
 dry run/backup and pending operator gates. `.env.example` already documents both
-new fields and needs no further correction. Worker commit `ff004ad` has 40 passing
+new fields and needs no further correction. Worker commit `c1990aa` has 89 passing
 fixture-only unit/local-runtime tests, generated-type and TypeScript checks, and
 a successful Wrangler dry run; see its [implementation plan](2026-11-05-r2-public-delivery.md).
-This checklist records code/documentation preparation only. PR publication is
-pending controller integration; the Worker is not deployed, storage has not
+This checklist records code/documentation preparation only. Ready-for-review
+[PR #312](https://github.com/CircleTeamHub/circle_be/pull/312) is open, with Linux CI
+required before merge. The Worker is not deployed, storage has not
 switched, and the runbook's live-operation checkboxes remain open.
 
 Read-only deployment verification additionally found the current controlled

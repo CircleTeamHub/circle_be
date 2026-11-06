@@ -32,10 +32,11 @@
 
 - [x] Exercise the actual Worker/R2 runtime using fixture-only local bindings, full/HEAD/ranged/suffix/conditional reads and private-prefix denials.
 - [x] Reproduce range regression: actual R2 may include full-read range metadata and an undefined suffix property. Add unit regression coverage; observe two failures before correction.
-- [x] Treat an actual Range request plus returned range metadata as 206; use normalized offset/length values before suffix fallback. Do not infer a suffix from property presence alone.
+- [x] Classify supported single byte ranges against selected metadata before native streaming reads; ignored ranges stay 200 and unsatisfiable ranges return 416.
 - [x] Restrict edge-cache cloning to images up to 8 MiB; observe two regression failures for video/large-image caching before the fix.
 - [x] Verify 40 tests pass, including cold-cache ETag and If-Match cases, and ensure runtime.dispose() closes the local helper.
 - [x] Reproduce the review's warm-cache/HEAD precondition, If-Range and unsatisfiable-range bugs before fixing them; verify 84 component tests including 54 real local-runtime cases.
+- [x] Reproduce equal-date conditional empty-body/cache contamination; use the shared local seconds-precision evaluator and an explicit body contract check. Verify 89 component tests and obtain final whole-branch review approval, subject to CI.
 - [x] Run Wrangler dry-run to validate the real binding configuration without deployment.
 
 ### Task 3: Continuous verification and publication review
