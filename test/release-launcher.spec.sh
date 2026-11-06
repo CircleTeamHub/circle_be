@@ -114,6 +114,13 @@ host_local_files=(
   monitoring/alertmanager/heartbeat-fail.url
   monitoring/prometheus/metrics_token
   monitoring/prometheus/probe-targets/public.yml
+  deploy/cloudflare/media-worker/node_modules/local.txt
+  deploy/cloudflare/media-worker/dist/local.js
+  deploy/cloudflare/media-worker/.wrangler/state/v3/r2/state.sqlite
+  deploy/cloudflare/media-worker/.dev.vars
+  deploy/cloudflare/media-worker/.dev.vars.production
+  deploy/cloudflare/media-worker/.env
+  deploy/cloudflare/media-worker/.env.production
 )
 for file in "${host_local_files[@]}"; do
   mkdir -p "$DEPLOY_ROOT/$(dirname "$file")"
@@ -128,6 +135,11 @@ printf 'template\n' > "$new_stage/.env.backup.example"
 printf 'template\n' > "$new_stage/monitoring/prometheus/probe-targets/public.yml.example"
 printf 'template\n' > "$new_stage/monitoring/alertmanager/discord.url.example"
 printf 'groups: []\n' > "$new_stage/monitoring/prometheus/alerts.yml"
+mkdir -p "$new_stage/deploy/cloudflare/media-worker"
+printf 'stale\n' > "$DEPLOY_ROOT/deploy/cloudflare/media-worker/.env.example"
+printf 'stale\n' > "$DEPLOY_ROOT/deploy/cloudflare/media-worker/.dev.vars.example"
+printf 'template\n' > "$new_stage/deploy/cloudflare/media-worker/.env.example"
+printf 'template\n' > "$new_stage/deploy/cloudflare/media-worker/.dev.vars.example"
 # A second staged release whose transfer fails part-way.
 cp -R "$new_stage" "$STATE_DIR/incoming/failing"
 printf 'failing\n' > "$STATE_DIR/incoming/failing/VERSION"
@@ -153,6 +165,8 @@ for file in "${host_local_files[@]}"; do
 done
 [ "$(cat "$DEPLOY_ROOT/.env.backup.example")" = "template" ]
 [ -f "$DEPLOY_ROOT/monitoring/prometheus/probe-targets/public.yml.example" ]
+[ "$(cat "$DEPLOY_ROOT/deploy/cloudflare/media-worker/.env.example")" = "template" ]
+[ "$(cat "$DEPLOY_ROOT/deploy/cloudflare/media-worker/.dev.vars.example")" = "template" ]
 [ ! -e "$DEPLOY_ROOT/removed-from-release.txt" ]
 # deploy/sync-ops-stacks.sh recreates the ops stacks only behind this marker.
 grep -qx 'keeps-host-config=1' "$CASE_DIR/new-env.log"
