@@ -39,7 +39,13 @@ import {
   CHAT_NOTE_IMPORT_SEGMENT,
   CHAT_NOTE_IMPORT_RESERVATION_MS,
   CHAT_NOTE_IMPORT_RESERVATION_REASON,
+  NOTE_CARD_PREVIEW_MAX,
+  NOTE_MEDIA_KEY_PREFIX,
 } from 'src/chat/chat.constants';
+import type {
+  NoteCardProjection,
+  NoteCardProjector,
+} from 'src/chat/note-card-projector';
 import {
   assertUrlsFromStorage,
   isUrlFromStorage,
@@ -590,7 +596,7 @@ function isSendableNoteLocation(
 }
 
 @Injectable()
-export class NoteService {
+export class NoteService implements NoteCardProjector {
   private readonly logger = new Logger(NoteService.name);
   private readonly loggingConfig = createLoggingConfig();
   private readonly storagePublicObjectBases: readonly string[];
@@ -4617,6 +4623,53 @@ export class NoteService {
    * 幂等：自己的笔记不复制直接返回；同一原笔记重复收藏只刷新来源快照。
    * 并发重复收藏由数据库唯一索引兜底，冲突后重读已有副本。
    */
+  /**
+   * 聊天笔记卡片读时的内容投影(见 src/chat/note-card-projector.ts):与「我的笔记」列表
+   * 同一套摘要算法(mapSummaryListResolved),用访客视角 —— 主人的备注、分组、名片、
+   * 来源都不带;封面现签。只投影此刻 ACTIVE + available 的笔记。
+   */
+  async projectChatNoteCards(
+    noteIds: readonly string[],
+  ): Promise<Map<string, NoteCardProjection>> {
+    const ids = [...new Set(noteIds)];
+    const result = new Map<string, NoteCardProjection>();
+    if (ids.length === 0) return result;
+    const notes = await this.prisma.note.findMany({
+      where: { id: { in: ids }, status: 'ACTIVE', available: true },
+      select: NOTE_SUMMARY_SELECT,
+    });
+    if (notes.length === 0) return result;
+    // 空字符串不会是任何笔记的主人:按访客视角生成摘要。
+    const summaries = await this.mapSummaryListResolved(notes, '');
+    const media = await this.prisma.noteMedia.findMany({
+      where: { noteID: { in: notes.map((note) => note.id) }, type: 'IMAGE' },
+      orderBy: [{ noteID: 'asc' }, { sortOrder: 'asc' }],
+      select: { noteID: true, objectKey: true },
+    });
+    const previewKeys = new Map<string, string[]>();
+    for (const item of media) {
+      if (!item.noteID || !item.objectKey.startsWith(NOTE_MEDIA_KEY_PREFIX))
+        continue;
+      const keys = previewKeys.get(item.noteID) ?? [];
+      if (keys.length < NOTE_CARD_PREVIEW_MAX) keys.push(item.objectKey);
+      previewKeys.set(item.noteID, keys);
+    }
+    for (const summary of summaries) {
+      result.set(summary.id, {
+        title: summary.title,
+        contentPreview: summary.contentPreview,
+        coverUrl: summary.cover?.url ?? null,
+        imageCount: summary.imageCount,
+        videoCount: summary.videoCount,
+        showcaseCount: summary.showcaseCount,
+        hasText: summary.hasText,
+        hasLocation: summary.hasLocation,
+        previewKeys: previewKeys.get(summary.id) ?? [],
+      });
+    }
+    return result;
+  }
+
   /**
    * Batched live status for chat note cards. Each id resolves through the
    * collect chain to its root, so a card for any hop reports the boss's

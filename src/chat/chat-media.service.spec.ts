@@ -218,6 +218,84 @@ describe('ChatMediaService', () => {
       expect(older.content.noteId).toBe('copy');
     });
 
+    describe('card content follows the note', () => {
+      const projector = { projectChatNoteCards: jest.fn() };
+      const moduleRef = { get: jest.fn(() => projector) };
+      const projecting = new ChatMediaService(
+        uploadService as never,
+        prisma as never,
+        moduleRef as never,
+      );
+      afterAll(() => projecting.onModuleDestroy());
+      const fresh = {
+        title: '北京大妞(新)',
+        contentPreview: '新的正文',
+        coverUrl: 'https://signed/notes/u1/cover-new.jpg',
+        imageCount: 3,
+        videoCount: 0,
+        showcaseCount: 3,
+        hasText: true,
+        hasLocation: false,
+        previewKeys: ['notes/u1/new-a.jpg', 'notes/u1/new-b.jpg'],
+      };
+
+      // 作者改了笔记:已经发出去的卡片读的时候换成笔记此刻的内容,四宫格按新图签。
+      it('an old card shows the note as it is now, with fresh previews', async () => {
+        projector.projectChatNoteCards.mockResolvedValueOnce(
+          new Map([['mine', fresh]]),
+        );
+        const message = dto({
+          type: 'note-card',
+          content: {
+            noteId: 'mine',
+            sourceNoteId: 'mine',
+            title: '北京大妞',
+            contentPreview: null,
+            imageCount: 0,
+            coverUrl: 'https://expired/cover.jpg',
+            previewKeys: ['notes/u1/old.jpg'],
+          },
+        });
+        await projecting.attachMediaUrls([message]);
+        expect(projector.projectChatNoteCards).toHaveBeenCalledWith(['mine']);
+        expect(message.content).toMatchObject({
+          noteId: 'mine',
+          title: '北京大妞(新)',
+          contentPreview: '新的正文',
+          coverUrl: 'https://signed/notes/u1/cover-new.jpg',
+          imageCount: 3,
+          hasText: true,
+          previewUrls: [
+            'https://signed/notes/u1/new-a.jpg',
+            'https://signed/notes/u1/new-b.jpg',
+          ],
+        });
+      });
+
+      it('a card whose source is no longer distributable keeps its snapshot', async () => {
+        prisma.note.findMany.mockResolvedValueOnce([
+          { id: 'mine', status: 'ACTIVE', available: false, workStatus: null },
+        ]);
+        const message = dto({
+          type: 'note-card',
+          content: { noteId: 'mine', sourceNoteId: 'mine', title: '旧标题' },
+        });
+        await projecting.attachMediaUrls([message]);
+        expect(projector.projectChatNoteCards).not.toHaveBeenCalled();
+        expect(message.content.title).toBe('旧标题');
+      });
+
+      it('a failed projection keeps the snapshot', async () => {
+        projector.projectChatNoteCards.mockRejectedValueOnce(new Error('db'));
+        const message = dto({
+          type: 'note-card',
+          content: { noteId: 'mine', sourceNoteId: 'mine', title: '旧标题' },
+        });
+        await projecting.attachMediaUrls([message]);
+        expect(message.content.title).toBe('旧标题');
+      });
+    });
+
     it('keeps the sent snapshot when the root lookup fails', async () => {
       prisma.note.findMany.mockRejectedValue(new Error('db down'));
       const message = dto({

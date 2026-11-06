@@ -777,6 +777,46 @@ describePostgres('note list summaries (PostgreSQL)', () => {
     }
   });
 
+  // 聊天卡片读时投影:与列表同一套摘要,访客视角,只投影此刻可分发的笔记。
+  it('projects chat note cards from the live note, only for distributable notes', async () => {
+    await note('n-card-hidden', { available: false, title: 'hidden' });
+    await note('n-card-unlisted', { status: 'UNLISTED', title: 'unlisted' });
+    const projections = await service.projectChatNoteCards([
+      'n-media',
+      'n-plain',
+      'n-plain',
+      'n-card-hidden',
+      'n-card-unlisted',
+      'missing',
+    ]);
+    expect([...projections.keys()].sort()).toEqual(['n-media', 'n-plain']);
+    const media = projections.get('n-media')!;
+    expect(media).toMatchObject({
+      title: 'title n-media',
+      imageCount: 2,
+      videoCount: 1,
+      previewKeys: ['notes/u1/m-img-a.bin', 'notes/u1/m-img-b.bin'],
+    });
+    expect(media.coverUrl).toEqual(expect.any(String));
+    expect(projections.get('n-plain')).toMatchObject({
+      contentPreview: 'Hello world second line',
+      hasText: true,
+      previewKeys: [],
+    });
+    // 只有卡片要的字段:主人的备注、分组、名片、来源不会经聊天带出去。
+    expect(Object.keys(media).sort()).toEqual([
+      'contentPreview',
+      'coverUrl',
+      'hasLocation',
+      'hasText',
+      'imageCount',
+      'previewKeys',
+      'showcaseCount',
+      'title',
+      'videoCount',
+    ]);
+  });
+
   it('reads a page of summaries by primary key and carries a fraction of the row data', async () => {
     await s.db.query(`
       INSERT INTO "Note" (id, "ownerID", title, content, "createdAt", "updatedAt")
