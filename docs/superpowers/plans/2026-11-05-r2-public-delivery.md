@@ -35,6 +35,7 @@
 - [x] Treat an actual Range request plus returned range metadata as 206; use normalized offset/length values before suffix fallback. Do not infer a suffix from property presence alone.
 - [x] Restrict edge-cache cloning to images up to 8 MiB; observe two regression failures for video/large-image caching before the fix.
 - [x] Verify 40 tests pass, including cold-cache ETag and If-Match cases, and ensure runtime.dispose() closes the local helper.
+- [x] Reproduce the review's warm-cache/HEAD precondition, If-Range and unsatisfiable-range bugs before fixing them; verify 84 component tests including 54 real local-runtime cases.
 - [x] Run Wrangler dry-run to validate the real binding configuration without deployment.
 
 ### Task 3: Continuous verification and publication review

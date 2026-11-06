@@ -42,18 +42,69 @@ const worker = {
       url.search = '';
       url.hash = '';
       url.pathname = `/${key.split('/').map(encodeURIComponent).join('/')}`;
-      if (request.method === 'GET') {
+      // Ignore unsupported/malformed ranges rather than trusting R2's normalized
+      // full-object range metadata to mean that a partial read was satisfied.
+      const readHeaders = new Headers(request.headers);
+      const rangeParts = /^bytes=(\d*)-(\d*)$/i.exec(
+        readHeaders.get('Range') ?? '',
+      );
+      const range =
+        rangeParts &&
+        (rangeParts[1] || rangeParts[2]) &&
+        !(
+          rangeParts[1] &&
+          rangeParts[2] &&
+          Number(rangeParts[1]) > Number(rangeParts[2])
+        )
+          ? rangeParts
+          : null;
+      if (!range || request.method === 'HEAD') readHeaders.delete('Range');
+      // Cache API handles read validators, but not write-style preconditions.
+      if (
+        request.method === 'GET' &&
+        !readHeaders.has('If-Match') &&
+        !readHeaders.has('If-Unmodified-Since')
+      ) {
+        const cacheHeaders = new Headers(readHeaders);
+        cacheHeaders.delete('Range');
         const cached = await caches.default.match(
-          new Request(url, { headers: request.headers }),
+          new Request(url, { headers: cacheHeaders }),
         );
-        if (cached) return cached;
+        if (cached) {
+          if (!range || cached.status !== 200) return cached;
+          const selected = selectRange(
+            range,
+            readHeaders.get('If-Range'),
+            cached.headers.get('ETag'),
+            cached.headers.get('Last-Modified'),
+            Number(cached.headers.get('Content-Length')),
+          );
+          if (selected === undefined) return cached;
+          await cached.body?.cancel();
+          if (selected === null) {
+            const headers = new Headers(cached.headers);
+            headers.set(
+              'Content-Range',
+              `bytes */${cached.headers.get('Content-Length')}`,
+            );
+            headers.delete('Content-Length');
+            return new Response(null, { status: 416, headers });
+          }
+          cacheHeaders.set(
+            'Range',
+            `bytes=${selected.offset}-${selected.offset + selected.length - 1}`,
+          );
+          const partial = await caches.default.match(
+            new Request(url, { headers: cacheHeaders }),
+          );
+          if (partial) return partial;
+        }
       }
-      const object =
-        request.method === 'HEAD'
+      let object =
+        request.method === 'HEAD' || range
           ? await env.MEDIA.head(key)
           : await env.MEDIA.get(key, {
-              range: request.headers,
-              onlyIf: request.headers,
+              onlyIf: readHeaders,
             });
       if (!object) {
         return new Response(null, {
@@ -75,65 +126,57 @@ const worker = {
       if (!headers.has('Cache-Control'))
         headers.set('Cache-Control', 'public, max-age=3600');
 
+      const conditionStatus = preconditionStatus(readHeaders, object);
+      if (conditionStatus) {
+        if ('body' in object)
+          await /** @type {R2ObjectBody} */ (object).body.cancel();
+        headers.delete('Content-Length');
+        return new Response(null, { status: conditionStatus, headers });
+      }
       if (request.method === 'HEAD') {
-        const candidates = request.headers
-          .get('If-None-Match')
-          ?.split(',')
-          .map((value) => value.trim());
-        if (
-          candidates?.some(
-            (value) =>
-              value === '*' ||
-              value === object.httpEtag ||
-              value === `W/${object.httpEtag}`,
-          )
-        ) {
-          return new Response(null, { status: 304, headers });
-        }
         headers.set('Content-Length', String(object.size));
         return new Response(null, { headers });
       }
-      if (!('body' in object)) {
-        const ifMatch = request.headers.get('If-Match');
-        const unmodifiedSince = request.headers.get('If-Unmodified-Since');
-        const failedMatch =
-          ifMatch &&
-          ifMatch !== '*' &&
-          !ifMatch
-            .split(',')
-            .map((value) => value.trim())
-            .includes(object.httpEtag);
-        const failedDate =
-          !ifMatch &&
-          unmodifiedSince &&
-          Math.floor(object.uploaded.getTime() / 1000) >
-            Math.floor(Date.parse(unmodifiedSince) / 1000);
-        headers.delete('Content-Length');
-        return new Response(null, {
-          status: failedMatch || failedDate ? 412 : 304,
-          headers,
-        });
-      }
 
       let status = 200;
-      if (request.headers.has('Range') && object.range) {
-        const range = object.range;
-        const suffix = 'suffix' in range ? range.suffix : undefined;
-        const offset =
-          ('offset' in range ? range.offset : undefined) ??
-          Math.max(0, object.size - (suffix ?? object.size));
-        const length =
-          ('length' in range ? range.length : undefined) ??
-          Math.min(object.size - offset, suffix ?? object.size);
-        headers.set(
-          'Content-Range',
-          `bytes ${offset}-${offset + length - 1}/${object.size}`,
+      if (range) {
+        const selected = selectRange(
+          range,
+          readHeaders.get('If-Range'),
+          object.httpEtag,
+          object.uploaded.toUTCString(),
+          object.size,
         );
-        headers.set('Content-Length', String(length));
-        status = 206;
-      } else {
-        headers.set('Content-Length', String(object.size));
+        if (selected === null) {
+          headers.set('Content-Range', `bytes */${object.size}`);
+          headers.delete('Content-Length');
+          return new Response(null, { status: 416, headers });
+        }
+        object = await env.MEDIA.get(key, {
+          range: selected,
+          onlyIf: readHeaders,
+        });
+        if (!object)
+          return new Response(null, {
+            status: 404,
+            headers: { 'Cache-Control': 'no-store' },
+          });
+        const statusAfterRead = preconditionStatus(readHeaders, object);
+        if (statusAfterRead) {
+          if ('body' in object)
+            await /** @type {R2ObjectBody} */ (object).body.cancel();
+          return new Response(null, { status: statusAfterRead, headers });
+        }
+        if (selected) {
+          headers.set(
+            'Content-Range',
+            `bytes ${selected.offset}-${selected.offset + selected.length - 1}/${object.size}`,
+          );
+          headers.set('Content-Length', String(selected.length));
+          status = 206;
+        }
       }
+      if (status === 200) headers.set('Content-Length', String(object.size));
       // R2 results that contain a body are R2ObjectBody instances by API contract.
       const response = new Response(/** @type {R2ObjectBody} */ (object).body, {
         status,
@@ -166,3 +209,75 @@ const worker = {
 };
 
 export default worker;
+
+/** @param {Headers} headers @param {R2Object} object */
+function preconditionStatus(headers, object) {
+  const ifMatch = headers.get('If-Match');
+  const unmodifiedSince = headers.get('If-Unmodified-Since');
+  const uploadedSeconds = Math.floor(object.uploaded.getTime() / 1000);
+  if (ifMatch !== null) {
+    if (
+      !ifMatch
+        .split(',')
+        .some(
+          (value) => value.trim() === '*' || value.trim() === object.httpEtag,
+        )
+    )
+      return 412;
+  } else if (
+    unmodifiedSince &&
+    uploadedSeconds > Math.floor(Date.parse(unmodifiedSince) / 1000)
+  ) {
+    return 412;
+  }
+  const ifNoneMatch = headers.get('If-None-Match');
+  if (ifNoneMatch !== null) {
+    if (
+      ifNoneMatch
+        .split(',')
+        .some(
+          (value) =>
+            value.trim() === '*' ||
+            value.trim().replace(/^W\//, '') === object.httpEtag,
+        )
+    )
+      return 304;
+  } else {
+    const modifiedSince = headers.get('If-Modified-Since');
+    if (
+      modifiedSince &&
+      uploadedSeconds <= Math.floor(Date.parse(modifiedSince) / 1000)
+    )
+      return 304;
+  }
+  return undefined;
+}
+
+/**
+ * Undefined ignores Range; null means a valid but unsatisfiable byte range.
+ * @param {RegExpExecArray} parts
+ * @param {string | null} ifRange
+ * @param {string | null} etag
+ * @param {string | null} lastModified
+ * @param {number} size
+ */
+function selectRange(parts, ifRange, etag, lastModified, size) {
+  if (
+    ifRange !== null &&
+    ifRange !== etag &&
+    (ifRange.startsWith('"') ||
+      ifRange.startsWith('W/') ||
+      Date.parse(ifRange) !== Date.parse(lastModified ?? ''))
+  )
+    return undefined;
+  const offset = parts[1]
+    ? Number(parts[1])
+    : Math.max(0, size - Number(parts[2]));
+  const end = parts[1]
+    ? parts[2]
+      ? Math.min(Number(parts[2]), size - 1)
+      : size - 1
+    : size - 1;
+  if (offset >= size || end < offset) return null;
+  return { offset, length: end - offset + 1 };
+}

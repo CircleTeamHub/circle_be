@@ -144,7 +144,7 @@ test('serves cached public data without a bucket read', async () => {
 test('returns a video byte range with correct headers and no partial-response cache write', async () => {
   const f = fixture();
   f.env.MEDIA.get = async (key, options) => {
-    assert.equal(options.range.get('Range'), 'bytes=2-4');
+    assert.deepEqual(options.range, { offset: 2, length: 3 });
     return {
       size: 10,
       httpEtag: '"video"',
@@ -322,14 +322,27 @@ test('full reads stay 200 when R2 includes normalized range metadata', async () 
   assert.equal(await response.text(), 'image');
 });
 
-for (const [contentType, size] of [['video/mp4', 5], ['image/png', 9 * 1024 * 1024]]) {
+for (const [contentType, size] of [
+  ['video/mp4', 5],
+  ['image/png', 9 * 1024 * 1024],
+]) {
   test(`streams ${contentType}/${size} without cloning a large or video body for edge cache`, async () => {
     const f = fixture();
-    f.env.MEDIA.get = async () => ({ size, httpEtag: '"stream-only"', uploaded: new Date(),
+    f.env.MEDIA.get = async () => ({
+      size,
+      httpEtag: '"stream-only"',
+      uploaded: new Date(),
       httpMetadata: { contentType },
-      writeHttpMetadata(headers) { headers.set('Content-Type', contentType); },
-      body: new Response(new Uint8Array(size)).body });
-    const response = await worker.fetch(f.request('posts/u/asset'), f.env, f.ctx);
+      writeHttpMetadata(headers) {
+        headers.set('Content-Type', contentType);
+      },
+      body: new Response(new Uint8Array(size)).body,
+    });
+    const response = await worker.fetch(
+      f.request('posts/u/asset'),
+      f.env,
+      f.ctx,
+    );
     assert.equal(response.status, 200);
     assert.equal((await response.arrayBuffer()).byteLength, size);
     await Promise.all(f.tasks);
