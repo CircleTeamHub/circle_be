@@ -311,6 +311,7 @@ describe('CircleService', () => {
         circleID: 'circle-1',
         applicantID: 'user-1',
         inviterID: 'user-1',
+        source: 'APPLICATION',
       },
       select: { id: true },
     });
