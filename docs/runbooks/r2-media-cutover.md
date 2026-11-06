@@ -1,10 +1,15 @@
 # Preproduction R2 media cutover
 
-Status on 2026-11-05: backend compatibility and the delivery Worker are prepared
-for review. The source copy contains **403 objects, 706898511 bytes**, verified
-with full SHA-256 hashes and metadata. This is a historical checkpoint: reconcile
-again at cutover. The Worker has **not been deployed**, application storage has
-not switched, and no database URL migration has been performed by this work.
+Status on 2026-11-05: backend compatibility is in ready-for-review
+[PR #312](https://github.com/CircleTeamHub/circle_be/pull/312). The source copy
+contains **403 objects, 706898511 bytes**, verified with full SHA-256 hashes and
+metadata. This is a historical checkpoint: reconcile again at cutover.
+After separate user approval, the public delivery Worker was deployed and passed
+live image/hash/cache, video-range and private-prefix denial checks. Its verified
+endpoint is `https://windnote-media-preprod-delivery.yiboding1998.workers.dev`,
+version `54abd6c9-1467-4054-907c-cdcdf41dd872`. The single-Worker temporary deployment
+token was deleted after publication. Application storage has **not switched**,
+and no database URL migration has been performed.
 
 ## Reviewed resources and configuration
 
@@ -19,7 +24,7 @@ not switched, and no database URL migration has been performed by this work.
 | `OBJECT_STORAGE_MANAGE_BUCKET` | `false` |
 | `OBJECT_STORAGE_BUCKET_CONFIG_VERIFIED_EXTERNALLY` | `true`, only after the manual checks below |
 | `OBJECT_STORAGE_LEGACY_PUBLIC_URLS` | `https://windnote-preprod-tokyo-1447743949.cos.ap-tokyo.myqcloud.com,https://api-43-134-85-95.sslip.io/circle` |
-| `OBJECT_STORAGE_DELIVERY_URL` | Expected `https://windnote-media-preprod-delivery.yiboding1998.workers.dev`; confirm the actual deployed endpoint before activation |
+| `OBJECT_STORAGE_DELIVERY_URL` | Verified `https://windnote-media-preprod-delivery.yiboding1998.workers.dev`; recheck before activation |
 
 Both `MINIO_*URL` values above are the S3 API endpoint without a bucket suffix.
 Path-style signing appends the bucket. Uploads and authorized private reads use

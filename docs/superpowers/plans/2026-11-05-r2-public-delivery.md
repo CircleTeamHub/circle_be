@@ -45,5 +45,13 @@
 
 - [x] Add the component's install/type-generation check/test/typecheck/dry-run commands to the existing required CI job; no Cloudflare deploy credentials in CI.
 - [x] Document scope, cache behavior, free-account deployment endpoint, no-write interface, and private-read separation.
-- [ ] Complete independent spec/quality review, then request the concrete Worker creation/public-exposure approval.
-- [ ] After approval, publish and bind the configured resources, verify public reads and private denials, and only then include its actual URL in the backend cutover.
+- [x] Complete independent spec/quality review, then request the concrete Worker creation/public-exposure approval.
+- [x] After approval, publish and bind the configured resources, verify public reads and private denials, and only then include its actual URL in the backend cutover.
+
+Publication evidence: separately approved Worker version
+`54abd6c9-1467-4054-907c-cdcdf41dd872` serves the verified endpoint
+`https://windnote-media-preprod-delivery.yiboding1998.workers.dev`. Sixteen live
+checks cover full-image SHA-256/cache integrity, HEAD/ETag, video ranges/If-Range,
+private/unknown/traversal denials, and anonymous S3 API rejection. The temporary
+single-Worker Editor token was deleted afterward. Backend configuration,
+database URLs and App clients have not switched.

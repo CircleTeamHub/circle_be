@@ -123,8 +123,9 @@ fixture-only unit/local-runtime tests, generated-type and TypeScript checks, and
 a successful Wrangler dry run; see its [implementation plan](2026-11-05-r2-public-delivery.md).
 This checklist records code/documentation preparation only. Ready-for-review
 [PR #312](https://github.com/CircleTeamHub/circle_be/pull/312) is open, with Linux CI
-required before merge. The Worker is not deployed, storage has not
-switched, and the runbook's live-operation checkboxes remain open.
+required before merge. The Worker has since been published under separate user
+approval and passed live verification; its temporary deployment token was
+deleted. Storage has not switched, and the runbook's cutover checkboxes remain open.
 
 Read-only deployment verification additionally found the current controlled
 delivery base `https://api-43-134-85-95.sslip.io/circle`; retain it alongside
