@@ -31,6 +31,7 @@ function harness(approval = true) {
   const admissions = new Map<string, any>();
   const deliveries = new Map<string, any>();
   const events = new Map<string, any>();
+  const bans = new Map<string, any>();
   const qr: any = {
     token: 'token',
     issuerID: 'owner',
@@ -41,6 +42,17 @@ function harness(approval = true) {
   };
   let serial: Promise<any> = Promise.resolve();
   const tx: any = {
+    chatGroupJoinBan: {
+      findFirst: jest.fn().mockImplementation(({ where }: any) => {
+        const ids =
+          typeof where.userID === 'string' ? [where.userID] : where.userID.in;
+        return ids.map((id: string) => bans.get(id)).find(Boolean) ?? null;
+      }),
+      upsert: jest.fn().mockImplementation(({ create }: any) => {
+        bans.set(create.userID, create);
+        return create;
+      }),
+    },
     $queryRaw: jest.fn().mockImplementation(() => [group]),
     $executeRaw: jest.fn(),
     chatConversation: {
@@ -211,7 +223,7 @@ function harness(approval = true) {
     ...tx,
     $transaction: jest.fn().mockImplementation((fn: any) => {
       const task = serial.then(async () => {
-        const state = [seats, admissions, deliveries, events];
+        const state = [seats, admissions, deliveries, events, bans];
         const snapshots = state.map((rows) => structuredClone(rows));
         try {
           return await fn(tx);
@@ -261,6 +273,7 @@ function harness(approval = true) {
     admissions,
     deliveries,
     events,
+    bans,
     group,
     qr,
     broadcast,
@@ -270,6 +283,65 @@ function harness(approval = true) {
 }
 
 describe('Group admission consent and authorization', () => {
+  it('blacklists an applicant atomically and blocks applications, invitations and QR entry', async () => {
+    const h = harness();
+    h.tx.friend.findMany.mockResolvedValue([
+      { userID: 'owner', friendID: 'candidate' },
+    ]);
+    const request = (await h.service.apply('candidate', 'g', '')) as {
+      id: string;
+    };
+    await h.service.act('owner', request.id, 'blacklist' as never);
+    expect(h.bans.get('candidate')).toMatchObject({
+      conversationID: 'g',
+      userID: 'candidate',
+      actorID: 'owner',
+    });
+    expect(h.admissions.get(request.id).status).toBe('REJECTED');
+    for (const operation of [
+      () => h.service.apply('candidate', 'g', ''),
+      () => h.service.invite('owner', 'g', ['candidate']),
+      () => h.service.acceptQr('candidate', 'token'),
+    ])
+      await expect(operation()).rejects.toMatchObject({
+        response: { errorCode: 'CHAT_GROUP_JOIN_BLOCKED' },
+      });
+  });
+
+  it('checks the blacklist again before accepting an old invitation', async () => {
+    const h = harness(false);
+    h.tx.friend.findMany.mockResolvedValue([
+      { userID: 'owner', friendID: 'candidate' },
+    ]);
+    await h.service.invite('owner', 'g', ['candidate']);
+    const request = [...h.admissions.values()][0];
+    h.bans.set('candidate', {
+      conversationID: 'g',
+      userID: 'candidate',
+      actorID: 'owner',
+    });
+    await expect(
+      h.service.act('candidate', request.id, 'accept'),
+    ).rejects.toMatchObject({
+      response: { errorCode: 'CHAT_GROUP_JOIN_BLOCKED' },
+    });
+    expect(h.seats.has('candidate')).toBe(false);
+  });
+
+  it('does not blacklist or remove an already joined member through a stale application', async () => {
+    const h = harness(false);
+    h.tx.friend.findMany.mockResolvedValue([
+      { userID: 'owner', friendID: 'candidate' },
+    ]);
+    await h.service.invite('owner', 'g', ['candidate']);
+    const request = [...h.admissions.values()][0];
+    await h.service.act('candidate', request.id, 'accept');
+    await expect(
+      h.service.act('owner', request.id, 'blacklist' as never),
+    ).rejects.toThrow();
+    expect(h.bans.size).toBe(0);
+    expect(h.seats.get('candidate').leftAt).toBeFalsy();
+  });
   it('includes decided admissions in a scoped manager history while keeping the inbox pending-only', async () => {
     const h = harness();
     h.tx.groupAdmission.findMany.mockResolvedValue([]);
@@ -391,7 +463,13 @@ describe('Group admission consent and authorization', () => {
         kind: 'member-joined',
         actorID: 'member',
         targetIDs: ['guest'],
-        payload: { via: 'invite' },
+        payload: {
+          via: 'invite',
+          status: 'JOINED',
+          source: 'INVITE',
+          inviterId: 'member',
+          operatorId: 'owner',
+        },
         createdAt: expect.any(Date),
       }),
     ]);
@@ -405,7 +483,13 @@ describe('Group admission consent and authorization', () => {
         kind: 'member-joined',
         actorID: null,
         targetIDs: ['guest'],
-        payload: { via: 'qr' },
+        payload: {
+          via: 'qr',
+          status: 'JOINED',
+          source: 'QR',
+          inviterId: 'owner',
+          operatorId: 'guest',
+        },
       }),
     ]);
   });

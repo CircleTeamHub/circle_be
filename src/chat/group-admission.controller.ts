@@ -28,8 +28,8 @@ class ApplyDto {
   reason?: string;
 }
 class ActionDto {
-  @IsIn(['accept', 'decline', 'approve', 'reject'])
-  action!: 'accept' | 'decline' | 'approve' | 'reject';
+  @IsIn(['accept', 'decline', 'approve', 'reject', 'blacklist'])
+  action!: 'accept' | 'decline' | 'approve' | 'reject' | 'blacklist';
 }
 class PageDto {
   @IsOptional() @IsUUID('4') cursor?: string;

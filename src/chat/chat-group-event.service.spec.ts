@@ -9,6 +9,7 @@ import { ChatGroupEventService } from './chat-group-event.service';
  */
 describe('ChatGroupEventService', () => {
   const prisma = {
+    $queryRaw: jest.fn(),
     chatMember: { findUnique: jest.fn(), findMany: jest.fn() },
     circleMember: { findUnique: jest.fn() },
     chatGroupEvent: { findMany: jest.fn(), create: jest.fn() },
@@ -18,7 +19,8 @@ describe('ChatGroupEventService', () => {
 
   const seat = (overrides: Record<string, unknown> = {}) => ({
     leftAt: null,
-    conversation: { type: 'GROUP', circleID: null },
+    role: 'ADMIN',
+    conversation: { type: 'GROUP', circleID: null, ownerID: 'owner-1' },
     ...overrides,
   });
   const row = (n: number, overrides: Record<string, unknown> = {}) => ({
@@ -41,6 +43,75 @@ describe('ChatGroupEventService', () => {
     prisma.user.findMany.mockResolvedValue([]);
   });
 
+  it.each([
+    'group-renamed',
+    'group-avatar-updated',
+    'group-notice-updated',
+  ] as const)(
+    'does not persist routine %s edits as group log notifications',
+    async (kind) => {
+      await service.recordInTx(prisma as never, 'conv-1', {
+        kind,
+        actorId: 'owner',
+      });
+      expect(prisma.chatGroupEvent.create).not.toHaveBeenCalled();
+    },
+  );
+
+  it('filters historical routine edits before cursor pagination', async () => {
+    await service.listEvents('owner-1', 'conv-1', { limit: 2 });
+    const where = prisma.chatGroupEvent.findMany.mock.calls[0][0].where;
+    expect(where.kind.in).toContain('member-removed');
+    expect(where.kind.in).not.toEqual(
+      expect.arrayContaining([
+        'group-renamed',
+        'group-avatar-updated',
+        'group-notice-updated',
+      ]),
+    );
+  });
+
+  it('searches the requested person role in the database before pagination', async () => {
+    prisma.$queryRaw.mockResolvedValue([{ id: 'event-1' }]);
+    prisma.chatGroupEvent.findMany.mockResolvedValue([row(1)]);
+    await service.listEvents('owner-1', 'conv-1', {
+      keyword: "name'--",
+      person: 'actor',
+      limit: 2,
+    });
+    const sql = prisma.$queryRaw.mock.calls[0][0];
+    expect(sql.values).toContain("%name'--%");
+    expect(sql.strings.join('')).toContain('operatorId');
+    expect(sql.strings.join('')).not.toContain("name'--");
+    expect(prisma.chatGroupEvent.findMany.mock.calls[0][0].where.id).toEqual({
+      in: ['event-1'],
+    });
+  });
+
+  it('returns real invitation and operator identities for a reviewed admission', async () => {
+    prisma.chatGroupEvent.findMany.mockResolvedValue([
+      row(1, {
+        payload: {
+          status: 'JOINED',
+          source: 'INVITE',
+          inviterId: 'inviter',
+          operatorId: 'operator',
+        },
+      }),
+    ]);
+    prisma.user.findMany.mockResolvedValue([
+      { id: 'inviter', nickname: 'Inviter', avatarUrl: null },
+      { id: 'operator', nickname: 'Operator', avatarUrl: null },
+    ]);
+    const page = await service.listEvents('owner-1', 'conv-1', {});
+    expect(page.events[0].review).toMatchObject({
+      status: 'JOINED',
+      source: 'INVITE',
+      inviter: { id: 'inviter' },
+      operator: { id: 'operator' },
+    });
+  });
+
   it('rejects callers without an active seat', async () => {
     prisma.chatMember.findUnique.mockResolvedValue(null);
     await expect(service.listEvents('u-1', 'conv-1', {})).rejects.toMatchObject(
@@ -49,6 +120,14 @@ describe('ChatGroupEventService', () => {
         response: { errorCode: ChatErrorCode.NotMember },
       },
     );
+    expect(prisma.chatGroupEvent.findMany).not.toHaveBeenCalled();
+  });
+
+  it('keeps standalone management logs private from ordinary members', async () => {
+    prisma.chatMember.findUnique.mockResolvedValue(seat({ role: 'MEMBER' }));
+    await expect(
+      service.listEvents('u-2', 'conv-1', {}),
+    ).rejects.toBeInstanceOf(ForbiddenException);
     expect(prisma.chatGroupEvent.findMany).not.toHaveBeenCalled();
   });
 
@@ -77,7 +156,7 @@ describe('ChatGroupEventService', () => {
     });
   });
 
-  it('lets every seated member of a standalone group read the log', async () => {
+  it('lets standalone managers read the log', async () => {
     prisma.chatGroupEvent.findMany.mockResolvedValue([row(1)]);
     prisma.user.findMany.mockResolvedValue([
       { id: 'owner-1', nickname: 'Owner', avatarUrl: null },
