@@ -35,6 +35,30 @@ function noteCardPreviewKeys(content: Record<string, unknown>): string[] {
     )
     .slice(0, NOTE_CARD_PREVIEW_MAX);
 }
+
+interface NoteCardLiveState {
+  workStatus: 'WORKING' | 'CLOSED' | 'OFF_SHELF' | 'UNSET';
+  publicationStatus: 'ACTIVE' | 'UNLISTED' | 'DELETED';
+}
+
+const DELETED_NOTE_CARD_STATE: NoteCardLiveState = {
+  workStatus: 'UNSET',
+  publicationStatus: 'DELETED',
+};
+
+/** 根笔记此刻的状态,换成聊天卡片的字段(与发送时盖章同一口径)。 */
+function noteCardLiveState(root: {
+  status: string;
+  available: boolean;
+  workStatus: NoteCardLiveState['workStatus'] | null;
+}): NoteCardLiveState {
+  const workStatus = root.workStatus ?? 'UNSET';
+  if (root.status === 'DELETED')
+    return { workStatus, publicationStatus: 'DELETED' };
+  if (root.status === 'ACTIVE' && root.available)
+    return { workStatus, publicationStatus: 'ACTIVE' };
+  return { workStatus, publicationStatus: 'UNLISTED' };
+}
 import { reportOperationalError } from 'src/logging/error-aggregation.service';
 import { diagnosticFailureDetails } from 'src/logging/http-failure.logger';
 import { sanitizeLogValue } from 'src/logging/log-sanitizer';
@@ -752,33 +776,34 @@ export class ChatMediaService implements OnModuleDestroy {
         }),
       );
     }
-    // 预览图只在来源根笔记此刻仍可分发(ACTIVE + available)时签:作者事后下架 / 删除,
-    // 已发出的卡片不再续签。本页所有卡片一次批量查;查失败按不可分发处理。
-    let previewRoots = new Set<string>();
-    const previewRootIds = [
+    // 卡片上的开工/打烊/下架与上下架是发送时的快照;读的时候按来源根笔记此刻的状态覆盖,
+    // 否则会话一重新加载(回到聊天页、翻页、重连)就把客户端实时补丁盖回旧快照,
+    // 同一条笔记的两张卡片还会显示不同状态。口径与发送时盖章(resolveNoteCardSourceState)
+    // 一致。预览图也只在根笔记此刻仍可分发(ACTIVE + available)时签:作者事后下架 / 删除,
+    // 已发出的卡片不再续签。本页所有卡片一次批量查;查失败就保留快照、不签预览。
+    const noteCardRootIds = [
       ...new Set(
         messages
           .filter(
             (message) =>
               message.type === 'note-card' &&
-              typeof message.content.sourceNoteId === 'string' &&
-              noteCardPreviewKeys(message.content).length > 0,
+              typeof message.content.sourceNoteId === 'string',
           )
           .map((message) => message.content.sourceNoteId as string),
       ),
     ];
-    if (previewRootIds.length) {
+    let noteCardRoots: Map<string, NoteCardLiveState> | null = new Map();
+    if (noteCardRootIds.length) {
       try {
         const roots = await this.prisma.note.findMany({
-          where: {
-            id: { in: previewRootIds },
-            status: 'ACTIVE',
-            available: true,
-          },
-          select: { id: true },
+          where: { id: { in: noteCardRootIds } },
+          select: { id: true, status: true, available: true, workStatus: true },
         });
-        previewRoots = new Set(roots.map((root) => root.id));
+        noteCardRoots = new Map(
+          roots.map((root) => [root.id, noteCardLiveState(root)]),
+        );
       } catch (error) {
+        noteCardRoots = null;
         this.logger.warn(
           sanitizeLogValue({
             event: 'chat_media_presign_failed',
@@ -821,7 +846,17 @@ export class ChatMediaService implements OnModuleDestroy {
         if (!fields && !isNoteCard) return;
         message.content = { ...message.content };
         for (const field of fields ?? []) delete message.content[field.url];
-        if (isNoteCard) delete message.content[NOTE_CARD_PREVIEW_URLS_FIELD];
+        if (isNoteCard) {
+          delete message.content[NOTE_CARD_PREVIEW_URLS_FIELD];
+          const sourceNoteId = message.content.sourceNoteId;
+          if (noteCardRoots && typeof sourceNoteId === 'string') {
+            // 根笔记已被物理删除(查不到)按已删除处理。
+            message.content = {
+              ...message.content,
+              ...(noteCardRoots.get(sourceNoteId) ?? DELETED_NOTE_CARD_STATE),
+            };
+          }
+        }
         let grant: { date: Date; ttl: number } | null = {
           date: windowDate,
           ttl: CHAT_MEDIA_URL_TTL_SECONDS,
@@ -844,7 +879,8 @@ export class ChatMediaService implements OnModuleDestroy {
           }
           if (
             isNoteCard &&
-            previewRoots.has(message.content.sourceNoteId as string)
+            noteCardRoots?.get(message.content.sourceNoteId as string)
+              ?.publicationStatus === 'ACTIVE'
           ) {
             const urls = await Promise.all(
               noteCardPreviewKeys(message.content).map((key) =>
