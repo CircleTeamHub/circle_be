@@ -15,6 +15,7 @@ import {
   ReorderNoteGroupsDto,
   SaveNoteDraftDto,
   SetNoteRemarkDto,
+  SetNoteWorkStatusDto,
   UpdateNoteGroupDto,
   UpdateNoteDto,
 } from './note.dto';
@@ -565,5 +566,24 @@ describe('CreateNoteExportDto scope', () => {
     expect(errorsFor('11111111-1111-4111-8111-111111111111')).toEqual([]);
     expect(errorsFor('x'.repeat(64))).toEqual([]);
     expect(errorsFor('x'.repeat(65))).toEqual(['scope']);
+  });
+});
+
+describe('SetNoteWorkStatusDto', () => {
+  it.each(['WORKING', 'CLOSED', 'OFF_SHELF', null])(
+    'accepts %p',
+    (workStatus) => {
+      const dto = plainToInstance(SetNoteWorkStatusDto, { workStatus });
+      expect(
+        validateSync(dto, { whitelist: true, forbidNonWhitelisted: true }),
+      ).toEqual([]);
+    },
+  );
+
+  it('rejects an unknown work status', () => {
+    const dto = plainToInstance(SetNoteWorkStatusDto, {
+      workStatus: 'UNLISTED',
+    });
+    expect(validateSync(dto)).not.toEqual([]);
   });
 });

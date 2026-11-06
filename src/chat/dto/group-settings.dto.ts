@@ -2,10 +2,12 @@ import { ApiProperty, ApiPropertyOptional } from '@nestjs/swagger';
 import { Transform } from 'class-transformer';
 import {
   IsBoolean,
+  IsInt,
   IsOptional,
   IsString,
   IsUUID,
   MaxLength,
+  Min,
   ValidateIf,
 } from 'class-validator';
 
@@ -124,4 +126,32 @@ export class UpdateGroupPoliciesDto {
   @IsOptional()
   @IsBoolean()
   membersCanAddFriends?: boolean;
+}
+
+/** 置顶一条消息(群里群主/管理员,私聊双方)。 */
+export class SetPinnedMessageDto {
+  @ApiProperty({ description: '要置顶的消息 id' })
+  @IsUUID()
+  messageId!: string;
+}
+
+/**
+ * 申请双向清空:申请人清到的位置(由刚才那次清空返回)。
+ * 两个 DTO 都读转换前的原值:全局 enableImplicitConversion 会把 false→0、
+ * 任意非空字符串→true,`accept: "false"` 就成了一次不可逆的「同意」(同 ClearHistoryDto)。
+ */
+export class RequestHistoryClearDto {
+  @ApiProperty({ description: '申请人已清到的水位' })
+  @Transform(({ obj }: { obj: Record<string, unknown> }) => obj.targetHeight)
+  @IsInt()
+  @Min(0)
+  targetHeight!: number;
+}
+
+/** 对方同意 / 拒绝双向清空申请。 */
+export class RespondHistoryClearDto {
+  @ApiProperty()
+  @Transform(({ obj }: { obj: Record<string, unknown> }) => obj.accept)
+  @IsBoolean()
+  accept!: boolean;
 }

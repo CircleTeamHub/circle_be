@@ -14,8 +14,27 @@ import {
   CHAT_MEDIA_KEY_PREFIX,
   CHAT_NOTE_IMPORT_RESERVATION_REASON,
   CHAT_NOTE_IMPORT_SEGMENT,
+  NOTE_CARD_PREVIEW_KEYS_FIELD,
+  NOTE_CARD_PREVIEW_MAX,
+  NOTE_CARD_PREVIEW_URLS_FIELD,
+  NOTE_MEDIA_KEY_PREFIX,
 } from './chat.constants';
 import type { ChatMessageDto } from './chat.types';
+
+/**
+ * 笔记卡片上服务端盖章写入的预览图 key。读路径只认这一处、只认笔记媒体前缀、
+ * 最多 NOTE_CARD_PREVIEW_MAX 张 —— 其余目录的对象绝不会经聊天读路径被签出去。
+ */
+function noteCardPreviewKeys(content: Record<string, unknown>): string[] {
+  const raw = content[NOTE_CARD_PREVIEW_KEYS_FIELD];
+  if (!Array.isArray(raw)) return [];
+  return raw
+    .filter(
+      (key): key is string =>
+        typeof key === 'string' && key.startsWith(NOTE_MEDIA_KEY_PREFIX),
+    )
+    .slice(0, NOTE_CARD_PREVIEW_MAX);
+}
 import { reportOperationalError } from 'src/logging/error-aggregation.service';
 import { diagnosticFailureDetails } from 'src/logging/http-failure.logger';
 import { sanitizeLogValue } from 'src/logging/log-sanitizer';
@@ -733,17 +752,76 @@ export class ChatMediaService implements OnModuleDestroy {
         }),
       );
     }
+    // 预览图只在来源根笔记此刻仍可分发(ACTIVE + available)时签:作者事后下架 / 删除,
+    // 已发出的卡片不再续签。本页所有卡片一次批量查;查失败按不可分发处理。
+    let previewRoots = new Set<string>();
+    const previewRootIds = [
+      ...new Set(
+        messages
+          .filter(
+            (message) =>
+              message.type === 'note-card' &&
+              typeof message.content.sourceNoteId === 'string' &&
+              noteCardPreviewKeys(message.content).length > 0,
+          )
+          .map((message) => message.content.sourceNoteId as string),
+      ),
+    ];
+    if (previewRootIds.length) {
+      try {
+        const roots = await this.prisma.note.findMany({
+          where: {
+            id: { in: previewRootIds },
+            status: 'ACTIVE',
+            available: true,
+          },
+          select: { id: true },
+        });
+        previewRoots = new Set(roots.map((root) => root.id));
+      } catch (error) {
+        this.logger.warn(
+          sanitizeLogValue({
+            event: 'chat_media_presign_failed',
+            operation: 'noteCardPreviewRoots',
+            ...diagnosticFailureDetails(error),
+          }),
+        );
+      }
+    }
     const signed = new Map<string, Promise<string | undefined>>();
     const windowDate = new Date(
       Math.floor(Date.now() / CHAT_MEDIA_URL_WINDOW_MS) *
         CHAT_MEDIA_URL_WINDOW_MS,
     );
+    const sign = (key: string, grant: { date: Date; ttl: number }) => {
+      const cacheKey = `${key}:${grant.date.getTime()}:${grant.ttl}`;
+      if (!signed.has(cacheKey))
+        signed.set(
+          cacheKey,
+          this.uploadService
+            .createPresignedGetUrl(key, grant.ttl, grant.date)
+            .then((result) => result.url)
+            .catch((error) => {
+              this.logger.warn(
+                sanitizeLogValue({
+                  event: 'chat_media_presign_failed',
+                  operation: 'attachMediaUrls',
+                  ...diagnosticFailureDetails(error),
+                }),
+              );
+              return undefined;
+            }),
+        );
+      return signed.get(cacheKey) as Promise<string | undefined>;
+    };
     await Promise.all(
       messages.map(async (message) => {
+        const isNoteCard = message.type === 'note-card';
         const fields = CHAT_MEDIA_KEY_FIELDS[message.type];
-        if (!fields) return;
+        if (!fields && !isNoteCard) return;
         message.content = { ...message.content };
-        for (const field of fields) delete message.content[field.url];
+        for (const field of fields ?? []) delete message.content[field.url];
+        if (isNoteCard) delete message.content[NOTE_CARD_PREVIEW_URLS_FIELD];
         let grant: { date: Date; ttl: number } | null = {
           date: windowDate,
           ttl: CHAT_MEDIA_URL_TTL_SECONDS,
@@ -752,34 +830,30 @@ export class ChatMediaService implements OnModuleDestroy {
           if (message.burnExpiresAt || message.burnDurationSec)
             grant = burnGrants.get(message.id) ?? null;
           if (!grant) return;
+          const activeGrant = grant;
           const patch: Record<string, unknown> = {};
-          for (const field of fields) {
+          for (const field of fields ?? []) {
             const key = message.content[field.key];
             if (
               typeof key !== 'string' ||
               !key.startsWith(CHAT_MEDIA_KEY_PREFIX)
             )
               continue;
-            const cacheKey = `${key}:${grant.date.getTime()}:${grant.ttl}`;
-            if (!signed.has(cacheKey))
-              signed.set(
-                cacheKey,
-                this.uploadService
-                  .createPresignedGetUrl(key, grant.ttl, grant.date)
-                  .then((result) => result.url)
-                  .catch((error) => {
-                    this.logger.warn(
-                      sanitizeLogValue({
-                        event: 'chat_media_presign_failed',
-                        operation: 'attachMediaUrls',
-                        ...diagnosticFailureDetails(error),
-                      }),
-                    );
-                    return undefined;
-                  }),
-              );
-            const url = await signed.get(cacheKey);
+            const url = await sign(key, activeGrant);
             if (url) patch[field.url] = url;
+          }
+          if (
+            isNoteCard &&
+            previewRoots.has(message.content.sourceNoteId as string)
+          ) {
+            const urls = await Promise.all(
+              noteCardPreviewKeys(message.content).map((key) =>
+                sign(key, activeGrant),
+              ),
+            );
+            const signedUrls = urls.filter((url): url is string => !!url);
+            if (signedUrls.length > 0)
+              patch[NOTE_CARD_PREVIEW_URLS_FIELD] = signedUrls;
           }
           message.content = { ...message.content, ...patch };
         } catch (error) {

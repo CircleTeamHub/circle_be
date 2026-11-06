@@ -34,6 +34,7 @@ describe('ChatController.createGroupConversation', () => {
       {} as never,
       {} as never,
       {} as never,
+      {} as never,
     );
     await expect(
       controller.createGroupConversation(
@@ -60,6 +61,7 @@ describe('ChatController.listConversations', () => {
     };
     const controller = new ChatController(
       chatService as never,
+      {} as never,
       {} as never,
       {} as never,
       {} as never,

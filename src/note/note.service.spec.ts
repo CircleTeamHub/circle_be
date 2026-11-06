@@ -1632,6 +1632,46 @@ describe('NoteService', () => {
   });
 
   // 列表摘要只取标量列，派生字段走 SQL 投影；摘要里唯一的媒体 url 是封面，只签它。
+  describe('listGroupBoundNotes (members see the group bound notes read-only)', () => {
+    it('lists only active, visible source notes bound to the group', async () => {
+      prisma.chatMember.findUnique.mockResolvedValueOnce({ leftAt: null });
+      prisma.note.findMany.mockResolvedValueOnce([listRow(0)]);
+
+      const items = await service.listGroupBoundNotes('viewer-1', 'conv-1');
+
+      expect(prisma.chatMember.findUnique).toHaveBeenCalledWith({
+        where: {
+          conversationID_userID: {
+            conversationID: 'conv-1',
+            userID: 'viewer-1',
+          },
+        },
+        select: { leftAt: true },
+      });
+      expect(prisma.note.findMany.mock.calls[0][0].where).toEqual({
+        sourceConversationID: 'conv-1',
+        collectedFromNoteID: null,
+        status: 'ACTIVE',
+        available: true,
+      });
+      expect(items.map((item) => item.id)).toEqual(['note-0']);
+    });
+
+    it.each([
+      ['never joined', null],
+      ['already left', { leftAt: new Date('2026-11-01T00:00:00.000Z') }],
+    ])('refuses a viewer who %s', async (_case, seat) => {
+      prisma.chatMember.findUnique.mockResolvedValueOnce(seat);
+
+      await expect(
+        service.listGroupBoundNotes('viewer-1', 'conv-1'),
+      ).rejects.toMatchObject({
+        response: { errorCode: 'CHAT_NOT_MEMBER' },
+      });
+      expect(prisma.note.findMany).not.toHaveBeenCalled();
+    });
+  });
+
   describe('list summaries without full rows', () => {
     const mediaRow = (id: string, type: string, sortOrder: number) => ({
       id,

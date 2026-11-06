@@ -22,7 +22,12 @@ import {
   standaloneGroupRole,
 } from './chat-group-roles';
 import { ChatSystemMessageService } from './chat-system-message.service';
-import type { ChatGroupPoliciesDto, ChatMessageDto } from './chat.types';
+import type {
+  ChatGroupPoliciesDto,
+  ChatMessageDto,
+  ChatPinnedMessageDto,
+} from './chat.types';
+import { messagePreviewText } from './chat-message-preview';
 import { CircleMemberLockService } from 'src/circle/circle-member-lock';
 
 /** 锁后的会话行:群策略与全员禁言都从这份快照读、往这行写。 */
@@ -43,6 +48,57 @@ interface LockedGroupRow {
   membersCanViewRoster: boolean;
   membersCanViewProfiles: boolean;
   membersCanAddFriends: boolean;
+}
+
+const PINNABLE_MESSAGE_SELECT = {
+  id: true,
+  conversationID: true,
+  height: true,
+  type: true,
+  content: true,
+  revokedAt: true,
+  deleted: true,
+  burnDurationSec: true,
+  burnExpiresAt: true,
+} as const;
+
+type PinnableMessage = {
+  id: string;
+  conversationID: string;
+  height: number;
+  type: string;
+  content: unknown;
+  revokedAt: Date | null;
+  deleted: boolean;
+  burnDurationSec: number | null;
+  burnExpiresAt: Date | null;
+};
+
+/**
+ * 能置顶的消息:本会话里、没撤回没删、不是系统提示、在清空水位以上,
+ * 且不是阅后即焚 —— 预览文案存在会话行上,焚毁之后横幅里还会留着原文。
+ */
+function assertPinnable(
+  row: PinnableMessage | null,
+  conversationId: string,
+  floor: number,
+): PinnableMessage {
+  if (
+    !row ||
+    row.conversationID !== conversationId ||
+    row.revokedAt ||
+    row.deleted ||
+    row.type === 'system' ||
+    row.height <= floor ||
+    row.burnExpiresAt ||
+    (row.burnDurationSec ?? 0) > 0
+  ) {
+    throw new NotFoundException({
+      message: '消息不存在',
+      errorCode: ChatErrorCode.MessageNotFound,
+    });
+  }
+  return row;
 }
 
 /** PATCH /policies 可改的键;圈子群的 memberCanInvite 写在 Circle 上。 */
@@ -174,21 +230,7 @@ export class ChatGroupSettingsService {
           errorCode: ChatErrorCode.PeerNotFound,
         });
       }
-      const block = await tx.block.findFirst({
-        where: {
-          OR: [
-            { blockerID: actorId, blockedID: targetUserId },
-            { blockerID: targetUserId, blockedID: actorId },
-          ],
-        },
-        select: { id: true },
-      });
-      if (block) {
-        throw new ForbiddenException({
-          message: '对方不可用',
-          errorCode: ChatErrorCode.Blocked,
-        });
-      }
+      await this.assertNotBlockedInTx(tx, actorId, targetUserId);
       await tx.chatConversation.update({
         where: { id: locked.id },
         data: { ownerID: targetUserId },
@@ -293,6 +335,137 @@ export class ChatGroupSettingsService {
     });
     if (result.message) await this.broadcastAfterCommit(result.message);
     return { notice: next, noticePinned: result.noticePinned };
+  }
+
+  /**
+   * 消息置顶:一个会话一条,置顶新的就替换旧的,messageId=null 取消置顶。
+   * 群里只有群主/管理员能设,私聊双方都能设;会话里所有人都看得到横幅。
+   * 同事务插一条系统提示,它随消息分发让各端刷新会话(和群公告同一条路)。
+   */
+  async setPinnedMessage(
+    actorId: string,
+    conversationId: string,
+    messageId: string | null,
+  ): Promise<ChatPinnedMessageDto | null> {
+    const seat = await this.prisma.chatMember.findUnique({
+      where: {
+        conversationID_userID: {
+          conversationID: conversationId,
+          userID: actorId,
+        },
+      },
+      include: { conversation: true },
+    });
+    if (!seat || seat.leftAt) {
+      throw new ForbiddenException({
+        message: '不是会话成员',
+        errorCode: ChatErrorCode.NotMember,
+      });
+    }
+    const isGroup = seat.conversation.type === 'GROUP';
+    if (!isGroup && seat.conversation.type !== 'DIRECT') {
+      throw new NotFoundException({
+        message: '会话不支持置顶',
+        errorCode: ChatErrorCode.ConversationNotFound,
+      });
+    }
+    const floor = Math.max(
+      seat.clearedBeforeHeight,
+      seat.conversation.clearedBeforeHeight,
+    );
+    const target = messageId
+      ? assertPinnable(
+          await this.prisma.chatMessage.findUnique({
+            where: { id: messageId },
+            select: PINNABLE_MESSAGE_SELECT,
+          }),
+          conversationId,
+          floor,
+        )
+      : null;
+    const pinnedAt = new Date();
+    let pinned: ChatPinnedMessageDto | null = null;
+
+    const message = await this.prisma.$transaction(async (tx) => {
+      let nextHeight: number;
+      if (isGroup) {
+        const locked = await this.lockGroup(tx, conversationId);
+        if (locked.circleID)
+          await this.circleMemberLock.lock(tx, locked.circleID, [actorId]);
+        this.assertManager(await this.actorRoleInTx(tx, locked, actorId));
+        nextHeight = locked.nextHeight;
+      } else {
+        const rows = await tx.$queryRaw<Array<{ nextHeight: number }>>`
+          SELECT "nextHeight" FROM "ChatConversation"
+          WHERE "id" = ${conversationId} FOR UPDATE`;
+        nextHeight = rows[0].nextHeight;
+        // 拉黑不摘座位:被拉黑的一方不能再改对方看到的横幅、往对方会话里插提示。
+        const peerId = seat.conversation.directKey
+          ?.split(':')
+          .find((id) => id !== actorId);
+        if (peerId) await this.assertNotBlockedInTx(tx, actorId, peerId);
+      }
+      // 锁内再核一次:锁外那次读到之后,这条消息可能刚被撤回 —— 撤回事务里
+      // 「清掉指向它的置顶」那步跑在我们写入之前,就会留下一个指向已撤回消息的横幅。
+      // 预览也用锁内这份算:中间若刚提交了一次编辑,横幅要是编辑后的文案。
+      if (target) {
+        const fresh = assertPinnable(
+          await tx.chatMessage.findUnique({
+            where: { id: target.id },
+            select: PINNABLE_MESSAGE_SELECT,
+          }),
+          conversationId,
+          floor,
+        );
+        pinned = {
+          messageId: fresh.id,
+          height: fresh.height,
+          preview: messagePreviewText(fresh.type, fresh.content),
+          pinnedAt: pinnedAt.toISOString(),
+        };
+      }
+      const current = await tx.chatConversation.findUnique({
+        where: { id: conversationId },
+        select: { pinnedMessageID: true },
+      });
+      if ((current?.pinnedMessageID ?? null) === (target?.id ?? null))
+        return null;
+      await tx.chatConversation.update({
+        where: { id: conversationId },
+        data: target
+          ? {
+              pinnedMessageID: target.id,
+              pinnedMessageHeight: target.height,
+              pinnedMessagePreview: pinned?.preview ?? '',
+              pinnedMessageAt: pinnedAt,
+              pinnedMessageByID: actorId,
+            }
+          : {
+              pinnedMessageID: null,
+              pinnedMessageHeight: null,
+              pinnedMessagePreview: null,
+              pinnedMessageAt: null,
+              pinnedMessageByID: null,
+            },
+      });
+      const kind = target ? 'message-pinned' : 'message-unpinned';
+      const notice =
+        await this.systemMessage.insertSystemMessageAfterLockedConversationInTx(
+          tx,
+          conversationId,
+          nextHeight,
+          { kind, actorId },
+        );
+      if (isGroup) {
+        await this.groupEvents.recordInTx(tx, conversationId, {
+          kind,
+          actorId,
+        });
+      }
+      return notice;
+    });
+    if (message) await this.broadcastAfterCommit(message);
+    return pinned;
   }
 
   /**
@@ -519,6 +692,29 @@ export class ChatGroupSettingsService {
       });
     }
     return locked[0];
+  }
+
+  /** 任一方向拉黑即拒绝(群主转让、私聊置顶)。 */
+  private async assertNotBlockedInTx(
+    tx: Prisma.TransactionClient,
+    userA: string,
+    userB: string,
+  ): Promise<void> {
+    const block = await tx.block.findFirst({
+      where: {
+        OR: [
+          { blockerID: userA, blockedID: userB },
+          { blockerID: userB, blockedID: userA },
+        ],
+      },
+      select: { id: true },
+    });
+    if (block) {
+      throw new ForbiddenException({
+        message: '对方不可用',
+        errorCode: ChatErrorCode.Blocked,
+      });
+    }
   }
 
   /** 锁后快照里本人的角色(与 ChatGroupAdminService.resolvePair 同一口径)。 */

@@ -237,6 +237,8 @@ describe('ChatService', () => {
     // 搜索/焚毁读路径:默认没有会话开焚毁。
     prisma.chatConversation.findMany.mockResolvedValue([]);
     prisma.note.findFirst.mockResolvedValue(null);
+    // 撤回 / 编辑会顺手看一眼置顶:默认没有命中。
+    prisma.chatConversation.updateMany.mockResolvedValue({ count: 0 });
     systemMessage.insertSystemMessageInTx.mockResolvedValue({
       id: 'sys-1',
       conversationId: 'conv-1',
@@ -597,6 +599,108 @@ describe('ChatService', () => {
         }),
       }),
     );
+  });
+
+  it('stamps note-card preview keys from the note and drops client-supplied ones', async () => {
+    prisma.chatMember.findUnique.mockResolvedValue(membership());
+    prisma.chatMessage.findUnique.mockResolvedValue(null);
+    prisma.$queryRaw.mockResolvedValue([{ nextHeight: 3 }]);
+    prisma.chatMessage.create.mockResolvedValue(createdRow);
+    prisma.chatConversation.update.mockResolvedValue({});
+    prisma.user.findUnique.mockResolvedValue(null);
+    prisma.note.findFirst
+      .mockResolvedValueOnce(null) // group snapshot
+      .mockResolvedValueOnce({
+        id: 'note-1',
+        status: 'ACTIVE',
+        available: true,
+        workStatus: null,
+        collectedFromNoteID: null,
+      }) // source state: root is distributable
+      .mockResolvedValueOnce({
+        media: [
+          { objectKey: 'notes/u1/a.jpg' },
+          { objectKey: 'notes/u1/b.jpg' },
+        ],
+      });
+
+    await service.sendMessage(
+      'u1',
+      sendPayload({
+        type: 'note-card',
+        content: {
+          noteId: 'note-1',
+          previewKeys: ['avatars/u2/private.jpg'],
+          previewUrls: ['https://attacker/x.jpg'],
+        },
+      }),
+    );
+
+    const previewQuery = prisma.note.findFirst.mock.calls[2][0];
+    expect(previewQuery.where).toEqual(
+      expect.objectContaining({
+        id: 'note-1',
+        OR: [{ ownerID: 'u1' }, { available: true, status: 'ACTIVE' }],
+      }),
+    );
+    expect(previewQuery.select.media.where).toEqual({ type: 'IMAGE' });
+    expect(previewQuery.select.media.take).toBe(4);
+    expect(prisma.chatMessage.create).toHaveBeenCalledWith(
+      expect.objectContaining({
+        data: expect.objectContaining({
+          content: {
+            noteId: 'note-1',
+            sourceNoteId: 'note-1',
+            workStatus: 'UNSET',
+            publicationStatus: 'ACTIVE',
+            previewKeys: ['notes/u1/a.jpg', 'notes/u1/b.jpg'],
+          },
+        }),
+      }),
+    );
+  });
+
+  // 收藏副本自身的行是 ACTIVE/available,但图片 key 指向原作者的 notes/ 对象:
+  // 原作者下架后,副本主人也不能把这些图经卡片发出去(同 requireDistributableForViewer)。
+  it('stamps no preview keys when the collected copy root is no longer distributable', async () => {
+    prisma.chatMember.findUnique.mockResolvedValue(membership());
+    prisma.chatMessage.findUnique.mockResolvedValue(null);
+    prisma.$queryRaw.mockResolvedValue([{ nextHeight: 3 }]);
+    prisma.chatMessage.create.mockResolvedValue(createdRow);
+    prisma.chatConversation.update.mockResolvedValue({});
+    prisma.user.findUnique.mockResolvedValue(null);
+    prisma.note.findFirst
+      .mockResolvedValueOnce(null) // group snapshot
+      .mockResolvedValueOnce({
+        id: 'copy-1',
+        status: 'ACTIVE',
+        available: true,
+        workStatus: null,
+        collectedFromNoteID: 'root-1',
+      });
+    prisma.note.findUnique.mockResolvedValueOnce({
+      id: 'root-1',
+      status: 'ACTIVE',
+      available: false,
+      workStatus: null,
+      collectedFromNoteID: null,
+    });
+
+    await service.sendMessage(
+      'u1',
+      sendPayload({ type: 'note-card', content: { noteId: 'copy-1' } }),
+    );
+
+    // 不再去查图片:只有群快照和来源状态两次。
+    expect(prisma.note.findFirst).toHaveBeenCalledTimes(2);
+    const created = prisma.chatMessage.create.mock.calls[0][0];
+    expect(created.data.content).toEqual(
+      expect.objectContaining({
+        sourceNoteId: 'root-1',
+        publicationStatus: 'UNLISTED',
+      }),
+    );
+    expect(created.data.content).not.toHaveProperty('previewKeys');
   });
 
   it('drops client-supplied card status when the sender cannot read the note', async () => {
@@ -3347,6 +3451,43 @@ describe('ChatService', () => {
       }
     });
 
+    // 前端整表刷新会整行覆盖会话:列表不带 pinnedMessage,冷启动后横幅就没了。
+    // 清空水位以下的那条照样对本人隐藏(与单会话接口同一口径)。
+    it('carries the pinned message on list rows and hides it below the viewer floor', async () => {
+      const pinnedColumns = {
+        pinnedMessageID: 'm9',
+        pinnedMessageHeight: 9,
+        pinnedMessagePreview: '置顶的话',
+        pinnedMessageAt: new Date('2026-11-06T00:00:00.000Z'),
+      };
+      prisma.chatMember.findMany.mockResolvedValueOnce([
+        membership({
+          conversation: { ...membership().conversation, ...pinnedColumns },
+        }),
+        membership({
+          id: 'member-2',
+          conversationID: 'conv-2',
+          clearedBeforeHeight: 9,
+          conversation: {
+            ...membership().conversation,
+            id: 'conv-2',
+            ...pinnedColumns,
+          },
+        }),
+      ]);
+      prisma.$queryRaw.mockResolvedValue([]);
+
+      const page = await service.listConversationsPage('u1');
+
+      expect(page.conversations[0].pinnedMessage).toEqual({
+        messageId: 'm9',
+        height: 9,
+        preview: '置顶的话',
+        pinnedAt: '2026-11-06T00:00:00.000Z',
+      });
+      expect(page.conversations[1].pinnedMessage).toBeNull();
+    });
+
     it('reports no more conversations when the page is not full', async () => {
       prisma.chatMember.findMany.mockResolvedValueOnce([membership()]);
       prisma.$queryRaw.mockResolvedValue([]);
@@ -4510,6 +4651,11 @@ describe('ChatService', () => {
           }),
         }),
       );
+      // 撤回的消息若正被置顶,横幅随之撤下。
+      expect(prisma.chatConversation.updateMany).toHaveBeenCalledWith({
+        where: { id: 'conv-1', pinnedMessageID: 'm1' },
+        data: expect.objectContaining({ pinnedMessageID: null }),
+      });
       // The durable deletion worker rechecks shared archive references.
       expect(media.drainPendingDeletions).toHaveBeenCalled();
       expect(media.queueDeletions).toHaveBeenCalledWith(prisma, [
@@ -4527,6 +4673,54 @@ describe('ChatService', () => {
       });
       expect(dto.revokedBy).toBe('u1');
       expect(dto.content).toEqual({});
+    });
+
+    // 撤回清掉了置顶:在线端只在收到置顶提示时才重拉会话,不通知的话横幅上会
+    // 一直挂着撤回前的原文。给每个在座成员一条 chat:conversation(updated)。
+    it('tells every seated member to refresh when the revoked message was pinned', async () => {
+      prisma.chatMember.findUnique.mockResolvedValue(membership());
+      prisma.chatMessage.findUnique.mockResolvedValue(revokableRow());
+      prisma.chatMessage.updateMany.mockResolvedValue({ count: 1 });
+      prisma.chatMessage.findUniqueOrThrow.mockResolvedValue({
+        ...revokableRow(),
+        content: {},
+        revokedAt: new Date(),
+        revokedBy: 'u1',
+      });
+      prisma.chatConversation.updateMany.mockResolvedValue({ count: 1 });
+      prisma.chatMember.findMany.mockResolvedValue([
+        { userID: 'u1' },
+        { userID: 'u2' },
+      ]);
+
+      await service.revokeMessage('u1', 'conv-1', 'm1');
+
+      expect(prisma.chatMember.findMany).toHaveBeenCalledWith({
+        where: { conversationID: 'conv-1', leftAt: null },
+        select: { userID: true },
+      });
+      expect(broadcast.emitConversationChange).toHaveBeenCalledTimes(2);
+      expect(broadcast.emitConversationChange).toHaveBeenCalledWith('u2', {
+        kind: 'updated',
+        conversationId: 'conv-1',
+        userId: 'u2',
+      });
+    });
+
+    it('sends no conversation refresh when the revoked message was not pinned', async () => {
+      prisma.chatMember.findUnique.mockResolvedValue(membership());
+      prisma.chatMessage.findUnique.mockResolvedValue(revokableRow());
+      prisma.chatMessage.updateMany.mockResolvedValue({ count: 1 });
+      prisma.chatMessage.findUniqueOrThrow.mockResolvedValue({
+        ...revokableRow(),
+        content: {},
+        revokedAt: new Date(),
+        revokedBy: 'u1',
+      });
+
+      await service.revokeMessage('u1', 'conv-1', 'm1');
+
+      expect(broadcast.emitConversationChange).not.toHaveBeenCalled();
     });
 
     // 消息行上的触发器会去更新会话计数器:先锁消息行再等会话行,与「先锁会话行
@@ -4978,6 +5172,31 @@ describe('ChatService', () => {
       );
       expect(dto.content['text']).toBe('new text');
       expect(dto.editedAt).toEqual(expect.any(String));
+    });
+
+    it('refreshes every seat when the edited message is the pinned one', async () => {
+      prisma.chatMember.findUnique.mockResolvedValue(membership());
+      prisma.chatMessage.findUnique.mockResolvedValue(editableRow());
+      prisma.chatMessage.updateMany.mockResolvedValue({ count: 1 });
+      prisma.chatMessage.findUniqueOrThrow.mockResolvedValue({
+        ...editableRow(),
+        content: { text: 'new text' },
+        editedAt: new Date(),
+      });
+      prisma.chatConversation.updateMany.mockResolvedValue({ count: 1 });
+      prisma.chatMember.findMany.mockResolvedValue([{ userID: 'u2' }]);
+
+      await service.editMessage('u1', 'conv-1', 'm1', { text: 'new text' });
+
+      expect(prisma.chatConversation.updateMany).toHaveBeenCalledWith({
+        where: { id: 'conv-1', pinnedMessageID: 'm1' },
+        data: { pinnedMessagePreview: 'new text' },
+      });
+      expect(broadcast.emitConversationChange).toHaveBeenCalledWith('u2', {
+        kind: 'updated',
+        conversationId: 'conv-1',
+        userId: 'u2',
+      });
     });
 
     /**
@@ -5591,7 +5810,9 @@ describe('ChatService', () => {
       expect(prisma.chatMember.updateMany).not.toHaveBeenCalled();
     });
 
-    it('advances both active members and broadcasts a direct-chat clear', async () => {
+    // 私聊不再接受单方面双删:老客户端 / 改过的客户端带 forEveryone 也只清自己,
+    // 清对方的记录必须走 ChatClearRequestService 由对方授权。
+    it('treats forEveryone in a direct chat as a personal clear', async () => {
       mockClearLock({ type: 'DIRECT' });
       prisma.chatMember.findUnique.mockResolvedValue(
         membership({
@@ -5605,56 +5826,46 @@ describe('ChatService', () => {
           },
         }),
       );
-      prisma.chatMessage.aggregate.mockResolvedValue({ _max: { height: 42 } });
-      prisma.chatMember.findMany.mockResolvedValue([
-        { userID: 'u1' },
-        { userID: 'u2' },
-      ]);
-      prisma.chatMember.updateMany.mockResolvedValue({ count: 2 });
+      prisma.chatMember.updateMany.mockResolvedValue({ count: 1 });
       prisma.chatMember.updateManyAndReturn.mockResolvedValue([
         { userID: 'u1' },
       ]);
 
-      await service.clearHistory('u1', 'conv-1', true);
+      await expect(service.clearHistory('u1', 'conv-1', true)).resolves.toEqual(
+        { clearedBeforeHeight: 42 },
+      );
 
       expect(prisma.chatMember.updateMany).toHaveBeenCalledWith({
         where: {
           conversationID: 'conv-1',
-          userID: { in: ['u1', 'u2'] },
-          leftAt: null,
+          userID: { in: ['u1'] },
           clearedBeforeHeight: { lt: 42 },
         },
         data: { clearedBeforeHeight: 42 },
       });
-      expect(broadcast.emitHistoryCleared).toHaveBeenCalledWith({
+      expect(prisma.chatConversation.updateMany).not.toHaveBeenCalled();
+      expect(broadcast.emitHistoryCleared).not.toHaveBeenCalled();
+      expect(
+        systemMessage.insertSystemMessageAfterLockedConversationInTx,
+      ).not.toHaveBeenCalled();
+      expect(broadcast.emitHistoryClearedToUser).toHaveBeenCalledWith('u1', {
         conversationId: 'conv-1',
         clearedBeforeHeight: 42,
         clearedBy: 'u1',
       });
-      expect(broadcast.emitRead).toHaveBeenCalledTimes(1);
-      expect(broadcast.emitRead).toHaveBeenCalledWith(
-        { conversationId: 'conv-1', userId: 'u1', height: 42 },
-        { readerOnly: false },
-      );
-      expect(
-        systemMessage.insertSystemMessageAfterLockedConversationInTx,
-      ).toHaveBeenCalledWith(expect.anything(), 'conv-1', 42, {
-        kind: 'history-cleared',
-        actorId: 'u1',
-      });
-      expect(systemMessage.broadcastSystemMessage).toHaveBeenCalledTimes(1);
     });
 
     it('returns the committed global clear when post-commit audit delivery fails', async () => {
-      mockClearLock({ type: 'DIRECT' });
+      mockClearLock({ ownerID: 'u1' });
       prisma.chatMember.findUnique.mockResolvedValue(
         membership({
           conversation: {
             id: 'conv-1',
-            type: 'DIRECT',
-            directKey: 'u1:u2',
+            type: 'GROUP',
+            directKey: null,
             circleID: null,
             tempChatID: null,
+            ownerID: 'u1',
             lastMessageAt: null,
           },
         }),
@@ -5693,33 +5904,30 @@ describe('ChatService', () => {
         .mockResolvedValueOnce([
           {
             id: 'conv-1',
-            type: 'DIRECT',
+            type: 'GROUP',
             circleID: null,
-            ownerID: null,
+            ownerID: 'u1',
             nextHeight: 50,
           },
         ])
-        .mockResolvedValueOnce([{ revision: 0 }])
-        .mockResolvedValueOnce([{ revision: 0 }])
         .mockResolvedValueOnce([
           {
             id: 'conv-1',
-            type: 'DIRECT',
+            type: 'GROUP',
             circleID: null,
-            ownerID: null,
+            ownerID: 'u1',
             nextHeight: 60,
           },
-        ])
-        .mockResolvedValueOnce([{ revision: 0 }])
-        .mockResolvedValueOnce([{ revision: 0 }]);
+        ]);
       prisma.chatMember.findUnique.mockResolvedValue(
         membership({
           conversation: {
             id: 'conv-1',
-            type: 'DIRECT',
-            directKey: 'u1:u2',
+            type: 'GROUP',
+            directKey: null,
             circleID: null,
             tempChatID: null,
+            ownerID: 'u1',
             lastMessageAt: null,
           },
         }),
@@ -5763,18 +5971,18 @@ describe('ChatService', () => {
         .mockResolvedValueOnce([
           {
             id: 'conv-1',
-            type: 'DIRECT',
+            type: 'GROUP',
             circleID: null,
-            ownerID: null,
+            ownerID: 'u1',
             nextHeight: 0,
           },
         ])
         .mockResolvedValueOnce([
           {
             id: 'conv-1',
-            type: 'DIRECT',
+            type: 'GROUP',
             circleID: null,
-            ownerID: null,
+            ownerID: 'u1',
             nextHeight: 1,
           },
         ]);
@@ -5782,10 +5990,11 @@ describe('ChatService', () => {
         membership({
           conversation: {
             id: 'conv-1',
-            type: 'DIRECT',
-            directKey: 'u1:u2',
+            type: 'GROUP',
+            directKey: null,
             circleID: null,
             tempChatID: null,
+            ownerID: 'u1',
             lastMessageAt: null,
           },
         }),

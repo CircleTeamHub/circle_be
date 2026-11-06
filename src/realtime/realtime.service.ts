@@ -128,7 +128,7 @@ type CachedUserProfileSummaryPayload = UserProfileSummaryPayload & {
 
 export type NoteSourceStatusPayload = {
   sourceNoteId: string;
-  workStatus: 'WORKING' | 'CLOSED' | null;
+  workStatus: 'WORKING' | 'CLOSED' | 'OFF_SHELF' | null;
   status: 'ACTIVE' | 'UNLISTED' | 'DELETED';
   available: boolean;
   changedAt: string;

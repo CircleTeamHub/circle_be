@@ -35,7 +35,7 @@ export type NoteStatus = (typeof NOTE_STATUS)[number];
 export const NOTE_WRITABLE_STATUS = ['ACTIVE', 'UNLISTED'] as const;
 export type NoteWritableStatus = (typeof NOTE_WRITABLE_STATUS)[number];
 
-export const NOTE_WORK_STATUS = ['WORKING', 'CLOSED'] as const;
+export const NOTE_WORK_STATUS = ['WORKING', 'CLOSED', 'OFF_SHELF'] as const;
 export type NoteWorkStatus = (typeof NOTE_WORK_STATUS)[number];
 
 export const NOTE_MEDIA_TYPE = ['IMAGE', 'VIDEO', 'AUDIO'] as const;
@@ -1024,8 +1024,8 @@ export class NoteSourceStatesQueryDto {
 
 export class NoteSourceStateDto {
   @ApiProperty() noteId: string;
-  @ApiProperty({ enum: ['WORKING', 'CLOSED', 'UNSET'] })
-  workStatus: 'WORKING' | 'CLOSED' | 'UNSET';
+  @ApiProperty({ enum: ['WORKING', 'CLOSED', 'OFF_SHELF', 'UNSET'] })
+  workStatus: NoteWorkStatus | 'UNSET';
   /** UNLISTED also covers notes the viewer cannot read (no existence oracle). */
   @ApiProperty({ enum: ['ACTIVE', 'UNLISTED', 'DELETED'] })
   publicationStatus: 'ACTIVE' | 'UNLISTED' | 'DELETED';

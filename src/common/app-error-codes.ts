@@ -398,6 +398,8 @@ export const ChatErrorCode = {
   GroupAvatarUrlInvalid: 'CHAT_GROUP_AVATAR_URL_INVALID',
   // 客户端幂等键 d 已经用于另一份内容:不能把旧内容当成这次发送的结果返回。
   DeliveryIdConflict: 'CHAT_DELIVERY_ID_CONFLICT',
+  // 双向清空申请已经同意或拒绝过(另一台设备先点了):不能再处理一次。
+  ClearRequestHandled: 'CHAT_CLEAR_REQUEST_HANDLED',
 } as const;
 
 // 二维码令牌:无效(不存在/已撤销/目标已不可用) / 已过期 / 该类型不支持此操作 /

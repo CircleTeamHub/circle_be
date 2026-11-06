@@ -33,19 +33,19 @@ type SourcePayload = {
   sourceNoteId: string;
   ownerID: string | null;
   title: string;
-  workStatus: 'WORKING' | 'CLOSED' | null;
+  workStatus: 'WORKING' | 'CLOSED' | 'OFF_SHELF' | null;
   status: 'ACTIVE' | 'UNLISTED' | 'DELETED';
   available: boolean;
   changedAt: string;
 };
 
-/** 只提醒开工/打烊的真实切换;上下架、删除只刷新名片。 */
+/** 只提醒开工/打烊的真实切换;上下架、场地「下架」状态、删除只刷新名片。 */
 function alertStatus(
   job: FanoutJob,
   payload: SourcePayload,
 ): 'CLOSED' | 'WORKING' | null {
   if (!job.workStatusChanged || payload.status === 'DELETED') return null;
-  return payload.workStatus;
+  return payload.workStatus === 'OFF_SHELF' ? null : payload.workStatus;
 }
 
 @Injectable()

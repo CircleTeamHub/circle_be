@@ -245,6 +245,22 @@ export class NoteController {
     return this.noteService.setStatus(req.user.userId, id, dto.status);
   }
 
+  // 必须先于 @Get(':id') 声明（同 share-links 的顺序注释）。
+  @Get('source-group/:conversationId')
+  @ApiOperation({
+    summary: 'List the source notes bound to a group (read-only, members only)',
+  })
+  @ApiOkResponse({ type: [NoteSummaryDto] })
+  listGroupBoundNotes(
+    @Param('conversationId', ParseUUIDPipe) conversationId: string,
+    @Req() req: RequestWithUser,
+  ): Promise<NoteSummaryDto[]> {
+    return this.noteService.listGroupBoundNotes(
+      req.user.userId,
+      conversationId,
+    );
+  }
+
   // 必须先于 @Get(':id') / @Patch(':id') 声明（同 share-links 的顺序注释）。
   @Get('recycle-bin')
   @ApiOperation({

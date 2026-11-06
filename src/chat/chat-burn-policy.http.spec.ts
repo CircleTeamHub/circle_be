@@ -17,6 +17,7 @@ import { JwtGuard } from 'src/guards/jwt.guard';
 import { ChatGroupAdminService } from './chat-group-admin.service';
 import { ChatGroupEventService } from './chat-group-event.service';
 import { ChatGroupSettingsService } from './chat-group-settings.service';
+import { ChatClearRequestService } from './chat-clear-request.service';
 import { ChatController } from './chat.controller';
 import { ChatService } from './chat.service';
 
@@ -68,6 +69,7 @@ describe('/chat/conversations/:id/burn HTTP pipeline', () => {
         { provide: ChatGroupAdminService, useValue: {} },
         { provide: ChatGroupEventService, useValue: {} },
         { provide: ChatGroupSettingsService, useValue: {} },
+        { provide: ChatClearRequestService, useValue: {} },
       ],
     })
       .overrideGuard(JwtGuard)
