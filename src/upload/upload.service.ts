@@ -286,10 +286,12 @@ export class UploadService implements OnModuleInit {
   private readonly bucket: string;
   private readonly publicUrl: string;
   private readonly publicObjectBase: string;
+  private readonly directPublicObjectBase: string;
   /** 认得出 key 的所有前缀（canonical 在前，切换前的直连域名在后）。 */
   private readonly publicObjectBases: string[];
   private readonly region: string;
   private readonly manageBucket: boolean;
+  private readonly bucketConfigVerifiedExternally: boolean;
   private readonly allowedOrigins: string[];
   private readonly externalDeliveryConfigured: boolean;
   private readonly deliveryUrlUnusable: boolean;
@@ -321,11 +323,16 @@ export class UploadService implements OnModuleInit {
       'OBJECT_STORAGE_MANAGE_BUCKET',
       true,
     );
+    this.bucketConfigVerifiedExternally = readBooleanConfig(
+      this.config,
+      'OBJECT_STORAGE_BUCKET_CONFIG_VERIFIED_EXTERNALLY',
+      false,
+    );
     this.allowedOrigins = (this.config.get<string>('ALLOWED_ORIGINS') ?? '')
       .split(',')
       .map((origin) => origin.trim())
       .filter(Boolean);
-    const directPublicObjectBase = buildStoragePublicObjectBase(
+    this.directPublicObjectBase = buildStoragePublicObjectBase(
       this.publicUrl,
       this.bucket,
       forcePathStyle,
@@ -343,7 +350,8 @@ export class UploadService implements OnModuleInit {
     this.deliveryUrlUnusable = Boolean(
       configuredDeliveryUrl && !sharedPublicObjectBase,
     );
-    this.publicObjectBase = sharedPublicObjectBase ?? directPublicObjectBase;
+    this.publicObjectBase =
+      sharedPublicObjectBase ?? this.directPublicObjectBase;
     // 写入永远用 publicObjectBase；识别要连**切换之前**存下的直连地址一起认，
     // 否则开启投递域名的那一刻，所有历史 url 都会变成「不是本站存储」。
     this.publicObjectBases = storagePublicObjectBasesFromConfig(this.config);
@@ -356,7 +364,7 @@ export class UploadService implements OnModuleInit {
       deliveryBase &&
       new URL(deliveryBase).protocol === 'https:' &&
       deliveryOrigin !== storageOrigin(this.publicUrl) &&
-      deliveryOrigin !== storageOrigin(directPublicObjectBase) &&
+      deliveryOrigin !== storageOrigin(this.directPublicObjectBase) &&
       !isDirectProviderHost(deliveryBase),
     );
     this.production =
@@ -887,8 +895,13 @@ export class UploadService implements OnModuleInit {
         // 外部对象存储（如腾讯 COS）的桶与匿名公开前缀由云控制台/CAM 管理。
         // HeadBucket 成功只证明凭据可访问目标桶，不能证明私有前缀策略正确；
         // 启动时不改 ACL/策略，因此 objectStoreStatus 保持 external-unverified。
-        step = 'verify_export_lifecycle';
-        await this.ensureExternalExportLifecycle();
+        // Bucket-only R2 credentials cannot read lifecycle configuration. This
+        // explicit operator attestation covers expiry and private bucket access;
+        // browser upload CORS must still pass a functional preflight below.
+        if (!this.bucketConfigVerifiedExternally) {
+          step = 'verify_export_lifecycle';
+          await this.ensureExternalExportLifecycle();
+        }
         step = 'verify_upload_cors';
         await this.ensureExternalUploadCors();
         this.logger.warn(
@@ -981,6 +994,44 @@ export class UploadService implements OnModuleInit {
   }
 
   private async ensureExternalUploadCors(): Promise<void> {
+    if (this.bucketConfigVerifiedExternally) {
+      for (const origin of this.allowedOrigins) {
+        const response = await fetch(
+          `${this.directPublicObjectBase}/uploads/__cors_probe__`,
+          {
+            method: 'OPTIONS',
+            redirect: 'error',
+            signal: AbortSignal.timeout(5000),
+            headers: {
+              Origin: origin,
+              'Access-Control-Request-Method': 'PUT',
+              'Access-Control-Request-Headers': 'content-type,if-none-match',
+            },
+          },
+        );
+        const rule = {
+          AllowedOrigins: [
+            response.headers.get('access-control-allow-origin') ?? '',
+          ],
+          AllowedMethods: (
+            response.headers.get('access-control-allow-methods') ?? ''
+          )
+            .split(',')
+            .map((item) => item.trim()),
+          AllowedHeaders: (
+            response.headers.get('access-control-allow-headers') ?? ''
+          )
+            .split(',')
+            .map((item) => item.trim()),
+        };
+        if (!response.ok || !corsRuleAllowsBrowserPut(rule, origin)) {
+          throw new Error(
+            'External R2 storage does not pass browser upload preflight',
+          );
+        }
+      }
+      return;
+    }
     const response = await this.client.send(
       new GetBucketCorsCommand({ Bucket: this.bucket }),
     );

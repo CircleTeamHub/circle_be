@@ -338,6 +338,8 @@ export function createEnvValidationSchema(
       .default('us-east-1'),
     OBJECT_STORAGE_FORCE_PATH_STYLE: Joi.boolean().default(true),
     OBJECT_STORAGE_MANAGE_BUCKET: Joi.boolean().default(true),
+    OBJECT_STORAGE_BUCKET_CONFIG_VERIFIED_EXTERNALLY:
+      Joi.boolean().default(false),
     OBJECT_STORAGE_DELIVERY_URL: Joi.when('NODE_ENV', {
       is: 'production',
       then: objectDeliveryUrlSchema(['https']).optional(),
@@ -382,6 +384,18 @@ export function createEnvValidationSchema(
   })
     .unknown(true)
     .custom((value, helpers) => {
+      if (
+        value.OBJECT_STORAGE_BUCKET_CONFIG_VERIFIED_EXTERNALLY &&
+        (value.OBJECT_STORAGE_MANAGE_BUCKET ||
+          !/^https:\/\/[a-f0-9]{32}(?:\.(?:eu|us|fedramp))?\.r2\.cloudflarestorage\.com\/?$/.test(
+            value.MINIO_ENDPOINT ?? '',
+          ))
+      ) {
+        return helpers.message({
+          custom:
+            'OBJECT_STORAGE_BUCKET_CONFIG_VERIFIED_EXTERNALLY requires an externally managed HTTPS R2 endpoint',
+        });
+      }
       // 显式开了 production 旁路却配不合格时，宁可启动失败也不要静默降级：
       // 运行时 fail closed（见 email-code-bypass.ts）会让运维以为旁路生效，
       // 拿着一个永远不通过的码排查半天。

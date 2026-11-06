@@ -186,6 +186,88 @@ describe('createEnvValidationSchema', () => {
     },
   );
 
+  it('defaults external bucket configuration attestation to false', () => {
+    const env = {
+      ...baseEnv,
+      DATABASE_URL: 'postgresql://user:pass@localhost:5432/db',
+    };
+
+    const { error, value } = createEnvValidationSchema(env).validate(env);
+
+    expect(error).toBeUndefined();
+    expect(value.OBJECT_STORAGE_BUCKET_CONFIG_VERIFIED_EXTERNALLY).toBe(false);
+  });
+
+  it.each(['', '.eu', '.us', '.fedramp'])(
+    'accepts explicit external R2 configuration attestation for jurisdiction %s',
+    (jurisdiction) => {
+      const env = {
+        ...baseEnv,
+        DATABASE_URL: 'postgresql://user:pass@localhost:5432/db',
+        MINIO_ENDPOINT: `https://${'a'.repeat(32)}${jurisdiction}.r2.cloudflarestorage.com/`,
+        OBJECT_STORAGE_MANAGE_BUCKET: 'false',
+        OBJECT_STORAGE_BUCKET_CONFIG_VERIFIED_EXTERNALLY: 'true',
+      };
+
+      const { error, value } = createEnvValidationSchema(env).validate(env);
+
+      expect(error).toBeUndefined();
+      expect(value.OBJECT_STORAGE_BUCKET_CONFIG_VERIFIED_EXTERNALLY).toBe(true);
+    },
+  );
+
+  it.each([
+    {
+      MINIO_ENDPOINT: `https://${'a'.repeat(32)}.r2.cloudflarestorage.com`,
+      OBJECT_STORAGE_MANAGE_BUCKET: 'true',
+    },
+    {
+      MINIO_ENDPOINT: 'https://cos.ap-tokyo.myqcloud.com',
+      OBJECT_STORAGE_MANAGE_BUCKET: 'false',
+    },
+    {
+      MINIO_ENDPOINT: `http://${'a'.repeat(32)}.r2.cloudflarestorage.com`,
+      OBJECT_STORAGE_MANAGE_BUCKET: 'false',
+    },
+    {
+      MINIO_ENDPOINT: `https://${'a'.repeat(32)}.r2.cloudflarestorage.com/bucket`,
+      OBJECT_STORAGE_MANAGE_BUCKET: 'false',
+    },
+    {
+      MINIO_ENDPOINT: 'https://r2.cloudflarestorage.com',
+      OBJECT_STORAGE_MANAGE_BUCKET: 'false',
+    },
+    { OBJECT_STORAGE_MANAGE_BUCKET: 'false' },
+  ])(
+    'rejects external configuration attestation outside unmanaged HTTPS R2: %o',
+    (storage) => {
+      const env = {
+        ...baseEnv,
+        DATABASE_URL: 'postgresql://user:pass@localhost:5432/db',
+        ...storage,
+        OBJECT_STORAGE_BUCKET_CONFIG_VERIFIED_EXTERNALLY: 'true',
+      };
+
+      const { error } = createEnvValidationSchema(env).validate(env);
+
+      expect(error?.message).toContain(
+        'OBJECT_STORAGE_BUCKET_CONFIG_VERIFIED_EXTERNALLY requires an externally managed HTTPS R2 endpoint',
+      );
+    },
+  );
+
+  it('rejects a malformed external configuration attestation boolean', () => {
+    const env = {
+      ...baseEnv,
+      DATABASE_URL: 'postgresql://user:pass@localhost:5432/db',
+      OBJECT_STORAGE_BUCKET_CONFIG_VERIFIED_EXTERNALLY: 'yes',
+    };
+
+    expect(
+      createEnvValidationSchema(env).validate(env).error?.message,
+    ).toContain('OBJECT_STORAGE_BUCKET_CONFIG_VERIFIED_EXTERNALLY');
+  });
+
   it('normalizes backwards-compatible object storage defaults', () => {
     const env = {
       ...baseEnv,
