@@ -158,7 +158,14 @@ describe('NoteService', () => {
         items('showcase')?.length ?? (items('media') ? 0 : images.length),
       contactItems: items('contacts'),
       groupItems: items('groups'),
-      hasLocation: isPlainObject(sections.location),
+      hasLocation:
+        isPlainObject(sections.location) &&
+        !(
+          sections.location.latitude === 0 &&
+          sections.location.longitude === 0 &&
+          !String(sections.location.title ?? '').trim() &&
+          !String(sections.location.address ?? '').trim()
+        ),
       coverId: cover?.id ?? null,
       coverType: cover?.type ?? null,
       coverUrl: cover?.url ?? null,

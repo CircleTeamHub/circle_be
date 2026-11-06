@@ -60,10 +60,15 @@ describe('ChatMediaService', () => {
     jest.clearAllMocks();
     prisma.chatMessage.findMany.mockResolvedValue([]);
     prisma.chatBurnArchive.findMany.mockResolvedValue([]);
-    // 预览图的来源根笔记默认都还可分发。
+    // 卡片的来源根笔记默认都还在、可分发、开工中。
     prisma.note.findMany.mockImplementation(
       async ({ where }: { where: { id: { in: string[] } } }) =>
-        where.id.in.map((id) => ({ id })),
+        where.id.in.map((id) => ({
+          id,
+          status: 'ACTIVE',
+          available: true,
+          workStatus: 'WORKING',
+        })),
     );
     prisma.chatMediaDeletion.findFirst.mockResolvedValue(null);
     uploadService.createPresignedGetUrl.mockImplementation((key: string) =>
@@ -111,7 +116,10 @@ describe('ChatMediaService', () => {
 
     // 作者事后下架 / 删除:已发出的卡片不再续签,一页卡片只批量查一次根笔记。
     it('stops signing previews once the source root is no longer distributable', async () => {
-      prisma.note.findMany.mockResolvedValue([{ id: 'live' }]);
+      prisma.note.findMany.mockResolvedValue([
+        { id: 'live', status: 'ACTIVE', available: true, workStatus: null },
+        { id: 'gone', status: 'ACTIVE', available: false, workStatus: null },
+      ]);
       const live = dto({
         id: 'm1',
         type: 'note-card',
@@ -125,17 +133,194 @@ describe('ChatMediaService', () => {
       await service.attachMediaUrls([live, unlisted]);
       expect(prisma.note.findMany).toHaveBeenCalledTimes(1);
       expect(prisma.note.findMany).toHaveBeenCalledWith({
-        where: {
-          id: { in: ['live', 'gone'] },
-          status: 'ACTIVE',
-          available: true,
-        },
-        select: { id: true },
+        where: { id: { in: ['live', 'gone'] } },
+        select: { id: true, status: true, available: true, workStatus: true },
       });
       expect(live.content.previewUrls).toEqual([
         'https://signed/notes/u1/a.jpg',
       ]);
       expect(unlisted.content.previewUrls).toBeUndefined();
+    });
+
+    // 卡片上的状态是发送时的快照:读的时候换成根笔记此刻的状态,会话重新加载不会
+    // 把客户端的实时补丁盖回旧值,同一笔记的几张卡片也不会各显示各的。
+    it('reports the source root live work and publication status on every read', async () => {
+      prisma.note.findMany.mockResolvedValue([
+        {
+          id: 'boss',
+          status: 'ACTIVE',
+          available: true,
+          workStatus: 'OFF_SHELF',
+        },
+        {
+          id: 'hidden',
+          status: 'ACTIVE',
+          available: false,
+          workStatus: 'WORKING',
+        },
+      ]);
+      const older = dto({
+        id: 'm1',
+        type: 'note-card',
+        content: {
+          noteId: 'copy',
+          sourceNoteId: 'boss',
+          workStatus: 'WORKING',
+          publicationStatus: 'ACTIVE',
+        },
+      });
+      const newer = dto({
+        id: 'm2',
+        type: 'note-card',
+        content: {
+          noteId: 'boss',
+          sourceNoteId: 'boss',
+          workStatus: 'OFF_SHELF',
+          publicationStatus: 'ACTIVE',
+        },
+      });
+      const unlisted = dto({
+        id: 'm3',
+        type: 'note-card',
+        content: {
+          sourceNoteId: 'hidden',
+          workStatus: 'WORKING',
+          publicationStatus: 'ACTIVE',
+        },
+      });
+      const deleted = dto({
+        id: 'm4',
+        type: 'note-card',
+        content: {
+          sourceNoteId: 'purged',
+          workStatus: 'CLOSED',
+          publicationStatus: 'ACTIVE',
+        },
+      });
+      await service.attachMediaUrls([older, newer, unlisted, deleted]);
+      expect(prisma.note.findMany).toHaveBeenCalledTimes(1);
+      expect(older.content).toMatchObject({
+        workStatus: 'OFF_SHELF',
+        publicationStatus: 'ACTIVE',
+      });
+      expect(newer.content).toMatchObject({
+        workStatus: 'OFF_SHELF',
+        publicationStatus: 'ACTIVE',
+      });
+      expect(unlisted.content).toMatchObject({
+        workStatus: 'WORKING',
+        publicationStatus: 'UNLISTED',
+      });
+      expect(deleted.content).toMatchObject({
+        workStatus: 'UNSET',
+        publicationStatus: 'DELETED',
+      });
+      expect(older.content.noteId).toBe('copy');
+    });
+
+    describe('card content follows the note', () => {
+      const projector = { projectChatNoteCards: jest.fn() };
+      const moduleRef = { get: jest.fn(() => projector) };
+      const projecting = new ChatMediaService(
+        uploadService as never,
+        prisma as never,
+        moduleRef as never,
+      );
+      afterAll(() => projecting.onModuleDestroy());
+      const fresh = {
+        title: '北京大妞(新)',
+        contentPreview: '新的正文',
+        coverUrl: 'https://signed/notes/u1/cover-new.jpg',
+        imageCount: 3,
+        videoCount: 0,
+        showcaseCount: 3,
+        hasText: true,
+        hasLocation: false,
+        previewKeys: ['notes/u1/new-a.jpg', 'notes/u1/new-b.jpg'],
+      };
+
+      // 作者改了笔记:已经发出去的卡片读的时候换成笔记此刻的内容,四宫格按新图签。
+      it('an old card shows the note as it is now, with fresh previews', async () => {
+        projector.projectChatNoteCards.mockResolvedValueOnce(
+          new Map([['mine', fresh]]),
+        );
+        const message = dto({
+          type: 'note-card',
+          content: {
+            noteId: 'mine',
+            sourceNoteId: 'mine',
+            title: '北京大妞',
+            contentPreview: null,
+            imageCount: 0,
+            coverUrl: 'https://expired/cover.jpg',
+            previewKeys: ['notes/u1/old.jpg'],
+          },
+        });
+        await projecting.attachMediaUrls([message]);
+        expect(projector.projectChatNoteCards).toHaveBeenCalledWith(['mine']);
+        expect(message.content).toMatchObject({
+          noteId: 'mine',
+          title: '北京大妞(新)',
+          contentPreview: '新的正文',
+          coverUrl: 'https://signed/notes/u1/cover-new.jpg',
+          imageCount: 3,
+          hasText: true,
+          previewUrls: [
+            'https://signed/notes/u1/new-a.jpg',
+            'https://signed/notes/u1/new-b.jpg',
+          ],
+        });
+      });
+
+      it('a card whose source is no longer distributable keeps its snapshot', async () => {
+        prisma.note.findMany.mockResolvedValueOnce([
+          { id: 'mine', status: 'ACTIVE', available: false, workStatus: null },
+        ]);
+        const message = dto({
+          type: 'note-card',
+          content: { noteId: 'mine', sourceNoteId: 'mine', title: '旧标题' },
+        });
+        await projecting.attachMediaUrls([message]);
+        expect(projector.projectChatNoteCards).not.toHaveBeenCalled();
+        expect(message.content.title).toBe('旧标题');
+      });
+
+      it('a failed projection keeps the snapshot', async () => {
+        projector.projectChatNoteCards.mockRejectedValueOnce(new Error('db'));
+        const message = dto({
+          type: 'note-card',
+          content: { noteId: 'mine', sourceNoteId: 'mine', title: '旧标题' },
+        });
+        await projecting.attachMediaUrls([message]);
+        expect(message.content.title).toBe('旧标题');
+      });
+    });
+
+    it('keeps the sent snapshot when the root lookup fails', async () => {
+      prisma.note.findMany.mockRejectedValue(new Error('db down'));
+      const message = dto({
+        type: 'note-card',
+        content: {
+          sourceNoteId: 'n1',
+          workStatus: 'CLOSED',
+          publicationStatus: 'ACTIVE',
+        },
+      });
+      await service.attachMediaUrls([message]);
+      expect(message.content).toMatchObject({
+        workStatus: 'CLOSED',
+        publicationStatus: 'ACTIVE',
+      });
+    });
+
+    it('leaves legacy cards without a server-stamped source alone', async () => {
+      const message = dto({
+        type: 'note-card',
+        content: { noteId: 'n1', workStatus: 'CLOSED' },
+      });
+      await service.attachMediaUrls([message]);
+      expect(prisma.note.findMany).not.toHaveBeenCalled();
+      expect(message.content.workStatus).toBe('CLOSED');
     });
 
     it('signs no previews when the root lookup fails', async () => {

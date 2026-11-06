@@ -18,7 +18,8 @@ import { Prisma, type NoteMediaType } from 'src/generated/prisma';
  *   都没有时数这条笔记的 IMAGE 媒体 —— 与 buildSectionsFromRow 的回退顺序一致；
  * - contactItems / groupItems：分区里显式的名片数组原样带回（调用方照旧过滤对象元素、
  *   补圈子 id、截前 3 张）；没有显式数组时为 NULL；
- * - hasLocation：分区里 location 是对象；
+ * - hasLocation：分区里 location 是对象，且不是 (0,0) 又没有名称、地址的空壳（早期数据里
+ *   有这种，发出去就是一条「未知位置」）；与 isSendableNoteLocation 同一口径；
  * - 封面：coverMediaID 指向的媒体是 IMAGE 就用它，否则这条笔记 sortOrder 最小的 IMAGE
  *   （(noteID, sortOrder) 唯一，不会并列）。coverNoteID 让调用方只给属于这条笔记的封面
  *   签名（原来只签 note.media 里的 url）。
@@ -90,7 +91,16 @@ export function noteSummaryProjectionQuery(
            CASE WHEN jsonb_typeof(s."groups" -> 'items') = 'array'
                 THEN s."groups" -> 'items'
            END AS "groupItems",
-           COALESCE(jsonb_typeof(s."location") = 'object', false) AS "hasLocation",
+           COALESCE(
+             jsonb_typeof(s."location") = 'object'
+             AND NOT (
+               COALESCE(s."location" -> 'latitude' = '0'::jsonb, false)
+               AND COALESCE(s."location" -> 'longitude' = '0'::jsonb, false)
+               AND btrim(COALESCE(s."location" ->> 'title', '')) = ''
+               AND btrim(COALESCE(s."location" ->> 'address', '')) = ''
+             ),
+             false
+           ) AS "hasLocation",
            COALESCE(chosen."id", fallback."id") AS "coverId",
            COALESCE(chosen."type", fallback."type") AS "coverType",
            COALESCE(chosen."url", fallback."url") AS "coverUrl",

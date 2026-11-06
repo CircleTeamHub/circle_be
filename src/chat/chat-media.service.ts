@@ -1,8 +1,10 @@
+import { ModuleRef } from '@nestjs/core';
 import {
   BadRequestException,
   Injectable,
   Logger,
   OnModuleDestroy,
+  Optional,
 } from '@nestjs/common';
 import { randomUUID } from 'crypto';
 import { PrismaService } from 'src/prisma/prisma.service';
@@ -20,6 +22,11 @@ import {
   NOTE_MEDIA_KEY_PREFIX,
 } from './chat.constants';
 import type { ChatMessageDto } from './chat.types';
+import {
+  NOTE_CARD_PROJECTOR,
+  type NoteCardProjection,
+  type NoteCardProjector,
+} from './note-card-projector';
 
 /**
  * 笔记卡片上服务端盖章写入的预览图 key。读路径只认这一处、只认笔记媒体前缀、
@@ -34,6 +41,30 @@ function noteCardPreviewKeys(content: Record<string, unknown>): string[] {
         typeof key === 'string' && key.startsWith(NOTE_MEDIA_KEY_PREFIX),
     )
     .slice(0, NOTE_CARD_PREVIEW_MAX);
+}
+
+interface NoteCardLiveState {
+  workStatus: 'WORKING' | 'CLOSED' | 'OFF_SHELF' | 'UNSET';
+  publicationStatus: 'ACTIVE' | 'UNLISTED' | 'DELETED';
+}
+
+const DELETED_NOTE_CARD_STATE: NoteCardLiveState = {
+  workStatus: 'UNSET',
+  publicationStatus: 'DELETED',
+};
+
+/** 根笔记此刻的状态,换成聊天卡片的字段(与发送时盖章同一口径)。 */
+function noteCardLiveState(root: {
+  status: string;
+  available: boolean;
+  workStatus: NoteCardLiveState['workStatus'] | null;
+}): NoteCardLiveState {
+  const workStatus = root.workStatus ?? 'UNSET';
+  if (root.status === 'DELETED')
+    return { workStatus, publicationStatus: 'DELETED' };
+  if (root.status === 'ACTIVE' && root.available)
+    return { workStatus, publicationStatus: 'ACTIVE' };
+  return { workStatus, publicationStatus: 'UNLISTED' };
 }
 import { reportOperationalError } from 'src/logging/error-aggregation.service';
 import { diagnosticFailureDetails } from 'src/logging/http-failure.logger';
@@ -123,9 +154,13 @@ export class ChatMediaService implements OnModuleDestroy {
   private retryTimer: NodeJS.Timeout | null = null;
   private sweeping = false;
 
+  /** 卡片内容投影的实现(笔记模块);找到之前每次读都再找一次,找到就缓存。 */
+  private noteCardProjectorInstance: NoteCardProjector | null = null;
+
   constructor(
     private readonly uploadService: UploadService,
     private readonly prisma: PrismaService,
+    @Optional() private readonly moduleRef?: ModuleRef,
   ) {
     const timer = setInterval(() => {
       void this.drainPendingDeletions();
@@ -734,6 +769,20 @@ export class ChatMediaService implements OnModuleDestroy {
     return grants;
   }
 
+  private noteCardProjector(): NoteCardProjector | null {
+    if (this.noteCardProjectorInstance) return this.noteCardProjectorInstance;
+    try {
+      this.noteCardProjectorInstance =
+        this.moduleRef?.get<NoteCardProjector>(NOTE_CARD_PROJECTOR, {
+          strict: false,
+        }) ?? null;
+    } catch {
+      // 笔记模块没加载(单独起的进程、部分测试):卡片保持发送时的快照。
+      this.noteCardProjectorInstance = null;
+    }
+    return this.noteCardProjectorInstance;
+  }
+
   /**
    * 就地把 dto.content 换成带签名 URL 的新对象(不改数据库行)。
    * 存储未配置/签名失败时降级:保留 key、缺 url,前端按占位图处理 ——
@@ -752,37 +801,72 @@ export class ChatMediaService implements OnModuleDestroy {
         }),
       );
     }
-    // 预览图只在来源根笔记此刻仍可分发(ACTIVE + available)时签:作者事后下架 / 删除,
-    // 已发出的卡片不再续签。本页所有卡片一次批量查;查失败按不可分发处理。
-    let previewRoots = new Set<string>();
-    const previewRootIds = [
+    // 卡片上的开工/打烊/下架与上下架是发送时的快照;读的时候按来源根笔记此刻的状态覆盖,
+    // 否则会话一重新加载(回到聊天页、翻页、重连)就把客户端实时补丁盖回旧快照,
+    // 同一条笔记的两张卡片还会显示不同状态。口径与发送时盖章(resolveNoteCardSourceState)
+    // 一致。预览图也只在根笔记此刻仍可分发(ACTIVE + available)时签:作者事后下架 / 删除,
+    // 已发出的卡片不再续签。本页所有卡片一次批量查;查失败就保留快照、不签预览。
+    const noteCardRootIds = [
       ...new Set(
         messages
           .filter(
             (message) =>
               message.type === 'note-card' &&
-              typeof message.content.sourceNoteId === 'string' &&
-              noteCardPreviewKeys(message.content).length > 0,
+              typeof message.content.sourceNoteId === 'string',
           )
           .map((message) => message.content.sourceNoteId as string),
       ),
     ];
-    if (previewRootIds.length) {
+    let noteCardRoots: Map<string, NoteCardLiveState> | null = new Map();
+    if (noteCardRootIds.length) {
       try {
         const roots = await this.prisma.note.findMany({
-          where: {
-            id: { in: previewRootIds },
-            status: 'ACTIVE',
-            available: true,
-          },
-          select: { id: true },
+          where: { id: { in: noteCardRootIds } },
+          select: { id: true, status: true, available: true, workStatus: true },
         });
-        previewRoots = new Set(roots.map((root) => root.id));
+        noteCardRoots = new Map(
+          roots.map((root) => [root.id, noteCardLiveState(root)]),
+        );
       } catch (error) {
+        noteCardRoots = null;
         this.logger.warn(
           sanitizeLogValue({
             event: 'chat_media_presign_failed',
             operation: 'noteCardPreviewRoots',
+            ...diagnosticFailureDetails(error),
+          }),
+        );
+      }
+    }
+    // 卡片内容(标题、正文预览、图片数、封面、四宫格)也按笔记此刻的内容覆盖:作者改了笔记,
+    // 已发出的卡片跟着变,封面也不再是发送时那个会过期的签名。只投影根笔记此刻仍可分发的
+    // 卡片(与预览图同一条件);投影失败或实现不在就保留快照。
+    let cardProjections = new Map<string, NoteCardProjection>();
+    const projectedNoteIds = noteCardRoots
+      ? [
+          ...new Set(
+            messages
+              .filter(
+                (message) =>
+                  message.type === 'note-card' &&
+                  typeof message.content.noteId === 'string' &&
+                  noteCardRoots?.get(message.content.sourceNoteId as string)
+                    ?.publicationStatus === 'ACTIVE',
+              )
+              .map((message) => message.content.noteId as string),
+          ),
+        ]
+      : [];
+    const projector = projectedNoteIds.length ? this.noteCardProjector() : null;
+    if (projector) {
+      try {
+        cardProjections =
+          await projector.projectChatNoteCards(projectedNoteIds);
+      } catch (error) {
+        this.logger.warn(
+          sanitizeLogValue({
+            event: 'chat_note_card_projection_failed',
+            operation: 'attachMediaUrls',
             ...diagnosticFailureDetails(error),
           }),
         );
@@ -821,7 +905,29 @@ export class ChatMediaService implements OnModuleDestroy {
         if (!fields && !isNoteCard) return;
         message.content = { ...message.content };
         for (const field of fields ?? []) delete message.content[field.url];
-        if (isNoteCard) delete message.content[NOTE_CARD_PREVIEW_URLS_FIELD];
+        if (isNoteCard) {
+          delete message.content[NOTE_CARD_PREVIEW_URLS_FIELD];
+          const sourceNoteId = message.content.sourceNoteId;
+          if (noteCardRoots && typeof sourceNoteId === 'string') {
+            // 根笔记已被物理删除(查不到)按已删除处理。
+            message.content = {
+              ...message.content,
+              ...(noteCardRoots.get(sourceNoteId) ?? DELETED_NOTE_CARD_STATE),
+            };
+          }
+          const projection =
+            typeof message.content.noteId === 'string'
+              ? cardProjections.get(message.content.noteId)
+              : undefined;
+          if (projection) {
+            const { previewKeys, ...fields } = projection;
+            message.content = {
+              ...message.content,
+              ...fields,
+              [NOTE_CARD_PREVIEW_KEYS_FIELD]: previewKeys,
+            };
+          }
+        }
         let grant: { date: Date; ttl: number } | null = {
           date: windowDate,
           ttl: CHAT_MEDIA_URL_TTL_SECONDS,
@@ -844,7 +950,8 @@ export class ChatMediaService implements OnModuleDestroy {
           }
           if (
             isNoteCard &&
-            previewRoots.has(message.content.sourceNoteId as string)
+            noteCardRoots?.get(message.content.sourceNoteId as string)
+              ?.publicationStatus === 'ACTIVE'
           ) {
             const urls = await Promise.all(
               noteCardPreviewKeys(message.content).map((key) =>
