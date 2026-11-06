@@ -21,6 +21,7 @@ import { CircleMemberLockService } from 'src/circle/circle-member-lock';
 import { ChatCircleSyncService } from 'src/chat/chat-circle-sync.service';
 import { ChatService } from 'src/chat/chat.service';
 import { ChatSystemMessageService } from 'src/chat/chat-system-message.service';
+import { assertGroupJoinAllowed } from 'src/chat/group-join-ban';
 import { RealtimeService } from 'src/realtime/realtime.service';
 import { PrivacySettingsService } from 'src/privacy/privacy-settings.service';
 import { NotificationService } from 'src/notification/notification.service';
@@ -743,6 +744,10 @@ export class CircleInvitationService {
         errorCode: CircleErrorCode.AlreadyMember,
       });
     }
+    await assertGroupJoinAllowed(tx, {
+      conversation: { circleID: circleId },
+      userID: applicantId,
+    });
 
     // 隐私开关只看 groupInvitePermission 与好友关系,从不看拉黑。默认值是
     // EVERYONE,所以被拉黑的人照样能把对方拉进圈子 —— requiredVerifierCount=1
@@ -887,6 +892,9 @@ export class CircleInvitationService {
       circleID: circleId,
       applicantID: applicantId,
       inviterID: inviterId,
+      source:
+        existingInvitation?.source ??
+        (opts?.requireQrJoinEnabled ? 'QR' : 'INVITE'),
       approvedCount: 1,
       requiredCount:
         existingInvitation?.requiredCount ?? circlePolicy.requiredVerifierCount,
@@ -1635,6 +1643,141 @@ export class CircleInvitationService {
     }
   }
 
+  async adminReject(
+    adminId: string,
+    invitationId: string,
+    blacklist = false,
+  ): Promise<void> {
+    const result = await this.runInvitationTransaction(async (tx) => {
+      const before = await tx.circleInvitation.findUnique({
+        where: { id: invitationId },
+      });
+      if (!before)
+        throw new NotFoundException({
+          message: 'Invitation not found',
+          errorCode: CircleInvitationErrorCode.NotFound,
+        });
+      await this.memberLock.lock(tx, before.circleID, [
+        adminId,
+        before.applicantID,
+      ]);
+      const [request, manager, applicant] = await Promise.all([
+        tx.circleInvitation.findUnique({ where: { id: invitationId } }),
+        tx.circleMember.findUnique({
+          where: {
+            userID_circleID: { userID: adminId, circleID: before.circleID },
+          },
+        }),
+        tx.circleMember.findUnique({
+          where: {
+            userID_circleID: {
+              userID: before.applicantID,
+              circleID: before.circleID,
+            },
+          },
+        }),
+      ]);
+      if (
+        !manager ||
+        manager.status !== 'ACTIVE' ||
+        (manager.role !== 'OWNER' && manager.role !== 'ADMIN')
+      ) {
+        throw new ForbiddenException({
+          message: 'Only circle owner or admin can review',
+          errorCode: CircleInvitationErrorCode.OwnerAdminOnly,
+        });
+      }
+      if (!request)
+        throw new NotFoundException({
+          message: 'Invitation not found',
+          errorCode: CircleInvitationErrorCode.NotFound,
+        });
+      if (applicant?.status === 'ACTIVE')
+        throw new ConflictException('该用户已入群，请刷新申请列表');
+      const conversation = await tx.chatConversation.findUnique({
+        where: { circleID: request.circleID },
+        select: { id: true },
+      });
+      if (request.status === 'REJECTED') {
+        if (!blacklist) return null;
+        if (
+          conversation &&
+          (await tx.chatGroupJoinBan.findFirst({
+            where: {
+              conversationID: conversation.id,
+              userID: request.applicantID,
+            },
+            select: { userID: true },
+          }))
+        )
+          return null;
+      } else if (request.status !== 'PENDING') {
+        throw new BadRequestException({
+          message: 'Invitation is no longer pending',
+          errorCode: CircleInvitationErrorCode.NotPending,
+        });
+      }
+      if (blacklist) {
+        if (!conversation) throw new NotFoundException('群聊不存在');
+        await tx.chatGroupJoinBan.upsert({
+          where: {
+            conversationID_userID: {
+              conversationID: conversation.id,
+              userID: request.applicantID,
+            },
+          },
+          create: {
+            conversationID: conversation.id,
+            userID: request.applicantID,
+            actorID: adminId,
+          },
+          update: {},
+        });
+      }
+      await tx.circleInvitation.updateMany({
+        where: { id: invitationId, status: { in: ['PENDING', 'REJECTED'] } },
+        data: { status: 'REJECTED' },
+      });
+      await tx.circleMember.updateMany({
+        where: {
+          circleID: request.circleID,
+          userID: request.applicantID,
+          status: 'PENDING',
+        },
+        data: { status: 'REJECTED' },
+      });
+      if (conversation)
+        await tx.chatGroupEvent.create({
+          data: {
+            conversationID: conversation.id,
+            kind: blacklist ? 'member-banned' : 'admission-reviewed',
+            actorID: adminId,
+            targetIDs: [request.applicantID],
+            payload: {
+              status: 'REJECTED',
+              source: request.source,
+              inviterId: request.inviterID,
+              blacklisted: blacklist,
+            },
+          },
+        });
+      return { circleId: request.circleID, applicantId: request.applicantID };
+    });
+    if (!result) return;
+    await this.createAndBroadcastInvitationNotification({
+      toUserID: result.applicantId,
+      fromUserID: adminId,
+      type: 'CIRCLE_INVITATION_REJECTED',
+      fromCircleID: result.circleId,
+      fromInvitationID: invitationId,
+    });
+    this.realtimeService.broadcastCircleInvitationReviewed(result.applicantId, {
+      invitationId,
+      circleId: result.circleId,
+      status: 'REJECTED',
+    });
+  }
+
   async adminApprove(adminId: string, invitationId: string): Promise<void> {
     const invitation = await this.prisma.circleInvitation.findUnique({
       where: { id: invitationId },
@@ -1670,6 +1813,8 @@ export class CircleInvitationService {
             status: true,
             circleID: true,
             applicantID: true,
+            inviterID: true,
+            source: true,
             circle: { select: { groupID: true } },
           },
         }),
@@ -1720,6 +1865,24 @@ export class CircleInvitationService {
         [pendingInvitation.applicantID],
         { locksHeld: true, actor: 'third-party' },
       );
+      const conversation = await tx.chatConversation.findUnique({
+        where: { circleID: pendingInvitation.circleID },
+        select: { id: true },
+      });
+      if (conversation)
+        await tx.chatGroupEvent.create({
+          data: {
+            conversationID: conversation.id,
+            kind: 'admission-reviewed',
+            actorID: adminId,
+            targetIDs: [pendingInvitation.applicantID],
+            payload: {
+              status: 'JOINED',
+              source: pendingInvitation.source,
+              inviterId: pendingInvitation.inviterID,
+            },
+          },
+        });
 
       return {
         admission:

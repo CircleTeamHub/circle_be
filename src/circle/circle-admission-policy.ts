@@ -15,6 +15,7 @@ import { MembershipLevel } from 'src/membership/membership.catalog';
 import { reserveCircleSeats } from './circle-capacity';
 import { CircleMemberLockService } from './circle-member-lock';
 import { resolveEffectiveFancyNumber } from 'src/fancy-number/fancy-number-status';
+import { assertGroupJoinAllowed } from 'src/chat/group-join-ban';
 
 type JoinLimitAudience = {
   /**
@@ -83,6 +84,10 @@ export class CircleAdmissionPolicy {
       await this.cancelPendingInvitations(tx, circleID, userIDs);
       return [];
     }
+    await assertGroupJoinAllowed(tx, {
+      conversation: { circleID },
+      userID: { in: activatingUserIDs },
+    });
 
     const circle = await tx.circle.findUnique({
       where: { id: circleID },
@@ -263,6 +268,8 @@ export class CircleAdmissionPolicy {
       select: CIRCLE_ADMISSION_SELECT,
     });
     if (!circle) this.throwCircleNotFound();
+
+    await assertGroupJoinAllowed(tx, { conversation: { circleID }, userID });
 
     const joinedCount = await tx.circleMember.count({
       where: {

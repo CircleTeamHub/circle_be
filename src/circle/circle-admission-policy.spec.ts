@@ -24,6 +24,7 @@ describe('CircleAdmissionPolicy', () => {
     status: 'ACTIVE';
   }> = [];
   const prisma = {
+    chatGroupJoinBan: { findFirst: jest.fn() },
     $executeRaw: jest.fn(),
     $queryRaw: jest.fn().mockResolvedValue([{ id: 'circle-1' }]),
     circle: { findFirst: jest.fn(), findUnique: jest.fn() },
@@ -68,6 +69,7 @@ describe('CircleAdmissionPolicy', () => {
 
   beforeEach(() => {
     jest.clearAllMocks();
+    prisma.chatGroupJoinBan.findFirst.mockResolvedValue(null);
     programEnabled = true;
     prisma.$queryRaw.mockResolvedValue([{ id: 'circle-1' }]);
     prisma.circle.findUnique.mockResolvedValue(circle());
@@ -79,6 +81,29 @@ describe('CircleAdmissionPolicy', () => {
     prisma.circleMember.createMany.mockResolvedValue({ count: 1 });
     prisma.user.findMany.mockResolvedValue([user()]);
     prisma.user.findUnique.mockResolvedValue(user());
+  });
+
+  it('blocks a blacklisted account before a new application is created', async () => {
+    prisma.chatGroupJoinBan.findFirst.mockResolvedValue({
+      userID: 'candidate-1',
+    });
+    await expect(
+      policy.assertCanApply(prisma as any, 'circle-1', 'candidate-1'),
+    ).rejects.toMatchObject({
+      response: { errorCode: 'CHAT_GROUP_JOIN_BLOCKED' },
+    });
+  });
+
+  it('blocks old invitations and administrative approval at final circle activation', async () => {
+    prisma.chatGroupJoinBan.findFirst.mockResolvedValue({
+      userID: 'candidate-1',
+    });
+    await expect(
+      policy.activateMembers(prisma as any, 'circle-1', ['candidate-1']),
+    ).rejects.toMatchObject({
+      response: { errorCode: 'CHAT_GROUP_JOIN_BLOCKED' },
+    });
+    expect(prisma.circleMember.createMany).not.toHaveBeenCalled();
   });
 
   it('uses the gold joined-circle limit while membership rollout is disabled', async () => {

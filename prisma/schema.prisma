@@ -2353,6 +2353,7 @@ model CircleInvitation {
   circleID                 String
   applicantID              String
   inviterID                String
+  source                   String                 @default("UNKNOWN")
   consentNoticeDeliveredAt DateTime?
   /// 同意制投递的认领租约:事务里写 now(),IO 成功或失败后清空;过期后补投接手。
   consentNoticeClaimedAt   DateTime?
@@ -2588,6 +2589,7 @@ model ChatConversation {
   messages              ChatMessage[]
   directAutoReplyStates ChatDirectAutoReplyState[]
   groupEvents           ChatGroupEvent[]
+  joinBans              ChatGroupJoinBan[]
   // burnDurationSec IS NOT NULL 的轮转扫描使用 migration 中的 partial index；
   // Prisma schema 无法表达 WHERE 条件。
 
@@ -2874,6 +2876,18 @@ model ChatCircleSyncRetry {
   nextAttemptAt DateTime @default(now())
 
   @@index([nextAttemptAt, circleID])
+}
+
+/// Accounts forbidden from applying or accepting an invitation to this group.
+model ChatGroupJoinBan {
+  conversationID String
+  userID         String
+  actorID        String
+  createdAt      DateTime @default(now())
+
+  conversation ChatConversation @relation(fields: [conversationID], references: [id], onDelete: Cascade)
+
+  @@id([conversationID, userID])
 }
 
 /// Pending invitations/applications never grant a ChatMember seat.

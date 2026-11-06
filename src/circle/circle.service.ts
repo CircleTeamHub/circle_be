@@ -670,6 +670,7 @@ export class CircleService {
                 circleID: circleId,
                 applicantID: userId,
                 inviterID: userId,
+                source: 'APPLICATION',
                 requiredCount: policy.requiredVerifierCount,
               },
               select: { id: true },

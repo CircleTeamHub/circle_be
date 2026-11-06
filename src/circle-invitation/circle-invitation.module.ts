@@ -8,6 +8,8 @@ import { CircleAdmissionPolicy } from 'src/circle/circle-admission-policy';
 import { CircleMemberLockService } from 'src/circle/circle-member-lock';
 import { CircleInvitationController } from './circle-invitation.controller';
 import { CircleInvitationService } from './circle-invitation.service';
+import { GroupReviewController } from './group-review.controller';
+import { GroupReviewService } from './group-review.service';
 
 @Module({
   imports: [
@@ -17,9 +19,10 @@ import { CircleInvitationService } from './circle-invitation.service';
     NotificationModule,
     MembershipPolicyModule,
   ],
-  controllers: [CircleInvitationController],
+  controllers: [CircleInvitationController, GroupReviewController],
   providers: [
     CircleInvitationService,
+    GroupReviewService,
     CircleAdmissionPolicy,
     CircleMemberLockService,
   ],
