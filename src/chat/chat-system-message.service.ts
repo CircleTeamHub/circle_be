@@ -1,4 +1,5 @@
 import { Injectable, Logger } from '@nestjs/common';
+import { createHash } from 'node:crypto';
 import { PrismaService } from 'src/prisma/prisma.service';
 import type { Prisma } from 'src/generated/prisma';
 import { SYSTEM_MESSAGE_TYPE } from './chat.constants';
@@ -60,6 +61,11 @@ export class ChatSystemMessageService {
       guard?: (tx: Prisma.TransactionClient) => Promise<void>;
     } = {},
   ): Promise<ChatMessageDto> {
+    // Keep legacy replay keys; bound generated keys to the varchar(128) column.
+    const clientMessageId =
+      input.clientMessageId && input.clientMessageId.length > 128
+        ? createHash('sha256').update(input.clientMessageId).digest('hex')
+        : input.clientMessageId;
     const { row, reused } = await this.prisma.$transaction(async (tx) => {
       // G-05:与客户端发送同一把行锁、同一个计数器(两条发号路径必须一致,
       // 否则并发下撞 (conversationID, height) 唯一约束)。
@@ -70,13 +76,13 @@ export class ChatSystemMessageService {
         throw new Error(`conversation ${conversationId} not found`);
       }
       await options.guard?.(tx);
-      if (input.clientMessageId && input.senderID) {
+      if (clientMessageId && input.senderID) {
         const existing = await tx.chatMessage.findUnique({
           where: {
             conversationID_senderID_clientMessageId: {
               conversationID: conversationId,
               senderID: input.senderID,
-              clientMessageId: input.clientMessageId,
+              clientMessageId,
             },
           },
         });
@@ -91,9 +97,7 @@ export class ChatSystemMessageService {
           type: input.type,
           content: input.content as Prisma.InputJsonObject,
           clientMessageId:
-            input.senderID && input.clientMessageId
-              ? input.clientMessageId
-              : null,
+            input.senderID && clientMessageId ? clientMessageId : null,
         },
       });
       await tx.chatConversation.update({
