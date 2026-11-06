@@ -35,6 +35,7 @@ describe('CircleService', () => {
   };
 
   const prisma = {
+    chatGroupJoinBan: { findFirst: jest.fn().mockResolvedValue(null) },
     user: {
       findUnique: jest.fn(),
     },
@@ -106,6 +107,7 @@ describe('CircleService', () => {
   beforeEach(async () => {
     jest.clearAllMocks();
     programEnabled = true;
+    prisma.chatGroupJoinBan.findFirst.mockResolvedValue(null);
 
     const module: TestingModule = await Test.createTestingModule({
       providers: [
@@ -228,12 +230,28 @@ describe('CircleService', () => {
         circleID: 'circle-1',
         applicantID: 'user-1',
         inviterID: 'user-1',
+        source: 'APPLICATION',
         requiredCount: 10,
       },
       select: { id: true },
     });
     // PENDING 不占正式名额、不进 OpenIM 群——转正统一发生在担保 finalize。
     expect(prisma.circle.update).not.toHaveBeenCalled();
+  });
+
+  it('refuses a blacklisted self-application without creating membership or invitation', async () => {
+    prisma.circle.findFirst.mockResolvedValue({
+      id: 'circle-1',
+      deleted: false,
+      groupID: 'group-1',
+    });
+    prisma.circleMember.findUnique.mockResolvedValue(null);
+    prisma.chatGroupJoinBan.findFirst.mockResolvedValue({ userID: 'blocked' });
+    await expect(
+      service.joinCircle('blocked', 'circle-1'),
+    ).rejects.toBeInstanceOf(ForbiddenException);
+    expect(prisma.circleMember.create).not.toHaveBeenCalled();
+    expect(prisma.circleInvitation.create).not.toHaveBeenCalled();
   });
 
   it('join reuses an existing pending invitation instead of duplicating it', async () => {
