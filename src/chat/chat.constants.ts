@@ -394,4 +394,4 @@ export const SYNC_PAGE_MAX = 200;
  * 聊天推送走的安卓通知渠道 id(跨仓契约):前端 src/chat-core/chat-notifications.ts
  * 用同一个 id 建高重要性渠道;老版本 App 没建时 expo-notifications 回落到默认渠道。
  */
-export const CHAT_PUSH_CHANNEL_ID = 'chat';
+export const CHAT_PUSH_CHANNEL_ID = 'chat_swift_gesture';

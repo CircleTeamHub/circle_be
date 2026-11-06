@@ -2,6 +2,7 @@ import { Injectable, Logger, OnModuleDestroy } from '@nestjs/common';
 import { PrismaService } from 'src/prisma/prisma.service';
 import {
   type ExpoPushPayload,
+  type PushTokenTarget,
   NotificationPushService,
   type TokenDeliveryOutcome,
 } from 'src/notification/notification-push.service';
@@ -34,17 +35,14 @@ const PUSH_TARGET_CAP = 6000;
 /** 附带 badge 的最大扇出规模(按全部收件人算):超过则跳过逐人未读聚合(照常推送,只是无数字)。 */
 const BADGE_TARGETS_MAX = 200;
 
-type TokensByUser = Map<
-  string,
-  Array<{ token: string; projectId: string | null }>
->;
+type TokensByUser = Map<string, PushTokenTarget[]>;
 
 /** 这个人这次真正要推的设备:去掉正开着 App 的那几台(消息已经实时送到上面了)。 */
 function deliverableTokens(
   tokensByUser: TokensByUser,
   foregroundTokens: Map<string, Set<string>>,
   userId: string,
-): Array<{ token: string; projectId: string | null }> {
+): PushTokenTarget[] {
   const onScreen = foregroundTokens.get(userId);
   return (tokensByUser.get(userId) ?? []).filter(
     (token) => !onScreen?.has(token.token),
