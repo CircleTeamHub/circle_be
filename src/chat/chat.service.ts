@@ -4285,7 +4285,7 @@ export class ChatService {
 
   /**
    * G-02 消息撤回:发送者本人限 CHAT_REVOKE_WINDOW_MS 时间窗;
-   * GROUP 会话的圈主/管理员不受窗口限制、可撤他人消息。
+   * GROUP 会话(圈子群与独立群聊)的群主/管理员不受窗口限制、可撤他人消息。
    * 撤回的消息仍占 height(坐标系不塌陷),content 清空,媒体对象一并删。
    */
   async revokeMessage(
@@ -4331,13 +4331,13 @@ export class ChatService {
       const expired =
         Date.now() - row.createdAt.getTime() > CHAT_REVOKE_WINDOW_MS;
       // 窗口过期的自己消息:圈主/管理员身份可豁免(管理动作),普通成员拒。
-      if (expired && !(await this.isCircleModerator(conversation, userId))) {
+      if (expired && !(await this.isGroupModerator(conversation, userId))) {
         throw new ForbiddenException({
           message: '超出可撤回时间',
           errorCode: ChatErrorCode.RevokeWindowExpired,
         });
       }
-    } else if (!(await this.isCircleModerator(conversation, userId))) {
+    } else if (!(await this.isGroupModerator(conversation, userId))) {
       throw new ForbiddenException({
         message: '无权撤回该消息',
         errorCode: ChatErrorCode.RevokeForbidden,
@@ -5146,23 +5146,34 @@ export class ChatService {
     return { clearedBeforeHeight: watermark };
   }
 
-  /** GROUP 会话按圈子角色判定管理权(OWNER/ADMIN 且 ACTIVE)。 */
-  private async isCircleModerator(
+  /**
+   * GROUP 会话的管理权(群主/管理员):圈子群按 CircleMember(ACTIVE),独立群聊按
+   * 群主字段 + 座位上的管理员标记(与群管理端点同一套判定)。
+   */
+  private async isGroupModerator(
     conversation: ChatConversation,
     userId: string,
   ): Promise<boolean> {
-    if (conversation.type !== 'GROUP' || !conversation.circleID) return false;
+    if (conversation.type !== 'GROUP') return false;
+    if (!conversation.circleID) {
+      const seat = await this.prisma.chatMember.findUnique({
+        where: {
+          conversationID_userID: {
+            conversationID: conversation.id,
+            userID: userId,
+          },
+        },
+        select: { userID: true, role: true, leftAt: true },
+      });
+      return isGroupManager(standaloneGroupRole(conversation.ownerID, seat));
+    }
     const member = await this.prisma.circleMember.findUnique({
       where: {
         userID_circleID: { userID: userId, circleID: conversation.circleID },
       },
       select: { role: true, status: true },
     });
-    return (
-      !!member &&
-      member.status === 'ACTIVE' &&
-      (member.role === 'OWNER' || member.role === 'ADMIN')
-    );
+    return isGroupManager(circleGroupRole(member));
   }
 
   /** 媒体消息 content 里的对象 key(撤回时要一并删的那些)。 */

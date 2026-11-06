@@ -10,6 +10,13 @@ import { ChatErrorCode } from 'src/common/app-error-codes';
 import { PrismaService } from 'src/prisma/prisma.service';
 import type { ChatMember, Prisma } from 'src/generated/prisma';
 import { ChatBroadcastService } from './chat-broadcast.service';
+import {
+  type AbnormalInactiveDays,
+  classifyAbnormalMember,
+  compareAbnormalMembers,
+  inactiveCutoff,
+  LOW_CREDIT_SCORE_THRESHOLD,
+} from './chat-group-abnormal-members';
 import { ChatGroupEventService } from './chat-group-event.service';
 import {
   canManageGroupTarget,
@@ -22,7 +29,12 @@ import {
   standaloneGroupRole,
 } from './chat-group-roles';
 import { ChatSystemMessageService } from './chat-system-message.service';
-import type { ChatMemberSilenceDto, ChatMessageDto } from './chat.types';
+import type {
+  ChatAbnormalMemberDto,
+  ChatAbnormalMembersDto,
+  ChatMemberSilenceDto,
+  ChatMessageDto,
+} from './chat.types';
 import type { GroupMemberRoleInput } from './dto/group-admin.dto';
 
 interface LockedGroupRow {
@@ -331,6 +343,97 @@ export class ChatGroupAdminService {
     return this.toSilenceDto(targetUserId, seat);
   }
 
+  /**
+   * 异常成员(两种群,群主/管理员):长期未登录、信誉值低。只列本人**有权移出**的
+   * 成员 —— 管理员看不到其他管理员和群主的信誉值;只读,不上锁。
+   */
+  async listAbnormalMembers(
+    actorId: string,
+    conversationId: string,
+    inactiveDays: AbnormalInactiveDays,
+  ): Promise<ChatAbnormalMembersDto> {
+    const { circleID, ownerID, actorRole } = await this.preflightGroup(
+      conversationId,
+      actorId,
+    );
+    if (!isGroupManager(actorRole)) {
+      throw new ForbiddenException({
+        message: '仅群主和管理员可查看异常成员',
+        errorCode: ChatErrorCode.GroupManagerOnly,
+      });
+    }
+    const empty = {
+      inactiveDays,
+      creditThreshold: LOW_CREDIT_SCORE_THRESHOLD,
+      members: [],
+    };
+    const seats = await this.prisma.chatMember.findMany({
+      where: {
+        conversationID: conversationId,
+        leftAt: null,
+        userID: { not: actorId },
+      },
+      select: { userID: true, role: true, leftAt: true },
+    });
+    if (seats.length === 0) return empty;
+    const circleRoles = circleID
+      ? new Map(
+          (
+            await this.prisma.circleMember.findMany({
+              where: { circleID, userID: { in: seats.map((s) => s.userID) } },
+              select: { userID: true, role: true, status: true },
+            })
+          ).map((row) => [row.userID, circleGroupRole(row)]),
+        )
+      : null;
+    const targetIds = seats
+      .filter((seat) =>
+        canManageGroupTarget(
+          actorRole,
+          circleRoles
+            ? (circleRoles.get(seat.userID) ?? null)
+            : standaloneGroupRole(ownerID, seat),
+        ),
+      )
+      .map((seat) => seat.userID);
+    if (targetIds.length === 0) return empty;
+
+    const cutoff = inactiveCutoff(inactiveDays, new Date());
+    const users = await this.prisma.user.findMany({
+      where: {
+        id: { in: targetIds },
+        OR: [
+          { creditScore: { lt: LOW_CREDIT_SCORE_THRESHOLD } },
+          { lastOnline: { lt: cutoff } },
+          { lastOnline: null, createdAt: { lt: cutoff } },
+        ],
+      },
+      select: {
+        id: true,
+        lastOnline: true,
+        createdAt: true,
+        creditScore: true,
+        privacySetting: { select: { shareOnlineStatus: true } },
+      },
+    });
+    const members = users
+      .map((user) =>
+        classifyAbnormalMember(
+          {
+            userId: user.id,
+            lastOnline: user.lastOnline,
+            createdAt: user.createdAt,
+            creditScore: user.creditScore,
+            shareOnlineStatus: user.privacySetting?.shareOnlineStatus ?? true,
+          },
+          cutoff,
+        ),
+      )
+      .filter((member): member is ChatAbnormalMemberDto => member !== null)
+      .sort(compareAbnormalMembers);
+    return { ...empty, members };
+  }
+
   /** Console entry; ordinary group APIs retain their membership checks. */
   async moderateAsAdministrator(
     actorId: string,
@@ -543,7 +646,11 @@ export class ChatGroupAdminService {
   private async preflightGroup(
     conversationId: string,
     actorId: string,
-  ): Promise<{ circleID: string | null; actorRole: GroupRole | null }> {
+  ): Promise<{
+    circleID: string | null;
+    ownerID: string | null;
+    actorRole: GroupRole | null;
+  }> {
     const seat = await this.prisma.chatMember.findUnique({
       where: {
         conversationID_userID: {
@@ -565,18 +672,19 @@ export class ChatGroupAdminService {
         errorCode: ChatErrorCode.ConversationNotFound,
       });
     }
-    const circleID = seat.conversation.circleID;
+    const { circleID, ownerID } = seat.conversation;
     if (!circleID) {
       return {
         circleID,
-        actorRole: standaloneGroupRole(seat.conversation.ownerID, seat),
+        ownerID,
+        actorRole: standaloneGroupRole(ownerID, seat),
       };
     }
     const membership = await this.prisma.circleMember.findUnique({
       where: { userID_circleID: { userID: actorId, circleID } },
       select: { role: true, status: true },
     });
-    return { circleID, actorRole: circleGroupRole(membership) };
+    return { circleID, ownerID, actorRole: circleGroupRole(membership) };
   }
 
   private async preflightStandalone(
