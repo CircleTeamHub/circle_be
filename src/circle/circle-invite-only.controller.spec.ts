@@ -17,6 +17,7 @@ import { CirclePlazaService } from 'src/circle-plaza/circle-plaza.service';
 import { JwtGuard } from 'src/guards/jwt.guard';
 import { CircleController } from './circle.controller';
 import { CircleService } from './circle.service';
+import { IdempotencyService } from 'src/idempotency/idempotency.service';
 
 describe('circles are invite-only: no platform-wide listing endpoint', () => {
   let app: INestApplication;
@@ -32,6 +33,13 @@ describe('circles are invite-only: no platform-wide listing endpoint', () => {
       imports: [ThrottlerModule.forRoot([{ ttl: 60_000, limit: 100 }])],
       controllers: [CircleController, CirclePlazaController],
       providers: [
+        {
+          provide: IdempotencyService,
+          useValue: {
+            run: (_request: unknown, operation: () => Promise<unknown>) =>
+              operation(),
+          },
+        },
         { provide: CircleService, useValue: circleService },
         { provide: CirclePlazaService, useValue: plazaService },
       ],

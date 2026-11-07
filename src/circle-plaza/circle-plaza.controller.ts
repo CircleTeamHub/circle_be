@@ -4,6 +4,7 @@ import {
   DefaultValuePipe,
   Delete,
   Get,
+  Headers,
   HttpCode,
   HttpStatus,
   Param,
@@ -16,6 +17,7 @@ import {
 } from '@nestjs/common';
 import {
   ApiBearerAuth,
+  ApiHeader,
   ApiNoContentResponse,
   ApiOkResponse,
   ApiOperation,
@@ -26,6 +28,10 @@ import { Throttle, ThrottlerGuard } from '@nestjs/throttler';
 import { JwtGuard } from 'src/guards/jwt.guard';
 import type { RequestWithUser } from 'src/auth/types';
 import { ClampPagePipe } from 'src/common/pagination';
+import {
+  IdempotencyScope,
+  IdempotencyService,
+} from 'src/idempotency/idempotency.service';
 import { CirclePlazaService } from './circle-plaza.service';
 import {
   CollaborationRecognitionResultDto,
@@ -46,7 +52,10 @@ import {
 @UseGuards(ThrottlerGuard, JwtGuard)
 @Controller('circle-plaza')
 export class CirclePlazaController {
-  constructor(private readonly plazaService: CirclePlazaService) {}
+  constructor(
+    private readonly plazaService: CirclePlazaService,
+    private readonly idempotency: IdempotencyService,
+  ) {}
 
   @Get('feed')
   @Throttle({ default: { limit: 60, ttl: 60_000 } })
@@ -92,13 +101,23 @@ export class CirclePlazaController {
   @Post('posts')
   @Throttle({ default: { limit: 10, ttl: 60_000 } })
   @ApiOperation({ summary: 'Create a plaza post' })
+  @ApiHeader({ name: 'Idempotency-Key', required: false })
   @ApiOkResponse({ type: PlazaPostDto })
   @ApiTooManyRequestsResponse({ description: 'Too many plaza post writes' })
   create(
     @Body() dto: CreatePlazaPostDto,
     @Req() req: RequestWithUser,
+    @Headers('idempotency-key') idempotencyKey?: string,
   ): Promise<PlazaPostDto> {
-    return this.plazaService.createPost(req.user.userId, dto);
+    return this.idempotency.run(
+      {
+        scope: IdempotencyScope.PlazaPostCreate,
+        userId: req.user.userId,
+        key: idempotencyKey,
+        request: dto,
+      },
+      () => this.plazaService.createPost(req.user.userId, dto),
+    );
   }
 
   @Get('posts/:id')

@@ -6,6 +6,7 @@ import { NoteController } from './note.controller';
 import { NoteService } from './note.service';
 import { JwtGuard } from '../guards/jwt.guard';
 import { createNoteWriteLimiterMount } from '../setup';
+import { IdempotencyService } from 'src/idempotency/idempotency.service';
 
 it('isolates per-account autosaves from the ordinary note-write budget', async () => {
   const module = await Test.createTestingModule({
@@ -14,6 +15,13 @@ it('isolates per-account autosaves from the ordinary note-write budget', async (
     ],
     controllers: [NoteController],
     providers: [
+      {
+        provide: IdempotencyService,
+        useValue: {
+          run: (_request: unknown, operation: () => Promise<unknown>) =>
+            operation(),
+        },
+      },
       {
         provide: NoteService,
         useValue: {

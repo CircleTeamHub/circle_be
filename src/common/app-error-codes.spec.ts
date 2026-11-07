@@ -16,6 +16,7 @@ import {
   GroupExpansionErrorCode,
   GroupErrorCode,
   IconErrorCode,
+  IdempotencyErrorCode,
   LikeErrorCode,
   MembershipErrorCode,
   NoteErrorCode,
@@ -65,6 +66,7 @@ describe('app error code catalog', () => {
     SupportErrorCode,
     UserErrorCode,
     QrErrorCode,
+    IdempotencyErrorCode,
   } as const;
 
   const allEntries = Object.entries(groups).flatMap(([group, codes]) =>
@@ -94,5 +96,14 @@ describe('app error code catalog', () => {
 
   it('exports the canonical flat frontend contract in group order', () => {
     expect(APP_ERROR_CODES).toEqual(allEntries.map(({ value }) => value));
+  });
+
+  // App 端按这三个字面量分支（重试 / 换新键 / 提示格式错），改名即断契约。
+  it('pins the generic Idempotency-Key codes the app branches on', () => {
+    expect(IdempotencyErrorCode).toEqual({
+      KeyInvalid: 'IDEMPOTENCY_KEY_INVALID',
+      KeyReused: 'IDEMPOTENCY_KEY_REUSED',
+      InProgress: 'IDEMPOTENCY_IN_PROGRESS',
+    });
   });
 });

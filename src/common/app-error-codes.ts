@@ -479,6 +479,18 @@ export const AdminUserErrorCode = {
   AuditUnavailable: 'ADMIN_AUDIT_UNAVAILABLE',
 } as const;
 
+// 通用 Idempotency-Key（Redis 存回放，见 src/idempotency）：建群/建圈/发动态/评论/
+// 发广场帖/建分享链接等「重试会造重复」的创建接口共用。与 COIN_/FANCY_NUMBER_ 等
+// 落库的业务幂等码分开：那些绑定各自的流水表，这三个只描述请求层的重放。
+// - KeyInvalid：带了头但不符合 ^[A-Za-z0-9_-]{8,128}$（400）；
+// - KeyReused：同一个键已经用于另一份请求体（409，客户端应换新键）；
+// - InProgress：同一个键的第一次请求还在处理（409，客户端稍后用同一个键重试）。
+export const IdempotencyErrorCode = {
+  KeyInvalid: 'IDEMPOTENCY_KEY_INVALID',
+  KeyReused: 'IDEMPOTENCY_KEY_REUSED',
+  InProgress: 'IDEMPOTENCY_IN_PROGRESS',
+} as const;
+
 export type AppErrorCode =
   | (typeof AdminUserErrorCode)[keyof typeof AdminUserErrorCode]
   | (typeof AuthErrorCode)[keyof typeof AuthErrorCode]
@@ -506,7 +518,8 @@ export type AppErrorCode =
   | (typeof PrivacyErrorCode)[keyof typeof PrivacyErrorCode]
   | (typeof SupportErrorCode)[keyof typeof SupportErrorCode]
   | (typeof UserErrorCode)[keyof typeof UserErrorCode]
-  | (typeof QrErrorCode)[keyof typeof QrErrorCode];
+  | (typeof QrErrorCode)[keyof typeof QrErrorCode]
+  | (typeof IdempotencyErrorCode)[keyof typeof IdempotencyErrorCode];
 
 export const APP_ERROR_CODE_GROUPS = [
   AdminUserErrorCode,
@@ -536,6 +549,7 @@ export const APP_ERROR_CODE_GROUPS = [
   SupportErrorCode,
   UserErrorCode,
   QrErrorCode,
+  IdempotencyErrorCode,
 ] as const;
 
 export const APP_ERROR_CODES = APP_ERROR_CODE_GROUPS.flatMap((group) =>

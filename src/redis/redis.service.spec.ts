@@ -339,6 +339,47 @@ describe('RedisService', () => {
     await expect(
       service.invalidateVersionedKey('k', 'k:version'),
     ).resolves.toBe(false);
+    await expect(service.setJsonIfAbsent('k', { a: 1 }, 10)).resolves.toBe(
+      null,
+    );
+  });
+
+  // 幂等键的「占位」：一条脚本里判空 + 写入 + 回读，不给两个并发重试同时占到的窗口。
+  it('claims an absent key atomically and otherwise returns what it holds', async () => {
+    process.env.REDIS_URL = 'redis://localhost:6379';
+    const service = new RedisService();
+    const client = {
+      eval: jest
+        .fn()
+        .mockResolvedValueOnce(null)
+        .mockResolvedValueOnce('{"state":"done"}')
+        .mockRejectedValueOnce(new Error('down')),
+    };
+    jest.spyOn(service as any, 'getCommandClient').mockResolvedValue(client);
+    jest.spyOn((service as any).logger, 'warn').mockImplementation(() => {});
+
+    await expect(
+      service.setJsonIfAbsent('idem:k', { state: 'pending' }, 60),
+    ).resolves.toEqual({ stored: true });
+    await expect(
+      service.setJsonIfAbsent('idem:k', { state: 'pending' }, 60),
+    ).resolves.toEqual({ stored: false, current: { state: 'done' } });
+    // Redis 答不上来 ≠ 键不存在：调用方要能区分出来再决定放行。
+    await expect(
+      service.setJsonIfAbsent('idem:k', { state: 'pending' }, 60),
+    ).resolves.toBeNull();
+
+    const [script, keyCount, key, value, ttl] = client.eval.mock.calls[0];
+    expect(script).toContain("redis.call('GET', KEYS[1])");
+    expect(script).toContain(
+      "redis.call('SET', KEYS[1], ARGV[1], 'EX', ARGV[2])",
+    );
+    expect([keyCount, key, value, ttl]).toEqual([
+      1,
+      'idem:k',
+      '{"state":"pending"}',
+      '60',
+    ]);
   });
 
   it('writes a versioned value only when the CAS script reports success', async () => {

@@ -87,6 +87,23 @@ describeRedis('RedisService real Redis integration', () => {
     expect(await admin.ttl(versionKey)).toBeGreaterThan(86_000);
   });
 
+  it('lets exactly one concurrent SET-NX claim win and hands the rest its value', async () => {
+    const key = `${prefix}:idem-claim`;
+    const results = await Promise.all(
+      Array.from({ length: 20 }, (_, index) =>
+        service.setJsonIfAbsent(key, { claimant: index }, 30),
+      ),
+    );
+
+    const winners = results.filter((result) => result?.stored === true);
+    expect(winners).toHaveLength(1);
+    const stored = await service.getJson<{ claimant: number }>(key);
+    for (const result of results) {
+      if (result?.stored === false) expect(result.current).toEqual(stored);
+    }
+    expect(await admin.ttl(key)).toBeGreaterThan(0);
+  });
+
   it('publishes messages to a real pattern subscriber', async () => {
     const channel = `${prefix}:events:one`;
     const received = new Promise<{ channel: string; message: string }>(
