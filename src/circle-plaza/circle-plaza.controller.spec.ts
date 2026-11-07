@@ -6,6 +6,7 @@ import {
 } from '@nestjs/common/constants';
 import { ThrottlerGuard } from '@nestjs/throttler';
 import { JwtGuard } from 'src/guards/jwt.guard';
+import { IdempotencyScope } from 'src/idempotency/idempotency.service';
 import { CirclePlazaController } from './circle-plaza.controller';
 import { CirclePlazaService } from './circle-plaza.service';
 
@@ -48,7 +49,7 @@ describe('CirclePlazaController', () => {
 
   it('exposes authenticated POST /feed/search and delegates to the feed query', async () => {
     const service = { getFeed: jest.fn().mockResolvedValue({ items: [] }) };
-    const controller = new CirclePlazaController(service as any);
+    const controller = new CirclePlazaController(service as any, {} as any);
     const body = { cities: [' Shanghai ', 'Shanghai'], limit: 25 };
 
     await controller.feedSearch(body, {
@@ -62,5 +63,51 @@ describe('CirclePlazaController', () => {
     );
     expect(service.getFeed).toHaveBeenCalledWith('viewer-1', body);
     expect(Reflect.getMetadata('THROTTLER:LIMITdefault', handler)).toBe(60);
+  });
+
+  it('runs post creation under its own idempotency scope with the raw header', async () => {
+    const post = { id: 'post-1' };
+    const service = { createPost: jest.fn().mockResolvedValue(post) };
+    const idempotency = {
+      run: jest.fn((_request: unknown, operation: () => Promise<unknown>) =>
+        operation(),
+      ),
+    };
+    const controller = new CirclePlazaController(
+      service as any,
+      idempotency as any,
+    );
+    const dto = { circleId: 'circle-1', title: 'Looking for a drummer' };
+
+    await expect(
+      controller.create(
+        dto as any,
+        { user: { userId: 'author-1' } } as any,
+        'plaza-retry-01',
+      ),
+    ).resolves.toBe(post);
+
+    expect(idempotency.run).toHaveBeenCalledWith(
+      {
+        scope: IdempotencyScope.PlazaPostCreate,
+        userId: 'author-1',
+        key: 'plaza-retry-01',
+        request: dto,
+      },
+      expect.any(Function),
+    );
+    expect(service.createPost).toHaveBeenCalledWith('author-1', dto);
+    expect(
+      Reflect.getMetadata(
+        'swagger/apiParameters',
+        CirclePlazaController.prototype.create,
+      ),
+    ).toContainEqual(
+      expect.objectContaining({
+        name: 'Idempotency-Key',
+        in: 'header',
+        required: false,
+      }),
+    );
   });
 });

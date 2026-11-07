@@ -39,6 +39,7 @@ import { GroupModule } from './group/group.module';
 import { CallModule } from './call/call.module';
 import { PrivacySettingsModule } from './privacy/privacy-settings.module';
 import { RedisModule } from './redis/redis.module';
+import { IdempotencyModule } from './idempotency/idempotency.module';
 import { CreditModule } from './credit/credit.module';
 import { AdminUserModule } from './admin-user/admin-user.module';
 import { FancyNumberModule } from './fancy-number/fancy-number.module';
@@ -79,6 +80,7 @@ const envFilePath = `.env.${nodeEnv}`;
       { name: 'qrSession', ttl: 60_000, limit: 120 },
     ]),
     RedisModule,
+    IdempotencyModule,
     PrismaModule,
     UserModule,
     AuthModule,

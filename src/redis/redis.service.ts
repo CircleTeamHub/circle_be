@@ -228,6 +228,48 @@ export class RedisService implements OnModuleInit, OnModuleDestroy {
   }
 
   /**
+   * SET NX for a JSON value that also answers with whatever the key already
+   * holds, in one script — so a caller never sees "taken" without the value
+   * that took it. `null` means Redis is unconfigured or could not answer,
+   * which callers must not mistake for either outcome.
+   */
+  async setJsonIfAbsent<T>(
+    key: string,
+    value: T,
+    ttlSeconds: number,
+  ): Promise<{ stored: true } | { stored: false; current: unknown } | null> {
+    const client = await this.getCommandClient();
+    if (!client) {
+      this.recordUnavailable('set');
+      return null;
+    }
+
+    try {
+      const current = await client.eval(
+        [
+          "local current = redis.call('GET', KEYS[1])",
+          'if current then return current end',
+          "redis.call('SET', KEYS[1], ARGV[1], 'EX', ARGV[2])",
+          'return false',
+        ].join('\n'),
+        1,
+        key,
+        JSON.stringify(value),
+        String(ttlSeconds),
+      );
+      return typeof current === 'string'
+        ? { stored: false, current: JSON.parse(current) }
+        : { stored: true };
+    } catch (error) {
+      this.recordCommandFailure('set', error);
+      this.logger.warn(
+        `Redis JSON set-if-absent failed for ${key}: ${this.formatError(error)}`,
+      );
+      return null;
+    }
+  }
+
+  /**
    * Atomically stores the greatest numeric value seen for a key.
    * A smaller late write succeeds without replacing the stronger marker.
    */

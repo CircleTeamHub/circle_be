@@ -663,6 +663,23 @@ export class TraceService {
     userId: string,
     traceId: string,
   ): Promise<{ liked: boolean; likeCount: number }> {
+    return this.writeLike(userId, traceId, (liked) => !liked);
+  }
+
+  /** PUT /trace/:id/like：设定而非翻转，已是目标状态就原样返回（重放安全）。 */
+  async setLike(
+    userId: string,
+    traceId: string,
+    liked: boolean,
+  ): Promise<{ liked: boolean; likeCount: number }> {
+    return this.writeLike(userId, traceId, () => liked);
+  }
+
+  private async writeLike(
+    userId: string,
+    traceId: string,
+    decide: (currentlyLiked: boolean) => boolean,
+  ): Promise<{ liked: boolean; likeCount: number }> {
     const trace = await this.requireVisibleTrace(traceId, userId);
 
     // The read-decide-write must be one atomic unit: a plain check-then-write
@@ -672,22 +689,24 @@ export class TraceService {
       const existing = await tx.traceLikeStat.findUnique({
         where: { traceID_userID: { traceID: traceId, userID: userId } },
       });
+      // `deleted` is the soft-unlike flag.
+      const currentlyLiked = existing ? !existing.deleted : false;
+      const liked = decide(currentlyLiked);
 
-      let liked: boolean;
-      let delta: number;
+      if (liked === currentlyLiked) {
+        const current = await tx.trace.findUniqueOrThrow({
+          where: { id: traceId },
+          select: { likeCount: true },
+        });
+        return { liked, likeCount: current.likeCount, changed: false };
+      }
 
       if (existing) {
-        // `deleted` is the soft-unlike flag — currently-deleted means a
-        // toggle now *likes* it.
-        liked = existing.deleted;
-        delta = liked ? 1 : -1;
         await tx.traceLikeStat.update({
           where: { id: existing.id },
           data: { deleted: !liked },
         });
       } else {
-        liked = true;
-        delta = 1;
         await tx.traceLikeStat.create({
           data: { traceID: traceId, userID: userId },
         });
@@ -695,14 +714,14 @@ export class TraceService {
 
       const updated = await tx.trace.update({
         where: { id: traceId },
-        data: { likeCount: { increment: delta } },
+        data: { likeCount: { increment: liked ? 1 : -1 } },
         select: { likeCount: true },
       });
 
-      return { liked, likeCount: updated.likeCount };
+      return { liked, likeCount: updated.likeCount, changed: true };
     });
 
-    if (result.liked) {
+    if (result.changed && result.liked) {
       try {
         const notification =
           await this.notificationService.createTraceLikeNotification({
@@ -726,7 +745,7 @@ export class TraceService {
       }
     }
 
-    return result;
+    return { liked: result.liked, likeCount: result.likeCount };
   }
 
   // ─── Comment ───────────────────────────────────────────────────────────────

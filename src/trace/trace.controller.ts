@@ -3,17 +3,20 @@ import {
   Controller,
   Delete,
   Get,
+  Headers,
   HttpCode,
   HttpStatus,
   Param,
   ParseUUIDPipe,
   Post,
+  Put,
   Query,
   Req,
   UseGuards,
 } from '@nestjs/common';
 import {
   ApiBearerAuth,
+  ApiHeader,
   ApiNoContentResponse,
   ApiOkResponse,
   ApiOperation,
@@ -21,11 +24,16 @@ import {
 } from '@nestjs/swagger';
 import { JwtGuard } from 'src/guards/jwt.guard';
 import type { RequestWithUser } from 'src/auth/types';
+import {
+  IdempotencyScope,
+  IdempotencyService,
+} from 'src/idempotency/idempotency.service';
 import { TraceService } from './trace.service';
 import {
   CreateTraceCommentDto,
   CreateTraceDto,
   NewCountQueryDto,
+  SetTraceLikeDto,
   TraceCommentDto,
   TraceDto,
   TraceFeedQueryDto,
@@ -36,7 +44,10 @@ import {
 @UseGuards(JwtGuard)
 @Controller('trace')
 export class TraceController {
-  constructor(private readonly traceService: TraceService) {}
+  constructor(
+    private readonly traceService: TraceService,
+    private readonly idempotency: IdempotencyService,
+  ) {}
 
   @Get('feed')
   @ApiOperation({ summary: 'Friend moments feed' })
@@ -64,12 +75,22 @@ export class TraceController {
 
   @Post()
   @ApiOperation({ summary: 'Post a moment' })
+  @ApiHeader({ name: 'Idempotency-Key', required: false })
   @ApiOkResponse({ type: TraceDto })
   create(
     @Body() dto: CreateTraceDto,
     @Req() req: RequestWithUser,
+    @Headers('idempotency-key') idempotencyKey?: string,
   ): Promise<TraceDto> {
-    return this.traceService.createTrace(req.user.userId, dto);
+    return this.idempotency.run(
+      {
+        scope: IdempotencyScope.MomentCreate,
+        userId: req.user.userId,
+        key: idempotencyKey,
+        request: dto,
+      },
+      () => this.traceService.createTrace(req.user.userId, dto),
+    );
   }
 
   @Delete(':id')
@@ -83,21 +104,44 @@ export class TraceController {
     return this.traceService.deleteTrace(req.user.userId, id);
   }
 
+  // 已装机的旧 App 仍走翻转；新版用下面的 PUT（重试不会把赞点回去）。
   @Post(':id/like')
   @ApiOperation({ summary: 'Toggle like on a moment' })
   like(@Param('id', ParseUUIDPipe) id: string, @Req() req: RequestWithUser) {
     return this.traceService.toggleLike(req.user.userId, id);
   }
 
+  @Put(':id/like')
+  @ApiOperation({
+    summary: 'Set like state on a moment (no-op when already in that state)',
+  })
+  setLike(
+    @Param('id', ParseUUIDPipe) id: string,
+    @Body() dto: SetTraceLikeDto,
+    @Req() req: RequestWithUser,
+  ): Promise<{ liked: boolean; likeCount: number }> {
+    return this.traceService.setLike(req.user.userId, id, dto.liked);
+  }
+
   @Post(':id/comment')
   @ApiOperation({ summary: 'Comment on a moment' })
+  @ApiHeader({ name: 'Idempotency-Key', required: false })
   @ApiOkResponse({ type: TraceCommentDto })
   comment(
     @Param('id', ParseUUIDPipe) id: string,
     @Body() dto: CreateTraceCommentDto,
     @Req() req: RequestWithUser,
+    @Headers('idempotency-key') idempotencyKey?: string,
   ): Promise<TraceCommentDto> {
-    return this.traceService.addComment(req.user.userId, id, dto);
+    return this.idempotency.run(
+      {
+        scope: IdempotencyScope.MomentCommentCreate,
+        userId: req.user.userId,
+        key: idempotencyKey,
+        request: { traceId: id, body: dto },
+      },
+      () => this.traceService.addComment(req.user.userId, id, dto),
+    );
   }
 
   @Delete('comment/:commentId')

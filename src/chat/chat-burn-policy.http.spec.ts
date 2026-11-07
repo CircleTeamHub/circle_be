@@ -20,6 +20,7 @@ import { ChatGroupSettingsService } from './chat-group-settings.service';
 import { ChatClearRequestService } from './chat-clear-request.service';
 import { ChatController } from './chat.controller';
 import { ChatService } from './chat.service';
+import { IdempotencyService } from 'src/idempotency/idempotency.service';
 
 /**
  * /chat/conversations/:id/burn 的 HTTP 管线。
@@ -58,6 +59,13 @@ describe('/chat/conversations/:id/burn HTTP pipeline', () => {
     const moduleRef = await Test.createTestingModule({
       controllers: [ChatController],
       providers: [
+        {
+          provide: IdempotencyService,
+          useValue: {
+            run: (_request: unknown, operation: () => Promise<unknown>) =>
+              operation(),
+          },
+        },
         {
           provide: GroupAdmissionService,
           useValue: {

@@ -20,6 +20,7 @@ import { NotificationService } from 'src/notification/notification.service';
 import { GroupController } from 'src/group/group.controller';
 import { GroupService } from 'src/group/group.service';
 import { UserThrottlerGuard } from './user-throttler.guard';
+import { IdempotencyService } from 'src/idempotency/idempotency.service';
 
 const alice = '11111111-1111-4111-8111-111111111111';
 const bob = '22222222-2222-4222-8222-222222222222';
@@ -158,6 +159,13 @@ describe('cross-user HTTP authorization matrix', () => {
         GroupController,
       ],
       providers: [
+        {
+          provide: IdempotencyService,
+          useValue: {
+            run: (_request: unknown, operation: () => Promise<unknown>) =>
+              operation(),
+          },
+        },
         MatrixStrategy,
         { provide: APP_GUARD, useClass: DefaultAuthGuard },
         {

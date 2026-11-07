@@ -89,6 +89,7 @@ describe('TraceService', () => {
   const prisma = {
     trace: {
       findFirst: jest.fn(),
+      findUniqueOrThrow: jest.fn(),
       create: jest.fn(),
       update: jest.fn(),
       count: jest.fn(),
@@ -1983,6 +1984,157 @@ describe('TraceService', () => {
     ).not.toHaveBeenCalled();
     expect(realtimeService.broadcastNotificationCreated).not.toHaveBeenCalled();
   });
+  // PUT /trace/:id/like：设定而不是翻转。弱网下「点了赞、超时、再点一次」用 toggle
+  // 会把赞点回去；set 重放多少次结果都一样。
+  describe('setLike (idempotent set)', () => {
+    const visibleTrace = {
+      id: 'trace-1',
+      fromID: 'author-1',
+      deleted: false,
+      visibility: 'PUBLIC',
+    };
+
+    beforeEach(() => {
+      prisma.trace.findFirst.mockResolvedValue(visibleTrace);
+      prisma.traceLikeStat.findUnique.mockReset();
+      prisma.traceLikeStat.create.mockReset();
+      prisma.traceLikeStat.update.mockReset();
+      prisma.trace.update.mockReset();
+      prisma.trace.findUniqueOrThrow.mockReset();
+    });
+
+    it('likes a moment the viewer has never liked', async () => {
+      const notification = { id: 'notification-1', type: 'TRACE_LIKE' };
+      prisma.traceLikeStat.findUnique.mockResolvedValue(null);
+      prisma.trace.update.mockResolvedValue({ likeCount: 8 });
+      notificationService.createTraceLikeNotification.mockResolvedValue(
+        notification,
+      );
+
+      await expect(
+        service.setLike('viewer-1', 'trace-1', true),
+      ).resolves.toEqual({ liked: true, likeCount: 8 });
+
+      expect(prisma.traceLikeStat.create).toHaveBeenCalledWith({
+        data: { traceID: 'trace-1', userID: 'viewer-1' },
+      });
+      expect(prisma.trace.update).toHaveBeenCalledWith({
+        where: { id: 'trace-1' },
+        data: { likeCount: { increment: 1 } },
+        select: { likeCount: true },
+      });
+      expect(realtimeService.broadcastNotificationCreated).toHaveBeenCalledWith(
+        'author-1',
+        notification,
+      );
+    });
+
+    it('re-likes a soft-unliked row', async () => {
+      prisma.traceLikeStat.findUnique.mockResolvedValue({
+        id: 'like-1',
+        deleted: true,
+      });
+      prisma.trace.update.mockResolvedValue({ likeCount: 3 });
+
+      await expect(
+        service.setLike('viewer-1', 'trace-1', true),
+      ).resolves.toEqual({ liked: true, likeCount: 3 });
+
+      expect(prisma.traceLikeStat.update).toHaveBeenCalledWith({
+        where: { id: 'like-1' },
+        data: { deleted: false },
+      });
+      expect(prisma.trace.update).toHaveBeenCalledWith(
+        expect.objectContaining({ data: { likeCount: { increment: 1 } } }),
+      );
+    });
+
+    it('is a no-op when liking an already-liked moment again', async () => {
+      prisma.traceLikeStat.findUnique.mockResolvedValue({
+        id: 'like-1',
+        deleted: false,
+      });
+      prisma.trace.findUniqueOrThrow.mockResolvedValue({ likeCount: 8 });
+
+      await expect(
+        service.setLike('viewer-1', 'trace-1', true),
+      ).resolves.toEqual({ liked: true, likeCount: 8 });
+
+      expect(prisma.trace.findUniqueOrThrow).toHaveBeenCalledWith({
+        where: { id: 'trace-1' },
+        select: { likeCount: true },
+      });
+      expect(prisma.traceLikeStat.create).not.toHaveBeenCalled();
+      expect(prisma.traceLikeStat.update).not.toHaveBeenCalled();
+      expect(prisma.trace.update).not.toHaveBeenCalled();
+      expect(
+        notificationService.createTraceLikeNotification,
+      ).not.toHaveBeenCalled();
+    });
+
+    it('unlikes a liked moment', async () => {
+      prisma.traceLikeStat.findUnique.mockResolvedValue({
+        id: 'like-1',
+        deleted: false,
+      });
+      prisma.trace.update.mockResolvedValue({ likeCount: 7 });
+
+      await expect(
+        service.setLike('viewer-1', 'trace-1', false),
+      ).resolves.toEqual({ liked: false, likeCount: 7 });
+
+      expect(prisma.traceLikeStat.update).toHaveBeenCalledWith({
+        where: { id: 'like-1' },
+        data: { deleted: true },
+      });
+      expect(prisma.trace.update).toHaveBeenCalledWith(
+        expect.objectContaining({ data: { likeCount: { increment: -1 } } }),
+      );
+      expect(
+        notificationService.createTraceLikeNotification,
+      ).not.toHaveBeenCalled();
+    });
+
+    it.each([
+      ['an already-unliked row', { id: 'like-1', deleted: true }],
+      ['a moment never liked', null],
+    ])('is a no-op when unliking %s again', async (_case, existing) => {
+      prisma.traceLikeStat.findUnique.mockResolvedValue(existing);
+      prisma.trace.findUniqueOrThrow.mockResolvedValue({ likeCount: 7 });
+
+      await expect(
+        service.setLike('viewer-1', 'trace-1', false),
+      ).resolves.toEqual({ liked: false, likeCount: 7 });
+
+      expect(prisma.traceLikeStat.create).not.toHaveBeenCalled();
+      expect(prisma.traceLikeStat.update).not.toHaveBeenCalled();
+      expect(prisma.trace.update).not.toHaveBeenCalled();
+    });
+
+    it('decides inside the serializable transaction', async () => {
+      prisma.traceLikeStat.findUnique.mockResolvedValue(null);
+      prisma.trace.update.mockResolvedValue({ likeCount: 1 });
+
+      await service.setLike('viewer-1', 'trace-1', true);
+
+      expect(prisma.$transaction).toHaveBeenCalledWith(
+        expect.any(Function),
+        expect.objectContaining({
+          isolationLevel: Prisma.TransactionIsolationLevel.Serializable,
+        }),
+      );
+    });
+
+    it('still refuses a moment the viewer cannot see', async () => {
+      prisma.trace.findFirst.mockResolvedValue(null);
+
+      await expect(
+        service.setLike('viewer-1', 'trace-1', true),
+      ).rejects.toThrow(NotFoundException);
+      expect(prisma.$transaction).not.toHaveBeenCalled();
+    });
+  });
+
   describe('moments feed poke (#89)', () => {
     it('does not commit a moment when its appearance projection cannot be resolved', async () => {
       avatarFrames.resolvePublicAppearances.mockRejectedValue(

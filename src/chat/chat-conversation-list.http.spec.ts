@@ -20,6 +20,7 @@ import { ChatClearRequestService } from './chat-clear-request.service';
 import { ChatController } from './chat.controller';
 import { ChatService } from './chat.service';
 import { GroupAdmissionService } from './group-admission.service';
+import { IdempotencyService } from 'src/idempotency/idempotency.service';
 
 /**
  * GET /chat/conversations 的 HTTP 管线：真实的查询串解析 + 全局 ValidationPipe +
@@ -68,6 +69,13 @@ describe('GET /chat/conversations HTTP pipeline', () => {
     const moduleRef = await Test.createTestingModule({
       controllers: [ChatController],
       providers: [
+        {
+          provide: IdempotencyService,
+          useValue: {
+            run: (_request: unknown, operation: () => Promise<unknown>) =>
+              operation(),
+          },
+        },
         { provide: ChatService, useValue: chatService },
         { provide: GroupAdmissionService, useValue: {} },
         { provide: ChatGroupAdminService, useValue: {} },

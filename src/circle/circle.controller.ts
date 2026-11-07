@@ -3,6 +3,7 @@ import {
   Controller,
   Delete,
   Get,
+  Headers,
   HttpCode,
   HttpStatus,
   Param,
@@ -16,6 +17,7 @@ import {
 import {
   ApiBearerAuth,
   ApiAcceptedResponse,
+  ApiHeader,
   ApiNoContentResponse,
   ApiOkResponse,
   ApiOperation,
@@ -25,6 +27,10 @@ import { Throttle } from '@nestjs/throttler';
 import { JwtGuard } from 'src/guards/jwt.guard';
 import { UserThrottlerGuard } from 'src/guards/user-throttler.guard';
 import type { RequestWithUser } from 'src/auth/types';
+import {
+  IdempotencyScope,
+  IdempotencyService,
+} from 'src/idempotency/idempotency.service';
 import { CircleService } from './circle.service';
 import {
   CircleDetailDto,
@@ -44,7 +50,10 @@ import { InvitationDto } from 'src/circle-invitation/dto/circle-invitation.dto';
 @UseGuards(JwtGuard)
 @Controller('circle')
 export class CircleController {
-  constructor(private readonly circleService: CircleService) {}
+  constructor(
+    private readonly circleService: CircleService,
+    private readonly idempotency: IdempotencyService,
+  ) {}
 
   @Post()
   // 没有全局 ThrottlerGuard。建圈是一个大事务（圈子 + 群聊 + 圈主席位 + 配额校验），
@@ -52,12 +61,22 @@ export class CircleController {
   @UseGuards(UserThrottlerGuard)
   @Throttle({ default: { limit: 5, ttl: 60_000 } })
   @ApiOperation({ summary: 'Create a circle' })
+  @ApiHeader({ name: 'Idempotency-Key', required: false })
   @ApiOkResponse({ type: CircleDetailDto })
   create(
     @Body() dto: CreateCircleDto,
     @Req() req: RequestWithUser,
+    @Headers('idempotency-key') idempotencyKey?: string,
   ): Promise<CircleDetailDto> {
-    return this.circleService.createCircle(req.user.userId, dto);
+    return this.idempotency.run(
+      {
+        scope: IdempotencyScope.CircleCreate,
+        userId: req.user.userId,
+        key: idempotencyKey,
+        request: dto,
+      },
+      () => this.circleService.createCircle(req.user.userId, dto),
+    );
   }
 
   @Get('my')

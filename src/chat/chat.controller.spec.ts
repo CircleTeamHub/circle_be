@@ -3,7 +3,14 @@ import { GUARDS_METADATA } from '@nestjs/common/constants';
 import { ThrottlerGuard } from '@nestjs/throttler';
 import { JwtGuard } from 'src/guards/jwt.guard';
 import { UserThrottlerGuard } from 'src/guards/user-throttler.guard';
+import { IdempotencyScope } from 'src/idempotency/idempotency.service';
 import { ChatController } from './chat.controller';
+
+const passthroughIdempotency = () => ({
+  run: jest.fn((_request: unknown, operation: () => Promise<unknown>) =>
+    operation(),
+  ),
+});
 
 // 按 IP 计数的话,同一运营商 NAT / 公司出口后面的人共享一份额度:发版后所有人
 // 同时重连拉会话列表(30 次/分钟),一个出口后面几十个人就互相挤出 429。
@@ -35,6 +42,7 @@ describe('ChatController.createGroupConversation', () => {
       {} as never,
       {} as never,
       {} as never,
+      passthroughIdempotency() as never,
     );
     await expect(
       controller.createGroupConversation(
@@ -43,6 +51,62 @@ describe('ChatController.createGroupConversation', () => {
       ),
     ).resolves.toBe(group);
     expect(admissions.flush).not.toHaveBeenCalled();
+  });
+
+  // 弱网超时后带同一个 Idempotency-Key 重试：建群走请求层重放，不再多建一个群。
+  it('runs the create under its own idempotency scope with the raw header', async () => {
+    const group = { id: 'new-group' };
+    const chatService = {
+      createGroupConversation: jest.fn().mockResolvedValue(group),
+    };
+    const idempotency = passthroughIdempotency();
+    const controller = new ChatController(
+      chatService as never,
+      {} as never,
+      {} as never,
+      {} as never,
+      {} as never,
+      {} as never,
+      idempotency as never,
+    );
+    const body = { name: 'Group', memberIds: ['friend-1'] };
+
+    await expect(
+      controller.createGroupConversation(
+        { user: { userId: 'owner' } } as never,
+        body,
+        'retry-key-0001',
+      ),
+    ).resolves.toBe(group);
+
+    expect(idempotency.run).toHaveBeenCalledWith(
+      {
+        scope: IdempotencyScope.ChatGroupCreate,
+        userId: 'owner',
+        key: 'retry-key-0001',
+        request: body,
+      },
+      expect.any(Function),
+    );
+    expect(chatService.createGroupConversation).toHaveBeenCalledWith('owner', {
+      name: 'Group',
+      memberIds: ['friend-1'],
+    });
+  });
+
+  it('documents the optional Idempotency-Key header', () => {
+    expect(
+      Reflect.getMetadata(
+        'swagger/apiParameters',
+        ChatController.prototype.createGroupConversation,
+      ),
+    ).toContainEqual(
+      expect.objectContaining({
+        name: 'Idempotency-Key',
+        in: 'header',
+        required: false,
+      }),
+    );
   });
 });
 
@@ -66,6 +130,7 @@ describe('ChatController.listConversations', () => {
       {} as never,
       {} as never,
       {} as never,
+      passthroughIdempotency() as never,
     );
     const res = { setHeader: jest.fn() };
     return { chatService, controller, res };
