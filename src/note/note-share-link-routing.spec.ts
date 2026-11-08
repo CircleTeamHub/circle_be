@@ -4,6 +4,7 @@ import { ThrottlerModule } from '@nestjs/throttler';
 import { JwtGuard } from 'src/guards/jwt.guard';
 import { NoteController } from './note.controller';
 import { NoteService } from './note.service';
+import { IdempotencyService } from 'src/idempotency/idempotency.service';
 
 /**
  * 分享链接管理路由的 HTTP 契约测试（真正起一个 Nest app 发请求）。
@@ -32,7 +33,16 @@ describe('note share-link management routing', () => {
       // NoteController 上另有挂 ThrottlerGuard 的路由，缺这个模块整个 app 起不来。
       imports: [ThrottlerModule.forRoot([{ limit: 1000, ttl: 60_000 }])],
       controllers: [NoteController],
-      providers: [{ provide: NoteService, useValue: noteService }],
+      providers: [
+        {
+          provide: IdempotencyService,
+          useValue: {
+            run: (_request: unknown, operation: () => Promise<unknown>) =>
+              operation(),
+          },
+        },
+        { provide: NoteService, useValue: noteService },
+      ],
     })
       // 只验路由，不验鉴权：放行并注入一个固定用户。
       .overrideGuard(JwtGuard)

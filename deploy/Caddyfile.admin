@@ -68,6 +68,11 @@
 #    access log，所以还要靠 `log_skip @not_chat_ws` 把其余请求挡掉（见下方）。
 
 {$API_DOMAIN} {
+	# 压缩文本类响应（JSON 等，默认清单不含图片/视频；WebSocket 不受影响）。国内经跨境线路
+	# 访问时丢包多，传的字节越少越不容易卡。Caddy 会给强 ETag 加编码后缀、并在请求里去掉，
+	# 后端的 304 照常生效。
+	encode zstd gzip
+
 	# 只记录 chat WebSocket 握手。连接追踪 ID 由 Caddy 生成，不含账号；
 	# query、全部请求头和 IP 在编码前删除，避免 token、签名 URL 或设备信息落盘。
 	@chat_ws path /chat-ws /chat-ws/*
@@ -176,6 +181,8 @@
 }
 
 {$ADMIN_DOMAIN} {
+	encode zstd gzip
+
 	# 管理域同样要限流：它把后端整个 API 也暴露在另一个域名下（/api/*），
 	# 只在 API_DOMAIN 那边限流等于留了一扇没上锁的后门 —— 攻击者换个 Host 就绕过。
 	# 管理台用户少、操作频次低，额度可以比主域紧。

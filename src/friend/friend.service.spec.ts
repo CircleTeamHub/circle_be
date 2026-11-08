@@ -2292,6 +2292,112 @@ describe('FriendService', () => {
     expect(prisma.friendActivity.createMany).not.toHaveBeenCalled();
   });
 
+  // 弱网：第一次「通过/拒绝」其实已经落库，只是响应丢了。同一个人对同一条申请重试
+  // 同一个动作，应拿到同样的成功（204），而不是 404/409 把用户吓一跳。
+  describe('retrying the same decision', () => {
+    const handled = (state: FriendState, friendID = 'user-2') => ({
+      id: 'request-1',
+      userID: 'user-1',
+      friendID,
+      state,
+      message: 'hello',
+    });
+
+    it.each([
+      ['accept', FriendState.ACCEPTED],
+      ['reject', FriendState.REJECTED],
+    ] as const)(
+      'treats a retried %s on an already-%s request as success without side effects',
+      async (_action, decision) => {
+        prisma.friend.findUnique.mockResolvedValue(handled(decision));
+
+        await expect(
+          service.handleRequest('user-2', 'request-1', decision),
+        ).resolves.toBeUndefined();
+
+        expect(prisma.$transaction).not.toHaveBeenCalled();
+        expect(prisma.user.findUnique).not.toHaveBeenCalled();
+        expect(prisma.friend.updateMany).not.toHaveBeenCalled();
+        expect(
+          notificationService.createFriendRequestNotification,
+        ).not.toHaveBeenCalled();
+        expect(replay.processRequest).not.toHaveBeenCalled();
+      },
+    );
+
+    it.each([
+      ['accept a rejected', FriendState.ACCEPTED, FriendState.REJECTED],
+      ['reject an accepted', FriendState.REJECTED, FriendState.ACCEPTED],
+      ['accept a withdrawn', FriendState.ACCEPTED, FriendState.WITHDRAWN],
+    ] as const)(
+      'still refuses to %s request',
+      async (_case, decision, state) => {
+        prisma.friend.findUnique.mockResolvedValue(handled(state));
+
+        await expect(
+          service.handleRequest('user-2', 'request-1', decision),
+        ).rejects.toMatchObject({
+          response: expect.objectContaining({
+            errorCode: FriendErrorCode.PendingRequestNotFound,
+          }),
+        });
+        expect(prisma.$transaction).not.toHaveBeenCalled();
+      },
+    );
+
+    it.each([
+      ['the requester', 'user-1'],
+      ['an outsider', 'user-3'],
+    ])(
+      'does not hand %s the retry success on an accepted request',
+      async (_case, callerId) => {
+        prisma.friend.findUnique.mockResolvedValue(
+          handled(FriendState.ACCEPTED),
+        );
+
+        await expect(
+          service.handleRequest(callerId, 'request-1', FriendState.ACCEPTED),
+        ).rejects.toBeInstanceOf(NotFoundException);
+      },
+    );
+
+    it('treats losing the race to its own in-flight attempt as success', async () => {
+      prisma.friend.findUnique
+        .mockResolvedValueOnce(handled(FriendState.PENDING))
+        .mockResolvedValueOnce(handled(FriendState.ACCEPTED));
+      prisma.user.findUnique.mockResolvedValue({ status: 'ACTIVE' });
+      prisma.friend.count.mockResolvedValue(0);
+
+      await expect(
+        service.handleRequest('user-2', 'request-1', FriendState.ACCEPTED),
+      ).resolves.toBeUndefined();
+
+      expect(prisma.friend.updateMany).not.toHaveBeenCalled();
+      expect(prisma.friendActivity.createMany).not.toHaveBeenCalled();
+      expect(
+        notificationService.createFriendRequestNotification,
+      ).not.toHaveBeenCalled();
+      expect(replay.processRequest).not.toHaveBeenCalled();
+    });
+
+    it('still reports a different decision that won the race', async () => {
+      prisma.friend.findUnique
+        .mockResolvedValueOnce(handled(FriendState.PENDING))
+        .mockResolvedValueOnce(handled(FriendState.REJECTED));
+      prisma.user.findUnique.mockResolvedValue({ status: 'ACTIVE' });
+      prisma.friend.count.mockResolvedValue(0);
+
+      await expect(
+        service.handleRequest('user-2', 'request-1', FriendState.ACCEPTED),
+      ).rejects.toMatchObject({
+        response: expect.objectContaining({
+          errorCode: FriendErrorCode.RequestAlreadyHandled,
+        }),
+      });
+      expect(prisma.friend.updateMany).not.toHaveBeenCalled();
+    });
+  });
+
   it('queues the message thread for durable replay on accept', async () => {
     replay.processRequest.mockClear();
     prisma.friend.findUnique.mockResolvedValue({

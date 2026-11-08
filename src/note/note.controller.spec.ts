@@ -1,3 +1,4 @@
+import { IdempotencyScope } from 'src/idempotency/idempotency.service';
 import { NoteController } from './note.controller';
 
 describe('NoteController', () => {
@@ -8,6 +9,7 @@ describe('NoteController', () => {
     revokeShareLink: jest.fn(),
     listShareLinks: jest.fn(),
     setRemark: jest.fn(),
+    createShareLink: jest.fn(),
   };
   const req = {
     user: { userId: 'user-1' },
@@ -44,7 +46,7 @@ describe('NoteController', () => {
       items: rows,
       hasMore: false,
     });
-    const controller = new NoteController(noteService as any);
+    const controller = new NoteController(noteService as any, {} as any);
 
     const result = await controller.listNotes(
       { status: 'ACTIVE' } as any,
@@ -70,7 +72,7 @@ describe('NoteController', () => {
     const rows = [{ id: 'note-1' }];
     noteService.listNotes.mockResolvedValueOnce({ items: rows, hasMore: true });
     const res = { setHeader: jest.fn() };
-    const controller = new NoteController(noteService as any);
+    const controller = new NoteController(noteService as any, {} as any);
 
     const result = await controller.listNotes({} as any, req, res as any);
 
@@ -85,7 +87,7 @@ describe('NoteController', () => {
       hasMore: false,
     });
     const res = { setHeader: jest.fn() };
-    const controller = new NoteController(noteService as any);
+    const controller = new NoteController(noteService as any, {} as any);
 
     const result = await controller.listDeleted(
       { page: 1, limit: 500 } as any,
@@ -122,7 +124,7 @@ describe('NoteController', () => {
       expiresAt: new Date('2026-06-29T12:15:00.000Z'),
     };
     noteService.createNoteExport.mockResolvedValueOnce(exportResult);
-    const controller = new NoteController(noteService as any);
+    const controller = new NoteController(noteService as any, {} as any);
 
     const result = await controller.createNoteExport(
       '11111111-1111-1111-1111-111111111111',
@@ -143,7 +145,7 @@ describe('NoteController', () => {
   // 而公开 controller 刻意不挂 JwtGuard。
   it('revokes a share link as the authenticated caller', async () => {
     noteService.revokeShareLink.mockResolvedValueOnce(undefined);
-    const controller = new NoteController(noteService as any);
+    const controller = new NoteController(noteService as any, {} as any);
 
     await controller.revokeShareLink(
       '22222222-2222-2222-2222-222222222222',
@@ -169,7 +171,7 @@ describe('NoteController', () => {
       },
     ];
     noteService.listShareLinks.mockResolvedValueOnce(links);
-    const controller = new NoteController(noteService as any);
+    const controller = new NoteController(noteService as any, {} as any);
 
     const result = await controller.listShareLinks(
       { cursor: '11111111-1111-4111-8111-111111111111' },
@@ -184,7 +186,7 @@ describe('NoteController', () => {
 
   it('patches note remark with the JWT identity and normalizes absent input to null', async () => {
     noteService.setRemark.mockResolvedValue({ id: 'note-1', remark: '客户' });
-    const controller = new NoteController(noteService as any);
+    const controller = new NoteController(noteService as any, {} as any);
 
     await controller.setRemark('note-1', { remark: '客户' } as any, req);
     // remark 字段缺省（body 为 {}）等价于清空 —— controller 归一成 null 再进 service。
@@ -201,6 +203,48 @@ describe('NoteController', () => {
       'user-1',
       'note-1',
       null,
+    );
+  });
+
+  it('creates share links under their own idempotency scope with the raw header', async () => {
+    const link = { id: 'link-1', url: 'https://notes.example/s/abc' };
+    noteService.createShareLink.mockResolvedValueOnce(link);
+    const idempotency = {
+      run: jest.fn((_request: unknown, operation: () => Promise<unknown>) =>
+        operation(),
+      ),
+    };
+    const controller = new NoteController(
+      noteService as any,
+      idempotency as any,
+    );
+    const dto = { noteId: 'note-1' };
+
+    await expect(
+      controller.createShareLink(dto as any, req, 'share-retry-01'),
+    ).resolves.toBe(link);
+
+    expect(idempotency.run).toHaveBeenCalledWith(
+      {
+        scope: IdempotencyScope.NoteShareLinkCreate,
+        userId: 'user-1',
+        key: 'share-retry-01',
+        request: dto,
+      },
+      expect.any(Function),
+    );
+    expect(noteService.createShareLink).toHaveBeenCalledWith('user-1', dto);
+    expect(
+      Reflect.getMetadata(
+        'swagger/apiParameters',
+        NoteController.prototype.createShareLink,
+      ),
+    ).toContainEqual(
+      expect.objectContaining({
+        name: 'Idempotency-Key',
+        in: 'header',
+        required: false,
+      }),
     );
   });
 });

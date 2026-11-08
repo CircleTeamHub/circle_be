@@ -539,6 +539,11 @@ export class FriendService {
     const record: any = await this.prisma.friend.findUnique({
       where: { id: requestId },
     });
+    // 接收方重试同一个动作（上一次已落库、只是响应丢了）：申请已是这个动作的
+    // 结果状态，原样回成功，不重复任何副作用。其它状态照旧拒绝。
+    if (record?.friendID === recipientId && record.state === decision) {
+      return;
+    }
     if (
       !record ||
       record.friendID !== recipientId ||
@@ -588,6 +593,8 @@ export class FriendService {
           errorCode: FriendErrorCode.PendingRequestNotFound,
         });
       }
+      // 重试撞上了还在飞的上一次：那一次已经提交，副作用由它自己发，这次什么都不做。
+      if (recordForTransition.state === decision) return null;
       if (recordForTransition.state !== FriendState.PENDING) {
         throw new ConflictException({
           message: 'Friend request has already been handled',
@@ -722,6 +729,7 @@ export class FriendService {
 
       return nextRequest;
     });
+    if (!nextRequest) return;
     if (decision === FriendState.ACCEPTED) {
       // The transaction durably queued this job; a failed eager attempt is retried by cron.
       await this.chatReplay.processRequest(nextRequest.id).catch(() => {

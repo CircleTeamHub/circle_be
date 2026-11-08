@@ -3,6 +3,7 @@ import {
   Controller,
   Delete,
   Get,
+  Headers,
   HttpCode,
   HttpStatus,
   Param,
@@ -17,6 +18,7 @@ import {
 } from '@nestjs/common';
 import {
   ApiBearerAuth,
+  ApiHeader,
   ApiNoContentResponse,
   ApiOkResponse,
   ApiOperation,
@@ -27,6 +29,10 @@ import type { Response } from 'express';
 import { JwtGuard } from 'src/guards/jwt.guard';
 import { UserThrottlerGuard } from 'src/guards/user-throttler.guard';
 import type { RequestWithUser } from 'src/auth/types';
+import {
+  IdempotencyScope,
+  IdempotencyService,
+} from 'src/idempotency/idempotency.service';
 import {
   CollectNoteDto,
   CollectNoteResultDto,
@@ -84,7 +90,10 @@ const HAS_MORE_RESPONSE_HEADERS = {
 @UseGuards(JwtGuard)
 @Controller('note')
 export class NoteController {
-  constructor(private readonly noteService: NoteService) {}
+  constructor(
+    private readonly noteService: NoteService,
+    private readonly idempotency: IdempotencyService,
+  ) {}
 
   @Get()
   @ApiOperation({ summary: 'My note list', description: HAS_MORE_DESCRIPTION })
@@ -322,12 +331,22 @@ export class NoteController {
   @UseGuards(ThrottlerGuard)
   @Throttle({ default: { limit: 10, ttl: 60_000 } })
   @ApiOperation({ summary: 'Create managed note share link' })
+  @ApiHeader({ name: 'Idempotency-Key', required: false })
   @ApiOkResponse({ type: NoteShareLinkDto })
   createShareLink(
     @Body() dto: CreateNoteShareLinkDto,
     @Req() req: RequestWithUser,
+    @Headers('idempotency-key') idempotencyKey?: string,
   ): Promise<NoteShareLinkDto> {
-    return this.noteService.createShareLink(req.user.userId, dto);
+    return this.idempotency.run(
+      {
+        scope: IdempotencyScope.NoteShareLinkCreate,
+        userId: req.user.userId,
+        key: idempotencyKey,
+        request: dto,
+      },
+      () => this.noteService.createShareLink(req.user.userId, dto),
+    );
   }
 
   // 必须声明在 @Get(':id') 之前：Nest 按声明顺序匹配，否则 /note/share-links 会

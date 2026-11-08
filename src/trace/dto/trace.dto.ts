@@ -3,6 +3,7 @@ import {
   ArrayMaxSize,
   ArrayUnique,
   IsArray,
+  IsBoolean,
   IsEnum,
   IsISO8601,
   IsInt,
@@ -131,6 +132,13 @@ export class CreateTraceCommentDto {
   @IsUUID(undefined, { each: true })
   @IsOptional()
   mentionedUserIds?: string[];
+}
+
+// PUT /trace/:id/like：把赞设成指定状态（已是该状态就什么都不做），重放安全。
+export class SetTraceLikeDto {
+  @ApiProperty()
+  @IsBoolean()
+  liked: boolean;
 }
 
 export class TraceFeedQueryDto {

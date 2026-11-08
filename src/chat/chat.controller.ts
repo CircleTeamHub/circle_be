@@ -3,6 +3,7 @@ import {
   Controller,
   Delete,
   Get,
+  Headers,
   Param,
   ParseUUIDPipe,
   Patch,
@@ -16,6 +17,7 @@ import {
 import type { Response } from 'express';
 import {
   ApiBearerAuth,
+  ApiHeader,
   ApiOkResponse,
   ApiOperation,
   ApiTags,
@@ -25,6 +27,10 @@ import type { RequestWithUser } from 'src/auth/types';
 import { AppAudienceGuard } from 'src/guards/app-audience.guard';
 import { JwtGuard } from 'src/guards/jwt.guard';
 import { UserThrottlerGuard } from 'src/guards/user-throttler.guard';
+import {
+  IdempotencyScope,
+  IdempotencyService,
+} from 'src/idempotency/idempotency.service';
 import { ChatGroupAdminService } from './chat-group-admin.service';
 import { ChatGroupEventService } from './chat-group-event.service';
 import { ChatGroupSettingsService } from './chat-group-settings.service';
@@ -105,6 +111,7 @@ export class ChatController {
     private readonly groupEvents: ChatGroupEventService,
     private readonly groupSettings: ChatGroupSettingsService,
     private readonly clearRequests: ChatClearRequestService,
+    private readonly idempotency: IdempotencyService,
   ) {}
 
   @Get('conversations')
@@ -185,18 +192,25 @@ export class ChatController {
   @Post('conversations/group')
   @Throttle({ default: { limit: 10, ttl: 60_000 } })
   @ApiOperation({ summary: '创建独立群聊(不挂圈子;初始成员必须是好友)' })
-  async createGroupConversation(
+  @ApiHeader({ name: 'Idempotency-Key', required: false })
+  createGroupConversation(
     @Req() req: RequestWithUser,
     @Body() body: CreateGroupConversationDto,
+    @Headers('idempotency-key') idempotencyKey?: string,
   ): Promise<ChatConversationDto> {
-    const conversation = await this.chatService.createGroupConversation(
-      req.user.userId,
+    return this.idempotency.run(
       {
-        name: body.name,
-        memberIds: body.memberIds,
+        scope: IdempotencyScope.ChatGroupCreate,
+        userId: req.user.userId,
+        key: idempotencyKey,
+        request: body,
       },
+      () =>
+        this.chatService.createGroupConversation(req.user.userId, {
+          name: body.name,
+          memberIds: body.memberIds,
+        }),
     );
-    return conversation;
   }
 
   @Post('conversations/:id/members')

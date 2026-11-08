@@ -18,6 +18,8 @@ import { ChatGroupAdminService } from './chat-group-admin.service';
 import { ChatGroupEventService } from './chat-group-event.service';
 import { ChatGroupSettingsService } from './chat-group-settings.service';
 import { ChatClearRequestService } from './chat-clear-request.service';
+import { IdempotencyService } from 'src/idempotency/idempotency.service';
+import { RedisService } from 'src/redis/redis.service';
 import { ChatController } from './chat.controller';
 import { ChatService } from './chat.service';
 
@@ -35,6 +37,23 @@ describe('POST /chat/conversations/group HTTP pipeline', () => {
 
   let app: INestApplication;
   const chatService = { createGroupConversation: jest.fn() };
+  // 幂等层用真实的 IdempotencyService，只把 Redis 换成同语义的内存表。
+  const redisStore = new Map<string, string>();
+  const memoryRedis = {
+    setJsonIfAbsent: async (key: string, value: unknown) => {
+      const raw = redisStore.get(key);
+      if (raw !== undefined) return { stored: false, current: JSON.parse(raw) };
+      redisStore.set(key, JSON.stringify(value));
+      return { stored: true };
+    },
+    setJson: async (key: string, value: unknown) => {
+      redisStore.set(key, JSON.stringify(value));
+      return true;
+    },
+    releaseLease: async (key: string, expected: string) => {
+      if (redisStore.get(key) === expected) redisStore.delete(key);
+    },
+  };
   const logger: LoggerService = {
     log: jest.fn(),
     error: jest.fn(),
@@ -52,6 +71,7 @@ describe('POST /chat/conversations/group HTTP pipeline', () => {
 
   beforeEach(async () => {
     jest.clearAllMocks();
+    redisStore.clear();
     chatService.createGroupConversation.mockResolvedValue({ id: 'conv-1' });
 
     const moduleRef = await Test.createTestingModule({
@@ -69,6 +89,8 @@ describe('POST /chat/conversations/group HTTP pipeline', () => {
         { provide: ChatGroupEventService, useValue: {} },
         { provide: ChatGroupSettingsService, useValue: {} },
         { provide: ChatClearRequestService, useValue: {} },
+        IdempotencyService,
+        { provide: RedisService, useValue: memoryRedis },
       ],
     })
       .overrideGuard(JwtGuard)
@@ -173,5 +195,65 @@ describe('POST /chat/conversations/group HTTP pipeline', () => {
     expect(chatService.createGroupConversation).not.toHaveBeenCalled();
     // DTO 层的 400 没有稳定错误码 —— 这正是群名不能在这一层拒的原因。
     expect(response.body.errorCode).toBeUndefined();
+  });
+
+  describe('Idempotency-Key', () => {
+    const body = { name: '周末爬山', memberIds: [FRIEND_A, FRIEND_B] };
+
+    it('replays the first 201 and body for a retry instead of creating a second group', async () => {
+      chatService.createGroupConversation
+        .mockResolvedValueOnce({ id: 'conv-1' })
+        .mockResolvedValueOnce({ id: 'conv-2' });
+
+      const first = await request(app.getHttpServer())
+        .post(ROUTE)
+        .set('Idempotency-Key', 'group-retry-0001')
+        .send(body)
+        .expect(201);
+      const retry = await request(app.getHttpServer())
+        .post(ROUTE)
+        .set('Idempotency-Key', 'group-retry-0001')
+        .send(body)
+        .expect(201);
+
+      expect(retry.body).toEqual(first.body);
+      expect(first.body).toEqual({ id: 'conv-1' });
+      expect(chatService.createGroupConversation).toHaveBeenCalledTimes(1);
+    });
+
+    it('keeps creating on every call when the header is absent (old clients)', async () => {
+      await request(app.getHttpServer()).post(ROUTE).send(body).expect(201);
+      await request(app.getHttpServer()).post(ROUTE).send(body).expect(201);
+
+      expect(chatService.createGroupConversation).toHaveBeenCalledTimes(2);
+    });
+
+    it('answers 409 IDEMPOTENCY_KEY_REUSED when the key comes back with another body', async () => {
+      await request(app.getHttpServer())
+        .post(ROUTE)
+        .set('Idempotency-Key', 'group-retry-0001')
+        .send(body)
+        .expect(201);
+
+      const response = await request(app.getHttpServer())
+        .post(ROUTE)
+        .set('Idempotency-Key', 'group-retry-0001')
+        .send({ ...body, name: '另一个群' })
+        .expect(409);
+
+      expect(response.body.errorCode).toBe('IDEMPOTENCY_KEY_REUSED');
+      expect(chatService.createGroupConversation).toHaveBeenCalledTimes(1);
+    });
+
+    it('answers 400 IDEMPOTENCY_KEY_INVALID for a malformed key', async () => {
+      const response = await request(app.getHttpServer())
+        .post(ROUTE)
+        .set('Idempotency-Key', 'bad key!')
+        .send(body)
+        .expect(400);
+
+      expect(response.body.errorCode).toBe('IDEMPOTENCY_KEY_INVALID');
+      expect(chatService.createGroupConversation).not.toHaveBeenCalled();
+    });
   });
 });
