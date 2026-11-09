@@ -54,6 +54,11 @@ import { logBusinessEvent } from 'src/logging/business-event.logger';
 import { buildImageMedia } from 'src/media/image-media';
 import { AssistantAlertDeliveryProcessor } from 'src/assistant/assistant-alert-delivery.processor';
 import { AssistantSubscriptionService } from 'src/assistant/assistant-subscription.service';
+import {
+  activeUnexpiredPostWhere,
+  CIRCLE_POST_AUTO_END_MS,
+  memberCircleScope,
+} from './circle-plaza-update.query';
 
 // The relations every DTO mapping needs, narrowed to the columns it reads.
 // `include: { author: true }` pulled the whole User row (passwordHash, email,
@@ -100,12 +105,11 @@ type SignupRestrictionFields = Pick<
 >;
 
 const MAX_COLLABORATION_RECOGNITIONS_PER_POST = 3;
-const CIRCLE_POST_AUTO_END_MS = 24 * 60 * 60 * 1000;
 const CIRCLE_POST_AUTO_END_BATCH_SIZE = 100;
 const DEFAULT_CIRCLE_POST_EXPIRY_HOURS = 6;
-// 发帖扇出通知的收件人上限：正常测试期圈子远小于此，作为超大圈的安全阀，
-// 命中时记日志而非静默截断。
-const CIRCLE_POST_PUBLISH_FANOUT_CAP = 500;
+// 发帖实时信号的收件人上限：超大圈/多圈发帖的安全阀，命中时记日志。
+// 超出的人不会丢更新 —— 下一次连上时红点快照会补回来。
+const CIRCLE_PLAZA_POKE_RECIPIENT_CAP = 5000;
 
 @Injectable()
 export class CirclePlazaService {
@@ -178,15 +182,6 @@ export class CirclePlazaService {
       if (out.length >= CirclePlazaService.MAX_FILTER_ITEMS) break;
     }
     return out;
-  }
-
-  // 圈子成员可见范围：圈子未删除 且 viewer 是该圈 ACTIVE 成员。
-  // getFeed 与 getPost 共用，保证「列表能看到」与「详情能打开」的可见性一致。
-  private memberCircleScope(viewerId: string): Prisma.CircleWhereInput {
-    return {
-      deleted: false,
-      members: { some: { userID: viewerId, status: 'ACTIVE' } },
-    };
   }
 
   // 建帖圈子多选归一化：优先用 circleIds，回落到旧的单个 circleId；去空白 + 去重 + 限量。
@@ -301,133 +296,114 @@ export class CirclePlazaService {
     // 主城市 city = cities[0]，兼容旧字段/旧客户端。
     const cities = this.normalizePostCities(dto.cities, dto.city);
     const primaryCity = cities[0] ?? null;
-    const publishRecipientIds = await this.getCirclePostPublishRecipientIds(
-      userId,
-      circleIds,
-    );
 
-    const { post, publishedNotifications } = await this.prisma.$transaction(
-      async (tx) => {
-        const author = await tx.user.findUnique({
-          where: { id: userId },
-          select: { vipLevel: true, vipExpiresAt: true },
+    const post = await this.prisma.$transaction(async (tx) => {
+      const author = await tx.user.findUnique({
+        where: { id: userId },
+        select: { vipLevel: true, vipExpiresAt: true },
+      });
+      if (!author) {
+        throw new NotFoundException({
+          message: 'User not found',
+          errorCode: PlazaErrorCode.NotActiveMember,
         });
-        if (!author) {
-          throw new NotFoundException({
-            message: 'User not found',
-            errorCode: PlazaErrorCode.NotActiveMember,
-          });
-        }
-        const authorLevel =
-          // lockForWrite: serialize the rollout-floor read against program
-          // enablement so this author-level gate uses a consistent floor.
-          (
-            await this.membershipPolicy.resolveEntitlement(
-              author,
-              tx,
-              new Date(),
-              {
-                lockForWrite: true,
-              },
-            )
-          ).level;
-        // Regular (level 0) authors are forbidden from the Plaza read paths
-        // (feed + detail both reject level 0), so a level-0 write would create a
-        // post its author can never see. Reject before any write or publish
-        // notification — a zero VIP restriction must not slip past the check
-        // below (0 > 0 is false).
-        if (authorLevel === 0) {
-          throw new ForbiddenException({
-            message: 'Membership required to publish circle posts',
-            errorCode: PlazaErrorCode.MembershipRequired,
-          });
-        }
-        const requestedVipRestriction = Math.max(
-          dto.vipRestriction ?? 0,
-          dto.signupVipRestriction ?? 0,
-        );
-        if (requestedVipRestriction > authorLevel) {
-          throw new ForbiddenException({
-            message: 'Post VIP restriction exceeds author membership',
-            errorCode: PlazaErrorCode.VipRestrictionExceedsAuthor,
-            limit: authorLevel,
-            details: { limit: authorLevel },
-          });
-        }
-
-        const created = await tx.circlePost.create({
-          data: {
-            content: dto.content,
-            images: dto.images ?? [],
-            tags: dto.tags ?? [],
-            city: primaryCity,
-            cities,
-            isHorn: dto.isHorn ?? false,
-            noteID: dto.noteId ?? null,
-            vipRestriction:
-              dto.vipRestriction === 0 ? null : (dto.vipRestriction ?? null),
-            creditRestriction: dto.creditRestriction ?? null,
-            fancyRestriction: dto.fancyRestriction ?? false,
-            signupVipRestriction:
-              dto.signupVipRestriction === 0
-                ? null
-                : (dto.signupVipRestriction ?? null),
-            signupCreditRestriction: dto.signupCreditRestriction ?? null,
-            signupFancyRestriction: dto.signupFancyRestriction ?? false,
-            authorID: userId,
-            expiresAt,
-            circleID: primaryCircleId,
-            // 关联表：主圈子 + 其余圈子都建一条 link。
-            circleLinks: {
-              create: circleIds.map((circleId) => ({
-                circle: { connect: { id: circleId } },
-              })),
-            },
-          },
-          include: PLAZA_POST_INCLUDE,
-        });
-
-        const notifications =
-          await this.notificationService.createCirclePostPublishedNotifications(
+      }
+      const authorLevel =
+        // lockForWrite: serialize the rollout-floor read against program
+        // enablement so this author-level gate uses a consistent floor.
+        (
+          await this.membershipPolicy.resolveEntitlement(
+            author,
             tx,
+            new Date(),
             {
-              postId: created.id,
-              fromUserId: userId,
-              recipientIds: publishRecipientIds,
+              lockForWrite: true,
             },
-          );
-
-        await this.assistantSubscriptions?.enqueueCirclePost(
-          tx,
-          created.id,
-          userId,
-          circleIds,
-        );
-
-        // 每个圈子的 postCount 都 +1。必须是事务里最后一条写:这条 UPDATE 给 Circle
-        // 行加的行锁要持有到提交,而入圈占座、改设置、别人发帖都要写这一行。排在
-        // 扇出(≤500 条通知 + ≤500 条推送 outbox)之前的话,整段扇出期间这一行都被占着。
-        // 建帖与关联表的外键检查只拿 FOR KEY SHARE,不挡别人更新圈子的普通列。
-        await tx.circle.updateMany({
-          where: { id: { in: circleIds } },
-          data: { postCount: { increment: 1 } },
+          )
+        ).level;
+      // Regular (level 0) authors are forbidden from the Plaza read paths
+      // (feed + detail both reject level 0), so a level-0 write would create a
+      // post its author can never see. Reject before any write or publish
+      // notification — a zero VIP restriction must not slip past the check
+      // below (0 > 0 is false).
+      if (authorLevel === 0) {
+        throw new ForbiddenException({
+          message: 'Membership required to publish circle posts',
+          errorCode: PlazaErrorCode.MembershipRequired,
         });
+      }
+      const requestedVipRestriction = Math.max(
+        dto.vipRestriction ?? 0,
+        dto.signupVipRestriction ?? 0,
+      );
+      if (requestedVipRestriction > authorLevel) {
+        throw new ForbiddenException({
+          message: 'Post VIP restriction exceeds author membership',
+          errorCode: PlazaErrorCode.VipRestrictionExceedsAuthor,
+          limit: authorLevel,
+          details: { limit: authorLevel },
+        });
+      }
 
-        return { post: created, publishedNotifications: notifications };
-      },
-    );
+      const created = await tx.circlePost.create({
+        data: {
+          content: dto.content,
+          images: dto.images ?? [],
+          tags: dto.tags ?? [],
+          city: primaryCity,
+          cities,
+          isHorn: dto.isHorn ?? false,
+          noteID: dto.noteId ?? null,
+          vipRestriction:
+            dto.vipRestriction === 0 ? null : (dto.vipRestriction ?? null),
+          creditRestriction: dto.creditRestriction ?? null,
+          fancyRestriction: dto.fancyRestriction ?? false,
+          signupVipRestriction:
+            dto.signupVipRestriction === 0
+              ? null
+              : (dto.signupVipRestriction ?? null),
+          signupCreditRestriction: dto.signupCreditRestriction ?? null,
+          signupFancyRestriction: dto.signupFancyRestriction ?? false,
+          authorID: userId,
+          expiresAt,
+          circleID: primaryCircleId,
+          // 关联表：主圈子 + 其余圈子都建一条 link。
+          circleLinks: {
+            create: circleIds.map((circleId) => ({
+              circle: { connect: { id: circleId } },
+            })),
+          },
+        },
+        include: PLAZA_POST_INCLUDE,
+      });
 
-    for (const { toUserId, notification } of publishedNotifications) {
-      try {
-        this.realtime.broadcastNotificationCreated(toUserId, notification);
-      } catch (error) {
-        this.logger.error(
-          `circle post publish realtime broadcast failed (post=${post.id}, user=${toUserId}): ${
+      await this.assistantSubscriptions?.enqueueCirclePost(
+        tx,
+        created.id,
+        userId,
+        circleIds,
+      );
+
+      // 每个圈子的 postCount 都 +1。必须是事务里最后一条写:这条 UPDATE 给 Circle
+      // 行加的行锁要持有到提交,而入圈占座、改设置、别人发帖都要写这一行。
+      // 建帖与关联表的外键检查只拿 FOR KEY SHARE,不挡别人更新圈子的普通列。
+      await tx.circle.updateMany({
+        where: { id: { in: circleIds } },
+        data: { postCount: { increment: 1 } },
+      });
+
+      return created;
+    });
+
+    void this.pokeCirclePlazaMembers(userId, circleIds).catch(
+      (error: unknown) => {
+        this.logger.warn(
+          `circle plaza poke failed (post=${post.id}): ${
             error instanceof Error ? error.message : String(error)
           }`,
         );
-      }
-    }
+      },
+    );
 
     if (this.assistantAlerts) {
       void this.assistantAlerts
@@ -479,41 +455,59 @@ export class CirclePlazaService {
   }
 
   /**
-   * Resolve a deterministic, capped set of ACTIVE recipients before the post
-   * transaction. Bidirectional blocks are excluded by the database query.
+   * 发帖后点亮同圈成员 tab 上的飞机红点：只发实时信号，不写通知、不推送。
+   *
+   * 每个圈子一个窗口内只发一次，几千人发帖也不会刷屏。窗口吞掉的信号不影响结果：
+   * 红点的真值由 User.circlePlazaSeenAt 算出，下一条帖子或下一次连上时的快照会补上。
    *
    * groupBy rather than findMany + distinct: Prisma applies `take` to a
    * `distinct` query in memory (the SQL has no LIMIT), so a post to 50 circles
    * of 3000 members read every row back. groupBy compiles to
    * `GROUP BY "userID" ORDER BY "userID" LIMIT n`.
    */
-  private async getCirclePostPublishRecipientIds(
+  private async pokeCirclePlazaMembers(
     authorId: string,
     circleIds: string[],
-  ): Promise<string[]> {
+  ): Promise<void> {
+    const claimedCircleIds =
+      await this.realtime.claimCirclePlazaPokes(circleIds);
+    if (claimedCircleIds.length === 0) return;
+
     const members = await this.prisma.circleMember.groupBy({
       by: ['userID'],
       where: {
-        circleID: { in: circleIds },
+        circleID: { in: claimedCircleIds },
         status: 'ACTIVE',
         userID: { not: authorId },
-        user: {
-          blocksIssued: { none: { blockedID: authorId } },
-          blocksReceived: { none: { blockerID: authorId } },
-        },
       },
       orderBy: { userID: 'asc' },
-      take: CIRCLE_POST_PUBLISH_FANOUT_CAP + 1,
+      take: CIRCLE_PLAZA_POKE_RECIPIENT_CAP + 1,
     });
 
-    if (members.length > CIRCLE_POST_PUBLISH_FANOUT_CAP) {
+    if (members.length > CIRCLE_PLAZA_POKE_RECIPIENT_CAP) {
       this.logger.warn(
-        `circle post publish fan-out capped at ${CIRCLE_POST_PUBLISH_FANOUT_CAP} recipients (author=${authorId}, eligible>${CIRCLE_POST_PUBLISH_FANOUT_CAP})`,
+        `circle plaza poke capped at ${CIRCLE_PLAZA_POKE_RECIPIENT_CAP} recipients (author=${authorId}, eligible>${CIRCLE_PLAZA_POKE_RECIPIENT_CAP})`,
       );
     }
-    return members
-      .slice(0, CIRCLE_POST_PUBLISH_FANOUT_CAP)
-      .map(({ userID }) => userID);
+    for (const { userID } of members.slice(
+      0,
+      CIRCLE_PLAZA_POKE_RECIPIENT_CAP,
+    )) {
+      this.realtime.broadcastCirclePlazaUpdated(userID);
+    }
+  }
+
+  /**
+   * 用户打开了圈子帖子列表：红点从这一刻重新算，并同步给他其它在线设备。
+   *
+   * 不用 prisma.user.update：它会带上 @updatedAt，而 User.updatedAt 是资料/会员
+   * 缓存的版本号，看一眼列表不该让它前进。
+   */
+  async markPlazaSeen(userId: string): Promise<void> {
+    await this.prisma.$executeRaw`
+      UPDATE "User" SET "circlePlazaSeenAt" = ${new Date()} WHERE "id" = ${userId}
+    `;
+    await this.realtime.broadcastCirclePlazaSeen(userId);
   }
 
   async getFeed(
@@ -596,7 +590,7 @@ export class CirclePlazaService {
     // 「viewer 是成员的那个圈子」时，才在该圈 feed 出现——杜绝跨圈泄露
     //（帖子同时 link 到 A、B，viewer 仅是 A 成员时，按 B 筛选不会命中）。
     const linkFilter: Prisma.CirclePostCircleWhereInput = {
-      circle: this.memberCircleScope(viewerId),
+      circle: memberCircleScope(viewerId),
     };
     if (query.circleId) {
       linkFilter.circleID = query.circleId;
@@ -605,7 +599,7 @@ export class CirclePlazaService {
     }
 
     const whereBase: Prisma.CirclePostWhereInput = {
-      ...this.activeUnexpiredPostWhere(),
+      ...activeUnexpiredPostWhere(),
       circleLinks: { some: linkFilter },
     };
     // 城市筛选走 cities[] 数组谓词（旧数据已回填 cities，故仍能命中）：
@@ -707,11 +701,11 @@ export class CirclePlazaService {
 
     const post = await this.prisma.circlePost.findFirst({
       where: {
-        ...this.activeUnexpiredPostWhere(),
+        ...activeUnexpiredPostWhere(),
         id: postId,
         // 与 feed 同一套可见性：viewer 必须是该动态所属任一圈子的 ACTIVE 成员，
         // 否则 findFirst 不命中 → 抛 404，避免凭 id 直读到非本圈私密动态。
-        circleLinks: { some: { circle: this.memberCircleScope(viewerId) } },
+        circleLinks: { some: { circle: memberCircleScope(viewerId) } },
       },
       include: PLAZA_POST_INCLUDE,
     });
@@ -721,7 +715,7 @@ export class CirclePlazaService {
       // 若帖子仍存在(仅因 viewer 非成员而被过滤)，回传主圈子信息，让前端提示「申请加入」。
       const visible = await this.prisma.circlePost.findFirst({
         where: {
-          ...this.activeUnexpiredPostWhere(),
+          ...activeUnexpiredPostWhere(),
           id: postId,
           circleLinks: { some: { circle: { deleted: false } } },
         },
@@ -785,7 +779,7 @@ export class CirclePlazaService {
 
   async deletePost(userId: string, postId: string): Promise<void> {
     const post = await this.prisma.circlePost.findFirst({
-      where: { ...this.activeUnexpiredPostWhere(), id: postId },
+      where: { ...activeUnexpiredPostWhere(), id: postId },
     });
     if (!post) {
       throw new NotFoundException({
@@ -833,10 +827,10 @@ export class CirclePlazaService {
   ): Promise<{ reported: boolean }> {
     const post = await this.prisma.circlePost.findFirst({
       where: {
-        ...this.activeUnexpiredPostWhere(),
+        ...activeUnexpiredPostWhere(),
         id: postId,
         circleLinks: {
-          some: { circle: this.memberCircleScope(userId) },
+          some: { circle: memberCircleScope(userId) },
         },
       },
       select: { id: true, authorID: true },
@@ -926,7 +920,7 @@ export class CirclePlazaService {
           // （vipRestriction 等）；后者由 checkCanInteract 管，此处只看 signup* 字段。
           const post = await tx.circlePost.findFirst({
             where: {
-              ...this.activeUnexpiredPostWhere(now),
+              ...activeUnexpiredPostWhere(now),
               id: postId,
               circleLinks: { some: { circle: { deleted: false } } },
             },
@@ -939,7 +933,7 @@ export class CirclePlazaService {
               signupCreditRestriction: true,
               signupFancyRestriction: true,
               circleLinks: {
-                where: { circle: this.memberCircleScope(userId) },
+                where: { circle: memberCircleScope(userId) },
                 select: { id: true },
                 take: 1,
               },
@@ -1027,7 +1021,7 @@ export class CirclePlazaService {
           // signupCount 是去规范化的软缓存；报名行的 COUNT(*) 才是真实来源。
           // 条件与上面的可见性读同一个 now:行锁等到之后按最新版本重判。
           const [counted] = await tx.circlePost.updateManyAndReturn({
-            where: { ...this.activeUnexpiredPostWhere(now), id: postId },
+            where: { ...activeUnexpiredPostWhere(now), id: postId },
             data: { signupCount: { increment: 1 } },
             select: { signupCount: true },
           });
@@ -1778,23 +1772,6 @@ export class CirclePlazaService {
       canInteract,
       createdAt: post.createdAt.toISOString(),
       expiresAt: this.formatPostExpiresAt(post),
-    };
-  }
-
-  private activeUnexpiredPostWhere(
-    now = new Date(),
-  ): Prisma.CirclePostWhereInput {
-    const legacyCutoff = new Date(now.getTime() - CIRCLE_POST_AUTO_END_MS);
-
-    return {
-      status: 'ACTIVE',
-      OR: [
-        { expiresAt: { gt: now } },
-        {
-          expiresAt: null,
-          createdAt: { gt: legacyCutoff },
-        },
-      ],
     };
   }
 

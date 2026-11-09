@@ -32,7 +32,9 @@ describe('圈子离线推送的门控面', () => {
     const circleTypes = Object.values(NotificationType).filter(
       (type) =>
         type.startsWith('CIRCLE_') &&
-        type !== NotificationType.CIRCLE_INVITATION_RECEIVED,
+        type !== NotificationType.CIRCLE_INVITATION_RECEIVED &&
+        // 已停用的类型：不再产生新通知，历史行也不进铃铛和未读数。
+        type !== NotificationType.CIRCLE_POST_PUBLISHED,
     );
     expect(new Set(CIRCLE_OFFLINE_PUSH_TYPES)).toEqual(new Set(circleTypes));
   });
