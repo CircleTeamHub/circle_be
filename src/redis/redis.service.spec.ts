@@ -23,6 +23,19 @@ describe('RedisService', () => {
     process.env = originalEnv;
   });
 
+  it.each([
+    [undefined, false],
+    ['false', false],
+    ['true', true],
+  ])('reports whether Redis is required (%s)', (configured, expected) => {
+    if (configured === undefined) delete process.env.REDIS_REQUIRED;
+    else process.env.REDIS_REQUIRED = configured;
+
+    const service = new RedisService();
+
+    expect(service.isRequired()).toBe(expected);
+  });
+
   it('degrades gracefully when REDIS_URL is not configured', async () => {
     const service = new RedisService();
 
@@ -380,6 +393,36 @@ describe('RedisService', () => {
       '{"state":"pending"}',
       '60',
     ]);
+  });
+
+  it('does not log Redis keys when idempotency writes fail', async () => {
+    process.env.REDIS_URL = 'redis://localhost:6379';
+    const service = new RedisService();
+    const failure = new Error('connection lost');
+    const client = {
+      set: jest.fn().mockRejectedValue(failure),
+      eval: jest.fn().mockRejectedValue(failure),
+    };
+    jest.spyOn(service as any, 'getCommandClient').mockResolvedValue(client);
+    const warn = jest
+      .spyOn((service as any).logger, 'warn')
+      .mockImplementation(() => undefined);
+    const sensitiveKey = 'idem:v1:circle-create:user-secret:retry-key-secret';
+
+    await expect(
+      service.setJson(sensitiveKey, { state: 'done' }, 60),
+    ).resolves.toBe(false);
+    await expect(
+      service.setJsonIfAbsent(sensitiveKey, { state: 'pending' }, 60),
+    ).resolves.toBeNull();
+    await expect(
+      service.releaseLease(sensitiveKey, 'lease-token'),
+    ).resolves.toBeUndefined();
+
+    const logged = JSON.stringify(warn.mock.calls);
+    expect(logged).toContain('connection lost');
+    expect(logged).not.toContain('user-secret');
+    expect(logged).not.toContain('retry-key-secret');
   });
 
   it('writes a versioned value only when the CAS script reports success', async () => {

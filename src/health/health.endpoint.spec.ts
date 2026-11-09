@@ -23,9 +23,14 @@ function buildDatabase(result: Promise<unknown>): HealthDatabase {
   return { $queryRaw: jest.fn(() => result) } as unknown as HealthDatabase;
 }
 
-function buildRedis(enabled: boolean, reachable = true): HealthRedis {
+function buildRedis(
+  enabled: boolean,
+  reachable = true,
+  required = false,
+): HealthRedis {
   return {
     isEnabled: jest.fn(() => enabled),
+    isRequired: jest.fn(() => required),
     ping: jest.fn(async () => reachable),
   };
 }
@@ -106,6 +111,25 @@ describe('createReadinessHandler', () => {
     expect(res.status).toHaveBeenCalledWith(200);
     expect(res.json).toHaveBeenCalledWith({
       status: 'ok',
+      database: 'up',
+      redis: 'down',
+      objectStore: 'disabled',
+      objectStoreReachable: 'disabled',
+    });
+  });
+
+  it('answers 503 when required Redis is down', async () => {
+    const database = buildDatabase(Promise.resolve([]));
+    const res = buildResponse();
+
+    await createReadinessHandler({
+      database,
+      redis: buildRedis(true, false, true),
+    })({} as never, res as never);
+
+    expect(res.status).toHaveBeenCalledWith(503);
+    expect(res.json).toHaveBeenCalledWith({
+      status: 'error',
       database: 'up',
       redis: 'down',
       objectStore: 'disabled',

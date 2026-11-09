@@ -1,4 +1,8 @@
-import { BadRequestException, ConflictException } from '@nestjs/common';
+import {
+  BadRequestException,
+  ConflictException,
+  ServiceUnavailableException,
+} from '@nestjs/common';
 import type { RedisService } from 'src/redis/redis.service';
 import { IdempotencyScope, IdempotencyService } from './idempotency.service';
 
@@ -234,18 +238,24 @@ describe('IdempotencyService', () => {
     });
   });
 
-  it('fails open when Redis cannot answer, logging without user id or key', async () => {
+  it('rejects a keyed request with 503 when Redis cannot answer', async () => {
     redis.setJsonIfAbsent.mockResolvedValue(null);
     const warn = jest
       .spyOn((service as any).logger, 'warn')
       .mockImplementation(() => undefined);
     const operation = jest.fn().mockResolvedValue({ id: 'circle-1' });
 
-    await expect(service.run(request(), operation)).resolves.toEqual({
-      id: 'circle-1',
+    const error = await service
+      .run(request(), operation)
+      .catch((caught: unknown) => caught);
+
+    expect(error).toBeInstanceOf(ServiceUnavailableException);
+    expect((error as ServiceUnavailableException).getStatus()).toBe(503);
+    expect((error as ServiceUnavailableException).getResponse()).toMatchObject({
+      message: '幂等保护暂不可用，请稍后重试',
     });
 
-    expect(operation).toHaveBeenCalledTimes(1);
+    expect(operation).not.toHaveBeenCalled();
     expect(redis.setJson).not.toHaveBeenCalled();
     expect(warn).toHaveBeenCalledTimes(1);
     const logged = JSON.stringify(warn.mock.calls[0]);

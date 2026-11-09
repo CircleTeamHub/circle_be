@@ -56,6 +56,10 @@ export class RedisService implements OnModuleInit, OnModuleDestroy {
     return this.redisUrl.length > 0;
   }
 
+  isRequired(): boolean {
+    return this.redisRequired;
+  }
+
   async onModuleInit(): Promise<void> {
     if (!this.isEnabled()) {
       if (this.redisRequired) {
@@ -220,9 +224,7 @@ export class RedisService implements OnModuleInit, OnModuleDestroy {
       return true;
     } catch (error) {
       this.recordCommandFailure('set', error);
-      this.logger.warn(
-        `Redis JSON set failed for ${key}: ${this.formatError(error)}`,
-      );
+      this.logger.warn(`Redis JSON set failed: ${this.formatError(error)}`);
       return false;
     }
   }
@@ -262,8 +264,9 @@ export class RedisService implements OnModuleInit, OnModuleDestroy {
         : { stored: true };
     } catch (error) {
       this.recordCommandFailure('set', error);
+      // Redis keys can embed account IDs, tokens, or client idempotency keys.
       this.logger.warn(
-        `Redis JSON set-if-absent failed for ${key}: ${this.formatError(error)}`,
+        `Redis JSON set-if-absent failed: ${this.formatError(error)}`,
       );
       return null;
     }
@@ -587,7 +590,7 @@ export class RedisService implements OnModuleInit, OnModuleDestroy {
     } catch (error) {
       this.recordCommandFailure('lease', error);
       this.logger.warn(
-        `Redis lease release failed for ${key}: ${this.formatError(error)}`,
+        `Redis lease release failed: ${this.formatError(error)}`,
       );
     }
   }

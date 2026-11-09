@@ -105,6 +105,7 @@ describe('production Redis deployment configuration', () => {
       `REDIS_URL="redis://default:${password}@redis:6379"`,
     );
     expect(firstAppEnv).toContain('REDIS_ALLOW_INSECURE=true');
+    expect(firstAppEnv).toContain('REDIS_REQUIRED=true');
     expect(firstComposeEnv).toContain('API_DOMAIN=api.example.com');
     expect(firstComposeEnv).toContain('ADMIN_DOMAIN=admin.example.com');
     expect(firstComposeEnv).toContain('ACME_EMAIL=ops@example.com');
@@ -132,6 +133,8 @@ describe('production Redis deployment configuration', () => {
     expect(upgradedComposeEnv.match(/^APP_ENV_GID=/gm)).toHaveLength(1);
     expect(upgradedAppEnv.match(/^REDIS_URL=/gm)).toHaveLength(1);
     expect(upgradedAppEnv.match(/^REDIS_ALLOW_INSECURE=/gm)).toHaveLength(1);
+    expect(upgradedAppEnv.match(/^REDIS_REQUIRED=/gm)).toHaveLength(1);
+    expect(upgradedAppEnv).toContain('REDIS_REQUIRED=true');
     expect(upgradedAppEnv).toContain(`SECRET=${originalSecret}`);
 
     writeFileSync(
@@ -230,6 +233,14 @@ exec "$REAL_CAT" "$@"
   });
 
   it('bounds Redis memory and lets application config choose the endpoint', () => {
+    const productionExample = readFileSync(
+      join(repositoryRoot, '.env.production.example'),
+      'utf8',
+    );
+
+    expect(productionExample).toContain('REDIS_REQUIRED=true');
+    expect(productionExample).not.toContain('REDIS_REQUIRED=false');
+
     const compose = readFileSync(
       join(repositoryRoot, 'docker-compose.prod.yml'),
       'utf8',
