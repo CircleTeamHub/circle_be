@@ -1,6 +1,6 @@
 import { Test, TestingModule } from '@nestjs/testing';
 import { ConfigService } from '@nestjs/config';
-import { UnauthorizedException } from '@nestjs/common';
+import { ConflictException, UnauthorizedException } from '@nestjs/common';
 import { PrismaService } from '../../prisma/prisma.service';
 import { RefreshTokenService } from '../refresh-token.service';
 import { SessionRevocationService } from '../session-revocation.service';
@@ -47,7 +47,13 @@ describe('RefreshTokenService', () => {
     if (where.OR && !where.OR.some((part: any) => matchesWhere(record, part))) {
       return false;
     }
-    for (const field of ['userId', 'token', 'audience', 'deviceKey']) {
+    for (const field of [
+      'userId',
+      'token',
+      'audience',
+      'deviceKey',
+      'rotationAttemptId',
+    ]) {
       if (where[field] !== undefined && record[field] !== where[field])
         return false;
     }
@@ -1556,6 +1562,139 @@ describe('RefreshTokenService', () => {
 
     // Every active session for the user should now be revoked.
     expect(newSessionAfterFirstRotate.revokedAt).toBeInstanceOf(Date);
+  });
+
+  describe('retrying a rotation whose result never reached the client', () => {
+    const attempt = '11111111-1111-4111-8111-111111111111';
+    const otherAttempt = '22222222-2222-4222-8222-222222222222';
+    const row = (sessionId: string) =>
+      records.find(({ id }) => id === sessionId);
+
+    it('records the attempt on the session it created', async () => {
+      const initial = await service.create('user-1');
+
+      const next = await service.rotate(initial.token, {
+        rotationAttemptId: attempt,
+      });
+
+      expect(row(next.sessionId).rotationAttemptId).toBe(attempt);
+    });
+
+    it('replaces the undelivered successor instead of treating the retry as theft', async () => {
+      const initial = await service.create('user-1');
+      const lost = await service.rotate(initial.token, {
+        rotationAttemptId: attempt,
+      });
+      jest.clearAllMocks();
+
+      const retried = await service.rotate(initial.token, {
+        rotationAttemptId: attempt,
+      });
+
+      expect(retried.sessionId).not.toBe(lost.sessionId);
+      expect(row(lost.sessionId).revokedAt).toBeInstanceOf(Date);
+      expect(row(lost.sessionId).revocationReason).toBe('ROTATED');
+      expect(row(retried.sessionId).revokedAt).toBeNull();
+      expect(row(retried.sessionId).familyId).toBe(
+        row(lost.sessionId).familyId,
+      );
+      expect(revocation.revokeScope).not.toHaveBeenCalled();
+      await expect(service.rotate(retried.token)).resolves.toMatchObject({
+        kind: 'rotated',
+      });
+    });
+
+    it('keeps working when the retried result is lost as well', async () => {
+      const initial = await service.create('user-1');
+      const context = { rotationAttemptId: attempt };
+
+      await service.rotate(initial.token, context);
+      await service.rotate(initial.token, context);
+      const third = await service.rotate(initial.token, context);
+
+      expect(row(third.sessionId).revokedAt).toBeNull();
+      expect(records.filter(({ revokedAt }) => !revokedAt)).toHaveLength(1);
+    });
+
+    it('treats the replay as theft once the successor has been used', async () => {
+      const initial = await service.create('user-1');
+      const delivered = await service.rotate(initial.token, {
+        rotationAttemptId: attempt,
+      });
+      const current = await service.rotate(delivered.token, {
+        rotationAttemptId: otherAttempt,
+      });
+
+      await expect(
+        service.rotate(initial.token, { rotationAttemptId: attempt }),
+      ).rejects.toThrow(/reuse detected/i);
+      expect(row(current.sessionId).revocationReason).toBe(
+        'TOKEN_FAMILY_REUSE',
+      );
+    });
+
+    it('refuses a duplicate that arrived before the successor existed, leaving the delivered session alone', async () => {
+      const initial = await service.create('user-1');
+      const abandonedArrival = new Date(Date.now() - 5_000);
+      const delivered = await service.rotate(initial.token, {
+        rotationAttemptId: attempt,
+      });
+      jest.clearAllMocks();
+
+      await expect(
+        service.rotate(initial.token, {
+          rotationAttemptId: attempt,
+          requestReceivedAt: abandonedArrival,
+        }),
+      ).rejects.toThrow(ConflictException);
+
+      expect(row(delivered.sessionId).revokedAt).toBeNull();
+      expect(revocation.revokeScope).not.toHaveBeenCalled();
+      await expect(
+        service.rotate(delivered.token, { rotationAttemptId: otherAttempt }),
+      ).resolves.toMatchObject({ kind: 'rotated' });
+    });
+
+    it('accepts a retry that arrived after the successor was created', async () => {
+      const initial = await service.create('user-1');
+      const lost = await service.rotate(initial.token, {
+        rotationAttemptId: attempt,
+      });
+
+      const retried = await service.rotate(initial.token, {
+        rotationAttemptId: attempt,
+        requestReceivedAt: new Date(Date.now() + 1_000),
+      });
+
+      expect(row(lost.sessionId).revokedAt).toBeInstanceOf(Date);
+      expect(row(retried.sessionId).revokedAt).toBeNull();
+    });
+
+    it.each([
+      ['a different attempt', { rotationAttemptId: otherAttempt }],
+      ['no attempt', undefined],
+    ])('treats a replay carrying %s as theft', async (_label, context) => {
+      const initial = await service.create('user-1');
+      await service.rotate(initial.token, { rotationAttemptId: attempt });
+
+      await expect(service.rotate(initial.token, context)).rejects.toThrow(
+        /reuse detected/i,
+      );
+    });
+
+    it('never matches an attempt from another session family', async () => {
+      const victim = await service.create('user-1');
+      await service.rotate(victim.token, { rotationAttemptId: otherAttempt });
+      const other = await service.create('user-1');
+      const live = await service.rotate(other.token, {
+        rotationAttemptId: attempt,
+      });
+
+      await expect(
+        service.rotate(victim.token, { rotationAttemptId: attempt }),
+      ).rejects.toThrow(/reuse detected/i);
+      expect(row(live.sessionId).revokedAt).toBeNull();
+    });
   });
 
   it('marks legacy revoked refresh-token replays with null revocation reason', async () => {

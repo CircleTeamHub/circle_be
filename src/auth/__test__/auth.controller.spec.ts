@@ -270,6 +270,38 @@ describe('AuthController', () => {
     );
   });
 
+  describe('refresh attempt id', () => {
+    const attempt = '11111111-1111-4111-8111-111111111111';
+    const refreshWith = async (headers: Record<string, string>) => {
+      const refresh = jest.spyOn(mockAuthService, 'refresh');
+      refresh.mockClear();
+      await controller.refresh({ refreshToken: 'refresh-token' }, {
+        headers,
+        ip: null,
+      } as any);
+      return refresh.mock.calls[0][1 as never] as unknown as {
+        rotationAttemptId?: string | null;
+        requestReceivedAt?: Date;
+      };
+    };
+
+    it('passes a valid Idempotency-Key and the arrival time to the rotation', async () => {
+      const context = await refreshWith({ 'idempotency-key': attempt });
+
+      expect(context.rotationAttemptId).toBe(attempt);
+      expect(context.requestReceivedAt).toBeInstanceOf(Date);
+    });
+
+    it.each([
+      ['a malformed key', { 'idempotency-key': 'not-a-uuid' }],
+      ['no key', {}],
+    ])('ignores %s', async (_label, headers) => {
+      const context = await refreshWith(headers as Record<string, string>);
+
+      expect(context.rotationAttemptId).toBeNull();
+    });
+  });
+
   it('sets login security code for the current user', async () => {
     const dto: SetLoginSecurityCodeDto = {
       securityCode: '1234',

@@ -1,5 +1,6 @@
 import { createHash, randomBytes, randomUUID } from 'node:crypto';
 import {
+  ConflictException,
   ForbiddenException,
   HttpException,
   UnauthorizedException,
@@ -418,6 +419,75 @@ describePostgres('AuthService.refresh on a real database', () => {
       await expect(h.auth.refresh(otherFamily.raw)).resolves.toHaveProperty(
         'accessToken',
       );
+    });
+
+    it('recognises a retry of the same attempt: the undelivered successor is replaced and the family survives', async () => {
+      const userId = await seedUser();
+      const consumed = await seedSession({ userId });
+      const context = { rotationAttemptId: randomUUID() };
+      h.revocation.revokeScope.mockClear();
+
+      const lost = await h.auth.refresh(consumed.raw, context);
+      const retried = await h.auth.refresh(consumed.raw, {
+        ...context,
+        requestReceivedAt: new Date(),
+      });
+
+      expect(await session(lost.refreshToken)).toMatchObject({
+        revocationReason: 'ROTATED',
+      });
+      expect((await session(lost.refreshToken)).revokedAt).not.toBeNull();
+      expect(await session(retried.refreshToken)).toMatchObject({
+        revokedAt: null,
+      });
+      expect(h.revocation.revokeScope).not.toHaveBeenCalled();
+      await expect(
+        h.auth.refresh(retried.refreshToken),
+      ).resolves.toHaveProperty('accessToken');
+    });
+
+    it('a slow duplicate that lost the lock to its own retry leaves the delivered session alone', async () => {
+      const userId = await seedUser();
+      const consumed = await seedSession({ userId });
+      const context = { rotationAttemptId: randomUUID() };
+      const abandonedArrival = new Date(Date.now() - 1_000);
+      h.revocation.revokeScope.mockClear();
+
+      const delivered = await h.auth.refresh(consumed.raw, context);
+      const error = await rejection(
+        h.auth.refresh(consumed.raw, {
+          ...context,
+          requestReceivedAt: abandonedArrival,
+        }),
+      );
+
+      expect(error).toBeInstanceOf(ConflictException);
+      expect(await session(delivered.refreshToken)).toMatchObject({
+        revokedAt: null,
+      });
+      expect(h.revocation.revokeScope).not.toHaveBeenCalled();
+      await expect(
+        h.auth.refresh(delivered.refreshToken, {
+          rotationAttemptId: randomUUID(),
+        }),
+      ).resolves.toHaveProperty('accessToken');
+    });
+
+    it('still treats the replay as theft once the successor has been used', async () => {
+      const userId = await seedUser();
+      const consumed = await seedSession({ userId });
+      const context = { rotationAttemptId: randomUUID() };
+
+      const delivered = await h.auth.refresh(consumed.raw, context);
+      const current = await h.auth.refresh(delivered.refreshToken, {
+        rotationAttemptId: randomUUID(),
+      });
+
+      const error = await rejection(h.auth.refresh(consumed.raw, context));
+      expect(error).toBeInstanceOf(UnauthorizedException);
+      expect(await session(current.refreshToken)).toMatchObject({
+        revocationReason: 'TOKEN_FAMILY_REUSE',
+      });
     });
 
     it.each([

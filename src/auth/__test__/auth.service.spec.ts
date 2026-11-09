@@ -2858,12 +2858,29 @@ describe('AuthService', () => {
       loginSecurityCodeHash: await argon2.hash('1234'),
     });
 
+    // 403, not 401: the app refreshes on any 401 and logs out when the retry is
+    // still 401, so a mistyped code must not look like a dead session.
     await expect(
       service.setLoginSecurityCode('uuid-1', '5678', '0000'),
-    ).rejects.toThrow(UnauthorizedException);
+    ).rejects.toThrow(ForbiddenException);
     await expect(
       service.setLoginSecurityCode('uuid-1', '5678'),
-    ).rejects.toThrow(UnauthorizedException);
+    ).rejects.toThrow(ForbiddenException);
+  });
+
+  it('rejects a wrong code when disabling the login security code without looking like a dead session', async () => {
+    users.push({
+      id: 'uuid-1',
+      accountId: 'testuser',
+      passwordHash: 'hash',
+      status: 'ACTIVE',
+      role: 'USER',
+      loginSecurityCodeHash: await argon2.hash('1234'),
+    });
+
+    await expect(
+      service.disableLoginSecurityCode('uuid-1', '0000'),
+    ).rejects.toThrow(ForbiddenException);
   });
 
   it('clears login security code after verifying the current code', async () => {

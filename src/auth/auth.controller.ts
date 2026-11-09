@@ -14,6 +14,7 @@ import {
   Req,
   UseGuards,
 } from '@nestjs/common';
+import { isUUID } from 'class-validator';
 import { Request } from 'express';
 import { Throttle, ThrottlerGuard } from '@nestjs/throttler';
 import {
@@ -382,12 +383,23 @@ export class AuthController {
     description:
       'Android only: the ANDROID_ID-derived device id this install would use after a reinstall',
   })
+  @ApiHeader({
+    name: 'idempotency-key',
+    required: false,
+    description:
+      'UUID v4 of this refresh attempt; resent unchanged when the previous result never arrived',
+  })
   @ApiCreatedResponse({
     description: 'Token refreshed successfully',
     type: AuthTokensDto,
   })
   refresh(@Body() dto: RefreshTokenDto, @Req() req?: Request) {
-    return this.authService.refresh(dto.refreshToken, getSessionContext(req));
+    const attemptId = getHeaderValue(req?.headers['idempotency-key']);
+    return this.authService.refresh(dto.refreshToken, {
+      ...getSessionContext(req),
+      rotationAttemptId: attemptId && isUUID(attemptId, '4') ? attemptId : null,
+      requestReceivedAt: new Date(),
+    });
   }
 
   @AnonymousAccess('Admin refresh token credential')
