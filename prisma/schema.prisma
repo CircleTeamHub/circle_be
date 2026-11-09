@@ -305,6 +305,7 @@ enum NotificationType {
   CIRCLE_INVITATION_APPROVED
   CIRCLE_INVITATION_REJECTED
   CIRCLE_ADMIN_OVERRIDE_APPROVED
+  /// 已停用：发帖改为只亮 tab 红点（User.circlePlazaSeenAt）。枚举值留给历史行。
   CIRCLE_POST_PUBLISHED
   CIRCLE_POST_SIGNUP_CREATED
   CIRCLE_POST_AUTO_ENDED
@@ -420,6 +421,9 @@ model User {
   /// 默认 true —— 与既有行为一致（此前推送不读任何用户偏好，人人都收）。
   /// 客户端的总闸关掉时也会把这里同步成 false，服务端只认这一个值。
   circleOfflinePushEnabled     Boolean           @default(true)
+  /// 最后一次打开圈子帖子列表的时间。晚于它的他人新帖会点亮 tab 上的飞机红点。
+  /// 默认 now()：上线时已有的帖子和新用户注册前的帖子都不算「更新」。
+  circlePlazaSeenAt            DateTime          @default(now())
   groupOfflinePushEnabled      Boolean           @default(true)
   nickname                     String
   avatarUrl                    String?

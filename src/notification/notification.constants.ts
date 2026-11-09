@@ -19,7 +19,8 @@ export const MOMENT_NOTIFICATION_TYPES = compactNotificationTypes([
 ] as const);
 
 /**
- * 圈子铃铛（CirclePlazaScreen 右上角）—— 担保验证、入圈审批、圈子帖动态。
+ * 圈子铃铛（CirclePlazaScreen 右上角）—— 担保验证、入圈审批、活动结束与认可。
+ * 有人发帖不进这里：发帖只点亮飞机 tab 的红点（见 circle-plaza-update.query）。
  * 「报名管理」未读走 CirclePostSignup.seenByAuthor，不在这张表里，
  * 由 signupUnread 单独统计。
  */
@@ -28,7 +29,6 @@ export const CIRCLE_NOTIFICATION_TYPES = compactNotificationTypes([
   NotificationType.CIRCLE_INVITATION_APPROVED,
   NotificationType.CIRCLE_INVITATION_REJECTED,
   NotificationType.CIRCLE_ADMIN_OVERRIDE_APPROVED,
-  NotificationType.CIRCLE_POST_PUBLISHED,
   NotificationType.CIRCLE_POST_AUTO_ENDED,
   NotificationType.CIRCLE_POST_COLLABORATION_RECOGNIZED,
 ] as const);

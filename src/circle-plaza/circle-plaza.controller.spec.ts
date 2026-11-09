@@ -47,6 +47,21 @@ describe('CirclePlazaController', () => {
     ).toBeUndefined();
   });
 
+  it('exposes POST /seen to clear the plaza update dot', async () => {
+    const service = { markPlazaSeen: jest.fn().mockResolvedValue(undefined) };
+    const controller = new CirclePlazaController(service as any, {} as any);
+
+    await controller.seen({ user: { userId: 'viewer-1' } } as any);
+
+    const handler = CirclePlazaController.prototype.seen;
+    expect(Reflect.getMetadata(PATH_METADATA, handler)).toBe('seen');
+    expect(Reflect.getMetadata(METHOD_METADATA, handler)).toBe(
+      RequestMethod.POST,
+    );
+    expect(Reflect.getMetadata('THROTTLER:LIMITdefault', handler)).toBe(60);
+    expect(service.markPlazaSeen).toHaveBeenCalledWith('viewer-1');
+  });
+
   it('exposes authenticated POST /feed/search and delegates to the feed query', async () => {
     const service = { getFeed: jest.fn().mockResolvedValue({ items: [] }) };
     const controller = new CirclePlazaController(service as any, {} as any);

@@ -62,10 +62,17 @@ describe('unread notifications by domain', () => {
       circleUnread: 0,
       profileUnread: 0,
     });
-    expect(one(NotificationType.CIRCLE_POST_PUBLISHED)).toEqual({
+    expect(one(NotificationType.CIRCLE_POST_AUTO_ENDED)).toEqual({
       discoverUnread: 1,
       momentsUnread: 0,
       circleUnread: 1,
+      profileUnread: 0,
+    });
+    // 发帖通知已停用：上线前留下的未读行不能继续挂在铃铛和 tab 数字上。
+    expect(one(NotificationType.CIRCLE_POST_PUBLISHED)).toEqual({
+      discoverUnread: 0,
+      momentsUnread: 0,
+      circleUnread: 0,
       profileUnread: 0,
     });
     // 好友申请 / 入群审批 / 圈子邀请只进互动总数，两个铃铛都不收。

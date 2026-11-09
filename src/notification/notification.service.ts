@@ -36,6 +36,7 @@ import {
   type RevokePushTokenDto,
 } from './notification.dto';
 import { NotificationPushService } from './notification-push.service';
+import { loadCirclePlazaHasUpdate } from 'src/circle-plaza/circle-plaza-update.query';
 import { loadUnreadNotificationsByDomain } from './notification-unread.query';
 import { notificationPageScanQuery } from './notification-list.query';
 import { loadNotificationRealtimeDtos } from './notification-realtime.loader';
@@ -422,6 +423,10 @@ export class NotificationService {
     // 四个数来自同一条 GROUP BY type（一个池连接），域的求和在 JS 里做。
     const { discoverUnread, momentsUnread, circleUnread, profileUnread } =
       await loadUnreadNotificationsByDomain(this.prisma, userId);
+    const circlePlazaHasUpdate = await loadCirclePlazaHasUpdate(
+      this.prisma,
+      userId,
+    );
 
     return {
       discoverUnread,
@@ -429,6 +434,7 @@ export class NotificationService {
       circleUnread,
       profileUnread,
       totalUnread: discoverUnread + profileUnread,
+      circlePlazaHasUpdate,
     };
   }
 
@@ -1339,59 +1345,6 @@ export class NotificationService {
       type: NotificationType.CIRCLE_POST_COLLABORATION_RECOGNIZED,
       fromCirclePostID: params.postId,
     });
-  }
-
-  /**
-   * "XX 在圈子发布了新活动" —— 在调用方事务内批量落库通知及 durable push
-   * outbox，再补上 fromUser/fromCirclePost 组成 DTO 供提交后 realtime 广播。
-   * recipientIds 由调用方保证已排除作者、被拉黑者、并去重。
-   *
-   * DTO 要在调用方事务里返回，关系查询只能留在事务里；但整批只有一个作者、一条帖子，
-   * 只查这两张表各一次（原来是整批回读 + 9 路 include）。
-   */
-  async createCirclePostPublishedNotifications(
-    tx: Prisma.TransactionClient,
-    params: {
-      postId: string;
-      fromUserId: string;
-      recipientIds: string[];
-    },
-  ): Promise<
-    Array<{ toUserId: string; notification: NotificationRealtimeDto }>
-  > {
-    const recipients = Array.from(
-      new Set(
-        params.recipientIds.filter((id) => id && id !== params.fromUserId),
-      ),
-    );
-    if (recipients.length === 0) {
-      return [];
-    }
-
-    const created = await tx.notification.createManyAndReturn({
-      data: recipients.map((toUserID) => ({
-        toUserID,
-        fromUserID: params.fromUserId,
-        type: NotificationType.CIRCLE_POST_PUBLISHED,
-        fromCirclePostID: params.postId,
-        content: '',
-      })),
-      select: NOTIFICATION_REALTIME_BASE_SELECT,
-    });
-
-    await tx.notificationPushOutbox.createMany({
-      data: created.map(({ id }) => ({ notificationID: id })),
-    });
-
-    const recipientRows = created.filter(
-      (row): row is typeof row & { toUserID: string } =>
-        typeof row.toUserID === 'string',
-    );
-    const dtos = await loadNotificationRealtimeDtos(tx, recipientRows);
-    return recipientRows.map((row, index) => ({
-      toUserId: row.toUserID,
-      notification: dtos[index],
-    }));
   }
 
   async createCircleInvitationNotification(data: {

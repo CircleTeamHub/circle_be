@@ -204,6 +204,18 @@ export class CirclePlazaController {
     return this.plazaService.listMyPosts(req.user.userId, page);
   }
 
+  @Post('seen')
+  @HttpCode(HttpStatus.NO_CONTENT)
+  @Throttle({ default: { limit: 60, ttl: 60_000 } })
+  @ApiOperation({
+    summary: 'Mark the circle post list as seen (clears tab dot)',
+  })
+  @ApiNoContentResponse()
+  @ApiTooManyRequestsResponse({ description: 'Too many plaza seen writes' })
+  seen(@Req() req: RequestWithUser): Promise<void> {
+    return this.plazaService.markPlazaSeen(req.user.userId);
+  }
+
   @Get('me/signups/unread-count')
   @Throttle({ default: { limit: 60, ttl: 60_000 } })
   @ApiOperation({ summary: 'Unread signup count across my posts (red dot)' })

@@ -93,12 +93,14 @@ describe('CirclePlazaService', () => {
     broadcastInteractionUnread: jest.fn(),
     broadcastNotificationCreated: jest.fn(),
     broadcastUserProfileSummary: jest.fn(),
+    claimCirclePlazaPokes: jest.fn(),
+    broadcastCirclePlazaUpdated: jest.fn(),
+    broadcastCirclePlazaSeen: jest.fn(),
   };
   const notificationService = {
     createCirclePostSignupNotification: jest.fn(),
     createCirclePostAutoEndedNotification: jest.fn(),
     createCollaborationRecognitionNotification: jest.fn(),
-    createCirclePostPublishedNotifications: jest.fn(),
   };
   const iconService = {
     invalidateDisplayIconCacheFor: jest.fn(),
@@ -120,15 +122,15 @@ describe('CirclePlazaService', () => {
       }),
     );
     realtime.broadcastNotificationCreated.mockReset();
+    realtime.broadcastCirclePlazaUpdated.mockReset();
     notificationService.createCirclePostSignupNotification.mockReset();
     notificationService.createCirclePostAutoEndedNotification.mockReset();
     notificationService.createCollaborationRecognitionNotification.mockReset();
     notificationService.createCollaborationRecognitionNotification.mockResolvedValue(
       null,
     );
-    notificationService.createCirclePostPublishedNotifications.mockReset();
-    notificationService.createCirclePostPublishedNotifications.mockResolvedValue(
-      [],
+    realtime.claimCirclePlazaPokes.mockImplementation((ids: string[]) =>
+      Promise.resolve(ids),
     );
     prisma.block.findMany.mockReset();
     prisma.block.findMany.mockResolvedValue([]);
@@ -1028,9 +1030,7 @@ describe('CirclePlazaService', () => {
       response: { errorCode: 'PLAZA_MEMBERSHIP_REQUIRED' },
     });
     expect(prisma.circlePost.create).not.toHaveBeenCalled();
-    expect(
-      notificationService.createCirclePostPublishedNotifications,
-    ).not.toHaveBeenCalled();
+    expect(realtime.broadcastCirclePlazaUpdated).not.toHaveBeenCalled();
   });
 
   it('rejects a regular (never-VIP) post author before any write', async () => {
@@ -1064,142 +1064,34 @@ describe('CirclePlazaService', () => {
       response: { errorCode: 'PLAZA_MEMBERSHIP_REQUIRED' },
     });
     expect(prisma.circlePost.create).not.toHaveBeenCalled();
-    expect(
-      notificationService.createCirclePostPublishedNotifications,
-    ).not.toHaveBeenCalled();
+    expect(realtime.broadcastCirclePlazaUpdated).not.toHaveBeenCalled();
   });
 
-  it('fans out a new-activity notification to active circle members after publishing', async () => {
-    // Active member author (level 1); the publish path is gated on level > 0.
+  const flushPublishPoke = () =>
+    new Promise((resolve) => setImmediate(resolve));
+
+  const mockPublishableAuthor = (
+    recipients: string[],
+    circleIds: string[] = ['circle-1'],
+  ) => {
     prisma.user.findUnique.mockResolvedValue({
       vipLevel: 1,
       vipExpiresAt: null,
     });
-    // 发帖成员校验用 include，扇出取成员用 select.userID —— 按参数分流，不依赖调用顺序。
-    prisma.circleMember.findMany.mockImplementation((args: any) => {
-      if (args?.select?.userID) {
-        return Promise.resolve([
-          { userID: 'member-2' },
-          { userID: 'member-3' },
-        ]);
-      }
-      return Promise.resolve([
-        {
-          circleID: 'circle-1',
-          id: 'member-1',
-          status: 'ACTIVE',
-          role: 'MEMBER',
-          circle: { id: 'circle-1', deleted: false, memberCanPost: true },
-        },
-      ]);
-    });
-    prisma.circlePost.create.mockResolvedValue({
-      id: 'post-1',
-      authorID: 'user-1',
-      content: 'hi',
-      images: [],
-      tags: [],
-      city: null,
-      isHorn: false,
-      author: {
-        id: 'user-1',
-        nickname: 'Host',
-        avatarUrl: null,
-        avatarFrame: null,
-        accountId: '1001',
-      },
-      circle: { id: 'circle-1', name: 'Board games' },
-      createdAt: new Date('2026-06-29T12:00:00Z'),
-      expiresAt: new Date('2026-06-30T12:00:00Z'),
-    });
-    notificationService.createCirclePostPublishedNotifications.mockResolvedValue(
-      [
-        { toUserId: 'member-2', notification: { id: 'n2' } },
-        { toUserId: 'member-3', notification: { id: 'n3' } },
-      ],
+    // 发帖成员校验用 include，取收件人用 select.userID —— 按参数分流，不依赖调用顺序。
+    prisma.circleMember.findMany.mockImplementation((args: any) =>
+      Promise.resolve(
+        args?.select?.userID
+          ? recipients.map((userID) => ({ userID }))
+          : circleIds.map((circleID) => ({
+              circleID,
+              id: `member-of-${circleID}`,
+              status: 'ACTIVE',
+              role: 'MEMBER',
+              circle: { id: circleID, deleted: false, memberCanPost: true },
+            })),
+      ),
     );
-
-    await service.createPost('user-1', {
-      circleId: 'circle-1',
-      content: 'hi',
-    });
-
-    expect(
-      notificationService.createCirclePostPublishedNotifications,
-    ).toHaveBeenCalledWith(prisma, {
-      postId: 'post-1',
-      fromUserId: 'user-1',
-      recipientIds: ['member-2', 'member-3'],
-    });
-    expect(realtime.broadcastNotificationCreated).toHaveBeenCalledWith(
-      'member-2',
-      { id: 'n2' },
-    );
-    expect(realtime.broadcastNotificationCreated).toHaveBeenCalledWith(
-      'member-3',
-      { id: 'n3' },
-    );
-  });
-
-  it('rolls back post creation when publication outbox creation fails', async () => {
-    prisma.user.findUnique.mockResolvedValue({
-      vipLevel: 1,
-      vipExpiresAt: null,
-    });
-    prisma.circleMember.findMany.mockImplementation((args: any) => {
-      if (args?.select?.userID) {
-        return Promise.resolve([{ userID: 'member-2' }]);
-      }
-      return Promise.resolve([
-        {
-          circleID: 'circle-1',
-          id: 'member-1',
-          status: 'ACTIVE',
-          role: 'MEMBER',
-          circle: { id: 'circle-1', deleted: false, memberCanPost: true },
-        },
-      ]);
-    });
-    prisma.circlePost.create.mockResolvedValue({
-      id: 'post-1',
-      authorID: 'user-1',
-      author: { id: 'user-1' },
-      circle: { id: 'circle-1', name: 'Board games' },
-      circleLinks: [],
-    });
-    const outboxError = new Error('outbox unavailable');
-    notificationService.createCirclePostPublishedNotifications.mockRejectedValue(
-      outboxError,
-    );
-
-    await expect(
-      service.createPost('user-1', {
-        circleId: 'circle-1',
-        content: 'hi',
-      }),
-    ).rejects.toBe(outboxError);
-    expect(realtime.broadcastNotificationCreated).not.toHaveBeenCalled();
-  });
-
-  it('does not fail a committed post when realtime publication broadcast fails', async () => {
-    prisma.user.findUnique.mockResolvedValue({
-      vipLevel: 1,
-      vipExpiresAt: null,
-    });
-    prisma.circleMember.findMany.mockImplementation((args: any) => {
-      if (args?.select?.userID) {
-        return Promise.resolve([{ userID: 'member-2' }]);
-      }
-      return Promise.resolve([
-        {
-          circleID: 'circle-1',
-          id: 'member-1',
-          status: 'ACTIVE',
-          role: 'MEMBER',
-          circle: { id: 'circle-1', deleted: false, memberCanPost: true },
-        },
-      ]);
-    });
     prisma.circlePost.create.mockResolvedValue({
       id: 'post-1',
       authorID: 'user-1',
@@ -1225,17 +1117,84 @@ describe('CirclePlazaService', () => {
         avatarFrame: null,
         accountId: '1001',
       },
-      circle: { id: 'circle-1', name: 'Board games' },
+      circle: { id: circleIds[0], name: 'Board games' },
       circleLinks: [],
       createdAt: new Date('2026-06-29T12:00:00Z'),
       expiresAt: new Date('2026-06-30T12:00:00Z'),
     });
-    notificationService.createCirclePostPublishedNotifications.mockResolvedValue(
-      [{ toUserId: 'member-2', notification: { id: 'n2' } }],
+  };
+
+  // 几千人发帖时不能每条都通知：发帖只点亮 tab 红点，不写通知、不进推送 outbox。
+  it('publishes without writing a notification and pokes the other active members', async () => {
+    mockPublishableAuthor(['member-2', 'member-3']);
+
+    await service.createPost('user-1', {
+      circleId: 'circle-1',
+      content: 'hi',
+    });
+    await flushPublishPoke();
+
+    expect(realtime.broadcastNotificationCreated).not.toHaveBeenCalled();
+    expect(realtime.claimCirclePlazaPokes).toHaveBeenCalledWith(['circle-1']);
+    expect(realtime.broadcastCirclePlazaUpdated.mock.calls).toEqual([
+      ['member-2'],
+      ['member-3'],
+    ]);
+  });
+
+  it('skips the member query while every target circle is inside its poke window', async () => {
+    mockPublishableAuthor(['member-2']);
+    realtime.claimCirclePlazaPokes.mockResolvedValue([]);
+
+    await service.createPost('user-1', {
+      circleId: 'circle-1',
+      content: 'hi',
+    });
+    await flushPublishPoke();
+
+    expect(prisma.circleMember.groupBy).not.toHaveBeenCalled();
+    expect(realtime.broadcastCirclePlazaUpdated).not.toHaveBeenCalled();
+  });
+
+  it('pokes only the circles whose window it claimed', async () => {
+    mockPublishableAuthor(['member-2'], ['circle-1', 'circle-2']);
+    realtime.claimCirclePlazaPokes.mockResolvedValue(['circle-2']);
+
+    await service.createPost('user-1', {
+      circleIds: ['circle-1', 'circle-2'],
+      content: 'hi',
+    });
+    await flushPublishPoke();
+
+    expect(prisma.circleMember.groupBy).toHaveBeenCalledWith(
+      expect.objectContaining({
+        where: expect.objectContaining({ circleID: { in: ['circle-2'] } }),
+      }),
     );
-    realtime.broadcastNotificationCreated.mockImplementation(() => {
+  });
+
+  // User.updatedAt 是资料/会员缓存的版本号，打开一次列表不该让它前进。
+  it('records the plaza as seen without bumping User.updatedAt and clears other devices', async () => {
+    prisma.$executeRaw.mockResolvedValue(1);
+
+    await service.markPlazaSeen('user-1');
+
+    expect(prisma.$executeRaw).toHaveBeenCalledTimes(1);
+    expect(prisma.user.updateMany).not.toHaveBeenCalled();
+    expect(realtime.broadcastCirclePlazaSeen).toHaveBeenCalledWith('user-1');
+  });
+
+  it('does not fail a committed post when the plaza poke fails', async () => {
+    mockPublishableAuthor(['member-2']);
+    realtime.broadcastCirclePlazaUpdated.mockImplementation(() => {
       throw new Error('realtime unavailable');
     });
+    const warn = jest
+      .spyOn(
+        (service as unknown as { logger: { warn: () => void } }).logger,
+        'warn',
+      )
+      .mockImplementation(() => undefined);
 
     await expect(
       service.createPost('user-1', {
@@ -1243,6 +1202,11 @@ describe('CirclePlazaService', () => {
         content: 'hi',
       }),
     ).resolves.toEqual(expect.objectContaining({ id: 'post-1' }));
+    await flushPublishPoke();
+
+    expect(warn).toHaveBeenCalledWith(
+      expect.stringContaining('circle plaza poke failed'),
+    );
   });
 
   it('does not fail a committed post when optional appearance projection fails', async () => {
@@ -1307,58 +1271,15 @@ describe('CirclePlazaService', () => {
     expect(prisma.circlePost.create).toHaveBeenCalledTimes(1);
   });
 
-  it('excludes the author and blocked users in the capped recipient query', async () => {
-    prisma.user.findUnique.mockResolvedValue({
-      vipLevel: 1,
-      vipExpiresAt: null,
-    });
-    prisma.circleMember.findMany.mockImplementation((args: any) => {
-      if (args?.select?.userID) {
-        return Promise.resolve([{ userID: 'member-2' }]);
-      }
-      return Promise.resolve([
-        {
-          circleID: 'circle-1',
-          id: 'member-1',
-          status: 'ACTIVE',
-          role: 'MEMBER',
-          circle: { id: 'circle-1', deleted: false, memberCanPost: true },
-        },
-      ]);
-    });
-    prisma.circlePost.create.mockResolvedValue({
-      id: 'post-1',
-      authorID: 'user-1',
-      content: 'hi',
-      images: [],
-      tags: [],
-      city: null,
-      isHorn: false,
-      author: {
-        id: 'user-1',
-        nickname: 'Host',
-        avatarUrl: null,
-        avatarFrame: null,
-        accountId: '1001',
-      },
-      circle: { id: 'circle-1', name: 'Board games' },
-      createdAt: new Date('2026-06-29T12:00:00Z'),
-      expiresAt: new Date('2026-06-30T12:00:00Z'),
-    });
+  it('finds the members to poke with a capped groupBy that leaves out the author', async () => {
+    mockPublishableAuthor(['member-2']);
 
     await service.createPost('user-1', {
       circleId: 'circle-1',
       content: 'hi',
     });
-    await new Promise((resolve) => setImmediate(resolve));
+    await flushPublishPoke();
 
-    expect(
-      notificationService.createCirclePostPublishedNotifications,
-    ).toHaveBeenCalledWith(prisma, {
-      postId: 'post-1',
-      fromUserId: 'user-1',
-      recipientIds: ['member-2'],
-    });
     // 必须是 groupBy:Prisma 对 distinct + take 不生成 LIMIT(在内存里截断),
     // 50 个圈子 × 3000 人会整批读回来;groupBy 编译成 GROUP BY ... LIMIT。
     expect(prisma.circleMember.groupBy).toHaveBeenCalledWith({
@@ -1367,55 +1288,21 @@ describe('CirclePlazaService', () => {
         circleID: { in: ['circle-1'] },
         status: 'ACTIVE',
         userID: { not: 'user-1' },
-        user: {
-          blocksIssued: { none: { blockedID: 'user-1' } },
-          blocksReceived: { none: { blockerID: 'user-1' } },
-        },
       },
       orderBy: { userID: 'asc' },
-      take: 501,
+      take: 5001,
     });
     expect(prisma.circleMember.findMany).not.toHaveBeenCalledWith(
       expect.objectContaining({ distinct: expect.anything() }),
     );
-    expect(prisma.block.findMany).not.toHaveBeenCalled();
   });
 
-  it('deterministically caps publish fan-out at 500 and logs overflow', async () => {
-    const members = Array.from({ length: 501 }, (_, index) => ({
-      userID: `member-${String(index + 1).padStart(3, '0')}`,
-    }));
-    prisma.circleMember.findMany.mockImplementation((args: any) => {
-      if (args?.select?.userID) return Promise.resolve(members);
-      return Promise.resolve([
-        {
-          circleID: 'circle-1',
-          id: 'member-1',
-          status: 'ACTIVE',
-          role: 'MEMBER',
-          circle: { id: 'circle-1', deleted: false, memberCanPost: true },
-        },
-      ]);
-    });
-    prisma.circlePost.create.mockResolvedValue({
-      id: 'post-1',
-      authorID: 'user-1',
-      content: 'hi',
-      images: [],
-      tags: [],
-      city: null,
-      isHorn: false,
-      author: {
-        id: 'user-1',
-        nickname: 'Host',
-        avatarUrl: null,
-        avatarFrame: null,
-        accountId: '1001',
-      },
-      circle: { id: 'circle-1', name: 'Board games' },
-      createdAt: new Date('2026-06-29T12:00:00Z'),
-      expiresAt: new Date('2026-06-30T12:00:00Z'),
-    });
+  it('caps the poke fan-out deterministically and logs overflow', async () => {
+    const members = Array.from(
+      { length: 5001 },
+      (_, index) => `member-${String(index + 1).padStart(4, '0')}`,
+    );
+    mockPublishableAuthor(members);
     const warn = jest
       .spyOn(
         (service as unknown as { logger: { warn: () => void } }).logger,
@@ -1427,14 +1314,13 @@ describe('CirclePlazaService', () => {
       circleId: 'circle-1',
       content: 'hi',
     });
+    await flushPublishPoke();
 
-    const params =
-      notificationService.createCirclePostPublishedNotifications.mock
-        .calls[0][1];
-    expect(params.recipientIds).toHaveLength(500);
-    expect(params.recipientIds[0]).toBe('member-001');
-    expect(params.recipientIds[499]).toBe('member-500');
-    expect(warn).toHaveBeenCalledWith(expect.stringContaining('eligible>500'));
+    const poked = realtime.broadcastCirclePlazaUpdated.mock.calls;
+    expect(poked).toHaveLength(5000);
+    expect(poked[0]).toEqual(['member-0001']);
+    expect(poked[4999]).toEqual(['member-5000']);
+    expect(warn).toHaveBeenCalledWith(expect.stringContaining('eligible>5000'));
   });
 
   it('defaults to a 6h expiry when expiresInHours is omitted', async () => {

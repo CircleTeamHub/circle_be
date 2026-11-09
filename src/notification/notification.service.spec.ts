@@ -84,7 +84,7 @@ describe('NotificationService', () => {
     trace: { findMany: jest.fn() },
     traceComment: { findMany: jest.fn() },
     circle: { findMany: jest.fn() },
-    circlePost: { findMany: jest.fn() },
+    circlePost: { findMany: jest.fn(), findFirst: jest.fn() },
     circleInvitation: { findMany: jest.fn() },
     groupAdmission: { findMany: jest.fn() },
     $queryRaw: jest.fn(),
@@ -176,11 +176,15 @@ describe('NotificationService', () => {
     // 一条 GROUP BY type 取回各类型未读数，域的求和在 JS 里做。
     prisma.$queryRaw.mockResolvedValueOnce([
       { type: 'TRACE_LIKE', count: 1 },
-      { type: 'CIRCLE_POST_PUBLISHED', count: 1 },
+      { type: 'CIRCLE_POST_AUTO_ENDED', count: 1 },
       { type: 'SYSTEM', count: 1 },
       // 报名通知不属于任何铃铛域，哪个数都不计。
       { type: 'CIRCLE_POST_SIGNUP_CREATED', count: 5 },
     ]);
+    prisma.user.findUnique.mockResolvedValueOnce({
+      circlePlazaSeenAt: new Date('2026-11-08T00:00:00.000Z'),
+    });
+    prisma.circlePost.findFirst.mockResolvedValueOnce({ id: 'post-1' });
 
     await expect(service.getUnreadSummary('user-1')).resolves.toEqual({
       discoverUnread: 2,
@@ -188,6 +192,7 @@ describe('NotificationService', () => {
       circleUnread: 1,
       profileUnread: 1,
       totalUnread: 3,
+      circlePlazaHasUpdate: true,
     });
     expect(prisma.$queryRaw).toHaveBeenCalledTimes(1);
     const query = prisma.$queryRaw.mock.calls[0][0] as {
@@ -1605,120 +1610,6 @@ describe('NotificationService', () => {
           },
         }),
       );
-    });
-
-    it('creates published-post notifications and push outbox rows in the supplied transaction', async () => {
-      const created = ['member-2', 'member-3'].map((toUserID, index) =>
-        baseRow({
-          id: `n${index + 2}`,
-          type: NotificationType.CIRCLE_POST_PUBLISHED,
-          createdAt: new Date('2026-06-29T12:00:00Z'),
-          toUserID,
-          fromUserID: 'author-1',
-          fromCirclePostID: 'post-1',
-        }),
-      );
-      const tx = {
-        notification: {
-          createManyAndReturn: jest.fn().mockResolvedValue(created),
-          findMany: jest.fn(),
-        },
-        notificationPushOutbox: {
-          createMany: jest.fn().mockResolvedValue({ count: 2 }),
-        },
-        user: {
-          findMany: jest
-            .fn()
-            .mockResolvedValue([
-              { id: 'author-1', nickname: 'Host', avatarUrl: null },
-            ]),
-        },
-        circlePost: {
-          findMany: jest
-            .fn()
-            .mockResolvedValue([{ id: 'post-1', content: 'hi', images: [] }]),
-        },
-      } as unknown as Prisma.TransactionClient;
-
-      const result = await service.createCirclePostPublishedNotifications(tx, {
-        postId: 'post-1',
-        fromUserId: 'author-1',
-        recipientIds: ['member-2', 'member-3', 'author-1', 'member-2'],
-      });
-
-      expect(tx.notification.createManyAndReturn).toHaveBeenCalledWith({
-        data: [
-          {
-            toUserID: 'member-2',
-            fromUserID: 'author-1',
-            type: NotificationType.CIRCLE_POST_PUBLISHED,
-            fromCirclePostID: 'post-1',
-            content: '',
-          },
-          {
-            toUserID: 'member-3',
-            fromUserID: 'author-1',
-            type: NotificationType.CIRCLE_POST_PUBLISHED,
-            fromCirclePostID: 'post-1',
-            content: '',
-          },
-        ],
-        select: NOTIFICATION_REALTIME_BASE_SELECT,
-      });
-      expect(tx.notificationPushOutbox.createMany).toHaveBeenCalledWith({
-        data: [{ notificationID: 'n2' }, { notificationID: 'n3' }],
-      });
-      // INSERT ... RETURNING 已经带回本表列，不再整批回读；关系只查作者和帖子各一次。
-      expect(tx.notification.findMany).not.toHaveBeenCalled();
-      expect(tx.user.findMany).toHaveBeenCalledTimes(1);
-      expect(tx.circlePost.findMany).toHaveBeenCalledTimes(1);
-      expect(pushService.sendNotification).not.toHaveBeenCalled();
-      expect(result).toEqual([
-        {
-          toUserId: 'member-2',
-          notification: expect.objectContaining({
-            id: 'n2',
-            fromUser: { id: 'author-1', nickname: 'Host', avatarUrl: null },
-            fromCirclePost: { id: 'post-1', excerpt: 'hi', firstImage: null },
-          }),
-        },
-        {
-          toUserId: 'member-3',
-          notification: expect.objectContaining({ id: 'n3' }),
-        },
-      ]);
-    });
-
-    it('propagates push outbox creation failure to the caller transaction', async () => {
-      const outboxError = new Error('outbox unavailable');
-      const tx = {
-        notification: {
-          createManyAndReturn: jest.fn().mockResolvedValue([
-            baseRow({
-              id: 'n2',
-              type: NotificationType.CIRCLE_POST_PUBLISHED,
-              toUserID: 'member-2',
-              fromUserID: 'author-1',
-              fromCirclePostID: 'post-1',
-            }),
-          ]),
-        },
-        notificationPushOutbox: {
-          createMany: jest.fn().mockRejectedValue(outboxError),
-        },
-        user: { findMany: jest.fn() },
-        circlePost: { findMany: jest.fn() },
-      } as unknown as Prisma.TransactionClient;
-
-      await expect(
-        service.createCirclePostPublishedNotifications(tx, {
-          postId: 'post-1',
-          fromUserId: 'author-1',
-          recipientIds: ['member-2'],
-        }),
-      ).rejects.toBe(outboxError);
-      expect(tx.user.findMany).not.toHaveBeenCalled();
-      expect(pushService.sendNotification).not.toHaveBeenCalled();
     });
 
     it('fans out trace comment notifications in precedence order and reads relations after commit', async () => {

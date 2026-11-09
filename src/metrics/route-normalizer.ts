@@ -117,6 +117,7 @@ export const STATIC_ROUTES = new Set([
   '/api/v1/circle-plaza/me/posts',
   '/api/v1/circle-plaza/me/signups/unread-count',
   '/api/v1/circle-plaza/posts',
+  '/api/v1/circle-plaza/seen',
   '/api/v1/avatar-frames/me',
   '/api/v1/avatar-frames/me/equipped',
   '/api/v1/coin/gift',

@@ -842,7 +842,10 @@ describe('NotificationPushOutboxProcessor (#88 per-token)', () => {
 });
 
 describe('圈子离线推送开关', () => {
-  const circleNotification = { ...notification, type: 'CIRCLE_POST_PUBLISHED' };
+  const circleNotification = {
+    ...notification,
+    type: 'CIRCLE_POST_AUTO_ENDED',
+  };
 
   const circleJob = {
     id: 'job-circle',

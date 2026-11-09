@@ -11,6 +11,7 @@ import { WebSocket } from 'ws';
 import { PrismaService } from 'src/prisma/prisma.service';
 import { RedisService } from 'src/redis/redis.service';
 import { PROFILE_NOTIFICATION_TYPES } from 'src/notification/notification.constants';
+import { loadCirclePlazaHasUpdate } from 'src/circle-plaza/circle-plaza-update.query';
 import { loadUnreadNotificationsByDomain } from 'src/notification/notification-unread.query';
 import {
   profileUnreadCountsByRecipientQuery,
@@ -65,11 +66,13 @@ type BadgeSnapshot = {
   discoverUnread: number;
   /** 朋友圈铃铛未读 —— 动态互动 + 资料点赞。 */
   momentsUnread: number;
-  /** 圈子铃铛未读 —— 担保验证/入圈审批/圈子帖动态（不含报名，见 signupUnread）。 */
+  /** 圈子铃铛未读 —— 担保验证/入圈审批/活动结束与认可（不含报名，见 signupUnread）。 */
   circleUnread: number;
   signupUnread: number;
   profileUnread: number;
   systemUnread: number;
+  /** 飞机 tab 的红点：上次打开圈子帖子列表后，有别人发的新帖。 */
+  circlePlazaHasUpdate: boolean;
   syncedAt: string;
 };
 
@@ -170,6 +173,10 @@ type RealtimeEvent =
       };
     }
   | {
+      type: 'circle.plaza.unread.changed';
+      payload: { hasUpdate: boolean; changedAt: string };
+    }
+  | {
       type: 'membership.status.changed';
       payload: MembershipStatusPayload;
     }
@@ -245,6 +252,7 @@ export class RealtimeService implements OnModuleInit, OnModuleDestroy {
   private static readonly REDIS_CHANNEL_PATTERN = `${RealtimeService.REDIS_CHANNEL_PREFIX}*`;
   private static readonly HOT_CACHE_PREFIX = 'circle:hot:user:';
   private static readonly BADGE_SNAPSHOT_TTL_SECONDS = 10;
+  private static readonly CIRCLE_PLAZA_POKE_WINDOW_MS = 30_000;
   private static readonly PROFILE_SUMMARY_TTL_SECONDS = 30;
   private static readonly MEMBERSHIP_STATUS_TTL_SECONDS = 30;
   private static readonly SUBSCRIPTION_RETRY_BASE_MS = 1_000;
@@ -266,6 +274,7 @@ export class RealtimeService implements OnModuleInit, OnModuleDestroy {
     'friend.activity.unread.changed',
     'interaction.unread.changed',
     'circle.signup.unread.changed',
+    'circle.plaza.unread.changed',
     'system.notification.unread.changed',
     'membership.status.changed',
     'wallet.balance.changed',
@@ -522,6 +531,10 @@ export class RealtimeService implements OnModuleInit, OnModuleDestroy {
       }),
     ]);
     const signupUnread = await this.countUnreadSignups(userId);
+    const circlePlazaHasUpdate = await loadCirclePlazaHasUpdate(
+      this.prisma,
+      userId,
+    );
     const { discoverUnread, momentsUnread, circleUnread, profileUnread } =
       notifications;
 
@@ -534,6 +547,7 @@ export class RealtimeService implements OnModuleInit, OnModuleDestroy {
       signupUnread,
       profileUnread,
       systemUnread: profileUnread,
+      circlePlazaHasUpdate,
       syncedAt: new Date().toISOString(),
     };
     return snapshot;
@@ -604,6 +618,39 @@ export class RealtimeService implements OnModuleInit, OnModuleDestroy {
         count,
         changedAt: new Date().toISOString(),
       },
+    });
+  }
+
+  /**
+   * 圈子帖子红点的实时信号按圈子限频：窗口内第一条帖子发信号，其余跳过。
+   * 返回这次拿到窗口的圈子。Redis 不可用时放行 —— 多几帧总比红点不亮好。
+   */
+  async claimCirclePlazaPokes(circleIds: string[]): Promise<string[]> {
+    const leases = await Promise.all(
+      circleIds.map((circleId) =>
+        this.redisService?.tryAcquireLease(
+          `circle:plaza-poke:${circleId}`,
+          RealtimeService.CIRCLE_PLAZA_POKE_WINDOW_MS,
+        ),
+      ),
+    );
+    return circleIds.filter((_, index) => leases[index] !== null);
+  }
+
+  /** 有新帖：点亮飞机红点。不失效快照缓存 —— 那要给每个成员写一次 Redis，缓存本身只活 10 秒。 */
+  broadcastCirclePlazaUpdated(userId: string) {
+    this.broadcast(userId, {
+      type: 'circle.plaza.unread.changed',
+      payload: { hasUpdate: true, changedAt: new Date().toISOString() },
+    });
+  }
+
+  /** 本人看过列表：清掉其它设备的红点；缓存里那份旧快照不能再把红点带回来。 */
+  async broadcastCirclePlazaSeen(userId: string) {
+    await this.invalidateBadgeSnapshotCache(userId);
+    this.broadcast(userId, {
+      type: 'circle.plaza.unread.changed',
+      payload: { hasUpdate: false, changedAt: new Date().toISOString() },
     });
   }
 

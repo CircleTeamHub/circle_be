@@ -29,6 +29,7 @@ describe('RealtimeService', () => {
     setJsonIfVersionMatches: jest.fn(),
     invalidateVersionedKey: jest.fn(),
     deleteKey: jest.fn(),
+    tryAcquireLease: jest.fn(),
   };
 
   const prisma = {
@@ -37,6 +38,9 @@ describe('RealtimeService', () => {
     },
     circlePostSignup: {
       count: jest.fn(),
+    },
+    circlePost: {
+      findFirst: jest.fn(),
     },
     notification: {
       count: jest.fn(),
@@ -127,7 +131,7 @@ describe('RealtimeService', () => {
     // 通知四个域来自同一条 GROUP BY type，按类型求和。
     prisma.$queryRaw.mockResolvedValue([
       { type: 'TRACE_LIKE', count: 1 },
-      { type: 'CIRCLE_POST_PUBLISHED', count: 1 },
+      { type: 'CIRCLE_POST_AUTO_ENDED', count: 1 },
       { type: 'SYSTEM', count: 1 },
     ]);
 
@@ -140,6 +144,7 @@ describe('RealtimeService', () => {
       signupUnread: 4,
       profileUnread: 1,
       systemUnread: 1,
+      circlePlazaHasUpdate: false,
       syncedAt: expect.any(String),
     });
     expect(prisma.$queryRaw).toHaveBeenCalledTimes(1);
@@ -231,7 +236,7 @@ describe('RealtimeService', () => {
     const broadcast = jest.spyOn(service, 'broadcast').mockImplementation();
     prisma.$queryRaw.mockResolvedValue([
       { type: 'TRACE_LIKE', count: 2 },
-      { type: 'CIRCLE_POST_PUBLISHED', count: 3 },
+      { type: 'CIRCLE_POST_AUTO_ENDED', count: 3 },
       // 系统通知不进互动域；报名不进任何铃铛。
       { type: 'SYSTEM', count: 9 },
       { type: 'CIRCLE_POST_SIGNUP_CREATED', count: 9 },
@@ -359,6 +364,109 @@ describe('RealtimeService', () => {
         joinedAt: '2026-06-11T03:00:10.000Z',
         changedAt: '2026-06-11T03:00:10.000Z',
       },
+    });
+  });
+
+  describe('circle plaza update dot', () => {
+    const seenAt = new Date('2026-11-08T00:00:00.000Z');
+
+    beforeEach(() => {
+      prisma.friendActivity.count.mockResolvedValue(0);
+      prisma.circlePostSignup.count.mockResolvedValue(0);
+      prisma.$queryRaw.mockResolvedValue([]);
+      prisma.user.findUnique.mockResolvedValue({ circlePlazaSeenAt: seenAt });
+    });
+
+    it('lights the dot for a post newer than the last visit that the feed would show', async () => {
+      prisma.circlePost.findFirst.mockResolvedValue({ id: 'post-1' });
+
+      await expect(service.buildSnapshot('user-1')).resolves.toEqual(
+        expect.objectContaining({ circlePlazaHasUpdate: true }),
+      );
+      expect(prisma.circlePost.findFirst).toHaveBeenCalledWith({
+        where: expect.objectContaining({
+          status: 'ACTIVE',
+          createdAt: { gt: seenAt },
+          authorID: { not: 'user-1' },
+          circleLinks: {
+            some: {
+              circle: {
+                deleted: false,
+                members: { some: { userID: 'user-1', status: 'ACTIVE' } },
+              },
+            },
+          },
+        }),
+        select: { id: true },
+      });
+    });
+
+    it('keeps the dot off when nothing is newer', async () => {
+      prisma.circlePost.findFirst.mockResolvedValue(null);
+
+      await expect(service.buildSnapshot('user-1')).resolves.toEqual(
+        expect.objectContaining({ circlePlazaHasUpdate: false }),
+      );
+    });
+
+    it('claims one poke window per circle and goes quiet while a window is held', async () => {
+      redis.tryAcquireLease
+        .mockResolvedValueOnce('token')
+        .mockResolvedValueOnce(null);
+
+      await expect(service.claimCirclePlazaPokes(['a', 'b'])).resolves.toEqual([
+        'a',
+      ]);
+      expect(redis.tryAcquireLease).toHaveBeenCalledWith(
+        'circle:plaza-poke:a',
+        30_000,
+      );
+    });
+
+    it('still pokes when Redis cannot answer', async () => {
+      redis.tryAcquireLease.mockResolvedValue(undefined);
+
+      await expect(service.claimCirclePlazaPokes(['a'])).resolves.toEqual([
+        'a',
+      ]);
+    });
+
+    it('lights the dot with a single frame and leaves the snapshot cache alone', () => {
+      const broadcast = jest.spyOn(service, 'broadcast').mockImplementation();
+
+      service.broadcastCirclePlazaUpdated('user-1');
+
+      expect(broadcast).toHaveBeenCalledWith('user-1', {
+        type: 'circle.plaza.unread.changed',
+        payload: { hasUpdate: true, changedAt: expect.any(String) },
+      });
+      expect(redis.invalidateVersionedKey).not.toHaveBeenCalled();
+    });
+
+    it('drops the cached snapshot before clearing the dot on other devices', async () => {
+      const broadcast = jest.spyOn(service, 'broadcast').mockImplementation();
+
+      await service.broadcastCirclePlazaSeen('user-1');
+
+      expect(redis.invalidateVersionedKey).toHaveBeenCalledWith(
+        'circle:hot:user:user-1:badge-snapshot',
+        'circle:hot:user:user-1:badge-snapshot:version',
+      );
+      expect(broadcast).toHaveBeenCalledWith('user-1', {
+        type: 'circle.plaza.unread.changed',
+        payload: { hasUpdate: false, changedAt: expect.any(String) },
+      });
+    });
+
+    // 不在白名单里的事件会被 Redis 背板静默丢掉，多实例部署时红点就只在本实例亮。
+    it('lets the dot event cross the Redis backplane', () => {
+      const allowList = (
+        RealtimeService as unknown as {
+          REALTIME_EVENT_TYPES: ReadonlySet<string>;
+        }
+      ).REALTIME_EVENT_TYPES;
+
+      expect(allowList.has('circle.plaza.unread.changed')).toBe(true);
     });
   });
 
