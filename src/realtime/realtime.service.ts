@@ -645,12 +645,12 @@ export class RealtimeService implements OnModuleInit, OnModuleDestroy {
     });
   }
 
-  /** 本人看过列表：清掉其它设备的红点；缓存里那份旧快照不能再把红点带回来。 */
-  async broadcastCirclePlazaSeen(userId: string) {
+  /** 本人确认 feed 水位后同步实际红点；失效旧快照，避免其它设备读回旧状态。 */
+  async broadcastCirclePlazaSeen(userId: string, hasUpdate: boolean) {
     await this.invalidateBadgeSnapshotCache(userId);
     this.broadcast(userId, {
       type: 'circle.plaza.unread.changed',
-      payload: { hasUpdate: false, changedAt: new Date().toISOString() },
+      payload: { hasUpdate, changedAt: new Date().toISOString() },
     });
   }
 

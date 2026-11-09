@@ -443,20 +443,23 @@ describe('RealtimeService', () => {
       expect(redis.invalidateVersionedKey).not.toHaveBeenCalled();
     });
 
-    it('drops the cached snapshot before clearing the dot on other devices', async () => {
-      const broadcast = jest.spyOn(service, 'broadcast').mockImplementation();
+    it.each([true, false])(
+      'invalidates the cached snapshot and broadcasts actual remaining updates=%s',
+      async (hasUpdate) => {
+        const broadcast = jest.spyOn(service, 'broadcast').mockImplementation();
 
-      await service.broadcastCirclePlazaSeen('user-1');
+        await service.broadcastCirclePlazaSeen('user-1', hasUpdate);
 
-      expect(redis.invalidateVersionedKey).toHaveBeenCalledWith(
-        'circle:hot:user:user-1:badge-snapshot',
-        'circle:hot:user:user-1:badge-snapshot:version',
-      );
-      expect(broadcast).toHaveBeenCalledWith('user-1', {
-        type: 'circle.plaza.unread.changed',
-        payload: { hasUpdate: false, changedAt: expect.any(String) },
-      });
-    });
+        expect(redis.invalidateVersionedKey).toHaveBeenCalledWith(
+          'circle:hot:user:user-1:badge-snapshot',
+          'circle:hot:user:user-1:badge-snapshot:version',
+        );
+        expect(broadcast).toHaveBeenCalledWith('user-1', {
+          type: 'circle.plaza.unread.changed',
+          payload: { hasUpdate, changedAt: expect.any(String) },
+        });
+      },
+    );
 
     // 不在白名单里的事件会被 Redis 背板静默丢掉，多实例部署时红点就只在本实例亮。
     it('lets the dot event cross the Redis backplane', () => {

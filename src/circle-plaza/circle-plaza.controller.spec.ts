@@ -1,6 +1,7 @@
-import { RequestMethod } from '@nestjs/common';
+import { HttpStatus, RequestMethod } from '@nestjs/common';
 import {
   GUARDS_METADATA,
+  HTTP_CODE_METADATA,
   METHOD_METADATA,
   PATH_METADATA,
 } from '@nestjs/common/constants';
@@ -9,6 +10,9 @@ import { JwtGuard } from 'src/guards/jwt.guard';
 import { IdempotencyScope } from 'src/idempotency/idempotency.service';
 import { CirclePlazaController } from './circle-plaza.controller';
 import { CirclePlazaService } from './circle-plaza.service';
+import { PlazaSeenDto } from './dto/circle-plaza.dto';
+import { plainToInstance } from 'class-transformer';
+import { validate } from 'class-validator';
 
 describe('CirclePlazaController', () => {
   it('requires authentication and throttling for plaza routes', () => {
@@ -47,11 +51,16 @@ describe('CirclePlazaController', () => {
     ).toBeUndefined();
   });
 
-  it('exposes POST /seen to clear the plaza update dot', async () => {
-    const service = { markPlazaSeen: jest.fn().mockResolvedValue(undefined) };
+  it('accepts a feed snapshot on POST /seen and returns remaining updates', async () => {
+    const service = {
+      markPlazaSeen: jest.fn().mockResolvedValue({ hasUpdate: true }),
+    };
     const controller = new CirclePlazaController(service as any, {} as any);
 
-    await controller.seen({ user: { userId: 'viewer-1' } } as any);
+    const body = { snapshotAt: '2026-11-09T00:00:00.123Z' };
+    await expect(
+      controller.seen(body, { user: { userId: 'viewer-1' } } as any),
+    ).resolves.toEqual({ hasUpdate: true });
 
     const handler = CirclePlazaController.prototype.seen;
     expect(Reflect.getMetadata(PATH_METADATA, handler)).toBe('seen');
@@ -59,7 +68,36 @@ describe('CirclePlazaController', () => {
       RequestMethod.POST,
     );
     expect(Reflect.getMetadata('THROTTLER:LIMITdefault', handler)).toBe(60);
-    expect(service.markPlazaSeen).toHaveBeenCalledWith('viewer-1');
+    expect(Reflect.getMetadata(HTTP_CODE_METADATA, handler)).toBe(
+      HttpStatus.OK,
+    );
+    expect(service.markPlazaSeen).toHaveBeenCalledWith(
+      'viewer-1',
+      body.snapshotAt,
+    );
+  });
+
+  it.each([
+    {},
+    { snapshotAt: null },
+    { snapshotAt: 'invalid' },
+    { snapshotAt: '2026-02-30T00:00:00.000Z' },
+    { snapshotAt: 123 },
+  ])('rejects invalid seen watermarks: %j', async (body) => {
+    const errors = await validate(
+      plainToInstance(PlazaSeenDto, body) as object,
+    );
+    expect(errors.some((error) => error.property === 'snapshotAt')).toBe(true);
+  });
+
+  it('accepts an ISO feed snapshot watermark', async () => {
+    await expect(
+      validate(
+        plainToInstance(PlazaSeenDto, {
+          snapshotAt: '2026-11-09T00:00:00.123Z',
+        }) as object,
+      ),
+    ).resolves.toEqual([]);
   });
 
   it('exposes authenticated POST /feed/search and delegates to the feed query', async () => {

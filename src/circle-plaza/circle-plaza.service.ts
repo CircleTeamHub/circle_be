@@ -58,6 +58,7 @@ import {
   activeUnexpiredPostWhere,
   CIRCLE_POST_AUTO_END_MS,
   memberCircleScope,
+  loadCirclePlazaHasUpdate,
 } from './circle-plaza-update.query';
 
 // The relations every DTO mapping needs, narrowed to the columns it reads.
@@ -497,17 +498,22 @@ export class CirclePlazaService {
     }
   }
 
-  /**
-   * 用户打开了圈子帖子列表：红点从这一刻重新算，并同步给他其它在线设备。
-   *
-   * 不用 prisma.user.update：它会带上 @updatedAt，而 User.updatedAt 是资料/会员
-   * 缓存的版本号，看一眼列表不该让它前进。
-   */
-  async markPlazaSeen(userId: string): Promise<void> {
+  /** 推进到成功 feed 的水位；User.updatedAt 是资料/会员缓存版本，不应改变。 */
+  async markPlazaSeen(
+    userId: string,
+    snapshotAt: string,
+  ): Promise<{ hasUpdate: boolean }> {
     await this.prisma.$executeRaw`
-      UPDATE "User" SET "circlePlazaSeenAt" = ${new Date()} WHERE "id" = ${userId}
+      UPDATE "User"
+      SET "circlePlazaSeenAt" = GREATEST("circlePlazaSeenAt", LEAST(
+        ${new Date(snapshotAt)}::timestamp,
+        date_trunc('milliseconds', CURRENT_TIMESTAMP AT TIME ZONE 'UTC')
+      ))
+      WHERE "id" = ${userId}
     `;
-    await this.realtime.broadcastCirclePlazaSeen(userId);
+    const hasUpdate = await loadCirclePlazaHasUpdate(this.prisma, userId);
+    await this.realtime.broadcastCirclePlazaSeen(userId, hasUpdate);
+    return { hasUpdate };
   }
 
   async getFeed(
@@ -520,6 +526,7 @@ export class CirclePlazaService {
     limit: number;
     hasMore: boolean;
     nextCursor: string | null;
+    snapshotAt: string;
   }> {
     const page = query.page ?? 1;
     const limit = query.limit ?? 20;
@@ -540,6 +547,12 @@ export class CirclePlazaService {
         ? legacyCities
         : this.normalizeCities(this.parseCommaList(query.cities, 1001));
 
+    // UTC + millisecond precision matches Prisma's timestamp columns and ISO transport.
+    const [{ snapshotAt }] = await this.prisma.$queryRaw<
+      Array<{ snapshotAt: Date }>
+    >`
+      SELECT date_trunc('milliseconds', CURRENT_TIMESTAMP AT TIME ZONE 'UTC') AS "snapshotAt"
+    `;
     const viewer = await this.prisma.user.findUnique({
       where: { id: viewerId },
       select: {
@@ -600,6 +613,7 @@ export class CirclePlazaService {
 
     const whereBase: Prisma.CirclePostWhereInput = {
       ...activeUnexpiredPostWhere(),
+      createdAt: { lte: snapshotAt },
       circleLinks: { some: linkFilter },
     };
     // 城市筛选走 cities[] 数组谓词（旧数据已回填 cities，故仍能命中）：
@@ -671,7 +685,15 @@ export class CirclePlazaService {
         `returned=${posts.length} total=${total ?? '-'}`,
     );
 
-    return { items, total, page, limit, hasMore, nextCursor };
+    return {
+      items,
+      total,
+      page,
+      limit,
+      hasMore,
+      nextCursor,
+      snapshotAt: snapshotAt.toISOString(),
+    };
   }
 
   async getPost(viewerId: string, postId: string): Promise<PlazaPostDto> {

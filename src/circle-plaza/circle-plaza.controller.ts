@@ -42,6 +42,8 @@ import {
   PlazaFeedResponseDto,
   PlazaFeedSearchDto,
   PlazaPostDto,
+  PlazaSeenDto,
+  PlazaSeenResponseDto,
   RecognizePostCollaboratorsDto,
   ReportCirclePostDto,
   PostSignupItemDto,
@@ -205,15 +207,19 @@ export class CirclePlazaController {
   }
 
   @Post('seen')
-  @HttpCode(HttpStatus.NO_CONTENT)
+  @HttpCode(HttpStatus.OK)
   @Throttle({ default: { limit: 60, ttl: 60_000 } })
   @ApiOperation({
-    summary: 'Mark the circle post list as seen (clears tab dot)',
+    summary:
+      'Acknowledge a successful feed snapshot and return remaining updates',
   })
-  @ApiNoContentResponse()
+  @ApiOkResponse({ type: PlazaSeenResponseDto })
   @ApiTooManyRequestsResponse({ description: 'Too many plaza seen writes' })
-  seen(@Req() req: RequestWithUser): Promise<void> {
-    return this.plazaService.markPlazaSeen(req.user.userId);
+  seen(
+    @Body() dto: PlazaSeenDto,
+    @Req() req: RequestWithUser,
+  ): Promise<PlazaSeenResponseDto> {
+    return this.plazaService.markPlazaSeen(req.user.userId, dto.snapshotAt);
   }
 
   @Get('me/signups/unread-count')

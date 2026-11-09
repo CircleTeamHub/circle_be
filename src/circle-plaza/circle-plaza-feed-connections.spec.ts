@@ -15,6 +15,7 @@ import { CirclePlazaService } from './circle-plaza.service';
  */
 describe('CirclePlazaService feed connection usage', () => {
   const prisma = {
+    $queryRaw: jest.fn().mockResolvedValue([{ snapshotAt: new Date() }]),
     user: {
       findUnique: jest.fn().mockResolvedValue({
         vipLevel: 1,
