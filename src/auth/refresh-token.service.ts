@@ -841,8 +841,8 @@ export class RefreshTokenService {
             select: { id: true, createdAt: true },
           })
         : null;
-      // 这个请求比后继来得还早：客户端等不及重发并已成功，它排队到现在才拿到锁。后继已经送达，
-      // 不能动它，也不算重放；客户端早已放弃这个请求，回什么它都收不到。
+      // 这个请求比后继来得还早：它在锁上排队时，同一次尝试的另一个请求已经换出了后继。后继可能
+      // 已经送达，不能动它，也不算重放。客户端万一还在等这个请求，409 也不会结束会话，下次同 ID 重试。
       if (
         undelivered &&
         context?.requestReceivedAt &&
