@@ -1,4 +1,9 @@
-import { Injectable, Logger, UnauthorizedException } from '@nestjs/common';
+import {
+  ConflictException,
+  Injectable,
+  Logger,
+  UnauthorizedException,
+} from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { CronExpression } from '@nestjs/schedule';
 import { createHash, randomBytes, randomUUID } from 'crypto';
@@ -77,6 +82,10 @@ export type SessionContext = {
   deviceKey?: string | null;
   /** sha256(x-stable-device-id)：老安卓安装重装后会用的设备 ID，只在续签时登记。 */
   stableDeviceKey?: string | null;
+  /** 客户端这次续签的尝试 ID：结果没送到时会带同一 ID 重试。 */
+  rotationAttemptId?: string | null;
+  /** 请求到达服务端的时间：用来认出排队太久、已被后来的重试取代的旧请求。 */
+  requestReceivedAt?: Date;
 };
 
 export type RefreshTokenAudience = 'APP' | 'ADMIN';
@@ -120,6 +129,7 @@ function normalizeContext(context?: SessionContext): SessionContext {
     ip: truncate(context?.ip, MAX_IP_LENGTH),
     userAgent: truncate(context?.userAgent, MAX_USER_AGENT_LENGTH),
     deviceKey: context?.deviceKey ?? null,
+    rotationAttemptId: context?.rotationAttemptId ?? null,
   };
 }
 
@@ -218,6 +228,7 @@ export class RefreshTokenService {
         ip: safe.ip,
         userAgent: safe.userAgent,
         deviceKey: safe.deviceKey,
+        rotationAttemptId: safe.rotationAttemptId,
         audience,
         lastUsedAt: new Date(),
       },
@@ -816,47 +827,80 @@ export class RefreshTokenService {
       ) {
         throw new UnauthorizedException('Invalid or expired refresh token');
       }
-      // Reuse compromises this family, not the account's independent sessions.
-      // A durable generation also rejects every ROTATED ancestor without Redis.
-      const scopeState = await this.advanceScopeGenerationWithClient(
-        tx,
-        record.userId,
-        SessionRevocationScope.FAMILY,
-        record.familyId,
-      );
-      await tx.refreshToken.updateMany({
-        where: {
+      // 同一次续签的重试：上次换出来的会话结果没送到客户端（超时、断流、进程被杀），也就没人
+      // 用它续签过。作废它，下面重新发一个。尝试 ID 对不上，或后继已被用来续签，才算重放。
+      const undelivered = context?.rotationAttemptId
+        ? await tx.refreshToken.findFirst({
+            where: {
+              userId: record.userId,
+              familyId: record.familyId,
+              audience,
+              rotationAttemptId: context.rotationAttemptId,
+              revokedAt: null,
+            },
+            select: { id: true, createdAt: true },
+          })
+        : null;
+      // 这个请求比后继来得还早：它在锁上排队时，同一次尝试的另一个请求已经换出了后继。后继可能
+      // 已经送达，不能动它，也不算重放。客户端万一还在等这个请求，409 也不会结束会话，下次同 ID 重试。
+      if (
+        undelivered &&
+        context?.requestReceivedAt &&
+        undelivered.createdAt >= context.requestReceivedAt
+      ) {
+        throw new ConflictException('Superseded by a newer refresh attempt');
+      }
+      if (undelivered) {
+        await tx.refreshToken.updateMany({
+          where: { id: undelivered.id, revokedAt: null },
+          data: {
+            revokedAt: now,
+            revocationReason: RefreshTokenRevocationReason.ROTATED,
+          },
+        });
+      } else {
+        // Reuse compromises this family, not the account's independent sessions.
+        // A durable generation also rejects every ROTATED ancestor without Redis.
+        const scopeState = await this.advanceScopeGenerationWithClient(
+          tx,
+          record.userId,
+          SessionRevocationScope.FAMILY,
+          record.familyId,
+        );
+        await tx.refreshToken.updateMany({
+          where: {
+            userId: record.userId,
+            familyId: record.familyId,
+            revokedAt: null,
+          },
+          data: {
+            revokedAt: now,
+            revocationReason: RefreshTokenRevocationReason.TOKEN_FAMILY_REUSE,
+          },
+        });
+        return {
+          kind: 'reuse',
           userId: record.userId,
           familyId: record.familyId,
+          generation: scopeState.generation,
+        };
+      }
+    } else {
+      const revoked = await tx.refreshToken.updateMany({
+        where: {
+          token: tokenHash,
           revokedAt: null,
+          expiredAt: { gt: now },
+          audience,
         },
         data: {
           revokedAt: now,
-          revocationReason: RefreshTokenRevocationReason.TOKEN_FAMILY_REUSE,
+          revocationReason: RefreshTokenRevocationReason.ROTATED,
         },
       });
-      return {
-        kind: 'reuse',
-        userId: record.userId,
-        familyId: record.familyId,
-        generation: scopeState.generation,
-      };
-    }
-
-    const revoked = await tx.refreshToken.updateMany({
-      where: {
-        token: tokenHash,
-        revokedAt: null,
-        expiredAt: { gt: now },
-        audience,
-      },
-      data: {
-        revokedAt: now,
-        revocationReason: RefreshTokenRevocationReason.ROTATED,
-      },
-    });
-    if (revoked.count !== 1) {
-      throw new UnauthorizedException('Invalid or expired refresh token');
+      if (revoked.count !== 1) {
+        throw new UnauthorizedException('Invalid or expired refresh token');
+      }
     }
 
     const newSession = await this.createWithClient(
@@ -869,6 +913,7 @@ export class RefreshTokenService {
         // 会话一旦绑定设备就不再改绑：换设备 ID 续签同一个 refresh token
         // 只可能是令牌被拷走，不能借此把别的设备「洗」成受信任。
         deviceKey: record.deviceKey ?? context?.deviceKey ?? null,
+        rotationAttemptId: context?.rotationAttemptId ?? null,
       },
       record.audience,
       record.familyId,

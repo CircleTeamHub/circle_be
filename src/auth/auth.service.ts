@@ -1809,8 +1809,9 @@ export class AuthService {
     }
 
     if (user.loginSecurityCodeHash) {
+      // 输错安全码用 403，不用 401：客户端遇 401 会续签重试，重试仍 401 就清会话下线。
       if (!oldSecurityCode) {
-        throw new UnauthorizedException({
+        throw new ForbiddenException({
           message: '当前安全码不正确',
           errorCode: AuthErrorCode.SecurityCodeInvalid,
         });
@@ -1821,7 +1822,7 @@ export class AuthService {
         oldSecurityCode,
       );
       if (!oldCodeValid) {
-        throw new UnauthorizedException({
+        throw new ForbiddenException({
           message: '当前安全码不正确',
           errorCode: AuthErrorCode.SecurityCodeInvalid,
         });
@@ -1871,7 +1872,7 @@ export class AuthService {
 
     const valid = await argon2.verify(user.loginSecurityCodeHash, securityCode);
     if (!valid) {
-      throw new UnauthorizedException({
+      throw new ForbiddenException({
         message: '安全码不正确',
         errorCode: AuthErrorCode.SecurityCodeInvalid,
       });
