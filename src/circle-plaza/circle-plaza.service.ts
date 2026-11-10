@@ -506,7 +506,7 @@ export class CirclePlazaService {
   async markPlazaSeen(
     userId: string,
     snapshotAt?: string,
-  ): Promise<{ hasUpdate: boolean }> {
+  ): Promise<{ hasUpdate: boolean; changedAt: string }> {
     await this.prisma.$executeRaw`
       UPDATE "User"
       SET "circlePlazaSeenAt" = GREATEST("circlePlazaSeenAt", LEAST(
@@ -520,14 +520,8 @@ export class CirclePlazaService {
       this.prisma,
       userId,
     );
-    if (changedAt !== null) {
-      await this.realtime.broadcastCirclePlazaSeen(
-        userId,
-        hasUpdate,
-        changedAt,
-      );
-    }
-    return { hasUpdate };
+    await this.realtime.broadcastCirclePlazaSeen(userId, hasUpdate, changedAt);
+    return { hasUpdate, changedAt };
   }
 
   async getFeed(

@@ -38,33 +38,37 @@ export function activeUnexpiredPostWhere(
  * 扫描量也只跟「当前还在进行的帖子」有关，不会随历史累积。
  */
 export async function loadCirclePlazaUpdate(
-  prisma: Pick<PrismaService, 'user' | 'circlePost'>,
+  prisma: Pick<PrismaService, 'user' | 'circlePost' | '$queryRaw'>,
   userId: string,
-): Promise<{ hasUpdate: boolean; changedAt: string | null }> {
+): Promise<{ hasUpdate: boolean; changedAt: string }> {
+  // State versions must advance even when the last unread post expires or is deleted.
+  const [clock] = await prisma.$queryRaw<Array<{ observedAt: Date }>>`
+    SELECT date_trunc('milliseconds', CURRENT_TIMESTAMP AT TIME ZONE 'UTC') AS "observedAt"
+  `;
+  const observedAt = clock.observedAt;
   const viewer = await prisma.user.findUnique({
     where: { id: userId },
     select: { circlePlazaSeenAt: true },
   });
-  if (!viewer) return { hasUpdate: false, changedAt: null };
+  if (!viewer) return { hasUpdate: false, changedAt: observedAt.toISOString() };
 
   const newerPost = await prisma.circlePost.findFirst({
     where: {
-      ...activeUnexpiredPostWhere(),
-      createdAt: { gt: viewer.circlePlazaSeenAt },
+      ...activeUnexpiredPostWhere(observedAt),
+      createdAt: { gt: viewer.circlePlazaSeenAt, lte: observedAt },
       authorID: { not: userId },
       circleLinks: { some: { circle: memberCircleScope(userId) } },
     },
-    orderBy: { createdAt: 'desc' },
-    select: { createdAt: true },
+    select: { id: true },
   });
   return {
     hasUpdate: newerPost !== null,
-    changedAt: (newerPost?.createdAt ?? viewer.circlePlazaSeenAt).toISOString(),
+    changedAt: observedAt.toISOString(),
   };
 }
 
 export async function loadCirclePlazaHasUpdate(
-  prisma: Pick<PrismaService, 'user' | 'circlePost'>,
+  prisma: Pick<PrismaService, 'user' | 'circlePost' | '$queryRaw'>,
   userId: string,
 ): Promise<boolean> {
   return (await loadCirclePlazaUpdate(prisma, userId)).hasUpdate;

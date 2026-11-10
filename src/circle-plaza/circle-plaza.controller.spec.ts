@@ -105,14 +105,20 @@ describe('CirclePlazaController', () => {
 
   it('accepts a feed snapshot on POST /seen-through and returns remaining updates', async () => {
     const service = {
-      markPlazaSeen: jest.fn().mockResolvedValue({ hasUpdate: true }),
+      markPlazaSeen: jest.fn().mockResolvedValue({
+        hasUpdate: true,
+        changedAt: '2026-11-09T00:00:10.000Z',
+      }),
     };
     const controller = new CirclePlazaController(service as any, {} as any);
 
     const body = { snapshotAt: '2026-11-09T00:00:00.123Z' };
     await expect(
       controller.seenThrough(body, { user: { userId: 'viewer-1' } } as any),
-    ).resolves.toEqual({ hasUpdate: true });
+    ).resolves.toEqual({
+      hasUpdate: true,
+      changedAt: '2026-11-09T00:00:10.000Z',
+    });
 
     const handler = CirclePlazaController.prototype.seenThrough;
     expect(Reflect.getMetadata(PATH_METADATA, handler)).toBe('seen-through');

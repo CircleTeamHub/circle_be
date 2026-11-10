@@ -174,13 +174,17 @@ describe('NotificationService', () => {
 
   it('builds discover/profile unread summary from one grouped unread query', async () => {
     // 一条 GROUP BY type 取回各类型未读数，域的求和在 JS 里做。
-    prisma.$queryRaw.mockResolvedValueOnce([
-      { type: 'TRACE_LIKE', count: 1 },
-      { type: 'CIRCLE_POST_AUTO_ENDED', count: 1 },
-      { type: 'SYSTEM', count: 1 },
-      // 报名通知不属于任何铃铛域，哪个数都不计。
-      { type: 'CIRCLE_POST_SIGNUP_CREATED', count: 5 },
-    ]);
+    prisma.$queryRaw
+      .mockResolvedValueOnce([
+        { type: 'TRACE_LIKE', count: 1 },
+        { type: 'CIRCLE_POST_AUTO_ENDED', count: 1 },
+        { type: 'SYSTEM', count: 1 },
+        // 报名通知不属于任何铃铛域，哪个数都不计。
+        { type: 'CIRCLE_POST_SIGNUP_CREATED', count: 5 },
+      ])
+      .mockResolvedValueOnce([
+        { observedAt: new Date('2026-11-09T00:00:10.000Z') },
+      ]);
     prisma.user.findUnique.mockResolvedValueOnce({
       circlePlazaSeenAt: new Date('2026-11-08T00:00:00.000Z'),
     });
@@ -195,9 +199,9 @@ describe('NotificationService', () => {
       profileUnread: 1,
       totalUnread: 3,
       circlePlazaHasUpdate: true,
-      circlePlazaChangedAt: '2026-11-09T00:00:02.000Z',
+      circlePlazaChangedAt: '2026-11-09T00:00:10.000Z',
     });
-    expect(prisma.$queryRaw).toHaveBeenCalledTimes(1);
+    expect(prisma.$queryRaw).toHaveBeenCalledTimes(2);
     const query = prisma.$queryRaw.mock.calls[0][0] as {
       sql: string;
       values: unknown[];
@@ -207,15 +211,19 @@ describe('NotificationService', () => {
     expect(prisma.notification.count).not.toHaveBeenCalled();
   });
 
-  it('returns the persisted seen version when the plaza has no unread posts', async () => {
-    prisma.$queryRaw.mockResolvedValueOnce([]);
+  it('returns the database observation version when the plaza has no unread posts', async () => {
+    prisma.$queryRaw
+      .mockResolvedValueOnce([])
+      .mockResolvedValueOnce([
+        { observedAt: new Date('2026-11-09T00:00:10.000Z') },
+      ]);
     prisma.user.findUnique.mockResolvedValueOnce({
       circlePlazaSeenAt: new Date('2026-11-09T00:00:03.000Z'),
     });
     prisma.circlePost.findFirst.mockResolvedValueOnce(null);
     await expect(service.getUnreadSummary('user-1')).resolves.toMatchObject({
       circlePlazaHasUpdate: false,
-      circlePlazaChangedAt: '2026-11-09T00:00:03.000Z',
+      circlePlazaChangedAt: '2026-11-09T00:00:10.000Z',
     });
   });
 

@@ -69,6 +69,9 @@ describe('RealtimeService', () => {
 
   beforeEach(async () => {
     jest.clearAllMocks();
+    prisma.$queryRaw.mockReset();
+    prisma.user.findUnique.mockReset().mockResolvedValue(null);
+    prisma.circlePost.findFirst.mockReset().mockResolvedValue(null);
     redis.isEnabled.mockReturnValue(true);
     redis.publish.mockResolvedValue(true);
     redis.subscribePattern.mockResolvedValue(true);
@@ -129,11 +132,15 @@ describe('RealtimeService', () => {
     prisma.friendActivity.count.mockResolvedValue(3);
     prisma.circlePostSignup.count.mockResolvedValue(4);
     // 通知四个域来自同一条 GROUP BY type，按类型求和。
-    prisma.$queryRaw.mockResolvedValue([
-      { type: 'TRACE_LIKE', count: 1 },
-      { type: 'CIRCLE_POST_AUTO_ENDED', count: 1 },
-      { type: 'SYSTEM', count: 1 },
-    ]);
+    prisma.$queryRaw
+      .mockResolvedValueOnce([
+        { type: 'TRACE_LIKE', count: 1 },
+        { type: 'CIRCLE_POST_AUTO_ENDED', count: 1 },
+        { type: 'SYSTEM', count: 1 },
+      ])
+      .mockResolvedValueOnce([
+        { observedAt: new Date('2026-11-09T00:00:10.000Z') },
+      ]);
 
     await expect(service.buildSnapshot('user-1')).resolves.toEqual({
       messagesUnread: 0,
@@ -145,10 +152,10 @@ describe('RealtimeService', () => {
       profileUnread: 1,
       systemUnread: 1,
       circlePlazaHasUpdate: false,
-      circlePlazaChangedAt: null,
+      circlePlazaChangedAt: '2026-11-09T00:00:10.000Z',
       syncedAt: expect.any(String),
     });
-    expect(prisma.$queryRaw).toHaveBeenCalledTimes(1);
+    expect(prisma.$queryRaw).toHaveBeenCalledTimes(2);
     expect(prisma.notification.count).not.toHaveBeenCalled();
     expect(redis.setJsonIfVersionMatches).toHaveBeenCalledWith(
       'circle:hot:user:user-1:badge-snapshot',
@@ -180,14 +187,22 @@ describe('RealtimeService', () => {
       };
     prisma.friendActivity.count.mockImplementation(tracked(1));
     prisma.circlePostSignup.count.mockImplementation(tracked(2));
-    prisma.$queryRaw.mockImplementation(tracked([]));
+    prisma.user.findUnique.mockImplementation(
+      tracked({ circlePlazaSeenAt: new Date(0) }),
+    );
+    prisma.circlePost.findFirst.mockImplementation(tracked(null));
+    prisma.$queryRaw
+      .mockImplementationOnce(tracked([]))
+      .mockImplementationOnce(
+        tracked([{ observedAt: new Date('2026-11-09T00:00:10.000Z') }]),
+      );
 
     await service.buildSnapshot('user-1');
 
     expect(peak).toBeLessThanOrEqual(2);
     expect(prisma.friendActivity.count).toHaveBeenCalledTimes(1);
     expect(prisma.circlePostSignup.count).toHaveBeenCalledTimes(1);
-    expect(prisma.$queryRaw).toHaveBeenCalledTimes(1);
+    expect(prisma.$queryRaw).toHaveBeenCalledTimes(2);
   });
 
   it('retries badge snapshot reads when invalidation wins the cache-write race', async () => {
@@ -199,7 +214,15 @@ describe('RealtimeService', () => {
       .mockResolvedValueOnce(true);
     prisma.friendActivity.count.mockResolvedValue(1);
     prisma.circlePostSignup.count.mockResolvedValue(2);
-    prisma.$queryRaw.mockResolvedValue([{ type: 'SYSTEM', count: 3 }]);
+    prisma.$queryRaw
+      .mockResolvedValueOnce([{ type: 'SYSTEM', count: 3 }])
+      .mockResolvedValueOnce([
+        { observedAt: new Date('2026-11-09T00:00:10.000Z') },
+      ])
+      .mockResolvedValueOnce([{ type: 'SYSTEM', count: 3 }])
+      .mockResolvedValueOnce([
+        { observedAt: new Date('2026-11-09T00:00:10.000Z') },
+      ]);
 
     await service.buildSnapshot('user-1');
 
@@ -374,7 +397,11 @@ describe('RealtimeService', () => {
     beforeEach(() => {
       prisma.friendActivity.count.mockResolvedValue(0);
       prisma.circlePostSignup.count.mockResolvedValue(0);
-      prisma.$queryRaw.mockResolvedValue([]);
+      prisma.$queryRaw
+        .mockResolvedValueOnce([])
+        .mockResolvedValueOnce([
+          { observedAt: new Date('2026-11-09T00:00:10.000Z') },
+        ]);
       prisma.user.findUnique.mockResolvedValue({ circlePlazaSeenAt: seenAt });
     });
 
@@ -386,13 +413,13 @@ describe('RealtimeService', () => {
       await expect(service.buildSnapshot('user-1')).resolves.toEqual(
         expect.objectContaining({
           circlePlazaHasUpdate: true,
-          circlePlazaChangedAt: '2026-11-09T00:00:02.000Z',
+          circlePlazaChangedAt: '2026-11-09T00:00:10.000Z',
         }),
       );
       expect(prisma.circlePost.findFirst).toHaveBeenCalledWith({
         where: expect.objectContaining({
           status: 'ACTIVE',
-          createdAt: { gt: seenAt },
+          createdAt: { gt: seenAt, lte: new Date('2026-11-09T00:00:10.000Z') },
           authorID: { not: 'user-1' },
           circleLinks: {
             some: {
@@ -403,8 +430,7 @@ describe('RealtimeService', () => {
             },
           },
         }),
-        orderBy: { createdAt: 'desc' },
-        select: { createdAt: true },
+        select: { id: true },
       });
     });
 
@@ -414,7 +440,7 @@ describe('RealtimeService', () => {
       await expect(service.buildSnapshot('user-1')).resolves.toEqual(
         expect.objectContaining({
           circlePlazaHasUpdate: false,
-          circlePlazaChangedAt: seenAt.toISOString(),
+          circlePlazaChangedAt: '2026-11-09T00:00:10.000Z',
         }),
       );
     });

@@ -132,7 +132,12 @@ describe('CirclePlazaService', () => {
     realtime.claimCirclePlazaPokes.mockImplementation((ids: string[]) =>
       Promise.resolve(ids),
     );
-    prisma.$queryRaw.mockResolvedValue([{ snapshotAt: new Date() }]);
+    prisma.$queryRaw.mockResolvedValue([
+      {
+        snapshotAt: new Date(),
+        observedAt: new Date('2026-11-09T00:00:10.000Z'),
+      },
+    ]);
     prisma.block.findMany.mockReset();
     prisma.block.findMany.mockResolvedValue([]);
     iconService.getDisplayIconsForUsers.mockReset();
@@ -1245,7 +1250,7 @@ describe('CirclePlazaService', () => {
     expect(realtime.broadcastCirclePlazaSeen).toHaveBeenCalledWith(
       'user-1',
       false,
-      '2026-11-09T00:00:00.000Z',
+      '2026-11-09T00:00:10.000Z',
     );
   });
 
@@ -1272,7 +1277,7 @@ describe('CirclePlazaService', () => {
 
       await expect(
         service.markPlazaSeen('user-1', snapshotAt),
-      ).resolves.toEqual({ hasUpdate });
+      ).resolves.toEqual({ hasUpdate, changedAt: '2026-11-09T00:00:10.000Z' });
 
       expect(prisma.$executeRaw).toHaveBeenCalledTimes(1);
       const [parts, watermark, userId] = prisma.$executeRaw.mock.calls[0];
@@ -1288,16 +1293,18 @@ describe('CirclePlazaService', () => {
       expect(prisma.circlePost.findFirst).toHaveBeenCalledWith(
         expect.objectContaining({
           where: expect.objectContaining({
-            createdAt: { gt: new Date(persistedSeenAt) },
+            createdAt: {
+              gt: new Date(persistedSeenAt),
+              lte: new Date('2026-11-09T00:00:10.000Z'),
+            },
           }),
-          orderBy: { createdAt: 'desc' },
-          select: { createdAt: true },
+          select: { id: true },
         }),
       );
       expect(realtime.broadcastCirclePlazaSeen).toHaveBeenCalledWith(
         'user-1',
         hasUpdate,
-        hasUpdate ? '2026-11-09T00:00:02.000Z' : persistedSeenAt,
+        '2026-11-09T00:00:10.000Z',
       );
     },
   );

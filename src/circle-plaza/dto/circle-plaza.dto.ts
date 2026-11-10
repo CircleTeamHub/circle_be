@@ -38,6 +38,12 @@ export class PlazaSeenDto {
 export class PlazaSeenResponseDto {
   @ApiProperty()
   hasUpdate: boolean;
+
+  @ApiProperty({
+    format: 'date-time',
+    description: 'Database observation watermark of hasUpdate',
+  })
+  changedAt: string;
 }
 
 export class CreatePlazaPostDto {

@@ -73,7 +73,7 @@ type BadgeSnapshot = {
   systemUnread: number;
   /** 飞机 tab 的红点：上次打开圈子帖子列表后，有别人发的新帖。 */
   circlePlazaHasUpdate: boolean;
-  circlePlazaChangedAt: string | null;
+  circlePlazaChangedAt: string;
   syncedAt: string;
 };
 

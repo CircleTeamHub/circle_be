@@ -1,4 +1,7 @@
-import { loadCirclePlazaHasUpdate } from 'src/circle-plaza/circle-plaza-update.query';
+import {
+  loadCirclePlazaHasUpdate,
+  loadCirclePlazaUpdate,
+} from 'src/circle-plaza/circle-plaza-update.query';
 import { CirclePlazaService } from 'src/circle-plaza/circle-plaza.service';
 import {
   type CircleTxDb,
@@ -153,13 +156,13 @@ describePostgres('circle plaza update dot (PostgreSQL)', () => {
   it('marks only the submitted snapshot, preserving later unread posts and User.updatedAt', async () => {
     const { viewer, author, circle } = await setup();
     await post(author, circle, { createdAt: new Date(Date.now() - 10_000) });
-    const snapshotAt = await databaseNow();
-    // An earlier poke can be followed by a throttled post: use the latest unread time.
+    const snapshotAt = new Date((await databaseNow()).getTime() - 5_000);
+    // Unread posts must be within the status observation, not artificially in the future.
     await post(author, circle, {
       createdAt: new Date(snapshotAt.getTime() + 1_000),
     });
     await post(author, circle, {
-      createdAt: new Date(snapshotAt.getTime() + 60_000),
+      createdAt: new Date(snapshotAt.getTime() + 2_000),
     });
     const broadcast = jest.fn();
     const service = serviceFor(broadcast);
@@ -170,7 +173,7 @@ describePostgres('circle plaza update dot (PostgreSQL)', () => {
 
     await expect(
       service.markPlazaSeen(viewer, snapshotAt.toISOString()),
-    ).resolves.toEqual({ hasUpdate: true });
+    ).resolves.toEqual({ hasUpdate: true, changedAt: expect.any(String) });
 
     const after = await t.prisma.user.findUniqueOrThrow({
       where: { id: viewer },
@@ -179,11 +182,39 @@ describePostgres('circle plaza update dot (PostgreSQL)', () => {
     expect(after.updatedAt).toEqual(before.updatedAt);
     expect(after.circlePlazaSeenAt).toEqual(snapshotAt);
     await expect(hasUpdate(viewer)).resolves.toBe(true);
-    expect(broadcast).toHaveBeenCalledWith(
-      viewer,
-      true,
-      new Date(snapshotAt.getTime() + 60_000).toISOString(),
-    );
+    expect(broadcast).toHaveBeenCalledWith(viewer, true, expect.any(String));
+  });
+
+  it.each(['expired', 'deleted'] as const)(
+    'clears the dot with a newer observation after the only unread post is %s',
+    async (reason) => {
+      const { viewer, author, circle } = await setup();
+      const postAt = new Date((await databaseNow()).getTime() - 1000);
+      const unread = await post(author, circle, { createdAt: postAt });
+      const first = await loadCirclePlazaUpdate(t.prisma as never, viewer);
+      expect(first.hasUpdate).toBe(true);
+      if (reason === 'deleted')
+        await t.prisma.circlePost.delete({ where: { id: unread.id } });
+      else
+        await t.prisma.circlePost.update({
+          where: { id: unread.id },
+          data: { expiresAt: new Date(postAt.getTime() - 1000) },
+        });
+      const second = await loadCirclePlazaUpdate(t.prisma as never, viewer);
+      expect(second.hasUpdate).toBe(false);
+      expect(Date.parse(second.changedAt)).toBeGreaterThan(postAt.getTime());
+      expect(Date.parse(second.changedAt)).toBeGreaterThanOrEqual(
+        Date.parse(first.changedAt),
+      );
+    },
+  );
+
+  it('does not include posts beyond the database observation watermark', async () => {
+    const { viewer, author, circle } = await setup();
+    await post(author, circle, {
+      createdAt: new Date((await databaseNow()).getTime() + 60_000),
+    });
+    await expect(hasUpdate(viewer)).resolves.toBe(false);
   });
 
   it('does not move the watermark backwards on a delayed older request', async () => {
@@ -212,7 +243,7 @@ describePostgres('circle plaza update dot (PostgreSQL)', () => {
 
     await expect(
       service.markPlazaSeen(viewer, '2099-01-01T00:00:00.000Z'),
-    ).resolves.toEqual({ hasUpdate: false });
+    ).resolves.toEqual({ hasUpdate: false, changedAt: expect.any(String) });
 
     const after = await databaseNow();
     const user = await t.prisma.user.findUniqueOrThrow({
@@ -226,10 +257,6 @@ describePostgres('circle plaza update dot (PostgreSQL)', () => {
       after.getTime(),
     );
     await expect(hasUpdate(viewer)).resolves.toBe(false);
-    expect(broadcast).toHaveBeenCalledWith(
-      viewer,
-      false,
-      user.circlePlazaSeenAt.toISOString(),
-    );
+    expect(broadcast).toHaveBeenCalledWith(viewer, false, expect.any(String));
   });
 });
