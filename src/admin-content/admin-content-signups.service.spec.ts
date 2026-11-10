@@ -60,11 +60,26 @@ describe('admin post signup visibility', () => {
     });
   });
 
-  it('returns signup and report counts for post detail', async () => {
+  it('returns video attachments with signup and report counts for reported post detail', async () => {
+    const videos = [
+      'https://media.example.test/posts/author/7f64c3a6-13ea-4dc8-9fa2-a651898d49fe.mp4',
+    ];
+    prisma.circlePost.findUnique.mockResolvedValueOnce({
+      id: 'post',
+      images: [],
+      videos,
+      _count: { signups: 3 },
+    });
     expect(await service.detail('post')).toEqual({
       id: 'post',
+      images: [],
+      videos,
       signupCount: 3,
       reportCount: 4,
+    });
+    expect(prisma.circlePost.findUnique).toHaveBeenCalledWith({
+      where: { id: 'post' },
+      select: expect.objectContaining({ videos: true }),
     });
     expect(prisma.circlePostReport.count).toHaveBeenCalledTimes(1);
     expect(prisma.circlePostReport.count).toHaveBeenCalledWith({

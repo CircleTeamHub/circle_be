@@ -7,6 +7,7 @@ const postSelect = {
   id: true,
   content: true,
   images: true,
+  videos: true,
   tags: true,
   _count: { select: { signups: true } },
   status: true,
