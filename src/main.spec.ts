@@ -13,11 +13,12 @@ import {
   Get,
   INestApplication,
   Module,
+  Req,
   Res,
   ServiceUnavailableException,
 } from '@nestjs/common';
 import { NestFactory } from '@nestjs/core';
-import type { Response } from 'express';
+import type { Request, Response } from 'express';
 import request from 'supertest';
 
 @Controller('cors-probe')
@@ -35,6 +36,17 @@ class CorsProbeController {
 
 @Module({ controllers: [CorsProbeController] })
 class CorsProbeModule {}
+
+@Controller('raw-body-probe')
+class RawBodyProbeController {
+  @Post()
+  raw(@Req() req: Request & { rawBody?: Buffer }) {
+    return { raw: req.rawBody?.toString('utf8') ?? null };
+  }
+}
+
+@Module({ controllers: [RawBodyProbeController] })
+class RawBodyProbeModule {}
 
 function checkOrigin(
   env: NodeJS.ProcessEnv,
@@ -436,6 +448,26 @@ describe('JSON payload size', () => {
         .post('/cors-probe')
         .send({ data: 'a'.repeat(2_100_000) })
         .expect(413);
+    } finally {
+      await app.close();
+    }
+  });
+
+  it('captures the raw body of LiveKit webhooks so their signature can be verified', async () => {
+    const app = await NestFactory.create(RawBodyProbeModule, {
+      rawBody: true,
+      logger: false,
+    });
+    configureHttpBodyParser(app as any);
+    await app.init();
+    const payload = '{"event":"room_finished"}';
+    try {
+      await request(app.getHttpServer())
+        .post('/raw-body-probe')
+        .set('Content-Type', 'application/webhook+json')
+        .send(payload)
+        .expect(201)
+        .expect({ raw: payload });
     } finally {
       await app.close();
     }
