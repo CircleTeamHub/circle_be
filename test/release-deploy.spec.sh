@@ -17,7 +17,7 @@ last_arg() {
 }
 
 new_case() {
-  unset RELEASE_DOWNTIME RELEASE_IRREVERSIBLE_MIGRATION RELEASE_MARKER_PATH RELEASE_SCHEMA_COMPATIBILITY SCHEMA_COMPATIBILITY_PATH RUNTIME_COMPATIBILITY_PATH COMPOSE_ENV_FILE APP_ENV_FILE APP_ENV_GID ENV_STAMP_FAIL KILL_AFTER_ENV_STAGE KILL_BEFORE_CADDY_RELOAD KILL_AFTER_CUTOVER_COMPLETE KILL_AFTER_CADDY_RELOAD KILL_AFTER_CADDY_RELOAD_TARGET TERM_AFTER_CADDY_RELOAD TERM_AFTER_CADDY_RELOAD_TARGET EXPECTED_SMOKE_UPSTREAM IMAGE_MISSING MIGRATE_FAIL CONTRACT_PROBE_STATE DANGEROUS_MIGRATION_APPLIED START_FAIL HEALTH_FAIL SMOKE_CODE SMOKE_CONTENT_TYPE CADDY_RELOAD_FAIL_TARGET PERSIST_FAIL_COLOR CADDY_NO_RATE_LIMIT || true
+  unset RELEASE_DOWNTIME RELEASE_IRREVERSIBLE_MIGRATION RELEASE_MARKER_PATH RELEASE_SCHEMA_COMPATIBILITY SCHEMA_COMPATIBILITY_PATH RUNTIME_COMPATIBILITY_PATH COMPOSE_ENV_FILE APP_ENV_FILE APP_ENV_GID ENV_STAMP_FAIL KILL_AFTER_ENV_STAGE KILL_BEFORE_CADDY_RELOAD KILL_AFTER_CUTOVER_COMPLETE KILL_AFTER_CADDY_RELOAD KILL_AFTER_CADDY_RELOAD_TARGET TERM_AFTER_CADDY_RELOAD TERM_AFTER_CADDY_RELOAD_TARGET EXPECTED_SMOKE_UPSTREAM IMAGE_MISSING MIGRATE_FAIL CONTRACT_PROBE_STATE DANGEROUS_MIGRATION_APPLIED START_FAIL HEALTH_FAIL SMOKE_CODE SMOKE_CONTENT_TYPE CADDY_RELOAD_FAIL_TARGET PERSIST_FAIL_COLOR CADDY_NO_RATE_LIMIT CADDY_LIST_MODULES_FAIL CADDY_MODULES_TRAILING_LINES || true
   CASE_DIR="$(mktemp -d)"
   export CASE_DIR
   export TEST_STATE_DIR="$CASE_DIR/services"
@@ -94,10 +94,19 @@ if [ "${1:-}" = "compose" ]; then
       # 部署脚本会先探一次 Caddy 是否带 rate_limit 模块(deploy/Caddyfile.admin 依赖它)。
       # 桩不认这条命令的话它恒返回空,守卫必失败,整套用例在第一步就退出。
       if printf '%s\n' "$*" | grep -q 'caddy list-modules'; then
+        if [ "${CADDY_LIST_MODULES_FAIL:-0}" = "1" ]; then
+          echo 'caddy list-modules stub failure' >&2
+          exit 1
+        fi
         if [ "${CADDY_NO_RATE_LIMIT:-0}" = "1" ]; then
           printf 'http.handlers.reverse_proxy\n'
         else
           printf 'http.handlers.reverse_proxy\nhttp.handlers.rate_limit\n'
+        fi
+        # 命中行之后还有大量输出时，读端若一命中就关管道，这里的写入会吃 SIGPIPE。
+        if [ -n "${CADDY_MODULES_TRAILING_LINES:-}" ]; then
+          awk -v n="$CADDY_MODULES_TRAILING_LINES" \
+            'BEGIN { for (i = 0; i < n; i++) printf "http.handlers.padding_%06d\n", i }'
         fi
         exit 0
       fi
@@ -294,6 +303,8 @@ run_release() {
     CADDY_RELOAD_FAIL_TARGET="${CADDY_RELOAD_FAIL_TARGET:-}" \
     PERSIST_FAIL_COLOR="${PERSIST_FAIL_COLOR:-}" \
     CADDY_NO_RATE_LIMIT="${CADDY_NO_RATE_LIMIT:-0}" \
+    CADDY_LIST_MODULES_FAIL="${CADDY_LIST_MODULES_FAIL:-0}" \
+    CADDY_MODULES_TRAILING_LINES="${CADDY_MODULES_TRAILING_LINES:-}" \
     COMPOSE_ENV_FILE="$COMPOSE_ENV_FILE" \
     APP_ENV_FILE="${APP_ENV_FILE:-$CASE_DIR/no-env-file}" \
     ENV_STAMP_FAIL="${ENV_STAMP_FAIL:-0}" \
@@ -423,6 +434,33 @@ test_caddy_rate_limit_check_is_skipped_when_caddy_is_down() {
   # 报错负责 —— 否则错误信息会指向一个不相干的方向。
   ! run_release || return 1
   grep -q 'Caddy is not running' "$CASE_DIR/release.log"
+}
+
+# 列不出模块(compose exec 本身失败)不等于缺模块。以前一律报「缺 rate_limit」并让人
+# 重建 Caddy —— 照做会中断公网入口,而真正需要的只是重跑。真实错误必须留在日志里。
+test_unlistable_caddy_modules_report_the_real_error() {
+  new_case
+  printf 'running\n' > "$TEST_STATE_DIR/circle_be"
+  printf 'running\n' > "$TEST_STATE_DIR/caddy"
+  printf 'circle_be\n' > "$RELEASE_STATE_DIR/active-color"
+  CADDY_LIST_MODULES_FAIL=1
+  ! run_release || return 1
+  assert_running circle_be && assert_absent circle_be_green &&
+    assert_active_color circle_be &&
+    grep -q 'caddy list-modules stub failure' "$CASE_DIR/release.log" &&
+    ! grep -q 'no rate_limit module' "$CASE_DIR/release.log"
+}
+
+# 模块明明在,检查却因为 grep -q 一命中就关管道、上游吃 SIGPIPE 而在 pipefail 下判失败。
+# 大量尾随输出让这个竞态必现。
+test_caddy_module_check_survives_early_match() {
+  new_case
+  printf 'running\n' > "$TEST_STATE_DIR/circle_be"
+  printf 'running\n' > "$TEST_STATE_DIR/caddy"
+  printf 'circle_be\n' > "$RELEASE_STATE_DIR/active-color"
+  CADDY_MODULES_TRAILING_LINES=50000
+  run_release || return 1
+  assert_running circle_be_green
 }
 
 test_proxy_switch_precedes_old_color_retirement() {
@@ -1094,6 +1132,8 @@ for test_name in \
   test_interrupted_rollout_preserves_recorded_live_color \
   test_missing_caddy_rate_limit_module_aborts_before_touching_colors \
   test_caddy_rate_limit_check_is_skipped_when_caddy_is_down \
+  test_unlistable_caddy_modules_report_the_real_error \
+  test_caddy_module_check_survives_early_match \
   test_proxy_switch_precedes_old_color_retirement \
   test_ops_stacks_sync_runs_only_after_a_successful_cutover \
   test_ops_stacks_sync_never_runs_on_rollback \
