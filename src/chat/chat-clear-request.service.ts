@@ -29,7 +29,7 @@ export class ChatClearRequestService {
   async requestClear(
     requesterId: string,
     conversationId: string,
-    targetHeight: number,
+    _targetHeight: number,
   ): Promise<{ requestId: string }> {
     const seat = await this.prisma.chatMember.findUnique({
       where: {
@@ -58,8 +58,10 @@ export class ChatClearRequestService {
     }
     // 拉黑不摘座位:被拉黑的一方不能再往对方会话里插申请提示。
     await this.chat.assertDirectMutationAllowed(seat.conversation, requesterId);
+    // 只信服务端已经落库的本人清空水位。否则改造客户端可以谎报 nextHeight，
+    // 自己保留历史，却让对方在「双向清空」确认后清掉对方的副本。
     const clearThrough = Math.min(
-      Math.max(0, targetHeight),
+      seat.clearedBeforeHeight,
       seat.conversation.nextHeight,
     );
     const { requestId, notice } = await this.prisma.$transaction(async (tx) => {

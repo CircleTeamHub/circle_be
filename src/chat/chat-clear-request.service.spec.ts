@@ -72,6 +72,7 @@ describe('ChatClearRequestService', () => {
   describe('requestClear', () => {
     const directSeat = (overrides: Record<string, unknown> = {}) => ({
       leftAt: null,
+      clearedBeforeHeight: 10,
       conversation: { type: 'DIRECT', nextHeight: 12, directKey: 'u1:u2' },
       ...overrides,
     });
@@ -95,12 +96,14 @@ describe('ChatClearRequestService', () => {
       expect(systemMessage.broadcastSystemMessage).toHaveBeenCalled();
     });
 
-    it('never asks to clear beyond the current end of the conversation', async () => {
-      prisma.chatMember.findUnique.mockResolvedValue(directSeat());
+    it('uses the requester server-side clear watermark instead of a client-claimed height', async () => {
+      prisma.chatMember.findUnique.mockResolvedValue(
+        directSeat({ clearedBeforeHeight: 7 }),
+      );
       await service.requestClear('u1', 'conv-1', 999);
       expect(
         prisma.chatClearRequest.create.mock.calls[0][0].data.targetHeight,
-      ).toBe(12);
+      ).toBe(7);
     });
 
     it('asking again while a request is pending reuses it instead of notifying again', async () => {
@@ -115,7 +118,9 @@ describe('ChatClearRequestService', () => {
 
     // 申请人后来又清到了更高处:对方同意时要清到最后那次的位置,而不是第一次的。
     it('raises a pending request to the newer height, never lowers it', async () => {
-      prisma.chatMember.findUnique.mockResolvedValue(directSeat());
+      prisma.chatMember.findUnique.mockResolvedValue(
+        directSeat({ clearedBeforeHeight: 11 }),
+      );
       prisma.chatClearRequest.findFirst.mockResolvedValue({ id: 'req-old' });
       await service.requestClear('u1', 'conv-1', 11);
       expect(prisma.chatClearRequest.updateMany).toHaveBeenCalledWith({
