@@ -2172,6 +2172,7 @@ model CirclePost {
   id                        String           @id @default(uuid())
   content                   String           @default("")
   images                    String[]         @default([])
+  videos                    String[]         @default([])
   tags                      String[]         @default([])
   // `city` 保留为「主城市」(= cities[0]) 兼容旧数据/旧客户端；`cities` 是多选来源。
   city                      String?

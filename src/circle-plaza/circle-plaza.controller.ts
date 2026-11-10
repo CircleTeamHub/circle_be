@@ -10,6 +10,7 @@ import {
   Param,
   ParseIntPipe,
   ParseUUIDPipe,
+  Patch,
   Post,
   Query,
   Req,
@@ -47,6 +48,7 @@ import {
   RecognizePostCollaboratorsDto,
   ReportCirclePostDto,
   PostSignupItemDto,
+  UpdatePlazaPostDto,
 } from './dto/circle-plaza.dto';
 
 @ApiTags('Circle Plaza')
@@ -239,6 +241,30 @@ export class CirclePlazaController {
   })
   mySignupsUnread(@Req() req: RequestWithUser): Promise<{ count: number }> {
     return this.plazaService.getMySignupsUnreadCount(req.user.userId);
+  }
+
+  @Get('me/posts/:id')
+  @Throttle({ default: { limit: 60, ttl: 60_000 } })
+  @ApiOperation({ summary: 'Details of my post, including ended activities' })
+  @ApiOkResponse({ type: PlazaPostDto })
+  myPost(
+    @Param('id', ParseUUIDPipe) id: string,
+    @Req() req: RequestWithUser,
+  ): Promise<PlazaPostDto> {
+    return this.plazaService.getMyPost(req.user.userId, id);
+  }
+
+  @Patch('me/posts/:id')
+  @Throttle({ default: { limit: 10, ttl: 60_000 } })
+  @HttpCode(HttpStatus.NO_CONTENT)
+  @ApiOperation({ summary: 'Edit the content of my post' })
+  @ApiNoContentResponse()
+  updateMyPost(
+    @Param('id', ParseUUIDPipe) id: string,
+    @Body() dto: UpdatePlazaPostDto,
+    @Req() req: RequestWithUser,
+  ): Promise<void> {
+    return this.plazaService.updateMyPost(req.user.userId, id, dto);
   }
 
   @Get('me/posts/:id/signups')

@@ -1436,12 +1436,48 @@ describe('note review regressions', () => {
       expect((prisma.note as any).create).not.toHaveBeenCalled();
     });
 
-    it('rejects a group card for a group the author does not own', async () => {
+    it.each(['create', 'update'] as const)(
+      'allows a member to %s a note with a group card without binding the note',
+      async (mode) => {
+        const { service, prisma, note } = publicationFixture(null);
+        standaloneOwnedBy(prisma, 'someone-else');
+        const input = {
+          title: 'Member card',
+          media: [],
+          sections: { groups: { items: [{ id: 'conv-s', name: 'x' }] } },
+        };
+        if (mode === 'create') {
+          await service.createNote('owner', input);
+        } else {
+          Object.assign(note, {
+            sourceConversationID: 'conv-old',
+            collectedFromNoteID: null,
+            sections: {
+              groups: { items: [{ id: 'conv-old', name: '旧群' }] },
+            },
+          });
+          await service.updateNote('owner', 'note-1', input);
+        }
+        const data = (prisma.note as any)[mode].mock.calls.at(-1)[0].data;
+        expect(data.sourceConversationID).toBeNull();
+        expect(data.sections.groups.items).toEqual([
+          {
+            id: 'conv-s',
+            name: '独立群',
+            faceURL: null,
+            conversationID: 'conv-s',
+          },
+        ]);
+      },
+    );
+
+    it('rejects a group card after the author has left the group', async () => {
       const { service, prisma } = publicationFixture(null);
       standaloneOwnedBy(prisma, 'someone-else');
+      prisma.chatConversation.findMany.mockResolvedValue([]);
       await expect(
         service.createNote('owner', {
-          title: 'Not mine',
+          title: 'Left the group',
           media: [],
           sections: { groups: { items: [{ id: 'conv-s', name: 'x' }] } },
         }),
@@ -1517,7 +1553,7 @@ describe('note review regressions', () => {
       expect(prisma.chatConversation.findUnique).not.toHaveBeenCalled();
     });
 
-    it('still requires group ownership when a legacy unbound note switches to another group card', async () => {
+    it('still requires group membership when a legacy unbound note switches to another group card', async () => {
       const { service, prisma, note } = publicationFixture(null);
       Object.assign(note, {
         sourceConversationID: null,
@@ -1527,6 +1563,7 @@ describe('note review regressions', () => {
         },
       });
       standaloneOwnedBy(prisma, 'someone-else');
+      prisma.chatConversation.findMany.mockResolvedValue([]);
       await expect(
         service.updateNote('owner', 'note-1', {
           title: 'Switch',
@@ -1537,7 +1574,7 @@ describe('note review regressions', () => {
       expect((prisma.note as any).update).not.toHaveBeenCalled();
     });
 
-    it('treats an already-bound card as changed when it is not the single stored card', async () => {
+    it('rejects switching a bound note to a card for a group the author has left', async () => {
       const { service, prisma, note } = publicationFixture(null);
       Object.assign(note, {
         sourceConversationID: 'conv-old',
@@ -1547,6 +1584,7 @@ describe('note review regressions', () => {
         },
       });
       standaloneOwnedBy(prisma, 'someone-else');
+      prisma.chatConversation.findMany.mockResolvedValue([]);
       await expect(
         service.updateNote('owner', 'note-1', {
           title: 'Switch',

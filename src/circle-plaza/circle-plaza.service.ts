@@ -43,6 +43,7 @@ import {
   PlazaFeedSearchDto,
   PlazaPostDto,
   PostSignupItemDto,
+  UpdatePlazaPostDto,
   MY_POST_SIGNUPS_PAGE_DEFAULT,
 } from './dto/circle-plaza.dto';
 import {
@@ -269,6 +270,25 @@ export class CirclePlazaService {
     }
 
     this.assertImagesAreSafe(dto.images);
+    const videos = dto.videos ?? [];
+    if ((dto.images?.length ?? 0) + videos.length > 9) {
+      throw new BadRequestException('At most nine attachments are allowed');
+    }
+    const videoPrefixes = this.storagePublicObjectBases.map(
+      (base) => `${base.replace(/\/$/, '')}/posts/${userId}/`,
+    );
+    if (
+      videos.some(
+        (url) =>
+          !videoPrefixes.some(
+            (prefix) =>
+              url.startsWith(prefix) &&
+              /^[0-9a-f-]{36}\.(mp4|mov|m4v)$/i.test(url.slice(prefix.length)),
+          ),
+      )
+    ) {
+      throw new BadRequestException('Invalid post video');
+    }
 
     if (dto.noteId) {
       const note = await this.prisma.note.findFirst({
@@ -350,6 +370,7 @@ export class CirclePlazaService {
         data: {
           content: dto.content,
           images: dto.images ?? [],
+          videos,
           tags: dto.tags ?? [],
           city: primaryCity,
           cities,
@@ -807,9 +828,59 @@ export class CirclePlazaService {
     );
   }
 
+  async getMyPost(authorId: string, postId: string): Promise<PlazaPostDto> {
+    const post = await this.prisma.circlePost.findFirst({
+      where: {
+        id: postId,
+        authorID: authorId,
+        status: { in: ['ACTIVE', 'ENDED'] },
+      },
+      include: PLAZA_POST_INCLUDE,
+    });
+    if (!post) {
+      throw new NotFoundException({
+        message: 'Post not found',
+        errorCode: PlazaErrorCode.PostNotFound,
+      });
+    }
+    const [icons, appearances] = await Promise.all([
+      this.getDisplayIconsByAuthorIds([authorId]),
+      this.avatarFrames.resolvePublicAppearances([authorId]),
+    ]);
+    return this.toPlazaPostDto(
+      post,
+      true,
+      false,
+      false,
+      icons.get(authorId) ?? [],
+      appearances.get(authorId)?.avatarFrame ?? null,
+    );
+  }
+
+  async updateMyPost(
+    authorId: string,
+    postId: string,
+    dto: UpdatePlazaPostDto,
+  ): Promise<void> {
+    const { count } = await this.prisma.circlePost.updateMany({
+      where: {
+        id: postId,
+        authorID: authorId,
+        status: { in: ['ACTIVE', 'ENDED'] },
+      },
+      data: { content: dto.content.trim() },
+    });
+    if (count === 0) {
+      throw new NotFoundException({
+        message: 'Post not found',
+        errorCode: PlazaErrorCode.PostNotFound,
+      });
+    }
+  }
+
   async deletePost(userId: string, postId: string): Promise<void> {
     const post = await this.prisma.circlePost.findFirst({
-      where: { ...activeUnexpiredPostWhere(), id: postId },
+      where: { id: postId, status: { in: ['ACTIVE', 'ENDED'] } },
     });
     if (!post) {
       throw new NotFoundException({
@@ -834,10 +905,13 @@ export class CirclePlazaService {
       : [post.circleID];
 
     await this.prisma.$transaction(async (tx) => {
-      // 原子认领：只把 ACTIVE→DELETED 的那一次算作真删除，才递减 postCount。
-      // 并发/重试的第二次 count=0 → 跳过递减，避免每个圈子被多扣（甚至扣成负数）。
+      // 结束活动不减 postCount。只有首次标记删除时才递减各圈子的计数。
       const claimed = await tx.circlePost.updateMany({
-        where: { id: postId, status: 'ACTIVE' },
+        where: {
+          id: postId,
+          authorID: userId,
+          status: { in: ['ACTIVE', 'ENDED'] },
+        },
         data: { status: 'DELETED' },
       });
       if (claimed.count !== 1) return;
@@ -1750,6 +1824,7 @@ export class CirclePlazaService {
       id: post.id,
       content: post.content,
       images: post.images,
+      videos: post.videos,
       media: buildImageMedia(post.images, this.imageTransformTemplate),
       tags: post.tags,
       city: post.city,

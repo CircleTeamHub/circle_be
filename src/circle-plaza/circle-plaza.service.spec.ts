@@ -899,7 +899,7 @@ describe('CirclePlazaService', () => {
     expect(prisma.$transaction).not.toHaveBeenCalled();
   });
 
-  it('persists a bounded post expiry duration when creating a plaza post', async () => {
+  it('persists a bounded post expiry duration and preserves video separately from images', async () => {
     jest
       .useFakeTimers()
       .setSystemTime(new Date('2026-06-29T12:00:00Z').getTime());
@@ -912,10 +912,34 @@ describe('CirclePlazaService', () => {
         circle: { id: 'circle-1', deleted: false, memberCanPost: true },
       },
     ]);
+    prisma.user.findUnique.mockResolvedValue({
+      vipLevel: 1,
+      vipExpiresAt: null,
+    });
+    const videoService = new CirclePlazaService(
+      prisma as unknown as PrismaService,
+      {
+        get: (key: string) =>
+          key === 'OBJECT_STORAGE_DELIVERY_URL'
+            ? 'https://media.example.test'
+            : undefined,
+      } as ConfigService,
+      realtime as unknown as RealtimeService,
+      notificationService as unknown as NotificationService,
+      iconService as unknown as IconService,
+      {
+        resolveEntitlement: jest.fn().mockResolvedValue({ level: 1 }),
+      } as unknown as MembershipPolicyService,
+      avatarFrames as unknown as AvatarFrameService,
+    );
+    const videos = [
+      'https://media.example.test/posts/user-1/7f64c3a6-13ea-4dc8-9fa2-a651898d49fe.mp4',
+    ];
     prisma.circlePost.create.mockResolvedValue({
       id: 'post-1',
       content: 'hello plaza',
       images: [],
+      videos,
       tags: [],
       city: null,
       isHorn: false,
@@ -941,19 +965,23 @@ describe('CirclePlazaService', () => {
     });
     prisma.circle.update.mockResolvedValue({});
 
-    const result = await service.createPost('user-1', {
+    const input = {
       circleId: 'circle-1',
       content: 'hello plaza',
       expiresInHours: 72,
-    });
+      videos,
+    };
+    const result = await videoService.createPost('user-1', input);
 
     expect(prisma.circlePost.create).toHaveBeenCalledWith(
       expect.objectContaining({
         data: expect.objectContaining({
           expiresAt: new Date('2026-07-02T12:00:00.000Z'),
+          videos,
         }),
       }),
     );
+    expect(result).toMatchObject({ images: [], videos });
     expect(result.expiresAt).toBe('2026-07-02T12:00:00.000Z');
     jest.useRealTimers();
   });
@@ -2568,8 +2596,11 @@ describe('CirclePlazaService', () => {
       status: 'ACTIVE',
     };
 
-    it('decrements postCount for every linked circle exactly once', async () => {
-      prisma.circlePost.findFirst.mockResolvedValue(ownPost);
+    it('decrements postCount for every linked circle exactly once when deleting an ended post', async () => {
+      prisma.circlePost.findFirst.mockResolvedValue({
+        ...ownPost,
+        status: 'ENDED',
+      });
       prisma.circlePostCircle.findMany.mockResolvedValue([
         { circleID: 'circle-1' },
         { circleID: 'circle-2' },
@@ -2579,7 +2610,11 @@ describe('CirclePlazaService', () => {
       await service.deletePost('author-1', 'post-1');
 
       expect(prisma.circlePost.updateMany).toHaveBeenCalledWith({
-        where: { id: 'post-1', status: 'ACTIVE' },
+        where: {
+          id: 'post-1',
+          authorID: 'author-1',
+          status: { in: ['ACTIVE', 'ENDED'] },
+        },
         data: { status: 'DELETED' },
       });
       expect(prisma.circle.updateMany).toHaveBeenCalledWith({
@@ -2611,6 +2646,39 @@ describe('CirclePlazaService', () => {
         ForbiddenException,
       );
       expect(prisma.circlePost.updateMany).not.toHaveBeenCalled();
+    });
+  });
+
+  describe('managing my post', () => {
+    it('looks up authored activity details without the public expiration filter', async () => {
+      prisma.circlePost.findFirst.mockResolvedValue(null);
+      await expect(service.getMyPost('author-1', 'post-1')).rejects.toThrow(
+        NotFoundException,
+      );
+      expect(prisma.circlePost.findFirst).toHaveBeenCalledWith(
+        expect.objectContaining({
+          where: {
+            id: 'post-1',
+            authorID: 'author-1',
+            status: { in: ['ACTIVE', 'ENDED'] },
+          },
+        }),
+      );
+    });
+
+    it('restricts the content write to the author and leaves activity metadata intact', async () => {
+      prisma.circlePost.updateMany.mockResolvedValueOnce({ count: 0 });
+      await expect(
+        service.updateMyPost('other-user', 'post-1', { content: ' Changed ' }),
+      ).rejects.toThrow(NotFoundException);
+      expect(prisma.circlePost.updateMany).toHaveBeenCalledWith({
+        where: {
+          id: 'post-1',
+          authorID: 'other-user',
+          status: { in: ['ACTIVE', 'ENDED'] },
+        },
+        data: { content: 'Changed' },
+      });
     });
   });
 

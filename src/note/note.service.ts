@@ -5084,7 +5084,7 @@ export class NoteService implements NoteCardProjector {
         errorCode: NoteErrorCode.NotFound,
       });
     }
-    // 收藏副本的来源群名片是固定的，不参与绑定；源笔记的群名片即绑定。
+    // 收藏副本的来源群名片是固定的，不参与绑定。
     const binding = existingNote.collectedFromNoteID
       ? undefined
       : await this.resolveGroupCardBinding(ownerID, input, existingNote);
@@ -5437,41 +5437,50 @@ export class NoteService implements NoteCardProjector {
    * 所有拒绝统一成 GroupBindForbidden：不区分「群不存在 / 不可用 / 不是群主」，
    * 避免借错误探测别人的群。
    */
-  private async assertCanBindGroup(
+  private async canBindAvailableGroup(
     ownerID: string,
     conversationID: string,
     tx?: Prisma.TransactionClient,
-  ) {
+  ): Promise<boolean> {
     const db = tx ?? this.prisma;
     const conversation = await db.chatConversation.findUnique({
       where: { id: conversationID },
       select: { type: true, ownerID: true, circleID: true },
     });
-    let allowed = false;
-    if (conversation?.type === 'GROUP' && conversation.circleID) {
+    if (conversation?.type !== 'GROUP') throw this.groupBindForbidden();
+    if (conversation.circleID) {
       const circle = await db.circle.findUnique({
         where: { id: conversation.circleID },
         select: { ownerID: true, deleted: true, adminState: true },
       });
-      allowed = Boolean(
-        circle &&
-        !circle.deleted &&
-        !DISABLED_ADMIN_STATES.has(circle.adminState) &&
-        circle.ownerID === ownerID,
-      );
-    } else if (conversation?.type === 'GROUP') {
-      const seat =
-        conversation.ownerID === ownerID
-          ? await db.chatMember.findUnique({
-              where: {
-                conversationID_userID: { conversationID, userID: ownerID },
-              },
-              select: { leftAt: true },
-            })
-          : null;
-      allowed = Boolean(seat && !seat.leftAt);
+      if (
+        !circle ||
+        circle.deleted ||
+        DISABLED_ADMIN_STATES.has(circle.adminState)
+      ) {
+        throw this.groupBindForbidden();
+      }
+      return circle.ownerID === ownerID;
     }
-    if (!allowed) throw this.groupBindForbidden();
+    if (conversation.ownerID !== ownerID) return false;
+    const seat = await db.chatMember.findUnique({
+      where: {
+        conversationID_userID: { conversationID, userID: ownerID },
+      },
+      select: { leftAt: true },
+    });
+    if (!seat || seat.leftAt) throw this.groupBindForbidden();
+    return true;
+  }
+
+  private async assertCanBindGroup(
+    ownerID: string,
+    conversationID: string,
+    tx?: Prisma.TransactionClient,
+  ) {
+    if (!(await this.canBindAvailableGroup(ownerID, conversationID, tx))) {
+      throw this.groupBindForbidden();
+    }
   }
 
   private groupBindForbidden() {
@@ -5525,8 +5534,8 @@ export class NoteService implements NoteCardProjector {
   }
 
   /**
-   * 群名片就是群设置里的「笔记管理」绑定：源笔记发布/更新时，提交的群名片
-   * 决定 sourceConversationID。返回 undefined 表示这次不动绑定——没带群名片段、
+   * 群主选择群名片时将笔记绑定到该群的「笔记管理」；其他成员保存名片快照。
+   * 返回 undefined 表示这次不动绑定——没带群名片段、
    * 旧版多张群名片，或群名片没换（换了群主后只改正文也不该被拦下）。
    *
    * 「没换」只看库里已存的名片，与有没有绑定无关：以前群成员也能加群名片，
@@ -5558,7 +5567,7 @@ export class NoteService implements NoteCardProjector {
     }
     if (items.length > 1) {
       // 一篇笔记只挂一张群名片。多张只为兼容多选时代的存量：全部都是库里已有的
-      // 才放行（不动绑定）；夹带新名片会绕过「只有群主能绑」，拒绝。
+      // 才放行（不动绑定）。
       if (items.every((item) => storedIds.includes(item.id))) return undefined;
       throw new BadRequestException({
         message: 'A note can carry only one group card',
@@ -5579,7 +5588,14 @@ export class NoteService implements NoteCardProjector {
     if (!conversationID) {
       throw this.groupBindForbidden();
     }
-    await this.assertCanBindGroup(ownerID, conversationID);
+    if (!(await this.canBindAvailableGroup(ownerID, conversationID))) {
+      // canonicalizeNoteCards verifies the author's membership and resolves
+      // the card fields before the note is written.
+      return {
+        conversationID: null,
+        card: { id: items[0].id, name: items[0].name, faceURL: null },
+      };
+    }
     // 没有群名的独立群沿用提交的名字；本人是否还在群里由随后的
     // canonicalizeNoteCards 按 leftAt 为空把关，不在就整单 403。
     const card = await this.resolveOriginGroupCard(
