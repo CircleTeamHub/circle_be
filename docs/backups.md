@@ -45,12 +45,12 @@ gap is gone, along with the tooling that worked around it.
 **Do not add these "just in case".** Both are reconstructible, and backing them
 up would mean copying secrets around for no recovery benefit.
 
-- **`redis_data`** — cache, WS backplane, and rate-limit counters only. Every
-  consumer degrades gracefully: production defaults to degraded startup when
-  Redis is unavailable (`REDIS_REQUIRED=false`, see `.env.example`). Restoring a
-  stale cache is at best useless and at worst actively wrong — it would resurrect
-  expired rate-limit windows and dead WS routing entries. Redis rebuilds itself
-  from Postgres on first use.
+- **`redis_data`** — cache, WS backplane, rate-limit counters and short-lived
+  idempotency claims only. Production needs Redis reachable by default
+  (`REDIS_REQUIRED=true`, see `.env.example`), but it never needs this data back:
+  an empty Redis is fine. Restoring a stale cache is at best useless and at worst
+  actively wrong — it would resurrect expired rate-limit windows and dead WS
+  routing entries. Redis rebuilds itself from Postgres on first use.
 - **`caddy_data`** — TLS certificates and ACME account keys. Caddy re-issues
   automatically from Let's Encrypt on startup. Restoring these buys nothing and
   copies private keys to a third location. The only cost of not having them is a

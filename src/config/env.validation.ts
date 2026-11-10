@@ -243,7 +243,11 @@ export function createEnvValidationSchema(
       then: Joi.string().invalid('__REPLACE_RANDOM__').required(),
       otherwise: Joi.string().optional(),
     }),
-    REDIS_REQUIRED: Joi.boolean().default(false),
+    REDIS_REQUIRED: Joi.when('NODE_ENV', {
+      is: 'production',
+      then: Joi.boolean().default(true),
+      otherwise: Joi.boolean().default(false),
+    }),
     REDIS_ALLOW_INSECURE: Joi.boolean().default(false),
     REDIS_URL: Joi.when('REDIS_REQUIRED', {
       is: true,

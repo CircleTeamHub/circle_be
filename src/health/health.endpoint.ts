@@ -15,6 +15,7 @@ export interface HealthDatabase {
 /** The slice of RedisService the readiness probe reports on. */
 export interface HealthRedis {
   isEnabled(): boolean;
+  isRequired(): boolean;
   ping(): Promise<boolean>;
 }
 
@@ -63,9 +64,9 @@ export function createLivenessHandler() {
  * real round-trip, because "the port is open" is not the same as "we can serve"
  * — that gap is exactly what lets a broken deploy look healthy.
  *
- * Redis is reported but never gates readiness: it is optional here (the app
- * degrades to per-instance rate limiting and realtime), so failing readiness on
- * it would take a serving instance out of rotation for a non-fatal condition.
+ * Redis gates readiness only when REDIS_REQUIRED is enabled. Optional Redis
+ * deployments still degrade to per-instance rate limiting and realtime, while
+ * strict production deployments stop receiving traffic during an outage.
  *
  * The object store is reported on the same terms, for a sharper reason: an
  * unapplied bucket policy is identical on every replica, so gating readiness on
@@ -88,6 +89,8 @@ export function createReadinessHandler({
       checkObjectStoreReachable(objectStore),
     ]);
     const objectStoreStatus = objectStore?.objectStoreStatus() ?? 'disabled';
+    const redisRequired = redis?.isRequired() ?? false;
+    const ready = databaseUp && (!redisRequired || redisStatus === 'up');
 
     if (objectStoreStatus === 'policy-unconfirmed') {
       // The probe body stays terse; this is the only place the consequence is
@@ -97,8 +100,8 @@ export function createReadinessHandler({
       );
     }
 
-    res.status(databaseUp ? 200 : 503).json({
-      status: databaseUp ? 'ok' : 'error',
+    res.status(ready ? 200 : 503).json({
+      status: ready ? 'ok' : 'error',
       database: databaseUp ? 'up' : 'down',
       redis: redisStatus,
       objectStore: objectStoreStatus,

@@ -102,6 +102,8 @@ describe('createEnvValidationSchema', () => {
     SECRET: 'x'.repeat(32),
     TEMP_CHAT_LINK_SECRET: 'x'.repeat(32),
     METRICS_AUTH_TOKEN: 'a-production-metrics-scrape-token',
+    REDIS_URL: 'redis://default:secret@redis:6379',
+    REDIS_ALLOW_INSECURE: 'true',
     EMAIL_CODE_DEV_BYPASS: 'Zq7mK2xR9vT4sPwL8bN3',
     EMAIL_CODE_ALLOW_PRODUCTION_BYPASS: 'true',
     EMAIL_CODE_PRODUCTION_BYPASS_ALLOWLIST: 'LOGIN:tester@example.com',
@@ -505,6 +507,8 @@ describe('createEnvValidationSchema', () => {
       SECRET: 'x'.repeat(32),
       TEMP_CHAT_LINK_SECRET: 'x'.repeat(32),
       METRICS_AUTH_TOKEN: 'a-production-metrics-scrape-token',
+      REDIS_URL: 'redis://default:secret@redis:6379',
+      REDIS_ALLOW_INSECURE: 'true',
       OBJECT_STORAGE_DELIVERY_URL: deliveryUrl,
     };
 
@@ -632,7 +636,7 @@ describe('createEnvValidationSchema', () => {
     expect(value.REDIS_URL).toBe('redis://localhost:6379');
   });
 
-  it('allows production startup without Redis by default for backwards compatibility', () => {
+  it('requires Redis by default in production', () => {
     const env = {
       NODE_ENV: 'production',
       DATABASE_URL: 'postgresql://user:pass@localhost:5432/db',
@@ -644,7 +648,24 @@ describe('createEnvValidationSchema', () => {
 
     const { error } = createEnvValidationSchema(env).validate(env);
 
+    expect(error?.message).toContain('"REDIS_URL" is required');
+  });
+
+  it('allows an explicit production Redis opt-out', () => {
+    const env = {
+      NODE_ENV: 'production',
+      DATABASE_URL: 'postgresql://user:pass@localhost:5432/db',
+      SECRET: 'a-production-secret-that-is-over-32-characters',
+      ALLOWED_ORIGINS: 'https://app.example.com',
+      TEMP_CHAT_LINK_SECRET: 'a-temp-chat-secret-that-is-over-32-characters',
+      METRICS_AUTH_TOKEN: 'a-production-metrics-scrape-token',
+      REDIS_REQUIRED: 'false',
+    };
+
+    const { error, value } = createEnvValidationSchema(env).validate(env);
+
     expect(error).toBeUndefined();
+    expect(value.REDIS_REQUIRED).toBe(false);
   });
 
   it('requires REDIS_URL when strict Redis startup is explicitly enabled', () => {
@@ -888,6 +909,8 @@ describe('METRICS_AUTH_TOKEN', () => {
     SECRET: 'a-production-secret-that-is-over-32-characters',
     ALLOWED_ORIGINS: 'https://app.example.com',
     TEMP_CHAT_LINK_SECRET: 'a-temp-chat-secret-that-is-over-32-characters',
+    REDIS_URL: 'redis://default:secret@redis:6379',
+    REDIS_ALLOW_INSECURE: 'true',
   };
 
   it('is required in production', () => {

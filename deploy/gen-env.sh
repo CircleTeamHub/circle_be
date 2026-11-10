@@ -286,7 +286,7 @@ if [ -f .env.production ]; then
   else
     grep -q '^REDIS_ALLOW_INSECURE=' .env.production || printf 'REDIS_ALLOW_INSECURE=false\n' >> .env.production
   fi
-  grep -q '^REDIS_REQUIRED=' .env.production || printf 'REDIS_REQUIRED=false\n' >> .env.production
+  set_env_value .env.production REDIS_REQUIRED true
   if [ "$metrics_auth_token_generated" = "1" ]; then
     mkdir -p "$release_state_dir"
     chmod 700 "$release_state_dir"
@@ -342,7 +342,7 @@ NODE_ENV=production
 DATABASE_URL="postgresql://circle:$DB_PASSWORD@postgres:5432/circle?schema=public"
 REDIS_URL="redis://default:$REDIS_PASSWORD@redis:6379"
 REDIS_ALLOW_INSECURE=true
-REDIS_REQUIRED=false
+REDIS_REQUIRED=true
 SECRET="$SECRET"
 JWT_EXPIRES_IN=1h
 REFRESH_EXPIRES_IN=30d

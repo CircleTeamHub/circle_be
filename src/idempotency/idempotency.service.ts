@@ -3,6 +3,7 @@ import {
   ConflictException,
   Injectable,
   Logger,
+  ServiceUnavailableException,
 } from '@nestjs/common';
 import { createHash, randomUUID } from 'crypto';
 import { IdempotencyErrorCode } from 'src/common/app-error-codes';
@@ -44,7 +45,8 @@ const DONE_TTL_SECONDS = 24 * 60 * 60;
 /**
  * 可选 Idempotency-Key 的请求层重放：超时后带同一个键重试，拿回第一次的响应，
  * 不再建第二份。只做「同一个人、同一个接口、同一份请求」的去重，业务规则照旧由
- * operation 自己把关；Redis 不可用时退回不去重（与没有这层时一致）。
+ * operation 自己把关；带键请求在 Redis 不可用时拒绝执行，避免失去重放保护后创建
+ * 重复数据。没带键的旧客户端仍按原路径执行。
  */
 @Injectable()
 export class IdempotencyService {
@@ -94,9 +96,11 @@ export class IdempotencyService {
     );
     if (claim === null) {
       this.logger.warn(
-        `Idempotency store unavailable; running ${scope} without replay protection`,
+        `Idempotency store unavailable; rejecting ${scope} to preserve replay protection`,
       );
-      return operation();
+      throw new ServiceUnavailableException({
+        message: '幂等保护暂不可用，请稍后重试',
+      });
     }
     // strictNullChecks 关着，按 stored 字面量收窄不生效，改用 in。
     if ('current' in claim) {
