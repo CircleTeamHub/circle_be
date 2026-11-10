@@ -41,7 +41,12 @@ export { resolveCorsOriginChecker } from './config/cors-origin';
 export function configureHttpBodyParser(
   app: Pick<NestExpressApplication, 'useBodyParser'>,
 ) {
-  app.useBodyParser('json', { limit: '2mb' });
+  app.useBodyParser('json', {
+    limit: '2mb',
+    // LiveKit 回调的类型是 application/webhook+json；不认这个类型就拿不到
+    // rawBody，请求在验签之前就会被 400 拒绝。
+    type: ['application/json', 'application/webhook+json'],
+  });
 }
 
 export function buildNestFactoryOptions() {
