@@ -11,6 +11,7 @@ import {
   IsOptional,
   IsString,
   IsUUID,
+  Matches,
   Max,
   MaxLength,
   Min,
@@ -62,6 +63,15 @@ export class CreatePlazaPostDto {
   @ArrayMaxSize(9)
   @IsOptional()
   images?: string[];
+
+  @ApiPropertyOptional({ type: [String] })
+  @IsArray()
+  @IsString({ each: true })
+  @MaxLength(500, { each: true })
+  @ArrayUnique()
+  @ArrayMaxSize(9)
+  @IsOptional()
+  videos?: string[];
 
   @ApiPropertyOptional({ type: [String] })
   @IsArray()
@@ -181,6 +191,14 @@ export class CreatePlazaPostDto {
   @IsBoolean()
   @IsOptional()
   signupFancyRestriction?: boolean;
+}
+
+export class UpdatePlazaPostDto {
+  @ApiProperty()
+  @IsString()
+  @Matches(/\S/)
+  @MaxLength(5000)
+  content: string;
 }
 
 /** 帖子报名列表默认页大小（已装机 App 不传 limit）。 */
@@ -360,6 +378,9 @@ export class PlazaPostDto {
   id: string;
   content: string;
   images: string[];
+
+  @ApiProperty({ type: [String] })
+  videos: string[];
   @ApiPropertyOptional({ type: [ImageMediaVariantDto] })
   media?: ImageMediaVariantDto[];
   tags: string[];

@@ -309,6 +309,7 @@ export const DYNAMIC_ROUTE_TEMPLATES = [
   '/api/v1/circle-invitation/:id/eligible-verifiers',
   '/api/v1/circle-invitation/:id/respond',
   '/api/v1/circle-invitation/circle/:circleId/pending',
+  '/api/v1/circle-plaza/me/posts/:id',
   '/api/v1/circle-plaza/me/posts/:id/signups',
   '/api/v1/circle-plaza/me/posts/:id/signups/read',
   '/api/v1/circle-plaza/me/posts/:id/collaboration-recognitions',

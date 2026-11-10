@@ -205,6 +205,21 @@ describe('StorageAuditService', () => {
     expect(await service.audit(now)).toMatchObject({ orphanCount: 0 });
   });
 
+  it('counts circle post videos as referenced objects', async () => {
+    const key = 'posts/user-1/clip.mp4';
+    const { service } = harness({
+      objects: {
+        'posts/': [{ key, size: 1, lastModified: old }],
+      },
+      referenced: {
+        circlePost: [
+          { id: 'post-1', images: [], videos: [`https://cdn.test/${key}`] },
+        ],
+      },
+    });
+    expect(await service.audit(now)).toMatchObject({ orphanCount: 0 });
+  });
+
   it('keeps published and draft card avatar snapshots referenced after avatar rotation', async () => {
     const { service } = harness({
       objects: {

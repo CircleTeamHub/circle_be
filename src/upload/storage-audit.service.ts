@@ -413,12 +413,15 @@ export class StorageAuditService {
     await this.collectFrom(
       (cursor, take) =>
         this.prisma.circlePost.findMany({
-          select: { id: true, images: true },
+          select: { id: true, images: true, videos: true },
           orderBy: { id: 'asc' },
           take,
           ...(cursor ? { cursor: { id: cursor }, skip: 1 } : {}),
         }),
-      (row) => row.images.forEach(add),
+      (row) => {
+        row.images.forEach(add);
+        row.videos.forEach(add);
+      },
     );
     await this.collectFrom(
       (cursor, take) =>
