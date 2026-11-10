@@ -309,8 +309,18 @@ restore_minimum_schema_compatibility_floor() {
 assert_caddy_has_rate_limit() {
   # caddy 没在跑：交给 switch_proxy 自己的「Caddy is not running」检查处理。
   [ -n "$(running caddy)" ] || return 0
-  if compose exec -T caddy caddy list-modules 2>/dev/null |
-    grep -qx 'http\.handlers\.rate_limit'; then
+  # 先把输出整段收下再匹配：管道里 grep -q 一命中就关读端，pipefail 下上游吃 SIGPIPE
+  # 会被判失败，把「有模块」误报成「缺模块」。stdin 接 /dev/null，exec 不吃 launcher 的输入。
+  local modules
+  if ! modules="$(compose exec -T caddy caddy list-modules </dev/null 2>&1)"; then
+    {
+      echo 'Could not list the running Caddy modules; stopped before pulling images or switching traffic. Output:'
+      printf '%s\n' "$modules" | tail -n 20
+      echo 'This does not mean rate_limit is missing. Re-run this deploy; do not rebuild Caddy for it.'
+    } >&2
+    return 1
+  fi
+  if grep -qx 'http\.handlers\.rate_limit' <<<"$modules"; then
     return 0
   fi
   cat >&2 <<'CADDY_MSG'
