@@ -184,7 +184,9 @@ describe('NotificationService', () => {
     prisma.user.findUnique.mockResolvedValueOnce({
       circlePlazaSeenAt: new Date('2026-11-08T00:00:00.000Z'),
     });
-    prisma.circlePost.findFirst.mockResolvedValueOnce({ id: 'post-1' });
+    prisma.circlePost.findFirst.mockResolvedValueOnce({
+      createdAt: new Date('2026-11-09T00:00:02.000Z'),
+    });
 
     await expect(service.getUnreadSummary('user-1')).resolves.toEqual({
       discoverUnread: 2,
@@ -193,6 +195,7 @@ describe('NotificationService', () => {
       profileUnread: 1,
       totalUnread: 3,
       circlePlazaHasUpdate: true,
+      circlePlazaChangedAt: '2026-11-09T00:00:02.000Z',
     });
     expect(prisma.$queryRaw).toHaveBeenCalledTimes(1);
     const query = prisma.$queryRaw.mock.calls[0][0] as {
@@ -202,6 +205,18 @@ describe('NotificationService', () => {
     expect(query.sql).toContain('GROUP BY n."type"');
     expect(query.values).toEqual(['user-1']);
     expect(prisma.notification.count).not.toHaveBeenCalled();
+  });
+
+  it('returns the persisted seen version when the plaza has no unread posts', async () => {
+    prisma.$queryRaw.mockResolvedValueOnce([]);
+    prisma.user.findUnique.mockResolvedValueOnce({
+      circlePlazaSeenAt: new Date('2026-11-09T00:00:03.000Z'),
+    });
+    prisma.circlePost.findFirst.mockResolvedValueOnce(null);
+    await expect(service.getUnreadSummary('user-1')).resolves.toMatchObject({
+      circlePlazaHasUpdate: false,
+      circlePlazaChangedAt: '2026-11-09T00:00:03.000Z',
+    });
   });
 
   it('keeps the bell domains disjoint', () => {

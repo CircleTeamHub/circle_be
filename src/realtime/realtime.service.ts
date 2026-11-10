@@ -11,7 +11,7 @@ import { WebSocket } from 'ws';
 import { PrismaService } from 'src/prisma/prisma.service';
 import { RedisService } from 'src/redis/redis.service';
 import { PROFILE_NOTIFICATION_TYPES } from 'src/notification/notification.constants';
-import { loadCirclePlazaHasUpdate } from 'src/circle-plaza/circle-plaza-update.query';
+import { loadCirclePlazaUpdate } from 'src/circle-plaza/circle-plaza-update.query';
 import { loadUnreadNotificationsByDomain } from 'src/notification/notification-unread.query';
 import {
   profileUnreadCountsByRecipientQuery,
@@ -73,6 +73,7 @@ type BadgeSnapshot = {
   systemUnread: number;
   /** 飞机 tab 的红点：上次打开圈子帖子列表后，有别人发的新帖。 */
   circlePlazaHasUpdate: boolean;
+  circlePlazaChangedAt: string | null;
   syncedAt: string;
 };
 
@@ -531,10 +532,7 @@ export class RealtimeService implements OnModuleInit, OnModuleDestroy {
       }),
     ]);
     const signupUnread = await this.countUnreadSignups(userId);
-    const circlePlazaHasUpdate = await loadCirclePlazaHasUpdate(
-      this.prisma,
-      userId,
-    );
+    const circlePlaza = await loadCirclePlazaUpdate(this.prisma, userId);
     const { discoverUnread, momentsUnread, circleUnread, profileUnread } =
       notifications;
 
@@ -547,7 +545,8 @@ export class RealtimeService implements OnModuleInit, OnModuleDestroy {
       signupUnread,
       profileUnread,
       systemUnread: profileUnread,
-      circlePlazaHasUpdate,
+      circlePlazaHasUpdate: circlePlaza.hasUpdate,
+      circlePlazaChangedAt: circlePlaza.changedAt,
       syncedAt: new Date().toISOString(),
     };
     return snapshot;

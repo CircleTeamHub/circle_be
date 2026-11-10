@@ -36,7 +36,7 @@ import {
   type RevokePushTokenDto,
 } from './notification.dto';
 import { NotificationPushService } from './notification-push.service';
-import { loadCirclePlazaHasUpdate } from 'src/circle-plaza/circle-plaza-update.query';
+import { loadCirclePlazaUpdate } from 'src/circle-plaza/circle-plaza-update.query';
 import { loadUnreadNotificationsByDomain } from './notification-unread.query';
 import { notificationPageScanQuery } from './notification-list.query';
 import { loadNotificationRealtimeDtos } from './notification-realtime.loader';
@@ -423,10 +423,7 @@ export class NotificationService {
     // 四个数来自同一条 GROUP BY type（一个池连接），域的求和在 JS 里做。
     const { discoverUnread, momentsUnread, circleUnread, profileUnread } =
       await loadUnreadNotificationsByDomain(this.prisma, userId);
-    const circlePlazaHasUpdate = await loadCirclePlazaHasUpdate(
-      this.prisma,
-      userId,
-    );
+    const circlePlaza = await loadCirclePlazaUpdate(this.prisma, userId);
 
     return {
       discoverUnread,
@@ -434,7 +431,8 @@ export class NotificationService {
       circleUnread,
       profileUnread,
       totalUnread: discoverUnread + profileUnread,
-      circlePlazaHasUpdate,
+      circlePlazaHasUpdate: circlePlaza.hasUpdate,
+      circlePlazaChangedAt: circlePlaza.changedAt,
     };
   }
 

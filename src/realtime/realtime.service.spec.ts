@@ -145,6 +145,7 @@ describe('RealtimeService', () => {
       profileUnread: 1,
       systemUnread: 1,
       circlePlazaHasUpdate: false,
+      circlePlazaChangedAt: null,
       syncedAt: expect.any(String),
     });
     expect(prisma.$queryRaw).toHaveBeenCalledTimes(1);
@@ -378,10 +379,15 @@ describe('RealtimeService', () => {
     });
 
     it('lights the dot for a post newer than the last visit that the feed would show', async () => {
-      prisma.circlePost.findFirst.mockResolvedValue({ id: 'post-1' });
+      prisma.circlePost.findFirst.mockResolvedValue({
+        createdAt: new Date('2026-11-09T00:00:02.000Z'),
+      });
 
       await expect(service.buildSnapshot('user-1')).resolves.toEqual(
-        expect.objectContaining({ circlePlazaHasUpdate: true }),
+        expect.objectContaining({
+          circlePlazaHasUpdate: true,
+          circlePlazaChangedAt: '2026-11-09T00:00:02.000Z',
+        }),
       );
       expect(prisma.circlePost.findFirst).toHaveBeenCalledWith({
         where: expect.objectContaining({
@@ -406,7 +412,10 @@ describe('RealtimeService', () => {
       prisma.circlePost.findFirst.mockResolvedValue(null);
 
       await expect(service.buildSnapshot('user-1')).resolves.toEqual(
-        expect.objectContaining({ circlePlazaHasUpdate: false }),
+        expect.objectContaining({
+          circlePlazaHasUpdate: false,
+          circlePlazaChangedAt: seenAt.toISOString(),
+        }),
       );
     });
 
