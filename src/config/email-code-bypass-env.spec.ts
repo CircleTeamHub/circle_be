@@ -21,6 +21,8 @@ it.each([
       TEMP_CHAT_LINK_SECRET: 'x'.repeat(32),
       ALLOWED_ORIGINS: 'https://app.example.com',
       METRICS_AUTH_TOKEN: 'test-only-metrics-token',
+      REDIS_URL: 'redis://default:secret@redis:6379',
+      REDIS_ALLOW_INSECURE: 'true',
       EMAIL_CODE_DEV_BYPASS: '999999',
       ...(deployEnv ? { APP_DEPLOY_ENV: deployEnv } : {}),
     };
