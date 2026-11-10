@@ -206,7 +206,16 @@ export class CirclePlazaController {
     return this.plazaService.listMyPosts(req.user.userId, page);
   }
 
+  // Published apps acknowledge without a body and expect 204.
   @Post('seen')
+  @HttpCode(HttpStatus.NO_CONTENT)
+  @Throttle({ default: { limit: 60, ttl: 60_000 } })
+  @ApiOperation({ summary: 'Legacy plaza acknowledgement' })
+  async seen(@Req() req: RequestWithUser): Promise<void> {
+    await this.plazaService.markPlazaSeen(req.user.userId);
+  }
+
+  @Post('seen-through')
   @HttpCode(HttpStatus.OK)
   @Throttle({ default: { limit: 60, ttl: 60_000 } })
   @ApiOperation({
@@ -215,7 +224,7 @@ export class CirclePlazaController {
   })
   @ApiOkResponse({ type: PlazaSeenResponseDto })
   @ApiTooManyRequestsResponse({ description: 'Too many plaza seen writes' })
-  seen(
+  seenThrough(
     @Body() dto: PlazaSeenDto,
     @Req() req: RequestWithUser,
   ): Promise<PlazaSeenResponseDto> {

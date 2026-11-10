@@ -154,6 +154,10 @@ describePostgres('circle plaza update dot (PostgreSQL)', () => {
     const { viewer, author, circle } = await setup();
     await post(author, circle, { createdAt: new Date(Date.now() - 10_000) });
     const snapshotAt = await databaseNow();
+    // An earlier poke can be followed by a throttled post: use the latest unread time.
+    await post(author, circle, {
+      createdAt: new Date(snapshotAt.getTime() + 1_000),
+    });
     await post(author, circle, {
       createdAt: new Date(snapshotAt.getTime() + 60_000),
     });
@@ -175,7 +179,11 @@ describePostgres('circle plaza update dot (PostgreSQL)', () => {
     expect(after.updatedAt).toEqual(before.updatedAt);
     expect(after.circlePlazaSeenAt).toEqual(snapshotAt);
     await expect(hasUpdate(viewer)).resolves.toBe(true);
-    expect(broadcast).toHaveBeenCalledWith(viewer, true);
+    expect(broadcast).toHaveBeenCalledWith(
+      viewer,
+      true,
+      new Date(snapshotAt.getTime() + 60_000).toISOString(),
+    );
   });
 
   it('does not move the watermark backwards on a delayed older request', async () => {
@@ -218,6 +226,10 @@ describePostgres('circle plaza update dot (PostgreSQL)', () => {
       after.getTime(),
     );
     await expect(hasUpdate(viewer)).resolves.toBe(false);
-    expect(broadcast).toHaveBeenCalledWith(viewer, false);
+    expect(broadcast).toHaveBeenCalledWith(
+      viewer,
+      false,
+      user.circlePlazaSeenAt.toISOString(),
+    );
   });
 });

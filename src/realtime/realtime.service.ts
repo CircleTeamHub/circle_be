@@ -638,19 +638,23 @@ export class RealtimeService implements OnModuleInit, OnModuleDestroy {
   }
 
   /** 有新帖：点亮飞机红点。不失效快照缓存 —— 那要给每个成员写一次 Redis，缓存本身只活 10 秒。 */
-  broadcastCirclePlazaUpdated(userId: string) {
+  broadcastCirclePlazaUpdated(userId: string, changedAt: string) {
     this.broadcast(userId, {
       type: 'circle.plaza.unread.changed',
-      payload: { hasUpdate: true, changedAt: new Date().toISOString() },
+      payload: { hasUpdate: true, changedAt },
     });
   }
 
   /** 本人确认 feed 水位后同步实际红点；失效旧快照，避免其它设备读回旧状态。 */
-  async broadcastCirclePlazaSeen(userId: string, hasUpdate: boolean) {
+  async broadcastCirclePlazaSeen(
+    userId: string,
+    hasUpdate: boolean,
+    changedAt: string,
+  ) {
     await this.invalidateBadgeSnapshotCache(userId);
     this.broadcast(userId, {
       type: 'circle.plaza.unread.changed',
-      payload: { hasUpdate, changedAt: new Date().toISOString() },
+      payload: { hasUpdate, changedAt },
     });
   }
 

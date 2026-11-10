@@ -37,15 +37,15 @@ export function activeUnexpiredPostWhere(
  * status='ACTIVE' 的帖子到期就会被定时任务结束，所以即使用户很久没打开，
  * 扫描量也只跟「当前还在进行的帖子」有关，不会随历史累积。
  */
-export async function loadCirclePlazaHasUpdate(
+export async function loadCirclePlazaUpdate(
   prisma: Pick<PrismaService, 'user' | 'circlePost'>,
   userId: string,
-): Promise<boolean> {
+): Promise<{ hasUpdate: boolean; changedAt: string | null }> {
   const viewer = await prisma.user.findUnique({
     where: { id: userId },
     select: { circlePlazaSeenAt: true },
   });
-  if (!viewer) return false;
+  if (!viewer) return { hasUpdate: false, changedAt: null };
 
   const newerPost = await prisma.circlePost.findFirst({
     where: {
@@ -54,7 +54,18 @@ export async function loadCirclePlazaHasUpdate(
       authorID: { not: userId },
       circleLinks: { some: { circle: memberCircleScope(userId) } },
     },
-    select: { id: true },
+    orderBy: { createdAt: 'desc' },
+    select: { createdAt: true },
   });
-  return newerPost !== null;
+  return {
+    hasUpdate: newerPost !== null,
+    changedAt: (newerPost?.createdAt ?? viewer.circlePlazaSeenAt).toISOString(),
+  };
+}
+
+export async function loadCirclePlazaHasUpdate(
+  prisma: Pick<PrismaService, 'user' | 'circlePost'>,
+  userId: string,
+): Promise<boolean> {
+  return (await loadCirclePlazaUpdate(prisma, userId)).hasUpdate;
 }

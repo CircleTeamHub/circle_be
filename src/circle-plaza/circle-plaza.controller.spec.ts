@@ -1,4 +1,4 @@
-import { HttpStatus, RequestMethod } from '@nestjs/common';
+import { HttpStatus, RequestMethod, ValidationPipe } from '@nestjs/common';
 import {
   GUARDS_METADATA,
   HTTP_CODE_METADATA,
@@ -51,7 +51,59 @@ describe('CirclePlazaController', () => {
     ).toBeUndefined();
   });
 
-  it('accepts a feed snapshot on POST /seen and returns remaining updates', async () => {
+  it('keeps the legacy empty body valid and the 204 route available', async () => {
+    const pipe = new ValidationPipe({ transform: true, whitelist: true });
+    const metatype = Reflect.getMetadata(
+      'design:paramtypes',
+      CirclePlazaController.prototype,
+      'seen',
+    )[0];
+    await expect(
+      pipe.transform({}, { type: 'body', metatype }),
+    ).resolves.toEqual({});
+    expect(
+      Reflect.getMetadata(
+        HTTP_CODE_METADATA,
+        CirclePlazaController.prototype.seen,
+      ),
+    ).toBe(HttpStatus.NO_CONTENT);
+    const service = {
+      markPlazaSeen: jest.fn().mockResolvedValue({ hasUpdate: false }),
+    };
+    const controller = new CirclePlazaController(service as any, {} as any);
+    await expect(
+      controller.seen({ user: { userId: 'viewer-1' } } as any),
+    ).resolves.toBeUndefined();
+    expect(service.markPlazaSeen).toHaveBeenCalledWith('viewer-1');
+  });
+
+  it('validates the versioned route through ValidationPipe', async () => {
+    const handler = CirclePlazaController.prototype.seenThrough;
+    expect(handler).toBeDefined();
+    expect(Reflect.getMetadata(PATH_METADATA, handler)).toBe('seen-through');
+    const metatype = Reflect.getMetadata(
+      'design:paramtypes',
+      CirclePlazaController.prototype,
+      'seenThrough',
+    )[0];
+    const pipe = new ValidationPipe({ transform: true, whitelist: true });
+    const valid = { snapshotAt: '2026-11-09T00:00:00.123Z' };
+    await expect(
+      pipe.transform(valid, { type: 'body', metatype }),
+    ).resolves.toEqual(valid);
+    for (const body of [
+      {},
+      { snapshotAt: null },
+      { snapshotAt: 'invalid' },
+      { snapshotAt: '2026-02-30T00:00:00Z' },
+    ]) {
+      await expect(
+        pipe.transform(body, { type: 'body', metatype }),
+      ).rejects.toThrow();
+    }
+  });
+
+  it('accepts a feed snapshot on POST /seen-through and returns remaining updates', async () => {
     const service = {
       markPlazaSeen: jest.fn().mockResolvedValue({ hasUpdate: true }),
     };
@@ -59,11 +111,11 @@ describe('CirclePlazaController', () => {
 
     const body = { snapshotAt: '2026-11-09T00:00:00.123Z' };
     await expect(
-      controller.seen(body, { user: { userId: 'viewer-1' } } as any),
+      controller.seenThrough(body, { user: { userId: 'viewer-1' } } as any),
     ).resolves.toEqual({ hasUpdate: true });
 
-    const handler = CirclePlazaController.prototype.seen;
-    expect(Reflect.getMetadata(PATH_METADATA, handler)).toBe('seen');
+    const handler = CirclePlazaController.prototype.seenThrough;
+    expect(Reflect.getMetadata(PATH_METADATA, handler)).toBe('seen-through');
     expect(Reflect.getMetadata(METHOD_METADATA, handler)).toBe(
       RequestMethod.POST,
     );

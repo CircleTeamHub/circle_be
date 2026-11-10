@@ -397,7 +397,8 @@ describe('RealtimeService', () => {
             },
           },
         }),
-        select: { id: true },
+        orderBy: { createdAt: 'desc' },
+        select: { createdAt: true },
       });
     });
 
@@ -431,10 +432,33 @@ describe('RealtimeService', () => {
       ]);
     });
 
+    it('preserves semantic versions when cache invalidation delays seen after a new post', async () => {
+      const invalidation = deferred<void>();
+      redis.invalidateVersionedKey.mockReturnValueOnce(invalidation.promise);
+      const broadcast = jest.spyOn(service, 'broadcast').mockImplementation();
+      const seenAt = '2026-11-09T00:00:00.000Z';
+      const createdAt = '2026-11-09T00:00:01.000Z';
+      const seen = service.broadcastCirclePlazaSeen('user-1', false, seenAt);
+      expect(broadcast).not.toHaveBeenCalled();
+      service.broadcastCirclePlazaUpdated('user-1', createdAt);
+      invalidation.resolve();
+      await seen;
+      expect(broadcast.mock.calls.map((call) => call[1])).toEqual([
+        {
+          type: 'circle.plaza.unread.changed',
+          payload: { hasUpdate: true, changedAt: createdAt },
+        },
+        {
+          type: 'circle.plaza.unread.changed',
+          payload: { hasUpdate: false, changedAt: seenAt },
+        },
+      ]);
+    });
+
     it('lights the dot with a single frame and leaves the snapshot cache alone', () => {
       const broadcast = jest.spyOn(service, 'broadcast').mockImplementation();
 
-      service.broadcastCirclePlazaUpdated('user-1');
+      service.broadcastCirclePlazaUpdated('user-1', '2026-11-09T00:00:00.000Z');
 
       expect(broadcast).toHaveBeenCalledWith('user-1', {
         type: 'circle.plaza.unread.changed',
@@ -448,7 +472,11 @@ describe('RealtimeService', () => {
       async (hasUpdate) => {
         const broadcast = jest.spyOn(service, 'broadcast').mockImplementation();
 
-        await service.broadcastCirclePlazaSeen('user-1', hasUpdate);
+        await service.broadcastCirclePlazaSeen(
+          'user-1',
+          hasUpdate,
+          '2026-11-09T00:00:00.000Z',
+        );
 
         expect(redis.invalidateVersionedKey).toHaveBeenCalledWith(
           'circle:hot:user:user-1:badge-snapshot',

@@ -58,7 +58,7 @@ import {
   activeUnexpiredPostWhere,
   CIRCLE_POST_AUTO_END_MS,
   memberCircleScope,
-  loadCirclePlazaHasUpdate,
+  loadCirclePlazaUpdate,
 } from './circle-plaza-update.query';
 
 // The relations every DTO mapping needs, narrowed to the columns it reads.
@@ -396,7 +396,7 @@ export class CirclePlazaService {
       return created;
     });
 
-    void this.pokeCirclePlazaMembers(userId, circleIds).catch(
+    void this.pokeCirclePlazaMembers(userId, circleIds, post.createdAt).catch(
       (error: unknown) => {
         this.logger.warn(
           `circle plaza poke failed (post=${post.id}): ${
@@ -469,6 +469,7 @@ export class CirclePlazaService {
   private async pokeCirclePlazaMembers(
     authorId: string,
     circleIds: string[],
+    createdAt: Date,
   ): Promise<void> {
     const claimedCircleIds =
       await this.realtime.claimCirclePlazaPokes(circleIds);
@@ -494,25 +495,38 @@ export class CirclePlazaService {
       0,
       CIRCLE_PLAZA_POKE_RECIPIENT_CAP,
     )) {
-      this.realtime.broadcastCirclePlazaUpdated(userID);
+      this.realtime.broadcastCirclePlazaUpdated(
+        userID,
+        createdAt.toISOString(),
+      );
     }
   }
 
   /** 推进到成功 feed 的水位；User.updatedAt 是资料/会员缓存版本，不应改变。 */
   async markPlazaSeen(
     userId: string,
-    snapshotAt: string,
+    snapshotAt?: string,
   ): Promise<{ hasUpdate: boolean }> {
     await this.prisma.$executeRaw`
       UPDATE "User"
       SET "circlePlazaSeenAt" = GREATEST("circlePlazaSeenAt", LEAST(
-        ${new Date(snapshotAt)}::timestamp,
+        COALESCE(${snapshotAt ? new Date(snapshotAt) : null}::timestamp,
+          date_trunc('milliseconds', CURRENT_TIMESTAMP AT TIME ZONE 'UTC')),
         date_trunc('milliseconds', CURRENT_TIMESTAMP AT TIME ZONE 'UTC')
       ))
       WHERE "id" = ${userId}
     `;
-    const hasUpdate = await loadCirclePlazaHasUpdate(this.prisma, userId);
-    await this.realtime.broadcastCirclePlazaSeen(userId, hasUpdate);
+    const { hasUpdate, changedAt } = await loadCirclePlazaUpdate(
+      this.prisma,
+      userId,
+    );
+    if (changedAt !== null) {
+      await this.realtime.broadcastCirclePlazaSeen(
+        userId,
+        hasUpdate,
+        changedAt,
+      );
+    }
     return { hasUpdate };
   }
 

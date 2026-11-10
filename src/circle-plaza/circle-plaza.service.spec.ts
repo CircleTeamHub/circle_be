@@ -1197,8 +1197,8 @@ describe('CirclePlazaService', () => {
     expect(realtime.broadcastNotificationCreated).not.toHaveBeenCalled();
     expect(realtime.claimCirclePlazaPokes).toHaveBeenCalledWith(['circle-1']);
     expect(realtime.broadcastCirclePlazaUpdated.mock.calls).toEqual([
-      ['member-2'],
-      ['member-3'],
+      ['member-2', '2026-06-29T12:00:00.000Z'],
+      ['member-3', '2026-06-29T12:00:00.000Z'],
     ]);
   });
 
@@ -1233,17 +1233,41 @@ describe('CirclePlazaService', () => {
     );
   });
 
+  it('keeps legacy acknowledgement bounded by the database clock', async () => {
+    prisma.user.findUnique.mockResolvedValue({
+      circlePlazaSeenAt: new Date('2026-11-09T00:00:00.000Z'),
+    });
+    prisma.circlePost.findFirst.mockResolvedValue(null);
+    await service.markPlazaSeen('user-1');
+    const [parts, watermark] = prisma.$executeRaw.mock.calls[0];
+    expect(watermark).toBeNull();
+    expect(parts.join('?')).toMatch(/COALESCE[\s\S]*CURRENT_TIMESTAMP/);
+    expect(realtime.broadcastCirclePlazaSeen).toHaveBeenCalledWith(
+      'user-1',
+      false,
+      '2026-11-09T00:00:00.000Z',
+    );
+  });
+
   // User.updatedAt 是资料/会员缓存的版本号，打开一次列表不该让它前进。
   it.each([true, false])(
     'advances only to the bounded watermark and returns actual hasUpdate=%s',
     async (hasUpdate) => {
       const snapshotAt = '2026-11-09T00:00:00.123Z';
       prisma.$executeRaw.mockResolvedValue(1);
+      const persistedSeenAt = hasUpdate
+        ? snapshotAt
+        : '2026-11-09T00:00:05.000Z';
       prisma.user.findUnique.mockResolvedValue({
-        circlePlazaSeenAt: new Date(snapshotAt),
+        circlePlazaSeenAt: new Date(persistedSeenAt),
       });
       prisma.circlePost.findFirst.mockResolvedValue(
-        hasUpdate ? { id: 'newer-post' } : null,
+        hasUpdate
+          ? {
+              id: 'newer-post',
+              createdAt: new Date('2026-11-09T00:00:02.000Z'),
+            }
+          : null,
       );
 
       await expect(
@@ -1264,13 +1288,16 @@ describe('CirclePlazaService', () => {
       expect(prisma.circlePost.findFirst).toHaveBeenCalledWith(
         expect.objectContaining({
           where: expect.objectContaining({
-            createdAt: { gt: new Date(snapshotAt) },
+            createdAt: { gt: new Date(persistedSeenAt) },
           }),
+          orderBy: { createdAt: 'desc' },
+          select: { createdAt: true },
         }),
       );
       expect(realtime.broadcastCirclePlazaSeen).toHaveBeenCalledWith(
         'user-1',
         hasUpdate,
+        hasUpdate ? '2026-11-09T00:00:02.000Z' : persistedSeenAt,
       );
     },
   );
@@ -1409,8 +1436,8 @@ describe('CirclePlazaService', () => {
 
     const poked = realtime.broadcastCirclePlazaUpdated.mock.calls;
     expect(poked).toHaveLength(5000);
-    expect(poked[0]).toEqual(['member-0001']);
-    expect(poked[4999]).toEqual(['member-5000']);
+    expect(poked[0]).toEqual(['member-0001', '2026-06-29T12:00:00.000Z']);
+    expect(poked[4999]).toEqual(['member-5000', '2026-06-29T12:00:00.000Z']);
     expect(warn).toHaveBeenCalledWith(expect.stringContaining('eligible>5000'));
   });
 
