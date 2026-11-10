@@ -11,7 +11,7 @@ import { WebSocket } from 'ws';
 import { PrismaService } from 'src/prisma/prisma.service';
 import { RedisService } from 'src/redis/redis.service';
 import { PROFILE_NOTIFICATION_TYPES } from 'src/notification/notification.constants';
-import { loadCirclePlazaHasUpdate } from 'src/circle-plaza/circle-plaza-update.query';
+import { loadCirclePlazaUpdate } from 'src/circle-plaza/circle-plaza-update.query';
 import { loadUnreadNotificationsByDomain } from 'src/notification/notification-unread.query';
 import {
   profileUnreadCountsByRecipientQuery,
@@ -73,6 +73,7 @@ type BadgeSnapshot = {
   systemUnread: number;
   /** 飞机 tab 的红点：上次打开圈子帖子列表后，有别人发的新帖。 */
   circlePlazaHasUpdate: boolean;
+  circlePlazaChangedAt: string;
   syncedAt: string;
 };
 
@@ -531,10 +532,7 @@ export class RealtimeService implements OnModuleInit, OnModuleDestroy {
       }),
     ]);
     const signupUnread = await this.countUnreadSignups(userId);
-    const circlePlazaHasUpdate = await loadCirclePlazaHasUpdate(
-      this.prisma,
-      userId,
-    );
+    const circlePlaza = await loadCirclePlazaUpdate(this.prisma, userId);
     const { discoverUnread, momentsUnread, circleUnread, profileUnread } =
       notifications;
 
@@ -547,7 +545,8 @@ export class RealtimeService implements OnModuleInit, OnModuleDestroy {
       signupUnread,
       profileUnread,
       systemUnread: profileUnread,
-      circlePlazaHasUpdate,
+      circlePlazaHasUpdate: circlePlaza.hasUpdate,
+      circlePlazaChangedAt: circlePlaza.changedAt,
       syncedAt: new Date().toISOString(),
     };
     return snapshot;
@@ -638,19 +637,23 @@ export class RealtimeService implements OnModuleInit, OnModuleDestroy {
   }
 
   /** 有新帖：点亮飞机红点。不失效快照缓存 —— 那要给每个成员写一次 Redis，缓存本身只活 10 秒。 */
-  broadcastCirclePlazaUpdated(userId: string) {
+  broadcastCirclePlazaUpdated(userId: string, changedAt: string) {
     this.broadcast(userId, {
       type: 'circle.plaza.unread.changed',
-      payload: { hasUpdate: true, changedAt: new Date().toISOString() },
+      payload: { hasUpdate: true, changedAt },
     });
   }
 
-  /** 本人看过列表：清掉其它设备的红点；缓存里那份旧快照不能再把红点带回来。 */
-  async broadcastCirclePlazaSeen(userId: string) {
+  /** 本人确认 feed 水位后同步实际红点；失效旧快照，避免其它设备读回旧状态。 */
+  async broadcastCirclePlazaSeen(
+    userId: string,
+    hasUpdate: boolean,
+    changedAt: string,
+  ) {
     await this.invalidateBadgeSnapshotCache(userId);
     this.broadcast(userId, {
       type: 'circle.plaza.unread.changed',
-      payload: { hasUpdate: false, changedAt: new Date().toISOString() },
+      payload: { hasUpdate, changedAt },
     });
   }
 

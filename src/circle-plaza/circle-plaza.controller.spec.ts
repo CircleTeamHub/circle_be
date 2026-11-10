@@ -1,6 +1,7 @@
-import { RequestMethod } from '@nestjs/common';
+import { HttpStatus, RequestMethod, ValidationPipe } from '@nestjs/common';
 import {
   GUARDS_METADATA,
+  HTTP_CODE_METADATA,
   METHOD_METADATA,
   PATH_METADATA,
 } from '@nestjs/common/constants';
@@ -9,6 +10,9 @@ import { JwtGuard } from 'src/guards/jwt.guard';
 import { IdempotencyScope } from 'src/idempotency/idempotency.service';
 import { CirclePlazaController } from './circle-plaza.controller';
 import { CirclePlazaService } from './circle-plaza.service';
+import { PlazaSeenDto } from './dto/circle-plaza.dto';
+import { plainToInstance } from 'class-transformer';
+import { validate } from 'class-validator';
 
 describe('CirclePlazaController', () => {
   it('requires authentication and throttling for plaza routes', () => {
@@ -47,19 +51,111 @@ describe('CirclePlazaController', () => {
     ).toBeUndefined();
   });
 
-  it('exposes POST /seen to clear the plaza update dot', async () => {
-    const service = { markPlazaSeen: jest.fn().mockResolvedValue(undefined) };
+  it('keeps the legacy empty body valid and the 204 route available', async () => {
+    const pipe = new ValidationPipe({ transform: true, whitelist: true });
+    const metatype = Reflect.getMetadata(
+      'design:paramtypes',
+      CirclePlazaController.prototype,
+      'seen',
+    )[0];
+    await expect(
+      pipe.transform({}, { type: 'body', metatype }),
+    ).resolves.toEqual({});
+    expect(
+      Reflect.getMetadata(
+        HTTP_CODE_METADATA,
+        CirclePlazaController.prototype.seen,
+      ),
+    ).toBe(HttpStatus.NO_CONTENT);
+    const service = {
+      markPlazaSeen: jest.fn().mockResolvedValue({ hasUpdate: false }),
+    };
+    const controller = new CirclePlazaController(service as any, {} as any);
+    await expect(
+      controller.seen({ user: { userId: 'viewer-1' } } as any),
+    ).resolves.toBeUndefined();
+    expect(service.markPlazaSeen).toHaveBeenCalledWith('viewer-1');
+  });
+
+  it('validates the versioned route through ValidationPipe', async () => {
+    const handler = CirclePlazaController.prototype.seenThrough;
+    expect(handler).toBeDefined();
+    expect(Reflect.getMetadata(PATH_METADATA, handler)).toBe('seen-through');
+    const metatype = Reflect.getMetadata(
+      'design:paramtypes',
+      CirclePlazaController.prototype,
+      'seenThrough',
+    )[0];
+    const pipe = new ValidationPipe({ transform: true, whitelist: true });
+    const valid = { snapshotAt: '2026-11-09T00:00:00.123Z' };
+    await expect(
+      pipe.transform(valid, { type: 'body', metatype }),
+    ).resolves.toEqual(valid);
+    for (const body of [
+      {},
+      { snapshotAt: null },
+      { snapshotAt: 'invalid' },
+      { snapshotAt: '2026-02-30T00:00:00Z' },
+    ]) {
+      await expect(
+        pipe.transform(body, { type: 'body', metatype }),
+      ).rejects.toThrow();
+    }
+  });
+
+  it('accepts a feed snapshot on POST /seen-through and returns remaining updates', async () => {
+    const service = {
+      markPlazaSeen: jest.fn().mockResolvedValue({
+        hasUpdate: true,
+        changedAt: '2026-11-09T00:00:10.000Z',
+      }),
+    };
     const controller = new CirclePlazaController(service as any, {} as any);
 
-    await controller.seen({ user: { userId: 'viewer-1' } } as any);
+    const body = { snapshotAt: '2026-11-09T00:00:00.123Z' };
+    await expect(
+      controller.seenThrough(body, { user: { userId: 'viewer-1' } } as any),
+    ).resolves.toEqual({
+      hasUpdate: true,
+      changedAt: '2026-11-09T00:00:10.000Z',
+    });
 
-    const handler = CirclePlazaController.prototype.seen;
-    expect(Reflect.getMetadata(PATH_METADATA, handler)).toBe('seen');
+    const handler = CirclePlazaController.prototype.seenThrough;
+    expect(Reflect.getMetadata(PATH_METADATA, handler)).toBe('seen-through');
     expect(Reflect.getMetadata(METHOD_METADATA, handler)).toBe(
       RequestMethod.POST,
     );
     expect(Reflect.getMetadata('THROTTLER:LIMITdefault', handler)).toBe(60);
-    expect(service.markPlazaSeen).toHaveBeenCalledWith('viewer-1');
+    expect(Reflect.getMetadata(HTTP_CODE_METADATA, handler)).toBe(
+      HttpStatus.OK,
+    );
+    expect(service.markPlazaSeen).toHaveBeenCalledWith(
+      'viewer-1',
+      body.snapshotAt,
+    );
+  });
+
+  it.each([
+    {},
+    { snapshotAt: null },
+    { snapshotAt: 'invalid' },
+    { snapshotAt: '2026-02-30T00:00:00.000Z' },
+    { snapshotAt: 123 },
+  ])('rejects invalid seen watermarks: %j', async (body) => {
+    const errors = await validate(
+      plainToInstance(PlazaSeenDto, body) as object,
+    );
+    expect(errors.some((error) => error.property === 'snapshotAt')).toBe(true);
+  });
+
+  it('accepts an ISO feed snapshot watermark', async () => {
+    await expect(
+      validate(
+        plainToInstance(PlazaSeenDto, {
+          snapshotAt: '2026-11-09T00:00:00.123Z',
+        }) as object,
+      ),
+    ).resolves.toEqual([]);
   });
 
   it('exposes authenticated POST /feed/search and delegates to the feed query', async () => {

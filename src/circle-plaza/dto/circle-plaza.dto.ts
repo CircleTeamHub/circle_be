@@ -6,6 +6,7 @@ import {
   IsArray,
   IsBoolean,
   IsInt,
+  IsISO8601,
   IsNotEmpty,
   IsOptional,
   IsString,
@@ -24,6 +25,26 @@ import { MAX_PAGE } from 'src/common/pagination';
 import { ImageMediaVariantDto } from 'src/media/image-media.dto';
 
 // ── Request DTOs ─────────────────────────────────────────────────────────────
+
+export class PlazaSeenDto {
+  @ApiProperty({
+    format: 'date-time',
+    description: '成功 feed 响应的 snapshotAt',
+  })
+  @IsISO8601({ strict: true })
+  snapshotAt: string;
+}
+
+export class PlazaSeenResponseDto {
+  @ApiProperty()
+  hasUpdate: boolean;
+
+  @ApiProperty({
+    format: 'date-time',
+    description: 'Database observation watermark of hasUpdate',
+  })
+  changedAt: string;
+}
 
 export class CreatePlazaPostDto {
   @ApiProperty()
@@ -406,6 +427,12 @@ export class ReportCirclePostDto {
 // GET /circle-plaza/feed 与 POST /circle-plaza/feed/search 的分页信封响应。之前 feed/search
 // 的 @ApiOkResponse 谎报成裸 PlazaPostDto[]，生成的移动端客户端会按错误的顶层结构反序列化。
 export class PlazaFeedResponseDto {
+  @ApiProperty({
+    format: 'date-time',
+    description: '本次 feed 的数据库快照水位',
+  })
+  snapshotAt: string;
+
   @ApiProperty({ type: PlazaPostDto, isArray: true })
   items: PlazaPostDto[];
 

@@ -42,6 +42,8 @@ import {
   PlazaFeedResponseDto,
   PlazaFeedSearchDto,
   PlazaPostDto,
+  PlazaSeenDto,
+  PlazaSeenResponseDto,
   RecognizePostCollaboratorsDto,
   ReportCirclePostDto,
   PostSignupItemDto,
@@ -204,16 +206,29 @@ export class CirclePlazaController {
     return this.plazaService.listMyPosts(req.user.userId, page);
   }
 
+  // Published apps acknowledge without a body and expect 204.
   @Post('seen')
   @HttpCode(HttpStatus.NO_CONTENT)
   @Throttle({ default: { limit: 60, ttl: 60_000 } })
+  @ApiOperation({ summary: 'Legacy plaza acknowledgement' })
+  async seen(@Req() req: RequestWithUser): Promise<void> {
+    await this.plazaService.markPlazaSeen(req.user.userId);
+  }
+
+  @Post('seen-through')
+  @HttpCode(HttpStatus.OK)
+  @Throttle({ default: { limit: 60, ttl: 60_000 } })
   @ApiOperation({
-    summary: 'Mark the circle post list as seen (clears tab dot)',
+    summary:
+      'Acknowledge a successful feed snapshot and return remaining updates',
   })
-  @ApiNoContentResponse()
+  @ApiOkResponse({ type: PlazaSeenResponseDto })
   @ApiTooManyRequestsResponse({ description: 'Too many plaza seen writes' })
-  seen(@Req() req: RequestWithUser): Promise<void> {
-    return this.plazaService.markPlazaSeen(req.user.userId);
+  seenThrough(
+    @Body() dto: PlazaSeenDto,
+    @Req() req: RequestWithUser,
+  ): Promise<PlazaSeenResponseDto> {
+    return this.plazaService.markPlazaSeen(req.user.userId, dto.snapshotAt);
   }
 
   @Get('me/signups/unread-count')

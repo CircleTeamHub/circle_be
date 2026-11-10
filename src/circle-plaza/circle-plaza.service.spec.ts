@@ -132,6 +132,12 @@ describe('CirclePlazaService', () => {
     realtime.claimCirclePlazaPokes.mockImplementation((ids: string[]) =>
       Promise.resolve(ids),
     );
+    prisma.$queryRaw.mockResolvedValue([
+      {
+        snapshotAt: new Date(),
+        observedAt: new Date('2026-11-09T00:00:10.000Z'),
+      },
+    ]);
     prisma.block.findMany.mockReset();
     prisma.block.findMany.mockResolvedValue([]);
     iconService.getDisplayIconsForUsers.mockReset();
@@ -163,6 +169,65 @@ describe('CirclePlazaService', () => {
   });
 
   describe('getFeed', () => {
+    it('returns the database snapshot and bounds both offset queries by it', async () => {
+      const snapshotAt = new Date('2026-11-09T00:00:00.123Z');
+      prisma.$queryRaw.mockResolvedValue([{ snapshotAt }]);
+      prisma.circlePost.findMany.mockResolvedValue([]);
+      prisma.circlePost.count.mockResolvedValue(0);
+      prisma.user.findUnique.mockResolvedValue({
+        vipLevel: 1,
+        vipExpiresAt: null,
+      });
+
+      const result = await service.getFeed('viewer-1', {});
+
+      expect(result).toHaveProperty('snapshotAt', snapshotAt.toISOString());
+      const sql = prisma.$queryRaw.mock.calls[0][0].join('');
+      expect(sql).toMatch(/CURRENT_TIMESTAMP/i);
+      expect(sql).toMatch(/snapshotAt/);
+      for (const query of [
+        prisma.circlePost.findMany,
+        prisma.circlePost.count,
+      ]) {
+        expect(query).toHaveBeenCalledWith(
+          expect.objectContaining({
+            where: expect.objectContaining({ createdAt: { lte: snapshotAt } }),
+          }),
+        );
+      }
+      expect(prisma.$queryRaw.mock.invocationCallOrder[0]).toBeLessThan(
+        prisma.circlePost.findMany.mock.invocationCallOrder[0],
+      );
+    });
+
+    it('also bounds keyset pages by the database snapshot', async () => {
+      const snapshotAt = new Date('2026-11-09T00:00:00.123Z');
+      prisma.$queryRaw.mockResolvedValue([{ snapshotAt }]);
+      prisma.circlePost.findMany.mockResolvedValue([]);
+      prisma.user.findUnique.mockResolvedValue({
+        vipLevel: 1,
+        vipExpiresAt: null,
+      });
+      const cursor = Buffer.from('2026-11-08T00:00:00.000Z|post-1').toString(
+        'base64url',
+      );
+
+      const result = await service.getFeed('viewer-1', { cursor });
+
+      expect(result).toHaveProperty('snapshotAt', snapshotAt.toISOString());
+      expect(prisma.circlePost.findMany).toHaveBeenCalledWith(
+        expect.objectContaining({
+          where: {
+            AND: [
+              expect.objectContaining({ createdAt: { lte: snapshotAt } }),
+              expect.anything(),
+            ],
+          },
+        }),
+      );
+      expect(prisma.circlePost.count).not.toHaveBeenCalled();
+    });
+
     // 广场每行曾 include 整行 User（含 passwordHash/email）与整行 Circle，而
     // mapper 只用作者 7 列、圈子 2 列。include 必须是显式 select：既省 DB→应用
     // 的传输，也避免某个分支一次手滑就把敏感列送出去。
@@ -1137,8 +1202,8 @@ describe('CirclePlazaService', () => {
     expect(realtime.broadcastNotificationCreated).not.toHaveBeenCalled();
     expect(realtime.claimCirclePlazaPokes).toHaveBeenCalledWith(['circle-1']);
     expect(realtime.broadcastCirclePlazaUpdated.mock.calls).toEqual([
-      ['member-2'],
-      ['member-3'],
+      ['member-2', '2026-06-29T12:00:00.000Z'],
+      ['member-3', '2026-06-29T12:00:00.000Z'],
     ]);
   });
 
@@ -1173,16 +1238,76 @@ describe('CirclePlazaService', () => {
     );
   });
 
-  // User.updatedAt 是资料/会员缓存的版本号，打开一次列表不该让它前进。
-  it('records the plaza as seen without bumping User.updatedAt and clears other devices', async () => {
-    prisma.$executeRaw.mockResolvedValue(1);
-
+  it('keeps legacy acknowledgement bounded by the database clock', async () => {
+    prisma.user.findUnique.mockResolvedValue({
+      circlePlazaSeenAt: new Date('2026-11-09T00:00:00.000Z'),
+    });
+    prisma.circlePost.findFirst.mockResolvedValue(null);
     await service.markPlazaSeen('user-1');
-
-    expect(prisma.$executeRaw).toHaveBeenCalledTimes(1);
-    expect(prisma.user.updateMany).not.toHaveBeenCalled();
-    expect(realtime.broadcastCirclePlazaSeen).toHaveBeenCalledWith('user-1');
+    const [parts, watermark] = prisma.$executeRaw.mock.calls[0];
+    expect(watermark).toBeNull();
+    expect(parts.join('?')).toMatch(/COALESCE[\s\S]*CURRENT_TIMESTAMP/);
+    expect(realtime.broadcastCirclePlazaSeen).toHaveBeenCalledWith(
+      'user-1',
+      false,
+      '2026-11-09T00:00:10.000Z',
+    );
   });
+
+  // User.updatedAt 是资料/会员缓存的版本号，打开一次列表不该让它前进。
+  it.each([true, false])(
+    'advances only to the bounded watermark and returns actual hasUpdate=%s',
+    async (hasUpdate) => {
+      const snapshotAt = '2026-11-09T00:00:00.123Z';
+      prisma.$executeRaw.mockResolvedValue(1);
+      const persistedSeenAt = hasUpdate
+        ? snapshotAt
+        : '2026-11-09T00:00:05.000Z';
+      prisma.user.findUnique.mockResolvedValue({
+        circlePlazaSeenAt: new Date(persistedSeenAt),
+      });
+      prisma.circlePost.findFirst.mockResolvedValue(
+        hasUpdate
+          ? {
+              id: 'newer-post',
+              createdAt: new Date('2026-11-09T00:00:02.000Z'),
+            }
+          : null,
+      );
+
+      await expect(
+        service.markPlazaSeen('user-1', snapshotAt),
+      ).resolves.toEqual({ hasUpdate, changedAt: '2026-11-09T00:00:10.000Z' });
+
+      expect(prisma.$executeRaw).toHaveBeenCalledTimes(1);
+      const [parts, watermark, userId] = prisma.$executeRaw.mock.calls[0];
+      const sql = parts.join('?');
+      expect(sql).toMatch(
+        /GREATEST\s*\(\s*"circlePlazaSeenAt"\s*,\s*LEAST\s*\(/i,
+      );
+      expect(sql).toMatch(/CURRENT_TIMESTAMP/i);
+      expect(sql).not.toMatch(/updatedAt/);
+      expect(watermark).toEqual(new Date(snapshotAt));
+      expect(userId).toBe('user-1');
+      expect(prisma.user.updateMany).not.toHaveBeenCalled();
+      expect(prisma.circlePost.findFirst).toHaveBeenCalledWith(
+        expect.objectContaining({
+          where: expect.objectContaining({
+            createdAt: {
+              gt: new Date(persistedSeenAt),
+              lte: new Date('2026-11-09T00:00:10.000Z'),
+            },
+          }),
+          select: { id: true },
+        }),
+      );
+      expect(realtime.broadcastCirclePlazaSeen).toHaveBeenCalledWith(
+        'user-1',
+        hasUpdate,
+        '2026-11-09T00:00:10.000Z',
+      );
+    },
+  );
 
   it('does not fail a committed post when the plaza poke fails', async () => {
     mockPublishableAuthor(['member-2']);
@@ -1318,8 +1443,8 @@ describe('CirclePlazaService', () => {
 
     const poked = realtime.broadcastCirclePlazaUpdated.mock.calls;
     expect(poked).toHaveLength(5000);
-    expect(poked[0]).toEqual(['member-0001']);
-    expect(poked[4999]).toEqual(['member-5000']);
+    expect(poked[0]).toEqual(['member-0001', '2026-06-29T12:00:00.000Z']);
+    expect(poked[4999]).toEqual(['member-5000', '2026-06-29T12:00:00.000Z']);
     expect(warn).toHaveBeenCalledWith(expect.stringContaining('eligible>5000'));
   });
 
