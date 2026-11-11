@@ -3709,6 +3709,11 @@ export class ChatService {
     }
     const seats = await this.prisma.chatMember.findMany({
       where: { conversationID: conversationId, leftAt: null },
+      // Without an explicit order Postgres returns physical/index order, which
+      // moves with every seat update (read heights), so the owner wandered
+      // around the roster. Join order, with userID breaking ties between seats
+      // created in the same transaction, keeps it stable; roles are applied below.
+      orderBy: [{ joinedAt: 'asc' }, { userID: 'asc' }],
       select: {
         userID: true,
         role: true,
@@ -3742,6 +3747,10 @@ export class ChatService {
       if (conversation.circleID) return roles.get(seat.userID) ?? null;
       return standaloneGroupRole(conversation.ownerID, seat);
     };
+    // Owner first, then admins, then everyone else; sort is stable, so each
+    // tier keeps the join order from the query.
+    const tiers: Partial<Record<string, number>> = { OWNER: 0, ADMIN: 1 };
+    const rank = (role: ChatMemberDto['role']) => tiers[role ?? ''] ?? 2;
     return seats
       .map((seat) => {
         const user = users.get(seat.userID);
@@ -3756,7 +3765,8 @@ export class ChatService {
           silencedUntil: silencedUntilOf(seat),
         };
       })
-      .filter((m): m is ChatMemberDto => m !== null);
+      .filter((m): m is ChatMemberDto => m !== null)
+      .sort((a, b) => rank(a.role) - rank(b.role));
   }
 
   /** 网关访客鉴权用:房间是否仍 ACTIVE 未过期。 */

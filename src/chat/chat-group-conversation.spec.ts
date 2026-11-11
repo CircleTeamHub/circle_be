@@ -779,4 +779,36 @@ describe('ChatService standalone group conversations', () => {
       members.map((m) => m.userId).sort((a, b) => a.localeCompare(b)),
     ).toEqual(['f1', 'owner-1']);
   });
+
+  it('lists the owner first, then admins, then members in join order', async () => {
+    prisma.chatMember.findUnique.mockResolvedValue(seat({ userID: 'f1' }));
+    // Seats come back in join order; the owner's seat is not the earliest one.
+    prisma.chatMember.findMany.mockResolvedValue([
+      { userID: 'f1', role: 'MEMBER' },
+      { userID: 'owner-1', role: 'MEMBER' },
+      { userID: 'f2', role: 'MEMBER' },
+      { userID: 'admin-1', role: 'ADMIN' },
+    ]);
+    prisma.user.findMany.mockResolvedValue(
+      ['f1', 'owner-1', 'f2', 'admin-1'].map((id) => ({
+        id,
+        nickname: id,
+        avatarUrl: null,
+      })),
+    );
+
+    const members = await service.listMembers('f1', 'conv-1');
+
+    expect(prisma.chatMember.findMany).toHaveBeenCalledWith(
+      expect.objectContaining({
+        orderBy: [{ joinedAt: 'asc' }, { userID: 'asc' }],
+      }),
+    );
+    expect(members.map((m) => [m.userId, m.role])).toEqual([
+      ['owner-1', 'OWNER'],
+      ['admin-1', 'ADMIN'],
+      ['f1', 'MEMBER'],
+      ['f2', 'MEMBER'],
+    ]);
+  });
 });
