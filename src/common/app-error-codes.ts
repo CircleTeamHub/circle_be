@@ -369,6 +369,8 @@ export const ChatErrorCode = {
   EditWindowExpired: 'CHAT_EDIT_WINDOW_EXPIRED',
   EditForbidden: 'CHAT_EDIT_FORBIDDEN',
   ForwardForbidden: 'CHAT_FORWARD_FORBIDDEN',
+  // 媒体过了保留期、对象已被每日任务删掉(见 chat-media-retention):不能再转发、收藏。
+  MediaExpired: 'CHAT_MEDIA_EXPIRED',
   // 逐条已读名单只给消息发送者本人(其他成员的消息、无作者的系统消息一律拒)。
   ReadersForbidden: 'CHAT_READERS_FORBIDDEN',
   // 独立群聊(不挂圈子的 GROUP):建群/邀请只能选好友;圈子群的成员由圈子管理,

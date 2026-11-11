@@ -23,6 +23,10 @@ import {
 } from './chat.constants';
 import type { ChatMessageDto } from './chat.types';
 import {
+  expiredMediaContent,
+  isChatMediaExpired,
+} from './chat-media-retention';
+import {
   NOTE_CARD_PROJECTOR,
   type NoteCardProjection,
   type NoteCardProjector,
@@ -787,8 +791,14 @@ export class ChatMediaService implements OnModuleDestroy {
    * 就地把 dto.content 换成带签名 URL 的新对象(不改数据库行)。
    * 存储未配置/签名失败时降级:保留 key、缺 url,前端按占位图处理 ——
    * 读路径绝不因媒体签名把整页历史打挂。
+   *
+   * 超过保留期的媒体(见 chat-media-retention)标 `expired`、去掉 key 不再签名。
+   * 收藏页传 ignoreRetention:收藏着的消息不会被每日任务清理,照常签。
    */
-  async attachMediaUrls(messages: ChatMessageDto[]): Promise<void> {
+  async attachMediaUrls(
+    messages: ChatMessageDto[],
+    { ignoreRetention = false }: { ignoreRetention?: boolean } = {},
+  ): Promise<void> {
     let burnGrants = new Map<string, { date: Date; ttl: number }>();
     try {
       burnGrants = await this.burnMediaGrants(messages);
@@ -905,6 +915,10 @@ export class ChatMediaService implements OnModuleDestroy {
         if (!fields && !isNoteCard) return;
         message.content = { ...message.content };
         for (const field of fields ?? []) delete message.content[field.url];
+        if (!ignoreRetention && isChatMediaExpired(message)) {
+          message.content = expiredMediaContent(message.content);
+          return;
+        }
         if (isNoteCard) {
           delete message.content[NOTE_CARD_PREVIEW_URLS_FIELD];
           const sourceNoteId = message.content.sourceNoteId;

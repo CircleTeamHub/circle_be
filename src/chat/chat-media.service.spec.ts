@@ -17,7 +17,8 @@ function dto(overrides: Partial<ChatMessageDto>): ChatMessageDto {
     sender: null,
     replyToId: null,
     d: null,
-    createdAt: '2026-08-05T12:00:00.000Z',
+    // 发送时间取当下:写死的过去日期会随时间滑出媒体保留期。
+    createdAt: new Date().toISOString(),
     ...overrides,
   };
 }
@@ -95,6 +96,68 @@ describe('ChatMediaService', () => {
         ? values[0].map((key: string) => ({ key }))
         : [],
     );
+  });
+
+  describe('media retention', () => {
+    const daysAgo = (days: number) =>
+      new Date(Date.now() - days * 24 * 60 * 60 * 1000).toISOString();
+    const video = (createdAt: string, extra: Partial<ChatMessageDto> = {}) =>
+      dto({
+        type: 'video',
+        createdAt,
+        content: {
+          key: 'chat/u1/a.mp4',
+          thumbKey: 'chat/u1/a.jpg',
+          width: 720,
+          height: 1280,
+          duration: 12,
+        },
+        ...extra,
+      });
+
+    it('marks media past retention expired instead of signing it', async () => {
+      const old = video(daysAgo(31));
+      await service.attachMediaUrls([old]);
+      expect(old.content).toEqual({
+        width: 720,
+        height: 1280,
+        duration: 12,
+        expired: true,
+      });
+      expect(uploadService.createPresignedGetUrl).not.toHaveBeenCalled();
+    });
+
+    it('still signs media inside the retention window', async () => {
+      const recent = video(daysAgo(29));
+      await service.attachMediaUrls([recent]);
+      expect(recent.content).toMatchObject({
+        url: 'https://signed/chat/u1/a.mp4',
+        thumbUrl: 'https://signed/chat/u1/a.jpg',
+      });
+      expect(recent.content.expired).toBeUndefined();
+    });
+
+    // 收藏着的消息不会被每日任务清理,收藏页照常签地址。
+    it('ignores retention for collection reads', async () => {
+      const collected = video(daysAgo(200));
+      await service.attachMediaUrls([collected], { ignoreRetention: true });
+      expect(collected.content).toMatchObject({
+        url: 'https://signed/chat/u1/a.mp4',
+      });
+      expect(collected.content.expired).toBeUndefined();
+    });
+
+    it('keeps the stored expired marker once the objects are gone', async () => {
+      const purged = video(daysAgo(200), {
+        content: { width: 720, height: 1280, expired: true },
+      });
+      await service.attachMediaUrls([purged], { ignoreRetention: true });
+      expect(purged.content).toEqual({
+        width: 720,
+        height: 1280,
+        expired: true,
+      });
+    });
   });
 
   describe('note card previews', () => {

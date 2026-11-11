@@ -25,6 +25,7 @@ import { ChatPushService } from './chat-push.service';
 import { ChatSystemMessageService } from './chat-system-message.service';
 import { ChatBurnArchiveCleanupService } from './chat-burn-archive-cleanup.service';
 import { ChatBurnSweeperService } from './chat-burn-sweeper.service';
+import { ChatMediaRetentionService } from './chat-media-retention.service';
 import { ChatPresenceRegistry } from './chat-presence.registry';
 import { ChatService } from './chat.service';
 import { ChatSupportRechargeProcessor } from './chat-support-recharge.processor';
@@ -64,6 +65,7 @@ import { ChatDirectAutoReplyProcessor } from './chat-direct-auto-reply.processor
     ChatPushService,
     ChatSystemMessageService,
     ChatBurnSweeperService,
+    ChatMediaRetentionService,
     ChatBurnArchiveCleanupService,
     ChatPresenceRegistry,
     ChatSupportRechargeProcessor,
