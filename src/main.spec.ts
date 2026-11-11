@@ -153,7 +153,7 @@ describe('production HTTP CORS integration', () => {
       .set('Access-Control-Request-Method', 'GET')
       .set(
         'Access-Control-Request-Headers',
-        'Authorization, Content-Type, X-Request-Id, X-Device-Name, Idempotency-Key',
+        'Authorization, Content-Type, X-Request-Id, X-Device-Name, Idempotency-Key, X-Call-Invite-Created-At',
       );
 
     expect(allowed.status).toBe(204);
@@ -163,6 +163,9 @@ describe('production HTTP CORS integration', () => {
     expect(allowed.headers['access-control-allow-credentials']).toBe('true');
     expect(allowed.headers['access-control-allow-headers']).toContain(
       'X-Request-Id',
+    );
+    expect(allowed.headers['access-control-allow-headers']).toContain(
+      'X-Call-Invite-Created-At',
     );
 
     const blocked = await request(app.getHttpServer())
@@ -234,6 +237,7 @@ describe('buildNestFactoryOptions', () => {
         'X-Device-Name',
         'X-Device-Id',
         'Idempotency-Key',
+        'X-Call-Invite-Created-At',
       ]),
     );
   });

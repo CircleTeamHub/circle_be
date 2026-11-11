@@ -92,6 +92,7 @@ type CallInvitePayload = {
   invitees: CallUserLite[];
   expiresAt: string;
   createdAt: string;
+  invitationMode?: 'members' | 'contacts';
 };
 
 type CallParticipantPayload = {
@@ -150,6 +151,7 @@ type RealtimeEvent =
       payload: NoteSourceStatusPayload;
     }
   | { type: 'call.invite'; payload: CallInvitePayload }
+  | { type: 'call.updated'; payload: { call: Record<string, unknown> } }
   | { type: 'call.participant.joined'; payload: CallParticipantPayload }
   | { type: 'call.participant.left'; payload: CallParticipantPayload }
   | { type: 'call.participant.rejected'; payload: CallParticipantPayload }
@@ -267,6 +269,7 @@ export class RealtimeService implements OnModuleInit, OnModuleDestroy {
     'moments.feed.updated',
     'note.source.status.changed',
     'call.invite',
+    'call.updated',
     'call.participant.joined',
     'call.participant.left',
     'call.participant.rejected',
@@ -912,6 +915,13 @@ export class RealtimeService implements OnModuleInit, OnModuleDestroy {
       type: 'call.invite',
       payload,
     });
+  }
+
+  broadcastCallUpdated(
+    userId: string,
+    payload: { call: Record<string, unknown> },
+  ) {
+    this.broadcast(userId, { type: 'call.updated', payload });
   }
 
   broadcastCallParticipantJoined(

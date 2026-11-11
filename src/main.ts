@@ -62,6 +62,7 @@ export function buildNestFactoryOptions() {
         // 陌生设备登录验证的设备标识；网页端不放行就永远被当成陌生设备。
         'X-Device-Id',
         'Idempotency-Key',
+        'X-Call-Invite-Created-At',
       ],
       // GET /note and /note/recycle-bin signal truncation through this header
       // while the body stays an array; browsers hide unlisted response headers

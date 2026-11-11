@@ -22,9 +22,19 @@ export function deriveDeclineTokenKey(secret: string): Buffer {
   );
 }
 
-function mac(key: Buffer, callId: string, userId: string, exp: number) {
+function mac(
+  key: Buffer,
+  callId: string,
+  userId: string,
+  exp: number,
+  generation?: string,
+) {
   return createHmac('sha256', key)
-    .update(`${VERSION}|${callId}|${userId}|${exp}`)
+    .update(
+      generation === undefined
+        ? `${VERSION}|${callId}|${userId}|${exp}`
+        : `v2|${callId}|${userId}|${exp}|${generation}`,
+    )
     .digest();
 }
 
@@ -33,14 +43,17 @@ export function issueDeclineToken(
   callId: string,
   userId: string,
   ringExpiresAt: Date,
+  invitedAt?: Date,
 ): string {
   const exp =
     Math.floor(ringExpiresAt.getTime() / 1000) + DECLINE_TOKEN_GRACE_SECONDS;
+  const generation = invitedAt?.getTime().toString();
   return [
-    VERSION,
+    generation === undefined ? VERSION : 'v2',
     userId,
     String(exp),
-    mac(key, callId, userId, exp).toString('base64url'),
+    ...(generation === undefined ? [] : [generation]),
+    mac(key, callId, userId, exp, generation).toString('base64url'),
   ].join('.');
 }
 
@@ -52,12 +65,17 @@ export function verifyDeclineToken(
   now: Date = new Date(),
 ): string | null {
   const parts = token.split('.');
-  if (parts.length !== 4 || parts[0] !== VERSION) return null;
-  const [, userId, expRaw, signature] = parts;
+  const isV2 = parts[0] === 'v2';
+  if (parts.length !== (isV2 ? 5 : 4) || (!isV2 && parts[0] !== VERSION))
+    return null;
+  const [, userId, expRaw] = parts;
+  const generation = isV2 ? parts[3] : undefined;
+  if (isV2 && !/^\d{1,15}$/.test(generation!)) return null;
+  const signature = parts[parts.length - 1];
   if (!USER_ID_PATTERN.test(userId) || !/^\d{1,12}$/.test(expRaw)) return null;
   const exp = Number(expRaw);
   if (exp * 1000 < now.getTime()) return null;
-  const expected = mac(key, callId, userId, exp);
+  const expected = mac(key, callId, userId, exp, generation);
   const actual = Buffer.from(signature, 'base64url');
   if (actual.length !== expected.length) return null;
   return timingSafeEqual(actual, expected) ? userId : null;

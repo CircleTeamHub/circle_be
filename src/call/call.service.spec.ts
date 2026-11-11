@@ -263,6 +263,7 @@ describe('CallService', () => {
         callType: 'AUDIO',
         initiator: { id: 'user-1', nickname: 'Alice' },
         expiresAt: '2026-06-11T03:00:45.000Z',
+        createdAt: '2026-06-11T03:00:00.000Z',
       },
       ['user-2'],
     );
@@ -817,6 +818,7 @@ describe('CallService', () => {
       'call-1',
       'user-2',
       'answered_elsewhere',
+      undefined,
     );
     expect(result.livekit.token).toBe('livekit-token');
   });
@@ -1109,6 +1111,7 @@ describe('CallService', () => {
       'call-1',
       'user-2',
       'declined_elsewhere',
+      undefined,
     );
     // 还有别的被叫在响：通话没终局，不发整通撤销。
     expect(callPush.dismissForEndedCall).not.toHaveBeenCalled();
@@ -1366,7 +1369,20 @@ describe('CallService', () => {
 
     expect(prisma.callSession.findMany).toHaveBeenCalledWith(
       expect.objectContaining({
-        where: { status: 'RINGING', expiresAt: { lte: now } },
+        where: {
+          OR: [
+            { status: 'RINGING', expiresAt: { lte: now } },
+            {
+              status: 'ACTIVE',
+              participants: {
+                some: {
+                  status: 'INVITED',
+                  invitedAt: { lte: new Date(now.getTime() - 45_000) },
+                },
+              },
+            },
+          ],
+        },
         take: 10,
       }),
     );

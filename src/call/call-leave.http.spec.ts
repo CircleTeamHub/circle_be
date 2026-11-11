@@ -10,6 +10,7 @@ import { AppAudienceGuard } from 'src/guards/app-audience.guard';
 import { JwtGuard } from 'src/guards/jwt.guard';
 import { CallController } from './call.controller';
 import { CallService } from './call.service';
+import { IdempotencyService } from 'src/idempotency/idempotency.service';
 
 /**
  * POST /calls/:callId/leave 的 HTTP 管线。挂断是通话里最不能失败的一步:挂不断的
@@ -40,7 +41,10 @@ describe('POST /calls/:callId/leave HTTP pipeline', () => {
 
     const moduleRef = await Test.createTestingModule({
       controllers: [CallController],
-      providers: [{ provide: CallService, useValue: callService }],
+      providers: [
+        { provide: CallService, useValue: callService },
+        { provide: IdempotencyService, useValue: {} },
+      ],
     })
       .overrideGuard(JwtGuard)
       .useValue(asCaller)

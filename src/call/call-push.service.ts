@@ -61,6 +61,7 @@ export type CallPushInvite = {
   callType: 'AUDIO' | 'VIDEO';
   initiator: { id: string; nickname: string };
   expiresAt: string;
+  createdAt?: string;
 };
 
 type CallPushTarget = {
@@ -124,11 +125,12 @@ export class CallPushService implements OnModuleDestroy {
     userID: string,
     reason: Extract<
       CallDismissReason,
-      'answered_elsewhere' | 'declined_elsewhere'
+      'answered_elsewhere' | 'declined_elsewhere' | 'missed'
     >,
+    invitedAt?: Date,
   ): void {
     this.track('dismiss', callId, () =>
-      this.sendDismiss(callId, [userID], reason),
+      this.sendDismiss(callId, [userID], reason, invitedAt),
     );
   }
 
@@ -208,6 +210,7 @@ export class CallPushService implements OnModuleDestroy {
       callerId: invite.initiator.id,
       callerName: truncateChars(invite.initiator.nickname, NAME_MAX_CHARS),
       expiresAt: expiresAt.toISOString(),
+      createdAt: invite.createdAt ?? new Date().toISOString(),
       ...(groupName
         ? { groupName: truncateChars(groupName, NAME_MAX_CHARS) }
         : {}),
@@ -219,6 +222,7 @@ export class CallPushService implements OnModuleDestroy {
         invite.callId,
         userID,
         expiresAt,
+        invite.createdAt ? new Date(invite.createdAt) : undefined,
       ),
     });
 
@@ -259,6 +263,7 @@ export class CallPushService implements OnModuleDestroy {
             callId: invite.callId,
             callType: invite.callType,
             sessionType: invite.sessionType,
+            createdAt: base.createdAt,
           },
           ttlSeconds,
         },
@@ -273,6 +278,7 @@ export class CallPushService implements OnModuleDestroy {
     callId: string,
     userIDs: string[],
     reason: CallDismissReason,
+    invitedAt?: Date,
   ): Promise<void> {
     const targets = (await this.listTargets(userIDs)).filter(
       (target) => target.provider === 'jpush',
@@ -283,6 +289,7 @@ export class CallPushService implements OnModuleDestroy {
       type: 'call.dismiss',
       callId,
       reason,
+      createdAt: (invitedAt ?? new Date()).toISOString(),
     };
     // 撤销追着邀请跑：邀请的 TTL 是剩余振铃时间，撤销留一整个振铃窗口就一定够；
     // 多留几秒无害（原生层收不到对应的振铃就什么都不做），少留会漏收。

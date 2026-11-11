@@ -1,4 +1,5 @@
 import {
+  BadRequestException,
   Body,
   Controller,
   Get,
@@ -15,7 +16,27 @@ import type { RequestWithUser } from 'src/auth/types';
 import { AppAudienceGuard } from 'src/guards/app-audience.guard';
 import { JwtGuard } from 'src/guards/jwt.guard';
 import { CallService } from './call.service';
-import { CreateDirectCallDto, CreateGroupCallDto } from './dto/call.dto';
+import {
+  IdempotencyScope,
+  IdempotencyService,
+} from 'src/idempotency/idempotency.service';
+import {
+  CreateDirectCallDto,
+  CreateGroupCallDto,
+  InviteCallParticipantsDto,
+} from './dto/call.dto';
+
+function parseInvitationCreatedAt(value?: string): Date | undefined {
+  if (value === undefined) return undefined;
+  const timestamp = new Date(value);
+  if (
+    !Number.isFinite(timestamp.getTime()) ||
+    timestamp.toISOString() !== value
+  ) {
+    throw new BadRequestException('Invalid call invitation timestamp');
+  }
+  return timestamp;
+}
 
 @ApiTags('Calls')
 @ApiBearerAuth()
@@ -24,7 +45,10 @@ import { CreateDirectCallDto, CreateGroupCallDto } from './dto/call.dto';
 @UseGuards(ThrottlerGuard, JwtGuard, AppAudienceGuard)
 @Controller('calls')
 export class CallController {
-  constructor(private readonly callService: CallService) {}
+  constructor(
+    private readonly callService: CallService,
+    private readonly idempotency: IdempotencyService,
+  ) {}
 
   @Post('group')
   @Throttle({ default: { limit: 10, ttl: 60_000 } })
@@ -66,8 +90,32 @@ export class CallController {
   acceptCall(
     @Param('callId', ParseUUIDPipe) callId: string,
     @Req() req: RequestWithUser,
+    @Headers('x-call-invite-created-at') invitedAt?: string,
   ) {
-    return this.callService.acceptCall(req.user.userId, callId);
+    return this.callService.acceptCall(
+      req.user.userId,
+      callId,
+      parseInvitationCreatedAt(invitedAt),
+    );
+  }
+
+  @Post(':callId/invite')
+  @Throttle({ default: { limit: 10, ttl: 60_000 } })
+  inviteParticipants(
+    @Param('callId', ParseUUIDPipe) callId: string,
+    @Body() dto: InviteCallParticipantsDto,
+    @Req() req: RequestWithUser,
+    @Headers('idempotency-key') idempotencyKey?: string,
+  ) {
+    return this.idempotency.run(
+      {
+        scope: IdempotencyScope.CallInvite,
+        userId: req.user.userId,
+        key: idempotencyKey,
+        request: { callId, ...dto },
+      },
+      () => this.callService.inviteParticipants(req.user.userId, callId, dto),
+    );
   }
 
   @Post(':callId/reject')
@@ -75,8 +123,13 @@ export class CallController {
   rejectCall(
     @Param('callId', ParseUUIDPipe) callId: string,
     @Req() req: RequestWithUser,
+    @Headers('x-call-invite-created-at') invitedAt?: string,
   ) {
-    return this.callService.rejectCall(req.user.userId, callId);
+    return this.callService.rejectCall(
+      req.user.userId,
+      callId,
+      parseInvitationCreatedAt(invitedAt),
+    );
   }
 
   // 挂断刻意不收 @Body():结束原因(CallSession.endReason)由服务端按状态机推导,

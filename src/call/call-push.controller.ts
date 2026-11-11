@@ -48,6 +48,9 @@ export class CallPushController {
     if (!userID) {
       throw new UnauthorizedException('CALL_PUSH_TOKEN_INVALID');
     }
-    await this.callService.declineFromPush(userID, callId);
+    const invitedAt = dto.token.startsWith('v2.')
+      ? new Date(Number(dto.token.split('.')[3]))
+      : null;
+    await this.callService.declineFromPush(userID, callId, invitedAt);
   }
 }

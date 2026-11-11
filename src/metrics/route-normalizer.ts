@@ -256,6 +256,7 @@ export const DYNAMIC_ROUTE_TEMPLATES = [
   '/api/v1/calls/:callId/accept',
   '/api/v1/calls/:callId/cancel',
   '/api/v1/calls/:callId/join-token',
+  '/api/v1/calls/:callId/invite',
   '/api/v1/calls/:callId/leave',
   '/api/v1/calls/:callId/push-decline',
   '/api/v1/calls/:callId/reject',

@@ -640,7 +640,7 @@ describe('CallService direct calls (#113 #115) + current (#FE93)', () => {
     // 另一方还 JOINED，也直接终局：CAS 转换 + 删房 + 终局广播 + 留痕
     expect(prisma.callSession.updateMany).toHaveBeenCalledWith(
       expect.objectContaining({
-        where: { id: 'call-1', status: CallStatus.ACTIVE },
+        where: { id: 'call-1', status: CallStatus.ACTIVE, sessionType: 1 },
         data: expect.objectContaining({
           status: CallStatus.ENDED,
           endReason: CallEndReason.ALL_LEFT,

@@ -1,7 +1,11 @@
 import 'reflect-metadata';
 import { plainToInstance } from 'class-transformer';
 import { validateSync } from 'class-validator';
-import { CreateDirectCallDto, CreateGroupCallDto } from './call.dto';
+import {
+  CreateDirectCallDto,
+  CreateGroupCallDto,
+  InviteCallParticipantsDto,
+} from './call.dto';
 
 const USER_A = '2f7c1d9e-8b3a-4c5d-9e1f-0a1b2c3d4e5f';
 const USER_B = '6a1b2c3d-4e5f-4a6b-8c7d-9e0f1a2b3c4d';
@@ -83,4 +87,20 @@ describe('CreateDirectCallDto', () => {
       errorsFor(CreateDirectCallDto, { calleeID, callType: 'AUDIO' }),
     ).toContain('calleeID');
   });
+});
+
+describe('InviteCallParticipantsDto', () => {
+  it('accepts a bounded list of user UUIDs', () => {
+    expect(
+      errorsFor(InviteCallParticipantsDto, { inviteeIDs: [USER_A, USER_B] }),
+    ).toEqual([]);
+  });
+  it.each([undefined, [], ['not-a-uuid'], Array(101).fill(USER_A)])(
+    'rejects invalid invitee lists (%j)',
+    (inviteeIDs) => {
+      expect(errorsFor(InviteCallParticipantsDto, { inviteeIDs })).toContain(
+        'inviteeIDs',
+      );
+    },
+  );
 });
