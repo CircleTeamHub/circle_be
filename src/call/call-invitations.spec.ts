@@ -254,6 +254,42 @@ describe('in-progress call invitations', () => {
     expect(livekit.mintJoinToken).toHaveBeenCalled();
   });
 
+  it('does not disclose later participant joins to a rejected conference invitee', async () => {
+    call.sessionType = 4;
+    call.conversationID = 'conference:call-1';
+    call.metadata = { invitedBy: { dave: 'alice' } };
+    call.participants.push(
+      {
+        userID: 'carol',
+        user: user('carol'),
+        status: 'REJECTED',
+        invitedAt: new Date(now.getTime() - 60_000),
+        rejectedAt: new Date(now.getTime() - 30_000),
+      },
+      {
+        userID: 'dave',
+        user: user('dave'),
+        status: 'INVITED',
+        invitedAt: now,
+      },
+    );
+
+    await service.acceptCall('dave', 'call-1', now);
+
+    expect(realtime.broadcastCallParticipantJoined).toHaveBeenCalledWith(
+      'alice',
+      expect.objectContaining({ user: user('dave') }),
+    );
+    expect(realtime.broadcastCallParticipantJoined).toHaveBeenCalledWith(
+      'dave',
+      expect.objectContaining({ user: user('dave') }),
+    );
+    expect(realtime.broadcastCallParticipantJoined).not.toHaveBeenCalledWith(
+      'carol',
+      expect.anything(),
+    );
+  });
+
   it('expires an unanswered late invite while leaving the active room running', async () => {
     await invite();
     jest.setSystemTime(now.getTime() + 46_000);

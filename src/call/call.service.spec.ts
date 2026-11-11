@@ -786,7 +786,10 @@ describe('CallService', () => {
       status: 'ACTIVE',
       livekitRoomName: 'circle_call_1',
       initiator: { id: 'user-1', nickname: 'Alice', avatarUrl: null },
-      participants: [],
+      participants: [
+        { userID: 'user-1', status: 'JOINED' },
+        { userID: 'user-2', status: 'JOINED' },
+      ],
       startedAt: now,
       endedAt: null,
       expiresAt: new Date('2026-06-11T03:00:45.000Z'),
@@ -1076,7 +1079,10 @@ describe('CallService', () => {
       call: {
         id: 'call-1',
         status: 'RINGING',
-        participants: [{ userID: 'user-1' }, { userID: 'user-2' }],
+        participants: [
+          { userID: 'user-1', status: 'JOINED' },
+          { userID: 'user-2', status: 'INVITED' },
+        ],
       },
       user: { id: 'user-2', nickname: 'Bob', avatarUrl: null },
     };
@@ -1252,7 +1258,10 @@ describe('CallService', () => {
         id: 'call-1',
         livekitRoomName: 'circle_call_1',
         status: 'ACTIVE',
-        participants: [{ userID: 'user-1' }, { userID: 'user-2' }],
+        participants: [
+          { userID: 'user-1', status: 'JOINED' },
+          { userID: 'user-2', status: 'JOINED' },
+        ],
       },
       user: { id: 'user-2', nickname: 'Bob', avatarUrl: null },
     });
