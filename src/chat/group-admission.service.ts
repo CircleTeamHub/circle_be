@@ -22,6 +22,7 @@ import { lockUserRelationshipState } from 'src/utils/user-relationship-lock';
 import { withDatabaseWorkBudget } from 'src/utils/database-work-budget';
 import { normalizeUserIdAlias } from 'src/user/user-id-alias';
 import { assertGroupJoinAllowed } from './group-join-ban';
+import { GROUP_DIRECT_JOIN_MAX_MEMBERS } from './chat-group-roles';
 
 const ACTIVE = ['INVITED', 'PENDING'];
 const TTL = 7 * 24 * 60 * 60 * 1000;
@@ -219,21 +220,26 @@ export class GroupAdmissionService {
     });
   }
   /**
-   * 逐人邀请的批量版,每位被邀请人的结果与原来逐人跑 member → current → create →
-   * event 完全一致:在座的跳过;不在座的先把已过期的有效邀请标 EXPIRED(current 的
-   * 语义),仍有有效邀请(INVITED/PENDING)的跳过;其余各建一条 INVITED 邀请和一条
-   * INVITED 投递。
+   * 逐人邀请的批量版:在座的跳过;不在座的先把已过期的有效邀请标 EXPIRED(current 的
+   * 语义),仍有有效邀请(INVITED/PENDING)的跳过;其余每人一条邀请记录和对应投递。
+   *
+   * Consent: while the group (owner included) stays within
+   * GROUP_DIRECT_JOIN_MAX_MEMBERS, the fresh invitees, in selection order, skip
+   * the acceptance step: they are seated at once (JOINED), or, when the group
+   * requires approval and the inviter is not a manager, go straight to manager
+   * review (PENDING). Invitees past the limit get the INVITED flow as before.
    *
    * 原来每人 5-6 次往返(100 人约 500 条),全程持有会话行 FOR UPDATE、事务默认 5 秒
-   * 超时;现在与人数无关的 3-5 条。同一会话的邀请写入都在这把会话行锁下串行,部分
+   * 超时;现在与人数无关的常数条。同一会话的邀请写入都在这把会话行锁下串行,部分
    * 唯一索引 GroupAdmission_active_applicant_key 兜底「每人至多一条有效邀请」。
    */
   private async inviteBatch(
     tx: Tx,
-    group: string,
+    g: Group,
     actor: string,
     users: string[],
   ): Promise<void> {
+    const group = g.id;
     const seated = new Set(
       (
         await tx.chatMember.findMany({
@@ -271,27 +277,113 @@ export class GroupAdmissionService {
     );
     const fresh = candidates.filter((user) => !pending.has(user));
     if (!fresh.length) return;
-    const expiresAt = new Date(Date.now() + TTL);
+    const members = await tx.chatMember.count({
+      where: { conversationID: group, leftAt: null },
+    });
+    const consentFree = fresh.slice(
+      0,
+      Math.max(0, GROUP_DIRECT_JOIN_MAX_MEMBERS - members),
+    );
+    const review =
+      consentFree.length > 0 &&
+      g.joinApprovalRequired &&
+      !(await this.manager(tx, g, actor));
+    const joining = review ? [] : consentFree;
+    if (joining.length) await this.seat(tx, g, actor, joining);
+    const now = new Date();
+    const expiresAt = new Date(now.getTime() + TTL);
+    const consentFreeState = review
+      ? { status: 'PENDING', acceptedAt: now }
+      : { status: 'JOINED', acceptedAt: now, decidedByID: actor };
     const created = await tx.groupAdmission.createManyAndReturn({
       data: fresh.map((applicantID) => ({
         conversationID: group,
         applicantID,
         inviterID: actor,
         kind: 'INVITE',
-        status: 'INVITED',
         expiresAt,
+        ...(consentFree.includes(applicantID)
+          ? consentFreeState
+          : { status: 'INVITED' }),
       })),
-      select: { id: true, applicantID: true },
+      select: { id: true, applicantID: true, status: true },
     });
+    const reviewers = review ? await this.reviewers(tx, g) : [];
     // 与 event() 的 upsert(update: {})同义:新建的邀请不会已有投递,冲突即跳过。
+    // A consent-free request waiting for review reaches the reviewers on the
+    // applicant's behalf, exactly like an accepted invitation does.
     await tx.groupAdmissionDelivery.createMany({
-      data: created.map((admission) => ({
-        admissionID: admission.id,
-        recipientID: admission.applicantID,
-        actorID: actor,
-        event: 'INVITED',
+      data: created.flatMap((admission) =>
+        admission.status === 'PENDING'
+          ? reviewers.map((recipientID) => ({
+              admissionID: admission.id,
+              recipientID,
+              actorID: admission.applicantID,
+              event: 'PENDING',
+            }))
+          : [
+              {
+                admissionID: admission.id,
+                recipientID: admission.applicantID,
+                actorID: actor,
+                event: admission.status,
+              },
+            ],
+      ),
+      skipDuplicates: true,
+    });
+  }
+  /**
+   * Batch form of join()'s seating for consent-free invitees. Seats must be
+   * written before their JOINED admissions: delivery treats a seat newer than
+   * its admission as a later rejoin and drops the room broadcast.
+   */
+  private async seat(tx: Tx, g: Group, actor: string, users: string[]) {
+    const top = await tx.chatMessage.aggregate({
+      where: { conversationID: g.id },
+      _max: { height: true },
+    });
+    const clearedBeforeHeight = Math.max(
+      g.clearedBeforeHeight,
+      top._max.height ?? 0,
+    );
+    // Departed members keep their seat row: reopen it with join()'s reset.
+    await tx.chatMember.updateMany({
+      where: {
+        conversationID: g.id,
+        userID: { in: users },
+        leftAt: { not: null },
+      },
+      data: {
+        leftAt: null,
+        joinedAt: new Date(),
+        role: 'MEMBER',
+        hiddenAt: null,
+        clearedBeforeHeight,
+      },
+    });
+    await tx.chatMember.createMany({
+      data: users.map((userID) => ({
+        conversationID: g.id,
+        userID,
+        clearedBeforeHeight,
       })),
       skipDuplicates: true,
+    });
+    await tx.chatGroupEvent.create({
+      data: {
+        conversationID: g.id,
+        kind: 'member-joined',
+        actorID: actor,
+        targetIDs: users,
+        payload: {
+          via: 'invite',
+          status: 'JOINED',
+          source: 'INVITE',
+          inviterId: actor,
+          operatorId: actor,
+        },
+      },
     });
   }
   async invite(actor: string, group: string, rawUsers: string[]) {
@@ -304,7 +396,7 @@ export class GroupAdmissionService {
       const g = await this.lock(tx, group);
       await this.assertInviter(tx, g, actor);
       await this.targets(tx, actor, users);
-      await this.inviteBatch(tx, group, actor, users);
+      await this.inviteBatch(tx, g, actor, users);
     });
     void this.flush().catch(() =>
       this.logger.warn({

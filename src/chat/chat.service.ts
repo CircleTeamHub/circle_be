@@ -29,6 +29,7 @@ import {
 import { loadSeatAliases, type SeatRef, seatKey } from './chat-seat-alias';
 import {
   circleGroupRole,
+  GROUP_DIRECT_JOIN_MAX_MEMBERS,
   type GroupRole,
   isGroupManager,
   isSeatSilenced,
@@ -2108,10 +2109,16 @@ export class ChatService {
     }
     const conversation = await this.prisma.$transaction(async (tx) => {
       await lockUserRelationshipState(tx, [userId, ...memberIds]);
-      const directMemberIds = await this.assertInviteTargetsAllowed(
-        tx,
-        userId,
-        memberIds,
+      const optedIn = new Set(
+        await this.assertInviteTargetsAllowed(tx, userId, memberIds),
+      );
+      // The owner holds one seat, so the first picks (in selection order) fill
+      // the group up to GROUP_DIRECT_JOIN_MAX_MEMBERS without a consent step.
+      // Past that, only friends who opted into direct joining are seated; the
+      // rest get an invitation to accept.
+      const directMemberIds = memberIds.filter(
+        (id, index) =>
+          index < GROUP_DIRECT_JOIN_MAX_MEMBERS - 1 || optedIn.has(id),
       );
       const directMembers = new Set(directMemberIds);
       const activeCount = await tx.user.count({
