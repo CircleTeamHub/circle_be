@@ -1,5 +1,6 @@
 import {
   ArrayMaxSize,
+  ArrayMinSize,
   IsArray,
   IsEnum,
   IsString,
@@ -46,12 +47,20 @@ export class CreateDirectCallDto {
   callType!: CallType;
 }
 
+export class InviteCallParticipantsDto {
+  @IsArray()
+  @ArrayMinSize(1)
+  @ArrayMaxSize(100)
+  @IsUUID(undefined, { each: true })
+  inviteeIDs!: string[];
+}
+
 export class PushDeclineDto {
   // v1.<userId>.<expSeconds>.<base64url-hmac>；校验在 verifyDeclineToken 里做，
   // 这里只挡掉明显不是令牌的东西（长度、字符集）。
   @IsString()
   @MaxLength(256)
-  @Matches(/^v1\.[0-9a-fA-F-]+\.\d+\.[\w-]+$/, {
+  @Matches(/^v(?:1\.[0-9a-fA-F-]+\.\d+|2\.[0-9a-fA-F-]+\.\d+\.\d+)\.[\w-]+$/, {
     message: 'token is malformed',
   })
   token!: string;

@@ -20,6 +20,7 @@ export const IdempotencyScope = {
   MomentCommentCreate: 'moment-comment-create',
   PlazaPostCreate: 'plaza-post-create',
   NoteShareLinkCreate: 'note-share-link-create',
+  CallInvite: 'call-invite',
 } as const;
 export type IdempotencyScope =
   (typeof IdempotencyScope)[keyof typeof IdempotencyScope];

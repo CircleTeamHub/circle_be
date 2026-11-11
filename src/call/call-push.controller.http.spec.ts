@@ -57,7 +57,28 @@ describe('POST /calls/:callId/push-decline HTTP pipeline', () => {
 
     await request(app.getHttpServer()).post(ROUTE).send({ token }).expect(204);
 
-    expect(callService.declineFromPush).toHaveBeenCalledWith(USER_ID, CALL_ID);
+    expect(callService.declineFromPush).toHaveBeenCalledWith(
+      USER_ID,
+      CALL_ID,
+      null,
+    );
+  });
+
+  it('passes the authenticated invitation generation from a v2 token', async () => {
+    const invitedAt = new Date();
+    const token = issueDeclineToken(
+      key,
+      CALL_ID,
+      USER_ID,
+      ringExpiresAt(),
+      invitedAt,
+    );
+    await request(app.getHttpServer()).post(ROUTE).send({ token }).expect(204);
+    expect(callService.declineFromPush).toHaveBeenCalledWith(
+      USER_ID,
+      CALL_ID,
+      invitedAt,
+    );
   });
 
   it('rejects a token issued for another call', async () => {

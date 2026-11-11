@@ -19,6 +19,24 @@ describe('call push decline token', () => {
     expect(verifyDeclineToken(key, callId, token, duringRing)).toBe(userId);
   });
 
+  it('authenticates the exact invitation generation in v2 tokens', () => {
+    const invitedAt = new Date('2026-10-26T12:00:00.123Z');
+    const token = (issueDeclineToken as any)(
+      key,
+      callId,
+      userId,
+      ringExpiresAt,
+      invitedAt,
+    );
+    expect(token).toMatch(/^v2\.[0-9a-f-]+\.\d+\.\d+\.[A-Za-z0-9_-]+$/);
+    expect(verifyDeclineToken(key, callId, token, duringRing)).toBe(userId);
+    const parts = token.split('.');
+    parts[3] = String(invitedAt.getTime() + 1);
+    expect(
+      verifyDeclineToken(key, callId, parts.join('.'), duringRing),
+    ).toBeNull();
+  });
+
   it('stays valid for a short grace period after the ring ends, then expires', () => {
     const token = issueDeclineToken(key, callId, userId, ringExpiresAt);
     const justInsideGrace = new Date(

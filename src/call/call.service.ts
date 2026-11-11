@@ -26,7 +26,12 @@ import { ChatSystemMessageService } from 'src/chat/chat-system-message.service';
 import { PrivacySettingsService } from 'src/privacy/privacy-settings.service';
 import { PrismaService } from 'src/prisma/prisma.service';
 import { RealtimeService } from 'src/realtime/realtime.service';
-import { CreateDirectCallDto, CreateGroupCallDto } from './dto/call.dto';
+import {
+  CreateDirectCallDto,
+  CreateGroupCallDto,
+  InviteCallParticipantsDto,
+} from './dto/call.dto';
+import { runSerializableTransaction } from 'src/utils/prisma-tx';
 import { LiveKitCallService } from './livekit.service';
 import { CallPushService } from './call-push.service';
 import { createLoggingConfig } from 'src/logging/logging.config';
@@ -43,6 +48,7 @@ import {
 const GROUP_SESSION_TYPE = 3;
 // OpenIM 单聊 sessionType。toCallDto 一直会把非 GROUP 映射成 'single'（此前是死分支）。
 const SINGLE_SESSION_TYPE = 1;
+const CONFERENCE_SESSION_TYPE = 4;
 // 通话留痕消息发送的有界重试（review：瞬断不该永久丢历史）
 const CALL_RECORD_SEND_ATTEMPTS = 3;
 const CALL_RECORD_RETRY_DELAY_MS = 1_000;
@@ -79,6 +85,13 @@ type CallWithParticipants = {
   endReason?: string | null;
   participants?: CallParticipantWithUser[];
   createdAt?: Date;
+  metadata?: Prisma.JsonValue;
+};
+
+type CallMetadata = {
+  idempotencyKey?: string;
+  originalParticipantIDs?: string[];
+  invitedBy?: Record<string, string>;
 };
 
 type LiveKitWebhookEvent = {
@@ -301,9 +314,15 @@ export class CallService {
         participants: {
           some: {
             userID,
-            status: {
-              in: [CallParticipantStatus.INVITED, CallParticipantStatus.JOINED],
-            },
+            OR: [
+              { status: CallParticipantStatus.JOINED },
+              {
+                status: CallParticipantStatus.INVITED,
+                invitedAt: {
+                  gt: new Date(Date.now() - this.ringTimeoutSeconds() * 1000),
+                },
+              },
+            ],
           },
         },
       },
@@ -315,11 +334,250 @@ export class CallService {
       return { call: null, selfParticipant: null };
     }
     return {
-      call: this.toCallDto(call),
+      call: this.toCallDto(call, userID),
       selfParticipant: this.toParticipantDto(
         this.findParticipant(call, userID),
       ),
     };
+  }
+
+  async inviteParticipants(
+    userID: string,
+    callId: string,
+    dto: InviteCallParticipantsDto,
+  ) {
+    const inviteeIDs = this.uniqueIDs(dto.inviteeIDs).filter(
+      (id) => id !== userID,
+    );
+    if (!inviteeIDs.length) {
+      throw new BadRequestException({
+        message: 'CALL_INVITEES_REQUIRED',
+        errorCode: CallErrorCode.InviteesRequired,
+      });
+    }
+    this.assertParticipantLimit(inviteeIDs.length + 1);
+    const initial = await this.findParticipantForUser(callId, userID);
+    const initialCall = initial.call as CallWithParticipants;
+    this.assertInvitationActor(initialCall, userID);
+    await this.assertCurrentCallAccess(initialCall, userID);
+    if (
+      inviteeIDs.every((id) => {
+        const seat = this.findParticipant(initialCall, id);
+        return (
+          seat?.status === CallParticipantStatus.JOINED ||
+          (seat?.status === CallParticipantStatus.INVITED &&
+            this.invitationDeadline(seat).getTime() > Date.now())
+        );
+      })
+    )
+      return { call: this.toCallDto(initialCall, userID) };
+    await this.expireStaleRingingCallsForUsers(inviteeIDs);
+
+    // Third parties must never receive the original direct-chat identifier through LiveKit.
+    // A failed database write after this update leaves a harmless generic room label.
+    if (initialCall.sessionType === SINGLE_SESSION_TYPE) {
+      await this.assertInvitationTargets(initialCall, userID, inviteeIDs);
+      await this.livekit.updateRoomMetadata(
+        initialCall.livekitRoomName!,
+        JSON.stringify({
+          callId,
+          conversationID: `conference:${callId}`,
+        }),
+      );
+    }
+
+    const result = await runSerializableTransaction(this.prisma, async (tx) => {
+      await this.lockParticipantsForCall(
+        [
+          userID,
+          ...inviteeIDs,
+          ...(initialCall.participants ?? []).map((row) => row.userID),
+        ],
+        tx,
+      );
+      await tx.$queryRaw`SELECT "id" FROM "CallSession" WHERE "id" = ${callId} FOR UPDATE`;
+      const call = (await tx.callSession.findUnique({
+        where: { id: callId },
+        include: this.callInclude(),
+      })) as CallWithParticipants;
+      this.assertInvitationActor(call, userID);
+      await this.assertCurrentCallAccess(call, userID, tx);
+      const active = (call.participants ?? []).filter(
+        (row) =>
+          row.status === CallParticipantStatus.JOINED ||
+          (row.status === CallParticipantStatus.INVITED &&
+            this.invitationDeadline(row).getTime() > Date.now()),
+      );
+      const pendingIDs = inviteeIDs.filter(
+        (id) => !active.some((row) => row.userID === id),
+      );
+      if (!pendingIDs.length) return { call, invitedIDs: [] as string[] };
+      this.assertParticipantLimit(active.length + pendingIDs.length);
+      const callableIDs = await this.assertInvitationTargets(
+        call,
+        userID,
+        pendingIDs,
+        tx,
+      );
+      if (!callableIDs.length) {
+        throw new BadRequestException({
+          message: 'CALL_INVITEES_REQUIRED',
+          errorCode: CallErrorCode.InviteesRequired,
+        });
+      }
+      await this.loadActiveUsers([userID, ...callableIDs], tx);
+      await this.assertNotBusy(callableIDs, tx);
+      const invitedAt = new Date();
+      const metadata = { ...((call.metadata as CallMetadata) ?? {}) };
+      if (call.sessionType !== GROUP_SESSION_TYPE) {
+        metadata.originalParticipantIDs ??= [
+          call.initiatorID!,
+          ...(call.participants ?? [])
+            .filter((row) => row.userID !== call.initiatorID)
+            .map((row) => row.userID),
+        ];
+        metadata.invitedBy = {
+          ...metadata.invitedBy,
+          ...Object.fromEntries(callableIDs.map((id) => [id, userID])),
+        };
+        await tx.callSession.update({
+          where: { id: callId },
+          data: {
+            sessionType: CONFERENCE_SESSION_TYPE,
+            conversationID: `conference:${callId}`,
+            metadata,
+          },
+        });
+      }
+      for (const targetID of callableIDs) {
+        await tx.callParticipant.upsert({
+          where: { callID_userID: { callID: callId, userID: targetID } },
+          create: {
+            callID: callId,
+            userID: targetID,
+            status: CallParticipantStatus.INVITED,
+            invitedAt,
+          },
+          update: {
+            status: CallParticipantStatus.INVITED,
+            invitedAt,
+            joinedAt: null,
+            leftAt: null,
+            rejectedAt: null,
+            missedAt: null,
+            lastTokenAt: null,
+          },
+        });
+      }
+      const updated = (await tx.callSession.findUnique({
+        where: { id: callId },
+        include: this.callInclude(),
+      })) as CallWithParticipants;
+      return { call: updated, invitedIDs: callableIDs };
+    });
+
+    if (result.invitedIDs.length) {
+      await this.broadcastCallUpdate(result.call);
+      const initiator = this.findParticipant(result.call, userID)!.user!;
+      const invitePayload = {
+        callId,
+        conversationID: result.call.conversationID!,
+        sessionType: 'group' as const,
+        callType: result.call.callType as CallType,
+        initiator,
+        invitationMode:
+          result.call.sessionType === CONFERENCE_SESSION_TYPE
+            ? ('contacts' as const)
+            : ('members' as const),
+        invitees: result.invitedIDs.map(
+          (id) => this.findParticipant(result.call, id)!.user!,
+        ),
+        expiresAt: this.invitationDeadline(
+          this.findParticipant(result.call, result.invitedIDs[0])!,
+        ).toISOString(),
+        createdAt: this.findParticipant(
+          result.call,
+          result.invitedIDs[0],
+        )!.invitedAt!.toISOString(),
+      };
+      await this.realtime.safeBroadcastAll(
+        result.invitedIDs.map(
+          (targetID) => () =>
+            this.realtime.broadcastCallInvite(targetID, invitePayload),
+        ),
+      );
+      this.callPush.ringInvitees(invitePayload, result.invitedIDs);
+    }
+    return { call: this.toCallDto(result.call, userID) };
+  }
+
+  private assertInvitationActor(
+    call: CallWithParticipants | null,
+    userID: string,
+  ) {
+    if (call?.status !== CallStatus.ACTIVE) {
+      throw new ConflictException({
+        message: 'CALL_ENDED',
+        errorCode: CallErrorCode.Ended,
+      });
+    }
+    if (
+      this.findParticipant(call, userID)?.status !==
+      CallParticipantStatus.JOINED
+    ) {
+      throw new ForbiddenException({
+        message: 'CALL_NOT_ACCEPTED',
+        errorCode: CallErrorCode.NotAccepted,
+      });
+    }
+  }
+
+  private async assertInvitationTargets(
+    call: CallWithParticipants,
+    userID: string,
+    inviteeIDs: string[],
+    db: Prisma.TransactionClient | PrismaService = this.prisma,
+  ): Promise<string[]> {
+    if (call.sessionType === GROUP_SESSION_TYPE) {
+      await this.assertGroupMembers(
+        call.conversationID!,
+        [userID, ...inviteeIDs],
+        userID,
+        db,
+      );
+    } else {
+      for (const targetID of inviteeIDs)
+        await this.assertDirectCallee(userID, targetID, db);
+    }
+    const participantIDs = (call.participants ?? [])
+      .filter(
+        (row) =>
+          row.status === CallParticipantStatus.JOINED ||
+          row.status === CallParticipantStatus.INVITED,
+      )
+      .map((row) => row.userID);
+    const blocked = await db.block.findFirst({
+      where: {
+        OR: [
+          { blockerID: { in: participantIDs }, blockedID: { in: inviteeIDs } },
+          { blockerID: { in: inviteeIDs }, blockedID: { in: participantIDs } },
+        ],
+      },
+      select: { id: true },
+    });
+    if (blocked)
+      throw new ForbiddenException({
+        message: 'CALL_NOT_FRIEND',
+        errorCode: CallErrorCode.NotFriend,
+      });
+    return this.filterCallableInvitees(userID, inviteeIDs, db);
+  }
+
+  private invitationDeadline(participant: CallParticipantWithUser): Date {
+    return new Date(
+      (participant.invitedAt?.getTime() ?? 0) +
+        this.ringTimeoutSeconds() * 1000,
+    );
   }
 
   /**
@@ -375,8 +633,10 @@ export class CallService {
 
     const callId = randomUUID();
     const livekitRoomName = `circle_call_${callId.replace(/-/g, '')}`;
-    const expiresAt = this.dateAfterSeconds(this.ringTimeoutSeconds());
     const joinedAt = new Date();
+    const expiresAt = new Date(
+      joinedAt.getTime() + this.ringTimeoutSeconds() * 1000,
+    );
 
     await this.livekit.createRoom({
       name: livekitRoomName,
@@ -418,6 +678,7 @@ export class CallService {
               participants: {
                 create: participantIDs.map((userID) => ({
                   userID,
+                  invitedAt: joinedAt,
                   status:
                     userID === initiatorID
                       ? CallParticipantStatus.JOINED
@@ -471,7 +732,11 @@ export class CallService {
       initiator: users.get(initiatorID)!,
       invitees: inviteeIDs.map((id) => users.get(id)!),
       expiresAt: expiresAt.toISOString(),
-      createdAt: (call.createdAt ?? joinedAt).toISOString(),
+      createdAt: (
+        this.findParticipant(call, inviteeIDs[0])?.invitedAt ??
+        call.createdAt ??
+        joinedAt
+      ).toISOString(),
     };
 
     await this.realtime.safeBroadcastAll(
@@ -493,6 +758,7 @@ export class CallService {
           nickname: invitePayload.initiator.nickname,
         },
         expiresAt: invitePayload.expiresAt,
+        createdAt: invitePayload.createdAt,
       },
       inviteeIDs,
     );
@@ -518,8 +784,9 @@ export class CallService {
     };
   }
 
-  async acceptCall(userID: string, callId: string) {
+  async acceptCall(userID: string, callId: string, expectedInvitedAt?: Date) {
     const participant = await this.findParticipantForUser(callId, userID);
+    this.assertInvitationGeneration(participant, expectedInvitedAt);
     if (participant.status === CallParticipantStatus.JOINED) {
       const call = participant.call as CallWithParticipants;
       if (
@@ -551,7 +818,13 @@ export class CallService {
     const kind = callKindOf(call.sessionType);
     const trace: CallAcceptTrace = { replayed: false };
     try {
-      const accepted = await this.joinInvitedCall(userID, callId, call, trace);
+      const accepted = await this.joinInvitedCall(
+        userID,
+        callId,
+        call,
+        participant,
+        trace,
+      );
       if (!trace.replayed) recordCallAccept(kind, 'accepted');
       return accepted;
     } catch (error) {
@@ -565,6 +838,7 @@ export class CallService {
     userID: string,
     callId: string,
     call: CallWithParticipants,
+    invitation: CallParticipantWithUser,
     trace: CallAcceptTrace,
   ) {
     if (
@@ -576,8 +850,14 @@ export class CallService {
         errorCode: CallErrorCode.Ended,
       });
     }
-    if (call.expiresAt && call.expiresAt.getTime() < Date.now()) {
-      await this.expireRingingCallAsMissed(call, new Date());
+    const invitationExpiresAt =
+      call.status === CallStatus.ACTIVE && invitation?.invitedAt
+        ? this.invitationDeadline(invitation)
+        : call.expiresAt;
+    if (invitationExpiresAt && invitationExpiresAt.getTime() <= Date.now()) {
+      if (call.status === CallStatus.RINGING)
+        await this.expireRingingCallAsMissed(call, new Date());
+      else await this.expireParticipantInvitation(call, invitation, new Date());
       throw new ConflictException({
         message: 'CALL_EXPIRED',
         errorCode: CallErrorCode.Expired,
@@ -597,12 +877,28 @@ export class CallService {
       if (isSingleCall) {
         await this.lockParticipantsForCall([call.initiatorID!, userID], tx);
         await this.assertDirectCallee(call.initiatorID!, userID, tx);
+      } else if (call.sessionType === CONFERENCE_SESSION_TYPE) {
+        await this.lockParticipantsForCall(
+          (call.participants ?? []).map((row) => row.userID),
+          tx,
+        );
+        await this.assertCurrentCallAccess(call, userID, tx);
       }
       const claim = await tx.callParticipant.updateMany({
         where: {
           callID: callId,
           userID,
           status: CallParticipantStatus.INVITED,
+          invitedAt: invitation.invitedAt,
+          ...(call.status === CallStatus.ACTIVE
+            ? {
+                AND: {
+                  invitedAt: {
+                    gt: new Date(Date.now() - this.ringTimeoutSeconds() * 1000),
+                  },
+                },
+              }
+            : {}),
         },
         data: {
           status: CallParticipantStatus.JOINED,
@@ -615,9 +911,12 @@ export class CallService {
         // 等终局参与态）按通话已结束拒绝。
         const nowRow = await tx.callParticipant.findUnique({
           where: { callID_userID: { callID: callId, userID } },
-          select: { status: true },
+          select: { status: true, invitedAt: true },
         });
-        if (nowRow?.status !== CallParticipantStatus.JOINED) {
+        if (
+          nowRow?.status !== CallParticipantStatus.JOINED ||
+          nowRow.invitedAt?.getTime() !== invitation.invitedAt?.getTime()
+        ) {
           throw new ConflictException({
             message: 'CALL_ENDED',
             errorCode: CallErrorCode.Ended,
@@ -664,7 +963,12 @@ export class CallService {
       this.realtime.broadcastCallParticipantJoined(targetID, payload),
     );
     // 本人其他设备上的振铃（安卓全屏通知）收掉；iOS 由 WS 的 participant.joined 收。
-    this.callPush.dismissForUser(callId, userID, 'answered_elsewhere');
+    this.callPush.dismissForUser(
+      callId,
+      userID,
+      'answered_elsewhere',
+      updatedParticipant.invitedAt,
+    );
     this.logger.log(
       `call.participant_joined callId=${callId} userID=${userID}`,
     );
@@ -684,8 +988,9 @@ export class CallService {
     };
   }
 
-  async rejectCall(userID: string, callId: string) {
+  async rejectCall(userID: string, callId: string, expectedInvitedAt?: Date) {
     const participant = await this.findParticipantForUser(callId, userID);
+    this.assertInvitationGeneration(participant, expectedInvitedAt);
     if (participant.status === CallParticipantStatus.REJECTED) {
       return this.toRejectResponse(
         participant.call as CallWithParticipants,
@@ -704,6 +1009,7 @@ export class CallService {
         callID: callId,
         userID,
         status: CallParticipantStatus.INVITED,
+        invitedAt: participant.invitedAt,
       },
       data: {
         status: CallParticipantStatus.REJECTED,
@@ -715,7 +1021,10 @@ export class CallService {
         where: { callID_userID: { callID: callId, userID } },
         include: { user: { select: userLiteSelect } },
       });
-      if (current?.status === CallParticipantStatus.REJECTED) {
+      if (
+        current?.status === CallParticipantStatus.REJECTED &&
+        current.invitedAt?.getTime() === participant.invitedAt?.getTime()
+      ) {
         return this.toRejectResponse(
           await this.reloadCall(
             callId,
@@ -749,7 +1058,12 @@ export class CallService {
           changedAt: rejectedAt.toISOString(),
         }),
     );
-    this.callPush.dismissForUser(callId, userID, 'declined_elsewhere');
+    this.callPush.dismissForUser(
+      callId,
+      userID,
+      'declined_elsewhere',
+      participant.invitedAt,
+    );
     await this.endRingingCallIfNoInviteesRemain(
       participant.call as CallWithParticipants,
       rejectedAt,
@@ -771,15 +1085,53 @@ export class CallService {
     );
   }
 
+  private assertInvitationGeneration(
+    participant: CallParticipantWithUser,
+    expectedInvitedAt?: Date,
+  ) {
+    if (
+      expectedInvitedAt &&
+      participant.invitedAt?.getTime() !== expectedInvitedAt.getTime()
+    ) {
+      throw new ConflictException({
+        message: 'CALL_EXPIRED',
+        errorCode: CallErrorCode.Expired,
+      });
+    }
+  }
+
   /**
    * 推送来电里的「拒接」（POST /calls/:id/push-decline，凭单通令牌、不带登录态）。
    * 与 rejectCall 同一条路径；电话已经不在振铃（已取消 / 超时 / 本人已在别处接听或
    * 拒接）时按幂等成功处理 —— 原生层只关心振铃收掉了，不该因此重试，也不该从
    * 状态码里读出这通电话后来怎样了。
    */
-  async declineFromPush(userID: string, callId: string): Promise<void> {
+  async declineFromPush(
+    userID: string,
+    callId: string,
+    invitationGeneration?: Date | null,
+  ): Promise<void> {
     try {
-      await this.rejectCall(userID, callId);
+      const participant = await this.findParticipantForUser(callId, userID);
+      if (
+        invitationGeneration &&
+        participant.invitedAt?.getTime() !== invitationGeneration.getTime()
+      )
+        return;
+      // v1 tokens identify only the initial invitation; later invitations require v2.
+      const createdAt = (participant.call as CallWithParticipants).createdAt;
+      if (
+        invitationGeneration === null &&
+        participant.invitedAt &&
+        createdAt &&
+        participant.invitedAt.getTime() > createdAt.getTime()
+      )
+        return;
+      await this.rejectCall(
+        userID,
+        callId,
+        invitationGeneration ?? participant.invitedAt,
+      );
     } catch (error) {
       if (
         error instanceof NotFoundException ||
@@ -834,7 +1186,7 @@ export class CallService {
       include: { user: { select: userLiteSelect } },
     });
 
-    const callRow = participant.call as CallWithParticipants;
+    let callRow = participant.call as CallWithParticipants;
     // review 修复：1:1 已接通的通话里任一方挂断即整场结束 —— 群语义
     // （joinedCount===0 才终局）会让另一方一直挂在 ACTIVE 会话里、LiveKit
     // 房间不删、终局事件与留痕迟迟不发。
@@ -842,8 +1194,8 @@ export class CallService {
     // 群会话都落回群语义（joinedCount===0 终局），行为不回归。
     const isSingle = callRow.sessionType === SINGLE_SESSION_TYPE;
     if (isSingle && callRow.status === CallStatus.ACTIVE) {
-      await this.endSingleCallOnFirstLeave(callRow, userID, leftAt);
-      return;
+      if (await this.endSingleCallOnFirstLeave(callRow, userID, leftAt)) return;
+      callRow = await this.reloadCall(callId, callRow);
     }
 
     const joinedCount = await this.prisma.callParticipant.count({
@@ -853,20 +1205,18 @@ export class CallService {
       },
     });
     if (joinedCount > 0) {
-      await this.broadcastToCallParticipants(
-        participant.call as CallWithParticipants,
-        (targetID) =>
-          this.realtime.broadcastCallParticipantLeft(targetID, {
-            callId,
-            user: updatedParticipant.user,
-            leftAt: leftAt.toISOString(),
-            changedAt: leftAt.toISOString(),
-          }),
+      await this.broadcastToCallParticipants(callRow, (targetID) =>
+        this.realtime.broadcastCallParticipantLeft(targetID, {
+          callId,
+          user: updatedParticipant.user,
+          leftAt: leftAt.toISOString(),
+          changedAt: leftAt.toISOString(),
+        }),
       );
       return;
     }
 
-    const call = (participant.call ?? {}) as CallWithParticipants;
+    const call = callRow;
     // round 2 review：群通话的 all-left 终局同样必须 CAS —— LiveKit
     // room_finished webhook 可能先赢下 NORMAL 转换并发过留痕，这里无条件
     // update 会把已终局的行改写成 ALL_LEFT 再发第二条留痕。
@@ -916,9 +1266,13 @@ export class CallService {
     call: CallWithParticipants,
     leaverID: string,
     leftAt: Date,
-  ): Promise<void> {
+  ): Promise<boolean> {
     const transition = await this.prisma.callSession.updateMany({
-      where: { id: call.id, status: CallStatus.ACTIVE },
+      where: {
+        id: call.id,
+        status: CallStatus.ACTIVE,
+        sessionType: SINGLE_SESSION_TYPE,
+      },
       data: {
         status: CallStatus.ENDED,
         endReason: CallEndReason.ALL_LEFT,
@@ -927,7 +1281,7 @@ export class CallService {
       },
     });
     if (transition.count === 0) {
-      return;
+      return false;
     }
     await this.prisma.callParticipant.updateMany({
       where: { callID: call.id, status: CallParticipantStatus.JOINED },
@@ -950,6 +1304,7 @@ export class CallService {
       `call.ended callId=${call.id} reason=${CallEndReason.ALL_LEFT} (single first-leave)`,
     );
     this.emitCallRecordMessage(call, CallEndReason.ALL_LEFT, leftAt);
+    return true;
   }
 
   async cancelCall(userID: string, callId: string) {
@@ -1089,16 +1444,84 @@ export class CallService {
   async sweepExpiredRingingCalls(limit = 50): Promise<number> {
     const now = new Date();
     const staleCalls = (await this.prisma.callSession.findMany({
-      where: { status: CallStatus.RINGING, expiresAt: { lte: now } },
+      where: {
+        OR: [
+          { status: CallStatus.RINGING, expiresAt: { lte: now } },
+          {
+            status: CallStatus.ACTIVE,
+            participants: {
+              some: {
+                status: CallParticipantStatus.INVITED,
+                invitedAt: {
+                  lte: new Date(
+                    now.getTime() - this.ringTimeoutSeconds() * 1000,
+                  ),
+                },
+              },
+            },
+          },
+        ],
+      },
       include: this.callInclude(),
       take: limit,
     })) as CallWithParticipants[];
 
     for (const call of staleCalls) {
-      await this.expireRingingCallAsMissed(call, now);
+      if (call.status === CallStatus.ACTIVE) {
+        for (const participant of call.participants ?? []) {
+          if (
+            participant.status === CallParticipantStatus.INVITED &&
+            this.invitationDeadline(participant).getTime() <= now.getTime()
+          ) {
+            await this.expireParticipantInvitation(call, participant, now);
+          }
+        }
+      } else await this.expireRingingCallAsMissed(call, now);
     }
 
     return staleCalls.length;
+  }
+
+  private async expireParticipantInvitation(
+    call: CallWithParticipants,
+    participant: CallParticipantWithUser,
+    now: Date,
+  ) {
+    const claimed = await this.prisma.callParticipant.updateMany({
+      where: {
+        callID: call.id,
+        userID: participant.userID,
+        status: CallParticipantStatus.INVITED,
+        invitedAt: participant.invitedAt,
+      },
+      data: { status: CallParticipantStatus.MISSED, missedAt: now },
+    });
+    if (!claimed.count) return;
+    this.callPush.dismissForUser(
+      call.id,
+      participant.userID,
+      'missed',
+      participant.invitedAt,
+    );
+    const updated = (await this.prisma.callSession.findUnique({
+      where: { id: call.id },
+      include: this.callInclude(),
+    })) as CallWithParticipants;
+    await this.broadcastCallUpdate(updated);
+  }
+
+  private async broadcastCallUpdate(call: CallWithParticipants) {
+    const recipients = (call.participants ?? []).filter(
+      (row) => row.status === CallParticipantStatus.JOINED,
+    );
+    await this.realtime.safeBroadcastAll(
+      recipients.map(
+        (row) => () =>
+          this.realtime.broadcastCallUpdated(row.userID, {
+            call: this.toCallDto(call, row.userID),
+          }),
+      ),
+    );
   }
 
   async handleLiveKitWebhook(
@@ -1146,8 +1569,9 @@ export class CallService {
     conversationID: string,
     participantIDs: string[],
     initiatorID: string,
+    db: Prisma.TransactionClient | PrismaService = this.prisma,
   ): Promise<void> {
-    const circle = await this.prisma.circle.findFirst({
+    const circle = await db.circle.findFirst({
       where: {
         deleted: false,
         OR: [
@@ -1166,7 +1590,7 @@ export class CallService {
           message: 'CALL_NOT_GROUP_MEMBER',
           errorCode: CallErrorCode.NotGroupMember,
         });
-      const members = await this.prisma.circleMember.findMany({
+      const members = await db.circleMember.findMany({
         where: {
           circleID: circle.id,
           userID: { in: participantIDs },
@@ -1199,7 +1623,7 @@ export class CallService {
     // 但必须先把单聊会话挡在门外。座位校验对 DIRECT 会话同样成立(双方都在座),
     // 于是拿一个单聊 conversationID 打群呼端点就能整个绕过 assertDirectCallee ——
     // 好友关系和双向拉黑都不再校验,被拉黑的人可以照样把对方呼起来。
-    const conversation = await this.prisma.chatConversation.findUnique({
+    const conversation = await db.chatConversation.findUnique({
       where: { id: conversationID },
       select: {
         type: true,
@@ -1214,7 +1638,7 @@ export class CallService {
       });
     }
     if (conversation.circleID) {
-      const currentCircle = await this.prisma.circle.findFirst({
+      const currentCircle = await db.circle.findFirst({
         where: {
           id: conversation.circleID,
           deleted: false,
@@ -1228,7 +1652,7 @@ export class CallService {
           errorCode: CallErrorCode.NotGroupMember,
         });
       }
-      const members = await this.prisma.circleMember.findMany({
+      const members = await db.circleMember.findMany({
         where: {
           circleID: conversation.circleID,
           userID: { in: participantIDs },
@@ -1250,7 +1674,7 @@ export class CallService {
     }
     if (conversation.type === 'TEMP') {
       const room = conversation.tempChatID
-        ? await this.prisma.tempChat.findUnique({
+        ? await db.tempChat.findUnique({
             where: { id: conversation.tempChatID },
             select: { status: true, endedAt: true, expiresAt: true },
           })
@@ -1268,7 +1692,7 @@ export class CallService {
       }
     }
 
-    const seats = await this.prisma.chatMember.findMany({
+    const seats = await db.chatMember.findMany({
       where: {
         conversationID,
         userID: { in: participantIDs },
@@ -1301,9 +1725,10 @@ export class CallService {
   private async filterCallableInvitees(
     initiatorID: string,
     inviteeIDs: string[],
+    db: Prisma.TransactionClient | PrismaService = this.prisma,
   ): Promise<string[]> {
     const [friendships, settingsByUser] = await Promise.all([
-      this.prisma.friend.findMany({
+      db.friend.findMany({
         where: {
           state: FriendState.ACCEPTED,
           OR: [
@@ -1393,6 +1818,15 @@ export class CallService {
           in: [CallParticipantStatus.INVITED, CallParticipantStatus.JOINED],
         },
         call: { status: { in: [CallStatus.RINGING, CallStatus.ACTIVE] } },
+        OR: [
+          { status: CallParticipantStatus.JOINED },
+          {
+            status: CallParticipantStatus.INVITED,
+            invitedAt: {
+              gt: new Date(Date.now() - this.ringTimeoutSeconds() * 1000),
+            },
+          },
+        ],
       },
       select: { id: true },
     });
@@ -1468,8 +1902,9 @@ export class CallService {
 
   private async loadActiveUsers(
     userIDs: string[],
+    db: Prisma.TransactionClient | PrismaService = this.prisma,
   ): Promise<Map<string, UserLite>> {
-    const users = await this.prisma.user.findMany({
+    const users = await db.user.findMany({
       where: { id: { in: userIDs }, status: UserStatus.ACTIVE },
       select: userLiteSelect,
     });
@@ -1508,9 +1943,10 @@ export class CallService {
   private async assertCurrentCallAccess(
     call: CallWithParticipants,
     userID: string,
+    db: Prisma.TransactionClient | PrismaService = this.prisma,
   ) {
     if (call.sessionType === GROUP_SESSION_TYPE) {
-      await this.assertGroupMembers(call.conversationID, [userID], userID);
+      await this.assertGroupMembers(call.conversationID, [userID], userID, db);
     } else if (call.sessionType === SINGLE_SESSION_TYPE && call.initiatorID) {
       const calleeID =
         userID !== call.initiatorID
@@ -1522,7 +1958,39 @@ export class CallService {
           message: 'CALL_NOT_FRIEND',
           errorCode: CallErrorCode.NotFriend,
         });
-      await this.assertDirectCallee(call.initiatorID, calleeID);
+      await this.assertDirectCallee(call.initiatorID, calleeID, db);
+    } else if (call.sessionType === CONFERENCE_SESSION_TYPE) {
+      const metadata = call.metadata as CallMetadata;
+      const inviterID = metadata.invitedBy?.[userID];
+      if (inviterID) await this.assertDirectCallee(inviterID, userID, db);
+      else if (metadata.originalParticipantIDs?.includes(userID)) {
+        await this.assertDirectCallee(
+          metadata.originalParticipantIDs[0],
+          metadata.originalParticipantIDs[1],
+          db,
+        );
+      } else throw new ForbiddenException('CALL_NOT_FOUND');
+      const others = (call.participants ?? [])
+        .filter(
+          (row) =>
+            row.userID !== userID &&
+            row.status === CallParticipantStatus.JOINED,
+        )
+        .map((row) => row.userID);
+      const block = await db.block.findFirst({
+        where: {
+          OR: [
+            { blockerID: userID, blockedID: { in: others } },
+            { blockerID: { in: others }, blockedID: userID },
+          ],
+        },
+        select: { id: true },
+      });
+      if (block)
+        throw new ForbiddenException({
+          message: 'CALL_NOT_FRIEND',
+          errorCode: CallErrorCode.NotFriend,
+        });
     } else {
       throw new ForbiddenException('CALL_NOT_FOUND');
     }
@@ -1709,9 +2177,6 @@ export class CallService {
       endedAt,
     });
     void (async () => {
-      const initiator =
-        call.initiator ??
-        this.findParticipant(call, call.initiatorID ?? '')?.user;
       if (!call.initiatorID || !call.conversationID) return;
 
       const durationSeconds =
@@ -1727,6 +2192,8 @@ export class CallService {
       // chat 会话 id(新)或 Circle.id(旧入参),两种都解析。
       let conversationId: string | null = null;
       if (isSingle) {
+        const originalIDs = (call.metadata as CallMetadata)
+          ?.originalParticipantIDs;
         const other = call.participants?.find(
           (participant) => participant.userID !== call.initiatorID,
         );
@@ -1738,7 +2205,7 @@ export class CallService {
         conversationId =
           await this.chatService.ensureDirectConversationForSettlement(
             call.initiatorID,
-            other.userID,
+            originalIDs?.find((id) => id !== call.initiatorID) ?? other.userID,
           );
       } else {
         const direct = await this.prisma.chatConversation.findUnique({
@@ -1810,17 +2277,32 @@ export class CallService {
     };
   }
 
-  private toCallDto(call: CallWithParticipants) {
+  private toCallDto(call: CallWithParticipants, viewerID?: string) {
+    const conference = call.sessionType === CONFERENCE_SESSION_TYPE;
+    const self = viewerID ? this.findParticipant(call, viewerID) : undefined;
+    const inviterID =
+      conference && self?.status === CallParticipantStatus.INVITED
+        ? (call.metadata as CallMetadata).invitedBy?.[viewerID!]
+        : undefined;
+    const expiresAt =
+      self?.status === CallParticipantStatus.INVITED && self.invitedAt
+        ? this.invitationDeadline(self)
+        : call.expiresAt;
     return {
       id: call.id,
       conversationID: call.conversationID,
-      sessionType: call.sessionType === GROUP_SESSION_TYPE ? 'group' : 'single',
+      sessionType:
+        call.sessionType === GROUP_SESSION_TYPE || conference
+          ? 'group'
+          : 'single',
+      ...(conference ? { invitationMode: 'contacts' as const } : {}),
       callType: call.callType,
       status: call.status,
-      initiator: call.initiator,
+      initiator:
+        this.findParticipant(call, inviterID ?? '')?.user ?? call.initiator,
       startedAt: call.startedAt?.toISOString() ?? null,
       endedAt: call.endedAt?.toISOString() ?? null,
-      expiresAt: call.expiresAt?.toISOString() ?? null,
+      expiresAt: expiresAt?.toISOString() ?? null,
       durationSeconds:
         call.startedAt && call.endedAt
           ? Math.max(
@@ -1845,6 +2327,13 @@ export class CallService {
       user: participant.user,
       status: participant.status,
       invitedAt: participant.invitedAt?.toISOString() ?? null,
+      ...(participant.invitedAt &&
+      participant.status === CallParticipantStatus.INVITED
+        ? {
+            invitationExpiresAt:
+              this.invitationDeadline(participant).toISOString(),
+          }
+        : {}),
       joinedAt: participant.joinedAt?.toISOString() ?? null,
       leftAt: participant.leftAt?.toISOString() ?? null,
     };

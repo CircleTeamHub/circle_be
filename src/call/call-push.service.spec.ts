@@ -131,6 +131,7 @@ describe('CallPushService', () => {
       sessionType: 'single',
       callerId: 'caller-1',
       callerName: '小明',
+      createdAt: now.toISOString(),
       expiresAt: new Date(now.getTime() + 45_000).toISOString(),
     });
     expect(
@@ -173,6 +174,7 @@ describe('CallPushService', () => {
         'callType',
         'callerId',
         'callerName',
+        'createdAt',
         'declineToken',
         'expiresAt',
         'sessionType',
@@ -385,6 +387,7 @@ describe('CallPushService', () => {
         callId: CALL_ID,
         callType: 'VIDEO',
         sessionType: 'single',
+        createdAt: now.toISOString(),
       },
       ttlSeconds: 45,
     });
@@ -439,6 +442,7 @@ describe('CallPushService', () => {
           type: 'call.dismiss',
           callId: CALL_ID,
           reason: 'canceled',
+          createdAt: now.toISOString(),
         },
         ttlSeconds: 45,
       });
@@ -469,6 +473,7 @@ describe('CallPushService', () => {
           type: 'call.dismiss',
           callId: CALL_ID,
           reason: 'answered_elsewhere',
+          createdAt: now.toISOString(),
         },
         ttlSeconds: 45,
       });

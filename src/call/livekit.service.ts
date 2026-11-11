@@ -182,6 +182,26 @@ export class LiveKitCallService {
     }
   }
 
+  async updateRoomMetadata(roomName: string, metadata: string): Promise<void> {
+    this.assertConfigured();
+    const start = Date.now();
+    try {
+      await withTimeout(
+        this.roomService!.updateRoomMetadata(roomName, metadata),
+        'LiveKit updateRoomMetadata',
+      );
+    } catch (error) {
+      logExternalCallFailure(this.logger, {
+        enabled: this.loggingConfig.externalLogOn,
+        service: 'livekit',
+        operation: 'update_room_metadata',
+        durationMs: Date.now() - start,
+        error,
+      });
+      throw new ServiceUnavailableException('LiveKit room update failed');
+    }
+  }
+
   async mintJoinToken(input: MintJoinTokenInput): Promise<string> {
     this.assertConfigured();
 
