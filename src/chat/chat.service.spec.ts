@@ -1015,6 +1015,42 @@ describe('ChatService', () => {
       expect(prisma.chatMessage.create).not.toHaveBeenCalled();
     });
 
+    // 每日保留期任务已删掉对象、清空了 key:给一个明确的「已过期」,而不是
+    // copyForForward 的「源对象 key 无效」。
+    it('refuses to forward media whose objects were purged by retention', async () => {
+      prisma.chatMember.findUnique
+        .mockResolvedValueOnce(membership())
+        .mockResolvedValueOnce(
+          membership({ conversationID: 'source-conv', clearedBeforeHeight: 0 }),
+        );
+      prisma.chatMessage.findUnique.mockResolvedValueOnce({
+        ...createdRow,
+        id: 'source-message',
+        conversationID: 'source-conv',
+        senderID: 'u2',
+        height: 8,
+        type: 'video',
+        content: { width: 720, height: 1280, expired: true },
+        createdAt: new Date(Date.now() - 40 * 24 * 60 * 60 * 1000),
+        revokedAt: null,
+      });
+
+      await expect(
+        service.sendMessage(
+          'u1',
+          sendPayload({
+            type: 'video',
+            content: {},
+            forwardFromMessageId: 'source-message',
+          } as never),
+        ),
+      ).rejects.toMatchObject({
+        response: expect.objectContaining({ errorCode: 'CHAT_MEDIA_EXPIRED' }),
+      });
+      expect(media.copyForForward).not.toHaveBeenCalled();
+      expect(prisma.chatMessage.create).not.toHaveBeenCalled();
+    });
+
     it('lets a user forward media sent before burn-after-read was enabled', async () => {
       const targetMembership = membership();
       const burnStartedAt = new Date('2026-09-14T10:00:00.000Z');

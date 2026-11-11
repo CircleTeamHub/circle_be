@@ -132,6 +132,10 @@ describe('collection message resolution', () => {
     expect(prisma.chatMember.findUnique).not.toHaveBeenCalled();
     expect(prisma.user.findMany).toHaveBeenCalledTimes(1);
     expect(media.attachMediaUrls).toHaveBeenCalledTimes(1);
+    // 收藏着的消息不会被保留期清理,收藏页要照常签地址。
+    expect(media.attachMediaUrls).toHaveBeenCalledWith(expect.any(Array), {
+      ignoreRetention: true,
+    });
   });
 
   it('does no database work for no source ids', async () => {

@@ -1,6 +1,7 @@
 import {
   BadRequestException,
   ForbiddenException,
+  GoneException,
   Injectable,
   NotFoundException,
 } from '@nestjs/common';
@@ -10,7 +11,8 @@ import {
 } from 'src/chat/chat-card-content';
 import { messagePreviewText } from 'src/chat/chat-message-preview';
 import { ChatService } from 'src/chat/chat.service';
-import { CollectionErrorCode } from 'src/common/app-error-codes';
+import { isChatMediaExpired } from 'src/chat/chat-media-retention';
+import { ChatErrorCode, CollectionErrorCode } from 'src/common/app-error-codes';
 import { CollectionType, Prisma } from 'src/generated/prisma';
 import { PrismaService } from 'src/prisma/prisma.service';
 import { CreateCollectionDto, UserCollectionDto } from './dto/collection.dto';
@@ -154,6 +156,13 @@ export class CollectionService {
       rawContent && typeof rawContent === 'object' && !Array.isArray(rawContent)
         ? (rawContent as Record<string, unknown>)
         : {};
+    // 只收没过保留期的:每日清理只碰过期的消息,两边不重叠,收藏下的对象不会随即被删。
+    if (content['expired'] === true || isChatMediaExpired(row)) {
+      throw new GoneException({
+        message: '媒体已过期',
+        errorCode: ChatErrorCode.MediaExpired,
+      });
+    }
     let messageType: string = row.type;
     if (row.type === 'text' || row.type === 'quote') {
       messageType = row.senderID === userId ? 'sent' : 'received';

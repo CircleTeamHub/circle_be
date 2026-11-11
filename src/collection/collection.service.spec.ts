@@ -40,7 +40,8 @@ describe('CollectionService', () => {
       type: 'text',
       content: { text: 'verified text' },
       height: 9,
-      createdAt: new Date('2026-09-08T08:00:00.000Z'),
+      // 发送时间默认取当下:写死的过去日期会随时间滑出媒体保留期(视频 30 天、图片一年)。
+      createdAt: new Date(),
       ...row,
     },
     conversation: {
@@ -315,6 +316,44 @@ describe('CollectionService', () => {
     expect(prisma.userCollection.create).toHaveBeenCalled();
   });
 
+  // 每日保留期任务已删掉对象:收藏下来也打不开,直接告诉用户已过期。
+  it('refuses to collect media whose objects were purged by retention', async () => {
+    chat.requireVisibleMessage.mockResolvedValue(
+      visible({
+        type: 'video',
+        content: { width: 720, height: 1280, expired: true },
+      }),
+    );
+
+    await expect(
+      service.create('user-1', messageCollection('msg-1')),
+    ).rejects.toMatchObject({
+      response: expect.objectContaining({ errorCode: 'CHAT_MEDIA_EXPIRED' }),
+    });
+    expect(prisma.userCollection.create).not.toHaveBeenCalled();
+  });
+
+  // 已过保留期、对象还没被当天的任务删掉:同样拒收。清理只碰过期的消息,收藏也只
+  // 收没过期的,两边永远不重叠 —— 不会出现收藏刚写下、对象随即被删的竞态。
+  it('refuses to collect media past retention even before the daily purge ran', async () => {
+    chat.requireVisibleMessage.mockResolvedValue(
+      visible({
+        type: 'video',
+        content: { key: 'chat/peer-1/a.mp4', width: 720 },
+        createdAt: new Date(Date.now() - 31 * 24 * 60 * 60 * 1000),
+        burnDurationSec: null,
+        burnExpiresAt: null,
+      }),
+    );
+
+    await expect(
+      service.create('user-1', messageCollection('msg-1')),
+    ).rejects.toMatchObject({
+      response: expect.objectContaining({ errorCode: 'CHAT_MEDIA_EXPIRED' }),
+    });
+    expect(prisma.userCollection.create).not.toHaveBeenCalled();
+  });
+
   it('refuses to collect a peer message with a sender-owned burn policy', async () => {
     chat.requireVisibleMessage.mockResolvedValue(
       visible(
@@ -446,6 +485,9 @@ describe('CollectionService', () => {
   });
 
   it('persists content-bearing message fields from the verified row, not the client snapshot', async () => {
+    chat.requireVisibleMessage.mockResolvedValue(
+      visible({ createdAt: new Date('2026-09-08T08:00:00.000Z') }),
+    );
     await service.create('user-1', {
       type: 'MESSAGE',
       title: '收藏消息',

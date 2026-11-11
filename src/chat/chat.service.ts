@@ -3,6 +3,7 @@ import {
   BadRequestException,
   ConflictException,
   ForbiddenException,
+  GoneException,
   Injectable,
   Logger,
   NotFoundException,
@@ -1268,7 +1269,7 @@ export class ChatService {
       ]),
     );
     await this.attachReplyTo(messages, { heightFloors });
-    await this.media.attachMediaUrls(messages);
+    await this.media.attachMediaUrls(messages, { ignoreRetention: true });
     return new Map(messages.map((message) => [message.id, message]));
   }
 
@@ -1303,6 +1304,13 @@ export class ChatService {
     const content = row.content;
     if (!content || typeof content !== 'object' || Array.isArray(content)) {
       throw this.messageNotFound();
+    }
+    // 只看对象还在不在:过了保留期但被收藏着(没被清理)的,从收藏页照常能转发。
+    if ((content as Record<string, unknown>).expired === true) {
+      throw new GoneException({
+        message: '媒体已过期',
+        errorCode: ChatErrorCode.MediaExpired,
+      });
     }
     return { type: row.type, content: content as Record<string, unknown> };
   }
