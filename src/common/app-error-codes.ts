@@ -301,6 +301,29 @@ export const NoteErrorCode = {
   ShareLinkUnavailable: 'NOTE_SHARE_LINK_UNAVAILABLE',
 } as const;
 
+// 笔记评分（好评 / 差评）。评分资格不满足时的原因码同时出现在
+// GET /note/:id/ratings/summary 的 reason 里，客户端据此解释按钮为什么灰掉。
+export const NoteRatingErrorCode = {
+  Owner: 'NOTE_RATING_OWNER',
+  NotCollected: 'NOTE_RATING_NOT_COLLECTED',
+  NotInGroup: 'NOTE_RATING_NOT_IN_GROUP',
+  NoGroup: 'NOTE_RATING_NO_GROUP',
+  LowCredit: 'NOTE_RATING_LOW_CREDIT',
+  AccountTooNew: 'NOTE_RATING_ACCOUNT_TOO_NEW',
+  RaterDailyLimit: 'NOTE_RATING_RATER_DAILY_LIMIT',
+  Cooldown: 'NOTE_RATING_COOLDOWN',
+  NoteGoodFull: 'NOTE_RATING_NOTE_GOOD_FULL',
+  NoteBadFull: 'NOTE_RATING_NOTE_BAD_FULL',
+  // 申诉：评分不存在或不是本人笔记收到的差评共用一个码，不泄漏别人的评分 id。
+  NotFound: 'NOTE_RATING_NOT_FOUND',
+  NotAppealable: 'NOTE_RATING_NOT_APPEALABLE',
+  AlreadyAppealed: 'NOTE_RATING_ALREADY_APPEALED',
+  AppealQuota: 'NOTE_RATING_APPEAL_QUOTA',
+  // 管理台：审核单已处理 / 动作与审核单类型不符。
+  CaseResolved: 'NOTE_RATING_CASE_RESOLVED',
+  CaseActionInvalid: 'NOTE_RATING_CASE_ACTION_INVALID',
+} as const;
+
 // 实时通话:会在通话 UI 弹给用户的错误。
 // 其余信令竞态、LiveKit 基建错误走通用兜底。原 message 本就是 CALL_* 机器串,保留。
 export const CallErrorCode = {
@@ -509,6 +532,7 @@ export type AppErrorCode =
   | (typeof TraceErrorCode)[keyof typeof TraceErrorCode]
   | (typeof FriendErrorCode)[keyof typeof FriendErrorCode]
   | (typeof NoteErrorCode)[keyof typeof NoteErrorCode]
+  | (typeof NoteRatingErrorCode)[keyof typeof NoteRatingErrorCode]
   | (typeof CallErrorCode)[keyof typeof CallErrorCode]
   | (typeof ConversationGroupErrorCode)[keyof typeof ConversationGroupErrorCode]
   | (typeof ChatHistoryErrorCode)[keyof typeof ChatHistoryErrorCode]
@@ -539,6 +563,7 @@ export const APP_ERROR_CODE_GROUPS = [
   TraceErrorCode,
   FriendErrorCode,
   NoteErrorCode,
+  NoteRatingErrorCode,
   CallErrorCode,
   UploadErrorCode,
   ConversationGroupErrorCode,

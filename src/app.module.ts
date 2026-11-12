@@ -22,6 +22,7 @@ import { FriendModule } from './friend/friend.module';
 import { CoinModule } from './coin/coin.module';
 import { CollectionModule } from './collection/collection.module';
 import { NoteModule } from './note/note.module';
+import { NoteRatingModule } from './note-rating/note-rating.module';
 import { MembershipModule } from './membership/membership.module';
 import { MallModule } from './mall/mall.module';
 import { CircleModule } from './circle/circle.module';
@@ -93,6 +94,7 @@ const envFilePath = `.env.${nodeEnv}`;
     MallModule,
     CollectionModule,
     NoteModule,
+    NoteRatingModule,
     CircleModule,
     IconModule,
     LikeModule,

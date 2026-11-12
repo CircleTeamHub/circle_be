@@ -880,6 +880,14 @@ export class NoteSummaryDto {
     description: '聊天收藏来源快照；自建笔记为 null',
   })
   collectedFrom: Record<string, unknown> | null;
+  @ApiProperty({
+    description: '本月（上海时区）计入的好评数；收藏副本显示根笔记的计数',
+  })
+  goodCount: number;
+  @ApiProperty({
+    description: '本月（上海时区）计入的差评数；收藏副本显示根笔记的计数',
+  })
+  badCount: number;
   @ApiProperty() createdAt: Date;
   @ApiProperty() updatedAt: Date;
 }
@@ -1029,6 +1037,9 @@ export class NoteSourceStateDto {
   /** UNLISTED also covers notes the viewer cannot read (no existence oracle). */
   @ApiProperty({ enum: ['ACTIVE', 'UNLISTED', 'DELETED'] })
   publicationStatus: 'ACTIVE' | 'UNLISTED' | 'DELETED';
+  /** This month's rating counters of the root; 0 for notes the viewer cannot read. */
+  @ApiProperty() goodCount: number;
+  @ApiProperty() badCount: number;
 }
 
 export class CollectNoteResultDto {

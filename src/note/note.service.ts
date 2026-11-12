@@ -95,6 +95,11 @@ import {
 } from './dto/note.dto';
 import { createLoggingConfig } from 'src/logging/logging.config';
 import { logBusinessEvent } from 'src/logging/business-event.logger';
+import {
+  loadMonthlyCounters,
+  ZERO_RATING_COUNTERS,
+  type NoteRatingCounters,
+} from 'src/note-rating/note-rating-counters';
 
 // ── BlockNote inline content types ───────────────────────────────────────────
 // These mirror the BlockNote default schema as documented at
@@ -2876,12 +2881,14 @@ export class NoteService implements NoteCardProjector {
   private mapSummary(
     note: NoteRow,
     viewerID: string,
+    ratings: NoteRatingCounters,
     presignedUrls?: Map<string, string>,
   ): NoteSummaryDto {
     return this.buildSummaryDto(
       note,
       this.summaryFactsFromRow(note),
       viewerID,
+      ratings,
       presignedUrls,
     );
   }
@@ -2910,6 +2917,7 @@ export class NoteService implements NoteCardProjector {
     note: NoteSummaryBase,
     facts: NoteSummaryFacts,
     viewerID: string,
+    ratings: NoteRatingCounters,
     presignedUrls?: Map<string, string>,
   ): NoteSummaryDto {
     // 置顶与分组是主人整理自己笔记本的私人标记，与 remark / collectedFrom 一样
@@ -2972,14 +2980,34 @@ export class NoteService implements NoteCardProjector {
         isOwner && this.isRecord(note.collectedFrom)
           ? note.collectedFrom
           : null,
+      goodCount: ratings.goodCount,
+      badCount: ratings.badCount,
       createdAt: note.createdAt,
       updatedAt: note.updatedAt,
     };
   }
 
+  /** This month's rating counters, keyed by the note: copies show their root's. */
+  private async loadRatingCounters(
+    notes: ReadonlyArray<{ id: string; rootSourceNoteID: string | null }>,
+  ): Promise<
+    (note: {
+      id: string;
+      rootSourceNoteID: string | null;
+    }) => NoteRatingCounters
+  > {
+    const counters = await loadMonthlyCounters(
+      this.prisma,
+      notes.map((note) => this.noteRootID(note)),
+    );
+    return (note) =>
+      counters.get(this.noteRootID(note)) ?? ZERO_RATING_COUNTERS;
+  }
+
   private mapDetail(
     note: NoteRow,
     viewerID: string,
+    ratings: NoteRatingCounters,
     presignedUrls?: Map<string, string>,
   ): NoteDetailDto {
     const sections = this.buildSectionsFromRow(note, presignedUrls);
@@ -2997,7 +3025,7 @@ export class NoteService implements NoteCardProjector {
       presignedUrls,
     );
     return {
-      ...this.mapSummary(note, viewerID, presignedUrls),
+      ...this.mapSummary(note, viewerID, ratings, presignedUrls),
       content: note.content ?? null,
       contentJson: (note.ownerID === viewerID
         ? publishedBlocks
@@ -3200,10 +3228,16 @@ export class NoteService implements NoteCardProjector {
   ): Promise<NoteDetailDto> {
     const [overlaid] = await this.overlayCollectedSourceState([note]);
     const [effectiveNote] = await this.withLegacyCircleIds([overlaid]);
-    const presigned = await this.presignNoteMedia(
-      this.collectNoteMediaTargets(effectiveNote),
+    const [presigned, ratingsOf] = await Promise.all([
+      this.presignNoteMedia(this.collectNoteMediaTargets(effectiveNote)),
+      this.loadRatingCounters([effectiveNote]),
+    ]);
+    return this.mapDetail(
+      effectiveNote,
+      viewerID,
+      ratingsOf(effectiveNote),
+      presigned,
     );
-    return this.mapDetail(effectiveNote, viewerID, presigned);
   }
 
   /**
@@ -3248,7 +3282,10 @@ export class NoteService implements NoteCardProjector {
         ? [{ url: row.coverUrl, objectKey: row.coverObjectKey }]
         : [];
     });
-    const presigned = await this.presignNoteMedia(coverTargets);
+    const [presigned, ratingsOf] = await Promise.all([
+      this.presignNoteMedia(coverTargets),
+      this.loadRatingCounters(effectiveNotes),
+    ]);
     return effectiveNotes.map((note) => {
       const { row, content } = projections.get(note.id)!;
       const sections: Record<string, any> = this.isRecord(note.sections)
@@ -3274,7 +3311,13 @@ export class NoteService implements NoteCardProjector {
             ? { id: row.coverId, type: row.coverType, url: row.coverUrl }
             : null,
       };
-      return this.buildSummaryDto(note, facts, viewerID, presigned);
+      return this.buildSummaryDto(
+        note,
+        facts,
+        viewerID,
+        ratingsOf(note),
+        presigned,
+      );
     });
   }
 
@@ -4694,15 +4737,23 @@ export class NoteService implements NoteCardProjector {
         available: true,
         workStatus: true,
         collectedFromNoteID: true,
+        rootSourceNoteID: true,
       },
     })) as unknown as NoteRow[];
     const effective = await this.overlayCollectedSourceState(rows);
     const byId = new Map(effective.map((note) => [note.id, note]));
+    // Chat note cards show the source's rating counters; this is their batch read.
+    const ratingsOf = await this.loadRatingCounters(effective);
 
     return ids.map((noteId) => {
       const note = byId.get(noteId);
       if (!note) {
-        return { noteId, workStatus: 'UNSET', publicationStatus: 'UNLISTED' };
+        return {
+          noteId,
+          workStatus: 'UNSET',
+          publicationStatus: 'UNLISTED',
+          ...ZERO_RATING_COUNTERS,
+        };
       }
       const publicationStatus: NoteSourceStateDto['publicationStatus'] =
         note.status === 'DELETED'
@@ -4716,6 +4767,7 @@ export class NoteService implements NoteCardProjector {
         noteId,
         workStatus: revealWorkStatus ? (note.workStatus ?? 'UNSET') : 'UNSET',
         publicationStatus,
+        ...ratingsOf(note),
       };
     });
   }

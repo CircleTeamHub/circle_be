@@ -182,6 +182,7 @@ Admin & moderation:
 - `admin_user_status_changed`
 - `membership_granted`
 - `avatar_frame_granted`
+- `note_rating_case_resolved` — an admin released / voided a burst case or upheld / revoked an appeal (`metadata.penalized` raters lost 15 credit each)
 
 Friends & blocks:
 
@@ -206,6 +207,9 @@ Content:
 - `plaza_post_created`
 - `moment_created`
 - `note_share_link_created`, `note_share_link_revoked`
+- `note_rating_created` — a rating was recorded on a source note (`metadata.status` is `COUNTED`, or `HELD` when burst detection paused it); rejections are not logged
+- `note_rating_burst_held` — burst detection held ≥3 same-value ratings for one owner within 10 minutes and opened (or extended) a `BURST` review case
+- `note_rating_appeal_created` — an owner appealed a bad rating; the rating stays counted until an admin decides
 - `temp_chat_created`, `temp_chat_ended`, `temp_chat_deleted`
 
 Calls:
