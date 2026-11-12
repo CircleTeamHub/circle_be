@@ -259,80 +259,77 @@ describe('ChatService standalone group conversations', () => {
     },
   );
 
-  it('directly joins only explicitly opted-in friends and durably invites the rest', async () => {
-    prisma.friend.findMany.mockResolvedValue(
-      friendRows('owner-1', ['f1', 'f2', 'f3']),
-    );
+  it('seats picks directly up to 30 members, then only opted-in friends, and invites the rest', async () => {
+    // Owner + 29 picks fill the 30 consent-free seats; f29 and f31 must accept,
+    // f30 opted into direct joining so it is seated past the limit.
+    const memberIds = Array.from({ length: 32 }, (_, index) => `f${index}`);
+    const direct = [...memberIds.slice(0, 29), 'f30'];
+    prisma.friend.findMany.mockResolvedValue(friendRows('owner-1', memberIds));
     prisma.userPrivacySetting.findMany.mockResolvedValue([
       {
-        userID: 'f1',
+        userID: 'f30',
         groupInvitePermission: 'FRIENDS_ONLY',
         allowFriendGroupDirectJoin: true,
       },
       {
-        userID: 'f2',
+        userID: 'f31',
         groupInvitePermission: 'EVERYONE',
         allowFriendGroupDirectJoin: false,
       },
     ]);
-    prisma.user.count.mockResolvedValue(3);
+    prisma.user.count.mockResolvedValue(memberIds.length);
     prisma.chatConversation.create.mockResolvedValue({ id: 'conv-1' });
 
     await service.createGroupConversation('owner-1', {
       name: '周末爬山',
-      memberIds: ['f1', 'f2', 'f3'],
+      memberIds,
     });
 
     expect(prisma.chatConversation.create).toHaveBeenCalledWith(
       expect.objectContaining({
         data: expect.objectContaining({
-          members: { create: [{ userID: 'owner-1' }, { userID: 'f1' }] },
+          members: {
+            create: ['owner-1', ...direct].map((userID) => ({ userID })),
+          },
         }),
       }),
     );
     expect(prisma.groupAdmission.createManyAndReturn).toHaveBeenCalledWith({
-      data: [
-        {
-          conversationID: 'conv-1',
-          applicantID: 'f1',
-          inviterID: 'owner-1',
-          kind: 'INVITE',
-          status: 'JOINED',
-          acceptedAt: expect.any(Date),
-          decidedByID: 'owner-1',
-          expiresAt: expect.any(Date),
-        },
-        ...['f2', 'f3'].map((applicantID) => ({
-          conversationID: 'conv-1',
-          applicantID,
-          inviterID: 'owner-1',
-          kind: 'INVITE',
-          status: 'INVITED',
-          expiresAt: expect.any(Date),
-        })),
-      ],
+      data: memberIds.map((applicantID) =>
+        direct.includes(applicantID)
+          ? {
+              conversationID: 'conv-1',
+              applicantID,
+              inviterID: 'owner-1',
+              kind: 'INVITE',
+              status: 'JOINED',
+              acceptedAt: expect.any(Date),
+              decidedByID: 'owner-1',
+              expiresAt: expect.any(Date),
+            }
+          : {
+              conversationID: 'conv-1',
+              applicantID,
+              inviterID: 'owner-1',
+              kind: 'INVITE',
+              status: 'INVITED',
+              expiresAt: expect.any(Date),
+            },
+      ),
       select: { id: true, applicantID: true, status: true },
     });
     expect(prisma.groupAdmissionDelivery.createMany).toHaveBeenCalledWith({
-      data: [
-        {
-          admissionID: 'admission-f1',
-          recipientID: 'f1',
-          actorID: 'owner-1',
-          event: 'JOINED',
-        },
-        ...['f2', 'f3'].map((recipientID) => ({
-          admissionID: `admission-${recipientID}`,
-          recipientID,
-          actorID: 'owner-1',
-          event: 'INVITED',
-        })),
-      ],
+      data: memberIds.map((recipientID) => ({
+        admissionID: `admission-${recipientID}`,
+        recipientID,
+        actorID: 'owner-1',
+        event: direct.includes(recipientID) ? 'JOINED' : 'INVITED',
+      })),
     });
     expect(groupEvents.recordInTx).toHaveBeenCalledWith(prisma, 'conv-1', {
       kind: 'member-joined',
       actorId: 'owner-1',
-      targetIds: ['f1'],
+      targetIds: direct,
       payload: { via: 'invite' },
     });
   });
@@ -419,7 +416,7 @@ describe('ChatService standalone group conversations', () => {
     expect(systemMessage.emit).not.toHaveBeenCalled();
   });
 
-  it('creates only the owner seat and pending invitations for the selected friends', async () => {
+  it('seats every picked friend of a group that stays within 30 members', async () => {
     prisma.friend.findMany.mockResolvedValue(
       friendRows('owner-1', ['f1', 'f2']),
     );
@@ -441,14 +438,14 @@ describe('ChatService standalone group conversations', () => {
         membersCanViewRoster: true,
         membersCanViewProfiles: true,
         members: {
-          create: [{ userID: 'owner-1' }],
+          create: ['owner-1', 'f1', 'f2'].map((userID) => ({ userID })),
         },
       },
       select: { id: true },
     });
-    // 未同意直接入群的好友仍只收邀请;只有群主入房。
+    // Only the owner enters the room here; joined friends follow via the delivery outbox.
     expect(broadcast.joinUserToConversation).toHaveBeenCalledTimes(1);
-    // 每位好友一条邀请 + 一条投递,批量写入(原来每人两次 INSERT)。
+    // One admission and one delivery per friend, written in a single batch.
     expect(prisma.groupAdmission.createManyAndReturn).toHaveBeenCalledTimes(1);
     expect(prisma.groupAdmission.createManyAndReturn).toHaveBeenCalledWith({
       data: ['f1', 'f2'].map((applicantID) => ({
@@ -456,7 +453,9 @@ describe('ChatService standalone group conversations', () => {
         applicantID,
         inviterID: 'owner-1',
         kind: 'INVITE',
-        status: 'INVITED',
+        status: 'JOINED',
+        acceptedAt: expect.any(Date),
+        decidedByID: 'owner-1',
         expiresAt: expect.any(Date),
       })),
       select: { id: true, applicantID: true, status: true },
@@ -466,7 +465,7 @@ describe('ChatService standalone group conversations', () => {
         admissionID: `admission-${recipientID}`,
         recipientID,
         actorID: 'owner-1',
-        event: 'INVITED',
+        event: 'JOINED',
       })),
     });
     expect(broadcast.emitConversationChange).toHaveBeenCalledTimes(1);
@@ -510,7 +509,7 @@ describe('ChatService standalone group conversations', () => {
       expect.objectContaining({
         data: expect.objectContaining({
           members: {
-            create: [{ userID: 'owner-1' }],
+            create: ['owner-1', friendId, 'f2'].map((userID) => ({ userID })),
           },
         }),
       }),
@@ -779,5 +778,37 @@ describe('ChatService standalone group conversations', () => {
     expect(
       members.map((m) => m.userId).sort((a, b) => a.localeCompare(b)),
     ).toEqual(['f1', 'owner-1']);
+  });
+
+  it('lists the owner first, then admins, then members in join order', async () => {
+    prisma.chatMember.findUnique.mockResolvedValue(seat({ userID: 'f1' }));
+    // Seats come back in join order; the owner's seat is not the earliest one.
+    prisma.chatMember.findMany.mockResolvedValue([
+      { userID: 'f1', role: 'MEMBER' },
+      { userID: 'owner-1', role: 'MEMBER' },
+      { userID: 'f2', role: 'MEMBER' },
+      { userID: 'admin-1', role: 'ADMIN' },
+    ]);
+    prisma.user.findMany.mockResolvedValue(
+      ['f1', 'owner-1', 'f2', 'admin-1'].map((id) => ({
+        id,
+        nickname: id,
+        avatarUrl: null,
+      })),
+    );
+
+    const members = await service.listMembers('f1', 'conv-1');
+
+    expect(prisma.chatMember.findMany).toHaveBeenCalledWith(
+      expect.objectContaining({
+        orderBy: [{ joinedAt: 'asc' }, { userID: 'asc' }],
+      }),
+    );
+    expect(members.map((m) => [m.userId, m.role])).toEqual([
+      ['owner-1', 'OWNER'],
+      ['admin-1', 'ADMIN'],
+      ['f1', 'MEMBER'],
+      ['f2', 'MEMBER'],
+    ]);
   });
 });

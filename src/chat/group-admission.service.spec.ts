@@ -1,5 +1,6 @@
 import { ForbiddenException } from '@nestjs/common';
 import { GroupAdmissionService } from './group-admission.service';
+import { GROUP_DIRECT_JOIN_MAX_MEMBERS } from './chat-group-roles';
 import { jobMetrics } from '../metrics/job-metrics';
 
 async function deliveryRuns(result: string): Promise<number> {
@@ -11,7 +12,9 @@ async function deliveryRuns(result: string): Promise<number> {
 }
 
 // Stateful transaction harness verifies membership rather than only mock calls.
-function harness(approval = true) {
+// `crowded` seats filler members so the group already sits at the direct-join
+// limit: invitations then take the consent path the older tests exercise.
+function harness(approval = true, crowded = true) {
   const group: any = {
     id: 'g',
     type: 'GROUP',
@@ -28,6 +31,13 @@ function harness(approval = true) {
   const seats = new Map<string, any>([
     ['owner', { userID: 'owner', role: 'MEMBER', leftAt: null }],
   ]);
+  if (crowded)
+    for (let i = 1; i < GROUP_DIRECT_JOIN_MAX_MEMBERS; i += 1)
+      seats.set(`filler-${i}`, {
+        userID: `filler-${i}`,
+        role: 'MEMBER',
+        leftAt: null,
+      });
   const admissions = new Map<string, any>();
   const deliveries = new Map<string, any>();
   const events = new Map<string, any>();
@@ -88,6 +98,26 @@ function harness(approval = true) {
         seats.set(id, seat);
         return seat;
       }),
+      updateMany: jest.fn().mockImplementation(({ where, data }: any) => {
+        let count = 0;
+        for (const seat of seats.values())
+          if (where.userID.in.includes(seat.userID) && seat.leftAt) {
+            Object.assign(seat, data);
+            count += 1;
+          }
+        return { count };
+      }),
+      createMany: jest.fn().mockImplementation(({ data }: any) => {
+        for (const row of data)
+          if (!seats.has(row.userID))
+            seats.set(row.userID, {
+              role: 'MEMBER',
+              leftAt: null,
+              joinedAt: new Date(),
+              ...row,
+            });
+        return { count: data.length };
+      }),
     },
     groupAdmission: {
       updateMany: jest.fn().mockImplementation(({ where, data }: any) => {
@@ -123,7 +153,7 @@ function harness(approval = true) {
             ...row,
           };
           admissions.set(a.id, a);
-          return { id: a.id, applicantID: a.applicantID };
+          return { id: a.id, applicantID: a.applicantID, status: a.status };
         }),
       ),
       findFirst: jest
@@ -705,6 +735,199 @@ describe('Group admission consent and authorization', () => {
     const h = harness();
     await h.service.invite('owner', 'g', ['guest']);
     await expect(h.service.detail('other', 'a0')).rejects.toThrow();
+  });
+});
+
+describe('Group admission small-group direct join', () => {
+  const befriend = (
+    h: ReturnType<typeof harness>,
+    inviter: string,
+    ids: string[],
+  ) =>
+    h.tx.friend.findMany.mockResolvedValue(
+      ids.map((friendID) => ({ userID: inviter, friendID })),
+    );
+  const statuses = (h: ReturnType<typeof harness>) =>
+    [...h.admissions.values()].map((a) => [a.applicantID, a.status]);
+  const jobs = (h: ReturnType<typeof harness>) =>
+    [...h.deliveries.values()].map((job) => [job.recipientID, job.event]);
+
+  it('seats invited friends without a consent step while the group stays within the limit', async () => {
+    const h = harness(true, false);
+    befriend(h, 'owner', ['guest', 'friend']);
+    await h.service.invite('owner', 'g', ['guest', 'friend']);
+    for (const id of ['guest', 'friend'])
+      expect(h.seats.get(id)).toMatchObject({
+        leftAt: null,
+        role: 'MEMBER',
+        clearedBeforeHeight: 10,
+      });
+    expect([...h.admissions.values()]).toEqual(
+      ['guest', 'friend'].map((applicantID) =>
+        expect.objectContaining({
+          applicantID,
+          inviterID: 'owner',
+          status: 'JOINED',
+          acceptedAt: expect.any(Date),
+          decidedByID: 'owner',
+        }),
+      ),
+    );
+    expect(jobs(h)).toEqual([
+      ['guest', 'JOINED'],
+      ['friend', 'JOINED'],
+    ]);
+    expect([...h.events.values()]).toEqual([
+      expect.objectContaining({
+        conversationID: 'g',
+        kind: 'member-joined',
+        actorID: 'owner',
+        targetIDs: ['guest', 'friend'],
+        payload: {
+          via: 'invite',
+          status: 'JOINED',
+          source: 'INVITE',
+          inviterId: 'owner',
+          operatorId: 'owner',
+        },
+      }),
+    ]);
+  });
+
+  it('fills the group up to the limit in selection order and invites everyone past it', async () => {
+    const h = harness(false, false);
+    // Owner plus 27 members: two seats remain below the limit.
+    for (let i = 1; i <= GROUP_DIRECT_JOIN_MAX_MEMBERS - 3; i += 1)
+      h.seats.set(`m${i}`, { userID: `m${i}`, role: 'MEMBER', leftAt: null });
+    befriend(h, 'owner', ['a', 'b', 'c', 'd', 'e']);
+    await h.service.invite('owner', 'g', ['c', 'a', 'd', 'b']);
+    expect(statuses(h)).toEqual([
+      ['c', 'JOINED'],
+      ['a', 'JOINED'],
+      ['d', 'INVITED'],
+      ['b', 'INVITED'],
+    ]);
+    expect(jobs(h)).toEqual([
+      ['c', 'JOINED'],
+      ['a', 'JOINED'],
+      ['d', 'INVITED'],
+      ['b', 'INVITED'],
+    ]);
+    expect(['c', 'a'].every((id) => h.seats.has(id))).toBe(true);
+    expect(['d', 'b'].some((id) => h.seats.has(id))).toBe(false);
+    // The group now holds exactly the limit, so the next invitee must accept.
+    await h.service.invite('owner', 'g', ['e']);
+    expect(h.admissions.get('a4').status).toBe('INVITED');
+    expect(h.seats.has('e')).toBe(false);
+  });
+
+  it('skips consent for a regular member invitation but keeps manager review', async () => {
+    const h = harness(true, false);
+    h.seats.set('member', { userID: 'member', role: 'MEMBER', leftAt: null });
+    befriend(h, 'member', ['guest']);
+    await h.service.invite('member', 'g', ['guest']);
+    expect(h.seats.has('guest')).toBe(false);
+    expect(h.admissions.get('a0')).toMatchObject({
+      status: 'PENDING',
+      inviterID: 'member',
+      acceptedAt: expect.any(Date),
+    });
+    // Reviewers get the join request on the applicant's behalf; no invitation card.
+    expect([...h.deliveries.values()]).toEqual([
+      expect.objectContaining({
+        admissionID: 'a0',
+        recipientID: 'owner',
+        actorID: 'guest',
+        event: 'PENDING',
+      }),
+    ]);
+    await h.service.act('owner', 'a0', 'approve');
+    expect(h.admissions.get('a0').status).toBe('JOINED');
+    expect(h.seats.has('guest')).toBe(true);
+  });
+
+  it('sends only the invitees within the limit to review and invites the rest', async () => {
+    const h = harness(true, false);
+    h.seats.set('member', { userID: 'member', role: 'MEMBER', leftAt: null });
+    // Owner, member and 27 more: one seat remains below the limit.
+    for (let i = 1; i <= GROUP_DIRECT_JOIN_MAX_MEMBERS - 3; i += 1)
+      h.seats.set(`m${i}`, { userID: `m${i}`, role: 'MEMBER', leftAt: null });
+    befriend(h, 'member', ['x', 'y']);
+    await h.service.invite('member', 'g', ['x', 'y']);
+    expect(statuses(h)).toEqual([
+      ['x', 'PENDING'],
+      ['y', 'INVITED'],
+    ]);
+    expect(jobs(h)).toEqual([
+      ['owner', 'PENDING'],
+      ['y', 'INVITED'],
+    ]);
+    expect(['x', 'y'].some((id) => h.seats.has(id))).toBe(false);
+  });
+
+  it('re-seats a departed member with a fresh role and history floor', async () => {
+    const h = harness(false, false);
+    h.seats.set('guest', {
+      userID: 'guest',
+      role: 'ADMIN',
+      leftAt: new Date(0),
+      hiddenAt: new Date(0),
+      clearedBeforeHeight: 1,
+    });
+    befriend(h, 'owner', ['guest']);
+    await h.service.invite('owner', 'g', ['guest']);
+    expect(h.seats.get('guest')).toMatchObject({
+      leftAt: null,
+      role: 'MEMBER',
+      hiddenAt: null,
+      clearedBeforeHeight: 10,
+    });
+    expect(h.admissions.get('a0').status).toBe('JOINED');
+  });
+
+  it('still refuses a friend who disabled group invitations, seating nobody', async () => {
+    const h = harness(false, false);
+    befriend(h, 'owner', ['guest', 'friend']);
+    h.tx.userPrivacySetting.findMany.mockResolvedValue([
+      { userID: 'friend', groupInvitePermission: 'NONE' },
+    ]);
+    await expect(
+      h.service.invite('owner', 'g', ['guest', 'friend']),
+    ).rejects.toMatchObject({
+      response: { errorCode: 'GROUP_INVITE_NOT_ALLOWED' },
+    });
+    expect(h.seats.has('guest')).toBe(false);
+    expect(h.admissions.size).toBe(0);
+  });
+
+  it('delivers a direct join so the new member enters the room', async () => {
+    const h = harness(false, false);
+    befriend(h, 'owner', ['guest']);
+    await h.service.invite('owner', 'g', ['guest']);
+    h.tx.groupAdmissionDelivery.findMany.mockResolvedValue([
+      {
+        id: 'joined-job',
+        admission: h.admissions.get('a0'),
+        recipientID: 'guest',
+        actorID: 'owner',
+        event: 'JOINED',
+        attempts: 0,
+      },
+    ]);
+    await h.service.flush();
+    expect(h.broadcast.joinUserToConversation).toHaveBeenCalledWith(
+      'guest',
+      'g',
+    );
+    expect(
+      h.notifications.deliverGroupAdmissionNotification,
+    ).toHaveBeenCalledWith(
+      expect.objectContaining({
+        toUserID: 'guest',
+        content: '已加入「Group」',
+      }),
+    );
+    expect(h.messages.insertServerMessage).not.toHaveBeenCalled();
   });
 });
 

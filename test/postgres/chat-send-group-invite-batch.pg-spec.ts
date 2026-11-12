@@ -17,6 +17,8 @@ import {
  * 往返,全程持有会话行 FOR UPDATE(事务默认 5 秒超时);建群最多 199 人,每人两次
  * INSERT,全程持有关系锁。现在先用 IN 批量预读,再 createMany。每个被邀请人的结果
  * (跳过 / 过期后重邀 / 新邀请,以及投递行)与原来逐人处理完全一致。
+ * Since the group direct-join rule, invitees that keep the group within 30
+ * members are seated in the same batch instead of being invited.
  */
 // 建整套表(prisma migrate diff 生成的 DDL)在共享测试库上可能要好几秒。
 jest.setTimeout(60_000);
@@ -87,6 +89,8 @@ describePostgres('group invite and create-group batching', () => {
     live.statements.length = 0;
   });
 
+  // deliveries = the applicant's own job for the admission's status
+  // (INVITED card or JOINED notice) sent on the owner's behalf.
   const admissionRows = async () =>
     (
       await live.db.query<{
@@ -99,11 +103,17 @@ describePostgres('group invite and create-group batching', () => {
         `SELECT a."applicantID", a.status, a."inviterID", a.kind,
                 (SELECT count(*)::int FROM "GroupAdmissionDelivery" d
                  WHERE d."admissionID" = a.id AND d."recipientID" = a."applicantID"
-                   AND d."actorID" = 'owner' AND d.event = 'INVITED') AS deliveries
+                   AND d."actorID" = 'owner' AND d.event = a.status) AS deliveries
          FROM "GroupAdmission" a WHERE a."conversationID" <> 'elsewhere'
          ORDER BY a."applicantID", a.status`,
       )
     ).rows;
+  const activeSeats = async () =>
+    (
+      await live.db.query<{ userID: string }>(
+        `SELECT "userID" FROM "ChatMember" WHERE "leftAt" IS NULL ORDER BY "userID"`,
+      )
+    ).rows.map((row) => row.userID);
 
   describe('invite', () => {
     beforeEach(async () => {
@@ -130,7 +140,7 @@ describePostgres('group invite and create-group batching', () => {
       live.statements.length = 0;
     });
 
-    it('produces the same per-invitee outcome as the one-by-one loop', async () => {
+    it('seats fresh invitees up to 30 members and invites the rest, per invitee', async () => {
       await admissions.invite('owner', 'grp', invitees);
 
       const rows = await admissionRows();
@@ -159,11 +169,11 @@ describePostgres('group invite and create-group batching', () => {
           deliveries: 0,
         }),
       ]);
-      // 过期的先标 EXPIRED,再建一条新的 INVITED + 一条投递。
+      // 过期的先标 EXPIRED,再建一条新记录 + 一条投递(u005 排在前 27 位,直接入群)。
       expect(byUser.get('u005')).toEqual([
         expect.objectContaining({ status: 'EXPIRED', deliveries: 0 }),
         expect.objectContaining({
-          status: 'INVITED',
+          status: 'JOINED',
           kind: 'INVITE',
           deliveries: 1,
         }),
@@ -176,20 +186,37 @@ describePostgres('group invite and create-group batching', () => {
           )
         ).rows[0].status,
       ).toBe('INVITED');
-      // 其余(含离座的 u002 和 u006 在本群)各一条新邀请、一条投递。
+      // 其余(含离座的 u002 和 u006 在本群)各一条新记录、一条投递。The group
+      // had 3 members, so the first 27 fresh invitees in request order join
+      // directly (u002, u005, u006..u030) and everyone after them is invited.
       const fresh = invitees.filter(
-        (u) => !['u000', 'u001', 'u003', 'u004', 'u005'].includes(u),
+        (u) => !['u000', 'u001', 'u003', 'u004'].includes(u),
       );
-      for (const u of fresh) {
+      const joined = fresh.slice(0, 27);
+      expect(joined[joined.length - 1]).toBe('u030');
+      for (const u of fresh.filter((id) => id !== 'u005')) {
         expect(byUser.get(u)).toEqual([
           expect.objectContaining({
-            status: 'INVITED',
+            status: joined.includes(u) ? 'JOINED' : 'INVITED',
             kind: 'INVITE',
             inviterID: 'owner',
             deliveries: 1,
           }),
         ]);
       }
+      // The departed u002 reuses its seat row; the group now holds exactly 30.
+      expect(await activeSeats()).toEqual(
+        ['owner', 'u000', 'u001', ...joined].sort((a, b) => a.localeCompare(b)),
+      );
+      expect(
+        (
+          await live.prisma.chatGroupEvent.findMany({
+            select: { kind: true, actorID: true, targetIDs: true },
+          })
+        ).map((event) => ({ ...event, targetIDs: [...event.targetIDs] })),
+      ).toEqual([
+        { kind: 'member-joined', actorID: 'owner', targetIDs: joined },
+      ]);
       const expiry = await live.db.query<{ ok: boolean }>(
         `SELECT bool_and("expiresAt" BETWEEN now() + interval '7 days' - interval '1 minute'
                                          AND now() + interval '7 days' + interval '1 minute') AS ok
@@ -212,7 +239,15 @@ describePostgres('group invite and create-group batching', () => {
       expect(
         work.filter((s) => touches('GroupAdmissionDelivery')(s.sql)),
       ).toHaveLength(1);
-      expect(work.length).toBeLessThanOrEqual(13);
+      // Direct joins reopen departed seats and insert the new ones in one go each.
+      expect(
+        work.filter((s) =>
+          /(INSERT INTO|UPDATE) "[^"]+"\."ChatMember"/.test(s.sql),
+        ),
+      ).toHaveLength(2);
+      // 13 for invitations, plus member count, inviter role, history floor,
+      // the two seat writes and the join log.
+      expect(work.length).toBeLessThanOrEqual(19);
     });
 
     it('does nothing for a list of seated or already-invited users', async () => {
@@ -232,24 +267,22 @@ describePostgres('group invite and create-group batching', () => {
   });
 
   describe('createGroupConversation', () => {
-    it('seats only explicitly opted-in friends with matching admission, delivery, and audit rows', async () => {
-      const members = invitees.slice(0, 3);
+    it('seats the first 29 picks, then only opted-in friends, with matching admission, delivery, and audit rows', async () => {
+      // Owner + u000..u028 make 30. Past that, u030 opted into direct joining
+      // and is seated; u029 declined it and is invited.
+      const members = invitees.slice(0, 31);
       await live.prisma.userPrivacySetting.createMany({
         data: [
-          { userID: members[0], allowFriendGroupDirectJoin: true },
-          { userID: members[1], allowFriendGroupDirectJoin: false },
+          { userID: 'u029', allowFriendGroupDirectJoin: false },
+          { userID: 'u030', allowFriendGroupDirectJoin: true },
         ],
       });
+      const direct = members.filter((id) => id !== 'u029');
       await chat.createGroupConversation('owner', {
         name: '新群',
         memberIds: members,
       });
-      expect(
-        await live.prisma.chatMember.findMany({
-          select: { userID: true },
-          orderBy: { userID: 'asc' },
-        }),
-      ).toEqual([{ userID: 'owner' }, { userID: members[0] }]);
+      expect(await activeSeats()).toEqual(['owner', ...direct]);
       const admissions = await live.prisma.groupAdmission.findMany({
         orderBy: { applicantID: 'asc' },
         include: { deliveries: true },
@@ -261,29 +294,28 @@ describePostgres('group invite and create-group batching', () => {
           events: a.deliveries.map((d) => d.event),
         })),
       ).toEqual(
-        members.map((applicantID, i) => ({
-          applicantID,
-          status: i === 0 ? 'JOINED' : 'INVITED',
-          events: [i === 0 ? 'JOINED' : 'INVITED'],
-        })),
+        members.map((applicantID) => {
+          const status = direct.includes(applicantID) ? 'JOINED' : 'INVITED';
+          return { applicantID, status, events: [status] };
+        }),
       );
+      const invited = admissions.find((a) => a.applicantID === 'u029')!;
       expect(admissions[0].acceptedAt).toBeInstanceOf(Date);
       expect(admissions[0].decidedByID).toBe('owner');
-      expect(admissions[1].acceptedAt).toBeNull();
+      expect(invited.acceptedAt).toBeNull();
       expect(
-        await live.prisma.chatGroupEvent.findMany({
-          select: { kind: true, actorID: true, targetIDs: true },
-        }),
+        (
+          await live.prisma.chatGroupEvent.findMany({
+            select: { kind: true, actorID: true, targetIDs: true },
+          })
+        ).map((event) => ({ ...event, targetIDs: [...event.targetIDs] })),
       ).toEqual([
-        { kind: 'member-joined', actorID: 'owner', targetIDs: [members[0]] },
+        { kind: 'member-joined', actorID: 'owner', targetIDs: direct },
       ]);
     });
 
     it('rolls back seats, admissions, and logs when joined delivery insertion fails', async () => {
       const members = invitees.slice(0, 2);
-      await live.prisma.userPrivacySetting.create({
-        data: { userID: members[0], allowFriendGroupDirectJoin: true },
-      });
       await live.db.query(
         'ALTER TABLE "GroupAdmissionDelivery" ADD CONSTRAINT "deny_joined_delivery" CHECK (event <> \'JOINED\')',
       );
@@ -306,7 +338,7 @@ describePostgres('group invite and create-group batching', () => {
       }
     });
 
-    it('invites every member with one admission and one delivery each, in constant statements', async () => {
+    it('writes one admission and one delivery per member, in constant statements', async () => {
       const members = invitees.slice(0, 60);
       await chat.createGroupConversation('owner', {
         name: '新群',
@@ -316,16 +348,16 @@ describePostgres('group invite and create-group batching', () => {
       const rows = await admissionRows();
       expect(rows).toHaveLength(60);
       expect(rows.map((row) => row.applicantID)).toEqual(members);
-      for (const row of rows) {
+      // The first 29 picks fill the group to 30; nobody here opted in past it.
+      rows.forEach((row, index) => {
         expect(row).toMatchObject({
-          status: 'INVITED',
+          status: index < 29 ? 'JOINED' : 'INVITED',
           kind: 'INVITE',
           inviterID: 'owner',
           deliveries: 1,
         });
-      }
-      const seats = await live.db.query(`SELECT "userID" FROM "ChatMember"`);
-      expect(seats.rows).toEqual([{ userID: 'owner' }]);
+      });
+      expect(await activeSeats()).toEqual(['owner', ...members.slice(0, 29)]);
 
       const tx = transactionOf(live.statements, (sql) =>
         /INSERT INTO "[^"]+"\."ChatConversation"/.test(sql),

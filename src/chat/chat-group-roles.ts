@@ -19,6 +19,13 @@ export const SILENCE_DURATION_MAX_SEC = 30 * 86_400;
 export const GROUP_EVENTS_PAGE_DEFAULT = 50;
 export const GROUP_EVENTS_PAGE_MAX = 100;
 
+/**
+ * Standalone groups seat invited friends directly, with no consent step, as
+ * long as the group (owner included) stays within this many members.
+ * Invitees past the limit fall back to accepting the invitation first.
+ */
+export const GROUP_DIRECT_JOIN_MAX_MEMBERS = 30;
+
 export interface StandaloneSeatLike {
   userID: string;
   role: ChatMemberRole;

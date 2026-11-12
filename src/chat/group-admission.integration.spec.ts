@@ -5,6 +5,7 @@ import { readFileSync } from 'fs';
 import { randomUUID } from 'crypto';
 import { spawnSync } from 'child_process';
 import { GroupAdmissionService } from './group-admission.service';
+import { GROUP_DIRECT_JOIN_MAX_MEMBERS } from './chat-group-roles';
 
 // Opt-in; isolated schema only. Never migrates or seeds the application's schema.
 const run = process.env.GROUP_ADMISSION_TEST_DATABASE_URL
@@ -116,6 +117,14 @@ run('Group admission PostgreSQL transactions', () => {
     });
   });
   it('serializes manager invites and joins exactly once only after acceptance', async () => {
+    // A group at the direct-join limit: the invitation needs the guest's consent.
+    const fillers = Array.from(
+      { length: GROUP_DIRECT_JOIN_MAX_MEMBERS - 1 },
+      () => randomUUID(),
+    );
+    await db.chatMember.createMany({
+      data: fillers.map((userID) => ({ conversationID: group, userID })),
+    });
     await Promise.all([
       service.invite(owner, group, [guest]),
       service.invite(owner, group, [guest]),
@@ -137,6 +146,8 @@ run('Group admission PostgreSQL transactions', () => {
     expect(
       await db.groupAdmissionDelivery.count({ where: { event: 'JOINED' } }),
     ).toBe(1);
+    // Later cases build on the guest's seat, not on the filler members.
+    await db.chatMember.deleteMany({ where: { userID: { in: fillers } } });
   });
   it('rolls back an invalid QR acceptance and leaves no pending record or member', async () => {
     const token = randomUUID();
