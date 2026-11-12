@@ -99,6 +99,10 @@ function oldMapSummary(
     cardPreview,
     collectedFrom:
       isOwner && svc.isRecord(note.collectedFrom) ? note.collectedFrom : null,
+    // Rating counters arrived later and are not part of this comparison; no
+    // note here has a rating this month, so both sides report 0.
+    goodCount: 0,
+    badCount: 0,
     createdAt: note.createdAt,
     updatedAt: note.updatedAt,
   };
@@ -403,6 +407,13 @@ describePostgres('note list summaries (PostgreSQL)', () => {
         "createdAt" timestamp(3) NOT NULL DEFAULT now()
       );
       CREATE TABLE "Circle" (id text PRIMARY KEY, "groupID" text);
+      CREATE TABLE "NoteRatingMonthly" (
+        "noteID" text NOT NULL,
+        month char(7) NOT NULL,
+        "goodCount" integer NOT NULL DEFAULT 0,
+        "badCount" integer NOT NULL DEFAULT 0,
+        PRIMARY KEY ("noteID", month)
+      );
       CREATE TABLE "NoteShareLink" (
         id text PRIMARY KEY,
         "ownerID" text NOT NULL,

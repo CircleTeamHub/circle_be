@@ -57,6 +57,10 @@ lock, so the counter upserts never race.
   needs no job. Status changes adjust the rows of the day and month the rating
   was made in (`transitionRatings`).
 - Invariant: both tables equal the number of `COUNTED` ratings per bucket.
+  The 5 + 5 cap is enforced only when a new rating arrives. An admin release
+  adds the held ratings back to their day even if that day has since filled
+  up, so a day can end above 5: those ratings were judged genuine, and
+  dropping them would punish the raters for the burst.
 
 ## Burst detection
 
@@ -91,7 +95,9 @@ admin to resolve a case wins (`NOTE_RATING_CASE_RESOLVED` for the rest).
 
 Counters (`goodCount` / `badCount` on note summaries, details and
 `POST /note/source-states`) are public. The owner's bad-rating list returns
-reason, text, time, status and appeal state, never the rater. Admin cases include
+reason, text, time, status and appeal state, never the rater. It includes held
+ratings (shown as under review) so the owner knows why the counter has not
+moved; it does not say which other ratings are in the same case. Admin cases include
 the rater, their credit and registration date.
 
 ## Deferred

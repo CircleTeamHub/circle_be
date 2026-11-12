@@ -178,7 +178,11 @@ export class NoteRatingAdminService {
             (rating) => rating.id,
           ),
         );
-        voided = ratings.filter((rating) => changed.has(rating.id));
+        // Lock the raters' User rows in one global order: two admins resolving
+        // cases of different owners that share raters must not deadlock.
+        voided = ratings
+          .filter((rating) => changed.has(rating.id))
+          .sort((a, b) => a.raterID.localeCompare(b.raterID));
         for (const rating of voided) {
           await this.creditService.applyDeltaInTransaction(tx, {
             userId: rating.raterID,

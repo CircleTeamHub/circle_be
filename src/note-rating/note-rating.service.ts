@@ -182,8 +182,6 @@ export class NoteRatingService {
     }
 
     const target = await this.resolveTarget(raterID, noteId);
-    const now = new Date();
-    const calendar = ratingCalendar(now);
 
     const outcome = await this.prisma.$transaction(async (tx) => {
       // Rater lock: the per-rater daily and per-note cooldown checks below.
@@ -191,6 +189,9 @@ export class NoteRatingService {
       // owner would otherwise race (each would miss the others' fresh rows).
       await lockRater(tx, raterID);
       await lockOwner(tx, target.ownerID);
+      // Read the clock after the locks so createdAt follows commit order.
+      const now = new Date();
+      const calendar = ratingCalendar(now);
 
       const block = await this.findBlock(tx, raterID, target, now, calendar);
       if (block.reason) throw rejected(block.reason, block.nextRatableAt);
@@ -253,6 +254,8 @@ export class NoteRatingService {
         caseID,
         heldCount: burst ? peers.length + 1 : 0,
         counters,
+        now,
+        month: calendar.month,
       };
     });
 
@@ -280,12 +283,14 @@ export class NoteRatingService {
 
     return {
       noteId: target.noteID,
-      month: calendar.month,
+      month: outcome.month,
       ...outcome.counters,
       ratingId: outcome.rating.id,
       status: outcome.rating.status === 'HELD' ? 'HELD' : 'COUNTED',
       // The per-note cooldown (72h) always outlasts the per-rater daily limit.
-      nextRatableAt: new Date(now.getTime() + NOTE_RATING_NOTE_COOLDOWN_MS),
+      nextRatableAt: new Date(
+        outcome.now.getTime() + NOTE_RATING_NOTE_COOLDOWN_MS,
+      ),
     };
   }
 

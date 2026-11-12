@@ -144,8 +144,8 @@ describe('NoteRatingAdminService.resolveCase', () => {
 
   it('voids a burst and deducts 15 credit per voided rating, once each', async () => {
     const { service, prisma, credit, notifications } = setup('BURST', [
-      held('r1', 'u1'),
       held('r2', 'u2'),
+      held('r1', 'u1'),
     ]);
 
     await service.resolveCase(ADMIN, 'case-1', {
@@ -154,10 +154,16 @@ describe('NoteRatingAdminService.resolveCase', () => {
     });
 
     expect(prisma.noteRating.updateMany).toHaveBeenCalledWith({
-      where: { id: { in: ['r1', 'r2'] } },
+      where: { id: { in: ['r2', 'r1'] } },
       data: { status: 'VOID' },
     });
     expect(credit.applyDeltaInTransaction).toHaveBeenCalledTimes(2);
+    // User rows are locked in raterID order, whatever order the case lists them.
+    expect(
+      credit.applyDeltaInTransaction.mock.calls.map(
+        (call) => (call as unknown as [unknown, { userId: string }])[1].userId,
+      ),
+    ).toEqual(['u1', 'u2']);
     expect(credit.applyDeltaInTransaction).toHaveBeenCalledWith(prisma, {
       userId: 'u1',
       delta: -15,
