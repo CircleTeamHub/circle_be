@@ -86,6 +86,8 @@ describe('NoteService', () => {
       createMany: jest.fn(),
       findMany: jest.fn(),
     },
+    // Rating counters (this month); no ratings unless a test seeds them.
+    noteRatingMonthly: { findMany: jest.fn().mockResolvedValue([]) },
     noteGroupMembership: {
       deleteMany: jest.fn(),
       createMany: jest.fn(),
@@ -5053,6 +5055,29 @@ describe('NoteService', () => {
       prisma.note.findMany.mockReset();
     });
 
+    it("getNote shows a collected copy with its root's monthly rating counters", async () => {
+      prisma.note.findFirst.mockResolvedValueOnce({
+        ...relayCopy,
+        rootSourceNoteID: 'boss-note',
+      });
+      prisma.note.findMany.mockResolvedValue([rootState()]);
+      prisma.noteRatingMonthly.findMany.mockResolvedValueOnce([
+        { noteID: 'boss-note', goodCount: 7, badCount: 2 },
+      ]);
+
+      const detail = await service.getNote('relay-user', 'relay-copy');
+
+      expect(detail).toMatchObject({ goodCount: 7, badCount: 2 });
+      expect(prisma.noteRatingMonthly.findMany).toHaveBeenCalledWith({
+        where: {
+          noteID: { in: ['boss-note'] },
+          month: expect.stringMatching(/^\d{4}-\d{2}$/),
+        },
+        select: { noteID: true, goodCount: true, badCount: true },
+      });
+      prisma.note.findMany.mockReset();
+    });
+
     it('getSharedNoteForGuest hides a copy whose source was deleted', async () => {
       prisma.note.findFirst.mockResolvedValueOnce(relayCopy);
       prisma.note.findMany.mockResolvedValueOnce([
@@ -5065,9 +5090,13 @@ describe('NoteService', () => {
     });
 
     it('getSourceStates reports root state per requested id and hides unreadable ones', async () => {
+      // Chat cards read the root's monthly rating counters from here too.
+      prisma.noteRatingMonthly.findMany.mockResolvedValueOnce([
+        { noteID: 'boss-note', goodCount: 4, badCount: 1 },
+      ]);
       prisma.note.findMany
         .mockResolvedValueOnce([
-          { ...relayCopy, id: 'relay-copy' },
+          { ...relayCopy, id: 'relay-copy', rootSourceNoteID: 'boss-note' },
           {
             ...otherUsersNote,
             id: 'plain-note',
@@ -5105,18 +5134,31 @@ describe('NoteService', () => {
           noteId: 'relay-copy',
           workStatus: 'UNSET',
           publicationStatus: 'UNLISTED',
+          goodCount: 4,
+          badCount: 1,
         },
         {
           noteId: 'plain-note',
           workStatus: 'WORKING',
           publicationStatus: 'ACTIVE',
+          goodCount: 0,
+          badCount: 0,
         },
         {
           noteId: 'hidden-note',
           workStatus: 'UNSET',
           publicationStatus: 'UNLISTED',
+          goodCount: 0,
+          badCount: 0,
         },
       ]);
+      expect(prisma.noteRatingMonthly.findMany).toHaveBeenCalledWith(
+        expect.objectContaining({
+          where: expect.objectContaining({
+            noteID: { in: ['boss-note', 'plain-note'] },
+          }),
+        }),
+      );
     });
 
     it('createNoteExport refuses to export a copy whose source was unlisted', async () => {

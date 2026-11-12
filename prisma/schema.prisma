@@ -509,6 +509,10 @@ model User {
   noteDrafts                        NoteDraft[]
   noteShareLinks                    NoteShareLink[]
   noteGroups                        NoteGroup[]
+  noteRatingsGiven                  NoteRating[]                @relation("noteRatingRater")
+  noteRatingsReceived               NoteRating[]                @relation("noteRatingOwner")
+  noteRatingCases                   NoteRatingCase[]            @relation("noteRatingCaseOwner")
+  noteRatingCasesResolved           NoteRatingCase[]            @relation("noteRatingCaseResolver")
   circles                           Circle[]
   circleMembers                     CircleMember[]
   collaborationRecognitionsReceived CollaborationRecognition[]  @relation("collaborationRecognitionRecipient")
@@ -1327,6 +1331,132 @@ model NoteStatusFanoutOutbox {
   updatedAt              DateTime                     @updatedAt
 
   @@index([status, nextAttemptAt, queuedAt])
+}
+
+enum NoteRatingValue {
+  GOOD
+  BAD
+}
+
+enum NoteRatingReason {
+  INACCURATE
+  EXPIRED
+  BAD_EXPERIENCE
+  OTHER
+}
+
+/// Only COUNTED ratings feed the displayed counters.
+enum NoteRatingStatus {
+  COUNTED
+  /// Paused by burst detection until an admin releases or voids it.
+  HELD
+  /// Removed by an admin decision (burst void / appeal revoke).
+  VOID
+}
+
+enum NoteRatingCaseKind {
+  BURST
+  APPEAL
+}
+
+enum NoteRatingCaseStatus {
+  PENDING
+  RESOLVED
+}
+
+enum NoteRatingCaseResolution {
+  /// BURST: held ratings go back to COUNTED.
+  RELEASE
+  /// BURST: held ratings become VOID and each rater loses credit.
+  VOID
+  /// APPEAL: the bad rating stays.
+  UPHOLD
+  /// APPEAL: the bad rating becomes VOID and its rater loses credit.
+  REVOKE
+}
+
+/// 笔记评分（好评 / 差评）：每次评分是一条事件，记在收藏链的根笔记上。
+/// noteID 不设外键：根笔记被永久删除（回收站 30 天到期）后评分仍留着供审计与申诉。
+/// ownerID 冗余根笔记主人，供集中刷分检测（以及以后的互刷检测）按主人查。
+model NoteRating {
+  id        String            @id @default(uuid())
+  noteID    String
+  ownerID   String
+  raterID   String
+  value     NoteRatingValue
+  reason    NoteRatingReason?
+  comment   String?           @db.VarChar(200)
+  status    NoteRatingStatus  @default(COUNTED)
+  /// 评分当天的上海日期；月计数按它所在的月份调整。
+  ratedDay  DateTime          @db.Date
+  createdAt DateTime          @default(now())
+  updatedAt DateTime          @updatedAt
+
+  owner     User                 @relation("noteRatingOwner", fields: [ownerID], references: [id], onDelete: Cascade)
+  rater     User                 @relation("noteRatingRater", fields: [raterID], references: [id], onDelete: Cascade)
+  caseItems NoteRatingCaseItem[]
+
+  @@index([raterID, createdAt])
+  @@index([raterID, noteID, createdAt])
+  @@index([noteID, createdAt])
+  @@index([ownerID, createdAt])
+  @@index([raterID, ownerID, value, createdAt])
+}
+
+/// 每条笔记每个上海自然日计入（COUNTED）的好评 / 差评数。新评分用条件自增
+/// 守住每天 5 + 5 的上限；状态变更（暂扣、放行、作废）同步调整当天那一行。
+model NoteRatingDaily {
+  noteID    String
+  day       DateTime @db.Date
+  goodCount Int      @default(0)
+  badCount  Int      @default(0)
+
+  @@id([noteID, day])
+}
+
+/// 展示用的本月计数（上海时区 YYYY-MM）。读取只取当月行、没有行就是 0，
+/// 所以每月 1 号清零不需要定时任务。
+model NoteRatingMonthly {
+  noteID    String
+  month     String @db.Char(7)
+  goodCount Int    @default(0)
+  badCount  Int    @default(0)
+
+  @@id([noteID, month])
+}
+
+/// 评分审核单：BURST（集中刷分被暂扣）或 APPEAL（主人对差评的申诉）。
+model NoteRatingCase {
+  id             String                    @id @default(uuid())
+  kind           NoteRatingCaseKind
+  status         NoteRatingCaseStatus      @default(PENDING)
+  /// 被评分的笔记主人（BURST 按主人聚合；APPEAL 是申诉人）。
+  ownerID        String
+  ownerReason    String?                   @db.VarChar(500)
+  resolution     NoteRatingCaseResolution?
+  resolutionNote String?                   @db.VarChar(500)
+  resolvedByID   String?
+  resolvedAt     DateTime?
+  createdAt      DateTime                  @default(now())
+  updatedAt      DateTime                  @updatedAt
+
+  owner      User                 @relation("noteRatingCaseOwner", fields: [ownerID], references: [id], onDelete: Cascade)
+  resolvedBy User?                @relation("noteRatingCaseResolver", fields: [resolvedByID], references: [id], onDelete: SetNull)
+  items      NoteRatingCaseItem[]
+
+  @@index([status, kind, createdAt])
+  @@index([ownerID, kind, createdAt])
+}
+
+model NoteRatingCaseItem {
+  caseID   String
+  ratingID String
+
+  case   NoteRatingCase @relation(fields: [caseID], references: [id], onDelete: Cascade)
+  rating NoteRating     @relation(fields: [ratingID], references: [id], onDelete: Cascade)
+
+  @@id([caseID, ratingID])
+  @@index([ratingID])
 }
 
 model NoteDraft {

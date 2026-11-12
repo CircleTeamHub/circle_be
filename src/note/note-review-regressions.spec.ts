@@ -15,6 +15,7 @@ import {
 } from './note.service';
 import { NoteDetailDto, NoteDraftDto, NoteSummaryDto } from './dto/note.dto';
 import { Prisma } from 'src/generated/prisma';
+import { ZERO_RATING_COUNTERS } from 'src/note-rating/note-rating-counters';
 
 describe('note review regressions', () => {
   const row = {
@@ -52,6 +53,7 @@ describe('note review regressions', () => {
         createMany: jest.fn().mockResolvedValue({ count: 1 }),
         deleteMany: jest.fn().mockResolvedValue({ count: 0 }),
       },
+      noteRatingMonthly: { findMany: jest.fn().mockResolvedValue([]) },
       friend: { findMany: jest.fn().mockResolvedValue([]) },
       circle: {
         findMany: jest.fn().mockResolvedValue([]),
@@ -533,6 +535,7 @@ describe('note review regressions', () => {
         sections: { audio: { items: [] } },
       },
       'owner',
+      ZERO_RATING_COUNTERS,
     );
     expect(summary.audioCount).toBe(2);
   });
@@ -1093,7 +1096,9 @@ describe('note review regressions', () => {
       media: [{ type: 'AUDIO', url: 'https://storage.test/audio.m4a' }],
       sections: {},
     };
-    expect((service as any).mapSummary(note, 'owner').cover).toBeNull();
+    expect(
+      (service as any).mapSummary(note, 'owner', ZERO_RATING_COUNTERS).cover,
+    ).toBeNull();
   });
 
   it.each([false, true])(
