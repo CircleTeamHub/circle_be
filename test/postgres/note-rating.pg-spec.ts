@@ -193,6 +193,19 @@ describePostgres('note ratings on PostgreSQL', () => {
     const b = await counters('root-b');
     expect(a.monthly.goodCount + b.monthly.goodCount).toBe(3);
     expect(a.daily.goodCount + b.daily.goodCount).toBe(3);
+
+    // A fourth rating inside the same window leaves the released three alone.
+    const fourth = await ratings.rate('r4', 'copy-root-b-r4', {
+      value: 'GOOD',
+    });
+    expect(fourth.status).toBe('COUNTED');
+    expect(await statuses()).toEqual([
+      'COUNTED',
+      'COUNTED',
+      'COUNTED',
+      'COUNTED',
+    ]);
+    expect((await admin.listCases({})).items).toHaveLength(0);
   });
 
   it('voids a burst, deducts 15 credit per rater and so removes their rating rights', async () => {

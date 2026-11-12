@@ -206,6 +206,9 @@ export class NoteRatingService {
           createdAt: {
             gt: new Date(now.getTime() - NOTE_RATING_BURST_WINDOW_MS),
           },
+          // Ratings an admin already released stay counted; a later rating in
+          // the same window must not pull them back into a new burst.
+          caseItems: { none: { case: { kind: 'BURST', status: 'RESOLVED' } } },
         },
         select: LEDGER_SELECT,
       });

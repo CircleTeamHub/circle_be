@@ -351,6 +351,7 @@ describe('NoteRatingService.rate', () => {
         value: 'GOOD',
         status: { in: ['COUNTED', 'HELD'] },
         createdAt: { gt: new Date(NOW.getTime() - 10 * 60 * 1000) },
+        caseItems: { none: { case: { kind: 'BURST', status: 'RESOLVED' } } },
       },
       select: expect.any(Object),
     });
