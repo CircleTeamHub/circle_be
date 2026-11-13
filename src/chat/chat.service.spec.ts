@@ -65,6 +65,7 @@ describe('ChatService', () => {
     supportRechargeJob: { create: jest.fn() },
     chatDirectAutoReplyJob: { create: jest.fn() },
     userPrivacySetting: { findUnique: jest.fn() },
+    userCollection: { findFirst: jest.fn() },
     $transaction: jest.fn(),
     $executeRaw: jest.fn(),
     $queryRaw: jest.fn(),
@@ -966,8 +967,74 @@ describe('ChatService', () => {
           } as never),
         ),
       ).rejects.toThrow(NotFoundException);
+      // 没收藏过:不会退到收藏的读取规则。
+      expect(prisma.userCollection.findFirst).toHaveBeenCalledWith({
+        where: { userID: 'u1', sourceID: 'source-message' },
+        select: { id: true },
+      });
+      expect(prisma.chatMessage.findMany).not.toHaveBeenCalled();
       expect(media.copyForForward).not.toHaveBeenCalled();
       expect(prisma.chatMessage.create).not.toHaveBeenCalled();
+    });
+
+    // 收藏不受本人清空聊天记录影响,收藏页里看得到的媒体也要转得出去。
+    it('forwards a favorited media source even below the viewer clear watermark', async () => {
+      const targetMembership = membership();
+      const sourceMembership = membership({
+        conversationID: 'source-conv',
+        clearedBeforeHeight: 8,
+        conversation: {
+          ...membership().conversation,
+          id: 'source-conv',
+          burnDurationSec: null,
+        },
+      });
+      const source = {
+        ...createdRow,
+        id: 'source-message',
+        conversationID: 'source-conv',
+        senderID: 'u2',
+        height: 8,
+        type: 'image',
+        content: { key: 'chat/u2/source.jpg', width: 640 },
+        revokedAt: null,
+      };
+      prisma.chatMember.findUnique
+        .mockResolvedValueOnce(targetMembership)
+        .mockResolvedValueOnce(sourceMembership)
+        .mockResolvedValueOnce(targetMembership);
+      prisma.chatMessage.findUnique
+        .mockResolvedValueOnce(source)
+        .mockResolvedValueOnce(null);
+      prisma.userCollection.findFirst.mockResolvedValueOnce({ id: 'fav-1' });
+      prisma.chatMessage.findMany.mockResolvedValueOnce([source]);
+      prisma.chatMember.findMany.mockResolvedValueOnce([sourceMembership]);
+      media.copyForForward.mockResolvedValue({
+        content: { key: 'chat/u1/copied.jpg', width: 640 },
+        copiedKeys: ['chat/u1/copied.jpg'],
+      });
+      prisma.chatMessage.create.mockResolvedValue({
+        ...createdRow,
+        type: 'image',
+        content: { key: 'chat/u1/copied.jpg', width: 640 },
+      });
+      prisma.chatConversation.update.mockResolvedValue({});
+
+      const result = await service.sendMessage(
+        'u1',
+        sendPayload({
+          type: 'image',
+          content: {},
+          forwardFromMessageId: 'source-message',
+        } as never),
+      );
+
+      expect(media.copyForForward).toHaveBeenCalledWith(
+        'image',
+        { key: 'chat/u2/source.jpg', width: 640 },
+        'u1',
+      );
+      expect(result.reused).toBe(false);
     });
 
     // 可见性只回答「你现在能不能看见」。阅后即焚会话里**别人**发的媒体仍在
