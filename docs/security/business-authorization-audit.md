@@ -9,7 +9,7 @@
 | 领域 | 已检查的授权边界 | 结果 / 回归依据 |
 |---|---|---|
 | 笔记、分组、草稿、共享、导出、媒体引用 | 私有读与编辑绑定 ownerID；公开/分享读取按分享策略；收藏来源必须是本人当前可见的同一张笔记卡片 | 修复来源消息快照越权；`note.service.spec.ts`、`note-review-regressions.spec.ts`、HTTP 矩阵 |
-| 聊天历史、清空/删除/撤回、转发、收藏、卡片 | 当前成员资格、清空水位、删除/撤回、焚毁过期、消息与会话一致；修改动作限制发送者/管理权限 | 修复 guest 卡片读取缺少清空/过期检查；`chat.service.spec.ts` 等 |
+| 聊天历史、清空/删除/撤回、转发、收藏、卡片 | 当前成员资格、清空水位、删除/撤回、焚毁过期、消息与会话一致；修改动作限制发送者/管理权限。例外：读取已有收藏不看本人座位的清空水位（`resolveCollectionMessages`），全会话水位仍生效 | 修复 guest 卡片读取缺少清空/过期检查；`chat.service.spec.ts` 等 |
 | 群成员管理、角色、入群/邀请、圈子修改 | 群主/管理员/普通成员分权，不能自提权；邀请和申请需要接受/批准；关键写事务内复核 | `group.service.spec.ts`、`group-admission.service.spec.ts`、相关 HTTP / integration 测试及新 HTTP 矩阵 |
 | 会话分类、用户收藏、通知 | ownerID / userID / toUserID 均来自 JWT；任意会话分类 ID 不会授予聊天读取权 | HTTP 矩阵验证跨账号修改/删除不写库；通知对无权对象按原有合同返回成功 no-op |
 | 钱包、赠送、靓号和扩容购买 | 付款身份来自 JWT；余额条件更新、额度、正整数金额、服务端报价、用户范围内的幂等及请求指纹 | HTTP 矩阵含伪造付款人/钱包 owner、负数/小数金额、他人幂等键；原有 coin / fancy-number / group-expansion 测试 |

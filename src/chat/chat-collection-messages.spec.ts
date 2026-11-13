@@ -189,8 +189,23 @@ describe('collection message resolution', () => {
     });
   });
 
+  it('keeps a favorite after the user clears their own chat history', async () => {
+    // Clearing is the viewer's own housekeeping; a favorite is something they chose to keep.
+    prisma.chatMember.findMany.mockImplementation((args: any) =>
+      Promise.resolve(
+        args.include ? [membership({ clearedBeforeHeight: 77 })] : [],
+      ),
+    );
+
+    expect((await resolve(['msg-1'])).get('msg-1')).toMatchObject({
+      id: 'msg-1',
+      height: 37,
+      content: { text: 'saved text' },
+    });
+    expect(media.attachMediaUrls).toHaveBeenCalledTimes(1);
+  });
+
   it.each([
-    { clearedBeforeHeight: 37 },
     {
       clearedBeforeHeight: 0,
       conversation: { id: 'conversation-1', clearedBeforeHeight: 40 },

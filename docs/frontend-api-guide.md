@@ -1593,7 +1593,7 @@ Authorization: Bearer <accessToken>
 
 | 方法 | 路径 | 请求 | 响应 | 关键规则 |
 |---|---|---|---|---|
-| GET | `/collections` | query：`type`（可选） | UserCollection 数组 | 按创建时间倒序，最多 100 条 |
+| GET | `/collections` | query：`type`（可选） | UserCollection 数组 | 按创建时间倒序，最多 100 条；聊天收藏每次按 `sourceID` 从源消息重建 `message`，源消息被删除/撤回、焚毁过期、全会话清空或本人已离开会话时为 `null`。本人「清空聊天记录」不影响收藏 |
 | POST | `/collections` | `{ type, title, summary?, sourceID?, payload? }`：`title` ≤ 80，`summary` ≤ 240，`sourceID` ≤ 120，`payload` 为对象 | UserCollection | 每人最多 500 条（`COLLECTION_LIMIT`）；收藏聊天消息时服务端按 `sourceID` 校验这条消息我仍可见，不信任客户端自报的快照（`COLLECTION_INVALID_MESSAGE_SOURCE`）；阅后即焚会话里别人发的消息不可收藏（`COLLECTION_EPHEMERAL_FORBIDDEN`） |
 | DELETE | `/collections/:id` | — | `204` | 只能删自己的收藏，否则 `COLLECTION_NOT_FOUND` |
 

@@ -1173,21 +1173,21 @@ export class ChatService {
       row.conversationID,
       userId,
     );
-    if (!this.isMessageVisible(row, conversation, member)) {
+    if (
+      !this.isMessageVisible(row, conversation, member.clearedBeforeHeight ?? 0)
+    ) {
       throw this.messageNotFound();
     }
     return { row, conversation, member };
   }
 
+  /** seatFloor 是本人座位的清空水位;全会话水位总是生效。 */
   private isMessageVisible(
     row: MessageRow,
     conversation: ChatConversation,
-    member: ChatMember,
+    seatFloor: number,
   ): boolean {
-    const floor = Math.max(
-      member.clearedBeforeHeight ?? 0,
-      conversation.clearedBeforeHeight ?? 0,
-    );
+    const floor = Math.max(seatFloor, conversation.clearedBeforeHeight ?? 0);
     return (
       !row.deleted &&
       !row.revokedAt &&
@@ -1201,7 +1201,8 @@ export class ChatService {
   }
 
   /**
-   * 收藏读时从源消息重建 DTO,只给当前仍可访问且允许收藏的内容签媒体 URL。
+   * 收藏读时从源消息重建 DTO,只给当前仍可访问且允许收藏的内容签媒体 URL
+   * (本人清空聊天记录不影响收藏,见下方 visible 的说明)。
    * 按集合取消息和座位,不信收藏快照里的对象 key,也不逐条查询来源。
    * 不可访问的来源缺省;数据库故障仍向上传递,不能伪装成权限拒绝。
    */
@@ -1210,39 +1211,9 @@ export class ChatService {
     messageIds: string[],
   ): Promise<Map<string, ChatMessageDto>> {
     if (messageIds.length === 0) return new Map();
-    const rows = await this.prisma.chatMessage.findMany({
-      where: { id: { in: [...new Set(messageIds)] } },
-      omit: MESSAGE_READ_OMIT,
-    });
-    if (rows.length === 0) return new Map();
-    const memberships = await this.prisma.chatMember.findMany({
-      where: {
-        userID: userId,
-        leftAt: null,
-        conversationID: {
-          in: [...new Set(rows.map((row) => row.conversationID))],
-        },
-      },
-      include: { conversation: true },
-    });
-    const byConversation = new Map(
-      memberships.map((member) => [member.conversationID, member]),
-    );
-    const visible = rows.filter((row) => {
-      const member = byConversation.get(row.conversationID);
-      if (
-        !member ||
-        member.leftAt ||
-        !this.isMessageVisible(row, member.conversation, member)
-      )
-        return false;
-      // 同创建收藏的规则:不能把别人阅后即焚的消息变成可保存/转发的收藏。
-      return (
-        row.senderID === userId ||
-        ((row.burnDurationSec ?? 0) <= 0 && !row.burnExpiresAt)
-      );
-    });
-    if (visible.length === 0) return new Map();
+    const sources = await this.collectionSourceRows(userId, messageIds);
+    if (!sources || sources.visible.length === 0) return new Map();
+    const { visible, memberships, byConversation } = sources;
     const [senders, aliases] = await Promise.all([
       this.resolveSenders(
         visible
@@ -1260,6 +1231,8 @@ export class ChatService {
         userId,
       ),
     );
+    // 引用预览仍按完整水位脱敏:被引用的那条可能在入群边界之前,收藏本身
+    // 不受本人清空影响,不等于连带放开它引用的旧内容。
     const heightFloors = new Map(
       memberships.map((member) => [
         member.conversationID,
@@ -1274,6 +1247,53 @@ export class ChatService {
     return new Map(messages.map((message) => [message.id, message]));
   }
 
+  /**
+   * 收藏来源里我现在还能读的那些:未删/未撤回、仍在座、高于全会话清空水位、
+   * 未过焚毁窗口,别人发的阅后即焚不算。读收藏和从收藏转发共用这一把尺子。
+   * 没有任何来源行时返回 null,调用方不必再查座位。
+   */
+  private async collectionSourceRows(userId: string, messageIds: string[]) {
+    const rows = await this.prisma.chatMessage.findMany({
+      where: { id: { in: [...new Set(messageIds)] } },
+      omit: MESSAGE_READ_OMIT,
+    });
+    if (rows.length === 0) return null;
+    const memberships = await this.prisma.chatMember.findMany({
+      where: {
+        userID: userId,
+        leftAt: null,
+        conversationID: {
+          in: [...new Set(rows.map((row) => row.conversationID))],
+        },
+      },
+      include: { conversation: true },
+    });
+    const byConversation = new Map(
+      memberships.map((member) => [member.conversationID, member]),
+    );
+    const visible = rows.filter((row) => {
+      const member = byConversation.get(row.conversationID);
+      // 本人「清空聊天记录」只是整理自己的会话视图,不该连带让收藏失效:收藏是
+      // 他当时看得到、主动留下的。所以这里不算本人座位的清空水位;删除/撤回、
+      // 全会话水位(解散、给所有人删除)、离开会话和阅后即焚仍然生效。
+      // 座位水位同时也是邀请/申请入群时的「入群前历史」边界(group-admission
+      // 的 seat()),这里一并不看是安全的:创建收藏走 requireVisibleMessage,
+      // 按完整水位校验过,收藏行只会指向本人当时看得到的消息。
+      if (
+        !member ||
+        member.leftAt ||
+        !this.isMessageVisible(row, member.conversation, 0)
+      )
+        return false;
+      // 同创建收藏的规则:不能把别人阅后即焚的消息变成可保存/转发的收藏。
+      return (
+        row.senderID === userId ||
+        ((row.burnDurationSec ?? 0) <= 0 && !row.burnExpiresAt)
+      );
+    });
+    return { visible, memberships, byConversation };
+  }
+
   private messageNotFound(): NotFoundException {
     return new NotFoundException({
       message: '消息不存在',
@@ -1281,11 +1301,37 @@ export class ChatService {
     });
   }
 
+  /**
+   * 转发来源要是我现在看得到的消息。收藏过的例外:收藏不受本人清空聊天记录
+   * 影响(collectionSourceRows),收藏页里看得到、存得下的媒体也要转得出去。
+   * 只在常规判定说「看不到」时才查收藏,普通转发不多一次查询。
+   */
+  private async forwardSourceRow(
+    userId: string,
+    messageId: string,
+  ): Promise<MessageRow> {
+    try {
+      return (await this.requireVisibleMessage(userId, messageId)).row;
+    } catch (error) {
+      if (!(error instanceof NotFoundException)) throw error;
+      const collected = await this.prisma.userCollection.findFirst({
+        where: { userID: userId, sourceID: messageId },
+        select: { id: true },
+      });
+      const [row] = collected
+        ? ((await this.collectionSourceRows(userId, [messageId]))?.visible ??
+          [])
+        : [];
+      if (!row) throw error;
+      return row;
+    }
+  }
+
   private async resolveForwardableMedia(
     userId: string,
     messageId: string,
   ): Promise<{ type: string; content: Record<string, unknown> }> {
-    const { row } = await this.requireVisibleMessage(userId, messageId);
+    const row = await this.forwardSourceRow(userId, messageId);
     if (!MEDIA_MESSAGE_TYPES.includes(row.type)) {
       throw this.messageNotFound();
     }
