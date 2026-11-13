@@ -1201,7 +1201,8 @@ export class ChatService {
   }
 
   /**
-   * 收藏读时从源消息重建 DTO,只给当前仍可访问且允许收藏的内容签媒体 URL。
+   * 收藏读时从源消息重建 DTO,只给当前仍可访问且允许收藏的内容签媒体 URL
+   * (本人清空聊天记录不影响收藏,见下方 visible 的说明)。
    * 按集合取消息和座位,不信收藏快照里的对象 key,也不逐条查询来源。
    * 不可访问的来源缺省;数据库故障仍向上传递,不能伪装成权限拒绝。
    */
@@ -1230,10 +1231,19 @@ export class ChatService {
     );
     const visible = rows.filter((row) => {
       const member = byConversation.get(row.conversationID);
+      // 本人「清空聊天记录」只是整理自己的会话视图,不该连带让收藏失效:收藏是
+      // 他当时看得到、主动留下的。所以这里不算本人座位的清空水位;删除/撤回、
+      // 全会话水位(解散、给所有人删除)、离开会话和阅后即焚仍然生效。
+      // 座位水位同时也是邀请/申请入群时的「入群前历史」边界(group-admission
+      // 的 seat()),这里一并不看是安全的:创建收藏走 requireVisibleMessage,
+      // 按完整水位校验过,收藏行只会指向本人当时看得到的消息。
       if (
         !member ||
         member.leftAt ||
-        !this.isMessageVisible(row, member.conversation, member)
+        !this.isMessageVisible(row, member.conversation, {
+          ...member,
+          clearedBeforeHeight: 0,
+        })
       )
         return false;
       // 同创建收藏的规则:不能把别人阅后即焚的消息变成可保存/转发的收藏。
