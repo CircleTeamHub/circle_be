@@ -155,8 +155,27 @@ if [ "${1:-}" = "compose" ]; then
 fi
 
 if [ "${1:-}" = "image" ] && [ "${2:-}" = "inspect" ]; then
-  [ "${IMAGE_MISSING:-0}" != "1" ]
-  exit
+  [ "${IMAGE_MISSING:-0}" != "1" ] || exit 1
+  if printf '%s\n' "$*" | grep -qF '{{.Id}}'; then
+    cat "$CASE_DIR/current-image-id" 2>/dev/null || printf 'sha256:release\n'
+  fi
+  exit 0
+fi
+# 本地镜像表:一行一个完整 ID,和真 docker 一样按构建时间从新到旧;同一镜像有
+# 几个标签就出现几行。in-use-images 里的 ID 模拟还被容器引用,rmi 不带 -f 会拒删。
+if [ "${1:-}" = "image" ] && [ "${2:-}" = "ls" ]; then
+  cat "$CASE_DIR/local-images" 2>/dev/null || true
+  exit 0
+fi
+if [ "${1:-}" = "rmi" ]; then
+  image="$(last_arg "$@")"
+  if grep -qxF -- "$image" "$CASE_DIR/in-use-images" 2>/dev/null; then
+    echo "Error response from daemon: conflict: unable to delete $image - image is being used" >&2
+    exit 1
+  fi
+  grep -vxF -- "$image" "$CASE_DIR/local-images" > "$CASE_DIR/local-images.next" || true
+  cat "$CASE_DIR/local-images.next" > "$CASE_DIR/local-images"
+  exit 0
 fi
 if [ "${1:-}" = "inspect" ]; then
   container="$(last_arg "$@")"
@@ -509,6 +528,73 @@ test_ops_stacks_sync_never_runs_on_rollback() {
     echo 'ops stacks synced during a rollback' >&2
     return 1
   fi
+}
+
+# 每次发版都从 GHCR 拉一个约 1.5GB 的镜像。2026-11-14 测试服 59G 的盘被 29 个旧版本
+# 写到 96%(HostDiskNearlyFull),Loki 跟着丢日志。参数按从新到旧给短名。
+seed_release_images() {
+  : > "$CASE_DIR/local-images"
+  local name
+  for name in "$@"; do printf 'sha256:%s\n' "$name" >> "$CASE_DIR/local-images"; done
+}
+
+assert_release_images() {
+  local expected actual
+  expected="$(printf 'sha256:%s\n' "$@")"
+  actual="$(cat "$CASE_DIR/local-images")"
+  [ "$actual" = "$expected" ] || {
+    printf 'expected release images:\n%s\nactual:\n%s\n' "$expected" "$actual" >&2
+    cat "$CASE_DIR/release.log" >&2
+    return 1
+  }
+}
+
+prepare_image_prune_case() {
+  new_case
+  printf 'running\n' > "$TEST_STATE_DIR/circle_be"
+  printf 'running\n' > "$TEST_STATE_DIR/caddy"
+  printf 'circle_be\n' > "$RELEASE_STATE_DIR/active-color"
+  printf 'sha256:%s\n' "$1" > "$CASE_DIR/current-image-id"
+}
+
+# 同一镜像有两个标签时 image ls 会列两行,必须按一个版本算,否则会多删一个。
+test_successful_release_keeps_only_the_newest_release_images() {
+  prepare_image_prune_case r8
+  seed_release_images r8 r7 r7 r6 r5 r4 r3 r2 r1
+  run_release || return 1
+  assert_release_images r8 r7 r7 r6 r5 r4 &&
+    assert_log_before '==> Release v1.2.3 deployed' 'Pruned 3 old release image(s)' &&
+    grep -qE '^image ls --no-trunc .* ghcr\.io/circleteamhub/circle_be $' "$TEST_COMMAND_LOG"
+}
+
+# 回滚到旧 tag 时在役镜像按构建时间排在后面:它本身必须留下,另外再留最新的几个。
+test_rollback_to_an_older_release_keeps_the_live_image() {
+  prepare_image_prune_case r2
+  seed_release_images r8 r7 r6 r5 r4 r3 r2 r1
+  run_release || return 1
+  assert_release_images r8 r7 r6 r5 r2
+}
+
+# 手工起的容器还引用着旧镜像:rmi 拒删只告警,不影响发版结果,其他旧镜像照删。
+test_image_still_in_use_is_skipped_without_failing_the_release() {
+  prepare_image_prune_case r8
+  seed_release_images r8 r7 r6 r5 r4 r3 r2 r1
+  printf 'sha256:r2\n' > "$CASE_DIR/in-use-images"
+  run_release || return 1
+  assert_release_images r8 r7 r6 r5 r4 r2 &&
+    grep -qF 'could not remove 1 old release image(s)' "$CASE_DIR/release.log"
+}
+
+test_release_images_are_never_pruned_on_rollback() {
+  prepare_image_prune_case r8
+  seed_release_images r8 r7 r6 r5 r4 r3 r2 r1
+  SMOKE_CODE=500
+  ! run_release || return 1
+  if grep -q '^rmi ' "$TEST_COMMAND_LOG"; then
+    echo 'release images pruned during a rollback' >&2
+    return 1
+  fi
+  assert_release_images r8 r7 r6 r5 r4 r3 r2 r1
 }
 
 test_release_stamps_sentry_release_before_starting_the_new_color() {
@@ -1137,6 +1223,10 @@ for test_name in \
   test_proxy_switch_precedes_old_color_retirement \
   test_ops_stacks_sync_runs_only_after_a_successful_cutover \
   test_ops_stacks_sync_never_runs_on_rollback \
+  test_successful_release_keeps_only_the_newest_release_images \
+  test_rollback_to_an_older_release_keeps_the_live_image \
+  test_image_still_in_use_is_skipped_without_failing_the_release \
+  test_release_images_are_never_pruned_on_rollback \
   test_release_stamps_sentry_release_before_starting_the_new_color \
   test_release_never_widens_permissions_on_the_secrets_it_rewrites \
   test_failed_sentry_stamp_leaves_no_readable_copy_of_the_secrets \

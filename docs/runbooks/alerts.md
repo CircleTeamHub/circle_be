@@ -736,7 +736,8 @@
 **常见原因与处置**：
 - 数据库：`pg_data` 增长，或 WAL 归档失败时 `pg_wal` 一直堆（对照 `BackupCheckFailing` 的 `postgres_archive`）。
 - 对象存储：`note-exports/` 没有生命周期规则会无限增长，按 DEPLOY.md「存量环境补齐 note-exports 生命周期规则」补上。
-- 日志与监控：后端日志卷按 14 天保留、没有总量上限；Loki 保留 7 天；Prometheus 上限 8GB。另外 `~/circle_be_backups/` 保留 7 份发版前 dump，恢复演练期间 `backup_scratch` 要占用约等于库大小的空间。旧镜像可以 `docker image prune -a --filter "until=720h"`（慎用）。
+- 日志与监控：后端日志卷按 14 天保留、没有总量上限；Loki 保留 7 天；Prometheus 上限 8GB。另外 `~/circle_be_backups/` 保留 7 份发版前 dump，恢复演练期间 `backup_scratch` 要占用约等于库大小的空间。
+- 镜像与构建缓存：每个后端版本约 1.5GB，发版成功后只留最近 5 个；发版日志里没有 `Pruned … old release image(s)`，或者出现 `could not remove`，说明清理没生效。手工构建留下的构建缓存可以 `docker builder prune -af`（发版从不在本机构建）。其他旧镜像用 `docker rmi <id>` 逐个删，不要加 `-f`；`docker image prune -a` 会连 `rollback-*` 这类手工留的回滚标签一起删。
 - 同一块盘剩不到 5% 时被 `HostDiskNearlyFull` 压掉。
 
 ### HostDiskNearlyFull
