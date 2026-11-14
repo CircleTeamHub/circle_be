@@ -44,6 +44,7 @@ import type {
   ChatMessage,
   Prisma,
 } from 'src/generated/prisma';
+import { CollectionType } from 'src/generated/prisma';
 import {
   CHAT_MEDIA_KEY_PREFIX,
   NOTE_CARD_PREVIEW_KEYS_FIELD,
@@ -1315,7 +1316,17 @@ export class ChatService {
     } catch (error) {
       if (!(error instanceof NotFoundException)) throw error;
       const collected = await this.prisma.userCollection.findFirst({
-        where: { userID: userId, sourceID: messageId },
+        where: {
+          userID: userId,
+          sourceID: messageId,
+          OR: [
+            { type: { not: CollectionType.NOTE } },
+            {
+              type: CollectionType.NOTE,
+              payload: { path: ['kind'], equals: 'openim-message' },
+            },
+          ],
+        },
         select: { id: true },
       });
       const [row] = collected
