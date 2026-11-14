@@ -1,6 +1,9 @@
 import { ChatService } from 'src/chat/chat.service';
 import { GroupAdmissionService } from 'src/chat/group-admission.service';
+import { GROUP_DIRECT_JOIN_MAX_MEMBERS } from 'src/chat/chat-group-roles';
 import { ChatGroupEventService } from 'src/chat/chat-group-event.service';
+import { readFileSync } from 'fs';
+import { join } from 'path';
 import { describePostgres } from './pg-test-db';
 import {
   type LiveSchema,
@@ -234,7 +237,7 @@ describePostgres('group invite and create-group batching', () => {
       const work = tx.filter((s) => !isAdvisory(s.sql));
       // 原来每位被邀请人 5-6 条(100 人 ≈ 500 条),现在与人数无关。
       expect(work.filter((s) => touches('GroupAdmission')(s.sql))).toHaveLength(
-        3,
+        4,
       );
       expect(
         work.filter((s) => touches('GroupAdmissionDelivery')(s.sql)),
@@ -245,9 +248,9 @@ describePostgres('group invite and create-group batching', () => {
           /(INSERT INTO|UPDATE) "[^"]+"\."ChatMember"/.test(s.sql),
         ),
       ).toHaveLength(2);
-      // 13 for invitations, plus member count, inviter role, history floor,
-      // the two seat writes and the join log.
-      expect(work.length).toBeLessThanOrEqual(19);
+      // 13 for invitations, plus member/reservation counts, inviter role,
+      // history floor, the two seat writes and the join log.
+      expect(work.length).toBeLessThanOrEqual(20);
     });
 
     it('does nothing for a list of seated or already-invited users', async () => {
@@ -263,6 +266,146 @@ describePostgres('group invite and create-group batching', () => {
           )
         ).rows[0].n,
       ).toBe(0);
+    });
+  });
+
+  describe('regular-member consent reservations', () => {
+    beforeAll(async () => {
+      await live.db.query(
+        readFileSync(
+          join(
+            process.cwd(),
+            'prisma/migrations/20261113000100_group_admission_consent_reservation_trigger/migration.sql',
+          ),
+          'utf8',
+        ),
+      );
+    });
+
+    beforeEach(async () => {
+      const members = [
+        'owner',
+        'u000',
+        ...invitees.slice(3, GROUP_DIRECT_JOIN_MAX_MEMBERS),
+      ];
+      // 带参数的查询走扩展协议,一次只能一条命令:三条 INSERT 分开发。
+      await live.db.query(
+        `INSERT INTO "ChatConversation"
+           (id, type, "ownerID", "memberCanInvite", "joinApprovalRequired", "updatedAt")
+         VALUES ('reservation-group', 'GROUP', 'owner', true, true, now())`,
+      );
+      await live.db.query(
+        `INSERT INTO "ChatMember" (id, "conversationID", "userID", role)
+         SELECT 'reservation-seat-' || u, 'reservation-group', u, 'MEMBER'
+         FROM unnest($1::text[]) u`,
+        [members],
+      );
+      await live.db.query(
+        `INSERT INTO "Friend" (id, "userID", "friendID", state, "updatedAt") VALUES
+           ('reservation-friend-1', 'u000', 'u001', 'ACCEPTED', now()),
+           ('reservation-friend-2', 'u000', 'u002', 'ACCEPTED', now())`,
+      );
+    });
+
+    it('serializes concurrent invite batches against the same remaining slot', async () => {
+      await Promise.all([
+        admissions.invite('u000', 'reservation-group', ['u001']),
+        admissions.invite('u000', 'reservation-group', ['u002']),
+      ]);
+
+      const records = await live.prisma.groupAdmission.findMany({
+        where: { conversationID: 'reservation-group' },
+        orderBy: { applicantID: 'asc' },
+      });
+      expect(
+        records
+          .map((record) => record.status)
+          .sort((a, b) => a.localeCompare(b)),
+      ).toEqual(['INVITED', 'PENDING']);
+      expect(records.filter((record) => record.consentSeatReserved)).toEqual([
+        expect.objectContaining({ status: 'PENDING' }),
+      ]);
+    });
+
+    it('marks pending invite inserts from the previous binary as reservations', async () => {
+      await live.db.query(`
+        INSERT INTO "GroupAdmission"
+          (id, "conversationID", "applicantID", "inviterID", kind, status,
+           "acceptedAt", "expiresAt", "updatedAt")
+        VALUES
+          ('legacy-pending', 'reservation-group', 'u001', 'u000', 'INVITE',
+           'PENDING', now(), now() + interval '1 day', now());
+      `);
+
+      const row = await live.prisma.groupAdmission.findUniqueOrThrow({
+        where: { id: 'legacy-pending' },
+      });
+      expect(row.consentSeatReserved).toBe(true);
+    });
+
+    it('does not reserve a consent seat when the previous binary accepts an invite', async () => {
+      await live.db.query(`
+        INSERT INTO "GroupAdmission"
+          (id, "conversationID", "applicantID", "inviterID", kind, status,
+           "acceptedAt", "expiresAt", "updatedAt")
+        VALUES
+          ('legacy-acceptance', 'reservation-group', 'u002', 'u000', 'INVITE',
+           'INVITED', NULL, now() + interval '1 day', now());
+
+        UPDATE "GroupAdmission"
+        SET status = 'PENDING', "acceptedAt" = now()
+        WHERE id = 'legacy-acceptance';
+      `);
+
+      const row = await live.prisma.groupAdmission.findUniqueOrThrow({
+        where: { id: 'legacy-acceptance' },
+      });
+      expect(row.consentSeatReserved).toBe(false);
+    });
+
+    it('backfills existing pending invites without changing invited rows', async () => {
+      await live.db.query(`
+        INSERT INTO "GroupAdmission"
+          (id, "conversationID", "applicantID", "inviterID", kind, status,
+           "acceptedAt", "expiresAt", "updatedAt")
+        VALUES
+          ('legacy-backfill', 'reservation-group', 'u001', 'u000', 'INVITE',
+           'INVITED', NULL, now() + interval '1 day', now()),
+          ('legacy-invited', 'reservation-group', 'u002', 'u000', 'INVITE',
+           'INVITED', NULL, now() + interval '1 day', now());
+
+        UPDATE "GroupAdmission"
+        SET status = 'PENDING', "acceptedAt" = now(),
+            "consentSeatReserved" = false
+        WHERE id = 'legacy-backfill';
+      `);
+
+      await live.db.query(
+        readFileSync(
+          join(
+            process.cwd(),
+            'prisma/migrations/20261113000200_backfill_group_admission_consent_reservations/migration.sql',
+          ),
+          'utf8',
+        ),
+      );
+
+      const records = await live.prisma.groupAdmission.findMany({
+        where: {
+          id: { in: ['legacy-backfill', 'legacy-invited'] },
+        },
+        orderBy: { id: 'asc' },
+      });
+      expect(records).toEqual([
+        expect.objectContaining({
+          id: 'legacy-backfill',
+          consentSeatReserved: true,
+        }),
+        expect.objectContaining({
+          id: 'legacy-invited',
+          consentSeatReserved: false,
+        }),
+      ]);
     });
   });
 

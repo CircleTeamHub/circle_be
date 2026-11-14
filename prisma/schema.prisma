@@ -3068,6 +3068,8 @@ model GroupAdmission {
   reason         String                   @default("")
   expiresAt      DateTime
   acceptedAt     DateTime?
+  /// System-accepted PENDING invite reserves one small-group consent-free slot.
+  consentSeatReserved Boolean @default(false)
   decidedByID    String?
   createdAt      DateTime                 @default(now())
   updatedAt      DateTime                 @updatedAt

@@ -227,7 +227,9 @@ export class GroupAdmissionService {
    * GROUP_DIRECT_JOIN_MAX_MEMBERS, the fresh invitees, in selection order, skip
    * the acceptance step: they are seated at once (JOINED), or, when the group
    * requires approval and the inviter is not a manager, go straight to manager
-   * review (PENDING). Invitees past the limit get the INVITED flow as before.
+   * review (PENDING). Those pending rows reserve their consent-free capacity
+   * until review or expiry, so later batches cannot reuse the same slots.
+   * Invitees past the limit get the INVITED flow as before.
    *
    * 原来每人 5-6 次往返(100 人约 500 条),全程持有会话行 FOR UPDATE、事务默认 5 秒
    * 超时;现在与人数无关的常数条。同一会话的邀请写入都在这把会话行锁下串行,部分
@@ -277,12 +279,23 @@ export class GroupAdmissionService {
     );
     const fresh = candidates.filter((user) => !pending.has(user));
     if (!fresh.length) return;
-    const members = await tx.chatMember.count({
-      where: { conversationID: group, leftAt: null },
-    });
+    const now = new Date();
+    const [members, reserved] = await Promise.all([
+      tx.chatMember.count({
+        where: { conversationID: group, leftAt: null },
+      }),
+      tx.groupAdmission.count({
+        where: {
+          conversationID: group,
+          status: 'PENDING',
+          consentSeatReserved: true,
+          expiresAt: { gt: now },
+        },
+      }),
+    ]);
     const consentFree = fresh.slice(
       0,
-      Math.max(0, GROUP_DIRECT_JOIN_MAX_MEMBERS - members),
+      Math.max(0, GROUP_DIRECT_JOIN_MAX_MEMBERS - members - reserved),
     );
     const review =
       consentFree.length > 0 &&
@@ -290,10 +303,9 @@ export class GroupAdmissionService {
       !(await this.manager(tx, g, actor));
     const joining = review ? [] : consentFree;
     if (joining.length) await this.seat(tx, g, actor, joining);
-    const now = new Date();
     const expiresAt = new Date(now.getTime() + TTL);
     const consentFreeState = review
-      ? { status: 'PENDING', acceptedAt: now }
+      ? { status: 'PENDING', acceptedAt: now, consentSeatReserved: true }
       : { status: 'JOINED', acceptedAt: now, decidedByID: actor };
     const created = await tx.groupAdmission.createManyAndReturn({
       data: fresh.map((applicantID) => ({
