@@ -959,7 +959,7 @@ export class CallService {
       joinedAt: joinedAt.toISOString(),
       changedAt: joinedAt.toISOString(),
     };
-    await this.broadcastToCallParticipants(call, (targetID) =>
+    await this.broadcastParticipantUpdate(updatedCall, userID, (targetID) =>
       this.realtime.broadcastCallParticipantJoined(targetID, payload),
     );
     // 本人其他设备上的振铃（安卓全屏通知）收掉；iOS 由 WS 的 participant.joined 收。
@@ -1048,8 +1048,9 @@ export class CallService {
         errorCode: CallErrorCode.NotInvited,
       });
     }
-    await this.broadcastToCallParticipants(
+    await this.broadcastParticipantUpdate(
       participant.call as CallWithParticipants,
+      userID,
       (targetID) =>
         this.realtime.broadcastCallParticipantRejected(targetID, {
           callId,
@@ -1205,7 +1206,7 @@ export class CallService {
       },
     });
     if (joinedCount > 0) {
-      await this.broadcastToCallParticipants(callRow, (targetID) =>
+      await this.broadcastParticipantUpdate(callRow, userID, (targetID) =>
         this.realtime.broadcastCallParticipantLeft(targetID, {
           callId,
           user: updatedParticipant.user,
@@ -2018,6 +2019,29 @@ export class CallService {
   ) {
     const userIDs = this.uniqueIDs(
       (call.participants ?? []).map((p) => p.userID),
+    );
+    await this.realtime.safeBroadcastAll(
+      userIDs.map((targetID) => () => broadcast(targetID)),
+    );
+  }
+
+  /**
+   * 成员级事件只发给仍在通话里的人，以及状态刚变化的成员本人（同步其其它设备）。
+   * REJECTED/MISSED/LEFT 是历史行，不应继续收到后来加入者的身份和通话活动。
+   */
+  private async broadcastParticipantUpdate(
+    call: CallWithParticipants,
+    changedUserID: string,
+    broadcast: (userID: string) => void,
+  ) {
+    const userIDs = this.uniqueIDs(
+      (call.participants ?? [])
+        .filter(
+          (participant) =>
+            participant.status === CallParticipantStatus.JOINED ||
+            participant.userID === changedUserID,
+        )
+        .map((participant) => participant.userID),
     );
     await this.realtime.safeBroadcastAll(
       userIDs.map((targetID) => () => broadcast(targetID)),

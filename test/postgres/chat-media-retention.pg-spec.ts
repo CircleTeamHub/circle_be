@@ -47,7 +47,10 @@ describePostgres('chat media retention (PostgreSQL)', () => {
         "createdAt" timestamp(3) NOT NULL
       );
       CREATE INDEX "ChatMessage_conversationID_createdAt_idx" ON "ChatMessage" ("conversationID", "createdAt");
-      CREATE TABLE "UserCollection" (id text PRIMARY KEY, "sourceID" text);
+      CREATE TYPE "CollectionType" AS ENUM ('CHAT', 'VIDEO', 'VOICE', 'MESSAGE', 'NOTE');
+      CREATE TABLE "UserCollection" (
+        id text PRIMARY KEY, type "CollectionType" NOT NULL, "sourceID" text, payload jsonb
+      );
       INSERT INTO "ChatConversation" SELECT 'c' || g FROM generate_series(1, 2000) g;
       -- 20 万条背景消息:大半是文字,媒体分布在过去两年,时间按 UTC 存(同 Prisma)。
       INSERT INTO "ChatMessage"
@@ -58,7 +61,7 @@ describePostgres('chat media retention (PostgreSQL)', () => {
              g % 11 = 0, NULL, NULL,
              (now() AT TIME ZONE 'UTC') - (g % 730) * interval '1 day'
       FROM generate_series(1, 200000) g;
-      INSERT INTO "UserCollection" SELECT 'col' || g, 'm' || (g * 37) FROM generate_series(1, 5000) g;
+      INSERT INTO "UserCollection" SELECT 'col' || g, 'CHAT', 'm' || (g * 37), NULL FROM generate_series(1, 5000) g;
     `);
     for (const migration of MIGRATIONS) {
       const sql = readFileSync(
@@ -150,7 +153,7 @@ describePostgres('chat media retention (PostgreSQL)', () => {
       width: 1,
     });
     await s.db.query(
-      `INSERT INTO "UserCollection" VALUES ('fx-col', 'fx-collected')`,
+      `INSERT INTO "UserCollection" VALUES ('fx-col', 'CHAT', 'fx-collected', NULL)`,
     );
 
     const purge = purgeExpiredMediaQuery(['fx-purge', 'fx-collected']);
@@ -178,5 +181,22 @@ describePostgres('chat media retention (PostgreSQL)', () => {
     // 已经清过的不再被取到、也不会被改第二遍。
     const again = await s.db.query(purge.text, purge.values);
     expect(again.rows).toEqual([]);
+  });
+
+  it('lets only real message collections pin media, not a note naming it as its source', async () => {
+    await insert('fx-note-forged', 'video', 40, { key: 'chat/u1/f.mp4' });
+    await insert('fx-note-message', 'video', 40, { key: 'chat/u1/m.mp4' });
+    // 普通笔记收藏的 sourceID 是客户端自报的,指向一条聊天消息也不能让它永不过期;
+    // 收藏聊天消息走的 NOTE + kind=openim-message 是服务端校验过的,照常保护。
+    await s.db.query(
+      `INSERT INTO "UserCollection" VALUES
+         ('fx-forged', 'NOTE', 'fx-note-forged', '{"noteId":"n1"}'),
+         ('fx-note-col', 'NOTE', 'fx-note-message',
+          '{"kind":"openim-message","messageID":"fx-note-message"}')`,
+    );
+
+    const purge = purgeExpiredMediaQuery(['fx-note-forged', 'fx-note-message']);
+    const { rows } = await s.db.query<{ id: string }>(purge.text, purge.values);
+    expect(rows.map((row) => row.id)).toEqual(['fx-note-forged']);
   });
 });

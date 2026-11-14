@@ -122,6 +122,18 @@ describe('ChatMediaRetentionService', () => {
     expect(media.queueDeletions).not.toHaveBeenCalled();
   });
 
+  it('does not let an unrelated note collection pin chat media forever', async () => {
+    candidates.video = [row('v1', 'c1', 31)];
+
+    await service.purgeOnce(lease, now);
+
+    const purge = prisma.$queryRaw.mock.calls
+      .map(([arg]) => sqlText(arg as SqlArg))
+      .find((text) => text.includes('UPDATE "ChatMessage"'));
+    expect(purge).toContain(`c."type" <> 'NOTE'`);
+    expect(purge).toContain(`c."payload" ->> 'kind' = 'openim-message'`);
+  });
+
   it('pages past a full batch with the (createdAt, id) keyset', async () => {
     const full = Array.from({ length: 500 }, (_, index) =>
       row(`v${index}`, 'c1', 31),

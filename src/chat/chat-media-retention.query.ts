@@ -57,7 +57,13 @@ export function purgeExpiredMediaQuery(ids: string[]): Prisma.Sql {
         AND m."burnDurationSec" IS NULL
         AND m."burnExpiresAt" IS NULL
         AND NOT EXISTS (
-          SELECT 1 FROM "UserCollection" AS c WHERE c."sourceID" = m."id"
+          SELECT 1
+          FROM "UserCollection" AS c
+          WHERE c."sourceID" = m."id"
+            AND (
+              c."type" <> 'NOTE'
+              OR c."payload" ->> 'kind' = 'openim-message'
+            )
         )
       FOR UPDATE OF m
     )
