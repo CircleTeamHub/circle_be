@@ -24,6 +24,13 @@ import { PrismaService } from 'src/prisma/prisma.service';
 import { MembershipPolicyService } from 'src/membership/membership-policy.service';
 import { purgeDeletedNote } from './note-purge';
 import {
+  NOTE_MEDIA_TYPE_LIMITS,
+  countNoteMediaByType,
+  countStoredNoteMediaByType,
+  findExceededNoteMediaType,
+  type NoteMediaTypeCounts,
+} from './note-media-limits';
+import {
   NOTE_SUMMARY_CONTENT_HEAD,
   NoteSummaryProjectionRow,
   noteSummaryProjectionQuery,
@@ -2477,6 +2484,22 @@ export class NoteService implements NoteCardProjector {
     };
   }
 
+  /** 照片 9 / 视频 5 / 验证视频 5。编辑时传 previous,上限前就已超的旧笔记只拦再往上加。 */
+  private assertMediaTypeLimits(
+    derived: { media: CreateNoteDto['media']; sections: NoteSections },
+    previous?: NoteMediaTypeCounts,
+  ) {
+    const exceeded = findExceededNoteMediaType(
+      countNoteMediaByType(derived.media, derived.sections.showcase.items),
+      previous,
+    );
+    if (!exceeded) return;
+    throw new BadRequestException({
+      message: `Note allows at most ${NOTE_MEDIA_TYPE_LIMITS[exceeded]} ${exceeded}`,
+      errorCode: NoteErrorCode.MediaTypeLimit,
+    });
+  }
+
   private isRecord(value: unknown): value is Record<string, any> {
     return Boolean(value && typeof value === 'object' && !Array.isArray(value));
   }
@@ -3447,6 +3470,7 @@ export class NoteService implements NoteCardProjector {
       binding ? this.withGroupCard(input, binding.card) : input,
     );
     const derived = this.deriveNoteContent(canonicalInput);
+    this.assertMediaTypeLimits(derived);
     this.assertMediaOwnership(ownerID, derived.media);
     this.assertMediaUrlsAreSafe(derived.media);
 
@@ -5126,6 +5150,8 @@ export class NoteService implements NoteCardProjector {
       where: { id: noteId, ownerID, status: { not: 'DELETED' } },
       select: {
         sections: true,
+        imageCount: true,
+        videoCount: true,
         collectedFromNoteID: true,
         sourceConversationID: true,
       },
@@ -5146,6 +5172,10 @@ export class NoteService implements NoteCardProjector {
       existingNote.sections,
     );
     const derived = this.deriveNoteContent(canonicalInput);
+    this.assertMediaTypeLimits(
+      derived,
+      countStoredNoteMediaByType(existingNote),
+    );
     // 收藏复制的笔记媒体沿用原作者的 objectKey；这些 key 是服务端 collectNote
     // 时合法落到本笔记上的，编辑时允许原样保留（新增媒体仍必须归属自己）。
     const existingMedia = await this.prisma.noteMedia.findMany({

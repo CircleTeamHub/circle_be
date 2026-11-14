@@ -24,6 +24,7 @@ import { UploadService } from 'src/upload/upload.service';
 import { MembershipPolicyService } from 'src/membership/membership-policy.service';
 import { MembershipProgramService } from 'src/membership/membership-program.service';
 import { NoteService } from './note.service';
+import { NoteErrorCode } from 'src/common/app-error-codes';
 
 describe('NoteService', () => {
   let service: NoteService;
@@ -5407,6 +5408,96 @@ describe('NoteService', () => {
         ],
       }),
     ).rejects.toBeInstanceOf(BadRequestException);
+  });
+
+  describe('per-type media limits (9 photos / 5 videos / 5 verification videos)', () => {
+    const photo = (index: number) => ({
+      type: 'IMAGE' as const,
+      objectKey: `notes/user-1/p${index}.jpg`,
+      url: `https://cdn.example.com/p${index}.jpg`,
+      sortOrder: index,
+    });
+    const clip = (index: number) => ({
+      type: 'VIDEO' as const,
+      objectKey: `notes/user-1/v${index}.mp4`,
+      url: `https://cdn.example.com/v${index}.mp4`,
+      sortOrder: index,
+    });
+    const range = (count: number) => Array.from({ length: count }, (_, i) => i);
+
+    it('createNote rejects a tenth photo before writing anything', async () => {
+      const rejection = await service
+        .createNote('user-1', {
+          title: '十张照片',
+          media: range(10).map(photo),
+        } as any)
+        .catch((error: unknown) => error);
+
+      expect(rejection).toBeInstanceOf(BadRequestException);
+      expect((rejection as BadRequestException).getResponse()).toMatchObject({
+        errorCode: NoteErrorCode.MediaTypeLimit,
+      });
+      expect(prisma.note.create).not.toHaveBeenCalled();
+    });
+
+    it('createNote counts verification videos against their own limit', async () => {
+      const showcase = range(6).map(clip);
+      const rejection = await service
+        .createNote('user-1', {
+          title: '六个验证视频',
+          media: showcase,
+          sections: { media: { items: [] }, showcase: { items: showcase } },
+        } as any)
+        .catch((error: unknown) => error);
+
+      expect((rejection as BadRequestException).getResponse()).toMatchObject({
+        errorCode: NoteErrorCode.MediaTypeLimit,
+      });
+      expect(prisma.note.create).not.toHaveBeenCalled();
+    });
+
+    it('updateNote lets an older note keep the 7 videos it already has', async () => {
+      prisma.noteMedia.findMany.mockResolvedValueOnce([]);
+      prisma.note.findFirst
+        .mockResolvedValueOnce({ sections: null, imageCount: 0, videoCount: 7 })
+        .mockResolvedValueOnce({
+          id: 'note-old',
+          ownerID: 'user-1',
+          status: 'ACTIVE',
+        });
+      prisma.note.update.mockResolvedValueOnce({
+        ...otherUsersNote,
+        id: 'note-old',
+        ownerID: 'user-1',
+      });
+
+      await expect(
+        service.updateNote('user-1', 'note-old', {
+          title: '只改了标题',
+          media: range(7).map(clip),
+        }),
+      ).resolves.toBeDefined();
+    });
+
+    it('updateNote rejects adding an eighth video to that older note', async () => {
+      prisma.note.findFirst.mockResolvedValueOnce({
+        sections: null,
+        imageCount: 0,
+        videoCount: 7,
+      });
+
+      const rejection = await service
+        .updateNote('user-1', 'note-old', {
+          title: '又加了一个',
+          media: range(8).map(clip),
+        })
+        .catch((error: unknown) => error);
+
+      expect((rejection as BadRequestException).getResponse()).toMatchObject({
+        errorCode: NoteErrorCode.MediaTypeLimit,
+      });
+      expect(prisma.note.update).not.toHaveBeenCalled();
+    });
   });
 
   // ── resolveShareLink（访客侧解析）──────────────────────────────────────────
