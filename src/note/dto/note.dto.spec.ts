@@ -9,9 +9,11 @@ import {
   CreateNoteShareLinkDto,
   ListNoteShareLinksQueryDto,
   ListNotesQueryDto,
+  NOTE_CITY_MAX_LENGTH,
+  NOTE_RANKING_DEFAULT_LIMIT,
   NOTE_REMARK_MAX_LENGTH,
   NoteLocationSectionDto,
-  RecycleBinQueryDto,
+  NoteRankingQueryDto,
   ReorderNoteGroupsDto,
   SaveNoteDraftDto,
   SetNoteRemarkDto,
@@ -492,27 +494,12 @@ describe('CreateNoteMediaDto url is optional', () => {
   });
 });
 
-// app 的 fetchNotes / fetchDeletedNotes 从不传 page/limit：默认页必须装得下整本笔记，
+// app 的 fetchNotes 从不传 page/limit：默认页必须装得下整本笔记，
 // 否则超过默认页（以前 50）的笔记被静默截掉。显式上限同样放到 500。
 describe('note list query limits', () => {
   it('ListNotesQueryDto defaults limit to 500 and caps it at 500', () => {
     const parse = (query: Record<string, unknown>) =>
       plainToInstance(ListNotesQueryDto, query, {
-        enableImplicitConversion: true,
-      });
-
-    const empty = parse({});
-    expect(validateSync(empty)).toHaveLength(0);
-    expect(empty.limit).toBe(500);
-    expect(validateSync(parse({ limit: '500' }))).toHaveLength(0);
-    expect(
-      validateSync(parse({ limit: '501' })).map((error) => error.property),
-    ).toContain('limit');
-  });
-
-  it('RecycleBinQueryDto defaults limit to 500 and caps it at 500', () => {
-    const parse = (query: Record<string, unknown>) =>
-      plainToInstance(RecycleBinQueryDto, query, {
         enableImplicitConversion: true,
       });
 
@@ -585,5 +572,106 @@ describe('SetNoteWorkStatusDto', () => {
       workStatus: 'UNLISTED',
     });
     expect(validateSync(dto)).not.toEqual([]);
+  });
+});
+
+describe('note city', () => {
+  // 与 setup.ts 的全局 ValidationPipe 同一套选项。
+  const parse = (
+    type: new () => { city?: string | null },
+    body: Record<string, unknown>,
+  ) => {
+    const dto = plainToInstance(type, body, {
+      enableImplicitConversion: true,
+    });
+    const errors = validateSync(dto, {
+      whitelist: true,
+      forbidNonWhitelisted: true,
+    }).map((error) => error.property);
+    return { dto, errors };
+  };
+  const bodies = [
+    [CreateNoteDto, { title: 'Shop', media: [] }],
+    [UpdateNoteDto, { title: 'Shop', media: [] }],
+    [SaveNoteDraftDto, {}],
+  ] as const;
+
+  describe.each(bodies)('%p', (type, base) => {
+    it('trims the city name', () => {
+      const { dto, errors } = parse(type, { ...base, city: '  上海 ' });
+      expect(errors).toEqual([]);
+      expect(dto.city).toBe('上海');
+    });
+
+    it.each(['', '   ', null])('normalizes %p to no city', (city) => {
+      const { dto, errors } = parse(type, { ...base, city });
+      expect(errors).toEqual([]);
+      expect(dto.city).toBeNull();
+    });
+
+    it('leaves an omitted city undefined', () => {
+      const { dto, errors } = parse(type, base);
+      expect(errors).toEqual([]);
+      expect(dto.city).toBeUndefined();
+    });
+
+    it('measures the 32-character cap after trimming', () => {
+      const longest = '城'.repeat(NOTE_CITY_MAX_LENGTH);
+      expect(parse(type, { ...base, city: ` ${longest} ` }).errors).toEqual([]);
+      expect(parse(type, { ...base, city: `${longest}市` }).errors).toEqual([
+        'city',
+      ]);
+    });
+
+    it('rejects a non-string city', () => {
+      expect(parse(type, { ...base, city: ['上海'] }).errors).toEqual(['city']);
+    });
+  });
+});
+
+describe('NoteRankingQueryDto', () => {
+  // 查询串永远是字符串：同 ListNoteShareLinksQueryDto，用 enableImplicitConversion 复现。
+  const parse = (query: Record<string, unknown>) => {
+    const dto = plainToInstance(NoteRankingQueryDto, query, {
+      enableImplicitConversion: true,
+    });
+    return {
+      dto,
+      errors: validateSync(dto, {
+        whitelist: true,
+        forbidNonWhitelisted: true,
+      }).map((error) => error.property),
+    };
+  };
+
+  it('defaults to the nationwide list of 50', () => {
+    const { dto, errors } = parse({});
+    expect(errors).toEqual([]);
+    expect(dto.city).toBeUndefined();
+    expect(dto.limit).toBe(NOTE_RANKING_DEFAULT_LIMIT);
+    expect(NOTE_RANKING_DEFAULT_LIMIT).toBe(50);
+  });
+
+  it('trims the city and treats an empty one as nationwide', () => {
+    expect(parse({ city: ' 成都 ' }).dto.city).toBe('成都');
+    expect(parse({ city: '' }).dto.city).toBeNull();
+    expect(parse({ city: '  ' }).errors).toEqual([]);
+  });
+
+  it('rejects a city longer than 32 characters', () => {
+    expect(parse({ city: 'x'.repeat(33) }).errors).toEqual(['city']);
+  });
+
+  it.each([
+    ['1', 1],
+    ['100', 100],
+  ])('accepts limit=%s', (limit, expected) => {
+    const { dto, errors } = parse({ limit });
+    expect(errors).toEqual([]);
+    expect(dto.limit).toBe(expected);
+  });
+
+  it.each(['0', '101', '2.5', 'ten'])('rejects limit=%s', (limit) => {
+    expect(parse({ limit }).errors).toEqual(['limit']);
   });
 });

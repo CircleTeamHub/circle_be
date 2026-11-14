@@ -1,7 +1,7 @@
 import { Prisma, type NoteMediaType } from 'src/generated/prisma';
 
 /**
- * 笔记列表摘要（listNotes / listDeletedNotes / 公开的 resolveShareLink）要的派生字段，
+ * 笔记列表摘要（listNotes / 群绑定列表 / 榜单 / 公开的 resolveShareLink）要的派生字段，
  * 按这一页的笔记 id 在 SQL 里算好再带回来。
  *
  * 此前三条列表都 include NOTE_INCLUDE：正文最多 2 万字、contentJson、sections（里面还有

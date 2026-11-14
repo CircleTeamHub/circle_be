@@ -1,6 +1,6 @@
 import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
-import { expiredRecycleBinNotesQuery } from 'src/note/note-recycle-bin.query';
+import { deletedNotesQuery } from 'src/note/note-cleanup.query';
 import {
   describePostgres,
   explainPlan,
@@ -11,14 +11,15 @@ import { capturePrisma, captureQueries } from './prisma-sql-capture';
 
 /**
  * Note 上两条部分索引（迁移 20261026000500）在真 PostgreSQL 上的口径与成本：
- * - 回收站到期清理按 (updatedAt, id) 键集翻页：只取到期的 DELETED 行、不重不漏、
- *   不反复取到同一行，并且落在 Note_recycle_bin_updatedAt_id_idx 上；
+ * - 已删除笔记的清理（NoteCleanup，2026-11 取消回收站后不再等 30 天）按 (updatedAt, id)
+ *   键集翻页：只取 DELETED 行、不重不漏、不反复取到同一行，并且落在
+ *   Note_recycle_bin_updatedAt_id_idx 上（索引名沿用回收站时代）；
  * - 收录链下游（永久删除改指向、来源状态广播）按 collectedFromNoteID 等值 / IN
  *   查找，落在 Note_collectedFromNoteID_present_idx 上，而不是以 ownerID 打头的
  *   活跃副本唯一索引或整表扫描。
  */
 describePostgres(
-  'note collect-chain and recycle-bin indexes (PostgreSQL)',
+  'note collect-chain and deleted-note indexes (PostgreSQL)',
   () => {
     let s: IsolatedSchema;
     const capture = capturePrisma();
@@ -49,19 +50,19 @@ describePostgres(
     };
 
     /** 照清理任务的写法逐批翻页，返回每批的 id。 */
-    const pageAll = async (cutoff: Date, limit: number) => {
+    const pageAll = async (limit: number) => {
       const pages: string[][] = [];
-      let after: { updatedAt: Date; id: string } | undefined;
+      let after: { at: Date; id: string } | undefined;
       for (;;) {
-        const q = expiredRecycleBinNotesQuery({ cutoff, after, limit });
-        const { rows } = await s.db.query<{ id: string; updatedAt: Date }>(
+        const q = deletedNotesQuery({ after, limit });
+        const { rows } = await s.db.query<{ id: string; cursorAt: Date }>(
           q.text,
           q.values,
         );
         pages.push(rows.map((row) => row.id));
         if (rows.length < limit) break;
         const last = rows[rows.length - 1];
-        after = { updatedAt: last.updatedAt, id: last.id };
+        after = { at: last.cursorAt, id: last.id };
       }
       return pages;
     };
@@ -76,6 +77,7 @@ describePostgres(
         status "NoteStatus" NOT NULL DEFAULT 'ACTIVE',
         pinned boolean NOT NULL DEFAULT false,
         "collectedFromNoteID" text,
+        "rootSourceNoteID" text,
         "updatedAt" timestamp(3) NOT NULL
       );
       -- 线上已有、会和新索引竞争的两条：以 ownerID 打头的普通索引与活跃副本唯一索引。
@@ -107,15 +109,15 @@ describePostgres(
       await s.db.query('TRUNCATE "Note"');
     });
 
-    it('pages expired recycle-bin notes by (updatedAt, id) without gaps or repeats', async () => {
+    it('pages every deleted note by (updatedAt, id) without gaps or repeats', async () => {
       // 同一时刻删的一批（updatedAt 相同），id 决出先后。
       for (const id of ['b', 'a', 'd', 'c']) {
         await insertNote(id, { updatedAt: '2026-06-01 00:00:00' });
       }
       await insertNote('e', { updatedAt: '2026-06-02 00:00:00' });
-      await insertNote('f', { updatedAt: '2026-06-30 23:59:59.999' });
-      // 不在口径内：刚删的（还没到 30 天）、下架的、正常的。
+      // 刚删的也在口径内：删除即永久，不再等 30 天。
       await insertNote('recent', { updatedAt: '2026-07-01 00:00:00' });
+      // 不在口径内：下架的、正常的。
       await insertNote('unlisted', {
         status: 'UNLISTED',
         updatedAt: '2026-01-01 00:00:00',
@@ -125,10 +127,9 @@ describePostgres(
         updatedAt: '2026-01-01 00:00:00',
       });
 
-      const cutoff = new Date('2026-07-01T00:00:00.000Z');
-      const pages = await pageAll(cutoff, 2);
+      const pages = await pageAll(2);
 
-      expect(pages).toEqual([['a', 'b'], ['c', 'd'], ['e', 'f'], []]);
+      expect(pages).toEqual([['a', 'b'], ['c', 'd'], ['e', 'recent'], []]);
     });
 
     it('moves past rows the sweep failed to delete instead of fetching them again', async () => {
@@ -137,33 +138,31 @@ describePostgres(
       }
 
       // 什么都没删（相当于整批都删失败）：每行仍然只出现一次，翻页照样走到底。
-      const pages = await pageAll(new Date('2026-07-01T00:00:00.000Z'), 2);
+      const pages = await pageAll(2);
 
       expect(pages.flat()).toEqual(['n0', 'n1', 'n2', 'n3', 'n4']);
     });
 
-    it('reads a recycle-bin batch through the partial (updatedAt, id) index', async () => {
-      // 大量正常笔记 + 尚未到期的回收站笔记，到期的只有几条。
+    it('reads a deleted-note batch through the partial (updatedAt, id) index', async () => {
+      // 大量正常 / 下架笔记，已删除的只有一条。
       await s.db.query(`
       INSERT INTO "Note" (id, "ownerID", status, "updatedAt")
       SELECT 'filler-' || g, 'owner-' || (g % 200),
-             CASE WHEN g % 10 = 0 THEN 'DELETED'::"NoteStatus" ELSE 'ACTIVE'::"NoteStatus" END,
+             CASE WHEN g % 10 = 0 THEN 'UNLISTED'::"NoteStatus" ELSE 'ACTIVE'::"NoteStatus" END,
              TIMESTAMP '2026-07-10 00:00:00' + (g || ' seconds')::interval
       FROM generate_series(1, 5000) g
     `);
-      await insertNote('expired', { updatedAt: '2026-06-01 00:00:00' });
+      await insertNote('deleted', { updatedAt: '2026-06-01 00:00:00' });
       await s.db.query('ANALYZE "Note"');
 
-      const cutoff = new Date('2026-07-01T00:00:00.000Z');
       await s.db.query('SET enable_seqscan = off');
       try {
-        const first = expiredRecycleBinNotesQuery({ cutoff, limit: 200 });
+        const first = deletedNotesQuery({ limit: 200 });
         expect(await explainPlan(s.db, first.text, first.values)).toContain(
           'Note_recycle_bin_updatedAt_id_idx',
         );
-        const next = expiredRecycleBinNotesQuery({
-          cutoff,
-          after: { updatedAt: new Date('2026-05-01T00:00:00.000Z'), id: 'x' },
+        const next = deletedNotesQuery({
+          after: { at: new Date('2026-05-01T00:00:00.000Z'), id: 'x' },
           limit: 200,
         });
         expect(await explainPlan(s.db, next.text, next.values)).toContain(
@@ -172,25 +171,22 @@ describePostgres(
       } finally {
         await s.db.query('RESET enable_seqscan');
       }
-      expect((await pageAll(cutoff, 200)).flat()).toEqual(['expired']);
+      expect((await pageAll(200)).flat()).toEqual(['deleted']);
     });
 
-    it('could not use the recycle-bin index through Prisma\u2019s parameterized enum filter', async () => {
+    it('could not use the deleted-note index through Prisma\u2019s parameterized enum filter', async () => {
       await s.db.query(`
       INSERT INTO "Note" (id, "ownerID", status, "updatedAt")
       SELECT 'filler-' || g, 'owner-' || (g % 200), 'ACTIVE', TIMESTAMP '2026-07-10 00:00:00'
       FROM generate_series(1, 2000) g
     `);
       await s.db.query('ANALYZE "Note"');
-      // 对照：改造前清理任务的 note.findMany，现场编译出 Prisma 的真实 SQL。status 是
+      // 对照：用 note.findMany 写同一个批次查询，现场编译出 Prisma 的真实 SQL。status 是
       // CAST($n::text AS "NoteStatus")，规划期折不成常量，部分索引用不上 —— 所以批次
-      // 查询改成了原生 SQL（expiredRecycleBinNotesQuery），别再「简化」回 findMany。
+      // 查询是原生 SQL（deletedNotesQuery），别再「简化」回 findMany。
       const [prismaShape] = await captureQueries(capture.queries, () =>
         capture.prisma.note.findMany({
-          where: {
-            status: 'DELETED',
-            updatedAt: { lt: new Date('2026-07-01T00:00:00.000Z') },
-          },
+          where: { status: 'DELETED' },
           select: { id: true },
           orderBy: { id: 'asc' },
           take: 200,

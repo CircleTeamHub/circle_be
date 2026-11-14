@@ -7,7 +7,7 @@ import { Prisma } from 'src/generated/prisma';
  * 落在迁移 20261111000000 的部分索引 ("type", "createdAt", "id") 上:每类一次范围扫描,
  * 读到 LIMIT 条就停;清理后正文没了 key 就离开索引。能用上的前提是 type 与其余谓词
  * 写成 SQL 字面量,与索引谓词一致 —— Prisma 会把 type 参数化,规划期看不到值,部分
- * 索引就失效(见 note-recycle-bin.query.ts 的说明)。改这里必须同步改迁移。
+ * 索引就失效(见 note-cleanup.query.ts 的说明)。改这里必须同步改迁移。
  *
  * 被收藏着的消息仍是候选(清理语句里跳过),键集游标让同一轮不会反复取到它们。
  */

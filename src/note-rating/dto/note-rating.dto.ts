@@ -78,6 +78,13 @@ export class NoteRatingSummaryDto extends NoteRatingCountersDto {
   reason: string | null;
   @ApiPropertyOptional({ nullable: true, type: Date })
   nextRatableAt: Date | null;
+  @ApiProperty({
+    description:
+      'The viewer already gave a 好评 today (Shanghai day); 好评 and 差评 are one each per day. `reason` only turns into NOTE_RATING_RATER_DAILY_LIMIT once both are used.',
+  })
+  goodRatedToday: boolean;
+  @ApiProperty({ description: 'The viewer already gave a 差评 today.' })
+  badRatedToday: boolean;
   @ApiProperty({ description: 'Today’s 5 counted good ratings are taken.' })
   goodFull: boolean;
   @ApiProperty({ description: 'Today’s 5 counted bad ratings are taken.' })

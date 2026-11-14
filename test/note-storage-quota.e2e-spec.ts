@@ -171,64 +171,35 @@ describePostgres('Note storage quota concurrency e2e', () => {
     ]);
   });
 
-  it('rejects restoring a deleted note when already at the storage limit', async () => {
-    const user = await createUser('note-restore-full');
-    // 50 ACTIVE (at limit) + 1 DELETED. Restoring re-consumes a slot, so it must
-    // be rejected — a DELETED note is released capacity only while deleted.
+  // 删除即永久（2026-11 起没有回收站）：标成 DELETED 那一刻就让出名额，不等清理任务删行。
+  it('frees the slot as soon as a note is deleted', async () => {
+    const user = await createUser('note-delete-frees');
     await prisma.note.createMany({
       data: Array.from({ length: 50 }, (_, index) => ({
         ownerID: user.id,
         title: `Existing ${index}`,
       })),
     });
-    const deleted = await prisma.note.create({
-      data: { ownerID: user.id, title: 'Deleted', status: 'DELETED' },
+    const victim = await prisma.note.findFirstOrThrow({
+      where: { ownerID: user.id },
+      select: { id: true },
     });
-    const token = accessToken(user);
-
-    const res = await request(getE2eApp().getHttpServer())
-      .post(`/api/v1/note/${deleted.id}/restore`)
-      .set('Authorization', `Bearer ${token}`);
-
-    expect(res.status).toBe(403);
-    expect(res.body).toMatchObject({
-      errorCode: NoteErrorCode.StorageQuotaReached,
-    });
-    await expect(
-      prisma.note.findUnique({
-        where: { id: deleted.id },
-        select: { status: true },
-      }),
-    ).resolves.toMatchObject({ status: 'DELETED' });
-  });
-
-  it('allows only available slots when deleted notes are restored in parallel at limit minus one', async () => {
-    const user = await createUser('note-restore-race');
-    // 49 ACTIVE (limit - 1) + 2 DELETED: only one restore may win the last slot.
-    await prisma.note.createMany({
-      data: Array.from({ length: 49 }, (_, index) => ({
-        ownerID: user.id,
-        title: `Existing ${index}`,
-      })),
-    });
-    const [deletedA, deletedB] = await Promise.all([
-      prisma.note.create({
-        data: { ownerID: user.id, title: 'Deleted A', status: 'DELETED' },
-      }),
-      prisma.note.create({
-        data: { ownerID: user.id, title: 'Deleted B', status: 'DELETED' },
-      }),
-    ]);
     const token = accessToken(user);
     const server = getE2eApp().getHttpServer();
 
-    await expectOneQuotaWinner(user.id, [
-      request(server)
-        .post(`/api/v1/note/${deletedA.id}/restore`)
-        .set('Authorization', `Bearer ${token}`),
-      request(server)
-        .post(`/api/v1/note/${deletedB.id}/restore`)
-        .set('Authorization', `Bearer ${token}`),
-    ]);
+    const full = await request(server)
+      .post('/api/v1/note')
+      .set('Authorization', `Bearer ${token}`)
+      .send({ title: 'Over the limit', media: [] });
+    expect(full.status).toBe(403);
+    await request(server)
+      .delete(`/api/v1/note/${victim.id}`)
+      .set('Authorization', `Bearer ${token}`)
+      .expect(204);
+    await request(server)
+      .post('/api/v1/note')
+      .set('Authorization', `Bearer ${token}`)
+      .send({ title: 'Fits again', media: [] })
+      .expect(201);
   });
 });

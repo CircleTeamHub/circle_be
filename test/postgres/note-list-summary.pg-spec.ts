@@ -14,12 +14,12 @@ import {
 
 /**
  * 笔记列表摘要改成「标量列 select + SQL 投影 + 只签封面」后，在真 PostgreSQL 上与原实现
- * 逐字段对照（listNotes / listDeletedNotes / 公开的 resolveShareLink）：
+ * 逐字段对照（listNotes / 公开的 resolveShareLink；回收站列表 2026-11 已取消）：
  * - 原实现照抄改造前的代码：NOTE_INCLUDE 整行 → 收录链 overlay → 补圈子 id → 全量签名
  *   → 原 mapSummary（逐行照抄在下面）；新实现就是 NoteService 本身，跑真的 PrismaClient；
  * - 覆盖纯文字、长文、开头大段空白（要补读正文）、预览 120 字边界、代理对、Unicode 空白、
  *   控制字符、带媒体 / 封面回退、带名片（含坏数据与旧圈子卡片）、各种显式分区与畸形
- *   sections、正文块数组、分组、收录副本、回收站、分享链接（访客视角）；
+ *   sections、正文块数组、分组、收录副本、已删除、分享链接（访客视角）；
  * - 两边的 DTO 序列化后逐字节相同（字段顺序也一样），并且新实现签名的对象只剩封面、
  *   搬回来的数据量小一个数量级。
  */
@@ -73,8 +73,12 @@ function oldMapSummary(
     ownerId: note.ownerID,
     canEdit: isOwner,
     title: note.title,
+    // City arrived later and is a plain column passthrough, public to every viewer.
+    city: note.city,
     contentPreview: svc.buildPreview(note.content),
     status: note.status,
+    // unlistedAt arrived later (下架 auto-delete); plain column passthrough.
+    unlistedAt: note.unlistedAt,
     available: note.available,
     workStatus: note.workStatus ?? null,
     sourceConversationID: isOwner ? (note.sourceConversationID ?? null) : null,
@@ -199,18 +203,6 @@ describePostgres('note list summaries (PostgreSQL)', () => {
       skip: (page - 1) * limit,
     });
     return oldPage(notes, limit, ownerID);
-  };
-
-  const oldListDeleted = async (ownerID: string, page = 1, limit = 500) => {
-    const take = Math.min(limit, NOTE_LIST_DEFAULT_LIMIT);
-    const notes = await prisma.note.findMany({
-      where: { ownerID, status: 'DELETED' },
-      orderBy: { updatedAt: 'desc' },
-      take: take + 1,
-      skip: (page - 1) * take,
-      include: NOTE_INCLUDE_BEFORE,
-    });
-    return oldPage(notes, take, ownerID);
   };
 
   const oldResolveShareLink = async (token: string) => {
@@ -357,6 +349,7 @@ describePostgres('note list summaries (PostgreSQL)', () => {
         "contentJson" jsonb,
         sections jsonb,
         status "NoteStatus" NOT NULL DEFAULT 'ACTIVE',
+        "unlistedAt" timestamp(3),
         available boolean NOT NULL DEFAULT true,
         "workStatus" "NoteWorkStatus",
         "sourceConversationID" text,
@@ -367,6 +360,7 @@ describePostgres('note list summaries (PostgreSQL)', () => {
         "videoCount" integer NOT NULL DEFAULT 0,
         "audioCount" integer NOT NULL DEFAULT 0,
         remark text,
+        city varchar(32),
         "collectedFrom" jsonb,
         "collectedFromNoteID" text,
         "rootSourceNoteID" text,
@@ -630,14 +624,15 @@ describePostgres('note list summaries (PostgreSQL)', () => {
       workStatus: 'WORKING',
       sourceConversationID: 'conv-1',
     });
-    await note('src-1', { ownerID: 'u2', status: 'UNLISTED' });
+    // 来源被主人设成不可见：副本对他人不可分发（下架的来源照常可分发，见 n-card-unlisted）。
+    await note('src-1', { ownerID: 'u2', available: false });
     await note('n-copy', {
       collectedFromNoteID: 'src-1',
       collectedFrom: { groupName: '私密来源群' },
     });
     await note('n-copy-purged', { collectedFromNoteID: 'gone-forever' });
 
-    // ── 回收站 ──────────────────────────────────────────────────────────────
+    // ── 已删除（等 NoteCleanup 删行）──────────────────────────────────────────
     await note('d-1', { status: 'DELETED', counts: [1, 1, 0, 0] });
     await media('m-d1', 'd-1', 'IMAGE', 0);
     await note('d-2', {
@@ -758,18 +753,6 @@ describePostgres('note list summaries (PostgreSQL)', () => {
     );
   });
 
-  it('lists the recycle bin exactly like the full-row implementation', async () => {
-    const { expected } = await compare(
-      () => service.listDeletedNotes('u1'),
-      () => oldListDeleted('u1'),
-    );
-    expect((expected as { items: unknown[] }).items).toHaveLength(2);
-    await compare(
-      () => service.listDeletedNotes('u1', 2, 1),
-      () => oldListDeleted('u1', 2, 1),
-    );
-  });
-
   it('resolves share links for a guest exactly like the full-row implementation', async () => {
     for (const token of ['tok-all', 'tok-some', 'tok-unlisted-g1']) {
       const { expected } = await compare(
@@ -780,7 +763,7 @@ describePostgres('note list summaries (PostgreSQL)', () => {
         notes: Array<{ id: string; contactCount: number; canEdit: boolean }>;
       };
       expect(notes.length).toBeGreaterThan(0);
-      // 访客视角：名片、编辑权限都不外发；来源已下架的副本被滤掉。
+      // 访客视角：名片、编辑权限都不外发；来源设成不可见的副本被滤掉。
       expect(
         notes.every((item) => !item.canEdit && item.contactCount === 0),
       ).toBe(true);
@@ -788,7 +771,7 @@ describePostgres('note list summaries (PostgreSQL)', () => {
     }
   });
 
-  // 聊天卡片读时投影:与列表同一套摘要,访客视角,只投影此刻可分发的笔记。
+  // 聊天卡片读时投影:与列表同一套摘要,访客视角,只投影此刻可分发的笔记(下架的也算)。
   it('projects chat note cards from the live note, only for distributable notes', async () => {
     await note('n-card-hidden', { available: false, title: 'hidden' });
     await note('n-card-unlisted', { status: 'UNLISTED', title: 'unlisted' });
@@ -800,7 +783,11 @@ describePostgres('note list summaries (PostgreSQL)', () => {
       'n-card-unlisted',
       'missing',
     ]);
-    expect([...projections.keys()].sort()).toEqual(['n-media', 'n-plain']);
+    expect([...projections.keys()].sort()).toEqual([
+      'n-card-unlisted',
+      'n-media',
+      'n-plain',
+    ]);
     const media = projections.get('n-media')!;
     expect(media).toMatchObject({
       title: 'title n-media',

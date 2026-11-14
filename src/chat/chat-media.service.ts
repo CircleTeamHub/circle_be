@@ -57,18 +57,29 @@ const DELETED_NOTE_CARD_STATE: NoteCardLiveState = {
   publicationStatus: 'DELETED',
 };
 
-/** 根笔记此刻的状态,换成聊天卡片的字段(与发送时盖章同一口径)。 */
-function noteCardLiveState(root: {
-  status: string;
+type NoteCardRoot = {
+  status: NoteCardLiveState['publicationStatus'];
   available: boolean;
   workStatus: NoteCardLiveState['workStatus'] | null;
-}): NoteCardLiveState {
+};
+
+/** 根笔记此刻他人还能拿到内容:未删除且 available(下架照常可读)。 */
+function noteCardDistributable(root: NoteCardRoot): boolean {
+  return root.status !== 'DELETED' && root.available;
+}
+
+/**
+ * 根笔记此刻的状态,换成聊天卡片的字段(与发送时盖章同一口径):下架报 UNLISTED,
+ * 不可见(available=false)的沿用 UNLISTED。
+ */
+function noteCardLiveState(root: NoteCardRoot): NoteCardLiveState {
   const workStatus = root.workStatus ?? 'UNSET';
   if (root.status === 'DELETED')
     return { workStatus, publicationStatus: 'DELETED' };
-  if (root.status === 'ACTIVE' && root.available)
-    return { workStatus, publicationStatus: 'ACTIVE' };
-  return { workStatus, publicationStatus: 'UNLISTED' };
+  return {
+    workStatus,
+    publicationStatus: noteCardDistributable(root) ? root.status : 'UNLISTED',
+  };
 }
 import { reportOperationalError } from 'src/logging/error-aggregation.service';
 import { diagnosticFailureDetails } from 'src/logging/http-failure.logger';
@@ -814,8 +825,8 @@ export class ChatMediaService implements OnModuleDestroy {
     // 卡片上的开工/打烊/下架与上下架是发送时的快照;读的时候按来源根笔记此刻的状态覆盖,
     // 否则会话一重新加载(回到聊天页、翻页、重连)就把客户端实时补丁盖回旧快照,
     // 同一条笔记的两张卡片还会显示不同状态。口径与发送时盖章(resolveNoteCardSourceState)
-    // 一致。预览图也只在根笔记此刻仍可分发(ACTIVE + available)时签:作者事后下架 / 删除,
-    // 已发出的卡片不再续签。本页所有卡片一次批量查;查失败就保留快照、不签预览。
+    // 一致。预览图也只在根笔记此刻仍可分发(未删除 + available,下架也算)时签:作者事后
+    // 设成不可见 / 删除,已发出的卡片不再续签。本页所有卡片一次批量查;查失败就保留快照、不签预览。
     const noteCardRootIds = [
       ...new Set(
         messages
@@ -828,6 +839,7 @@ export class ChatMediaService implements OnModuleDestroy {
       ),
     ];
     let noteCardRoots: Map<string, NoteCardLiveState> | null = new Map();
+    const distributableRoots = new Set<string>();
     if (noteCardRootIds.length) {
       try {
         const roots = await this.prisma.note.findMany({
@@ -837,6 +849,8 @@ export class ChatMediaService implements OnModuleDestroy {
         noteCardRoots = new Map(
           roots.map((root) => [root.id, noteCardLiveState(root)]),
         );
+        for (const root of roots)
+          if (noteCardDistributable(root)) distributableRoots.add(root.id);
       } catch (error) {
         noteCardRoots = null;
         this.logger.warn(
@@ -860,8 +874,9 @@ export class ChatMediaService implements OnModuleDestroy {
                 (message) =>
                   message.type === 'note-card' &&
                   typeof message.content.noteId === 'string' &&
-                  noteCardRoots?.get(message.content.sourceNoteId as string)
-                    ?.publicationStatus === 'ACTIVE',
+                  distributableRoots.has(
+                    message.content.sourceNoteId as string,
+                  ),
               )
               .map((message) => message.content.noteId as string),
           ),
@@ -964,8 +979,7 @@ export class ChatMediaService implements OnModuleDestroy {
           }
           if (
             isNoteCard &&
-            noteCardRoots?.get(message.content.sourceNoteId as string)
-              ?.publicationStatus === 'ACTIVE'
+            distributableRoots.has(message.content.sourceNoteId as string)
           ) {
             const urls = await Promise.all(
               noteCardPreviewKeys(message.content).map((key) =>

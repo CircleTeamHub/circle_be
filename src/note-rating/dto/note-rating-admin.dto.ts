@@ -85,7 +85,7 @@ export class NoteRatingCaseNoteDto {
   @ApiPropertyOptional({
     nullable: true,
     type: String,
-    description: 'null once the note was purged from the recycle bin.',
+    description: 'null once the note was purged.',
   })
   title: string | null;
   @ApiPropertyOptional({ nullable: true, type: String })

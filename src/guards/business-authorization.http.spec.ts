@@ -229,7 +229,6 @@ describe('cross-user HTTP authorization matrix', () => {
   it.each([
     ['get', `/note/${resource}`, undefined, 404],
     ['patch', `/note/${resource}/pin`, { pinned: true }, 404],
-    ['patch', `/note/${resource}/available`, { available: true }, 404],
     ['patch', `/note/${resource}/remark`, { remark: 'stolen' }, 404],
     ['delete', `/note/${resource}`, undefined, 404],
     ['delete', `/collections/${resource}`, undefined, 404],
