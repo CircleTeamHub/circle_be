@@ -66,7 +66,7 @@ describeDatabase('Permanent delete keeps collected-copy chains intact', () => {
   }
 
   it('purging a middle copy re-points its downstream copy and keeps it readable', async () => {
-    const { b, stranger, root, relay, leaf } = await chain();
+    const { stranger, root, relay, leaf } = await chain();
     await prisma.note.update({
       where: { id: relay.id },
       data: { status: 'DELETED' },
@@ -75,15 +75,13 @@ describeDatabase('Permanent delete keeps collected-copy chains intact', () => {
       where: { id: leaf.id },
     });
 
-    await expect(
-      purgeDeletedNote(prisma, relay.id, { ownerID: b.id }),
-    ).resolves.toBe(true);
+    await expect(purgeDeletedNote(prisma, relay.id)).resolves.toBe(true);
 
     const after = await prisma.note.findUniqueOrThrow({
       where: { id: leaf.id },
     });
     expect(after.collectedFromNoteID).toBe(root.id);
-    // 改指向不能给下游续命：回收站 30 天计时看的就是 updatedAt。
+    // 改指向只修收录链，不算编辑：不碰下游的 updatedAt。
     expect(after.updatedAt.getTime()).toBe(before.updatedAt.getTime());
     // 原文还在上架：第三人照样能读这份副本。
     await expect(notes.getNote(stranger.id, leaf.id)).resolves.toMatchObject({
@@ -92,15 +90,13 @@ describeDatabase('Permanent delete keeps collected-copy chains intact', () => {
   });
 
   it('purging the original blocks every downstream copy for other viewers', async () => {
-    const { a, c, stranger, root, leaf } = await chain();
+    const { c, stranger, root, leaf } = await chain();
     await prisma.note.update({
       where: { id: root.id },
       data: { status: 'DELETED' },
     });
 
-    await expect(
-      purgeDeletedNote(prisma, root.id, { ownerID: a.id }),
-    ).resolves.toBe(true);
+    await expect(purgeDeletedNote(prisma, root.id)).resolves.toBe(true);
 
     await expect(notes.getNote(stranger.id, leaf.id)).rejects.toBeInstanceOf(
       NotFoundException,
@@ -112,7 +108,7 @@ describeDatabase('Permanent delete keeps collected-copy chains intact', () => {
   });
 
   it('leaves a downstream copy alone when its owner already holds a direct copy of the upstream', async () => {
-    const { b, c, root, relay, leaf } = await chain();
+    const { c, root, relay, leaf } = await chain();
     // C 另外直接收藏过原文：再把 leaf 改指向原文会撞「同人同源唯一」索引。
     await note(c.id, root.id);
     await prisma.note.update({
@@ -120,9 +116,7 @@ describeDatabase('Permanent delete keeps collected-copy chains intact', () => {
       data: { status: 'DELETED' },
     });
 
-    await expect(
-      purgeDeletedNote(prisma, relay.id, { ownerID: b.id }),
-    ).resolves.toBe(true);
+    await expect(purgeDeletedNote(prisma, relay.id)).resolves.toBe(true);
 
     const after = await prisma.note.findUniqueOrThrow({
       where: { id: leaf.id },
@@ -130,20 +124,15 @@ describeDatabase('Permanent delete keeps collected-copy chains intact', () => {
     expect(after.collectedFromNoteID).toBe(relay.id);
   });
 
-  it('only purges notes that are in the recycle bin of the caller', async () => {
-    const { b, c, relay } = await chain();
-    // 还没删进回收站。
-    await expect(
-      purgeDeletedNote(prisma, relay.id, { ownerID: b.id }),
-    ).resolves.toBe(false);
+  it('only purges notes that are already deleted', async () => {
+    const { relay } = await chain();
+    // 上架、下架的都不动：下架满 60 天要先经 expireUnlistedNote 标成 DELETED。
+    await expect(purgeDeletedNote(prisma, relay.id)).resolves.toBe(false);
     await prisma.note.update({
       where: { id: relay.id },
-      data: { status: 'DELETED' },
+      data: { status: 'UNLISTED', unlistedAt: new Date(0) },
     });
-    // 别人的回收站。
-    await expect(
-      purgeDeletedNote(prisma, relay.id, { ownerID: c.id }),
-    ).resolves.toBe(false);
+    await expect(purgeDeletedNote(prisma, relay.id)).resolves.toBe(false);
     await expect(
       prisma.note.findUnique({ where: { id: relay.id } }),
     ).resolves.not.toBeNull();

@@ -1077,7 +1077,10 @@ POST /coin/gift
 }
 ```
 
-**status 枚举值：** `ACTIVE` | `UNLISTED` | `DELETED`
+**status 枚举值：** `ACTIVE`（上架）| `UNLISTED`（下架）| `DELETED`（已删除，等清理任务删行，不会再出现在任何读接口里）
+
+- 下架（`UNLISTED`）只是给读者看的状态：他人照常可读、可收藏、可转发，带着真实 `status`；主人要藏起来用 `available=false`。2026-11 起场地「下架」`workStatus=OFF_SHELF` 已并入这里，不再返回。
+- `unlistedAt`：这次下架的时刻，上架为 `null`；满 60 天（绝对时长）永久删除。
 
 ---
 
@@ -1132,7 +1135,7 @@ Authorization: Bearer <accessToken>
 - `page` 可选，默认 1（上限 500）
 - `limit` 可选，默认 500，上限 500
 
-**响应头：** `X-Has-More: true|false` —— 本页之后是否还有笔记。响应体始终是数组；为 `true` 时用下一个 `page` 继续拉取。`GET /note/recycle-bin`（回收站）同一分页口径与同一响应头。
+**响应头：** `X-Has-More: true|false` —— 本页之后是否还有笔记。响应体始终是数组；为 `true` 时用下一个 `page` 继续拉取。回收站（`GET /note/recycle-bin`、`POST /note/:id/restore`、`DELETE /note/:id/permanent`）2026-11 已取消。
 
 **Response 200：**
 ```json
@@ -1165,7 +1168,7 @@ Authorization: Bearer <accessToken>
 
 **Response 200：** `NoteDetail`
 
-- 主人可读自己任何未删除的笔记（含 `UNLISTED`）；其他人只能读 `available=true` 且 `status=ACTIVE` 的笔记，否则 404 `NOTE_NOT_FOUND`。收藏（`POST /note/collect`）、导出（`POST /note/:id/exports`）、复制媒体（`POST /note/:id/chat-media`）与临时聊天访客读 note-card 同一口径。
+- 主人可读自己任何未删除的笔记；其他人能读 `available=true` 的上架或下架笔记（下架的 `status` 为 `UNLISTED`），否则 404 `NOTE_NOT_FOUND`。收藏（`POST /note/collect`）、导出（`POST /note/:id/exports`）、复制媒体（`POST /note/:id/chat-media`）与临时聊天访客读 note-card 同一口径。
 - 非主人视角：`canEdit=false`，`remark` / `collectedFrom` 为 `null`，`pinned` 恒为 `false`，`groups` 恒为 `[]`（置顶与分组是主人的私人整理标记，不随笔记外发）。
 
 ---
@@ -1262,7 +1265,7 @@ DELETE /note/:id
 Authorization: Bearer <accessToken>
 ```
 
-> 软删除，`status` 更新为 `DELETED`
+> 永久删除，不可恢复：立刻对所有人消失，行与媒体行由清理任务几分钟内删掉（媒体对象按存储审计流程另行回收）。
 
 **Response 204：** 无内容
 

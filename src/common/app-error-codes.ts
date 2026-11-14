@@ -283,7 +283,8 @@ export const NoteErrorCode = {
   // 群名片绑定被拒：群不存在 / 不可用（解散、停用）/ 不是群主 / 已不在群里，
   // 一律同一个码，不让调用方借错误区分别人的群是否存在。
   GroupBindForbidden: 'NOTE_GROUP_BIND_FORBIDDEN',
-  // round 3：回收站恢复撞上同源活跃收藏副本（唯一索引会拒绝）
+  // round 3：回收站恢复撞上同源活跃收藏副本（唯一索引会拒绝）。回收站 2026-11 已取消，
+  // 码保留：前端 i18n 契约里还有这个键。
   AlreadyCollected: 'NOTE_RESTORE_DUPLICATE',
   GroupNotFound: 'NOTE_GROUP_NOT_FOUND',
   ImageTooLarge: 'NOTE_IMAGE_TOO_LARGE',

@@ -641,7 +641,8 @@ describe('ChatService', () => {
     expect(previewQuery.where).toEqual(
       expect.objectContaining({
         id: 'note-1',
-        OR: [{ ownerID: 'u1' }, { available: true, status: 'ACTIVE' }],
+        status: { not: 'DELETED' },
+        OR: [{ ownerID: 'u1' }, { available: true }],
       }),
     );
     expect(previewQuery.select.media.where).toEqual({ type: 'IMAGE' });
@@ -702,6 +703,46 @@ describe('ChatService', () => {
       }),
     );
     expect(created.data.content).not.toHaveProperty('previewKeys');
+  });
+
+  // 2026-11 两种下架合并：下架（UNLISTED）的根照常可分发，卡片报真实状态 UNLISTED、照样带预览图。
+  it('stamps a 下架 root as UNLISTED and still carries its preview keys', async () => {
+    prisma.chatMember.findUnique.mockResolvedValue(membership());
+    prisma.chatMessage.findUnique.mockResolvedValue(null);
+    prisma.$queryRaw.mockResolvedValue([{ nextHeight: 3 }]);
+    prisma.chatMessage.create.mockResolvedValue(createdRow);
+    prisma.chatConversation.update.mockResolvedValue({});
+    prisma.user.findUnique.mockResolvedValue(null);
+    prisma.note.findFirst
+      .mockResolvedValueOnce(null) // group snapshot
+      .mockResolvedValueOnce({
+        id: 'copy-1',
+        status: 'ACTIVE',
+        available: true,
+        workStatus: null,
+        collectedFromNoteID: 'root-1',
+      })
+      .mockResolvedValueOnce({ media: [{ objectKey: 'notes/u2/a.jpg' }] });
+    prisma.note.findUnique.mockResolvedValueOnce({
+      id: 'root-1',
+      status: 'UNLISTED',
+      available: true,
+      workStatus: null,
+      collectedFromNoteID: null,
+    });
+
+    await service.sendMessage(
+      'u1',
+      sendPayload({ type: 'note-card', content: { noteId: 'copy-1' } }),
+    );
+
+    expect(prisma.chatMessage.create.mock.calls[0][0].data.content).toEqual(
+      expect.objectContaining({
+        sourceNoteId: 'root-1',
+        publicationStatus: 'UNLISTED',
+        previewKeys: ['notes/u2/a.jpg'],
+      }),
+    );
   });
 
   it('drops client-supplied card status when the sender cannot read the note', async () => {

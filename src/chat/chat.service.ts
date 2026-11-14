@@ -564,13 +564,13 @@ export class ChatService {
     // it is derived from the live root of the collect chain, never from the
     // replayed client content. Unresolvable notes drop the fields and the
     // client falls back to "unset".
-    let sourceState: NoteCardSourceState | null = null;
+    let source: {
+      state: NoteCardSourceState;
+      distributable: boolean;
+    } | null = null;
     if (noteId) {
       try {
-        sourceState = await this.resolveNoteCardSourceState(
-          senderUserId,
-          noteId,
-        );
+        source = await this.resolveNoteCardSourceState(senderUserId, noteId);
       } catch (error) {
         this.logger.warn(
           sanitizeLogValue({
@@ -584,9 +584,9 @@ export class ChatService {
     }
     // 多图预览的 key 只能由服务端从发送者读得到的笔记里取:读路径会给它们签名。
     // 对外分发看来源根笔记的实时状态(同 note 的 requireDistributableForViewer):
-    // 根不是 ACTIVE + available 时,收藏副本的主人也不能把图带出去。
+    // 根已删除或不可见(available=false)时,收藏副本的主人也不能把图带出去;下架照常可发。
     let previewKeys: string[] = [];
-    if (noteId && sourceState?.publicationStatus === 'ACTIVE') {
+    if (noteId && source?.distributable) {
       try {
         previewKeys = await this.resolveNoteCardPreviewKeys(
           senderUserId,
@@ -614,7 +614,7 @@ export class ChatService {
     } = content;
     return {
       ...baseContent,
-      ...(sourceState ?? {}),
+      ...(source?.state ?? {}),
       ...(previewKeys.length > 0
         ? { [NOTE_CARD_PREVIEW_KEYS_FIELD]: previewKeys }
         : {}),
@@ -642,7 +642,7 @@ export class ChatService {
       where: {
         id: noteId,
         status: { not: 'DELETED' },
-        OR: [{ ownerID: senderUserId }, { available: true, status: 'ACTIVE' }],
+        OR: [{ ownerID: senderUserId }, { available: true }],
       },
       select: {
         media: {
@@ -660,12 +660,16 @@ export class ChatService {
 
   /**
    * Walk the collect chain from a note the sender may read up to its root and
-   * report the root's live state in the chat-card vocabulary.
+   * report the root's live state in the chat-card vocabulary, plus whether
+   * others may still receive its content (not deleted, available; 下架 is).
    */
   private async resolveNoteCardSourceState(
     viewerID: string,
     noteId: string,
-  ): Promise<NoteCardSourceState | null> {
+  ): Promise<{
+    state: NoteCardSourceState;
+    distributable: boolean;
+  } | null> {
     const select = {
       id: true,
       status: true,
@@ -677,7 +681,7 @@ export class ChatService {
       where: {
         id: noteId,
         status: { not: 'DELETED' },
-        OR: [{ ownerID: viewerID }, { available: true, status: 'ACTIVE' }],
+        OR: [{ ownerID: viewerID }, { available: true }],
       },
       select,
     });
@@ -698,16 +702,21 @@ export class ChatService {
       seen.add(parent.id);
       current = parent;
     }
+    // 下架(UNLISTED)报真实状态;不可见(available=false)的沿用 UNLISTED,不露更多。
+    const distributable = current.status !== 'DELETED' && current.available;
     const publicationStatus: NoteCardSourceState['publicationStatus'] =
       current.status === 'DELETED'
         ? 'DELETED'
-        : current.status === 'ACTIVE' && current.available
-          ? 'ACTIVE'
+        : distributable
+          ? current.status
           : 'UNLISTED';
     return {
-      sourceNoteId: current.id,
-      workStatus: current.workStatus ?? 'UNSET',
-      publicationStatus,
+      state: {
+        sourceNoteId: current.id,
+        workStatus: current.workStatus ?? 'UNSET',
+        publicationStatus,
+      },
+      distributable,
     };
   }
 
@@ -753,7 +762,7 @@ export class ChatService {
         where: {
           id: currentID,
           status: { not: 'DELETED' },
-          OR: [{ ownerID: viewerID }, { available: true, status: 'ACTIVE' }],
+          OR: [{ ownerID: viewerID }, { available: true }],
         },
         select: {
           sections: true,

@@ -4,7 +4,6 @@ import { NoteController } from './note.controller';
 describe('NoteController', () => {
   const noteService = {
     listNotes: jest.fn(),
-    listDeletedNotes: jest.fn(),
     createNoteExport: jest.fn(),
     revokeShareLink: jest.fn(),
     listShareLinks: jest.fn(),
@@ -66,7 +65,7 @@ describe('NoteController', () => {
     });
   });
 
-  // app 依赖 GET /note 与 GET /note/recycle-bin 的响应体是数组：截断信号只能走
+  // app 依赖 GET /note 的响应体是数组：截断信号只能走
   // X-Has-More 响应头，不能把响应体改成 { items, hasMore }。
   it('returns the note array from GET /note and flags truncation in X-Has-More', async () => {
     const rows = [{ id: 'note-1' }];
@@ -81,30 +80,8 @@ describe('NoteController', () => {
     expect(res.setHeader).toHaveBeenCalledWith('X-Has-More', 'true');
   });
 
-  it('returns the recycle-bin array and sets X-Has-More=false when nothing was cut', async () => {
-    noteService.listDeletedNotes.mockResolvedValueOnce({
-      items: [],
-      hasMore: false,
-    });
-    const res = { setHeader: jest.fn() };
-    const controller = new NoteController(noteService as any, {} as any);
-
-    const result = await controller.listDeleted(
-      { page: 1, limit: 500 } as any,
-      req,
-      res as any,
-    );
-
-    expect(noteService.listDeletedNotes).toHaveBeenCalledWith('user-1', 1, 500);
-    expect(result).toEqual([]);
-    expect(res.setHeader).toHaveBeenCalledWith('X-Has-More', 'false');
-  });
-
-  it('documents the X-Has-More header on both list routes', () => {
-    for (const handler of [
-      NoteController.prototype.listNotes,
-      NoteController.prototype.listDeleted,
-    ]) {
+  it('documents the X-Has-More header on the list route', () => {
+    for (const handler of [NoteController.prototype.listNotes]) {
       const operation = Reflect.getMetadata(
         'swagger/apiOperation',
         handler,

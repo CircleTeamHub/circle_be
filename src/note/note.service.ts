@@ -22,7 +22,6 @@ import PDFDocument from 'pdfkit';
 import { Prisma } from 'src/generated/prisma';
 import { PrismaService } from 'src/prisma/prisma.service';
 import { MembershipPolicyService } from 'src/membership/membership-policy.service';
-import { purgeDeletedNote } from './note-purge';
 import {
   NOTE_MEDIA_TYPE_LIMITS,
   countNoteMediaByType,
@@ -35,6 +34,7 @@ import {
   NoteSummaryProjectionRow,
   noteSummaryProjectionQuery,
 } from './note-summary.query';
+import { noteRankingQuery } from './note-ranking.query';
 import {
   ChatCircleSyncService,
   DISABLED_ADMIN_STATES,
@@ -84,6 +84,8 @@ import {
   NoteExportResultDto,
   NoteGroupDto,
   NoteMediaType,
+  NoteRankingDto,
+  NoteRankingQueryDto,
   NoteSectionsDto,
   NoteSectionsResponseDto,
   SaveNoteDraftDto,
@@ -107,6 +109,7 @@ import {
   ZERO_RATING_COUNTERS,
   type NoteRatingCounters,
 } from 'src/note-rating/note-rating-counters';
+import { ratingCalendar } from 'src/note-rating/note-rating-calendar';
 
 // ── BlockNote inline content types ───────────────────────────────────────────
 // These mirror the BlockNote default schema as documented at
@@ -195,6 +198,7 @@ type NoteDraftRow = {
   content: string | null;
   contentJson: unknown;
   sections: unknown;
+  city: string | null;
   groupIDs: string[];
   mediaKeys: string[];
   createdAt: Date;
@@ -209,11 +213,13 @@ type NoteRow = {
   contentJson: unknown;
   sections: unknown;
   status: NoteStatus;
+  unlistedAt: Date | null;
   available: boolean;
   workStatus: NoteWorkStatus | null;
   sourceConversationID?: string | null;
   pinned: boolean;
   remark?: string | null;
+  city: string | null;
   imageCount: number;
   videoCount: number;
   audioCount: number;
@@ -312,7 +318,7 @@ const NOTE_INCLUDE = {
 } as const;
 
 /**
- * 列表摘要（listNotes / listDeletedNotes / resolveShareLink）专用的 select：只取标量列
+ * 列表摘要（listNotes / 群绑定列表 / 榜单 / resolveShareLink）专用的 select：只取标量列
  * 与分组。正文、contentJson、sections、全部 media 不搬回来 —— 摘要要的派生字段由
  * noteSummaryProjectionQuery 在 SQL 里算（见 note-summary.query.ts）。
  */
@@ -321,11 +327,13 @@ const NOTE_SUMMARY_SELECT = {
   ownerID: true,
   title: true,
   status: true,
+  unlistedAt: true,
   available: true,
   workStatus: true,
   sourceConversationID: true,
   pinned: true,
   remark: true,
+  city: true,
   imageCount: true,
   videoCount: true,
   audioCount: true,
@@ -348,11 +356,13 @@ type NoteSummaryBase = Pick<
   | 'ownerID'
   | 'title'
   | 'status'
+  | 'unlistedAt'
   | 'available'
   | 'workStatus'
   | 'sourceConversationID'
   | 'pinned'
   | 'remark'
+  | 'city'
   | 'imageCount'
   | 'videoCount'
   | 'audioCount'
@@ -388,6 +398,21 @@ type CollectedStateFields = Pick<
   // 必填:漏 select 这一列时类型直接报错,不会静默退回逐层走收藏链。
   rootSourceNoteID: string | null;
 };
+
+/** 下架满这么久（绝对时长，不按上海日历）由 NoteCleanup 永久删除。 */
+export const NOTE_UNLISTED_RETENTION_MS = 60 * 24 * 60 * 60 * 1000;
+
+/**
+ * 写入状态时的 unlistedAt：进入下架才起算 60 天；已经在下架的再设一遍（含编辑时
+ * 带回原状态）不续期；回到上架清空。
+ */
+function nextUnlistedAt(
+  next: NoteWritableStatus,
+  current?: { status: NoteStatus; unlistedAt: Date | null } | null,
+): Date | null {
+  if (next === 'ACTIVE') return null;
+  return current?.status === 'UNLISTED' ? current.unlistedAt : new Date();
+}
 
 const MAX_GROUPS_PER_USER = 50;
 // Discarded IDs prevent delayed autosaves for 30 days. Published outcomes never
@@ -668,6 +693,7 @@ export class NoteService implements NoteCardProjector {
       id: row.clientDraftID,
       sourceNoteId: row.sourceNoteID ?? null,
       title: row.title,
+      city: row.city,
       contentPreview: this.buildPreview(previewSource),
       mediaCount: row.mediaKeys.filter(
         (key) => !posterKeys.has(key) || primaryKeys.has(key),
@@ -977,6 +1003,7 @@ export class NoteService implements NoteCardProjector {
             : sliceByCodePoints(input.content, MAX_NOTE_CONTENT_LENGTH),
         contentJson: toPrismaJson(input.contentJson ?? null),
         sections: toPrismaJson(sections ?? null),
+        city: input.city ?? null,
         groupIDs,
         mediaKeys: inventoryKeys,
       };
@@ -1057,6 +1084,7 @@ export class NoteService implements NoteCardProjector {
       content: null,
       contentJson: Prisma.DbNull,
       sections: Prisma.DbNull,
+      city: null,
       groupIDs: [],
       mediaKeys: [],
     };
@@ -1260,7 +1288,7 @@ export class NoteService implements NoteCardProjector {
   }
 
   /**
-   * 归属校验：笔记是调用者的、且不在回收站，否则 404。调用方都只要这个结论（写入
+   * 归属校验：笔记是调用者的、且未删除，否则 404。调用方都只要这个结论（写入
    * 本身再带 ownerID + status 守卫防 TOCTOU），所以只取 id —— 不要再 include
    * NOTE_INCLUDE：正文、contentJson、sections、全部 media 与分组成员共四条查询，
    * 读完就丢。
@@ -2795,7 +2823,7 @@ export class NoteService implements NoteCardProjector {
       rows.forEach((row) => states.set(row.id, row));
     }
 
-    // 收录链上的笔记被永久删除（回收站「立即删除」或 30 天到期清理）后整行消失，
+    // 收录链上的笔记被永久删除（主人删除 / 下架满 60 天，由 NoteCleanup 删行）后整行消失，
     // 但 collectedFromNoteID 是普通列、仍指着它。查过却查不到的来源只能是被硬删了，
     // 按 DELETED 处理：不能因为「找不到父级」就退回副本自己的 ACTIVE 状态，
     // 让第三方在原笔记删除后还能读、分享、导出、再收藏副本。
@@ -2849,9 +2877,10 @@ export class NoteService implements NoteCardProjector {
    * Non-owner gate for collected copies. A copy keeps its own row (stored as
    * ACTIVE/available), so the row-level `readableByViewer` filter alone would
    * let anyone keep reading, exporting, forwarding or re-collecting it after
-   * the boss unlisted or deleted the source. The live root state decides:
-   * outside the owner, a copy is only reachable while its root is ACTIVE and
-   * available. CLOSED is a work-status reminder, not a distribution block.
+   * the boss hid or deleted the source. The live root state decides:
+   * outside the owner, a copy is only reachable while its root is not deleted
+   * and still available. 下架 (UNLISTED) and CLOSED are labels the reader sees,
+   * not distribution blocks.
    * Returns the note with the root state overlaid.
    */
   private async requireDistributableForViewer(
@@ -2872,7 +2901,7 @@ export class NoteService implements NoteCardProjector {
   /** Root-overlaid state check shared by single reads and share-link lists. */
   private isDistributable(effective: CollectedStateFields): boolean {
     if (!effective.collectedFromNoteID) return true;
-    return effective.status === 'ACTIVE' && effective.available;
+    return effective.status !== 'DELETED' && effective.available;
   }
 
   private assertExportMediaWithinLimits(media: NoteMediaRow[]) {
@@ -2963,8 +2992,11 @@ export class NoteService implements NoteCardProjector {
       ownerId: note.ownerID,
       canEdit: isOwner,
       title: note.title,
+      // 城市是公开的店铺信息（榜单按它筛选），不像 remark 那样只给主人。
+      city: note.city,
       contentPreview: facts.contentPreview,
       status: note.status,
+      unlistedAt: note.unlistedAt,
       available: note.available,
       workStatus: note.workStatus ?? null,
       sourceConversationID: isOwner
@@ -3519,9 +3551,11 @@ export class NoteService implements NoteCardProjector {
             content: derived.content,
             contentJson: toPrismaJson(derived.contentJson),
             sections: toPrismaJson(derived.sections),
+            city: canonicalInput.city ?? null,
             sourceConversationID: binding?.conversationID ?? null,
             groupID: null,
             status: canonicalInput.status ?? 'ACTIVE',
+            unlistedAt: nextUnlistedAt(canonicalInput.status ?? 'ACTIVE'),
             available: true,
             pinned: canonicalInput.pinned ?? false,
             ...counts,
@@ -3639,8 +3673,8 @@ export class NoteService implements NoteCardProjector {
 
   /**
    * 群成员只读查看本群绑定的来源笔记和它们的场地状态(开工/打烊/下架)。
-   * 只给在座成员;只列上架且可见的来源笔记 —— 作者把笔记本身下架(UNLISTED)
-   * 就是不想让别人看到,这里不能绕过 readableByViewer 的口径。
+   * 只给在座成员;口径同 readableByViewer 的非主人分支:下架(UNLISTED)的照常列出、
+   * 带着真实状态,主人设成不可见(available=false)的不列。
    */
   async listGroupBoundNotes(
     viewerID: string,
@@ -3660,7 +3694,7 @@ export class NoteService implements NoteCardProjector {
       where: {
         sourceConversationID: conversationID,
         collectedFromNoteID: null,
-        status: 'ACTIVE',
+        status: { not: 'DELETED' },
         available: true,
       },
       select: NOTE_SUMMARY_SELECT,
@@ -3668,6 +3702,34 @@ export class NoteService implements NoteCardProjector {
       take: GROUP_BOUND_NOTES_MAX,
     });
     return this.mapSummaryListResolved(notes, viewerID);
+  }
+
+  /**
+   * 大众点评月榜：本月好评最多的原笔记（可按城市筛）。资格与排序都在 noteRankingQuery
+   * 里做完；这里按名次读摘要行，用请求者视角映射（他人笔记的备注、名片照常隐藏）。
+   */
+  async getNoteRanking(
+    viewerID: string,
+    query: NoteRankingQueryDto,
+  ): Promise<NoteRankingDto> {
+    const { month } = ratingCalendar(new Date());
+    const city = query.city ?? null;
+    const ranked = await this.prisma.$queryRaw<Array<{ id: string }>>(
+      noteRankingQuery({ month, city, limit: query.limit }),
+    );
+    if (ranked.length === 0) return { month, city, items: [] };
+    const rows = await this.prisma.note.findMany({
+      where: { id: { in: ranked.map((row) => row.id) } },
+      select: NOTE_SUMMARY_SELECT,
+    });
+    const byId = new Map(rows.map((row) => [row.id, row]));
+    // 两次读取之间被永久删除的笔记直接少一名。
+    const ordered = ranked.flatMap((row) => byId.get(row.id) ?? []);
+    return {
+      month,
+      city,
+      items: await this.mapSummaryListResolved(ordered, viewerID),
+    };
   }
 
   /** 助手提醒附带名片用:只读收藏者自己、未删除的那份;没有就返回 null。 */
@@ -3885,10 +3947,10 @@ export class NoteService implements NoteCardProjector {
     const search = link.search?.trim();
     return {
       ownerID: link.ownerID,
-      // status 快照只可能是 ACTIVE / UNLISTED（NOTE_WRITABLE_STATUS）。没存快照时只露
-      // ACTIVE：UNLISTED 是主人藏起来的笔记，与 getNote 的非主人分支、访客读卡片同一
-      // 口径；主人显式存了 UNLISTED 快照才按快照放行。
-      status: link.status ?? ('ACTIVE' as const),
+      // status 快照只可能是 ACTIVE / UNLISTED（NOTE_WRITABLE_STATUS），是主人分享时
+      // 所在列表（上架 / 已下架）的筛选，照旧生效。没存快照时上架与下架都露：下架的
+      // 笔记他人照常可读（与 getNote 的非主人分支、访客读卡片同一口径），带真实状态。
+      status: link.status ?? { not: 'DELETED' as const },
       available: true,
       ...(link.noteIDs.length > 0 ? { id: { in: link.noteIDs } } : {}),
       // group 与 groupID 在 createShareLink 里互斥，两个分支不会同时命中。
@@ -4024,15 +4086,17 @@ export class NoteService implements NoteCardProjector {
   }
 
   /**
-   * 「谁能凭 UUID 读到这条笔记」的唯一口径：主人读自己的任何未删笔记；其他人
-   * 只能读 available 且 ACTIVE 的。UNLISTED 以前只是「不出现在列表里」——
-   * available=true 的 UNLISTED 笔记任何人拿到 UUID 就能读、能收藏、能导出、
-   * 能复制媒体，主人特意隐藏的内容其实并没有藏住。四条读路径共用这一片段，
-   * 免得日后某一条又悄悄放宽。
+   * 「谁能凭 UUID 读到这条笔记」的唯一口径：主人读自己的任何未删笔记；其他人能读
+   * available 的上架或下架笔记 —— 下架（UNLISTED）只是给读者看的状态（2026-11 两种
+   * 下架合并，口径同以前的场地「下架」），主人要藏起来用 available=false。调用方都另带
+   * status <> DELETED。读、收藏、导出、复制媒体、来源状态共用这一片段。
    */
   private readableByViewer(viewerID: string): Prisma.NoteWhereInput {
     return {
-      OR: [{ ownerID: viewerID }, { available: true, status: 'ACTIVE' }],
+      OR: [
+        { ownerID: viewerID },
+        { available: true, status: { not: 'DELETED' } },
+      ],
     };
   }
 
@@ -4262,11 +4326,11 @@ export class NoteService implements NoteCardProjector {
    */
   async getSharedNoteForGuest(noteId: string): Promise<NoteDetailDto> {
     // 访客没有「自己的笔记」分支：与 readableByViewer 的非主人分支同口径，
-    // 只放行 ACTIVE 且 available 的笔记，UNLISTED 不可读。
+    // 上架、下架（UNLISTED）都可读，主人设成不可见的不行。
     const note = await this.prisma.note.findFirst({
       where: {
         id: noteId,
-        status: 'ACTIVE',
+        status: { not: 'DELETED' },
         available: true,
       },
       include: NOTE_INCLUDE,
@@ -4693,7 +4757,7 @@ export class NoteService implements NoteCardProjector {
   /**
    * 聊天笔记卡片读时的内容投影(见 src/chat/note-card-projector.ts):与「我的笔记」列表
    * 同一套摘要算法(mapSummaryListResolved),用访客视角 —— 主人的备注、分组、名片、
-   * 来源都不带;封面现签。只投影此刻 ACTIVE + available 的笔记。
+   * 来源都不带;封面现签。只投影此刻他人可读(未删除 + available,含下架)的笔记。
    */
   async projectChatNoteCards(
     noteIds: readonly string[],
@@ -4702,7 +4766,7 @@ export class NoteService implements NoteCardProjector {
     const result = new Map<string, NoteCardProjection>();
     if (ids.length === 0) return result;
     const notes = await this.prisma.note.findMany({
-      where: { id: { in: ids }, status: 'ACTIVE', available: true },
+      where: { id: { in: ids }, status: { not: 'DELETED' }, available: true },
       select: NOTE_SUMMARY_SELECT,
     });
     if (notes.length === 0) return result;
@@ -4779,14 +4843,16 @@ export class NoteService implements NoteCardProjector {
           ...ZERO_RATING_COUNTERS,
         };
       }
+      // 他人可读 = 未删除且 available：报真实状态（下架就是 UNLISTED）。不可见的
+      // 同样报 UNLISTED、不露场地状态，与查不到的一样（不当存在性探针）。
+      const readable = note.status !== 'DELETED' && note.available;
       const publicationStatus: NoteSourceStateDto['publicationStatus'] =
         note.status === 'DELETED'
           ? 'DELETED'
-          : note.status === 'ACTIVE' && note.available
-            ? 'ACTIVE'
+          : readable
+            ? note.status
             : 'UNLISTED';
-      const revealWorkStatus =
-        publicationStatus === 'ACTIVE' || note.ownerID === viewerID;
+      const revealWorkStatus = readable || note.ownerID === viewerID;
       return {
         noteId,
         workStatus: revealWorkStatus ? (note.workStatus ?? 'UNSET') : 'UNSET',
@@ -4916,6 +4982,7 @@ export class NoteService implements NoteCardProjector {
               content: source.content,
               contentJson: toPrismaJson(source.contentJson),
               sections: toPrismaJson(copiedSections),
+              city: source.city,
               groupID: null,
               status: 'ACTIVE',
               available: true,
@@ -5220,12 +5287,13 @@ export class NoteService implements NoteCardProjector {
         Array<{
           id: string;
           status: NoteStatus;
+          unlistedAt: Date | null;
           sections: unknown;
           collectedFromNoteID: string | null;
           sourceConversationID: string | null;
         }>
       >`
-        SELECT "id", "status", "sections", "collectedFromNoteID",
+        SELECT "id", "status", "unlistedAt", "sections", "collectedFromNoteID",
                "sourceConversationID"
         FROM "Note"
         WHERE "id" = ${noteId} AND "ownerID" = ${ownerID}
@@ -5304,10 +5372,16 @@ export class NoteService implements NoteCardProjector {
               : derived.sections,
           ),
           ...(binding ? { sourceConversationID: binding.conversationID } : {}),
+          // 与正文/分区一样整份替换：请求里不带 city 就是清空。
+          city: canonicalInput.city ?? null,
           groupID: null,
           // Preserve the existing status when the caller omits it — omitting
           // status on a PATCH must not silently promote an UNLISTED note to ACTIVE.
           status: canonicalInput.status ?? existing.status,
+          unlistedAt: nextUnlistedAt(
+            canonicalInput.status ?? (existing.status as NoteWritableStatus),
+            existing,
+          ),
           pinned: canonicalInput.pinned ?? false,
           coverMediaID,
           ...counts,
@@ -5417,24 +5491,12 @@ export class NoteService implements NoteCardProjector {
     });
   }
 
-  async setAvailable(ownerID: string, noteId: string, available: boolean) {
-    const owned = await this.requireOwnedNote(ownerID, noteId);
-    const rootNoteID = this.noteRootID(owned);
-    // Include ownerID + status guard in the write to close the TOCTOU window.
-    return this.prisma.$transaction(async (tx) => {
-      const result = await tx.note.update({
-        where: { id: noteId, ownerID, status: { not: 'DELETED' } },
-        data: { available },
-        select: {
-          id: true,
-          available: true,
-        },
-      });
-      await this.enqueueSourceStatusFanout(tx, rootNoteID);
-      return result;
-    });
-  }
-
+  /**
+   * 群「笔记管理」里开工 / 打烊 / 下架是三个互斥按钮：
+   * - OFF_SHELF（旧版 app 的「下架」）= 下架，与 PATCH status=UNLISTED 同一写法，场地状态清空；
+   * - 下架中按开工 / 打烊 = 重新上架并设成该状态；
+   * - null 只清场地状态，下架的仍下架。
+   */
   async setWorkStatus(
     ownerID: string,
     noteId: string,
@@ -5445,15 +5507,25 @@ export class NoteService implements NoteCardProjector {
     return this.prisma.$transaction(async (tx) => {
       const before = await tx.note.findUnique({
         where: { id: noteId },
-        select: { workStatus: true },
+        select: { status: true, unlistedAt: true, workStatus: true },
       });
+      const nextWorkStatus = workStatus === 'OFF_SHELF' ? null : workStatus;
+      let status: NoteWritableStatus | undefined;
+      if (workStatus === 'OFF_SHELF') status = 'UNLISTED';
+      else if (workStatus !== null && before?.status === 'UNLISTED')
+        status = 'ACTIVE';
       // 收藏者只在开工/打烊真的切换时收到助手提醒;原样再设一遍或清成 null 不算。
       const workStatusChanged =
-        workStatus !== null && workStatus !== before?.workStatus;
+        nextWorkStatus !== null && nextWorkStatus !== before?.workStatus;
       const result = await tx.note.update({
         where: { id: noteId, ownerID, status: { not: 'DELETED' } },
-        data: { workStatus },
-        select: { id: true, workStatus: true },
+        data: {
+          workStatus: nextWorkStatus,
+          ...(status
+            ? { status, unlistedAt: nextUnlistedAt(status, before) }
+            : {}),
+        },
+        select: { id: true, status: true, workStatus: true, unlistedAt: true },
       });
       await this.enqueueSourceStatusFanout(tx, rootNoteID, workStatusChanged);
       return result;
@@ -5789,12 +5861,17 @@ export class NoteService implements NoteCardProjector {
     const rootNoteID = this.noteRootID(owned);
     // Include ownerID + status guard in the write to close the TOCTOU window.
     return this.prisma.$transaction(async (tx) => {
+      const before = await tx.note.findUnique({
+        where: { id: noteId },
+        select: { status: true, unlistedAt: true },
+      });
       const result = await tx.note.update({
         where: { id: noteId, ownerID, status: { not: 'DELETED' } },
-        data: { status },
+        data: { status, unlistedAt: nextUnlistedAt(status, before) },
         select: {
           id: true,
           status: true,
+          unlistedAt: true,
         },
       });
       await this.enqueueSourceStatusFanout(tx, rootNoteID);
@@ -5802,118 +5879,16 @@ export class NoteService implements NoteCardProjector {
     });
   }
 
-  /** FE#92 回收站：已软删笔记列表（新删在前）。 */
-  async listDeletedNotes(
-    ownerID: string,
-    page = 1,
-    limit = NOTE_LIST_DEFAULT_LIMIT,
-  ): Promise<NoteSummaryPage> {
-    const take = Math.min(limit, NOTE_LIST_DEFAULT_LIMIT);
-    const notes = await this.prisma.note.findMany({
-      where: { ownerID, status: 'DELETED' },
-      orderBy: { updatedAt: 'desc' },
-      // 多取一行只为判断 hasMore，不返回给调用方。
-      take: take + 1,
-      skip: (page - 1) * take,
-      select: NOTE_SUMMARY_SELECT,
-    });
-    return this.toSummaryPage(notes, take, ownerID);
-  }
-
   /**
-   * FE#92 回收站：恢复软删笔记 → ACTIVE。deleteNote 未记录删除前状态
-   * （UNLISTED/ACTIVE 无从区分），统一回 ACTIVE —— 用户在列表里可再手动隐藏。
+   * 删除即永久（2026-11 起没有回收站）：先标成 DELETED —— 所有读路径都排除它，
+   * 对所有人立刻消失，并广播给收藏者与聊天卡片 —— 行与媒体行由 NoteCleanup
+   * 几分钟内物理删除（purgeDeletedNote，收录链改指向在那里做）。
    */
-  async restoreNote(ownerID: string, noteId: string): Promise<void> {
-    // round 3 review：收藏复制的笔记受「同源活跃副本唯一」局部索引约束 ——
-    // 删除旧副本→再次收藏→恢复旧副本会撞唯一索引，裂成一个裸 DB 冲突。
-    // 先查同源活跃副本，命中给可控 409。
-    const target = await this.prisma.note.findFirst({
-      where: { id: noteId, ownerID, status: 'DELETED' },
-      select: {
-        id: true,
-        collectedFromNoteID: true,
-        rootSourceNoteID: true,
-      },
-    });
-    if (!target) {
-      throw new NotFoundException({
-        message: 'Note not found',
-        errorCode: NoteErrorCode.NotFound,
-      });
-    }
-    if (target.collectedFromNoteID) {
-      const activeDuplicate = await this.prisma.note.findFirst({
-        where: {
-          ownerID,
-          collectedFromNoteID: target.collectedFromNoteID,
-          status: { not: 'DELETED' },
-          id: { not: noteId },
-        },
-        select: { id: true },
-      });
-      if (activeDuplicate) {
-        throw new ConflictException({
-          message: '该笔记的另一份收藏副本已存在，无需恢复',
-          errorCode: NoteErrorCode.AlreadyCollected,
-        });
-      }
-    }
-    let result: { count: number };
-    try {
-      result = await runSerializableTransaction(this.prisma, async (tx) => {
-        await this.membershipPolicy.lockUsers(tx, [ownerID]);
-        // Restoring a soft-deleted note re-consumes a storage slot, so it must
-        // pass the same quota gate as create/collect under the user lock —
-        // otherwise delete → create replacements → restore old ones grows past
-        // the cap, and concurrent restores could cross the boundary together.
-        await this.assertNoteStorageAvailable(tx, ownerID);
-        const restored = await tx.note.updateMany({
-          where: { id: noteId, ownerID, status: 'DELETED' },
-          data: { status: 'ACTIVE' },
-        });
-        if (restored.count > 0) {
-          await this.enqueueSourceStatusFanout(tx, this.noteRootID(target));
-        }
-        return restored;
-      });
-    } catch (error) {
-      if (prismaErrorCode(error) === 'P2002') {
-        throw new ConflictException({
-          message: '该笔记的另一份收藏副本已存在，无需恢复',
-          errorCode: NoteErrorCode.AlreadyCollected,
-        });
-      }
-      throw error;
-    }
-    if (result.count === 0) {
-      throw new NotFoundException({
-        message: 'Note not found',
-        errorCode: NoteErrorCode.NotFound,
-      });
-    }
-  }
-
-  /**
-   * 回收站「立即删除」：不等 30 天，直接永久删除。与到期清理共用
-   * purgeDeletedNote（收录链改指向、媒体对象保留等语义见那里）。
-   * 只认自己回收站里的笔记（status=DELETED），正常/下架笔记必须先删进回收站。
-   */
-  async purgeNote(ownerID: string, noteId: string): Promise<void> {
-    const removed = await purgeDeletedNote(this.prisma, noteId, { ownerID });
-    if (!removed) {
-      throw new NotFoundException({
-        message: 'Note not found',
-        errorCode: NoteErrorCode.NotFound,
-      });
-    }
-  }
-
   async deleteNote(ownerID: string, noteId: string): Promise<void> {
     const owned = await this.requireOwnedNote(ownerID, noteId);
     const rootNoteID = this.noteRootID(owned);
     // Include ownerID + status in the write to close the TOCTOU window, for
-    // parity with setPinned / setAvailable.
+    // parity with setPinned / setStatus.
     await this.prisma.$transaction(async (tx) => {
       await tx.note.update({
         where: { id: noteId, ownerID, status: { not: 'DELETED' } },
@@ -5921,6 +5896,30 @@ export class NoteService implements NoteCardProjector {
         select: { id: true },
       });
       await this.enqueueSourceStatusFanout(tx, rootNoteID);
+    });
+  }
+
+  /**
+   * NoteCleanup 用：下架满 60 天的笔记按主人删除同样处理（标 DELETED + 广播），随后与其它
+   * 已删除笔记一起物理删除。条件写在 UPDATE 里：查出候选之后被重新上架、又被下架
+   * （unlistedAt 变新）的都不动。返回是否标记了。
+   */
+  async expireUnlistedNote(
+    note: { id: string; rootSourceNoteID: string | null },
+    unlistedBefore: Date,
+  ): Promise<boolean> {
+    return this.prisma.$transaction(async (tx) => {
+      const { count } = await tx.note.updateMany({
+        where: {
+          id: note.id,
+          status: 'UNLISTED',
+          unlistedAt: { lte: unlistedBefore },
+        },
+        data: { status: 'DELETED' },
+      });
+      if (count > 0)
+        await this.enqueueSourceStatusFanout(tx, this.noteRootID(note));
+      return count > 0;
     });
   }
 

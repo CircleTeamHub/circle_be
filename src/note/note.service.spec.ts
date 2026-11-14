@@ -1,6 +1,5 @@
 import { ChatService } from 'src/chat/chat.service';
 import { Test, TestingModule } from '@nestjs/testing';
-import * as notePurge from './note-purge';
 import {
   BadRequestException,
   ConflictException,
@@ -1585,24 +1584,6 @@ describe('NoteService', () => {
     expect(page.hasMore).toBe(false);
   });
 
-  it('lists up to 500 recycle-bin notes by default and reports hasMore', async () => {
-    prisma.note.findMany.mockResolvedValueOnce(
-      Array.from({ length: 501 }, (_, index) => listRow(index, 'DELETED')),
-    );
-
-    const page = await service.listDeletedNotes('user-1');
-
-    expect(prisma.note.findMany).toHaveBeenCalledWith(
-      expect.objectContaining({
-        where: { ownerID: 'user-1', status: 'DELETED' },
-        take: 501,
-        skip: 0,
-      }),
-    );
-    expect(page.items).toHaveLength(500);
-    expect(page.hasMore).toBe(true);
-  });
-
   it('fails note reads with 503 instead of exposing an unsigned media URL', async () => {
     prisma.note.findMany.mockResolvedValueOnce([
       {
@@ -1643,9 +1624,12 @@ describe('NoteService', () => {
 
   // 列表摘要只取标量列，派生字段走 SQL 投影；摘要里唯一的媒体 url 是封面，只签它。
   describe('listGroupBoundNotes (members see the group bound notes read-only)', () => {
-    it('lists only active, visible source notes bound to the group', async () => {
+    it('lists available source notes bound to the group, 下架 ones included', async () => {
       prisma.chatMember.findUnique.mockResolvedValueOnce({ leftAt: null });
-      prisma.note.findMany.mockResolvedValueOnce([listRow(0)]);
+      prisma.note.findMany.mockResolvedValueOnce([
+        listRow(0),
+        listRow(1, 'UNLISTED'),
+      ]);
 
       const items = await service.listGroupBoundNotes('viewer-1', 'conv-1');
 
@@ -1658,13 +1642,17 @@ describe('NoteService', () => {
         },
         select: { leftAt: true },
       });
+      // 下架（UNLISTED）的照常列出（带真实状态），不可见的、已删除的不列。
       expect(prisma.note.findMany.mock.calls[0][0].where).toEqual({
         sourceConversationID: 'conv-1',
         collectedFromNoteID: null,
-        status: 'ACTIVE',
+        status: { not: 'DELETED' },
         available: true,
       });
-      expect(items.map((item) => item.id)).toEqual(['note-0']);
+      expect(items.map((item) => [item.id, item.status])).toEqual([
+        ['note-0', 'ACTIVE'],
+        ['note-1', 'UNLISTED'],
+      ]);
     });
 
     it.each([
@@ -1739,7 +1727,10 @@ describe('NoteService', () => {
     });
 
     it.each([
-      ['listDeletedNotes', () => service.listDeletedNotes('user-1')],
+      [
+        'listGroupBoundNotes',
+        () => service.listGroupBoundNotes('user-1', 'conv-1'),
+      ],
       [
         'resolveShareLink',
         () => {
@@ -1855,7 +1846,10 @@ describe('NoteService', () => {
         where: {
           id: 'note-1',
           status: { not: 'DELETED' },
-          OR: [{ ownerID: 'user-1' }, { available: true, status: 'ACTIVE' }],
+          OR: [
+            { ownerID: 'user-1' },
+            { available: true, status: { not: 'DELETED' } },
+          ],
         },
       }),
     );
@@ -1894,7 +1888,10 @@ describe('NoteService', () => {
         where: {
           id: 'note-1',
           status: { not: 'DELETED' },
-          OR: [{ ownerID: 'user-2' }, { available: true, status: 'ACTIVE' }],
+          OR: [
+            { ownerID: 'user-2' },
+            { available: true, status: { not: 'DELETED' } },
+          ],
         },
       }),
     );
@@ -1907,9 +1904,39 @@ describe('NoteService', () => {
     });
   });
 
-  it('hides an unlisted note from non-owners even when it is marked available', async () => {
-    // UNLISTED 以前只是「不出现在列表里」：available=true 的 UNLISTED 笔记任何人
-    // 拿到 UUID 就能读。非主人分支必须同时要求 ACTIVE；主人分支保持不变。
+  // 2026-11 两种下架合并：下架（UNLISTED）的笔记他人照常可读、带真实状态；
+  // 主人要藏起来用 available=false —— 非主人分支只放行 available 的。
+  it('lets non-owners read a 下架 note with its real UNLISTED status', async () => {
+    prisma.note.findFirst.mockResolvedValueOnce({
+      id: 'note-1',
+      ownerID: 'user-1',
+      title: '下架的笔记',
+      content: '完整正文',
+      status: 'UNLISTED',
+      unlistedAt: new Date('2026-11-01T00:00:00.000Z'),
+      available: true,
+      pinned: false,
+      imageCount: 0,
+      videoCount: 0,
+      mediaCount: 0,
+      groupMemberships: [],
+      media: [],
+      coverMedia: null,
+      createdAt: new Date(),
+      updatedAt: new Date(),
+    });
+
+    const result = await service.getNote('user-2', 'note-1');
+
+    expect(result).toMatchObject({
+      id: 'note-1',
+      canEdit: false,
+      status: 'UNLISTED',
+      unlistedAt: new Date('2026-11-01T00:00:00.000Z'),
+    });
+  });
+
+  it('hides a note marked unavailable from non-owners', async () => {
     prisma.note.findFirst.mockResolvedValueOnce(null);
 
     await expect(service.getNote('user-2', 'note-1')).rejects.toThrow(
@@ -1920,7 +1947,10 @@ describe('NoteService', () => {
         where: {
           id: 'note-1',
           status: { not: 'DELETED' },
-          OR: [{ ownerID: 'user-2' }, { available: true, status: 'ACTIVE' }],
+          OR: [
+            { ownerID: 'user-2' },
+            { available: true, status: { not: 'DELETED' } },
+          ],
         },
       }),
     );
@@ -1956,9 +1986,9 @@ describe('NoteService', () => {
     });
   });
 
-  it('refuses to export another user unlisted note even when it is marked available', async () => {
-    // 导出与 getNote 共用 readableByViewer：非主人只能导出 available 且 ACTIVE 的笔记，
-    // 否则主人隐藏（UNLISTED）的内容换个入口仍能被整份打包带走。
+  it('refuses to export another user note that is marked unavailable', async () => {
+    // 导出与 getNote 共用 readableByViewer：非主人只能导出 available 的（上架或下架）笔记，
+    // 否则主人隐藏（available=false）的内容换个入口仍能被整份打包带走。
     prisma.note.findFirst.mockResolvedValueOnce(null);
 
     await expect(
@@ -1972,7 +2002,10 @@ describe('NoteService', () => {
         where: {
           id: 'note-1',
           status: { not: 'DELETED' },
-          OR: [{ ownerID: 'user-2' }, { available: true, status: 'ACTIVE' }],
+          OR: [
+            { ownerID: 'user-2' },
+            { available: true, status: { not: 'DELETED' } },
+          ],
         },
       }),
     );
@@ -2003,13 +2036,13 @@ describe('NoteService', () => {
 
     const result = await service.getSharedNoteForGuest('note-shared');
 
-    // 访客没有「自己的笔记」分支：只放行 ACTIVE 且 available 的笔记，UNLISTED
-    // 与 getNote 的非主人分支同口径地不可读。
+    // 访客没有「自己的笔记」分支：与 getNote 的非主人分支同口径，上架、下架都可读，
+    // 不可见（available=false）的不行。
     expect(prisma.note.findFirst).toHaveBeenCalledWith(
       expect.objectContaining({
         where: {
           id: 'note-shared',
-          status: 'ACTIVE',
+          status: { not: 'DELETED' },
           available: true,
         },
       }),
@@ -2866,10 +2899,6 @@ describe('NoteService', () => {
       ['setPinned', (s: NoteService) => s.setPinned('user-1', 'note-1', true)],
       ['setRemark', (s: NoteService) => s.setRemark('user-1', 'note-1', 'x')],
       [
-        'setAvailable',
-        (s: NoteService) => s.setAvailable('user-1', 'note-1', false),
-      ],
-      [
         'setStatus',
         (s: NoteService) => s.setStatus('user-1', 'note-1', 'UNLISTED'),
       ],
@@ -2939,29 +2968,6 @@ describe('NoteService', () => {
     });
   });
 
-  it('toggles note availability for the owner only', async () => {
-    prisma.note.findFirst.mockResolvedValueOnce({
-      id: 'note-1',
-      ownerID: 'user-1',
-    });
-    prisma.note.update.mockResolvedValueOnce({
-      id: 'note-1',
-      available: false,
-    });
-
-    const result = await service.setAvailable('user-1', 'note-1', false);
-
-    expect(prisma.note.update).toHaveBeenCalledWith({
-      where: { id: 'note-1', ownerID: 'user-1', status: { not: 'DELETED' } },
-      data: { available: false },
-      select: expect.any(Object),
-    });
-    expect(result).toMatchObject({
-      id: 'note-1',
-      available: false,
-    });
-  });
-
   it('atomically enqueues source status fan-out without scanning or broadcasting in the request', async () => {
     const configured = new NoteService(
       prisma as any,
@@ -2979,12 +2985,16 @@ describe('NoteService', () => {
       collectedFromNoteID: 'parent-note',
       rootSourceNoteID: 'source-note',
     });
+    prisma.note.findUnique.mockResolvedValueOnce({
+      status: 'ACTIVE',
+      unlistedAt: null,
+    });
     prisma.note.update.mockResolvedValueOnce({
       id: 'copy-note',
-      available: false,
+      status: 'UNLISTED',
     });
 
-    await configured.setAvailable('boss', 'copy-note', false);
+    await configured.setStatus('boss', 'copy-note', 'UNLISTED');
 
     expect(prisma.$transaction).toHaveBeenCalledWith(expect.any(Function));
     expect(prisma.note.update).toHaveBeenCalledWith(
@@ -3031,7 +3041,7 @@ describe('NoteService', () => {
 
     expect(prisma.note.update).toHaveBeenCalledWith({
       where: { id: 'note-1', ownerID: 'user-1', status: { not: 'DELETED' } },
-      data: { status: 'UNLISTED' },
+      data: { status: 'UNLISTED', unlistedAt: expect.any(Date) },
       select: expect.any(Object),
     });
     expect(result).toMatchObject({
@@ -3106,7 +3116,8 @@ describe('NoteService', () => {
     );
   });
 
-  it('soft deletes a note', async () => {
+  // 删除即永久：只标 DELETED（对所有人立刻消失）并广播；删行交给 NoteCleanup。
+  it('deletes a note for everyone at once and leaves the rows to the cleanup job', async () => {
     prisma.note.count.mockResolvedValue(51);
     prisma.note.findFirst.mockResolvedValueOnce({
       id: 'note-1',
@@ -3125,12 +3136,13 @@ describe('NoteService', () => {
       select: expect.any(Object),
     });
     expect(prisma.note.count).not.toHaveBeenCalled();
+    expect(prisma.note.deleteMany).not.toHaveBeenCalled();
     expect(prisma.noteStatusFanoutOutbox.upsert).toHaveBeenCalledWith(
       expect.objectContaining({ where: { rootNoteID: 'note-1' } }),
     );
   });
 
-  it('does not restore a soft-deleted note through the writable status path', async () => {
+  it('does not bring a deleted note back through the writable status path', async () => {
     prisma.note.findFirst.mockResolvedValueOnce(null);
 
     await expect(
@@ -3139,6 +3151,253 @@ describe('NoteService', () => {
 
     expect(prisma.note.update).not.toHaveBeenCalled();
     expect(prisma.note.count).not.toHaveBeenCalled();
+  });
+
+  describe('下架 lifecycle (unlistedAt, 60-day auto delete)', () => {
+    const OLD = new Date('2026-10-01T00:00:00.000Z');
+    const owned = {
+      id: 'note-1',
+      ownerID: 'user-1',
+      collectedFromNoteID: null,
+      rootSourceNoteID: null,
+    };
+    const saved = (fields: Record<string, unknown>) => ({
+      id: 'note-1',
+      ownerID: 'user-1',
+      title: 'Shop',
+      content: null,
+      contentJson: null,
+      sections: null,
+      available: true,
+      pinned: false,
+      imageCount: 0,
+      videoCount: 0,
+      mediaCount: 0,
+      groupMemberships: [],
+      media: [],
+      coverMedia: null,
+      createdAt: OLD,
+      updatedAt: OLD,
+      ...fields,
+    });
+    const written = () => prisma.note.update.mock.calls[0][0].data;
+
+    it.each([
+      ['UNLISTED', true],
+      ['ACTIVE', false],
+      [undefined, false],
+    ] as const)(
+      'createNote with status %p stamps unlistedAt: %p',
+      async (status, stamped) => {
+        prisma.note.create.mockResolvedValueOnce({ id: 'note-1' });
+        prisma.note.update.mockResolvedValueOnce(saved({ status }));
+
+        await service.createNote('user-1', {
+          title: 'Shop',
+          media: [],
+          status,
+        });
+
+        const { unlistedAt } = prisma.note.create.mock.calls[0][0].data;
+        if (stamped) expect(unlistedAt).toBeInstanceOf(Date);
+        else expect(unlistedAt).toBeNull();
+      },
+    );
+
+    it.each([
+      [
+        'ACTIVE → UNLISTED starts the 60 days',
+        'ACTIVE',
+        null,
+        'UNLISTED',
+        'now',
+      ],
+      ['UNLISTED → UNLISTED keeps them', 'UNLISTED', OLD, 'UNLISTED', 'kept'],
+      [
+        'an omitted status on a 下架 note keeps them',
+        'UNLISTED',
+        OLD,
+        undefined,
+        'kept',
+      ],
+      ['UNLISTED → ACTIVE clears them', 'UNLISTED', OLD, 'ACTIVE', 'cleared'],
+    ] as const)(
+      'updateNote: %s',
+      async (_label, current, currentUnlistedAt, next, expected) => {
+        prisma.note.findFirst
+          .mockResolvedValueOnce({ sections: null })
+          // 事务内 FOR UPDATE 读到的现状。
+          .mockResolvedValueOnce({
+            id: 'note-1',
+            ownerID: 'user-1',
+            status: current,
+            unlistedAt: currentUnlistedAt,
+          });
+        prisma.note.update.mockResolvedValueOnce(saved({ status: next }));
+
+        await service.updateNote('user-1', 'note-1', {
+          title: 'Shop',
+          media: [],
+          status: next,
+        });
+
+        const { unlistedAt } = written();
+        if (expected === 'now') {
+          expect(unlistedAt).toBeInstanceOf(Date);
+          expect(unlistedAt).not.toEqual(OLD);
+        } else if (expected === 'kept') expect(unlistedAt).toBe(OLD);
+        else expect(unlistedAt).toBeNull();
+      },
+    );
+
+    it.each([
+      ['ACTIVE', null, 'UNLISTED', 'now'],
+      ['UNLISTED', OLD, 'UNLISTED', 'kept'],
+      ['UNLISTED', OLD, 'ACTIVE', 'cleared'],
+    ] as const)(
+      'setStatus %s → %s',
+      async (current, currentUnlistedAt, next, expected) => {
+        prisma.note.findFirst.mockResolvedValueOnce(owned);
+        prisma.note.findUnique.mockResolvedValueOnce({
+          status: current,
+          unlistedAt: currentUnlistedAt,
+        });
+        prisma.note.update.mockResolvedValueOnce({ id: 'note-1' });
+
+        await service.setStatus('user-1', 'note-1', next);
+
+        const { status, unlistedAt } = written();
+        expect(status).toBe(next);
+        if (expected === 'now') expect(unlistedAt).toBeInstanceOf(Date);
+        else if (expected === 'kept') expect(unlistedAt).toBe(OLD);
+        else expect(unlistedAt).toBeNull();
+        expect(prisma.noteStatusFanoutOutbox.upsert).toHaveBeenCalledWith(
+          expect.objectContaining({ where: { rootNoteID: 'note-1' } }),
+        );
+      },
+    );
+
+    // 旧版 app 的「下架」按钮、群「笔记管理」的开工 / 打烊 / 下架三选一。
+    it.each([
+      [
+        'OFF_SHELF on an ACTIVE note puts it 下架',
+        { status: 'ACTIVE', unlistedAt: null, workStatus: 'WORKING' },
+        'OFF_SHELF',
+        { workStatus: null, status: 'UNLISTED', unlistedAt: 'now' },
+        false,
+      ],
+      [
+        'OFF_SHELF on a 下架 note keeps its 60 days',
+        { status: 'UNLISTED', unlistedAt: OLD, workStatus: null },
+        'OFF_SHELF',
+        { workStatus: null, status: 'UNLISTED', unlistedAt: OLD },
+        false,
+      ],
+      [
+        'WORKING on a 下架 note puts it back on shelf',
+        { status: 'UNLISTED', unlistedAt: OLD, workStatus: null },
+        'WORKING',
+        { workStatus: 'WORKING', status: 'ACTIVE', unlistedAt: null },
+        true,
+      ],
+      [
+        'CLOSED on a 下架 note puts it back on shelf',
+        { status: 'UNLISTED', unlistedAt: OLD, workStatus: null },
+        'CLOSED',
+        { workStatus: 'CLOSED', status: 'ACTIVE', unlistedAt: null },
+        true,
+      ],
+      [
+        'null on a 下架 note only clears the label',
+        { status: 'UNLISTED', unlistedAt: OLD, workStatus: 'CLOSED' },
+        null,
+        { workStatus: null },
+        false,
+      ],
+      [
+        'WORKING on an ACTIVE note only sets the label',
+        { status: 'ACTIVE', unlistedAt: null, workStatus: 'CLOSED' },
+        'WORKING',
+        { workStatus: 'WORKING' },
+        true,
+      ],
+    ] as const)(
+      'setWorkStatus: %s',
+      async (_label, before, requested, expected, reminded) => {
+        prisma.note.findFirst.mockResolvedValueOnce(owned);
+        prisma.note.findUnique.mockResolvedValueOnce(before);
+        prisma.note.update.mockResolvedValueOnce({ id: 'note-1' });
+
+        await service.setWorkStatus('user-1', 'note-1', requested);
+
+        const data = written();
+        expect(data).toEqual({
+          ...expected,
+          ...('unlistedAt' in expected && expected.unlistedAt === 'now'
+            ? { unlistedAt: expect.any(Date) }
+            : {}),
+        });
+        // 再也不写 OFF_SHELF。
+        expect(data.workStatus).not.toBe('OFF_SHELF');
+        // 与上下架同一条广播；只有真的切到开工 / 打烊才提醒收藏者。
+        const [upsert] = prisma.noteStatusFanoutOutbox.upsert.mock.calls[0];
+        expect(upsert.where).toEqual({ rootNoteID: 'note-1' });
+        expect(upsert.create.workStatusChanged).toBe(reminded);
+      },
+    );
+
+    it('exposes unlistedAt in summaries', async () => {
+      prisma.note.findMany.mockResolvedValueOnce([
+        saved({ id: 'note-1', status: 'UNLISTED', unlistedAt: OLD }),
+        saved({ id: 'note-2', status: 'ACTIVE', unlistedAt: null }),
+      ]);
+
+      const { items } = await service.listNotes('user-1', {});
+
+      expect(prisma.note.findMany.mock.calls[0][0].select.unlistedAt).toBe(
+        true,
+      );
+      expect(items.map((item) => [item.status, item.unlistedAt])).toEqual([
+        ['UNLISTED', OLD],
+        ['ACTIVE', null],
+      ]);
+    });
+
+    it('expireUnlistedNote marks a still-expired 下架 note DELETED and fans out from its root', async () => {
+      prisma.note.updateMany.mockResolvedValueOnce({ count: 1 });
+      const cutoff = new Date('2026-09-14T00:00:00.000Z');
+
+      await expect(
+        service.expireUnlistedNote(
+          { id: 'copy-1', rootSourceNoteID: 'root-1' },
+          cutoff,
+        ),
+      ).resolves.toBe(true);
+
+      expect(prisma.note.updateMany).toHaveBeenCalledWith({
+        where: {
+          id: 'copy-1',
+          status: 'UNLISTED',
+          unlistedAt: { lte: cutoff },
+        },
+        data: { status: 'DELETED' },
+      });
+      expect(prisma.noteStatusFanoutOutbox.upsert).toHaveBeenCalledWith(
+        expect.objectContaining({ where: { rootNoteID: 'root-1' } }),
+      );
+    });
+
+    it('expireUnlistedNote leaves a note relisted since the sweep picked it', async () => {
+      prisma.note.updateMany.mockResolvedValueOnce({ count: 0 });
+
+      await expect(
+        service.expireUnlistedNote(
+          { id: 'note-1', rootSourceNoteID: null },
+          new Date('2026-09-14T00:00:00.000Z'),
+        ),
+      ).resolves.toBe(false);
+      expect(prisma.noteStatusFanoutOutbox.upsert).not.toHaveBeenCalled();
+    });
   });
 
   it('creates and lists note groups for the owner', async () => {
@@ -4888,8 +5147,9 @@ describe('NoteService', () => {
     expect(prisma.note.create).not.toHaveBeenCalled();
   });
 
-  it('collectNote only snapshots another user note that is available and ACTIVE', async () => {
-    // UNLISTED 笔记拿到 UUID 也不能被他人收藏成自己的副本：与 getNote 同一条放行规则。
+  it('collectNote only snapshots another user note that is available', async () => {
+    // 不可见（available=false）的笔记拿到 UUID 也不能被他人收藏成自己的副本：与 getNote
+    // 同一条放行规则（下架的照常可收藏）。
     prisma.note.findFirst.mockResolvedValueOnce(null);
 
     await expect(
@@ -4903,7 +5163,10 @@ describe('NoteService', () => {
         where: {
           id: 'note-unlisted',
           status: { not: 'DELETED' },
-          OR: [{ ownerID: 'user-1' }, { available: true, status: 'ACTIVE' }],
+          OR: [
+            { ownerID: 'user-1' },
+            { available: true, status: { not: 'DELETED' } },
+          ],
         },
       }),
     );
@@ -4929,7 +5192,6 @@ describe('NoteService', () => {
     };
 
     it.each([
-      ['UNLISTED', { status: 'UNLISTED' }],
       ['DELETED', { status: 'DELETED' }],
       ['unavailable', { available: false }],
     ])(
@@ -4989,15 +5251,72 @@ describe('NoteService', () => {
       prisma.note.findMany.mockReset();
     });
 
-    it('getNote hides a copy from non-owners once its source is unlisted', async () => {
+    it('getNote hides a copy from non-owners once its source is made unavailable', async () => {
       prisma.note.findFirst.mockResolvedValueOnce(relayCopy);
       prisma.note.findMany.mockResolvedValueOnce([
-        rootState({ status: 'UNLISTED' }),
+        rootState({ available: false }),
       ]);
 
       await expect(
         service.getNote('user-1', 'relay-copy'),
       ).rejects.toBeInstanceOf(NotFoundException);
+    });
+
+    // 下架（UNLISTED）的来源照常可读：副本对他人带着来源的真实状态。
+    it('getNote lets non-owners read a copy whose source is 下架, as UNLISTED', async () => {
+      prisma.note.findFirst.mockResolvedValueOnce(relayCopy);
+      prisma.note.findMany.mockResolvedValue([
+        rootState({ status: 'UNLISTED' }),
+      ]);
+
+      const detail = await service.getNote('user-1', 'relay-copy');
+
+      expect(detail).toMatchObject({
+        id: 'relay-copy',
+        canEdit: false,
+        status: 'UNLISTED',
+      });
+      prisma.note.findMany.mockReset();
+    });
+
+    it('collectNote collects a copy whose source is 下架', async () => {
+      chatService.requireVisibleMessage.mockResolvedValueOnce({
+        row: {
+          id: 'msg-abc',
+          conversationID: 'sg_123',
+          senderID: 'user-2',
+          type: 'note-card',
+          content: { noteId: 'relay-copy' },
+        },
+        conversation: { id: 'sg_123', type: 'GROUP', circleID: 'g-1' },
+      });
+      prisma.note.findFirst
+        .mockResolvedValueOnce(relayCopy)
+        .mockResolvedValueOnce(null);
+      prisma.note.findMany.mockResolvedValue([
+        rootState({ status: 'UNLISTED' }),
+      ]);
+      prisma.note.create.mockResolvedValueOnce({ id: 'note-copy' });
+      prisma.noteMedia.createMany.mockResolvedValueOnce({ count: 2 });
+      prisma.note.update.mockImplementationOnce(async () => ({
+        ...relayCopy,
+        id: 'note-copy',
+        ownerID: 'user-1',
+        collectedFrom: { kind: 'chat' },
+        collectedFromNoteID: 'relay-copy',
+        rootSourceNoteID: 'boss-note',
+      }));
+
+      const result = await service.collectNote('user-1', {
+        noteId: 'relay-copy',
+        source: collectSource,
+      });
+
+      expect(result.alreadyCollected).toBe(false);
+      // 副本自己的行照常是上架；对外显示时叠加来源的下架状态。
+      expect(prisma.note.create.mock.calls[0][0].data.status).toBe('ACTIVE');
+      expect(result.note.status).toBe('UNLISTED');
+      prisma.note.findMany.mockReset();
     });
 
     it.each([
@@ -5015,7 +5334,7 @@ describe('NoteService', () => {
         prisma.note.findMany.mockImplementation(async (args: any) => {
           const requestedID = args.where.id.in[0];
           if (requestedID === 'boss-note') {
-            return [rootState({ status: 'UNLISTED' })];
+            return [rootState({ available: false })];
           }
           const relay = /^relay-(\d+)$/.exec(requestedID);
           if (!relay) return [];
@@ -5125,15 +5444,18 @@ describe('NoteService', () => {
           where: {
             id: { in: ['relay-copy', 'plain-note', 'hidden-note'] },
             status: { not: 'DELETED' },
-            OR: [{ ownerID: 'user-1' }, { available: true, status: 'ACTIVE' }],
+            OR: [
+              { ownerID: 'user-1' },
+              { available: true, status: { not: 'DELETED' } },
+            ],
           },
         }),
       );
       expect(states).toEqual([
-        // Non-owner of an unlisted root: no work status leak.
+        // A 下架 root stays readable: real status and work status.
         {
           noteId: 'relay-copy',
-          workStatus: 'UNSET',
+          workStatus: 'CLOSED',
           publicationStatus: 'UNLISTED',
           goodCount: 4,
           badCount: 1,
@@ -5162,10 +5484,10 @@ describe('NoteService', () => {
       );
     });
 
-    it('createNoteExport refuses to export a copy whose source was unlisted', async () => {
+    it('createNoteExport refuses to export a copy whose source was made unavailable', async () => {
       prisma.note.findFirst.mockResolvedValueOnce(relayCopy);
       prisma.note.findMany.mockResolvedValueOnce([
-        rootState({ status: 'UNLISTED' }),
+        rootState({ available: false }),
       ]);
 
       await expect(
@@ -5290,7 +5612,117 @@ describe('NoteService', () => {
     expect(detail.canEdit).toBe(false);
   });
 
-  // Codex P1：回收站「立即删除」/30 天清理会把原笔记整行删掉，副本不能因此
+  describe('note city', () => {
+    const savedRow = (fields: Record<string, unknown>) => ({
+      id: 'note-1',
+      ownerID: 'user-1',
+      title: 'Shop',
+      content: null,
+      contentJson: null,
+      sections: null,
+      status: 'ACTIVE',
+      available: true,
+      pinned: false,
+      imageCount: 0,
+      videoCount: 0,
+      mediaCount: 0,
+      groupMemberships: [],
+      media: [],
+      coverMedia: null,
+      createdAt: new Date('2026-11-01T00:00:00.000Z'),
+      updatedAt: new Date('2026-11-01T00:00:00.000Z'),
+      ...fields,
+    });
+
+    it.each([
+      ['上海', '上海'],
+      [null, null],
+      [undefined, null],
+    ])('createNote stores city %p as %p', async (city, stored) => {
+      prisma.note.create.mockResolvedValueOnce({ id: 'note-1' });
+      prisma.note.update.mockResolvedValueOnce(savedRow({ city: stored }));
+
+      const result = await service.createNote('user-1', {
+        title: 'Shop',
+        media: [],
+        city,
+      });
+
+      expect(prisma.note.create.mock.calls[0][0].data.city).toBe(stored);
+      expect(result.city).toBe(stored);
+    });
+
+    // UpdateNoteDto 整份替换（同 sections / contentJson / pinned）：不带 city 就是清空。
+    it.each([
+      ['成都', '成都'],
+      [null, null],
+      [undefined, null],
+    ])('updateNote replaces city with %p as %p', async (city, stored) => {
+      prisma.note.findFirst
+        .mockResolvedValueOnce({ sections: null })
+        .mockResolvedValueOnce({ id: 'note-1', ownerID: 'user-1' });
+      prisma.note.update.mockResolvedValueOnce(savedRow({ city: stored }));
+
+      const result = await service.updateNote('user-1', 'note-1', {
+        title: 'Shop',
+        media: [],
+        city,
+      });
+
+      expect(prisma.note.update.mock.calls[0][0].data.city).toBe(stored);
+      expect(result.city).toBe(stored);
+    });
+
+    it('collectNote copies the source city onto the collected copy', async () => {
+      const source = { ...otherUsersNote, city: '成都' };
+      prisma.note.findFirst
+        .mockResolvedValueOnce(source)
+        .mockResolvedValueOnce(null);
+      prisma.note.create.mockResolvedValueOnce({ id: 'note-copy' });
+      prisma.noteMedia.createMany.mockResolvedValueOnce({ count: 2 });
+      prisma.note.update.mockImplementationOnce(async () => ({
+        ...source,
+        id: 'note-copy',
+        ownerID: 'user-1',
+        collectedFromNoteID: 'note-src',
+      }));
+
+      const result = await service.collectNote('user-1', {
+        noteId: 'note-src',
+        source: collectSource,
+      });
+
+      expect(prisma.note.create.mock.calls[0][0].data.city).toBe('成都');
+      expect(result.note.city).toBe('成都');
+    });
+
+    it('shows the city to other viewers, unlike the private remark', async () => {
+      prisma.note.findFirst.mockResolvedValueOnce({
+        ...otherUsersNote,
+        remark: 'owner only',
+        city: '上海',
+      });
+
+      const detail = await service.getNote('user-9', 'note-src');
+
+      expect(detail.city).toBe('上海');
+      expect(detail.remark).toBeNull();
+    });
+
+    it('selects and returns the city in list summaries', async () => {
+      prisma.note.findMany.mockResolvedValueOnce([
+        savedRow({ id: 'note-1', city: '杭州' }),
+        savedRow({ id: 'note-2', city: null }),
+      ]);
+
+      const { items } = await service.listNotes('user-1', {});
+
+      expect(prisma.note.findMany.mock.calls[0][0].select.city).toBe(true);
+      expect(items.map((item) => item.city)).toEqual(['杭州', null]);
+    });
+  });
+
+  // Codex P1：NoteCleanup 会把已删除的原笔记整行删掉，副本不能因此
   // 「找不到来源」就退回自己的 ACTIVE 状态重新可读、可分享、可再收藏。
   describe('copies of a permanently deleted source', () => {
     const copyOf = (sourceID: string) => ({
@@ -5554,30 +5986,47 @@ describe('NoteService', () => {
       }
     };
 
-    it('drops collected copies whose source has been unlisted since the link was made', async () => {
-      prisma.noteShareLink.findUnique.mockResolvedValueOnce({
-        ...shareLinkRow,
-        noteIDs: ['note-1', 'copy-1'],
-      });
-      prisma.note.findMany
-        .mockResolvedValueOnce([
-          sharedNoteRow,
-          { ...sharedNoteRow, id: 'copy-1', collectedFromNoteID: 'boss-note' },
-        ])
-        .mockResolvedValueOnce([
-          {
-            id: 'boss-note',
-            status: 'UNLISTED',
-            available: true,
-            workStatus: null,
-            collectedFromNoteID: null,
-          },
+    it.each([
+      ['made unavailable', { status: 'ACTIVE', available: false }, []],
+      ['deleted', { status: 'DELETED', available: true }, []],
+      [
+        '下架 (still readable)',
+        { status: 'UNLISTED', available: true },
+        ['copy-1'],
+      ],
+    ])(
+      'keeps a collected copy whose source was %s since the link was made only while readable',
+      async (_label, root, keptCopies) => {
+        prisma.noteShareLink.findUnique.mockResolvedValueOnce({
+          ...shareLinkRow,
+          noteIDs: ['note-1', 'copy-1'],
+        });
+        prisma.note.findMany
+          .mockResolvedValueOnce([
+            sharedNoteRow,
+            {
+              ...sharedNoteRow,
+              id: 'copy-1',
+              collectedFromNoteID: 'boss-note',
+            },
+          ])
+          .mockResolvedValueOnce([
+            {
+              id: 'boss-note',
+              ...root,
+              workStatus: null,
+              collectedFromNoteID: null,
+            },
+          ]);
+
+        const result = await service.resolveShareLink('tok-abc');
+
+        expect(result.notes.map((note) => note.id)).toEqual([
+          'note-1',
+          ...keptCopies,
         ]);
-
-      const result = await service.resolveShareLink('tok-abc');
-
-      expect(result.notes.map((note) => note.id)).toEqual(['note-1']);
-    });
+      },
+    );
 
     it('resolves a valid token to the notes in the link snapshot', async () => {
       prisma.noteShareLink.findUnique.mockResolvedValueOnce({
@@ -5759,9 +6208,21 @@ describe('NoteService', () => {
 
       const where = prisma.note.findMany.mock.calls[0][0].where;
       expect(where.available).toBe(true);
-      // 没存状态快照的链接只露 ACTIVE：UNLISTED 是主人藏起来的笔记，与 getNote 的
-      // 非主人分支、访客读卡片同一口径。
-      expect(where.status).toBe('ACTIVE');
+      // 没存状态快照的链接上架、下架都露（下架的他人照常可读，带真实状态），与 getNote
+      // 的非主人分支、访客读卡片同一口径；已删除的不露。
+      expect(where.status).toEqual({ not: 'DELETED' });
+    });
+
+    it('honours an explicit ACTIVE snapshot (shared from the on-shelf list)', async () => {
+      prisma.noteShareLink.findUnique.mockResolvedValueOnce({
+        ...shareLinkRow,
+        status: 'ACTIVE',
+      });
+      prisma.note.findMany.mockResolvedValueOnce([]);
+
+      await service.resolveShareLink('tok-abc');
+
+      expect(prisma.note.findMany.mock.calls[0][0].where.status).toBe('ACTIVE');
     });
 
     it('honours an explicit UNLISTED snapshot the owner chose to share', async () => {
@@ -6396,13 +6857,13 @@ describe('NoteService', () => {
       );
     });
 
-    it('scopes the lookup to readable notes (own, or available and ACTIVE)', async () => {
+    it('scopes the lookup to readable notes (own, or available and not deleted)', async () => {
       prisma.note.findFirst.mockResolvedValueOnce(noteRow());
 
       await service.copyNoteMediaForChat('viewer-2', 'note-1', ['media']);
 
-      // 与 getNote 同一条放行规则：非主人只能碰 ACTIVE 且 available 的笔记，
-      // 否则 UNLISTED 笔记的媒体仍可经此路径被复制出去。
+      // 与 getNote 同一条放行规则：非主人只能碰 available 的（上架或下架）笔记，
+      // 否则主人设成不可见的笔记的媒体仍可经此路径被复制出去。
       expect(prisma.note.findFirst).toHaveBeenCalledWith(
         expect.objectContaining({
           where: expect.objectContaining({
@@ -6410,7 +6871,7 @@ describe('NoteService', () => {
             status: { not: 'DELETED' },
             OR: [
               { ownerID: 'viewer-2' },
-              { available: true, status: 'ACTIVE' },
+              { available: true, status: { not: 'DELETED' } },
             ],
           }),
         }),
@@ -6726,69 +7187,5 @@ describe('NoteService', () => {
       expect(own.remark).toBe('重要客户');
       expect(foreign.remark).toBeNull();
     });
-  });
-
-  // 真正的删除（收录链改指向、唯一索引避让、只认回收站）在真库 e2e
-  // test/note-purge-chain.e2e-spec.ts 里验证；这里只守接口口径。
-  describe('purgeNote (recycle bin delete now)', () => {
-    it('purges through the shared recycle-bin delete with an owner guard', async () => {
-      const purge = jest
-        .spyOn(notePurge, 'purgeDeletedNote')
-        .mockResolvedValueOnce(true);
-
-      await service.purgeNote('user-1', 'note-1');
-
-      expect(purge).toHaveBeenCalledWith(prisma, 'note-1', {
-        ownerID: 'user-1',
-      });
-    });
-
-    it('404s for a note that is not in my recycle bin (active, foreign or missing)', async () => {
-      jest.spyOn(notePurge, 'purgeDeletedNote').mockResolvedValueOnce(false);
-
-      await expect(service.purgeNote('user-1', 'note-1')).rejects.toThrow(
-        NotFoundException,
-      );
-    });
-  });
-
-  it('maps a concurrent restore unique collision to NOTE_RESTORE_DUPLICATE', async () => {
-    prisma.note.findFirst
-      .mockResolvedValueOnce({
-        id: 'deleted-copy',
-        collectedFromNoteID: 'source-note',
-      })
-      .mockResolvedValueOnce(null);
-    prisma.note.updateMany.mockRejectedValueOnce(
-      Object.assign(new Error('unique constraint'), { code: 'P2002' }),
-    );
-
-    await expect(
-      service.restoreNote('user-1', 'deleted-copy'),
-    ).rejects.toMatchObject({
-      response: expect.objectContaining({
-        errorCode: 'NOTE_RESTORE_DUPLICATE',
-      }),
-    });
-  });
-
-  it('restores and enqueues the root fan-out in the same serializable transaction', async () => {
-    prisma.note.findFirst
-      .mockResolvedValueOnce({
-        id: 'deleted-copy',
-        collectedFromNoteID: 'parent-copy',
-        rootSourceNoteID: 'source-note',
-      })
-      .mockResolvedValueOnce(null);
-    prisma.note.updateMany.mockResolvedValueOnce({ count: 1 });
-
-    await service.restoreNote('user-1', 'deleted-copy');
-
-    expect(prisma.$transaction).toHaveBeenCalledWith(expect.any(Function), {
-      isolationLevel: 'Serializable',
-    });
-    expect(prisma.noteStatusFanoutOutbox.upsert).toHaveBeenCalledWith(
-      expect.objectContaining({ where: { rootNoteID: 'source-note' } }),
-    );
   });
 });

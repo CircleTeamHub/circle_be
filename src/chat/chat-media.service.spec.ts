@@ -205,6 +205,37 @@ describe('ChatMediaService', () => {
       expect(unlisted.content.previewUrls).toBeUndefined();
     });
 
+    // 2026-11 两种下架合并:下架(UNLISTED)的根照常可分发 —— 卡片报真实状态、预览照签;
+    // 不可见(available=false)的沿用 UNLISTED 且不签。
+    it('keeps signing previews of a 下架 root and reports it as UNLISTED', async () => {
+      prisma.note.findMany.mockResolvedValue([
+        { id: 'off', status: 'UNLISTED', available: true, workStatus: null },
+        {
+          id: 'hidden',
+          status: 'UNLISTED',
+          available: false,
+          workStatus: null,
+        },
+      ]);
+      const offShelf = dto({
+        id: 'm1',
+        type: 'note-card',
+        content: { sourceNoteId: 'off', previewKeys: ['notes/u1/a.jpg'] },
+      });
+      const hidden = dto({
+        id: 'm2',
+        type: 'note-card',
+        content: { sourceNoteId: 'hidden', previewKeys: ['notes/u1/b.jpg'] },
+      });
+      await service.attachMediaUrls([offShelf, hidden]);
+      expect(offShelf.content).toMatchObject({
+        publicationStatus: 'UNLISTED',
+        previewUrls: ['https://signed/notes/u1/a.jpg'],
+      });
+      expect(hidden.content.publicationStatus).toBe('UNLISTED');
+      expect(hidden.content.previewUrls).toBeUndefined();
+    });
+
     // 卡片上的状态是发送时的快照:读的时候换成根笔记此刻的状态,会话重新加载不会
     // 把客户端的实时补丁盖回旧值,同一笔记的几张卡片也不会各显示各的。
     it('reports the source root live work and publication status on every read', async () => {

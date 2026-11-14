@@ -158,7 +158,8 @@ enum NoteStatus {
 enum NoteWorkStatus {
   WORKING
   CLOSED
-  // 场地状态里的「下架」:和开工/打烊并列,只是一个标记,不影响笔记本身的上下架可见性。
+  // 旧版「场地下架」标记。已并入笔记下架(status = UNLISTED):不再写入,旧版 app 发来的
+  // OFF_SHELF 由 setWorkStatus 换成下架;枚举值留着给历史数据与旧客户端。
   OFF_SHELF
 }
 
@@ -1269,6 +1270,9 @@ model Note {
   contentJson          Json?
   sections             Json?
   status               NoteStatus      @default(ACTIVE)
+  /// 这次进入下架（UNLISTED）的时刻；上架时为 NULL。满 60 天由 NoteCleanup 永久删除。
+  /// 清理查询走迁移 20261113130000 里的部分索引 (unlistedAt, id) WHERE status = 'UNLISTED'。
+  unlistedAt           DateTime?
   available            Boolean         @default(true)
   workStatus           NoteWorkStatus?
   /// 老板在群设置中绑定的来源聊天会话；收藏副本不继承此字段。
@@ -1281,6 +1285,8 @@ model Note {
   audioCount           Int             @default(0)
   // 仅笔记主人可见的私人备注 —— 不随分享/访客视图外发（序列化时按 viewer 判空）。
   remark               String?
+  /// 主人从城市选择器选的城市名（如「上海」）；为空 = 没选。选了城市才进大众点评榜。
+  city                 String?         @db.VarChar(32)
   // 从聊天收藏他人笔记时的来源快照（会话类型、群/发送者名片、消息定位信息）。
   // 自建笔记为 null；collectedFromNoteID 冗余成单列用于幂等去重查询。
   collectedFrom        Json?
@@ -1376,7 +1382,7 @@ enum NoteRatingCaseResolution {
 }
 
 /// 笔记评分（好评 / 差评）：每次评分是一条事件，记在收藏链的根笔记上。
-/// noteID 不设外键：根笔记被永久删除（回收站 30 天到期）后评分仍留着供审计与申诉。
+/// noteID 不设外键：根笔记被永久删除（NoteCleanup 删行）后评分仍留着供审计与申诉。
 /// ownerID 冗余根笔记主人，供集中刷分检测（以及以后的互刷检测）按主人查。
 model NoteRating {
   id        String            @id @default(uuid())
@@ -1423,6 +1429,8 @@ model NoteRatingMonthly {
   badCount  Int    @default(0)
 
   @@id([noteID, month])
+  // 大众点评月榜：按月份取本月好评最多的笔记（note-ranking.query.ts）。
+  @@index([month, goodCount])
 }
 
 /// 评分审核单：BURST（集中刷分被暂扣）或 APPEAL（主人对差评的申诉）。
@@ -1468,6 +1476,7 @@ model NoteDraft {
   content         String?
   contentJson     Json?
   sections        Json?
+  city            String?   @db.VarChar(32)
   groupIDs        String[]  @default([])
   mediaKeys       String[]  @default([])
   createdAt       DateTime  @default(now())

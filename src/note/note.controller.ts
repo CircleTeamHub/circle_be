@@ -47,16 +47,16 @@ import {
   ListNotesQueryDto,
   ListNoteDraftsQueryDto,
   NoteChatMediaImportDto,
-  RecycleBinQueryDto,
   NoteDetailDto,
   NoteDraftDto,
   NoteDraftSummaryDto,
   NoteExportResultDto,
   NoteGroupDto,
+  NoteRankingDto,
+  NoteRankingQueryDto,
   NoteShareLinkDto,
   NoteSummaryDto,
   ReorderNoteGroupsDto,
-  SetNoteAvailableDto,
   SetNoteRemarkDto,
   SetNoteStatusDto,
   SetNoteSourceConversationDto,
@@ -70,7 +70,7 @@ import {
 import { NoteService } from './note.service';
 
 /**
- * GET /note 与 GET /note/recycle-bin 的截断信号。app 依赖响应体是数组，「后面还有」
+ * GET /note 的截断信号。app 依赖响应体是数组，「后面还有」
  * 只能走响应头而不能把响应体改成 { items, hasMore }。
  */
 const HAS_MORE_HEADER = 'X-Has-More';
@@ -198,20 +198,22 @@ export class NoteController {
     return this.noteService.setRemark(req.user.userId, id, dto.remark ?? null);
   }
 
-  @Patch(':id/available')
-  @ApiOperation({ summary: 'Set note availability' })
-  @ApiOkResponse({ schema: { example: { id: 'uuid', available: true } } })
-  setAvailable(
-    @Param('id', ParseUUIDPipe) id: string,
-    @Body() dto: SetNoteAvailableDto,
-    @Req() req: RequestWithUser,
-  ) {
-    return this.noteService.setAvailable(req.user.userId, id, dto.available);
-  }
-
   @Patch(':id/work-status')
-  @ApiOperation({ summary: 'Set optional note work status' })
-  @ApiOkResponse({ schema: { example: { id: 'uuid', workStatus: 'WORKING' } } })
+  @ApiOperation({
+    summary: 'Set optional note work status (开工 / 打烊 / 下架)',
+    description:
+      'OFF_SHELF puts the note 下架 (status UNLISTED, workStatus null). WORKING / CLOSED on a 下架 note relists it (status ACTIVE). null only clears the label.',
+  })
+  @ApiOkResponse({
+    schema: {
+      example: {
+        id: 'uuid',
+        status: 'ACTIVE',
+        workStatus: 'WORKING',
+        unlistedAt: null,
+      },
+    },
+  })
   setWorkStatus(
     @Param('id', ParseUUIDPipe) id: string,
     @Body() dto: SetNoteWorkStatusDto,
@@ -244,8 +246,20 @@ export class NoteController {
   }
 
   @Patch(':id/status')
-  @ApiOperation({ summary: 'Set note status' })
-  @ApiOkResponse({ schema: { example: { id: 'uuid', status: 'UNLISTED' } } })
+  @ApiOperation({
+    summary: 'Set note status (上架 / 下架)',
+    description:
+      'UNLISTED = 下架: still readable by others with its real status, permanently deleted 60 days after unlistedAt. Re-sending UNLISTED keeps unlistedAt; ACTIVE clears it.',
+  })
+  @ApiOkResponse({
+    schema: {
+      example: {
+        id: 'uuid',
+        status: 'UNLISTED',
+        unlistedAt: '2026-11-13T12:00:00.000Z',
+      },
+    },
+  })
   setStatus(
     @Param('id', ParseUUIDPipe) id: string,
     @Body() dto: SetNoteStatusDto,
@@ -270,52 +284,28 @@ export class NoteController {
     );
   }
 
-  // 必须先于 @Get(':id') / @Patch(':id') 声明（同 share-links 的顺序注释）。
-  @Get('recycle-bin')
+  // 必须先于 @Get(':id') 声明（同 share-links 的顺序注释）。
+  @Get('ranking')
   @ApiOperation({
-    summary: 'List soft-deleted notes (FE#92 recycle bin)',
-    description: HAS_MORE_DESCRIPTION,
+    summary: 'Monthly 大众点评 ranking: notes with the most good ratings',
+    description:
+      'Current Shanghai month. Only ACTIVE + available source notes whose owner chose a city; `city` narrows to one city, absent = nationwide.',
   })
-  @ApiOkResponse({
-    type: [NoteSummaryDto],
-    headers: HAS_MORE_RESPONSE_HEADERS,
-  })
-  async listDeleted(
-    @Query() query: RecycleBinQueryDto,
+  @ApiOkResponse({ type: NoteRankingDto })
+  getRanking(
+    @Query() query: NoteRankingQueryDto,
     @Req() req: RequestWithUser,
-    @Res({ passthrough: true }) res: Response,
-  ): Promise<NoteSummaryDto[]> {
-    const page = await this.noteService.listDeletedNotes(
-      req.user.userId,
-      query.page,
-      query.limit,
-    );
-    res.setHeader(HAS_MORE_HEADER, String(page.hasMore));
-    return page.items;
-  }
-
-  @Post(':id/restore')
-  @ApiOperation({ summary: 'Restore a soft-deleted note to ACTIVE' })
-  restore(@Param('id', ParseUUIDPipe) id: string, @Req() req: RequestWithUser) {
-    return this.noteService.restoreNote(req.user.userId, id);
-  }
-
-  @Delete(':id/permanent')
-  @HttpCode(HttpStatus.NO_CONTENT)
-  @ApiOperation({
-    summary: 'Permanently delete a note that is already in the recycle bin',
-  })
-  @ApiNoContentResponse()
-  purge(
-    @Param('id', ParseUUIDPipe) id: string,
-    @Req() req: RequestWithUser,
-  ): Promise<void> {
-    return this.noteService.purgeNote(req.user.userId, id);
+  ): Promise<NoteRankingDto> {
+    return this.noteService.getNoteRanking(req.user.userId, query);
   }
 
   @Delete(':id')
   @HttpCode(HttpStatus.NO_CONTENT)
-  @ApiOperation({ summary: 'Soft delete note' })
+  @ApiOperation({
+    summary: 'Delete note permanently',
+    description:
+      'Not restorable. The note disappears for everyone at once; its rows are purged by the note cleanup job within minutes.',
+  })
   @ApiNoContentResponse()
   deleteNote(
     @Param('id', ParseUUIDPipe) id: string,

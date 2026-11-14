@@ -64,7 +64,7 @@ export function buildNestFactoryOptions() {
         'Idempotency-Key',
         'X-Call-Invite-Created-At',
       ],
-      // GET /note and /note/recycle-bin signal truncation through this header
+      // GET /note signals truncation through this header
       // while the body stays an array; browsers hide unlisted response headers
       // from cross-origin callers.
       // GET /chat/conversations 的键集分页把下一页游标放在 X-Next-Cursor,

@@ -700,7 +700,7 @@ describeDatabase('Note draft consumption concurrency', () => {
     },
   );
 
-  it('serializes the last keyed edit outcome slot, retains old replays, and keeps the cap across delete/restore', async () => {
+  it('serializes the last keyed edit outcome slot, retains old replays, and keeps the cap after the note is deleted', async () => {
     const { http, token, prisma, user, service } = await account();
     const creation = {
       title: 'Original',
@@ -804,15 +804,7 @@ describeDatabase('Note draft consumption concurrency', () => {
       .set('Authorization', `Bearer ${token}`)
       .send(edits[winner])
       .expect(404);
-    await http
-      .post(`/api/v1/note/${id}/restore`)
-      .set('Authorization', `Bearer ${token}`)
-      .expect(201);
-    await http
-      .patch(`/api/v1/note/${id}`)
-      .set('Authorization', `Bearer ${token}`)
-      .send(edits[loser])
-      .expect(403);
+    // 删除即永久（没有回收站）：已发布结果照样留着，行等 NoteCleanup 删。
     expect(await count()).toBe(MAX_NOTE_EDIT_PUBLICATION_OUTCOMES);
     expect((await prisma.note.findUniqueOrThrow({ where: { id } })).title).toBe(
       edits[winner].title,

@@ -207,6 +207,36 @@ describe('note review regressions', () => {
     ).resolves.toBeDefined();
   });
 
+  it.each([
+    ['上海', '上海'],
+    [null, null],
+    [undefined, null],
+  ])('persists draft city %p as %p and returns it', async (city, stored) => {
+    const { service, prisma } = fixture();
+    const result = await service.saveNoteDraft('owner', 'draft-1', { city });
+    const [{ create, update }] = prisma.noteDraft.upsert.mock.calls[0];
+    expect(create.city).toBe(stored);
+    expect(update.city).toBe(stored);
+    expect(result.city).toBe(stored);
+  });
+
+  it('lists draft summaries with their city', async () => {
+    const { service, prisma } = fixture();
+    prisma.noteDraft.findMany.mockResolvedValue([{ ...row, city: '成都' }]);
+    expect((await service.listNoteDrafts('owner'))[0].city).toBe('成都');
+  });
+
+  it('clears the city when a draft is discarded down to its tombstone', async () => {
+    const { service, prisma } = fixture();
+    prisma.noteDraft.findUnique.mockResolvedValue({
+      sourceNoteID: null,
+      consumedAt: null,
+    });
+    await service.deleteNoteDraft('owner', 'draft-1');
+    const [{ update }] = prisma.noteDraft.upsert.mock.calls[0];
+    expect(update).toMatchObject({ city: null, title: '' });
+  });
+
   it('reads only one bounded page of drafts', async () => {
     const { service, prisma } = fixture();
     await service.listNoteDrafts('owner', 2, 20);

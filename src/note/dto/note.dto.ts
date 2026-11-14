@@ -1,4 +1,5 @@
-import { Type } from 'class-transformer';
+import { applyDecorators } from '@nestjs/common';
+import { Transform, Type } from 'class-transformer';
 import { Trim } from 'src/decorators/trim.decorator';
 import {
   ArrayMaxSize,
@@ -45,6 +46,30 @@ export const MAX_NOTE_DRAFT_MEDIA_KEYS = 150;
 
 export const NOTE_EXPORT_FORMAT = ['IMAGE', 'PDF', 'IMAGES', 'VIDEOS'] as const;
 export type NoteExportFormat = (typeof NOTE_EXPORT_FORMAT)[number];
+
+/** Note.city / NoteDraft.city 是 VARCHAR(32)。 */
+export const NOTE_CITY_MAX_LENGTH = 32;
+
+/**
+ * 城市名(app 城市选择器里的名字,如「上海」):两端空白去掉,空串归一成 null = 没选城市;
+ * @MaxLength 量的是 trim 后的长度。非字符串原样交给 @IsString 报错。
+ */
+function NoteCity(description: string): PropertyDecorator {
+  return applyDecorators(
+    ApiPropertyOptional({
+      type: String,
+      nullable: true,
+      maxLength: NOTE_CITY_MAX_LENGTH,
+      description,
+    }),
+    Transform(({ value }: { value: unknown }) =>
+      typeof value === 'string' ? value.trim() || null : value,
+    ),
+    IsOptional(),
+    IsString(),
+    MaxLength(NOTE_CITY_MAX_LENGTH),
+  );
+}
 
 // Postgres int4 上限。NoteMedia 的 size/width/height/durationMs/sortOrder 都是 Int 列，
 // 只有 @Min 时 2^31 及以上的值会穿过 DTO 直达 Prisma，写入时抛未映射错误 → 500。
@@ -384,6 +409,11 @@ export class CreateNoteDto {
   @MaxLength(180)
   @Matches(/^[A-Za-z0-9._:-]+$/)
   clientDraftID?: string;
+
+  @NoteCity(
+    'City chosen in the app city picker. Empty or null = no city. Like the rest of the body, omitting it on update clears it.',
+  )
+  city?: string | null;
 }
 
 export class UpdateNoteDto extends CreateNoteDto {}
@@ -458,6 +488,9 @@ export class SaveNoteDraftDto {
     message: 'mediaKeys contains invalid characters',
   })
   mediaKeys?: string[];
+
+  @NoteCity('City chosen in the app city picker. Empty or null = no city.')
+  city?: string | null;
 }
 
 // 单独更新一条 note 的 group 归属。前端"批量调分组成员"流程要避免对每个 note 做
@@ -490,12 +523,6 @@ export class SetNoteRemarkDto {
   remark?: string | null;
 }
 
-export class SetNoteAvailableDto {
-  @ApiProperty()
-  @IsBoolean()
-  available: boolean;
-}
-
 export class SetNoteStatusDto {
   @ApiProperty({ enum: NOTE_WRITABLE_STATUS })
   @IsEnum(NOTE_WRITABLE_STATUS)
@@ -503,7 +530,12 @@ export class SetNoteStatusDto {
 }
 
 export class SetNoteWorkStatusDto {
-  @ApiPropertyOptional({ enum: NOTE_WORK_STATUS, nullable: true })
+  @ApiPropertyOptional({
+    enum: NOTE_WORK_STATUS,
+    nullable: true,
+    description:
+      'OFF_SHELF (sent by older app builds) puts the note 下架, same as PATCH status=UNLISTED. WORKING / CLOSED on a 下架 note puts it back on shelf. null only clears the label.',
+  })
   @IsOptional()
   @IsEnum(NOTE_WORK_STATUS)
   workStatus?: NoteWorkStatus | null;
@@ -517,33 +549,12 @@ export class SetNoteSourceConversationDto {
 }
 
 /**
- * GET /note 与 GET /note/recycle-bin 的默认页大小，同时是 limit 的上限。
+ * GET /note 的默认页大小，同时是 limit 的上限。
  *
  * app 从不传 page/limit，且依赖响应体是数组：默认页必须装得下整本笔记 —— 以前默认
  * 50，第 51 条起被静默截掉。仍然装不下时由 controller 的 X-Has-More 响应头告知。
  */
 export const NOTE_LIST_DEFAULT_LIMIT = 500;
-
-export class RecycleBinQueryDto {
-  @ApiPropertyOptional({ default: 1 })
-  @IsOptional()
-  @Type(() => Number)
-  @IsInt()
-  @Min(1)
-  @Max(MAX_PAGE)
-  page = 1;
-
-  @ApiPropertyOptional({
-    default: NOTE_LIST_DEFAULT_LIMIT,
-    maximum: NOTE_LIST_DEFAULT_LIMIT,
-  })
-  @IsOptional()
-  @Type(() => Number)
-  @IsInt()
-  @Min(1)
-  @Max(NOTE_LIST_DEFAULT_LIMIT)
-  limit = NOTE_LIST_DEFAULT_LIMIT;
-}
 
 export class ListNotesQueryDto {
   @ApiPropertyOptional({ enum: NOTE_STATUS })
@@ -841,8 +852,22 @@ export class NoteSummaryDto {
   @ApiProperty() ownerId: string;
   @ApiProperty() canEdit: boolean;
   @ApiProperty() title: string;
+  @ApiPropertyOptional({
+    type: String,
+    nullable: true,
+    description: '主人选的城市；所有人可见（不同于 remark）',
+  })
+  city: string | null;
   @ApiPropertyOptional() contentPreview: string | null;
   @ApiProperty({ enum: NOTE_STATUS }) status: NoteStatus;
+  @ApiPropertyOptional({
+    type: String,
+    format: 'date-time',
+    nullable: true,
+    description:
+      '这次下架（status=UNLISTED）的时刻，满 60 天永久删除；上架为 null。收藏副本是副本自己这一行的值',
+  })
+  unlistedAt: Date | null;
   @ApiProperty() available: boolean;
   @ApiPropertyOptional({ enum: NOTE_WORK_STATUS, nullable: true })
   workStatus: NoteWorkStatus | null;
@@ -896,6 +921,7 @@ export class NoteDraftSummaryDto {
   @ApiProperty({ description: 'Stable client draft id.' }) id: string;
   @ApiPropertyOptional({ nullable: true }) sourceNoteId: string | null;
   @ApiProperty() title: string;
+  @ApiPropertyOptional({ type: String, nullable: true }) city: string | null;
   @ApiPropertyOptional() contentPreview: string | null;
   @ApiProperty() mediaCount: number;
   @ApiProperty() createdAt: Date;
@@ -934,6 +960,49 @@ export class SharedNoteListDto {
   @ApiProperty() title: string;
   @ApiProperty({ type: [NoteSummaryDto] }) notes: NoteSummaryDto[];
   @ApiPropertyOptional() expiresAt: Date | null;
+}
+
+// ── 大众点评月榜 ─────────────────────────────────────────────────────────────
+
+export const NOTE_RANKING_DEFAULT_LIMIT = 50;
+export const NOTE_RANKING_MAX_LIMIT = 100;
+
+export class NoteRankingQueryDto {
+  @NoteCity('Only notes in this city. Absent or empty = nationwide.')
+  city?: string | null;
+
+  @ApiPropertyOptional({
+    default: NOTE_RANKING_DEFAULT_LIMIT,
+    minimum: 1,
+    maximum: NOTE_RANKING_MAX_LIMIT,
+  })
+  @IsOptional()
+  @Type(() => Number)
+  @IsInt()
+  @Min(1)
+  @Max(NOTE_RANKING_MAX_LIMIT)
+  limit = NOTE_RANKING_DEFAULT_LIMIT;
+}
+
+/** 同 SharedNoteListDto：引用 NoteSummaryDto，必须声明在它之后。 */
+export class NoteRankingDto {
+  @ApiProperty({
+    description: '榜单所属月份（上海时区 YYYY-MM），每月重新计数',
+    example: '2026-11',
+  })
+  month: string;
+  @ApiPropertyOptional({
+    type: String,
+    nullable: true,
+    description: '筛选的城市；全国榜为 null',
+  })
+  city: string | null;
+  @ApiProperty({
+    type: [NoteSummaryDto],
+    description:
+      '本月好评数降序（同分按差评少、最近更新、id），只含主人选了城市、上架且公开的原笔记',
+  })
+  items: NoteSummaryDto[];
 }
 
 // ── 收藏聊天中的笔记 → 复制入"我的笔记" ────────────────────────────────────────
@@ -1034,7 +1103,10 @@ export class NoteSourceStateDto {
   @ApiProperty() noteId: string;
   @ApiProperty({ enum: ['WORKING', 'CLOSED', 'OFF_SHELF', 'UNSET'] })
   workStatus: NoteWorkStatus | 'UNSET';
-  /** UNLISTED also covers notes the viewer cannot read (no existence oracle). */
+  /**
+   * The root's real status when the viewer can read it (下架 = UNLISTED stays readable).
+   * UNLISTED also covers notes the viewer cannot read (no existence oracle).
+   */
   @ApiProperty({ enum: ['ACTIVE', 'UNLISTED', 'DELETED'] })
   publicationStatus: 'ACTIVE' | 'UNLISTED' | 'DELETED';
   /** This month's rating counters of the root; 0 for notes the viewer cannot read. */

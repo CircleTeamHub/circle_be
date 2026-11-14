@@ -121,7 +121,7 @@ describePostgres('note ratings on PostgreSQL', () => {
     return rows.map((row) => row.status);
   }
 
-  it('counts a rating on the root and then holds the rater to one a day', async () => {
+  it('counts a rating on the root and then holds the rater to one 好评 and one 差评 a day', async () => {
     const result = await ratings.rate('r1', 'copy-root-a-r1', {
       value: 'GOOD',
     });
@@ -141,10 +141,21 @@ describePostgres('note ratings on PostgreSQL', () => {
     ).rejects.toMatchObject({
       response: { errorCode: 'NOTE_RATING_RATER_DAILY_LIMIT' },
     });
+    // 好评、差评每天各一次：今天的差评还没用。root-a 有 72 小时冷却，所以评 root-b。
+    await expect(ratings.getSummary('r1', 'root-b')).resolves.toMatchObject({
+      canRate: true,
+      goodRatedToday: true,
+      badRatedToday: false,
+    });
+    await expect(
+      ratings.rate('r1', 'copy-root-b-r1', { value: 'BAD', reason: 'EXPIRED' }),
+    ).resolves.toMatchObject({ noteId: 'root-b', badCount: 1 });
     await expect(ratings.getSummary('r1', 'root-a')).resolves.toMatchObject({
       goodCount: 1,
       canRate: false,
       reason: 'NOTE_RATING_RATER_DAILY_LIMIT',
+      goodRatedToday: true,
+      badRatedToday: true,
     });
   });
 

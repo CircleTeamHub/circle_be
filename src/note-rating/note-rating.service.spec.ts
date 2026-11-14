@@ -31,7 +31,8 @@ function setup(
     seat?: boolean;
     creditScore?: number;
     registeredAt?: Date;
-    ratedToday?: boolean;
+    /** true = 今天好评、差评都打过；数组 = 只打过其中几种。 */
+    ratedToday?: boolean | Array<'GOOD' | 'BAD'>;
     lastOnNote?: Date | null;
     peers?: Array<Record<string, unknown>>;
     openBurstCase?: string | null;
@@ -93,7 +94,9 @@ function setup(
         if (where.noteID) {
           return over.lastOnNote ? { createdAt: over.lastOnNote } : null;
         }
-        return over.ratedToday ? { id: 'earlier' } : null;
+        const usedToday =
+          over.ratedToday === true ? ['GOOD', 'BAD'] : over.ratedToday || [];
+        return usedToday.includes(where.value) ? { id: 'earlier' } : null;
       }),
       findMany: jest.fn(async () => over.peers ?? []),
       create: jest.fn(async ({ data }: { data: Record<string, unknown> }) => ({
@@ -261,8 +264,8 @@ describe('NoteRatingService.rate', () => {
     expect(prisma.noteRating.create).toHaveBeenCalled();
   });
 
-  it('limits a rater to one rating per Shanghai day across all notes', async () => {
-    const { service, prisma } = setup({ ratedToday: true });
+  it('limits a rater to one 好评 per Shanghai day across all notes', async () => {
+    const { service, prisma } = setup({ ratedToday: ['GOOD'] });
 
     const error = await rejection(service.rate(RATER, COPY, { value: 'GOOD' }));
 
@@ -277,9 +280,29 @@ describe('NoteRatingService.rate', () => {
     expect(prisma.noteRating.findFirst).toHaveBeenCalledWith({
       where: {
         raterID: RATER,
+        value: 'GOOD',
         createdAt: { gte: new Date('2026-11-10T16:00:00.000Z') },
       },
       select: { id: true },
+    });
+  });
+  it('still lets that rater give one 差评 the same day: 好评 and 差评 are one each', async () => {
+    const { service, prisma } = setup({ ratedToday: ['GOOD'] });
+
+    await service.rate(RATER, COPY, { value: 'BAD', reason: 'EXPIRED' });
+
+    expect(prisma.noteRating.create).toHaveBeenCalled();
+  });
+
+  it('blocks a second 差评 the same day', async () => {
+    const { service } = setup({ ratedToday: ['BAD'] });
+
+    const error = await rejection(
+      service.rate(RATER, COPY, { value: 'BAD', reason: 'EXPIRED' }),
+    );
+
+    expect(error.getResponse()).toMatchObject({
+      errorCode: 'NOTE_RATING_RATER_DAILY_LIMIT',
     });
   });
 
@@ -452,8 +475,23 @@ describe('NoteRatingService.getSummary', () => {
       canRate: true,
       reason: null,
       nextRatableAt: null,
+      goodRatedToday: false,
+      badRatedToday: false,
       goodFull: true,
       badFull: false,
+    });
+  });
+
+  // 2026-11 两种下架合并：下架（UNLISTED）的笔记他人照常可读、可评价；只认 available。
+  it('opens the note through the shared read gate (下架 included, hidden excluded)', async () => {
+    const { service, prisma } = setup();
+
+    await service.getSummary(RATER, COPY);
+
+    expect(prisma.note.findFirst.mock.calls[0][0].where).toEqual({
+      id: COPY,
+      status: { not: 'DELETED' },
+      OR: [{ ownerID: RATER }, { available: true }],
     });
   });
 
@@ -475,6 +513,17 @@ describe('NoteRatingService.getSummary', () => {
     await expect(service.getSummary(OWNER, ROOT)).resolves.toMatchObject({
       canRate: false,
       reason: 'NOTE_RATING_OWNER',
+    });
+  });
+
+  it("keeps the summary open while one of today's 好评 / 差评 is still unused", async () => {
+    const { service } = setup({ ratedToday: ['GOOD'] });
+
+    await expect(service.getSummary(RATER, COPY)).resolves.toMatchObject({
+      canRate: true,
+      reason: null,
+      goodRatedToday: true,
+      badRatedToday: false,
     });
   });
 

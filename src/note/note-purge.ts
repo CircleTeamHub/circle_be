@@ -1,11 +1,8 @@
 import type { PrismaService } from 'src/prisma/prisma.service';
 
-/** 永久删除前额外要满足的条件：主人本人删（立即删除）或到期（定时清理）。 */
-export type NotePurgeGuard = { ownerID: string } | { deletedBefore: Date };
-
 /**
- * 永久删除一条回收站里的笔记（status=DELETED）。回收站「立即删除」与 30 天到期
- * 清理共用，两边语义必须一致。
+ * 物理删除一条已删除（status=DELETED）的笔记：主人删除、下架满 60 天都先标成 DELETED，
+ * 再由 NoteCleanup 逐条调这里。
  *
  * 只删 Postgres 行（NoteMedia / NoteGroupMembership 随外键级联）；MinIO 对象留给
  * StorageAudit —— 收藏副本可能共用同一个 objectKey。
@@ -15,30 +12,23 @@ export type NotePurgeGuard = { ownerID: string } | { deletedBefore: Date };
  * 把它的下游改指向它的上游，链才不会断，下游也不会因为「中间那份没了」被误判成
  * 原文已删；删的是原文（没有上游）时下游照旧指着它，读取时判已删除，正是想要的。
  *
- * 改指向用原生 UPDATE：不能碰下游的 updatedAt —— 回收站 30 天计时就看它。
+ * 改指向用原生 UPDATE：只修收录链，不算编辑，不碰下游的 updatedAt / unlistedAt。
  * 若下游主人已经直接收藏过上游（「同人同源只能有一份活跃副本」唯一索引会拒绝），
  * 那一份不改指向：它仍会被判为来源已删，而这个人手里另有一份正常的副本。
  *
- * 返回是否真的删掉了（不在回收站 / 不满足条件 / 已被删时为 false）。
+ * 返回是否真的删掉了（不是 DELETED / 已被删时为 false）。
  */
 export async function purgeDeletedNote(
   prisma: PrismaService,
   noteId: string,
-  guard: NotePurgeGuard,
 ): Promise<boolean> {
   return prisma.$transaction(async (tx) => {
-    const [row] =
-      'ownerID' in guard
-        ? await tx.$queryRaw<Array<{ collectedFromNoteID: string | null }>>`
-            SELECT "collectedFromNoteID" FROM "Note"
-            WHERE "id" = ${noteId} AND "ownerID" = ${guard.ownerID}
-              AND "status" = 'DELETED'
-            FOR UPDATE`
-        : await tx.$queryRaw<Array<{ collectedFromNoteID: string | null }>>`
-            SELECT "collectedFromNoteID" FROM "Note"
-            WHERE "id" = ${noteId} AND "status" = 'DELETED'
-              AND "updatedAt" < ${guard.deletedBefore}
-            FOR UPDATE`;
+    const [row] = await tx.$queryRaw<
+      Array<{ collectedFromNoteID: string | null }>
+    >`
+      SELECT "collectedFromNoteID" FROM "Note"
+      WHERE "id" = ${noteId} AND "status" = 'DELETED'
+      FOR UPDATE`;
     if (!row) return false;
 
     const parentID = row.collectedFromNoteID;

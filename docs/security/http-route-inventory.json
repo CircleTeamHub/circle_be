@@ -1,6 +1,6 @@
 {
   "generatedAt": "2026-10-16",
-  "note": "321 HTTP handler inventory. Discovery is not proof of object authorization; see business-authorization-audit.md for reviewed boundaries and test scope.",
+  "note": "319 HTTP handler inventory. Discovery is not proof of object authorization; see business-authorization-audit.md for reviewed boundaries and test scope.",
   "routes": [
     {"file":"src/moderation/moderation-admin.controller.ts","controller":"Controller('admin/moderation')","method":"listGroupReports","route":"Get('group-reports')"},
     {"file":"src/moderation/moderation-admin.controller.ts","controller":"Controller('admin/moderation')","method":"reviewGroupReport","route":"Post('group-reports/:reportId/review')"},
@@ -206,13 +206,10 @@
     {"file":"src/note/note.controller.ts","controller":"Controller('note')","method":"updateNoteGroupIds","route":"Patch(':id/groups')"},
     {"file":"src/note/note.controller.ts","controller":"Controller('note')","method":"setPinned","route":"Patch(':id/pin')"},
     {"file":"src/note/note.controller.ts","controller":"Controller('note')","method":"setRemark","route":"Patch(':id/remark')"},
-    {"file":"src/note/note.controller.ts","controller":"Controller('note')","method":"setAvailable","route":"Patch(':id/available')"},
     {"file":"src/note/note.controller.ts","controller":"Controller('note')","method":"setWorkStatus","route":"Patch(':id/work-status')"},
     {"file":"src/note/note.controller.ts","controller":"Controller('note')","method":"setSourceConversation","route":"Patch(':id/source-group')"},
     {"file":"src/note/note.controller.ts","controller":"Controller('note')","method":"setStatus","route":"Patch(':id/status')"},
-    {"file":"src/note/note.controller.ts","controller":"Controller('note')","method":"listDeleted","route":"Get('recycle-bin')"},
-    {"file":"src/note/note.controller.ts","controller":"Controller('note')","method":"restore","route":"Post(':id/restore')"},
-    {"file":"src/note/note.controller.ts","controller":"Controller('note')","method":"purge","route":"Delete(':id/permanent')"},
+    {"file":"src/note/note.controller.ts","controller":"Controller('note')","method":"getRanking","route":"Get('ranking')"},
     {"file":"src/note/note.controller.ts","controller":"Controller('note')","method":"deleteNote","route":"Delete(':id')"},
     {"file":"src/note/note.controller.ts","controller":"Controller('note')","method":"createShareLink","route":"Post('share-links')"},
     {"file":"src/note/note.controller.ts","controller":"Controller('note')","method":"listShareLinks","route":"Get('share-links')"},

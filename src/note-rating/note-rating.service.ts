@@ -59,7 +59,13 @@ type RatingTarget = {
   groupCards: GroupCardRef[];
 };
 
-type Block = { reason: NoteRatingBlockCode | null; nextRatableAt: Date | null };
+type Block = {
+  reason: NoteRatingBlockCode | null;
+  nextRatableAt: Date | null;
+  /** 今天（上海）是否已经打过好评 / 差评：每天各一次。被更早的规则挡住时为 false。 */
+  goodRatedToday: boolean;
+  badRatedToday: boolean;
+};
 
 const LEDGER_SELECT = {
   id: true,
@@ -146,6 +152,7 @@ export class NoteRatingService {
       target,
       now,
       calendar,
+      null,
     );
     const today = await this.prisma.noteRatingDaily.findUnique({
       where: { noteID_day: { noteID: target.noteID, day: calendar.day } },
@@ -158,6 +165,8 @@ export class NoteRatingService {
       canRate: block.reason === null,
       reason: block.reason,
       nextRatableAt: block.nextRatableAt,
+      goodRatedToday: block.goodRatedToday,
+      badRatedToday: block.badRatedToday,
       goodFull: (today?.goodCount ?? 0) >= NOTE_RATING_NOTE_DAILY_CAP,
       badFull: (today?.badCount ?? 0) >= NOTE_RATING_NOTE_DAILY_CAP,
     };
@@ -193,7 +202,14 @@ export class NoteRatingService {
       const now = new Date();
       const calendar = ratingCalendar(now);
 
-      const block = await this.findBlock(tx, raterID, target, now, calendar);
+      const block = await this.findBlock(
+        tx,
+        raterID,
+        target,
+        now,
+        calendar,
+        value,
+      );
       if (block.reason) throw rejected(block.reason, block.nextRatableAt);
 
       // Every rating on this note is also a rating for its owner, so the
@@ -436,8 +452,8 @@ export class NoteRatingService {
 
   /**
    * The note the viewer opened may be their collected copy or any copy in the
-   * chain; ratings always go to the root. A root in the recycle bin or purged
-   * cannot be rated.
+   * chain; ratings always go to the root. A deleted or purged root cannot be
+   * rated; a 下架 (UNLISTED) one stays readable and ratable.
    */
   private async resolveTarget(
     viewerID: string,
@@ -447,7 +463,7 @@ export class NoteRatingService {
       where: {
         id: noteId,
         status: { not: 'DELETED' },
-        OR: [{ ownerID: viewerID }, { available: true, status: 'ACTIVE' }],
+        OR: [{ ownerID: viewerID }, { available: true }],
       },
       select: { id: true, rootSourceNoteID: true },
     });
@@ -473,17 +489,24 @@ export class NoteRatingService {
     };
   }
 
-  /** First rule the viewer fails, in the order the app explains them. */
+  /**
+   * First rule the viewer fails, in the order the app explains them.
+   * `value` = the rating being submitted; null = the summary, where the daily
+   * rule only blocks once both today's 好评 and 差评 are used.
+   */
   private async findBlock(
     client: Client,
     raterID: string,
     target: RatingTarget,
     now: Date,
     calendar: RatingCalendar,
+    value: 'GOOD' | 'BAD' | null,
   ): Promise<Block> {
     const blocked = (reason: NoteRatingBlockCode): Block => ({
       reason,
       nextRatableAt: null,
+      goodRatedToday: false,
+      badRatedToday: false,
     });
     if (target.ownerID === raterID) return blocked(NoteRatingErrorCode.Owner);
     if (target.groupCards.length === 0) {
@@ -515,11 +538,25 @@ export class NoteRatingService {
       return blocked(NoteRatingErrorCode.AccountTooNew);
     }
 
+    // 好评、差评每天各一次（上海自然日，2026-11-13 起；之前两者合计一次）。
     // Any status counts here: held and voided ratings used the rater's quota.
-    const ratedToday = await client.noteRating.findFirst({
-      where: { raterID, createdAt: { gte: calendar.dayStart } },
-      select: { id: true },
-    });
+    const ratedTodayWith = (ratingValue: 'GOOD' | 'BAD') =>
+      client.noteRating.findFirst({
+        where: {
+          raterID,
+          value: ratingValue,
+          createdAt: { gte: calendar.dayStart },
+        },
+        select: { id: true },
+      });
+    const goodRatedToday = Boolean(await ratedTodayWith('GOOD'));
+    const badRatedToday = Boolean(await ratedTodayWith('BAD'));
+    const ratedToday =
+      value === 'GOOD'
+        ? goodRatedToday
+        : value === 'BAD'
+          ? badRatedToday
+          : goodRatedToday && badRatedToday;
     const lastOnNote = await client.noteRating.findFirst({
       where: {
         raterID,
@@ -531,8 +568,14 @@ export class NoteRatingService {
       orderBy: { createdAt: 'desc' },
       select: { createdAt: true },
     });
-    if (!ratedToday && !lastOnNote)
-      return { reason: null, nextRatableAt: null };
+    if (!ratedToday && !lastOnNote) {
+      return {
+        reason: null,
+        nextRatableAt: null,
+        goodRatedToday,
+        badRatedToday,
+      };
+    }
     const cooldownEnds = lastOnNote
       ? lastOnNote.createdAt.getTime() + NOTE_RATING_NOTE_COOLDOWN_MS
       : 0;
@@ -542,6 +585,8 @@ export class NoteRatingService {
         ? NoteRatingErrorCode.RaterDailyLimit
         : NoteRatingErrorCode.Cooldown,
       nextRatableAt: new Date(Math.max(cooldownEnds, dayEnds)),
+      goodRatedToday,
+      badRatedToday,
     };
   }
 
