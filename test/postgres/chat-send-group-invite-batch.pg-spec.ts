@@ -288,17 +288,22 @@ describePostgres('group invite and create-group batching', () => {
         'u000',
         ...invitees.slice(3, GROUP_DIRECT_JOIN_MAX_MEMBERS),
       ];
+      // 带参数的查询走扩展协议,一次只能一条命令:三条 INSERT 分开发。
       await live.db.query(
         `INSERT INTO "ChatConversation"
            (id, type, "ownerID", "memberCanInvite", "joinApprovalRequired", "updatedAt")
-         VALUES ('reservation-group', 'GROUP', 'owner', true, true, now());
-         INSERT INTO "ChatMember" (id, "conversationID", "userID", role)
+         VALUES ('reservation-group', 'GROUP', 'owner', true, true, now())`,
+      );
+      await live.db.query(
+        `INSERT INTO "ChatMember" (id, "conversationID", "userID", role)
          SELECT 'reservation-seat-' || u, 'reservation-group', u, 'MEMBER'
-         FROM unnest($1::text[]) u;
-         INSERT INTO "Friend" (id, "userID", "friendID", state, "updatedAt") VALUES
-           ('reservation-friend-1', 'u000', 'u001', 'ACCEPTED', now()),
-           ('reservation-friend-2', 'u000', 'u002', 'ACCEPTED', now());`,
+         FROM unnest($1::text[]) u`,
         [members],
+      );
+      await live.db.query(
+        `INSERT INTO "Friend" (id, "userID", "friendID", state, "updatedAt") VALUES
+           ('reservation-friend-1', 'u000', 'u001', 'ACCEPTED', now()),
+           ('reservation-friend-2', 'u000', 'u002', 'ACCEPTED', now())`,
       );
     });
 
