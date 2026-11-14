@@ -11,15 +11,21 @@ export const NOTE_MEDIA_TYPE_LIMITS = {
 export type NoteMediaType = keyof typeof NOTE_MEDIA_TYPE_LIMITS;
 export type NoteMediaTypeCounts = Record<NoteMediaType, number>;
 
-type TypedItem = { type?: unknown };
+type TypedItem = { type?: unknown; objectKey?: unknown };
 
-const countVideos = (items: readonly unknown[]) =>
-  items.filter(
-    (item) =>
-      typeof item === 'object' &&
-      item !== null &&
-      (item as TypedItem).type === 'VIDEO',
-  ).length;
+/**
+ * 按 objectKey 去重计数:分区条目只是对笔记媒体的引用、服务端不去重,同一个视频在验证区
+ * 列 5 次不能算 5 个验证视频(否则「视频 = 全部 − 验证」会被压低,绕过视频上限)。
+ */
+const countVideos = (items: readonly unknown[]) => {
+  const keys = new Set<unknown>();
+  items.forEach((item, index) => {
+    if (typeof item !== 'object' || item === null) return;
+    const { type, objectKey } = item as TypedItem;
+    if (type === 'VIDEO') keys.add(objectKey ?? `#${index}`);
+  });
+  return keys.size;
+};
 
 /**
  * 照片 = 笔记里所有图片;验证视频 = 验证区(showcase)里的视频;视频 = 其余视频。

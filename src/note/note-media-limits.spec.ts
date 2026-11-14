@@ -27,6 +27,17 @@ describe('note media type limits', () => {
     });
   });
 
+  it('counts a video listed twice in the showcase once, so it cannot hide ordinary videos', () => {
+    // 验证区条目不去重:同一个视频列 5 次,原来会被当成 5 个验证视频、把 9 个普通视频压成 4 个。
+    const ordinary = ['v1', 'v2', 'v3', 'v4', 'v5', 'v6', 'v7', 'v8', 'v9'].map(
+      video,
+    );
+    const showcase = Array.from({ length: 5 }, () => video('v1'));
+    const counts = countNoteMediaByType(ordinary, showcase);
+    expect(counts).toEqual({ photos: 0, videos: 8, verificationVideos: 1 });
+    expect(findExceededNoteMediaType(counts)).toBe('videos');
+  });
+
   it('ignores showcase images (legacy notes fall back to images there)', () => {
     const media = [image('i1'), image('i2')];
     expect(countNoteMediaByType(media, media)).toEqual({
