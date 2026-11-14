@@ -191,7 +191,8 @@ flock 单飞锁 → 拉镜像 → pg_dump 备份(保留 7 份,~/circle_be_backup
 → 起另一色容器(circle_be / circle_be_green 交替)
 → 容器健康门禁(300s)→ validate 并原子 reload Caddy 到新色的唯一容器端点
   (`circle-be-blue` / `circle-be-green`)→ 走公网域名烟测
-→ 通过:停/删旧色,完成;失败:代理切回旧色并清理新色,CI 标红
+→ 通过:停/删旧色,清理本地旧后端镜像(只留含在役的最近 5 个),完成;
+  失败:代理切回旧色并清理新色,CI 标红,不清理镜像
 → 完成后:同步已经在跑的可选运维栈(deploy/sync-ops-stacks.sh)——备份 overlay
   的 backup/backup-metrics,监控栈及日志 overlay,让新的告警规则、抑制、Loki/Alloy
   配置随发布生效。只动从这棵树启动的栈里**正在跑**的服务(停掉的不拉起、新增的
@@ -295,7 +296,9 @@ launcher 会拒绝任何兼容级别低于 4 的 tag。
 
 镜像推/拉全用内置 `GITHUB_TOKEN`,无需额外 PAT;服务器只在部署那一刻用临时 token
 登录 GHCR(隔离的 DOCKER_CONFIG,用完即删),镜像随后留在本地 Docker 缓存,
-重启和回滚不依赖注册表。
+重启和回滚不依赖注册表。每次发版成功后只保留同一仓库最近 5 个后端镜像(含在役那个),
+更早的版本要回滚时由 Release 重新从 GHCR 拉取(`v*` 镜像永久保留);还被容器引用的
+镜像不会被删。
 
 ### 迁移里的并发建索引(CONCURRENTLY):发版前后必查
 
@@ -680,7 +683,8 @@ $S3 s3api get-object --bucket <bucket> \
   在 Settings → Environments → production 加 required reviewers 即可,不用改 workflow。
 - **镜像清理**:cleanup-images.yml 每周一自动清理老的 `sha-*` 镜像
   (保留最新 20 个且 14 天内的不动);`v*` 发布镜像与 `main` 永久保留。
-  服务器本地的旧镜像可偶尔 `docker image prune -a --filter "until=720h"`(慎用)。
+  服务器本地的旧后端镜像由 release-deploy.sh 在发版成功后自动清理(留最近 5 个);
+  其他镜像和手工构建留下的构建缓存(发版本身从不在本机构建)仍要偶尔手动清。
 - **构建时长**:amd64 runner 经 QEMU 交叉构建 arm64,首次 ~15–25 分钟,有 GHA 缓存后明显变快;
   构建在 main push 时异步发生,不占发版时间。仓库转 public 后可把两个构建 job 的
   `runs-on` 改成 `ubuntu-24.04-arm` 原生构建并删掉 QEMU 步骤(私有仓库的 ARM runner 收费)。

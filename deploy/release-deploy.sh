@@ -389,6 +389,36 @@ smoke() {
   return 1
 }
 
+# 每次发版都从 GHCR 拉一个约 1.5GB 的镜像。本地留旧版本是为了「重启和回滚不依赖注册表」
+# (DEPLOY.md 原话),但从不清理的话,按 main 合并即发版的频率,测试服 59G 的盘
+# 一周左右就写满(2026-11-14 HostDiskNearlyFull)。只留在役镜像加最新的另外几个;
+# image ls 按构建时间从新到旧,同一镜像几个标签就列几行,要按一个版本算。docker rmi
+# 不带 -f,还被容器引用的镜像会拒删,留到下次发版再试。
+RELEASE_IMAGES_TO_KEEP=5
+
+prune_old_release_images() {
+  local repository="${CIRCLE_BE_IMAGE%@*}" current_id listing id seen=""
+  local kept=1 removed=0 failed=0
+  current_id="$(docker image inspect --format '{{.Id}}' "$CIRCLE_BE_IMAGE")" || return 1
+  listing="$(docker image ls --no-trunc --format '{{.ID}}' "$repository")" || return 1
+  while IFS= read -r id; do
+    [ -n "$id" ] && [ "$id" != "$current_id" ] || continue
+    case " $seen " in *" $id "*) continue ;; esac
+    seen="$seen $id"
+    if [ "$kept" -lt "$RELEASE_IMAGES_TO_KEEP" ]; then
+      kept=$((kept + 1))
+    elif docker rmi "$id" >/dev/null; then
+      removed=$((removed + 1))
+    else
+      failed=$((failed + 1))
+    fi
+  done <<< "$listing"
+  echo "==> Pruned $removed old release image(s) from $repository; kept $kept"
+  if [ "$failed" -ne 0 ]; then
+    echo "WARNING: could not remove $failed old release image(s); they are retried on the next release" >&2
+  fi
+}
+
 ensure_recovery_color_healthy() {
   local color="$1" cid health attempt
   cid="$(running "$color")"
@@ -969,6 +999,8 @@ if smoke; then
     compose rm -f "$live"
   fi
   echo "==> Release $RELEASE_TAG deployed: $standby is live on $CIRCLE_BE_IMAGE"
+  prune_old_release_images ||
+    echo "WARNING: pruning old release images failed; watch the HostDisk* alerts" >&2
   # 已经在跑的可选运维栈（备份 overlay、监控、日志）跟着这次发布的配置走：告警
   # 规则、抑制、Loki/Alloy 配置随代码一起改，不同步就永远不会生效。尽力而为 ——
   # 发版到这里已经完成，同步失败只告警（详见 deploy/sync-ops-stacks.sh）。
