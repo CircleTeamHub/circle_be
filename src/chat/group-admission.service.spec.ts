@@ -120,6 +120,18 @@ function harness(approval = true, crowded = true) {
       }),
     },
     groupAdmission: {
+      count: jest
+        .fn()
+        .mockImplementation(
+          ({ where }: any) =>
+            [...admissions.values()].filter(
+              (a) =>
+                a.conversationID === where.conversationID &&
+                a.status === where.status &&
+                a.consentSeatReserved === where.consentSeatReserved &&
+                a.expiresAt > where.expiresAt.gt,
+            ).length,
+        ),
       updateMany: jest.fn().mockImplementation(({ where, data }: any) => {
         for (const a of admissions.values())
           if (
@@ -863,6 +875,37 @@ describe('Group admission small-group direct join', () => {
       ['y', 'INVITED'],
     ]);
     expect(['x', 'y'].some((id) => h.seats.has(id))).toBe(false);
+  });
+
+  it('reserves the consent-free slot across batches and releases it after review or expiry', async () => {
+    const h = harness(true, false);
+    h.seats.set('member', { userID: 'member', role: 'MEMBER', leftAt: null });
+    // Owner, inviter and 27 more leave exactly one consent-free slot.
+    for (let i = 1; i <= GROUP_DIRECT_JOIN_MAX_MEMBERS - 3; i += 1)
+      h.seats.set(`m${i}`, { userID: `m${i}`, role: 'MEMBER', leftAt: null });
+    befriend(h, 'member', ['x', 'y', 'z', 'w']);
+
+    await h.service.invite('member', 'g', ['x']);
+    await h.service.invite('member', 'g', ['y']);
+
+    expect(statuses(h)).toEqual([
+      ['x', 'PENDING'],
+      ['y', 'INVITED'],
+    ]);
+
+    await h.service.act('owner', 'a0', 'reject');
+    await h.service.invite('member', 'g', ['z']);
+    expect(h.admissions.get('a2')).toMatchObject({
+      applicantID: 'z',
+      status: 'PENDING',
+    });
+
+    h.admissions.get('a2').expiresAt = new Date(0);
+    await h.service.invite('member', 'g', ['w']);
+    expect(h.admissions.get('a3')).toMatchObject({
+      applicantID: 'w',
+      status: 'PENDING',
+    });
   });
 
   it('re-seats a departed member with a fresh role and history floor', async () => {
