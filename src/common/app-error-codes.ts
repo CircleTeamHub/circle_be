@@ -299,6 +299,9 @@ export const NoteErrorCode = {
   // 分享链接功能未开启（部署没配 NOTE_SHARE_WEB_BASE，没有能打开的落地页）。
   // 只用于主人侧创建；访客侧解析在功能关闭时仍回 ShareLinkInvalid，不暴露部署配置。
   ShareLinkUnavailable: 'NOTE_SHARE_LINK_UNAVAILABLE',
+  // 单条笔记的照片 / 视频 / 验证视频超出上限(9 / 5 / 5,见 note-media-limits.ts)。
+  // 上限前就已超的旧笔记编辑时不拦,只拦再往上加。
+  MediaTypeLimit: 'NOTE_MEDIA_TYPE_LIMIT',
 } as const;
 
 // 笔记评分（好评 / 差评）。评分资格不满足时的原因码同时出现在
