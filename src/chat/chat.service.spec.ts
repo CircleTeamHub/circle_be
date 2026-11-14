@@ -969,7 +969,17 @@ describe('ChatService', () => {
       ).rejects.toThrow(NotFoundException);
       // 没收藏过:不会退到收藏的读取规则。
       expect(prisma.userCollection.findFirst).toHaveBeenCalledWith({
-        where: { userID: 'u1', sourceID: 'source-message' },
+        where: {
+          userID: 'u1',
+          sourceID: 'source-message',
+          OR: [
+            { type: { not: 'NOTE' } },
+            {
+              type: 'NOTE',
+              payload: { path: ['kind'], equals: 'openim-message' },
+            },
+          ],
+        },
         select: { id: true },
       });
       expect(prisma.chatMessage.findMany).not.toHaveBeenCalled();
@@ -1035,6 +1045,92 @@ describe('ChatService', () => {
         'u1',
       );
       expect(result.reused).toBe(false);
+    });
+
+    it('does not treat a generic note collection with the same source id as a message favorite', async () => {
+      const targetMembership = membership();
+      const sourceMembership = membership({
+        conversationID: 'source-conv',
+        clearedBeforeHeight: 8,
+        conversation: {
+          ...membership().conversation,
+          id: 'source-conv',
+          burnDurationSec: null,
+        },
+      });
+      const source = {
+        ...createdRow,
+        id: 'source-message',
+        conversationID: 'source-conv',
+        senderID: 'u2',
+        height: 8,
+        type: 'image',
+        content: { key: 'chat/u2/source.jpg', width: 640 },
+        revokedAt: null,
+      };
+      prisma.chatMember.findUnique
+        .mockResolvedValueOnce(targetMembership)
+        .mockResolvedValueOnce(sourceMembership)
+        .mockResolvedValueOnce(targetMembership);
+      prisma.chatMessage.findUnique
+        .mockResolvedValueOnce(source)
+        .mockResolvedValueOnce(null);
+      prisma.userCollection.findFirst.mockImplementationOnce((args: any) =>
+        args.where.OR
+          ? Promise.resolve(null)
+          : Promise.resolve({ id: 'forged-note' }),
+      );
+      prisma.chatMessage.findMany.mockResolvedValueOnce([source]);
+      prisma.chatMember.findMany.mockResolvedValueOnce([sourceMembership]);
+      media.copyForForward.mockResolvedValue({
+        content: { key: 'chat/u1/copied.jpg', width: 640 },
+        copiedKeys: ['chat/u1/copied.jpg'],
+      });
+      prisma.chatMessage.create.mockResolvedValue({
+        ...createdRow,
+        type: 'image',
+        content: { key: 'chat/u1/copied.jpg', width: 640 },
+      });
+      prisma.chatConversation.update.mockResolvedValue({});
+
+      try {
+        await expect(
+          service.sendMessage(
+            'u1',
+            sendPayload({
+              type: 'image',
+              content: {},
+              forwardFromMessageId: 'source-message',
+            } as never),
+          ),
+        ).rejects.toThrow(NotFoundException);
+
+        expect(prisma.userCollection.findFirst).toHaveBeenCalledWith({
+          where: {
+            userID: 'u1',
+            sourceID: 'source-message',
+            OR: [
+              { type: { not: 'NOTE' } },
+              {
+                type: 'NOTE',
+                payload: { path: ['kind'], equals: 'openim-message' },
+              },
+            ],
+          },
+          select: { id: true },
+        });
+        expect(prisma.chatMessage.findMany).not.toHaveBeenCalled();
+        expect(media.copyForForward).not.toHaveBeenCalled();
+      } finally {
+        prisma.chatMember.findUnique.mockReset();
+        prisma.chatMember.findMany.mockReset();
+        prisma.chatMessage.findUnique.mockReset();
+        prisma.chatMessage.findMany.mockReset();
+        prisma.chatMessage.create.mockReset();
+        prisma.chatConversation.update.mockReset();
+        prisma.userCollection.findFirst.mockReset();
+        media.copyForForward.mockReset();
+      }
     });
 
     // 可见性只回答「你现在能不能看见」。阅后即焚会话里**别人**发的媒体仍在
