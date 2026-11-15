@@ -9,8 +9,8 @@ import { type LiveSchema, openLiveSchema, seedUsers } from './live-prisma';
  * schema.prisma 现场生成（含 Note.city 和 (month, goodCount) 索引），排名 SQL 就是
  * service 里那一条（noteRankingQuery），再走真实的摘要读取与映射。
  *
- * - 资格：只收本月好评 > 0、ACTIVE + available、选了城市的原笔记；下架、隐藏、删除、
- *   收藏副本、没选城市、零好评、只有上月计数的都不上榜；
+ * - 资格：只收本月好评 > 0、ACTIVE + available 的原笔记；下架、隐藏、删除、收藏副本、
+ *   零好评、只有上月计数的都不上榜；没选城市的只上全国榜；
  * - 排序：好评降序 → 差评升序 → 最近更新 → id，LIMIT 在库里做；
  * - 按城市筛选；映射用请求者视角（他人的备注不外发）。
  */
@@ -96,6 +96,8 @@ describePostgres('note ranking on PostgreSQL', () => {
     // 好评、差评、更新时间全相同：按 id 决出先后。
     await note('cd-same-b', { city: '成都' }, thisMonth(3, 1));
     await note('cd-same-a', { city: '成都' }, thisMonth(3, 1));
+    // 没选城市：照样上全国榜，任何城市榜都没有它。
+    await note('no-city', { city: null }, thisMonth(7, 0));
 
     // ── 不上榜（每条好评都比上榜的多，漏掉任何一个过滤就会排到最前面）──────────
     await note('unavailable', { available: false }, thisMonth(20, 0));
@@ -106,7 +108,6 @@ describePostgres('note ranking on PostgreSQL', () => {
       { ownerID: VIEWER, collectedFromNoteID: 'sh-top' },
       thisMonth(20, 0),
     );
-    await note('no-city', { city: null }, thisMonth(20, 0));
     await note('zero-good', {}, thisMonth(0, 5));
     await note('last-month', {}, [
       { month: previousMonthOf(month), good: 20, bad: 0 },
@@ -125,6 +126,7 @@ describePostgres('note ranking on PostgreSQL', () => {
   it('ranks only eligible notes nationwide in a deterministic order', async () => {
     expect(await ids(null)).toEqual([
       'sh-top',
+      'no-city',
       'sh-tie-fewer-bad',
       'cd-tie-newer',
       'sh-tie-older',
@@ -148,7 +150,7 @@ describePostgres('note ranking on PostgreSQL', () => {
   });
 
   it('applies the limit in the database', async () => {
-    expect(await ids(null, 2)).toEqual(['sh-top', 'sh-tie-fewer-bad']);
+    expect(await ids(null, 2)).toEqual(['sh-top', 'no-city']);
     const { rows } = await live.db.query<{ id: string }>(
       noteRankingQuery({ month, city: null, limit: 1 }).text,
       noteRankingQuery({ month, city: null, limit: 1 }).values,

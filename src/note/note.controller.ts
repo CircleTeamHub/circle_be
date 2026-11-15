@@ -289,7 +289,7 @@ export class NoteController {
   @ApiOperation({
     summary: 'Monthly 大众点评 ranking: notes with the most good ratings',
     description:
-      'Current Shanghai month. Only ACTIVE + available source notes whose owner chose a city; `city` narrows to one city, absent = nationwide.',
+      'Current Shanghai month. Only ACTIVE + available source notes. Absent `city` = nationwide, whether or not the owner chose a city; `city` narrows to notes whose owner chose that city.',
   })
   @ApiOkResponse({ type: NoteRankingDto })
   getRanking(

@@ -22,13 +22,15 @@ Checked server-side on every attempt, in this order (the first failure is the
 | ------------------------------------------ | ---------------------------------------------------------------- |
 | `NOTE_RATING_OWNER`                        | the viewer owns the root                                         |
 | `NOTE_RATING_NO_GROUP`                     | the root has no group cards (`sections.groups.items`)            |
-| `NOTE_RATING_NOT_COLLECTED`                | the viewer holds no non-deleted copy (`rootSourceNoteID = root`) |
 | `NOTE_RATING_NOT_IN_GROUP`                 | the viewer is in none of the root's groups                       |
 | `NOTE_RATING_LOW_CREDIT`                   | `creditScore < 90`                                               |
 | `NOTE_RATING_ACCOUNT_TOO_NEW`              | registered less than 7 days ago                                  |
 | `NOTE_RATING_RATER_DAILY_LIMIT`            | the viewer already gave a rating of this value today (Asia/Shanghai): one 好评 and one 差评 per day; the summary reports `goodRatedToday` / `badRatedToday` and only uses this code once both are used |
 | `NOTE_RATING_COOLDOWN`                     | the viewer rated this note within 72 hours                       |
 | `NOTE_RATING_NOTE_GOOD_FULL` / `_BAD_FULL` | the note already has 5 counted ratings of that value today       |
+
+Collecting the note is not required (dropped 2026-11-14): `NOTE_RATING_NOT_COLLECTED`
+is no longer returned; the code stays in `app-error-codes.ts` for older apps.
 
 Group card membership (resolves the spec's first "to confirm" item):
 
@@ -105,8 +107,8 @@ the rater, their credit and registration date.
 `GET /note/ranking?city=&limit=` (default 50, max 100) reads this month's
 `NoteRatingMonthly` rows (`(month, goodCount)` index) and returns
 `{ month, city, items: NoteSummaryDto[] }`. Only source notes (`collectedFromNoteID IS NULL`)
-that are `ACTIVE` + `available`, have at least one good rating this month and whose
-owner chose a city (`Note.city`) appear, nationwide too: choosing a city is the opt-in.
+that are `ACTIVE` + `available` and have at least one good rating this month appear.
+The nationwide list ignores `Note.city`; `?city=` keeps only notes whose owner chose that city.
 Order: good desc, bad asc, `updatedAt` desc, id. Items are mapped from the
 requester's point of view, like `GET /note/:id`. The SQL is `src/note/note-ranking.query.ts`;
 the real-database regression is `test/postgres/note-ranking.pg-spec.ts`.

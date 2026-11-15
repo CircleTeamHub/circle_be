@@ -309,6 +309,7 @@ export const NoteErrorCode = {
 // GET /note/:id/ratings/summary 的 reason 里，客户端据此解释按钮为什么灰掉。
 export const NoteRatingErrorCode = {
   Owner: 'NOTE_RATING_OWNER',
+  /** 2026-11-14 起不再返回（评价不要求先收藏）；保留给旧版 app 的文案映射。 */
   NotCollected: 'NOTE_RATING_NOT_COLLECTED',
   NotInGroup: 'NOTE_RATING_NOT_IN_GROUP',
   NoGroup: 'NOTE_RATING_NO_GROUP',

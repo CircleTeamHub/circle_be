@@ -16,7 +16,7 @@ import { NoteService } from './note.service';
 describe('noteRankingQuery', () => {
   const flat = (query: Prisma.Sql) => query.text.replace(/\s+/g, ' ');
 
-  it('keeps only ACTIVE, available source notes with a city and good ratings this month', () => {
+  it('keeps only ACTIVE, available source notes with good ratings this month', () => {
     const query = noteRankingQuery({ month: '2026-11', city: null, limit: 50 });
     const sql = flat(query);
 
@@ -26,8 +26,8 @@ describe('noteRankingQuery', () => {
     expect(sql).toContain(`n."status" = 'ACTIVE'`);
     expect(sql).toContain('n."available" = true');
     expect(sql).toContain('n."collectedFromNoteID" IS NULL');
-    // 全国榜也只收选了城市的笔记。
-    expect(sql).toContain('n."city" IS NOT NULL');
+    // 全国榜不看城市：没选城市的笔记也上榜。
+    expect(sql).not.toContain('"city"');
     expect(query.values).toEqual(['2026-11', 50]);
   });
 
@@ -118,16 +118,32 @@ describe('NoteService.getNoteRanking', () => {
           { noteID: 'note-b', goodCount: 4, badCount: 0 },
         ]),
       },
+      // note-a 有 5 张图（只取前 4 张，非 notes/ 目录的不签）；note-b 没有图。
+      noteMedia: {
+        findMany: jest.fn().mockResolvedValue([
+          { noteID: 'note-a', objectKey: 'notes/a/1.jpg' },
+          { noteID: 'note-a', objectKey: 'chat/x/foreign.jpg' },
+          { noteID: 'note-a', objectKey: 'notes/a/2.jpg' },
+          { noteID: 'note-a', objectKey: 'notes/a/3.jpg' },
+          { noteID: 'note-a', objectKey: 'notes/a/4.jpg' },
+          { noteID: 'note-a', objectKey: 'notes/a/5.jpg' },
+        ]),
+      },
       circle: { findMany: jest.fn().mockResolvedValue([]) },
+    };
+    const upload = {
+      createPresignedGetUrl: jest.fn(async (key: string) => ({
+        url: `https://signed/${key}`,
+      })),
     };
     const service = new NoteService(
       prisma as never,
       { get: () => undefined } as never,
       {} as never,
       {} as never,
-      { createPresignedGetUrl: jest.fn() } as never,
+      upload as never,
     );
-    return { service, prisma };
+    return { service, prisma, upload };
   }
 
   afterEach(() => jest.useRealTimers());
@@ -184,6 +200,35 @@ describe('NoteService.getNoteRanking', () => {
       goodCount: 4,
       badCount: 0,
     });
+  });
+
+  it('carries the first four note images as signed previews, like the chat note card', async () => {
+    const { service, prisma, upload } = fixture(['note-a', 'note-b']);
+
+    const { items } = await service.getNoteRanking('viewer', { limit: 50 });
+
+    expect(prisma.noteMedia.findMany).toHaveBeenCalledWith(
+      expect.objectContaining({
+        where: { noteID: { in: ['note-a', 'note-b'] }, type: 'IMAGE' },
+      }),
+    );
+    expect(items.map((item) => [item.id, item.previewUrls])).toEqual([
+      [
+        'note-a',
+        [
+          'https://signed/notes/a/1.jpg',
+          'https://signed/notes/a/2.jpg',
+          'https://signed/notes/a/3.jpg',
+          'https://signed/notes/a/4.jpg',
+        ],
+      ],
+      ['note-b', []],
+    ]);
+    expect(upload.createPresignedGetUrl).not.toHaveBeenCalledWith(
+      'chat/x/foreign.jpg',
+      expect.anything(),
+      expect.anything(),
+    );
   });
 
   it('reports the nationwide list as city null and skips the reads when nothing is ranked', async () => {

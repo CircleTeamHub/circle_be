@@ -191,6 +191,27 @@ describe('NoteRatingService.rate', () => {
     expect(calls[3]).toContain('"goodCount"');
   });
 
+  // 2026-11-14 起不再要求先把笔记添加到「我的笔记」：在笔记绑定的群里就能评。
+  it('lets a group member rate the source note without collecting it first', async () => {
+    const { service, prisma } = setup({ hasCopy: false });
+
+    await service.rate(RATER, ROOT, { value: 'GOOD' });
+
+    expect(prisma.noteRating.create).toHaveBeenCalledWith(
+      expect.objectContaining({
+        data: expect.objectContaining({
+          noteID: ROOT,
+          raterID: RATER,
+          status: 'COUNTED',
+        }),
+      }),
+    );
+    expect(prisma.note.findFirst).not.toHaveBeenCalledWith({
+      where: expect.objectContaining({ rootSourceNoteID: ROOT }),
+      select: expect.anything(),
+    });
+  });
+
   it('stores the reason and text of a bad rating', async () => {
     const { service, prisma } = setup();
 
@@ -229,7 +250,6 @@ describe('NoteRatingService.rate', () => {
   it.each([
     ['NOTE_RATING_OWNER', { viewer: OWNER }],
     ['NOTE_RATING_NO_GROUP', { cards: [] }],
-    ['NOTE_RATING_NOT_COLLECTED', { hasCopy: false }],
     ['NOTE_RATING_NOT_IN_GROUP', { seat: false, circleMember: false }],
     ['NOTE_RATING_LOW_CREDIT', { creditScore: 89 }],
     [
