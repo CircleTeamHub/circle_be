@@ -984,6 +984,16 @@ export class NoteRankingQueryDto {
   limit = NOTE_RANKING_DEFAULT_LIMIT;
 }
 
+/** 榜单一条：笔记摘要 + 聊天卡片同款的四宫格预览图。 */
+export class NoteRankingItemDto extends NoteSummaryDto {
+  @ApiProperty({
+    type: [String],
+    description:
+      '前几张图片（最多 4 张）的短时签名地址，同聊天笔记卡片的四宫格',
+  })
+  previewUrls: string[];
+}
+
 /** 同 SharedNoteListDto：引用 NoteSummaryDto，必须声明在它之后。 */
 export class NoteRankingDto {
   @ApiProperty({
@@ -998,11 +1008,11 @@ export class NoteRankingDto {
   })
   city: string | null;
   @ApiProperty({
-    type: [NoteSummaryDto],
+    type: [NoteRankingItemDto],
     description:
-      '本月好评数降序（同分按差评少、最近更新、id），只含主人选了城市、上架且公开的原笔记',
+      '本月好评数降序（同分按差评少、最近更新、id），只含上架且公开的原笔记；城市榜只含主人选了该城市的',
   })
-  items: NoteSummaryDto[];
+  items: NoteRankingItemDto[];
 }
 
 // ── 收藏聊天中的笔记 → 复制入"我的笔记" ────────────────────────────────────────

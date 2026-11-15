@@ -3725,10 +3725,25 @@ export class NoteService implements NoteCardProjector {
     const byId = new Map(rows.map((row) => [row.id, row]));
     // 两次读取之间被永久删除的笔记直接少一名。
     const ordered = ranked.flatMap((row) => byId.get(row.id) ?? []);
+    const [items, previewKeys] = await Promise.all([
+      this.mapSummaryListResolved(ordered, viewerID),
+      this.notePreviewKeys(ordered.map((row) => row.id)),
+    ]);
+    // 榜单用聊天卡片的样子展示：每条带前几张图的现签地址（同聊天卡片的四宫格）。
+    // presignNoteMedia 只拿 url 做去重键，这里直接用对象 key。
+    const keys = [...previewKeys.values()].flat();
+    const signed = await this.presignNoteMedia(
+      keys.map((objectKey) => ({ url: objectKey, objectKey })),
+    );
     return {
       month,
       city,
-      items: await this.mapSummaryListResolved(ordered, viewerID),
+      items: items.map((item) => ({
+        ...item,
+        previewUrls: (previewKeys.get(item.id) ?? []).flatMap(
+          (key) => signed.get(key) ?? [],
+        ),
+      })),
     };
   }
 
@@ -4772,19 +4787,9 @@ export class NoteService implements NoteCardProjector {
     if (notes.length === 0) return result;
     // 空字符串不会是任何笔记的主人:按访客视角生成摘要。
     const summaries = await this.mapSummaryListResolved(notes, '');
-    const media = await this.prisma.noteMedia.findMany({
-      where: { noteID: { in: notes.map((note) => note.id) }, type: 'IMAGE' },
-      orderBy: [{ noteID: 'asc' }, { sortOrder: 'asc' }],
-      select: { noteID: true, objectKey: true },
-    });
-    const previewKeys = new Map<string, string[]>();
-    for (const item of media) {
-      if (!item.noteID || !item.objectKey.startsWith(NOTE_MEDIA_KEY_PREFIX))
-        continue;
-      const keys = previewKeys.get(item.noteID) ?? [];
-      if (keys.length < NOTE_CARD_PREVIEW_MAX) keys.push(item.objectKey);
-      previewKeys.set(item.noteID, keys);
-    }
+    const previewKeys = await this.notePreviewKeys(
+      notes.map((note) => note.id),
+    );
     for (const summary of summaries) {
       result.set(summary.id, {
         title: summary.title,
@@ -4799,6 +4804,26 @@ export class NoteService implements NoteCardProjector {
       });
     }
     return result;
+  }
+
+  /** 每篇笔记前几张图片的对象 key(聊天卡片的四宫格),只收 notes/ 目录下的。 */
+  private async notePreviewKeys(
+    noteIds: string[],
+  ): Promise<Map<string, string[]>> {
+    const media = await this.prisma.noteMedia.findMany({
+      where: { noteID: { in: noteIds }, type: 'IMAGE' },
+      orderBy: [{ noteID: 'asc' }, { sortOrder: 'asc' }],
+      select: { noteID: true, objectKey: true },
+    });
+    const previewKeys = new Map<string, string[]>();
+    for (const item of media) {
+      if (!item.noteID || !item.objectKey.startsWith(NOTE_MEDIA_KEY_PREFIX))
+        continue;
+      const keys = previewKeys.get(item.noteID) ?? [];
+      if (keys.length < NOTE_CARD_PREVIEW_MAX) keys.push(item.objectKey);
+      previewKeys.set(item.noteID, keys);
+    }
+    return previewKeys;
   }
 
   /**
