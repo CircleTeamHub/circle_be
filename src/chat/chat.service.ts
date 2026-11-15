@@ -83,6 +83,7 @@ import {
   lastMessagesQuery,
   unreadCountsQuery,
 } from './chat-conversation-summary.query';
+import { AUTO_REPLY_QUIET_MS } from './chat-direct-auto-reply.processor';
 import { messageDaysQuery, messageDayWindows } from './chat-message-days.query';
 import { messagePreviewText } from './chat-message-preview';
 import {
@@ -1452,7 +1453,11 @@ export class ChatService {
     const directAutoReplyJobId = plan.directAutoReply
       ? (
           await tx.chatDirectAutoReplyJob.create({
-            data: { sourceMessageID: message.id },
+            data: {
+              sourceMessageID: message.id,
+              // 静默期过了才轮到它，只回连发里的最后一条（见 AUTO_REPLY_QUIET_MS）。
+              nextAttemptAt: new Date(Date.now() + AUTO_REPLY_QUIET_MS),
+            },
             select: { id: true },
           })
         ).id
