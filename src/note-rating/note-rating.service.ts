@@ -512,15 +512,7 @@ export class NoteRatingService {
     if (target.groupCards.length === 0) {
       return blocked(NoteRatingErrorCode.NoGroup);
     }
-    const copy = await client.note.findFirst({
-      where: {
-        ownerID: raterID,
-        rootSourceNoteID: target.noteID,
-        status: { not: 'DELETED' },
-      },
-      select: { id: true },
-    });
-    if (!copy) return blocked(NoteRatingErrorCode.NotCollected);
+    // 不要求先把笔记添加到「我的笔记」（2026-11-14 起）：在笔记绑定的群里就能评。
     if (!(await this.isMemberOfAnyGroup(client, raterID, target.groupCards))) {
       return blocked(NoteRatingErrorCode.NotInGroup);
     }
