@@ -1,5 +1,6 @@
 import { randomUUID } from 'crypto';
 import { CircleAdmissionPolicy } from 'src/circle/circle-admission-policy';
+import { CircleErrorCode } from 'src/common/app-error-codes';
 import { CircleMemberLockService } from 'src/circle/circle-member-lock';
 import { CircleService } from 'src/circle/circle.service';
 import { CircleInvitationService } from 'src/circle-invitation/circle-invitation.service';
@@ -117,6 +118,25 @@ describePostgres('Circle membership transition concurrency e2e', () => {
       }),
     ]);
     expect(circle.memberCount).toBe(activeCount);
+  };
+
+  // 「排在持锁事务后面」要等竞争方真的排进了锁队列才成立。持锁方在发起竞争方的
+  // 同一拍就放行的话,竞争方往往还没开事务对方就已提交 —— 测到的只是先后两次
+  // 调用,真正被挡住的那条路径只在 CI 偶尔撞上一次。
+  const waitUntilAdvisoryLockIsContended = async () => {
+    const deadline = Date.now() + 5_000;
+    while (Date.now() < deadline) {
+      const [{ waiting }] = await prisma.$queryRaw<{ waiting: number }[]>`
+        SELECT count(*)::int AS waiting
+        FROM pg_locks
+        WHERE locktype = 'advisory'
+          AND NOT granted
+          AND database = (SELECT oid FROM pg_database WHERE datname = current_database())
+      `;
+      if (waiting > 0) return;
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+    throw new Error('The racing call never queued behind the held lock');
   };
 
   beforeEach(() => {
@@ -242,7 +262,7 @@ describePostgres('Circle membership transition concurrency e2e', () => {
     await Promise.all(targetCircleIDs.map(expectCounterConsistent));
   });
 
-  it('serializes a complete batch behind a target leave and re-evaluates the target', async () => {
+  it('serializes a complete batch behind a target leave without half-applying it', async () => {
     const { admin, candidate, circle } = await createCircleWithPendingMember({
       admin: true,
     });
@@ -275,18 +295,40 @@ describePostgres('Circle membership transition concurrency e2e', () => {
     const inviting = groupService.inviteGroupMembers(admin!.id, circle.id, {
       userIDs: [candidate.id, candidate.id],
     });
-    releaseLeave();
-    await Promise.all([leaving, inviting]);
+    try {
+      await waitUntilAdvisoryLockIsContended();
+    } finally {
+      releaseLeave();
+    }
+    const [leaveResult, inviteResult] = await Promise.allSettled([
+      leaving,
+      inviting,
+    ]);
 
-    const finalMembership = await prisma.circleMember.findUnique({
-      where: {
-        userID_circleID: { userID: candidate.id, circleID: circle.id },
-      },
-      select: { status: true },
-    });
-    expect([null, { status: CircleMemberStatus.ACTIVE }]).toContainEqual(
-      finalMembership,
-    );
+    expect(leaveResult.status).toBe('fulfilled');
+    const [finalMembership, invitationCount] = await Promise.all([
+      prisma.circleMember.findUnique({
+        where: {
+          userID_circleID: { userID: candidate.id, circleID: circle.id },
+        },
+        select: { status: true },
+      }),
+      prisma.circleInvitation.count({
+        where: { circleID: circle.id, applicantID: candidate.id },
+      }),
+    ]);
+    // Serializable 的快照在事务第一条语句(拿成员锁、还在排队时)就定了,锁后复核
+    // 看不到退圈的提交:整批按「排在退圈之前」执行,目标仍是成员,整批回滚。这是合法
+    // 的串行顺序。要守住的是整批不落半截、计数不漂。
+    if (inviteResult.status === 'fulfilled') {
+      expect(finalMembership).toEqual({ status: CircleMemberStatus.ACTIVE });
+    } else {
+      expect(inviteResult.reason).toMatchObject({
+        response: { errorCode: CircleErrorCode.AlreadyMember },
+      });
+      expect(finalMembership).toBeNull();
+      expect(invitationCount).toBe(0);
+    }
     await expectCounterConsistent(circle.id);
   });
 
@@ -324,7 +366,11 @@ describePostgres('Circle membership transition concurrency e2e', () => {
     await demotionHasLock;
 
     const approving = invitationService.adminApprove(admin!.id, invitation.id);
-    releaseDemotion();
+    try {
+      await waitUntilAdvisoryLockIsContended();
+    } finally {
+      releaseDemotion();
+    }
     const [demotionResult, approvalResult] = await Promise.allSettled([
       demoting,
       approving,
