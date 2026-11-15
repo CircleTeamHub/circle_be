@@ -6,6 +6,10 @@ import {
 import { ChatErrorCode, GroupErrorCode } from 'src/common/app-error-codes';
 import { ChatService } from './chat.service';
 
+const membershipNoticesMock = {
+  deliverMembershipNotices: jest.fn().mockResolvedValue(undefined),
+};
+
 /**
  * 独立群聊(不挂圈子的 GROUP 会话)专属行为:
  * 建群/邀请只认好友、圈子群拒绝独立群操作、群主退群转移、目录全员可见。
@@ -75,6 +79,7 @@ describe('ChatService standalone group conversations', () => {
     { isSupportAgent: jest.fn() } as never,
     { lock: jest.fn() } as never,
     groupEvents as never,
+    membershipNoticesMock as never,
   );
 
   const conversationDto = { id: 'conv-1' };
@@ -526,6 +531,7 @@ describe('ChatService standalone group conversations', () => {
     ownerID: 'owner-1',
     nextHeight: 42,
     clearedBeforeHeight: 0,
+    name: ' 周末徒步 ',
     ...overrides,
   });
 
@@ -569,10 +575,19 @@ describe('ChatService standalone group conversations', () => {
     for (const userID of ['f1', 'f2']) {
       expect(broadcast.emitConversationChange).toHaveBeenCalledWith(userID, {
         kind: 'removed',
+        reason: 'dissolved',
         conversationId: 'conv-1',
         userId: userID,
       });
     }
+    // 其余成员各收一条「群聊已解散」知会(不推送),群主自己不收。
+    expect(membershipNoticesMock.deliverMembershipNotices).toHaveBeenCalledWith(
+      {
+        type: 'GROUP_DISSOLVED',
+        toUserIds: ['f1', 'f2'],
+        content: '周末徒步',
+      },
+    );
   });
 
   it('rejects dissolve from a non-owner member', async () => {

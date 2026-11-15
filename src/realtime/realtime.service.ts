@@ -71,6 +71,8 @@ type BadgeSnapshot = {
   signupUnread: number;
   profileUnread: number;
   systemUnread: number;
+  /** 消息页「通知」里的群聊知会（被移出独立群 / 独立群解散）。 */
+  groupNoticeUnread: number;
   /** 飞机 tab 的红点：上次打开圈子帖子列表后，有别人发的新帖。 */
   circlePlazaHasUpdate: boolean;
   circlePlazaChangedAt: string;
@@ -172,6 +174,7 @@ type RealtimeEvent =
         count: number;
         momentsUnread: number;
         circleUnread: number;
+        groupNoticeUnread: number;
         changedAt: string;
       };
     }
@@ -536,8 +539,13 @@ export class RealtimeService implements OnModuleInit, OnModuleDestroy {
     ]);
     const signupUnread = await this.countUnreadSignups(userId);
     const circlePlaza = await loadCirclePlazaUpdate(this.prisma, userId);
-    const { discoverUnread, momentsUnread, circleUnread, profileUnread } =
-      notifications;
+    const {
+      discoverUnread,
+      momentsUnread,
+      circleUnread,
+      profileUnread,
+      groupNoticeUnread,
+    } = notifications;
 
     const snapshot: BadgeSnapshot = {
       messagesUnread: 0,
@@ -548,6 +556,7 @@ export class RealtimeService implements OnModuleInit, OnModuleDestroy {
       signupUnread,
       profileUnread,
       systemUnread: profileUnread,
+      groupNoticeUnread,
       circlePlazaHasUpdate: circlePlaza.hasUpdate,
       circlePlazaChangedAt: circlePlaza.changedAt,
       syncedAt: new Date().toISOString(),
@@ -596,6 +605,7 @@ export class RealtimeService implements OnModuleInit, OnModuleDestroy {
       discoverUnread: count,
       momentsUnread,
       circleUnread,
+      groupNoticeUnread,
     } = await loadUnreadNotificationsByDomain(this.prisma, userId);
 
     this.broadcast(userId, {
@@ -604,6 +614,7 @@ export class RealtimeService implements OnModuleInit, OnModuleDestroy {
         count,
         momentsUnread,
         circleUnread,
+        groupNoticeUnread,
         changedAt: new Date().toISOString(),
       },
     });

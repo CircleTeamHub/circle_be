@@ -20,6 +20,7 @@ import { type JobLeaseContext, runWithJobLease } from 'src/redis/job-lease';
 import { RedisService } from 'src/redis/redis.service';
 import {
   DISCOVER_NOTIFICATION_TYPES,
+  GROUP_NOTICE_NOTIFICATION_TYPES,
   notificationTypesForDomain,
   PROFILE_NOTIFICATION_TYPES,
   type NotificationDomain,
@@ -40,6 +41,15 @@ import { loadCirclePlazaUpdate } from 'src/circle-plaza/circle-plaza-update.quer
 import { loadUnreadNotificationsByDomain } from './notification-unread.query';
 import { notificationPageScanQuery } from './notification-list.query';
 import { loadNotificationRealtimeDtos } from './notification-realtime.loader';
+
+/** 被移出 / 解散的站内知会类型,见 {@link NotificationService.deliverMembershipNotices}。 */
+export type MembershipNoticeType = Extract<
+  NotificationType,
+  | 'GROUP_MEMBER_REMOVED'
+  | 'GROUP_DISSOLVED'
+  | 'CIRCLE_MEMBER_REMOVED'
+  | 'CIRCLE_DISSOLVED'
+>;
 
 const NOTIFICATION_DEDUPE_WINDOW_MS = 60 * 60 * 1000;
 const SYSTEM_ANNOUNCEMENT_BATCH_SIZE = 500;
@@ -124,7 +134,12 @@ export class NotificationService {
   }
 
   private async broadcastUnreadForType(userId: string, type: NotificationType) {
-    if (this.isDiscoverNotification(type)) {
+    if (
+      this.isDiscoverNotification(type) ||
+      (GROUP_NOTICE_NOTIFICATION_TYPES as readonly NotificationType[]).includes(
+        type,
+      )
+    ) {
       await this.realtimeService.broadcastInteractionUnread(userId);
       return;
     }
@@ -421,8 +436,13 @@ export class NotificationService {
     // momentsUnread / circleUnread 各自喂一个铃铛（朋友圈 / 圈子广场）；
     // discoverUnread 仍是整个互动域的总数，老客户端和 tab 徽标继续读它。
     // 四个数来自同一条 GROUP BY type（一个池连接），域的求和在 JS 里做。
-    const { discoverUnread, momentsUnread, circleUnread, profileUnread } =
-      await loadUnreadNotificationsByDomain(this.prisma, userId);
+    const {
+      discoverUnread,
+      momentsUnread,
+      circleUnread,
+      profileUnread,
+      groupNoticeUnread,
+    } = await loadUnreadNotificationsByDomain(this.prisma, userId);
     const circlePlaza = await loadCirclePlazaUpdate(this.prisma, userId);
 
     return {
@@ -430,6 +450,7 @@ export class NotificationService {
       momentsUnread,
       circleUnread,
       profileUnread,
+      groupNoticeUnread,
       totalUnread: discoverUnread + profileUnread,
       circlePlazaHasUpdate: circlePlaza.hasUpdate,
       circlePlazaChangedAt: circlePlaza.changedAt,
@@ -542,6 +563,49 @@ export class NotificationService {
       input.toUserID,
       NotificationType.GROUP_ADMISSION,
     );
+  }
+
+  /**
+   * 被移出 / 解散的站内知会(GROUP_/CIRCLE_ MEMBER_REMOVED、DISSOLVED),在成员关系提交之后调用。
+   * - 不写推送 outbox:只在站内出现,理由见 GROUP_NOTICE_NOTIFICATION_TYPES。
+   * - fromUserID 记收件人本人(同 createSystemNotification):不把操作者暴露给被移出的人
+   *   —— 管理台移人时操作者是平台管理员。
+   * - content = 当时的群名/圈子名快照:之后群改名、圈子被删,通知仍说得清是哪个群。
+   * 尽力而为:成员关系已经落库,这里失败只记日志、不抛给调用方。
+   */
+  async deliverMembershipNotices(input: {
+    type: MembershipNoticeType;
+    toUserIds: readonly string[];
+    content: string;
+    circleId?: string;
+  }): Promise<void> {
+    if (input.toUserIds.length === 0) return;
+    try {
+      const rows = await this.prisma.notification.createManyAndReturn({
+        data: input.toUserIds.map((toUserID) => ({
+          type: input.type,
+          toUserID,
+          fromUserID: toUserID,
+          content: input.content,
+          fromCircleID: input.circleId ?? null,
+        })),
+        select: NOTIFICATION_REALTIME_BASE_SELECT,
+      });
+      // 加载器按入参顺序返回,第 i 个 DTO 就是第 i 行(DTO 本身不带收件人)。
+      const dtos = await loadNotificationRealtimeDtos(this.prisma, rows);
+      for (const [index, dto] of dtos.entries()) {
+        const toUserID = rows[index].toUserID;
+        if (!toUserID) continue;
+        this.realtimeService.broadcastNotificationCreated(toUserID, dto);
+        await this.broadcastUnreadForType(toUserID, input.type);
+      }
+    } catch (error) {
+      this.logger.warn(
+        `membership notice delivery failed type=${input.type} recipients=${input.toUserIds.length} (${
+          error instanceof Error ? error.name : 'unknown error'
+        })`,
+      );
+    }
   }
 
   async createSystemNotification(
@@ -1559,6 +1623,10 @@ export class NotificationService {
     });
     if (result.count > 0) {
       await this.realtimeService.broadcastInteractionUnread(userId);
+      // 消息页「通知」的全部已读会连系统公告一起清:「我」页的公告红点也要跟着刷新。
+      if (domain === 'notice' || domain === 'system') {
+        await this.realtimeService.broadcastSystemNotificationUnread(userId);
+      }
     }
     return { count: result.count };
   }

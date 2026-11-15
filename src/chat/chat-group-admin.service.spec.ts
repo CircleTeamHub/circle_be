@@ -6,6 +6,10 @@ import {
 import { ChatErrorCode } from 'src/common/app-error-codes';
 import { ChatGroupAdminService } from './chat-group-admin.service';
 
+const membershipNoticesMock = {
+  deliverMembershipNotices: jest.fn().mockResolvedValue(undefined),
+};
+
 /**
  * 群管理的权限矩阵与锁序:
  * - 先用锁外快照鉴权(非管理员碰不到会话行锁),锁后再用锁后快照重做一遍;
@@ -21,6 +25,8 @@ describe('ChatGroupAdminService', () => {
       update: jest.fn(),
     },
     circleMember: { findUnique: jest.fn(), findMany: jest.fn() },
+    user: { findUnique: jest.fn() },
+    adminAuditLog: { create: jest.fn() },
     $transaction: jest.fn(),
     $queryRaw: jest.fn(),
   };
@@ -56,6 +62,7 @@ describe('ChatGroupAdminService', () => {
     broadcast as never,
     systemMessage as never,
     groupEvents as never,
+    membershipNoticesMock as never,
   );
 
   const conversation = (overrides: Record<string, unknown> = {}) => ({
@@ -64,6 +71,7 @@ describe('ChatGroupAdminService', () => {
     circleID: null,
     ownerID: 'owner-1',
     nextHeight: 10,
+    name: '读书会',
     ...overrides,
   });
   const seat = (userID: string, overrides: Record<string, unknown> = {}) => ({
@@ -292,6 +300,97 @@ describe('ChatGroupAdminService', () => {
       ).toHaveBeenCalledWith(expect.objectContaining({ id: 'notice-1' }), [
         'admin-2',
       ]);
+      // 但他会收到一条站内知会(离线也能看到),群名取锁后快照。
+      expect(
+        membershipNoticesMock.deliverMembershipNotices,
+      ).toHaveBeenCalledWith({
+        type: 'GROUP_MEMBER_REMOVED',
+        toUserIds: ['admin-2'],
+        content: '读书会',
+      });
+    });
+
+    it('leaves the group name empty when the group was never named', async () => {
+      arrange({
+        conversation: { name: null },
+        actor: seat('owner-1'),
+        target: seat('u-2'),
+      });
+      await service.removeStandaloneMember('owner-1', 'conv-1', 'u-2');
+      expect(
+        membershipNoticesMock.deliverMembershipNotices,
+      ).toHaveBeenCalledWith({
+        type: 'GROUP_MEMBER_REMOVED',
+        toUserIds: ['u-2'],
+        content: '',
+      });
+    });
+
+    it('sends no notice when the removal is rejected', async () => {
+      arrange({ actor: seat('u-3'), target: seat('u-2') });
+      await expect(
+        service.removeStandaloneMember('u-3', 'conv-1', 'u-2'),
+      ).rejects.toBeInstanceOf(ForbiddenException);
+      expect(
+        membershipNoticesMock.deliverMembershipNotices,
+      ).not.toHaveBeenCalled();
+    });
+  });
+
+  describe('moderateAsAdministrator remove', () => {
+    it('leaves the removed member a notice that does not name the administrator', async () => {
+      arrange({ actor: seat('owner-1'), target: seat('u-2') });
+      prisma.user.findUnique.mockResolvedValue({
+        role: 'ADMIN',
+        status: 'ACTIVE',
+        adminAccess: { role: 'SUPER_ADMIN' },
+      });
+
+      await service.moderateAsAdministrator(
+        'platform-admin',
+        'conv-1',
+        'u-2',
+        'remove',
+        undefined,
+        '违规广告',
+      );
+
+      expect(broadcast.emitConversationChange).toHaveBeenCalledWith('u-2', {
+        kind: 'removed',
+        conversationId: 'conv-1',
+        userId: 'u-2',
+      });
+      // 离线也能看到;知会只带群名,操作者不进通知。
+      expect(
+        membershipNoticesMock.deliverMembershipNotices,
+      ).toHaveBeenCalledWith({
+        type: 'GROUP_MEMBER_REMOVED',
+        toUserIds: ['u-2'],
+        content: '读书会',
+      });
+    });
+
+    it('sends no membership notice for a console mute', async () => {
+      arrange({ actor: seat('owner-1'), target: seat('u-2') });
+      prisma.user.findUnique.mockResolvedValue({
+        role: 'ADMIN',
+        status: 'ACTIVE',
+        adminAccess: { role: 'SUPER_ADMIN' },
+      });
+      systemMessage.broadcastSystemMessage.mockResolvedValue(undefined);
+
+      await service.moderateAsAdministrator(
+        'platform-admin',
+        'conv-1',
+        'u-2',
+        'mute',
+        undefined,
+        '刷屏',
+      );
+
+      expect(
+        membershipNoticesMock.deliverMembershipNotices,
+      ).not.toHaveBeenCalled();
     });
   });
 

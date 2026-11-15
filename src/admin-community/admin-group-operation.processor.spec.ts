@@ -35,12 +35,14 @@ describe('AdminGroupOperationProcessor', () => {
   };
   const chatCircleSync = {
     ensureCircleConversation: jest.fn().mockResolvedValue('conv-1'),
+    dismissAllSeats: jest.fn().mockResolvedValue(undefined),
   };
   let processor: AdminGroupOperationProcessor;
 
   beforeEach(() => {
     jest.clearAllMocks();
     chatCircleSync.ensureCircleConversation.mockResolvedValue('conv-1');
+    chatCircleSync.dismissAllSeats.mockResolvedValue(undefined);
     processor = new AdminGroupOperationProcessor(
       prisma as never,
       chatCircleSync as never,
@@ -207,7 +209,8 @@ describe('AdminGroupOperationProcessor', () => {
 
     await processor.processOne(new Date('2026-07-29T12:00:00.000Z'));
 
-    expect(prisma.chatMember.updateMany).not.toHaveBeenCalled();
+    // 没有会话时清座是 no-op(见 ChatCircleSyncService.evictAllSeats),操作照常记成功。
+    expect(chatCircleSync.dismissAllSeats).toHaveBeenCalledWith('group-1');
     expect(prisma.adminGroupOperation.updateMany).toHaveBeenCalledWith({
       where: expect.objectContaining({ id: 'operation-1' }),
       data: expect.objectContaining({ status: 'SUCCEEDED' }),
@@ -222,11 +225,9 @@ describe('AdminGroupOperationProcessor', () => {
 
     await processor.processOne(new Date('2026-07-29T12:00:00.000Z'));
 
-    // 解散 = 会话全员离座(历史保留;发送被 membership 校验拒绝)。
-    expect(prisma.chatMember.updateMany).toHaveBeenCalledWith({
-      where: { conversationID: 'conv-1', leftAt: null },
-      data: { leftAt: expect.any(Date) },
-    });
+    // 解散 = 会话全员离座(历史保留;发送被 membership 校验拒绝),走圈子同步的统一清座,
+    // 成员收到「圈子已解散」。按圈子 id 清,不是 OpenIM 时代的 groupID。
+    expect(chatCircleSync.dismissAllSeats).toHaveBeenCalledWith('circle-1');
     expect(prisma.circle.update).toHaveBeenCalledWith({
       where: { id: 'circle-1' },
       data: { deleted: true, adminState: 'DISMISSED' },

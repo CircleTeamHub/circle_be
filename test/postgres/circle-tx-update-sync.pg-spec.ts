@@ -16,6 +16,10 @@ import {
 } from './circle-tx-harness';
 import { describePostgres } from './pg-test-db';
 
+const membershipNoticesMock = {
+  deliverMembershipNotices: jest.fn().mockResolvedValue(undefined),
+};
+
 /**
  * 改圈子设置(CircleService.updateCircle)与座位对账
  * (ChatCircleSyncService.ensureCircleConversation)交错时的锁环。
@@ -90,6 +94,7 @@ describePostgres(
         {} as never,
         groupEvents as never,
         {} as never,
+        membershipNoticesMock as never,
       );
       circles = new CircleService(
         t.prisma as never,

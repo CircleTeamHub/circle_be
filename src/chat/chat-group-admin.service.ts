@@ -7,6 +7,7 @@ import {
 } from '@nestjs/common';
 import { ADMIN_ROLE_PERMISSIONS } from 'src/admin-access/admin-permission.guard';
 import { ChatErrorCode } from 'src/common/app-error-codes';
+import { NotificationService } from 'src/notification/notification.service';
 import { PrismaService } from 'src/prisma/prisma.service';
 import type { ChatMember, Prisma } from 'src/generated/prisma';
 import { ChatBroadcastService } from './chat-broadcast.service';
@@ -43,6 +44,7 @@ interface LockedGroupRow {
   circleID: string | null;
   ownerID: string | null;
   nextHeight: number;
+  name: string | null;
 }
 
 interface ResolvedPair {
@@ -70,6 +72,7 @@ export class ChatGroupAdminService {
     private readonly broadcast: ChatBroadcastService,
     private readonly systemMessage: ChatSystemMessageService,
     private readonly groupEvents: ChatGroupEventService,
+    private readonly notifications: NotificationService,
   ) {}
 
   /** 独立群聊:群主设/撤管理员。幂等:已是目标角色时不写提示、不记事件。 */
@@ -159,7 +162,7 @@ export class ChatGroupAdminService {
     const preflight = await this.preflightStandalone(conversationId, actorId);
     this.assertManager(preflight.actorRole);
 
-    const notice = await this.prisma.$transaction(async (tx) => {
+    const { notice, groupName } = await this.prisma.$transaction(async (tx) => {
       const locked = await this.lockGroup(tx, conversationId);
       this.assertStandalone(locked);
       const { actorRole, targetRole, targetSeat } = await this.resolvePair(
@@ -189,7 +192,7 @@ export class ChatGroupAdminService {
         actorId,
         targetIds: [targetUserId],
       });
-      return message;
+      return { notice: message, groupName: locked.name?.trim() ?? '' };
     });
 
     // 先离房、再通知本人 UI、最后把提示播给其余成员(被移出的人不收)。
@@ -210,6 +213,12 @@ export class ChatGroupAdminService {
       kind: 'removed',
       conversationId,
       userId: targetUserId,
+    });
+    // 站内知会:离线的人下次打开 App 也能在「通知」里看到自己被移出了哪个群。
+    await this.notifications.deliverMembershipNotices({
+      type: 'GROUP_MEMBER_REMOVED',
+      toUserIds: [targetUserId],
+      content: groupName,
     });
     try {
       await this.systemMessage.broadcastSystemMessageExcludingUsers(notice, [
@@ -547,7 +556,7 @@ export class ChatGroupAdminService {
         targetIds: [targetUserId],
         payload: action === 'role' ? { role: role! } : {},
       });
-      return notice;
+      return { notice, groupName: locked.name?.trim() ?? '' };
     });
     if (result) {
       if (action === 'remove') {
@@ -561,18 +570,26 @@ export class ChatGroupAdminService {
         }
         try {
           await this.systemMessage.broadcastSystemMessageExcludingUsers(
-            result,
+            result.notice,
             [targetUserId],
           );
         } catch {
           this.logger.warn('Admin member notification failed');
         }
-      } else await this.broadcastAfterCommit(result);
+      } else await this.broadcastAfterCommit(result.notice);
       this.broadcast.emitConversationChange(targetUserId, {
         kind: action === 'remove' ? 'removed' : 'updated',
         conversationId,
         userId: targetUserId,
       });
+      // 平台移人同样留一条站内知会;fromUserID 记本人,不暴露是哪位管理员。
+      if (action === 'remove') {
+        await this.notifications.deliverMembershipNotices({
+          type: 'GROUP_MEMBER_REMOVED',
+          toUserIds: [targetUserId],
+          content: result.groupName,
+        });
+      }
     }
     return { completed: true };
   }
@@ -706,7 +723,7 @@ export class ChatGroupAdminService {
     conversationId: string,
   ): Promise<LockedGroupRow> {
     const locked = await tx.$queryRaw<LockedGroupRow[]>`
-      SELECT "id", "type", "circleID", "ownerID", "nextHeight"
+      SELECT "id", "type", "circleID", "ownerID", "nextHeight", "name"
       FROM "ChatConversation"
       WHERE "id" = ${conversationId} FOR UPDATE`;
     if (locked.length === 0 || locked[0].type !== 'GROUP') {

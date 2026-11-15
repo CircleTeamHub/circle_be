@@ -12,6 +12,10 @@ import type { Prisma } from 'src/generated/prisma';
 import { chatSendRequestHash } from './chat-send-request-hash';
 import type { ChatSendPayload } from './chat.types';
 
+const membershipNoticesMock = {
+  deliverMembershipNotices: jest.fn().mockResolvedValue(undefined),
+};
+
 // 「早就开启过」的边界:让查看者窗口真正生效,又不干扰用例本身要断言的 cutoff。
 const LONG_AGO = new Date('2019-01-01T00:00:00.000Z');
 
@@ -134,6 +138,7 @@ describe('ChatService', () => {
     support as never,
     circleMemberLock as never,
     groupEvents as never,
+    membershipNoticesMock as never,
   );
 
   // tx 即 prisma 本身,tx.* 委托到同一批 mock。

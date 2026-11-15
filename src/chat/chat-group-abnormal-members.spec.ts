@@ -11,6 +11,10 @@ import {
 import { ChatGroupAdminService } from './chat-group-admin.service';
 import { AbnormalMembersQueryDto } from './dto/group-admin.dto';
 
+const membershipNoticesMock = {
+  deliverMembershipNotices: jest.fn().mockResolvedValue(undefined),
+};
+
 const NOW = new Date('2026-11-05T00:00:00.000Z');
 const daysAgo = (days: number) => new Date(NOW.getTime() - days * 86_400_000);
 const CUTOFF = inactiveCutoff(30, NOW);
@@ -154,6 +158,7 @@ describe('ChatGroupAdminService.listAbnormalMembers', () => {
     {} as never,
     {} as never,
     {} as never,
+    membershipNoticesMock as never,
   );
   const seat = (userID: string, role = 'MEMBER') => ({
     userID,

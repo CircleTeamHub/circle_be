@@ -29,6 +29,10 @@ import {
 } from './circle-tx-harness';
 import { describePostgres } from './pg-test-db';
 
+const membershipNoticesMock = {
+  deliverMembershipNotices: jest.fn().mockResolvedValue(undefined),
+};
+
 const claimMigration = readFileSync(
   resolve(
     process.cwd(),
@@ -765,6 +769,7 @@ describePostgres('circle invitation transactions (PostgreSQL)', () => {
         {} as never,
         { record: async () => undefined } as never,
         {} as never,
+        membershipNoticesMock as never,
       );
       const ensure = jest.spyOn(sync, 'ensureCircleConversation');
       const service = new CircleInvitationService(

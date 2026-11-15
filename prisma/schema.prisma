@@ -312,6 +312,12 @@ enum NotificationType {
   CIRCLE_POST_AUTO_ENDED
   CIRCLE_POST_COLLABORATION_RECOGNIZED
   PROFILE_LIKE
+  /// 站内知会、不推送：本人被移出独立群聊 / 独立群聊被解散。content = 当时的群名(可空)。
+  GROUP_MEMBER_REMOVED
+  GROUP_DISSOLVED
+  /// 站内知会、不推送：本人被移出圈子(踢出圈子群) / 圈子被解散。fromCircleID 指向圈子。
+  CIRCLE_MEMBER_REMOVED
+  CIRCLE_DISSOLVED
 }
 
 enum CallType {

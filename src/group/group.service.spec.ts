@@ -14,6 +14,10 @@ import { GroupController } from './group.controller';
 import { GroupService } from './group.service';
 import * as groupMemberDtos from './dto/group-member.dto';
 
+const membershipNoticesMock = {
+  deliverMembershipNotices: jest.fn().mockResolvedValue(undefined),
+};
+
 describe('GroupService reportGroup', () => {
   let prisma: {
     $transaction: jest.Mock;
@@ -74,6 +78,7 @@ describe('GroupService reportGroup', () => {
   };
 
   beforeEach(() => {
+    membershipNoticesMock.deliverMembershipNotices.mockClear();
     prisma = {
       $transaction: jest.fn(async (callback) => callback(prisma)),
       $executeRaw: jest.fn(),
@@ -155,6 +160,7 @@ describe('GroupService reportGroup', () => {
       groupEvents as any,
       config as any,
       circleInvitations as any,
+      membershipNoticesMock as never,
     );
   });
 
@@ -227,6 +233,7 @@ describe('GroupService reportGroup', () => {
         groupEvents as any,
         { get: jest.fn(() => null) } as any,
         { invite: jest.fn() } as any,
+        membershipNoticesMock as never,
       );
 
       await report(['https://cdn.example/proof.png'], unguarded);
@@ -732,6 +739,73 @@ describe('GroupService reportGroup', () => {
       chatSystemMessage.broadcastSystemMessageExcludingUsers.mock
         .invocationCallOrder[0],
     );
+  });
+
+  it('leaves the kicked member a circle notice naming the circle', async () => {
+    chatCircleSync.releaseSeatInTx.mockResolvedValue('conversation-1');
+    prisma.chatConversation.findUnique.mockResolvedValue({
+      id: 'conversation-1',
+    });
+    prisma.circle.findFirst.mockResolvedValue({
+      id: 'circle-1',
+      name: '摄影圈',
+      groupID: 'group-1',
+      ownerID: 'owner-1',
+    });
+    prisma.circleMember.findUnique.mockImplementation(({ where }) =>
+      Promise.resolve({
+        id: `${where.userID_circleID.userID}-member`,
+        role:
+          where.userID_circleID.userID === 'admin-1'
+            ? CircleMemberRole.ADMIN
+            : CircleMemberRole.MEMBER,
+        status: CircleMemberStatus.ACTIVE,
+      }),
+    );
+
+    await service.removeGroupMember('admin-1', 'group-1', 'target-user');
+
+    // 踢出圈子群 = 移出圈子:知会进飞机(圈子域),不点名是谁踢的。
+    expect(membershipNoticesMock.deliverMembershipNotices).toHaveBeenCalledWith(
+      {
+        type: 'CIRCLE_MEMBER_REMOVED',
+        toUserIds: ['target-user'],
+        content: '摄影圈',
+        circleId: 'circle-1',
+      },
+    );
+  });
+
+  it('sends no circle notice when a pending applicant is turned away', async () => {
+    chatCircleSync.releaseSeatInTx.mockResolvedValue(null);
+    prisma.chatConversation.findUnique.mockResolvedValue(null);
+    prisma.circle.findFirst.mockResolvedValue({
+      id: 'circle-1',
+      name: '摄影圈',
+      groupID: 'group-1',
+      ownerID: 'owner-1',
+    });
+    prisma.circleMember.findUnique.mockImplementation(({ where }) =>
+      Promise.resolve(
+        where.userID_circleID.userID === 'admin-1'
+          ? {
+              id: 'actor-member',
+              role: CircleMemberRole.ADMIN,
+              status: CircleMemberStatus.ACTIVE,
+            }
+          : {
+              id: 'target-member',
+              role: CircleMemberRole.MEMBER,
+              status: CircleMemberStatus.PENDING,
+            },
+      ),
+    );
+
+    await service.removeGroupMember('admin-1', 'group-1', 'target-user');
+
+    expect(
+      membershipNoticesMock.deliverMembershipNotices,
+    ).not.toHaveBeenCalled();
   });
 
   it('waits for detach and excludes the removed user room from the detailed broadcast', async () => {
