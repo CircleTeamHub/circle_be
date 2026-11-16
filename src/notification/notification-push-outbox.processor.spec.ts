@@ -144,10 +144,13 @@ function buildHarness({
     { token: 'tok-a', projectId: null, provider: 'expo', platform: 'ios' },
   ],
   circleOfflinePushEnabled = true,
+  foregroundTokens,
 }: {
   jobs: any[];
   pendingDeliveries: any[];
   outcomes: any[];
+  /** 给了就挂一个聊天广播服务桩(收件人 → 正开着 App 的设备 token)。 */
+  foregroundTokens?: Map<string, Set<string>>;
   tokens?: Array<{
     token: string;
     projectId: string | null;
@@ -201,12 +204,95 @@ function buildHarness({
     listActiveTokens: jest.fn().mockResolvedValue(tokens),
     sendToTokens: jest.fn().mockResolvedValue(outcomes),
   };
+  const broadcast = {
+    getForegroundPushTokensForUsers: jest
+      .fn()
+      .mockResolvedValue(foregroundTokens ?? new Map()),
+  };
+  const moduleRef = foregroundTokens
+    ? { get: jest.fn().mockReturnValue(broadcast) }
+    : undefined;
   const processor = new NotificationPushOutboxProcessor(
     prisma as any,
     push as any,
+    moduleRef as any,
   );
-  return { prisma, push, processor };
+  return { prisma, push, processor, broadcast };
 }
+
+describe('正开着 App 的设备不弹系统推送', () => {
+  const comment = { ...notification, type: 'TRACE_COMMENT' };
+  const job = (base: typeof notification) => ({
+    id: 'job-1',
+    notificationID: 'notification-1',
+    status: 'PENDING',
+    attempts: 0,
+    payload: { title: 'T', body: 'B', data: {} },
+    notification: base,
+  });
+
+  it('前台设备直接终态，只推后台的那台', async () => {
+    const { prisma, push, processor, broadcast } = buildHarness({
+      jobs: [job(comment)],
+      tokens: [
+        { token: 'tok-phone', projectId: null, provider: 'jpush' },
+        { token: 'tok-pad', projectId: null, provider: 'jpush' },
+      ],
+      pendingDeliveries: [
+        { id: 'd-phone', token: 'tok-phone' },
+        { id: 'd-pad', token: 'tok-pad' },
+      ],
+      outcomes: [{ token: 'tok-pad', status: 'SENT', receiptFinal: true }],
+      foregroundTokens: new Map([['user-1', new Set(['tok-phone'])]]),
+    });
+
+    await processor.processPending();
+
+    expect(broadcast.getForegroundPushTokensForUsers).toHaveBeenCalledWith([
+      'user-1',
+    ]);
+    expect(prisma.notificationPushDelivery.updateMany).toHaveBeenCalledWith({
+      where: { id: { in: ['d-phone'] } },
+      data: { status: 'TERMINAL', lastError: 'device-in-foreground' },
+    });
+    expect(push.sendToTokens).toHaveBeenCalledWith(
+      [expect.objectContaining({ token: 'tok-pad' })],
+      expect.anything(),
+    );
+  });
+
+  it('所有设备都在前台时一条都不推，任务照常完成', async () => {
+    const { prisma, push, processor } = buildHarness({
+      jobs: [job(comment)],
+      pendingDeliveries: [{ id: 'd-a', token: 'tok-a' }],
+      outcomes: [],
+      foregroundTokens: new Map([['user-1', new Set(['tok-a'])]]),
+    });
+
+    expect(await processor.processPending()).toBe(1);
+    expect(push.sendToTokens).not.toHaveBeenCalled();
+    expect(
+      prisma.notificationPushOutbox.updateMany.mock.calls.some(
+        ([input]) => input.data.status === 'COMPLETED',
+      ),
+    ).toBe(true);
+  });
+
+  // 系统通知没有站内横幅：跳过推送就只剩一个红点。
+  it('系统通知不按前台设备过滤', async () => {
+    const { push, processor, broadcast } = buildHarness({
+      jobs: [job(notification)],
+      pendingDeliveries: [{ id: 'd-a', token: 'tok-a' }],
+      outcomes: [{ token: 'tok-a', status: 'SENT', ticketId: 't' }],
+      foregroundTokens: new Map([['user-1', new Set(['tok-a'])]]),
+    });
+
+    await processor.processPending();
+
+    expect(broadcast.getForegroundPushTokensForUsers).not.toHaveBeenCalled();
+    expect(push.sendToTokens).toHaveBeenCalled();
+  });
+});
 
 describe('NotificationPushOutboxProcessor (#88 per-token)', () => {
   it('hydrates jobs with notification columns only, never the nine relations', async () => {

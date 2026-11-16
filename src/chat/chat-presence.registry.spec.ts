@@ -328,5 +328,23 @@ describe('ChatPresenceRegistry', () => {
         Promise.resolve([...(sets.get(key) ?? [])]),
       );
     });
+
+    // 通知收件人不一定在任何会话房里:按人查,不经会话在线集合。
+    it('looks up foreground devices per user without a conversation', async () => {
+      const registry = open();
+      await registry.registerSocket('u1', 'phone', PHONE);
+      await registry.registerSocket('u2', 'tablet', TABLET);
+      await registry.setSocketBackground('u2', 'tablet', true);
+
+      expect(
+        await registry.getForegroundPushTokensForUsers(['u1', 'u2', 'u3']),
+      ).toEqual(new Map([['u1', new Set([PHONE])]]));
+    });
+
+    it('returns null for the per-user lookup without redis', async () => {
+      redis.isEnabled.mockReturnValue(false);
+      const registry = open();
+      expect(await registry.getForegroundPushTokensForUsers(['u1'])).toBeNull();
+    });
   });
 });

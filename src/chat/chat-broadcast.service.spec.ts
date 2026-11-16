@@ -615,6 +615,7 @@ describe('ChatBroadcastService presence fallback under Redis outage', () => {
       isOnline: jest.fn().mockResolvedValue(null),
       getOnlineUserIds: jest.fn().mockResolvedValue(null),
       getForegroundPushTokens: jest.fn().mockResolvedValue(null),
+      getForegroundPushTokensForUsers: jest.fn().mockResolvedValue(null),
       isRedisConfigured: jest.fn().mockReturnValue(redisConfigured),
       conversationJoined: jest.fn(),
     };
@@ -623,8 +624,42 @@ describe('ChatBroadcastService presence fallback under Redis outage', () => {
       prismaWithActiveUsers([]) as never,
     );
     service.setServer(server as never);
-    return { service, presence, fetchSockets };
+    return { service, presence, fetchSockets, server };
   }
+
+  it('getForegroundPushTokensForUsers 读不到时谁都不排除，也不对断掉的 Redis 发 RPC', async () => {
+    const { service, fetchSockets } = buildHarness(true);
+
+    await expect(
+      service.getForegroundPushTokensForUsers(['u1']),
+    ).resolves.toEqual(new Map());
+    expect(fetchSockets).not.toHaveBeenCalled();
+  });
+
+  it('getForegroundPushTokensForUsers 单实例回退按收件人的个人房查前台设备', async () => {
+    const { service, fetchSockets, server } = buildHarness(false);
+    fetchSockets.mockResolvedValue([
+      {
+        id: 's1',
+        data: { userId: 'u1', pushToken: 'ExponentPushToken[phone]' },
+      },
+      {
+        id: 's2',
+        data: {
+          userId: 'u2',
+          pushToken: 'ExponentPushToken[tablet]',
+          background: true,
+        },
+      },
+    ]);
+
+    await expect(
+      service.getForegroundPushTokensForUsers(['u1', 'u2', 'u1']),
+    ).resolves.toEqual(
+      new Map([['u1', new Set(['ExponentPushToken[phone]'])]]),
+    );
+    expect(server.in).toHaveBeenCalledWith(['u:u1', 'u:u2']);
+  });
 
   it('isUserOnline 不再对着已断的 Redis 发起跨节点 RPC', async () => {
     const { service, fetchSockets } = buildHarness(true);

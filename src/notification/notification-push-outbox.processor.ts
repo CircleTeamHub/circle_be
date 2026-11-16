@@ -1,5 +1,7 @@
-import { Injectable, Logger } from '@nestjs/common';
+import { Injectable, Logger, Optional } from '@nestjs/common';
+import { ModuleRef } from '@nestjs/core';
 import { CronExpression } from '@nestjs/schedule';
+import { ChatBroadcastService } from 'src/chat/chat-broadcast.service';
 import { TrackedCron } from '../metrics/tracked-cron.decorator';
 import { randomUUID } from 'crypto';
 import { PrismaService } from 'src/prisma/prisma.service';
@@ -37,10 +39,13 @@ const STALE_LOCK_MS = 10 * 60 * 1000;
 @Injectable()
 export class NotificationPushOutboxProcessor {
   private readonly logger = new Logger(NotificationPushOutboxProcessor.name);
+  private broadcastInstance: ChatBroadcastService | null | undefined;
 
   constructor(
     private readonly prisma: PrismaService,
     private readonly pushService: NotificationPushService,
+    // ChatModule 反向依赖本模块(@Global),不能 import 回去:用到时再按 token 取。
+    @Optional() private readonly moduleRef?: ModuleRef,
   ) {}
 
   @TrackedCron(CronExpression.EVERY_MINUTE, 'notification_push_outbox')
@@ -68,6 +73,9 @@ export class NotificationPushOutboxProcessor {
     // 放在出队之后、投递之前：仍然是投递时刻的值，而不是入队时刻的。
     const circleOfflinePushByUser =
       await this.loadCircleOfflinePushPreferences(jobs);
+    // 收件人正开着 App 的设备:通知已经实时送到(站内横幅 + 红点),不再弹系统推送。
+    // 同样是投递时刻的值。
+    const foregroundTokensByUser = await this.loadForegroundPushTokens(jobs);
     // 只有还没有 payload 快照、又确实要发的任务才组装文案；关系整批一次按外键补。
     const pushSources = await this.loadPushSourcesToCompose(
       jobs,
@@ -172,8 +180,26 @@ export class NotificationPushOutboxProcessor {
             data: { status: 'TERMINAL', lastError: 'token-revoked' },
           });
         }
-        const pendingDeliveries = retriableDeliveries.filter((delivery) =>
-          activeTokenSet.has(delivery.token),
+        // 正开着 App 的设备直接终态:后面退到后台、这条任务因别的设备失败而重试时,
+        // 不该再为一条已经在屏幕上看过的通知补一条推送。
+        const onScreen = foregroundTokensByUser.get(userId);
+        const foreground = onScreen
+          ? retriableDeliveries.filter(
+              (delivery) =>
+                activeTokenSet.has(delivery.token) &&
+                onScreen.has(delivery.token),
+            )
+          : [];
+        if (foreground.length > 0) {
+          await this.prisma.notificationPushDelivery.updateMany({
+            where: { id: { in: foreground.map((delivery) => delivery.id) } },
+            data: { status: 'TERMINAL', lastError: 'device-in-foreground' },
+          });
+        }
+        const pendingDeliveries = retriableDeliveries.filter(
+          (delivery) =>
+            activeTokenSet.has(delivery.token) &&
+            !onScreen?.has(delivery.token),
         );
 
         if (pendingDeliveries.length === 0) {
@@ -390,6 +416,42 @@ export class NotificationPushOutboxProcessor {
       select: { id: true, circleOfflinePushEnabled: true },
     });
     return new Map(rows.map((row) => [row.id, row.circleOfflinePushEnabled]));
+  }
+
+  /**
+   * 这一轮收件人里正开着 App 的设备(收件人 → 前台推送 token)。
+   *
+   * 系统通知不算:它没有站内横幅(客户端不处理 system.notification.created),
+   * 跳过推送就只剩一个红点。读不到在线状态时谁都不排除 —— 重复推送好过丢推送。
+   */
+  private async loadForegroundPushTokens(
+    jobs: readonly {
+      notification: { type: NotificationType; toUserID: string | null };
+    }[],
+  ): Promise<ReadonlyMap<string, ReadonlySet<string>>> {
+    const userIds = [
+      ...new Set(
+        jobs
+          .filter((job) => job.notification.type !== 'SYSTEM')
+          .map((job) => job.notification.toUserID)
+          .filter((id): id is string => Boolean(id)),
+      ),
+    ];
+    const broadcast = this.broadcast();
+    if (userIds.length === 0 || !broadcast) return new Map();
+    return broadcast.getForegroundPushTokensForUsers(userIds);
+  }
+
+  private broadcast(): ChatBroadcastService | null {
+    if (this.broadcastInstance !== undefined) return this.broadcastInstance;
+    try {
+      this.broadcastInstance =
+        this.moduleRef?.get(ChatBroadcastService, { strict: false }) ?? null;
+    } catch {
+      // 聊天模块没加载(单独起的进程、部分测试):没有在线状态可查,照常推送。
+      this.broadcastInstance = null;
+    }
+    return this.broadcastInstance;
   }
 
   private async finishJob(

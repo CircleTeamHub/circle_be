@@ -288,7 +288,11 @@ export class TraceService {
     return { items, total, page, limit, hasMore, nextCursor };
   }
 
-  async getNewCount(userId: string, since: string): Promise<number> {
+  async getNewCount(
+    userId: string,
+    since: string,
+    options: { friendsOnly?: boolean } = {},
+  ): Promise<number> {
     const sinceAt = new Date(since);
     if (Number.isNaN(sinceAt.getTime())) {
       throw new BadRequestException('Invalid timestamp');
@@ -297,7 +301,7 @@ export class TraceService {
     const scope = await this.loadMomentFriendScope(userId);
     const visibleUserIds = await this.filterMomentVisibleAuthorIds(
       userId,
-      [userId, ...scope.friendIds],
+      options.friendsOnly ? scope.friendIds : [userId, ...scope.friendIds],
       new Set(scope.friendIds),
       scope.chatOnlyIds,
     );
