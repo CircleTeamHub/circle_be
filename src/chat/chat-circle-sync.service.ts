@@ -6,6 +6,7 @@ import {
   TrackedCron,
 } from '../metrics/tracked-cron.decorator';
 import { Prisma } from 'src/generated/prisma';
+import { NotificationService } from 'src/notification/notification.service';
 import { PrismaService } from 'src/prisma/prisma.service';
 import { JobLeaseContext, runWithJobLease } from 'src/redis/job-lease';
 import { RedisService } from 'src/redis/redis.service';
@@ -114,6 +115,7 @@ export class ChatCircleSyncService {
     private readonly systemMessage: ChatSystemMessageService,
     private readonly groupEvents: ChatGroupEventService,
     private readonly redis: RedisService,
+    private readonly notifications: NotificationService,
   ) {}
 
   /**
@@ -499,7 +501,7 @@ export class ChatCircleSyncService {
     // CircleMember 行仍是 ACTIVE —— 若照常对账,下一轮就会把 leftAt 清回去,
     // 已解散的群聊自己重新开门(建会话端点同理,它走的是同一个方法)。
     if (circle.deleted || DISABLED_ADMIN_STATES.has(circle.adminState)) {
-      await this.evictAllSeats(circleId, options.actorId);
+      await this.evictAllSeats(circleId, { actorId: options.actorId });
       return null;
     }
 
@@ -573,7 +575,7 @@ export class ChatCircleSyncService {
       // State changed while waiting for the lock. Evict seats after the
       // transaction commits, using the same idempotent cleanup as the fast
       // path above.
-      await this.evictAllSeats(circleId, options.actorId);
+      await this.evictAllSeats(circleId, { actorId: options.actorId });
       return null;
     }
 
@@ -832,15 +834,26 @@ export class ChatCircleSyncService {
   }
 
   /**
+   * 管理台解散圈子:清空全部座位,并按「圈子已解散」通知每位成员(实时事件 + 飞机里的知会)。
+   * 处理器执行时圈子还停在 DISABLING(操作完成后才写 DISMISSED),按状态判断会当成
+   * 临时停用,所以这里显式标成解散。
+   */
+  async dismissAllSeats(circleId: string): Promise<void> {
+    await this.evictAllSeats(circleId, { dissolved: true });
+  }
+
+  /**
    * 圈子被解散/停用时收回全部在座座位,并把在线 socket 踢出会话房。
    * 幂等:座位已经清干净就什么都不做,不重复广播。
    * 发起解散的人收 left 而不是 removed,否则刚按下解散的圈主会被弹「你已被移出」
    * (与 ChatService.dissolveGroupConversation 同一语义)。
+   * dissolved 不传时按圈子状态判断(见下)。
    */
   private async evictAllSeats(
     circleId: string,
-    actorId?: string,
+    options: { actorId?: string; dissolved?: boolean } = {},
   ): Promise<void> {
+    const { actorId } = options;
     const conversation = await this.prisma.chatConversation.findUnique({
       where: { circleID: circleId },
       select: { id: true },
@@ -855,6 +868,18 @@ export class ChatCircleSyncService {
       where: { conversationID: conversation.id, leftAt: null },
       data: { leftAt: new Date() },
     });
+    // 解散才算「圈子没了」:圈主解散 = deleted 且不在停用态,管理台解散 = DISMISSED。
+    // 管理台停用同样写 deleted=true(状态 DISABLING/DISABLED…),它可能被恢复,恢复后
+    // 对账会把座位还回来,这时发「圈子已解散」就是错的。
+    const circle = await this.prisma.circle.findUnique({
+      where: { id: circleId },
+      select: { name: true, deleted: true, adminState: true },
+    });
+    const dissolved =
+      options.dissolved ??
+      (circle !== null &&
+        (circle.adminState === 'DISMISSED' ||
+          (circle.deleted && !DISABLED_ADMIN_STATES.has(circle.adminState))));
     for (const { userID } of seated) {
       void this.broadcast
         .removeUserFromConversation(userID, conversation.id)
@@ -870,10 +895,27 @@ export class ChatCircleSyncService {
             ),
           ),
         );
-      this.broadcast.emitConversationChange(userID, {
-        kind: userID === actorId ? 'left' : 'removed',
-        conversationId: conversation.id,
-        userId: userID,
+      this.broadcast.emitConversationChange(
+        userID,
+        userID === actorId
+          ? { kind: 'left', conversationId: conversation.id, userId: userID }
+          : {
+              kind: 'removed',
+              ...(dissolved ? { reason: 'dissolved' as const } : {}),
+              conversationId: conversation.id,
+              userId: userID,
+            },
+      );
+    }
+    if (dissolved) {
+      // 发起解散的人自己不收;其余成员离线也能在飞机(圈子通知)里看到圈子没了。
+      void this.notifications.deliverMembershipNotices({
+        type: 'CIRCLE_DISSOLVED',
+        toUserIds: seated
+          .map(({ userID }) => userID)
+          .filter((userID) => userID !== actorId),
+        content: circle?.name ?? '',
+        circleId,
       });
     }
   }

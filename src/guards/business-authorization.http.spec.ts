@@ -22,6 +22,10 @@ import { GroupService } from 'src/group/group.service';
 import { UserThrottlerGuard } from './user-throttler.guard';
 import { IdempotencyService } from 'src/idempotency/idempotency.service';
 
+const membershipNoticesMock = {
+  deliverMembershipNotices: jest.fn().mockResolvedValue(undefined),
+};
+
 const alice = '11111111-1111-4111-8111-111111111111';
 const bob = '22222222-2222-4222-8222-222222222222';
 const resource = '33333333-3333-4333-8333-333333333333';
@@ -199,6 +203,7 @@ describe('cross-user HTTP authorization matrix', () => {
             {} as any,
             config,
             {} as any,
+            membershipNoticesMock as never,
           ),
         },
       ],

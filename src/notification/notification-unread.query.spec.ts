@@ -2,6 +2,7 @@ import { NotificationType } from 'src/generated/prisma';
 import {
   CIRCLE_NOTIFICATION_TYPES,
   DISCOVER_NOTIFICATION_TYPES,
+  GROUP_NOTICE_NOTIFICATION_TYPES,
   MOMENT_NOTIFICATION_TYPES,
   PROFILE_NOTIFICATION_TYPES,
 } from './notification.constants';
@@ -31,6 +32,7 @@ describe('unread notifications by domain', () => {
       momentsUnread: expectedSum(MOMENT_NOTIFICATION_TYPES),
       circleUnread: expectedSum(CIRCLE_NOTIFICATION_TYPES),
       profileUnread: expectedSum(PROFILE_NOTIFICATION_TYPES),
+      groupNoticeUnread: expectedSum(GROUP_NOTICE_NOTIFICATION_TYPES),
     });
   });
 
@@ -49,6 +51,7 @@ describe('unread notifications by domain', () => {
       momentsUnread: 0,
       circleUnread: 0,
       profileUnread: 0,
+      groupNoticeUnread: 0,
     });
   });
 
@@ -61,12 +64,14 @@ describe('unread notifications by domain', () => {
       momentsUnread: 1,
       circleUnread: 0,
       profileUnread: 0,
+      groupNoticeUnread: 0,
     });
     expect(one(NotificationType.CIRCLE_POST_AUTO_ENDED)).toEqual({
       discoverUnread: 1,
       momentsUnread: 0,
       circleUnread: 1,
       profileUnread: 0,
+      groupNoticeUnread: 0,
     });
     // 发帖通知已停用：上线前留下的未读行不能继续挂在铃铛和 tab 数字上。
     expect(one(NotificationType.CIRCLE_POST_PUBLISHED)).toEqual({
@@ -74,18 +79,43 @@ describe('unread notifications by domain', () => {
       momentsUnread: 0,
       circleUnread: 0,
       profileUnread: 0,
+      groupNoticeUnread: 0,
     });
-    // 好友申请 / 入群审批 / 圈子邀请只进互动总数，两个铃铛都不收。
+    // 圈子邀请、被移出圈子、圈子解散都是圈子的事:进圈子铃铛(飞机)。
+    for (const type of [
+      NotificationType.CIRCLE_INVITATION_RECEIVED,
+      NotificationType.CIRCLE_MEMBER_REMOVED,
+      NotificationType.CIRCLE_DISSOLVED,
+    ]) {
+      expect(one(type)).toEqual({
+        discoverUnread: 1,
+        momentsUnread: 0,
+        circleUnread: 1,
+        profileUnread: 0,
+        groupNoticeUnread: 0,
+      });
+    }
+    // 独立群聊的被移出/解散只计进消息页「通知」的群聊知会,不进互动总数(老客户端的兜底列表看不懂它们)。
+    for (const type of GROUP_NOTICE_NOTIFICATION_TYPES) {
+      expect(one(type)).toEqual({
+        discoverUnread: 0,
+        momentsUnread: 0,
+        circleUnread: 0,
+        profileUnread: 0,
+        groupNoticeUnread: 1,
+      });
+    }
+    // 好友申请 / 入群审批只进互动总数，两个铃铛都不收。
     for (const type of [
       NotificationType.FRIEND_REQUEST_RECEIVED,
       NotificationType.GROUP_ADMISSION,
-      NotificationType.CIRCLE_INVITATION_RECEIVED,
     ]) {
       expect(one(type)).toEqual({
         discoverUnread: 1,
         momentsUnread: 0,
         circleUnread: 0,
         profileUnread: 0,
+        groupNoticeUnread: 0,
       });
     }
     expect(one(NotificationType.SYSTEM)).toEqual({
@@ -93,6 +123,7 @@ describe('unread notifications by domain', () => {
       momentsUnread: 0,
       circleUnread: 0,
       profileUnread: 1,
+      groupNoticeUnread: 0,
     });
   });
 
@@ -102,6 +133,7 @@ describe('unread notifications by domain', () => {
       momentsUnread: 0,
       circleUnread: 0,
       profileUnread: 0,
+      groupNoticeUnread: 0,
     });
   });
 
@@ -132,6 +164,7 @@ describe('unread notifications by domain', () => {
       momentsUnread: 2,
       circleUnread: 0,
       profileUnread: 3,
+      groupNoticeUnread: 0,
     });
     expect(db.$queryRaw).toHaveBeenCalledTimes(1);
   });

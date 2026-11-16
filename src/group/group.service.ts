@@ -23,6 +23,7 @@ import type { ChatMessageDto } from 'src/chat/chat.types';
 import { CircleAdmissionPolicy } from 'src/circle/circle-admission-policy';
 import { CircleMemberLockService } from 'src/circle/circle-member-lock';
 import { normalizeUserIdAlias } from 'src/user/user-id-alias';
+import { NotificationService } from 'src/notification/notification.service';
 import { PrismaService } from 'src/prisma/prisma.service';
 import { runSerializableTransaction } from 'src/utils/prisma-tx';
 import {
@@ -42,6 +43,7 @@ import { logBusinessEvent } from 'src/logging/business-event.logger';
 type GroupMemberSyncResult = { handled: boolean };
 type CircleGroupLookup = {
   id: string;
+  name: string;
   groupID: string | null;
   ownerID: string;
   deleted: boolean;
@@ -71,6 +73,7 @@ export class GroupService {
     private readonly groupEvents: ChatGroupEventService,
     private readonly config: ConfigService,
     private readonly circleInvitations: CircleInvitationService,
+    private readonly notifications: NotificationService,
   ) {
     this.storagePublicObjectBases = storagePublicObjectBasesFromConfig(
       this.config,
@@ -456,6 +459,7 @@ export class GroupService {
     const removalResult = await runSerializableTransaction<{
       conversationId: string | null;
       message: ChatMessageDto | null;
+      removedActiveMember: boolean;
     }>(this.prisma, async (tx) => {
       let conversationId: string | null = null;
       let message: ChatMessageDto | null = null;
@@ -605,7 +609,12 @@ export class GroupService {
           group: { ownerID: normalizedTargetUserID },
         },
       });
-      return { conversationId, message };
+      return {
+        conversationId,
+        message,
+        // 只有真正在圈里的人才收「你已被移出圈子」;拒掉待审的申请不算。
+        removedActiveMember: target?.status === CircleMemberStatus.ACTIVE,
+      };
     });
     if (removalResult.conversationId) {
       // 先派发旧会话房清理、再通知本人 UI；跨节点清理没有 adapter ack，
@@ -629,6 +638,15 @@ export class GroupService {
           `group audit realtime delivery failed after commit (${error instanceof Error ? error.name : 'unknown error'})`,
         );
       }
+    }
+    if (removalResult.removedActiveMember) {
+      // 踢出圈子群 = 移出圈子:知会进飞机(圈子通知),离线的人下次打开也看得到。
+      await this.notifications.deliverMembershipNotices({
+        type: 'CIRCLE_MEMBER_REMOVED',
+        toUserIds: [normalizedTargetUserID],
+        content: circle.name,
+        circleId: circle.id,
+      });
     }
 
     if (!consoleReason)
@@ -879,7 +897,13 @@ export class GroupService {
           ...groupIDCandidates.map((candidate) => ({ groupID: candidate })),
         ],
       },
-      select: { id: true, groupID: true, ownerID: true, deleted: true },
+      select: {
+        id: true,
+        name: true,
+        groupID: true,
+        ownerID: true,
+        deleted: true,
+      },
     });
   }
 

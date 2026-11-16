@@ -2,6 +2,7 @@ import { Prisma, type NotificationType } from 'src/generated/prisma';
 import {
   CIRCLE_NOTIFICATION_TYPES,
   DISCOVER_NOTIFICATION_TYPES,
+  GROUP_NOTICE_NOTIFICATION_TYPES,
   MOMENT_NOTIFICATION_TYPES,
   PROFILE_NOTIFICATION_TYPES,
 } from './notification.constants';
@@ -16,6 +17,8 @@ export type UnreadNotificationsByDomain = {
   momentsUnread: number;
   circleUnread: number;
   profileUnread: number;
+  /** 消息页「通知」里的群聊知会（被移出独立群 / 独立群解散）。 */
+  groupNoticeUnread: number;
 };
 
 /**
@@ -50,6 +53,7 @@ const DOMAIN_TYPES: ReadonlyArray<
   ['momentsUnread', new Set(MOMENT_NOTIFICATION_TYPES)],
   ['circleUnread', new Set(CIRCLE_NOTIFICATION_TYPES)],
   ['profileUnread', new Set(PROFILE_NOTIFICATION_TYPES)],
+  ['groupNoticeUnread', new Set(GROUP_NOTICE_NOTIFICATION_TYPES)],
 ];
 
 /**
@@ -65,6 +69,7 @@ export function sumUnreadNotificationsByDomain(
     momentsUnread: 0,
     circleUnread: 0,
     profileUnread: 0,
+    groupNoticeUnread: 0,
   };
   for (const row of rows) {
     const count = Number(row.count);

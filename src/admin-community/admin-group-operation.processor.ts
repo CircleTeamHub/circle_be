@@ -23,18 +23,6 @@ export class AdminGroupOperationProcessor {
     private readonly chatCircleSync: ChatCircleSyncService,
   ) {}
 
-  private async dismissChatConversation(circleId: string): Promise<void> {
-    const conversation = await this.prisma.chatConversation.findUnique({
-      where: { circleID: circleId },
-      select: { id: true },
-    });
-    if (!conversation) return;
-    await this.prisma.chatMember.updateMany({
-      where: { conversationID: conversation.id, leftAt: null },
-      data: { leftAt: new Date() },
-    });
-  }
-
   /** 自研会话侧禁言开关(groupID === circle.id;会话未建时为 no-op,建时对账兜底)。 */
   private async setChatMuteAll(
     circleId: string,
@@ -121,8 +109,12 @@ export class AdminGroupOperationProcessor {
       // complete() 写回 ACTIVE 之后(见 afterComplete)。
       return this.setChatMuteAll(operation.groupID, false);
     }
-    // 解散:会话全员离座(历史保留;发送被 membership 校验拒绝)。
-    return this.dismissChatConversation(operation.groupID);
+    // 解散:会话全员离座(历史保留;发送被 membership 校验拒绝)。走圈子同步的统一清座:
+    // 顺带把在线 socket 踢出会话房、给每位成员发「圈子已解散」(实时 + 飞机里的知会)。
+    // 圈子 id 与 syncCircleSeats 同一取法:早年 OpenIM 留下的圈子 groupID ≠ circle.id。
+    return this.chatCircleSync.dismissAllSeats(
+      operation.circleID ?? operation.groupID,
+    );
   }
 
   /**

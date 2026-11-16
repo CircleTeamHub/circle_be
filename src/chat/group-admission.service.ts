@@ -915,7 +915,8 @@ export class GroupAdmissionService {
       count: await this.prisma.notification.count({
         where: {
           toUserID: user,
-          type: { in: ['GROUP_ADMISSION', 'CIRCLE_INVITATION_RECEIVED'] },
+          // 收到圈子邀请归飞机(圈子铃铛),不再算进「新的朋友 → 群组」的红点。
+          type: 'GROUP_ADMISSION',
           read: false,
           deleted: false,
         },

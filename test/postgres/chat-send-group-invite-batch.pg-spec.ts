@@ -12,6 +12,10 @@ import {
   transactionOf,
 } from './live-prisma';
 
+const membershipNoticesMock = {
+  deliverMembershipNotices: jest.fn().mockResolvedValue(undefined),
+};
+
 /**
  * 群邀请(GroupAdmissionService.invite)与建群(ChatService.createGroupConversation)
  * 的逐人循环改成批量(真 PrismaClient + 真 PostgreSQL)。
@@ -57,6 +61,7 @@ describePostgres('group invite and create-group batching', () => {
       { isSupportAgent: jest.fn().mockResolvedValue(false) } as never,
       { lock: resolved() } as never,
       groupEvents,
+      membershipNoticesMock as never,
     );
     // 建群返回值要拼会话 DTO(另一套读路径),这里只关心事务里的写。
     jest

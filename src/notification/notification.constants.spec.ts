@@ -32,17 +32,21 @@ describe('圈子离线推送的门控面', () => {
     const circleTypes = Object.values(NotificationType).filter(
       (type) =>
         type.startsWith('CIRCLE_') &&
-        type !== NotificationType.CIRCLE_INVITATION_RECEIVED &&
         // 已停用的类型：不再产生新通知，历史行也不进铃铛和未读数。
         type !== NotificationType.CIRCLE_POST_PUBLISHED,
     );
     expect(new Set(CIRCLE_OFFLINE_PUSH_TYPES)).toEqual(new Set(circleTypes));
   });
 
-  it('收到圈子邀请属于联系人收件箱，不受圈内动态离线提醒开关控制', () => {
+  // 2026-11 起圈子的事一律进飞机(圈子铃铛),收到圈子邀请也从「新的朋友」挪了过来,
+  // 于是和其它圈子通知一样受「离线提醒」开关控制。
+  it('收到圈子邀请归圈子铃铛，受圈子离线提醒开关控制', () => {
+    expect(CIRCLE_NOTIFICATION_TYPES).toContain(
+      NotificationType.CIRCLE_INVITATION_RECEIVED,
+    );
     expect(
       isCircleOfflinePushGated(NotificationType.CIRCLE_INVITATION_RECEIVED),
-    ).toBe(false);
+    ).toBe(true);
   });
 
   it('非圈子通知与空值一律不门控', () => {

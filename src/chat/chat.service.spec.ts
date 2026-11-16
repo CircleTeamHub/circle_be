@@ -7,10 +7,15 @@ import {
 import { ChatErrorCode } from 'src/common/app-error-codes';
 import { CONVERSATION_LIST_MAX } from './chat.constants';
 import { ChatService, conversationSyncRevision } from './chat.service';
+import { AUTO_REPLY_QUIET_MS } from './chat-direct-auto-reply.processor';
 import { SINGLE_CHAR_SEARCH_WINDOW } from './chat-text-search.query';
 import type { Prisma } from 'src/generated/prisma';
 import { chatSendRequestHash } from './chat-send-request-hash';
 import type { ChatSendPayload } from './chat.types';
+
+const membershipNoticesMock = {
+  deliverMembershipNotices: jest.fn().mockResolvedValue(undefined),
+};
 
 // 「早就开启过」的边界:让查看者窗口真正生效,又不干扰用例本身要断言的 cutoff。
 const LONG_AGO = new Date('2019-01-01T00:00:00.000Z');
@@ -134,6 +139,7 @@ describe('ChatService', () => {
     support as never,
     circleMemberLock as never,
     groupEvents as never,
+    membershipNoticesMock as never,
   );
 
   // tx 即 prisma 本身,tx.* 委托到同一批 mock。
@@ -1574,12 +1580,20 @@ describe('ChatService', () => {
         directMessageAutoReplyText: '稍后回复',
       });
 
+      const before = Date.now();
       const result = await service.sendMessage('u1', sendPayload());
 
       expect(prisma.chatDirectAutoReplyJob.create).toHaveBeenCalledWith({
-        data: { sourceMessageID: 'msg-1' },
+        data: { sourceMessageID: 'msg-1', nextAttemptAt: expect.any(Date) },
         select: { id: true },
       });
+      // 排到静默期之后：定时扫描不能抢在连发结束前把回复插进中间。
+      const dueAt = (
+        prisma.chatDirectAutoReplyJob.create.mock.calls[0][0] as {
+          data: { nextAttemptAt: Date };
+        }
+      ).data.nextAttemptAt.getTime();
+      expect(dueAt).toBeGreaterThanOrEqual(before + AUTO_REPLY_QUIET_MS);
       expect(result.enqueuedJobs).toEqual({
         directAutoReplyJobId: 'auto-job-1',
         supportRechargeJobId: null,

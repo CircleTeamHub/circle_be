@@ -253,6 +253,11 @@ export interface ChatConversationBroadcast {
   conversationId: string;
   /** 变化的成员即接收者本人;冗余带上便于客户端校验与多端复用。 */
   userId: string;
+  /**
+   * 只跟 removed 一起出现:dissolved = 群(圈子)被解散,客户端据此提示「已解散」而不是
+   * 「你已被移出」。可选字段,老客户端忽略。
+   */
+  reason?: 'dissolved';
 }
 
 /**

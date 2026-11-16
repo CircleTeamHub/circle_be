@@ -1,6 +1,10 @@
 import { ChatMediaService } from './chat-media.service';
 import { ChatService } from './chat.service';
 
+const membershipNoticesMock = {
+  deliverMembershipNotices: jest.fn().mockResolvedValue(undefined),
+};
+
 describe('collection message resolution', () => {
   const prisma = {
     chatMessage: { findMany: jest.fn(), findUnique: jest.fn() },
@@ -21,6 +25,7 @@ describe('collection message resolution', () => {
       {} as never,
       {} as never,
       {} as never,
+      membershipNoticesMock as never,
     );
   const service = makeService();
   const resolve = (ids: string[], chat = service) =>

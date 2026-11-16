@@ -19,7 +19,8 @@ export const MOMENT_NOTIFICATION_TYPES = compactNotificationTypes([
 ] as const);
 
 /**
- * 圈子铃铛（CirclePlazaScreen 右上角）—— 担保验证、入圈审批、活动结束与认可。
+ * 圈子铃铛（CirclePlazaScreen 右上角 / 消息页飞机）—— 担保验证、入圈审批、收到圈子邀请、
+ * 活动结束与认可、被移出圈子、圈子解散。圈子的事一律走这里，不进消息页的「通知」。
  * 有人发帖不进这里：发帖只点亮飞机 tab 的红点（见 circle-plaza-update.query）。
  * 「报名管理」未读走 CirclePostSignup.seenByAuthor，不在这张表里，
  * 由 signupUnread 单独统计。
@@ -31,6 +32,18 @@ export const CIRCLE_NOTIFICATION_TYPES = compactNotificationTypes([
   NotificationType.CIRCLE_ADMIN_OVERRIDE_APPROVED,
   NotificationType.CIRCLE_POST_AUTO_ENDED,
   NotificationType.CIRCLE_POST_COLLABORATION_RECOGNIZED,
+  NotificationType.CIRCLE_INVITATION_RECEIVED,
+  NotificationType.CIRCLE_MEMBER_REMOVED,
+  NotificationType.CIRCLE_DISSOLVED,
+] as const);
+
+/**
+ * 群聊知会：本人被移出独立群聊、独立群聊被解散。只在站内出现（不写推送 outbox）——
+ * 被移出不需要本人做什么，推送只是打扰；独立群任何成员都能拉好友进群，反复拉踢还能刷别人的推送。
+ */
+export const GROUP_NOTICE_NOTIFICATION_TYPES = compactNotificationTypes([
+  NotificationType.GROUP_MEMBER_REMOVED,
+  NotificationType.GROUP_DISSOLVED,
 ] as const);
 
 /**
@@ -78,7 +91,6 @@ export const FRIEND_REQUEST_NOTIFICATION_TYPES = compactNotificationTypes([
 export const DISCOVER_NOTIFICATION_TYPES = compactNotificationTypes([
   ...FRIEND_REQUEST_NOTIFICATION_TYPES,
   NotificationType.GROUP_ADMISSION,
-  NotificationType.CIRCLE_INVITATION_RECEIVED,
   ...MOMENT_NOTIFICATION_TYPES,
   ...CIRCLE_NOTIFICATION_TYPES,
 ] as const);
@@ -87,7 +99,17 @@ export const PROFILE_NOTIFICATION_TYPES = compactNotificationTypes([
   NotificationType.SYSTEM,
 ] as const);
 
-export const NOTIFICATION_DOMAINS = ['moments', 'circle'] as const;
+/**
+ * 铃铛/入口的域。moments、circle 是两个铃铛；notice 是消息页的「通知」(圈子以外的知会，
+ * 好友申请/入群申请有自己的处理页「新的朋友」，不在列表里)，group / system 是它的两个分类。
+ */
+export const NOTIFICATION_DOMAINS = [
+  'moments',
+  'circle',
+  'notice',
+  'group',
+  'system',
+] as const;
 
 export type NotificationDomain = (typeof NOTIFICATION_DOMAINS)[number];
 
@@ -97,6 +119,13 @@ const NOTIFICATION_DOMAIN_TYPES: Record<
 > = {
   moments: MOMENT_NOTIFICATION_TYPES,
   circle: CIRCLE_NOTIFICATION_TYPES,
+  notice: [
+    ...MOMENT_NOTIFICATION_TYPES,
+    ...GROUP_NOTICE_NOTIFICATION_TYPES,
+    ...PROFILE_NOTIFICATION_TYPES,
+  ],
+  group: GROUP_NOTICE_NOTIFICATION_TYPES,
+  system: PROFILE_NOTIFICATION_TYPES,
 };
 
 /**

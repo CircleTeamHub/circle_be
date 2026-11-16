@@ -151,6 +151,7 @@ describe('RealtimeService', () => {
       signupUnread: 4,
       profileUnread: 1,
       systemUnread: 1,
+      groupNoticeUnread: 0,
       circlePlazaHasUpdate: false,
       circlePlazaChangedAt: '2026-11-09T00:00:10.000Z',
       syncedAt: expect.any(String),
@@ -264,6 +265,8 @@ describe('RealtimeService', () => {
       // 系统通知不进互动域；报名不进任何铃铛。
       { type: 'SYSTEM', count: 9 },
       { type: 'CIRCLE_POST_SIGNUP_CREATED', count: 9 },
+      // 独立群的被移出知会只进消息页「通知」,不进互动总数。
+      { type: 'GROUP_MEMBER_REMOVED', count: 4 },
     ]);
 
     await service.broadcastInteractionUnread('user-1');
@@ -278,6 +281,7 @@ describe('RealtimeService', () => {
         count: 5,
         momentsUnread: 2,
         circleUnread: 3,
+        groupNoticeUnread: 4,
         changedAt: expect.any(String),
       },
     });

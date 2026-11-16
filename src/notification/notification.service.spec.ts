@@ -110,6 +110,7 @@ describe('NotificationService', () => {
   ];
 
   const realtimeService = {
+    broadcastNotificationCreated: jest.fn(),
     broadcastInteractionUnread: jest.fn(),
     broadcastSystemNotificationUnread: jest.fn(),
     broadcastSystemNotificationUnreadToRecipients: jest.fn(),
@@ -197,6 +198,7 @@ describe('NotificationService', () => {
       momentsUnread: 1,
       circleUnread: 1,
       profileUnread: 1,
+      groupNoticeUnread: 0,
       totalUnread: 3,
       circlePlazaHasUpdate: true,
       circlePlazaChangedAt: '2026-11-09T00:00:10.000Z',
@@ -1815,6 +1817,129 @@ describe('NotificationService', () => {
         }),
       );
     });
+  });
+
+  describe('deliverMembershipNotices', () => {
+    const baseRow = (toUserID: string, overrides = {}) => ({
+      id: `n-${toUserID}`,
+      type: 'GROUP_DISSOLVED',
+      content: '周末徒步',
+      read: false,
+      createdAt: new Date('2026-11-14T00:00:00.000Z'),
+      toUserID,
+      fromUserID: toUserID,
+      fromTraceID: null,
+      fromReplyID: null,
+      fromCircleID: null,
+      fromCirclePostID: null,
+      fromInvitationID: null,
+      fromGroupAdmissionID: null,
+      fromFriendRequestID: null,
+      systemAnnouncementID: null,
+      ...overrides,
+    });
+
+    it('writes in-app rows with no push outbox and names nobody but the recipient', async () => {
+      prisma.notification.createManyAndReturn.mockResolvedValue([
+        baseRow('u1'),
+        baseRow('u2'),
+      ]);
+
+      await service.deliverMembershipNotices({
+        type: 'GROUP_DISSOLVED',
+        toUserIds: ['u1', 'u2'],
+        content: '周末徒步',
+      });
+
+      expect(prisma.notification.createManyAndReturn).toHaveBeenCalledWith({
+        data: [
+          {
+            type: 'GROUP_DISSOLVED',
+            toUserID: 'u1',
+            fromUserID: 'u1',
+            content: '周末徒步',
+            fromCircleID: null,
+          },
+          {
+            type: 'GROUP_DISSOLVED',
+            toUserID: 'u2',
+            fromUserID: 'u2',
+            content: '周末徒步',
+            fromCircleID: null,
+          },
+        ],
+        select: expect.any(Object),
+      });
+      // 不推送:outbox 一行都不写。
+      expect(prisma.notificationPushOutbox.create).not.toHaveBeenCalled();
+      expect(prisma.notificationPushOutbox.createMany).not.toHaveBeenCalled();
+      expect(prisma.notificationPushOutbox.upsert).not.toHaveBeenCalled();
+      // 每个收件人各收自己的那条,未读数随之刷新。
+      expect(realtimeService.broadcastNotificationCreated).toHaveBeenCalledWith(
+        'u1',
+        expect.objectContaining({ id: 'n-u1', type: 'GROUP_DISSOLVED' }),
+      );
+      expect(realtimeService.broadcastNotificationCreated).toHaveBeenCalledWith(
+        'u2',
+        expect.objectContaining({ id: 'n-u2' }),
+      );
+      expect(realtimeService.broadcastInteractionUnread).toHaveBeenCalledTimes(
+        2,
+      );
+    });
+
+    it('does nothing for an empty recipient list', async () => {
+      await service.deliverMembershipNotices({
+        type: 'GROUP_DISSOLVED',
+        toUserIds: [],
+        content: '',
+      });
+      expect(prisma.notification.createManyAndReturn).not.toHaveBeenCalled();
+    });
+
+    it('swallows a write failure: the membership change already committed', async () => {
+      prisma.notification.createManyAndReturn.mockRejectedValue(
+        new Error('db down'),
+      );
+      await expect(
+        service.deliverMembershipNotices({
+          type: 'CIRCLE_MEMBER_REMOVED',
+          toUserIds: ['u1'],
+          content: '摄影圈',
+          circleId: 'circle-1',
+        }),
+      ).resolves.toBeUndefined();
+      expect(
+        realtimeService.broadcastNotificationCreated,
+      ).not.toHaveBeenCalled();
+    });
+  });
+
+  it('clearing the message-page notice domain also refreshes the system badge', async () => {
+    prisma.notification.updateMany.mockResolvedValue({ count: 2 });
+
+    await service.markAllNotificationsRead('user-1', 'notice');
+
+    expect(prisma.notification.updateMany).toHaveBeenCalledWith(
+      expect.objectContaining({
+        where: expect.objectContaining({
+          type: {
+            in: expect.arrayContaining([
+              'TRACE_LIKE',
+              'GROUP_MEMBER_REMOVED',
+              'GROUP_DISSOLVED',
+              'SYSTEM',
+            ]),
+          },
+        }),
+      }),
+    );
+    expect(realtimeService.broadcastInteractionUnread).toHaveBeenCalledWith(
+      'user-1',
+    );
+    expect(
+      realtimeService.broadcastSystemNotificationUnread,
+    ).toHaveBeenCalledWith('user-1');
   });
 });
 

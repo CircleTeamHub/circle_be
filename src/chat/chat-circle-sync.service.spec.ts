@@ -5,6 +5,10 @@ import * as winston from 'winston';
 import { createWinstonOptions } from '../logging/winston-options';
 import { RedisService } from '../redis/redis.service';
 
+const membershipNoticesMock = {
+  deliverMembershipNotices: jest.fn().mockResolvedValue(undefined),
+};
+
 describe('ChatCircleSyncService', () => {
   const prisma = {
     chatCircleSyncRetry: {
@@ -58,6 +62,7 @@ describe('ChatCircleSyncService', () => {
     systemMessage as never,
     groupEvents as never,
     redis as never,
+    membershipNoticesMock as never,
   );
   const runTx = async (cb: (tx: typeof prisma) => unknown) => cb(prisma);
   /** 圈子成员与座位的差集(circleSeatDiffQuery 的结果行)。 */
@@ -118,6 +123,7 @@ describe('ChatCircleSyncService', () => {
         systemMessage as never,
         groupEvents as never,
         redis as never,
+        membershipNoticesMock as never,
       );
       (sync as unknown as { logger: LoggerService }).logger =
         WinstonModule.createLogger({ instance: logger });
@@ -227,6 +233,7 @@ describe('ChatCircleSyncService', () => {
   it('default-denies a dismissed circle and clears every seat', async () => {
     prisma.circle.findUnique.mockResolvedValue({
       id: 'circle-1',
+      name: '摄影圈',
       deleted: false,
       adminState: 'DISMISSED',
     });
@@ -251,15 +258,114 @@ describe('ChatCircleSyncService', () => {
     // 被清座的人要收到个人事件,否则 UI 一直停在已解散的群里。
     expect(broadcast.emitConversationChange).toHaveBeenCalledWith('u1', {
       kind: 'removed',
+      reason: 'dissolved',
       conversationId: 'conv-1',
       userId: 'u1',
     });
     expect(broadcast.emitConversationChange).toHaveBeenCalledWith('u2', {
       kind: 'removed',
+      reason: 'dissolved',
       conversationId: 'conv-1',
       userId: 'u2',
     });
+    // 管理台解散也是「圈子没了」:离线的人下次打开能在飞机里看到。
+    expect(membershipNoticesMock.deliverMembershipNotices).toHaveBeenCalledWith(
+      {
+        type: 'CIRCLE_DISSOLVED',
+        toUserIds: ['u1', 'u2'],
+        content: '摄影圈',
+        circleId: 'circle-1',
+      },
+    );
     expect(prisma.chatConversation.create).not.toHaveBeenCalled();
+  });
+
+  it.each(['DISABLING', 'DISABLED', 'RESTORING', 'SYNC_FAILED'])(
+    'evicts a circle the console disabled (%s) without claiming it was dissolved',
+    async (adminState) => {
+      // 管理台停用同样写 deleted=true,只有状态能说明它会被恢复。
+      prisma.circle.findUnique.mockResolvedValue({
+        id: 'circle-1',
+        name: '摄影圈',
+        deleted: true,
+        adminState,
+      });
+      prisma.chatConversation.findUnique.mockResolvedValue({ id: 'conv-1' });
+      prisma.chatMember.findMany.mockResolvedValue([{ userID: 'u1' }]);
+
+      await service.ensureCircleConversation('circle-1');
+
+      expect(broadcast.emitConversationChange).toHaveBeenCalledWith('u1', {
+        kind: 'removed',
+        conversationId: 'conv-1',
+        userId: 'u1',
+      });
+      expect(
+        membershipNoticesMock.deliverMembershipNotices,
+      ).not.toHaveBeenCalled();
+    },
+  );
+
+  it('a console dismissal is announced as dissolved even while the circle is still DISABLING', async () => {
+    prisma.circle.findUnique.mockResolvedValue({
+      id: 'circle-1',
+      name: '摄影圈',
+      deleted: true,
+      adminState: 'DISABLING',
+    });
+    prisma.chatConversation.findUnique.mockResolvedValue({ id: 'conv-1' });
+    prisma.chatMember.findMany.mockResolvedValue([
+      { userID: 'u1' },
+      { userID: 'u2' },
+    ]);
+
+    await service.dismissAllSeats('circle-1');
+
+    expect(prisma.chatMember.updateMany).toHaveBeenCalledWith({
+      where: { conversationID: 'conv-1', leftAt: null },
+      data: { leftAt: expect.any(Date) },
+    });
+    expect(broadcast.removeUserFromConversation).toHaveBeenCalledWith(
+      'u2',
+      'conv-1',
+    );
+    expect(broadcast.emitConversationChange).toHaveBeenCalledWith('u2', {
+      kind: 'removed',
+      reason: 'dissolved',
+      conversationId: 'conv-1',
+      userId: 'u2',
+    });
+    expect(membershipNoticesMock.deliverMembershipNotices).toHaveBeenCalledWith(
+      {
+        type: 'CIRCLE_DISSOLVED',
+        toUserIds: ['u1', 'u2'],
+        content: '摄影圈',
+        circleId: 'circle-1',
+      },
+    );
+  });
+
+  it('evicts a temporarily disabled circle without claiming it was dissolved', async () => {
+    prisma.circle.findUnique.mockResolvedValue({
+      id: 'circle-1',
+      name: '摄影圈',
+      deleted: false,
+      adminState: 'DISABLED',
+    });
+    prisma.chatConversation.findUnique.mockResolvedValue({ id: 'conv-1' });
+    prisma.chatMember.findMany.mockResolvedValue([{ userID: 'u1' }]);
+
+    await service.ensureCircleConversation('circle-1');
+
+    // 停用可能被恢复(恢复后对账把座位还回来):不能说「已解散」,也不留知会。
+    expect(broadcast.emitConversationChange).toHaveBeenCalledWith('u1', {
+      kind: 'removed',
+      conversationId: 'conv-1',
+      userId: 'u1',
+    });
+    expect(
+      membershipNoticesMock.deliverMembershipNotices,
+    ).not.toHaveBeenCalled();
   });
 
   it('default-denies a soft-deleted circle', async () => {
@@ -279,6 +385,7 @@ describe('ChatCircleSyncService', () => {
   it('tells the dissolving owner left and everyone else removed', async () => {
     prisma.circle.findUnique.mockResolvedValue({
       id: 'circle-1',
+      name: '摄影圈',
       deleted: true,
       adminState: 'ACTIVE',
     });
@@ -297,9 +404,19 @@ describe('ChatCircleSyncService', () => {
     });
     expect(broadcast.emitConversationChange).toHaveBeenCalledWith('u2', {
       kind: 'removed',
+      reason: 'dissolved',
       conversationId: 'conv-1',
       userId: 'u2',
     });
+    // 解散的圈主自己不收知会。
+    expect(membershipNoticesMock.deliverMembershipNotices).toHaveBeenCalledWith(
+      {
+        type: 'CIRCLE_DISSOLVED',
+        toUserIds: ['u2'],
+        content: '摄影圈',
+        circleId: 'circle-1',
+      },
+    );
   });
 
   it('rechecks circle state after the lock before re-seating members', async () => {
@@ -909,6 +1026,7 @@ describe('ChatCircleSyncService', () => {
         systemMessage as never,
         groupEvents as never,
         redis as never,
+        membershipNoticesMock as never,
       );
       const since = new Date(Date.now() - 120_000);
       prisma.$queryRaw.mockResolvedValueOnce([
@@ -930,6 +1048,7 @@ describe('ChatCircleSyncService', () => {
         systemMessage as never,
         groupEvents as never,
         redis as never,
+        membershipNoticesMock as never,
       );
       const ensure = jest
         .spyOn(restarted, 'ensureCircleConversation')
@@ -1022,6 +1141,7 @@ describe('circle sync durable scan progress', () => {
       {} as never,
       {} as never,
       redis as never,
+      membershipNoticesMock as never,
     );
   beforeEach(() => {
     jest.resetAllMocks();
@@ -1155,6 +1275,7 @@ describe('circle sync durable scan progress', () => {
         {} as never,
         {} as never,
         reader,
+        membershipNoticesMock as never,
       );
       (service as any).scanCursor = local;
       const expected =
@@ -1603,6 +1724,7 @@ describe('ChatCircleSyncService.syncCircleSeatsCoalesced', () => {
     {} as never,
     {} as never,
     {} as never,
+    membershipNoticesMock as never,
   );
 
   type Deferred = {

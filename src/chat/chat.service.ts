@@ -10,6 +10,7 @@ import {
 } from '@nestjs/common';
 import { ChatErrorCode, GroupErrorCode } from 'src/common/app-error-codes';
 import { sanitizeLogValue } from 'src/logging/log-sanitizer';
+import { NotificationService } from 'src/notification/notification.service';
 import { PrismaService } from 'src/prisma/prisma.service';
 import { SensitiveWordService } from 'src/sensitive-word/sensitive-word.service';
 import { PrivacySettingsService } from 'src/privacy/privacy-settings.service';
@@ -82,6 +83,7 @@ import {
   lastMessagesQuery,
   unreadCountsQuery,
 } from './chat-conversation-summary.query';
+import { AUTO_REPLY_QUIET_MS } from './chat-direct-auto-reply.processor';
 import { messageDaysQuery, messageDayWindows } from './chat-message-days.query';
 import { messagePreviewText } from './chat-message-preview';
 import {
@@ -360,6 +362,7 @@ export class ChatService {
     private readonly support: SupportService,
     private readonly circleMemberLock: CircleMemberLockService,
     private readonly groupEvents: ChatGroupEventService,
+    private readonly notifications: NotificationService,
   ) {}
 
   /**
@@ -1450,7 +1453,11 @@ export class ChatService {
     const directAutoReplyJobId = plan.directAutoReply
       ? (
           await tx.chatDirectAutoReplyJob.create({
-            data: { sourceMessageID: message.id },
+            data: {
+              sourceMessageID: message.id,
+              // 静默期过了才轮到它，只回连发里的最后一条（见 AUTO_REPLY_QUIET_MS）。
+              nextAttemptAt: new Date(Date.now() + AUTO_REPLY_QUIET_MS),
+            },
             select: { id: true },
           })
         ).id
@@ -2425,7 +2432,7 @@ export class ChatService {
       conversationId,
       userId,
     );
-    const dissolvedMembers = await this.prisma.$transaction(async (tx) => {
+    const dissolved = await this.prisma.$transaction(async (tx) => {
       // 与发消息/清空/退群同一把锁、同一个顺序:会话行锁永远最先拿。
       const locked = await tx.$queryRaw<
         Array<{
@@ -2434,8 +2441,9 @@ export class ChatService {
           circleID: string | null;
           ownerID: string | null;
           nextHeight: number;
+          name: string | null;
         }>
-      >`SELECT "id", "type", "circleID", "ownerID", "nextHeight"
+      >`SELECT "id", "type", "circleID", "ownerID", "nextHeight", "name"
         FROM "ChatConversation"
         WHERE "id" = ${conversation.id} FOR UPDATE`;
       if (
@@ -2495,23 +2503,38 @@ export class ChatService {
           leftAt: new Date(),
         },
       });
-      return seated.map((member) => member.userID);
+      return {
+        members: seated.map((member) => member.userID),
+        groupName: locked[0].name?.trim() ?? '',
+      };
     });
 
     // 广播放事务外:清空/退群同样的做法,推送失败不该回滚已经落库的解散。
-    for (const memberId of dissolvedMembers) {
+    for (const memberId of dissolved.members) {
       void this.broadcast
         .removeUserFromConversation(memberId, conversation.id)
         .catch(() => undefined);
       // 解散的人自己收 left(和主动退群同一语义,客户端静默收走);其他人收
       // removed,客户端才会提示群已经没了。给自己发 removed 的话,刚按下解散
-      // 的群主会被弹「你已被移出该群聊」。
-      this.broadcast.emitConversationChange(memberId, {
-        kind: memberId === userId ? 'left' : 'removed',
-        conversationId: conversation.id,
-        userId: memberId,
-      });
+      // 的群主会被弹「你已被移出该群聊」。reason 让其余成员看到的是「已解散」。
+      this.broadcast.emitConversationChange(
+        memberId,
+        memberId === userId
+          ? { kind: 'left', conversationId: conversation.id, userId: memberId }
+          : {
+              kind: 'removed',
+              reason: 'dissolved',
+              conversationId: conversation.id,
+              userId: memberId,
+            },
+      );
     }
+    // 群主自己不收知会;其余成员离线也能在「通知」里看到群没了。
+    void this.notifications.deliverMembershipNotices({
+      type: 'GROUP_DISSOLVED',
+      toUserIds: dissolved.members.filter((memberId) => memberId !== userId),
+      content: dissolved.groupName,
+    });
   }
 
   /** 独立群聊改名:任一在座成员可改(微信语义);改完发系统提示留痕。 */

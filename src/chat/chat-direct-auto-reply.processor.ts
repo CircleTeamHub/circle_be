@@ -21,6 +21,15 @@ const JOB_BACKOFF_BASE_MS = 2_000;
 const JOB_BACKOFF_MAX_MS = 60_000;
 const AUTO_REPLY_COOLDOWN_MS = 30_000;
 /**
+ * 静默期：发消息的人停手这么久才回，而且只回这一阵里的最后一条。原来每条私聊一落库
+ * 就立刻回 —— 一次批量发三条笔记，回复插在第一条后面，剩下两条又被 30 秒冷却挡掉。
+ * 批量发送在限流额度内是连发（毫秒级间隔），手打连发也多在这个量级。
+ * 入队时 nextAttemptAt 就排到静默期之后，定时扫描不会提前处理。
+ */
+export const AUTO_REPLY_QUIET_MS = 3_000;
+/** 即时 kick 比静默期多等一点：Node 计时器偶尔早触发 1ms，早了认领不到任务。 */
+const KICK_MARGIN_MS = 100;
+/**
  * 每会话冷却之外的**全局**上限：同一个应答者在这个窗口内最多向这么多个不同
  * 会话自动回复。
  *
@@ -66,8 +75,14 @@ export class ChatDirectAutoReplyProcessor {
     if (job) await this.processJob(job.id);
   }
 
-  /** Low-latency post-commit kick; the cron sweep remains the durable fallback. */
+  /**
+   * 提交后的即时 kick：等静默期过了再处理。进程在这期间退出，定时扫描兜底
+   * （计时器 unref，不拖住关停）。
+   */
   async processEnqueuedJob(jobId: string): Promise<void> {
+    await new Promise<void>((resolve) => {
+      setTimeout(resolve, AUTO_REPLY_QUIET_MS + KICK_MARGIN_MS).unref();
+    });
     await this.processJob(jobId);
   }
 
@@ -260,7 +275,9 @@ export class ChatDirectAutoReplyProcessor {
       const counter = await tx.$queryRaw<Array<{ nextHeight: number }>>`
         SELECT "nextHeight" FROM "ChatConversation"
         WHERE "id" = ${message.conversationID} FOR UPDATE`;
-      if (counter.length === 0) {
+      // 静默期里会话又有了新消息：要么对方接着发了（那条有自己的任务，回复跟在最后
+      // 一条后面），要么已经有人回了。这条都不该再回。
+      if (counter.length === 0 || counter[0].nextHeight !== message.height) {
         await this.completeJob(tx, jobId);
         return null;
       }

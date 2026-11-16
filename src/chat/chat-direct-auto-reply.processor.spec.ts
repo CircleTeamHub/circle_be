@@ -1,5 +1,8 @@
 import * as trackedCron from 'src/metrics/tracked-cron.decorator';
-import { ChatDirectAutoReplyProcessor } from './chat-direct-auto-reply.processor';
+import {
+  AUTO_REPLY_QUIET_MS,
+  ChatDirectAutoReplyProcessor,
+} from './chat-direct-auto-reply.processor';
 
 describe('ChatDirectAutoReplyProcessor', () => {
   const createdAt = new Date('2026-09-04T05:00:00.000Z');
@@ -183,7 +186,17 @@ describe('ChatDirectAutoReplyProcessor', () => {
   });
   // 网关拿着 sendMessage 带回的任务 id 直接 kick,不再按消息 id 查一次任务表。
   it('processes an enqueued job by id without looking it up by message', async () => {
-    await processor.processEnqueuedJob('job-1');
+    jest.useFakeTimers();
+    try {
+      const kicked = processor.processEnqueuedJob('job-1');
+      // 静默期内不动:连发的后几条还没到,这时候回就会插在中间。
+      await jest.advanceTimersByTimeAsync(AUTO_REPLY_QUIET_MS - 1);
+      expect(prisma.chatDirectAutoReplyJob.updateMany).not.toHaveBeenCalled();
+      await jest.advanceTimersByTimeAsync(1_000);
+      await kicked;
+    } finally {
+      jest.useRealTimers();
+    }
 
     expect(prisma.chatDirectAutoReplyJob.findUnique).not.toHaveBeenCalled();
     expect(prisma.chatDirectAutoReplyJob.updateMany).toHaveBeenCalledWith(
@@ -192,6 +205,27 @@ describe('ChatDirectAutoReplyProcessor', () => {
       }),
     );
     expect(prisma.chatMessage.create).toHaveBeenCalled();
+  });
+
+  // 一次批量发三条笔记:每条各有一个任务,只有最后一条该回,回复跟在整批后面。
+  it('stays quiet when the conversation moved on after the source message', async () => {
+    // 只改会话水位,其余(应答者、时钟)照旧放行 —— 拦下它的必须是「后面又有消息」。
+    const defaultQuery = prisma.$queryRaw.getMockImplementation()!;
+    prisma.$queryRaw.mockImplementation(async (query: TemplateStringsArray) =>
+      query.join(' ').includes('FROM "ChatConversation"')
+        ? [{ nextHeight: 6 }]
+        : defaultQuery(query),
+    );
+
+    await processor.processMessage('source-1');
+
+    expect(prisma.chatMessage.create).not.toHaveBeenCalled();
+    expect(prisma.chatDirectAutoReplyState.upsert).not.toHaveBeenCalled();
+    expect(prisma.chatDirectAutoReplyJob.update).toHaveBeenCalledWith({
+      where: { id: 'job-1' },
+      data: expect.objectContaining({ status: 'COMPLETED', lockedAt: null }),
+    });
+    expect(broadcast.emitMessage).not.toHaveBeenCalled();
   });
 
   it('uses current active members to send a trimmed deterministic reply as the peer', async () => {

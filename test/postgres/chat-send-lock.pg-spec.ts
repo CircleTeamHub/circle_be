@@ -15,6 +15,10 @@ import {
   waitUntilBlocked,
 } from './live-prisma';
 
+const membershipNoticesMock = {
+  deliverMembershipNotices: jest.fn().mockResolvedValue(undefined),
+};
+
 /**
  * 发送临界区与单聊已读的锁形状(真 PrismaClient + 真 PostgreSQL)。
  *
@@ -55,6 +59,7 @@ function makeService(live: LiveSchema): ChatService {
     { isSupportAgent: jest.fn().mockResolvedValue(false) } as never,
     { lock: resolved() } as never,
     { record: resolved(), recordInTx: resolved() } as never,
+    membershipNoticesMock as never,
   );
 }
 
