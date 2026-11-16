@@ -183,6 +183,12 @@ export class NewCountQueryDto {
   @ApiProperty()
   @IsISO8601()
   since: string;
+
+  /** 1 = 不数自己发的。探索 tab 的「好友有新动态」红点用：自己发的不该点亮自己。 */
+  @ApiPropertyOptional({ enum: ['1'] })
+  @IsOptional()
+  @IsIn(['1'])
+  friendsOnly?: '1';
 }
 
 // ── Response DTOs ────────────────────────────────────────────────────────────

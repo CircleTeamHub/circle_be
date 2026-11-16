@@ -47,6 +47,24 @@ export const GROUP_NOTICE_NOTIFICATION_TYPES = compactNotificationTypes([
 ] as const);
 
 /**
+ * 点赞只在站内出现（铃铛列表 + 红点），不写推送 outbox。
+ *
+ * 厂商通道把点赞这类「社交动态」归进资讯营销类：每台设备每天只放行 2~5 条，超出直接丢。
+ * 每个赞都推，会把评论、回复、@ 这些要人回应的推送一起挤掉。站内列表按动态合并展示。
+ */
+export const IN_APP_ONLY_NOTIFICATION_TYPES = compactNotificationTypes([
+  NotificationType.TRACE_LIKE,
+  NotificationType.PROFILE_LIKE,
+] as const);
+
+const IN_APP_ONLY_NOTIFICATION_TYPE_SET: ReadonlySet<NotificationType> =
+  new Set(IN_APP_ONLY_NOTIFICATION_TYPES);
+
+export function isInAppOnlyNotification(type: NotificationType): boolean {
+  return IN_APP_ONLY_NOTIFICATION_TYPE_SET.has(type);
+}
+
+/**
  * 受「圈子通知设置 → 离线提醒」门控的类型 —— 圈子铃铛那几种，再加上报名通知。
  *
  * 门控面比铃铛面宽一项：CIRCLE_POST_SIGNUP_CREATED 的未读走

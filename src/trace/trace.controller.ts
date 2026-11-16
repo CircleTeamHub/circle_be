@@ -58,7 +58,9 @@ export class TraceController {
   @Get('feed/new-count')
   @ApiOperation({ summary: 'Count new moments since timestamp' })
   newCount(@Query() query: NewCountQueryDto, @Req() req: RequestWithUser) {
-    return this.traceService.getNewCount(req.user.userId, query.since);
+    return this.traceService.getNewCount(req.user.userId, query.since, {
+      friendsOnly: query.friendsOnly === '1',
+    });
   }
 
   // NOTE: must stay AFTER the static `feed` / `feed/new-count` GET routes so

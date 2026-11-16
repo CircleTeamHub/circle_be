@@ -191,6 +191,21 @@ export class NotificationController {
     );
   }
 
+  // 朋友圈铃铛把同一条动态的点赞合并成一行：点开时一次标完，不按条发几百个请求。
+  @Put('trace-likes/:traceId/read')
+  @ApiOperation({
+    summary: 'Mark every like notification on one moment as read',
+  })
+  readTraceLikes(
+    @Param('traceId', ParseUUIDPipe) traceId: string,
+    @Req() req: RequestWithUser,
+  ) {
+    return this.notificationService.markTraceLikesRead(
+      req.user.userId,
+      traceId,
+    );
+  }
+
   @Put(':id/read')
   @ApiOperation({ summary: 'Mark one notification as read' })
   read(@Param('id', ParseUUIDPipe) id: string, @Req() req: RequestWithUser) {

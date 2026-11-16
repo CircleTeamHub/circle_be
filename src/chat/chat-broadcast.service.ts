@@ -44,6 +44,27 @@ function deliveryIdOwnerRoom(
   return userRoom(payload.sender.id);
 }
 
+/** 单实例回退:在前台、带推送 token 的 socket → 用户 → token。 */
+function foregroundTokensOf(
+  sockets: readonly RemoteSocket<never, unknown>[],
+): Map<string, Set<string>> {
+  const tokensByUser = new Map<string, Set<string>>();
+  for (const socket of sockets) {
+    const data = socket.data as {
+      userId?: unknown;
+      background?: unknown;
+      pushToken?: unknown;
+    };
+    if (data?.background === true) continue;
+    if (typeof data?.userId !== 'string') continue;
+    if (typeof data?.pushToken !== 'string') continue;
+    const tokens = tokensByUser.get(data.userId) ?? new Set<string>();
+    tokens.add(data.pushToken);
+    tokensByUser.set(data.userId, tokens);
+  }
+  return tokensByUser;
+}
+
 /**
  * 聊天广播出口(squady socket-broadcast.service 的移植)。
  * 网关 attach 时注入 io Server;其它模块(temp-chat 接线、系统消息)统一
@@ -284,24 +305,28 @@ export class ChatBroadcastService implements OnModuleInit, OnModuleDestroy {
     if (this.presence.isRedisConfigured()) return new Map();
     const server = this.requireServer('getForegroundPushTokensInConversation');
     if (!server) return new Map();
-    const sockets = await server
-      .in(conversationRoom(conversationId))
-      .fetchSockets();
-    const tokensByUser = new Map<string, Set<string>>();
-    for (const socket of sockets) {
-      const data = socket.data as {
-        userId?: unknown;
-        background?: unknown;
-        pushToken?: unknown;
-      };
-      if (data?.background === true) continue;
-      if (typeof data?.userId !== 'string') continue;
-      if (typeof data?.pushToken !== 'string') continue;
-      const tokens = tokensByUser.get(data.userId) ?? new Set<string>();
-      tokens.add(data.pushToken);
-      tokensByUser.set(data.userId, tokens);
-    }
-    return tokensByUser;
+    return foregroundTokensOf(
+      await server.in(conversationRoom(conversationId)).fetchSockets(),
+    );
+  }
+
+  /**
+   * 这些用户正开着 App 的设备 → 推送 token。通知推送用(通知不在会话房里,按人的
+   * 个人房查)。读不到时的取舍与上面一致:谁都不排除。
+   */
+  async getForegroundPushTokensForUsers(
+    userIds: readonly string[],
+  ): Promise<Map<string, Set<string>>> {
+    if (userIds.length === 0) return new Map();
+    const viaRegistry =
+      await this.presence.getForegroundPushTokensForUsers(userIds);
+    if (viaRegistry !== null) return viaRegistry;
+    if (this.presence.isRedisConfigured()) return new Map();
+    const server = this.requireServer('getForegroundPushTokensForUsers');
+    if (!server) return new Map();
+    return foregroundTokensOf(
+      await server.in([...new Set(userIds)].map(userRoom)).fetchSockets(),
+    );
   }
 
   /** 断开某用户全部在线 socket(临时房结束/访客清退用)。 */
