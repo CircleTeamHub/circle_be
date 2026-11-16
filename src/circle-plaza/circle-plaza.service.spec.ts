@@ -14,6 +14,7 @@ import { MembershipProgramService } from 'src/membership/membership-program.serv
 import { PlazaErrorCode } from 'src/common/app-error-codes';
 import { CirclePlazaService } from './circle-plaza.service';
 import { AvatarFrameService } from 'src/avatar-frame/avatar-frame.service';
+import { NoteService } from 'src/note/note.service';
 import { plainToInstance } from 'class-transformer';
 import { validate } from 'class-validator';
 import { CreatePlazaPostDto } from './dto/circle-plaza.dto';
@@ -109,6 +110,9 @@ describe('CirclePlazaService', () => {
   const avatarFrames = {
     resolvePublicAppearances: jest.fn(),
   };
+  const notes = {
+    projectPlazaNoteCards: jest.fn(),
+  };
 
   beforeEach(async () => {
     jest.clearAllMocks();
@@ -150,6 +154,8 @@ describe('CirclePlazaService', () => {
     prisma.user.updateMany.mockResolvedValue({ count: 0 });
     prisma.circle.updateMany.mockResolvedValue({ count: 1 });
     prisma.circlePostCircle.findMany.mockResolvedValue([]);
+    notes.projectPlazaNoteCards.mockReset();
+    notes.projectPlazaNoteCards.mockResolvedValue(new Map());
 
     const module: TestingModule = await Test.createTestingModule({
       providers: [
@@ -162,6 +168,7 @@ describe('CirclePlazaService', () => {
         MembershipPolicyService,
         { provide: MembershipProgramService, useValue: membershipProgram },
         { provide: AvatarFrameService, useValue: avatarFrames },
+        { provide: NoteService, useValue: notes },
       ],
     }).compile();
 
@@ -846,6 +853,287 @@ describe('CirclePlazaService', () => {
     });
   });
 
+  describe('attached note cards', () => {
+    const feedPost = (id: string, noteID: string | null) => ({
+      id,
+      content: `post ${id}`,
+      images: [],
+      tags: [],
+      city: null,
+      cities: [],
+      isHorn: false,
+      noteID,
+      vipRestriction: null,
+      creditRestriction: null,
+      fancyRestriction: false,
+      viewCount: 0,
+      signupCount: 0,
+      signupVipRestriction: null,
+      signupCreditRestriction: null,
+      signupFancyRestriction: false,
+      createdAt: new Date('2026-11-15T00:00:00.000Z'),
+      expiresAt: new Date('2026-11-16T00:00:00.000Z'),
+      author: {
+        id: 'author-1',
+        nickname: 'Author',
+        avatarUrl: null,
+        avatarFrame: null,
+        accountId: '1001',
+      },
+      circle: { id: 'circle-1', name: 'Circle' },
+      circleLinks: [],
+    });
+    const card = (
+      noteId: string,
+      publicationStatus: 'ACTIVE' | 'UNLISTED' | 'DELETED',
+    ) => ({
+      noteId,
+      ownerId: 'author-1',
+      title: `title ${noteId}`,
+      contentPreview: publicationStatus === 'ACTIVE' ? 'preview' : null,
+      coverUrl:
+        publicationStatus === 'ACTIVE' ? 'https://signed/notes/c.jpg' : null,
+      previewUrls:
+        publicationStatus === 'ACTIVE' ? ['https://signed/notes/p.jpg'] : [],
+      imageCount: publicationStatus === 'ACTIVE' ? 1 : 0,
+      videoCount: 0,
+      showcaseCount: 0,
+      hasText: publicationStatus === 'ACTIVE',
+      hasLocation: false,
+      workStatus: publicationStatus === 'ACTIVE' ? 'WORKING' : null,
+      publicationStatus,
+    });
+
+    beforeEach(() => {
+      prisma.user.findUnique.mockResolvedValue({
+        vipLevel: 1,
+        vipExpiresAt: new Date('2030-01-01T00:00:00.000Z'),
+        creditScore: 100,
+        fancyNumber: false,
+      });
+      prisma.circlePostSignup.findMany.mockResolvedValue([]);
+    });
+
+    it('puts the note card on feed posts: active, deleted, missing and none', async () => {
+      prisma.circlePost.findMany.mockResolvedValue([
+        feedPost('p-active', 'note-active'),
+        feedPost('p-deleted', 'note-deleted'),
+        feedPost('p-missing', 'note-gone'),
+        feedPost('p-plain', null),
+      ]);
+      prisma.circlePost.count.mockResolvedValue(4);
+      // 'note-gone' 已被永久删除：投影里没有它。
+      notes.projectPlazaNoteCards.mockResolvedValue(
+        new Map([
+          ['note-active', card('note-active', 'ACTIVE')],
+          ['note-deleted', card('note-deleted', 'DELETED')],
+        ]),
+      );
+
+      const { items } = await service.getFeed('viewer-1', {});
+
+      expect(items.map((item) => [item.id, item.noteId])).toEqual([
+        ['p-active', 'note-active'],
+        ['p-deleted', 'note-deleted'],
+        ['p-missing', 'note-gone'],
+        ['p-plain', null],
+      ]);
+      expect(items[0].noteCard).toEqual(card('note-active', 'ACTIVE'));
+      expect(items[1].noteCard).toMatchObject({
+        noteId: 'note-deleted',
+        title: 'title note-deleted',
+        publicationStatus: 'DELETED',
+        coverUrl: null,
+        previewUrls: [],
+      });
+      expect(items[2].noteCard).toBeNull();
+      expect(items[3].noteCard).toBeNull();
+    });
+
+    it('loads every note card on a feed page with one batched projection', async () => {
+      prisma.circlePost.findMany.mockResolvedValue(
+        Array.from({ length: 5 }, (_, index) =>
+          feedPost(`p-${index}`, index === 2 ? null : `note-${index}`),
+        ),
+      );
+      prisma.circlePost.count.mockResolvedValue(5);
+
+      await service.getFeed('viewer-1', {});
+
+      expect(notes.projectPlazaNoteCards).toHaveBeenCalledTimes(1);
+      expect(notes.projectPlazaNoteCards).toHaveBeenCalledWith([
+        'note-0',
+        'note-1',
+        'note-3',
+        'note-4',
+      ]);
+      expect(prisma.note.findFirst).not.toHaveBeenCalled();
+    });
+
+    it('puts the note card on the post detail', async () => {
+      prisma.circlePost.findFirst.mockResolvedValue(
+        feedPost('p-1', 'note-unlisted'),
+      );
+      prisma.circlePostSignup.findUnique.mockResolvedValue(null);
+      notes.projectPlazaNoteCards.mockResolvedValue(
+        new Map([['note-unlisted', card('note-unlisted', 'UNLISTED')]]),
+      );
+
+      const result = await service.getPost('viewer-1', 'p-1');
+
+      expect(notes.projectPlazaNoteCards).toHaveBeenCalledWith([
+        'note-unlisted',
+      ]);
+      expect(result.noteCard).toMatchObject({
+        noteId: 'note-unlisted',
+        publicationStatus: 'UNLISTED',
+      });
+    });
+
+    it("puts the note card on the author's own post detail", async () => {
+      prisma.circlePost.findFirst.mockResolvedValue(
+        feedPost('p-1', 'note-active'),
+      );
+      notes.projectPlazaNoteCards.mockResolvedValue(
+        new Map([['note-active', card('note-active', 'ACTIVE')]]),
+      );
+
+      const result = await service.getMyPost('author-1', 'p-1');
+
+      expect(result.noteCard).toEqual(card('note-active', 'ACTIVE'));
+    });
+
+    describe('createPost note validation', () => {
+      // 一张假的 Note 表：按 createPost 的 where 逐字段过滤，验的是查询条件本身。
+      const noteTable = [
+        {
+          id: 'mine-active',
+          ownerID: 'user-1',
+          status: 'ACTIVE',
+          available: true,
+        },
+        {
+          id: 'mine-unlisted',
+          ownerID: 'user-1',
+          status: 'UNLISTED',
+          available: true,
+        },
+        {
+          id: 'mine-deleted',
+          ownerID: 'user-1',
+          status: 'DELETED',
+          available: true,
+        },
+        {
+          id: 'mine-hidden',
+          ownerID: 'user-1',
+          status: 'ACTIVE',
+          available: false,
+        },
+        {
+          id: 'theirs-active',
+          ownerID: 'user-2',
+          status: 'ACTIVE',
+          available: true,
+        },
+      ];
+
+      beforeEach(() => {
+        prisma.circleMember.findMany.mockResolvedValue([
+          {
+            circleID: 'circle-1',
+            id: 'member-1',
+            status: 'ACTIVE',
+            role: 'MEMBER',
+            circle: { id: 'circle-1', deleted: false, memberCanPost: true },
+          },
+        ]);
+        prisma.note.findFirst.mockImplementation(
+          async ({ where }: { where: Record<string, unknown> }) =>
+            noteTable.find((note) =>
+              Object.entries(where).every(
+                ([field, value]) => note[field as keyof typeof note] === value,
+              ),
+            ) ?? null,
+        );
+      });
+
+      it("only accepts the author's own ACTIVE, available note", async () => {
+        await expect(
+          service.createPost('user-1', {
+            circleId: 'circle-1',
+            content: 'hello plaza',
+            noteId: 'mine-unlisted',
+          }),
+        ).rejects.toThrow(BadRequestException);
+
+        expect(prisma.note.findFirst).toHaveBeenCalledWith({
+          where: {
+            id: 'mine-unlisted',
+            ownerID: 'user-1',
+            available: true,
+            status: 'ACTIVE',
+          },
+          select: { id: true },
+        });
+      });
+
+      it.each([
+        ['an UNLISTED (下架) note', 'mine-unlisted'],
+        ['a DELETED (回收站) note', 'mine-deleted'],
+        ['a hidden note', 'mine-hidden'],
+        ["another user's note", 'theirs-active'],
+      ])(
+        'rejects %s with PLAZA note-invalid before writing',
+        async (_label, noteId) => {
+          await expect(
+            service.createPost('user-1', {
+              circleId: 'circle-1',
+              content: 'hello plaza',
+              noteId,
+            }),
+          ).rejects.toMatchObject({
+            status: 400,
+            response: expect.objectContaining({
+              errorCode: PlazaErrorCode.NoteInvalid,
+            }),
+          });
+          expect(prisma.$transaction).not.toHaveBeenCalled();
+          expect(notes.projectPlazaNoteCards).not.toHaveBeenCalled();
+        },
+      );
+
+      it('returns the note card of an accepted note on the created post', async () => {
+        prisma.user.findUnique.mockResolvedValue({
+          vipLevel: 1,
+          vipExpiresAt: new Date('2030-01-01T00:00:00.000Z'),
+        });
+        prisma.circlePost.create.mockResolvedValue(
+          feedPost('p-new', 'mine-active'),
+        );
+        notes.projectPlazaNoteCards.mockResolvedValue(
+          new Map([['mine-active', card('mine-active', 'ACTIVE')]]),
+        );
+
+        const result = await service.createPost('user-1', {
+          circleId: 'circle-1',
+          content: 'hello plaza',
+          noteId: 'mine-active',
+        });
+
+        expect(prisma.circlePost.create).toHaveBeenCalledWith(
+          expect.objectContaining({
+            data: expect.objectContaining({ noteID: 'mine-active' }),
+          }),
+        );
+        expect(notes.projectPlazaNoteCards).toHaveBeenCalledWith([
+          'mine-active',
+        ]);
+        expect(result.noteCard).toEqual(card('mine-active', 'ACTIVE'));
+      });
+    });
+  });
+
   it('rejects creating a post with a note owned by another user', async () => {
     prisma.circleMember.findMany.mockResolvedValue([
       {
@@ -878,6 +1166,7 @@ describe('CirclePlazaService', () => {
       iconService as any,
       new MembershipPolicyService(prisma as any),
       avatarFrames as any,
+      notes as any,
     );
     prisma.circleMember.findMany.mockResolvedValue([
       {
@@ -931,6 +1220,7 @@ describe('CirclePlazaService', () => {
         resolveEntitlement: jest.fn().mockResolvedValue({ level: 1 }),
       } as unknown as MembershipPolicyService,
       avatarFrames as unknown as AvatarFrameService,
+      notes as unknown as NoteService,
     );
     const videos = [
       'https://media.example.test/posts/user-1/7f64c3a6-13ea-4dc8-9fa2-a651898d49fe.mp4',

@@ -96,6 +96,7 @@ import {
   NoteCardPeerDto,
   NoteWritableStatus,
   NoteWorkStatus,
+  PlazaPostNoteCardDto,
   SharedNoteListDto,
   UpdateNoteDto,
   UpdateNoteGroupDto,
@@ -3729,26 +3730,100 @@ export class NoteService implements NoteCardProjector {
     const byId = new Map(rows.map((row) => [row.id, row]));
     // 两次读取之间被永久删除的笔记直接少一名。
     const ordered = ranked.flatMap((row) => byId.get(row.id) ?? []);
-    const [items, previewKeys] = await Promise.all([
-      this.mapSummaryListResolved(ordered, viewerID),
-      this.notePreviewKeys(ordered.map((row) => row.id)),
-    ]);
     // 榜单用聊天卡片的样子展示：每条带前几张图的现签地址（同聊天卡片的四宫格）。
-    // presignNoteMedia 只拿 url 做去重键，这里直接用对象 key。
-    const keys = [...previewKeys.values()].flat();
-    const signed = await this.presignNoteMedia(
-      keys.map((objectKey) => ({ url: objectKey, objectKey })),
-    );
+    const [items, previewUrls] = await Promise.all([
+      this.mapSummaryListResolved(ordered, viewerID),
+      this.notePreviewUrls(ordered.map((row) => row.id)),
+    ]);
     return {
       month,
       city,
       items: items.map((item) => ({
         ...item,
-        previewUrls: (previewKeys.get(item.id) ?? []).flatMap(
-          (key) => signed.get(key) ?? [],
-        ),
+        previewUrls: previewUrls.get(item.id) ?? [],
       })),
     };
+  }
+
+  /**
+   * 圈子动态附带的笔记卡片（PlazaPostDto.noteCard）：与榜单同一套摘要投影
+   * （mapSummaryListResolved，访客视角，封面现签）+ 聊天卡片同款的四宫格预览图。
+   * 一页动态调一次，查询条数与动态条数无关。
+   * - 查不到的 id（已被永久删除）不在结果里，调用方给 null；
+   * - 他人读不到的笔记（已删除；不可见 available=false；收藏副本看收录链根此刻的状态，
+   *   同 requireDistributableForViewer）只给标题与状态：删除报 DELETED，不可见报 UNLISTED
+   *   （同 getSourceStates，不当存在性探针）；正文预览、计数、场地状态都不给，媒体不签；
+   * - 下架（UNLISTED）照常可读，报真实状态。
+   */
+  async projectPlazaNoteCards(
+    noteIds: readonly string[],
+  ): Promise<Map<string, PlazaPostNoteCardDto>> {
+    const ids = [...new Set(noteIds)];
+    const result = new Map<string, PlazaPostNoteCardDto>();
+    if (ids.length === 0) return result;
+    const rows = await this.prisma.note.findMany({
+      where: { id: { in: ids } },
+      select: NOTE_SUMMARY_SELECT,
+    });
+    if (rows.length === 0) return result;
+    // 收藏副本的覆盖层换成根的 status / available，会盖住副本自己这一行的 DELETED，
+    // 所以副本自己删了要单独判。
+    const effective = new Map(
+      (await this.overlayCollectedSourceState(rows)).map((note) => [
+        note.id,
+        note,
+      ]),
+    );
+    const readable: typeof rows = [];
+    for (const row of rows) {
+      const state = effective.get(row.id) ?? row;
+      const deleted = row.status === 'DELETED' || state.status === 'DELETED';
+      if (!deleted && row.available && state.available) {
+        readable.push(row);
+        continue;
+      }
+      result.set(row.id, {
+        noteId: row.id,
+        ownerId: row.ownerID,
+        title: row.title,
+        contentPreview: null,
+        coverUrl: null,
+        previewUrls: [],
+        imageCount: 0,
+        videoCount: 0,
+        showcaseCount: 0,
+        hasText: false,
+        hasLocation: false,
+        workStatus: null,
+        publicationStatus: deleted ? 'DELETED' : 'UNLISTED',
+      });
+    }
+    // 空字符串不会是任何笔记的主人：按访客视角生成摘要。
+    const [summaries, previewUrls] = await Promise.all([
+      this.mapSummaryListResolved(readable, ''),
+      this.notePreviewUrls(readable.map((row) => row.id)),
+    ]);
+    for (const summary of summaries) {
+      result.set(summary.id, {
+        noteId: summary.id,
+        ownerId: summary.ownerId,
+        title: summary.title,
+        contentPreview: summary.contentPreview,
+        coverUrl: summary.cover?.url ?? null,
+        previewUrls: previewUrls.get(summary.id) ?? [],
+        imageCount: summary.imageCount,
+        videoCount: summary.videoCount,
+        showcaseCount: summary.showcaseCount,
+        hasText: summary.hasText,
+        hasLocation: summary.hasLocation,
+        workStatus:
+          summary.workStatus === 'WORKING' || summary.workStatus === 'CLOSED'
+            ? summary.workStatus
+            : 'UNSET',
+        publicationStatus: summary.status,
+      });
+    }
+    return result;
   }
 
   /** 助手提醒附带名片用:只读收藏者自己、未删除的那份;没有就返回 null。 */
@@ -4828,6 +4903,26 @@ export class NoteService implements NoteCardProjector {
       previewKeys.set(item.noteID, keys);
     }
     return previewKeys;
+  }
+
+  /** notePreviewKeys 签好的地址（榜单、圈子动态的笔记卡片用;聊天卡片在读聊天记录时另签）。 */
+  private async notePreviewUrls(
+    noteIds: string[],
+  ): Promise<Map<string, string[]>> {
+    if (noteIds.length === 0) return new Map();
+    const previewKeys = await this.notePreviewKeys(noteIds);
+    // presignNoteMedia 只拿 url 做去重键，这里直接用对象 key。
+    const signed = await this.presignNoteMedia(
+      [...previewKeys.values()]
+        .flat()
+        .map((objectKey) => ({ url: objectKey, objectKey })),
+    );
+    return new Map(
+      [...previewKeys].map(([noteId, keys]) => [
+        noteId,
+        keys.flatMap((key) => signed.get(key) ?? []),
+      ]),
+    );
   }
 
   /**

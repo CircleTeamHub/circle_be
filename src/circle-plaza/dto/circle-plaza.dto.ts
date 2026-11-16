@@ -24,6 +24,7 @@ import {
 } from 'src/user/dto/public-user.dto';
 import { MAX_PAGE } from 'src/common/pagination';
 import { ImageMediaVariantDto } from 'src/media/image-media.dto';
+import { PlazaPostNoteCardDto } from 'src/note/dto/note.dto';
 
 // ── Request DTOs ─────────────────────────────────────────────────────────────
 
@@ -388,6 +389,14 @@ export class PlazaPostDto {
   cities: string[];
   isHorn: boolean;
   noteId: string | null;
+
+  @ApiProperty({
+    type: PlazaPostNoteCardDto,
+    nullable: true,
+    description:
+      '附带的笔记卡片（访客视角）；没带笔记或笔记已被永久删除时为 null。他人读不到的（已删除 / 不可见）只给标题与 publicationStatus',
+  })
+  noteCard: PlazaPostNoteCardDto | null;
   restrictions: {
     vipLevel: number | null;
     creditScore: number | null;

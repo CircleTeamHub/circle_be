@@ -1453,7 +1453,22 @@ Authorization: Bearer <accessToken>
   "city": "上海",
   "cities": ["上海"],
   "isHorn": false,
-  "noteId": null,
+  "noteId": "uuid",
+  "noteCard": {                   // 附带笔记的卡片；没带笔记或笔记已被永久删除时为 null
+    "noteId": "uuid",
+    "ownerId": "uuid",
+    "title": "老王烧烤",
+    "contentPreview": "人均 80，营业到凌晨两点",
+    "coverUrl": "https://...signed",
+    "previewUrls": ["https://...signed"],   // 前几张图（最多 4 张），同聊天笔记卡片
+    "imageCount": 3,
+    "videoCount": 1,              // 同笔记摘要，含验证视频
+    "showcaseCount": 0,
+    "hasText": true,
+    "hasLocation": true,
+    "workStatus": "WORKING",      // WORKING | CLOSED | UNSET；他人读不到的笔记为 null
+    "publicationStatus": "ACTIVE" // ACTIVE | UNLISTED | DELETED
+  },
   "restrictions": { "vipLevel": null, "creditScore": null, "fancyNumber": false },   // 互动门槛
   "signupCount": 3,
   "signedByMe": false,
@@ -1477,6 +1492,8 @@ Authorization: Bearer <accessToken>
   "expiresAt": "2026-09-01T06:00:00.000Z"
 }
 ```
+
+- `noteCard`：feed / feed/search / 发帖 / 帖子详情 / 我的帖子详情都带，访客视角（同聊天笔记卡片：主人的备注、名片不带）。笔记下架照常显示，`publicationStatus` 为 `UNLISTED`；他人读不到的笔记（已删除进回收站、主人设成不可见、收藏副本的原笔记已删除）只给 `noteId`、`ownerId`、`title` 与 `publicationStatus`（删除为 `DELETED`，不可见为 `UNLISTED`），其余为空值、`previewUrls` 为 `[]`，封面与图片不签名。
 
 `MyCirclePost`：`{ id, circleId, excerpt, firstImage, signupCount, unreadSignupCount, status, createdAt, expiresAt }`。
 `PostSignupItem`：`{ userId, nickname, avatarUrl, accountId, signedAt, seen, displayIcons, recognized }`。
@@ -1508,7 +1525,7 @@ Authorization: Bearer <accessToken>
 | `tags` | 否 | ≤ 5，去重，每项 ≤ 30 字 |
 | `circleIds` | 是（或旧字段 `circleId`） | UUID 数组 ≤ 50，去重，至少 1 个；第一个为主圈子 |
 | `cities` | 否（或旧字段 `city`） | ≤ 50，去重，每项 ≤ 100 字 |
-| `noteId` | 否 | UUID，关联笔记（无效时 `PLAZA_NOTE_INVALID`） |
+| `noteId` | 否 | UUID，关联笔记：只能是自己上架（`ACTIVE`）且可见的笔记；下架、已删除、别人的笔记都返回 400 `PLAZA_NOTE_INVALID` |
 | `isHorn` | 否 | 布尔，默认 `false` |
 | `expiresInHours` | 否 | 6–168，默认 6 |
 | `vipRestriction` / `signupVipRestriction` | 否 | 0–4，互动 / 报名的会员门槛 |

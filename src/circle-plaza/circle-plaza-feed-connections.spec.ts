@@ -2,6 +2,7 @@ import { ConfigService } from '@nestjs/config';
 import { AvatarFrameService } from 'src/avatar-frame/avatar-frame.service';
 import { IconService } from 'src/icon/icon.service';
 import { MembershipPolicyService } from 'src/membership/membership-policy.service';
+import { NoteService } from 'src/note/note.service';
 import { NotificationService } from 'src/notification/notification.service';
 import { PrismaService } from 'src/prisma/prisma.service';
 import { RealtimeService } from 'src/realtime/realtime.service';
@@ -48,6 +49,9 @@ describe('CirclePlazaService feed connection usage', () => {
     {
       resolvePublicAppearances: jest.fn().mockResolvedValue(new Map()),
     } as unknown as AvatarFrameService,
+    {
+      projectPlazaNoteCards: jest.fn().mockResolvedValue(new Map()),
+    } as unknown as NoteService,
   );
 
   beforeEach(() => {
