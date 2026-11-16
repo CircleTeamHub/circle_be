@@ -75,7 +75,17 @@ export class NotificationPushOutboxProcessor {
       await this.loadCircleOfflinePushPreferences(jobs);
     // 收件人正开着 App 的设备:通知已经实时送到(站内横幅 + 红点),不再弹系统推送。
     // 同样是投递时刻的值。
-    const foregroundTokensByUser = await this.loadForegroundPushTokens(jobs);
+    // 读在线状态出错时谁都不排除:宁可重复推送,也不能让整轮推送停摆。
+    const foregroundTokensByUser = await this.loadForegroundPushTokens(
+      jobs,
+    ).catch((error: unknown): ReadonlyMap<string, ReadonlySet<string>> => {
+      reportOperationalError(error, {
+        component: 'NotificationPushOutboxProcessor',
+        operation: 'loadForegroundPushTokens',
+        kind: 'presence',
+      });
+      return new Map();
+    });
     // 只有还没有 payload 快照、又确实要发的任务才组装文案；关系整批一次按外键补。
     const pushSources = await this.loadPushSourcesToCompose(
       jobs,
@@ -235,11 +245,16 @@ export class NotificationPushOutboxProcessor {
               },
             );
           }
+          // 全部设备都正开着 App 而没推:记下原因,推送「莫名丢了」时查得到。
           await this.finishJob(
             job.id,
             leaseToken,
             finalStatus,
-            tokens.length === 0 ? 'NO_ACTIVE_DEVICE' : null,
+            tokens.length === 0
+              ? 'NO_ACTIVE_DEVICE'
+              : foreground.length > 0
+                ? 'DEVICE_IN_FOREGROUND'
+                : null,
           );
           processed += 1;
           continue;
@@ -458,7 +473,11 @@ export class NotificationPushOutboxProcessor {
     jobId: string,
     leaseToken: string,
     status: 'COMPLETED' | 'TERMINAL',
-    completionReason: 'CIRCLE_PUSH_DISABLED' | 'NO_ACTIVE_DEVICE' | null = null,
+    completionReason:
+      | 'CIRCLE_PUSH_DISABLED'
+      | 'NO_ACTIVE_DEVICE'
+      | 'DEVICE_IN_FOREGROUND'
+      | null = null,
   ): Promise<void> {
     await this.prisma.notificationPushOutbox.updateMany({
       where: { id: jobId, leaseToken, status: 'PROCESSING' },
