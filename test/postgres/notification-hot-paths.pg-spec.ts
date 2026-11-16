@@ -4,6 +4,7 @@ import { NotificationType } from 'src/generated/prisma';
 import {
   CIRCLE_NOTIFICATION_TYPES,
   DISCOVER_NOTIFICATION_TYPES,
+  GROUP_NOTICE_NOTIFICATION_TYPES,
   MOMENT_NOTIFICATION_TYPES,
   PROFILE_NOTIFICATION_TYPES,
 } from 'src/notification/notification.constants';
@@ -154,11 +155,12 @@ describePostgres('notification hot paths (PostgreSQL)', () => {
       INSERT INTO "Friend" SELECT 'fr' || g FROM generate_series(1, 50) g;
       INSERT INTO "GroupAdmission" SELECT 'ga' || g, 'conv' || (g % 10) FROM generate_series(1, 50) g;
 
-      -- big:四万条,SYSTEM 每 4000 条才一条;另有一百个普通用户分走一半的行。
+      -- big:四万条,SYSTEM 与群聊知会各每 4000 条才一条;另有一百个普通用户分走一半的行。
       INSERT INTO "Notification" (id, type, "toUserID", "fromUserID", "createdAt", deleted, read,
                                   "fromFriendRequestID", "fromGroupAdmissionID")
       SELECT 'n' || lpad(g::text, 6, '0'),
              (CASE WHEN g % 4000 = 0 THEN 'SYSTEM'
+                   WHEN g % 4000 = 2 THEN 'GROUP_MEMBER_REMOVED'
                    ELSE (${BIG_TYPE_ARRAY})[1 + g % ${BIG_TYPE_CYCLE.length}] END)::"NotificationType",
              CASE WHEN g % 2 = 0 THEN 'big' ELSE 'u' || (g % 100) END,
              'sender',
@@ -301,6 +303,7 @@ describePostgres('notification hot paths (PostgreSQL)', () => {
         momentsUnread: await oldCount(MOMENT_NOTIFICATION_TYPES),
         circleUnread: await oldCount(CIRCLE_NOTIFICATION_TYPES),
         profileUnread: await oldCount(PROFILE_NOTIFICATION_TYPES),
+        groupNoticeUnread: await oldCount(GROUP_NOTICE_NOTIFICATION_TYPES),
       });
     }
   });
