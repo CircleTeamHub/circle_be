@@ -307,6 +307,7 @@
     {"file":"src/notification/notification.controller.ts","controller":"Controller('notification')","method":"registerPushToken","route":"Put('push-token')"},
     {"file":"src/notification/notification.controller.ts","controller":"Controller('notification')","method":"deletePushToken","route":"Delete('push-token')"},
     {"file":"src/notification/notification.controller.ts","controller":"Controller('notification')","method":"openOwnership","route":"Get(':id/open-ownership')"},
+    {"file":"src/notification/notification.controller.ts","controller":"Controller('notification')","method":"readTraceLikes","route":"Put('trace-likes/:traceId/read')"},
     {"file":"src/notification/notification.controller.ts","controller":"Controller('notification')","method":"read","route":"Put(':id/read')"},
     {"file":"src/notification/notification.controller.ts","controller":"Controller('notification')","method":"remove","route":"Delete(':id')"},
     {"file":"src/notification/notification.controller.ts","controller":"Controller('notification')","method":"markProfileRead","route":"Post('profile/read-all')"},

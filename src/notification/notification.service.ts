@@ -21,6 +21,7 @@ import { RedisService } from 'src/redis/redis.service';
 import {
   DISCOVER_NOTIFICATION_TYPES,
   GROUP_NOTICE_NOTIFICATION_TYPES,
+  isInAppOnlyNotification,
   notificationTypesForDomain,
   PROFILE_NOTIFICATION_TYPES,
   type NotificationDomain,
@@ -1294,9 +1295,11 @@ export class NotificationService {
         },
         select: NOTIFICATION_REALTIME_BASE_SELECT,
       });
-      await tx.notificationPushOutbox.create({
-        data: { notificationID: created.id },
-      });
+      if (!isInAppOnlyNotification(notificationData.type)) {
+        await tx.notificationPushOutbox.create({
+          data: { notificationID: created.id },
+        });
+      }
       return created;
     });
     if (!notification) return null;
@@ -1604,6 +1607,27 @@ export class NotificationService {
     if (result.count > 0) {
       await this.broadcastUnreadForType(userId, notification.type);
     }
+  }
+
+  /** 某条动态收到的点赞通知一起标已读（列表里它们合并成一行）。 */
+  async markTraceLikesRead(
+    userId: string,
+    traceId: string,
+  ): Promise<{ count: number }> {
+    const result = await this.prisma.notification.updateMany({
+      where: {
+        toUserID: userId,
+        type: NotificationType.TRACE_LIKE,
+        fromTraceID: traceId,
+        read: false,
+        deleted: false,
+      },
+      data: { read: true },
+    });
+    if (result.count > 0) {
+      await this.realtimeService.broadcastInteractionUnread(userId);
+    }
+    return { count: result.count };
   }
 
   // domain 收窄「全部已读」的作用范围：朋友圈铃铛的「全部已读」不该顺手把

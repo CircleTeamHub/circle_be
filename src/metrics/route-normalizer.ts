@@ -369,6 +369,7 @@ export const DYNAMIC_ROUTE_TEMPLATES = [
   '/api/v1/notification/:id',
   '/api/v1/notification/:id/open-ownership',
   '/api/v1/notification/:id/read',
+  '/api/v1/notification/trace-likes/:traceId/read',
   '/api/v1/qr/tokens/:token',
   '/api/v1/qr/tokens/:token/join',
   '/api/v1/qr/tokens/:token/accept',

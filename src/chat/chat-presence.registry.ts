@@ -268,8 +268,19 @@ export class ChatPresenceRegistry implements OnModuleInit, OnModuleDestroy {
   ): Promise<Map<string, Set<string>> | null> {
     const online = await this.getOnlineUserIds(conversationId);
     if (online === null) return null;
+    return this.getForegroundPushTokensForUsers(online);
+  }
+
+  /**
+   * 同上,但按给定的人查(不经会话在线集合)。通知推送用:收件人不在某个会话房里,
+   * 只要他的手机正开着 App,这条通知已经实时送到 —— 不该再弹系统推送。
+   */
+  async getForegroundPushTokensForUsers(
+    userIds: readonly string[],
+  ): Promise<Map<string, Set<string>> | null> {
+    if (!this.redis.isEnabled()) return null;
     const perUser = await Promise.all(
-      online.map(async (userId) => {
+      [...new Set(userIds)].map(async (userId) => {
         const [leases, background] = await Promise.all([
           this.redis.getLiveSetMembers(connKey(userId)),
           this.redis.getLiveSetMembers(backgroundKey(userId)),

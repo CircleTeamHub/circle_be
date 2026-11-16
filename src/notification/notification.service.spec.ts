@@ -1454,6 +1454,31 @@ describe('NotificationService', () => {
           fromTrace: { id: 'trace-1', excerpt: 'trace body', firstImage: null },
         }),
       );
+      // 点赞只在站内：不写推送 outbox（厂商把它归资讯营销类，每天只放行 2~5 条）。
+      expect(prisma.notificationPushOutbox.create).not.toHaveBeenCalled();
+    });
+
+    it('keeps profile likes in-app only as well', async () => {
+      prisma.notification.findFirst.mockResolvedValue(null);
+      prisma.notification.create.mockResolvedValue(
+        baseRow({
+          id: 'profile-like-n1',
+          type: NotificationType.PROFILE_LIKE,
+          toUserID: 'owner-1',
+          fromUserID: 'viewer-1',
+        }),
+      );
+      prisma.user.findMany.mockResolvedValue([
+        { id: 'viewer-1', nickname: 'V', avatarUrl: null },
+      ]);
+
+      await service.createProfileLikeNotification({
+        actorId: 'viewer-1',
+        toUserId: 'owner-1',
+      });
+
+      expect(prisma.notification.create).toHaveBeenCalled();
+      expect(prisma.notificationPushOutbox.create).not.toHaveBeenCalled();
     });
 
     it('fails the notification transaction when durable push enqueue fails', async () => {
@@ -1573,6 +1598,34 @@ describe('NotificationService', () => {
       expect(
         realtimeService.broadcastSystemNotificationUnread,
       ).not.toHaveBeenCalled();
+    });
+
+    it('marks every unread like on one moment read in one statement', async () => {
+      prisma.notification.updateMany.mockResolvedValue({ count: 3 });
+
+      await expect(
+        service.markTraceLikesRead('user-1', 'trace-1'),
+      ).resolves.toEqual({ count: 3 });
+
+      expect(prisma.notification.updateMany).toHaveBeenCalledWith({
+        where: {
+          toUserID: 'user-1',
+          type: NotificationType.TRACE_LIKE,
+          fromTraceID: 'trace-1',
+          read: false,
+          deleted: false,
+        },
+        data: { read: true },
+      });
+      expect(realtimeService.broadcastInteractionUnread).toHaveBeenCalledWith(
+        'user-1',
+      );
+    });
+
+    it('does not broadcast when no like on the moment was unread', async () => {
+      prisma.notification.updateMany.mockResolvedValue({ count: 0 });
+      await service.markTraceLikesRead('user-1', 'trace-1');
+      expect(realtimeService.broadcastInteractionUnread).not.toHaveBeenCalled();
     });
 
     it('markNotificationRead skips broadcasting when the row is missing', async () => {

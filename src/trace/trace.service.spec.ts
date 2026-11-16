@@ -1530,6 +1530,21 @@ describe('TraceService', () => {
     });
   });
 
+  it('leaves the viewer out of the new-moments count when asked for friends only', async () => {
+    stubFriendScope('friend-1');
+    prisma.trace.count.mockResolvedValue(1);
+
+    await service.getNewCount('viewer-1', '2026-06-01T00:00:00.000Z', {
+      friendsOnly: true,
+    });
+
+    expect(prisma.trace.count).toHaveBeenCalledWith(
+      expect.objectContaining({
+        where: expect.objectContaining({ fromID: { in: ['friend-1'] } }),
+      }),
+    );
+  });
+
   it('resolves feed author appearances in one deduped batch', async () => {
     stubFriendScope('friend-1');
     stubFeedTraces([
