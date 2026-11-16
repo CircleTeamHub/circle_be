@@ -8,9 +8,9 @@ in `src/note-rating/`; limits are in `note-rating.constants.ts`.
 
 A rating is an event row in `NoteRating`, always recorded on the **root of the
 collect chain** (`Note.rootSourceNoteID ?? Note.id`). A collected copy, or a copy of
-a copy, shows its root's counters. `NoteRating.noteID` has no foreign key: deleted
-notes (and notes 下架 for 60 days) are hard-deleted by `NoteCleanup`
-(`note-purge.ts`); ratings, cases and credit events stay for audit. `ownerID` is the
+a copy, shows its root's counters. `NoteRating.noteID` has no foreign key: notes go
+to the recycle bin (`status = DELETED`) and are hard-deleted 30 days later (notes
+下架 for 60 days are hard-deleted directly) by `NoteCleanup` (`note-purge.ts`); ratings, cases and credit events stay for audit. `ownerID` is the
 root's owner, denormalised for burst detection and a later collusion check.
 
 ## Who can rate

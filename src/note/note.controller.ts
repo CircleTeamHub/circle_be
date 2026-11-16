@@ -47,6 +47,7 @@ import {
   ListNotesQueryDto,
   ListNoteDraftsQueryDto,
   NoteChatMediaImportDto,
+  RecycleBinQueryDto,
   NoteDetailDto,
   NoteDraftDto,
   NoteDraftSummaryDto,
@@ -70,7 +71,7 @@ import {
 import { NoteService } from './note.service';
 
 /**
- * GET /note 的截断信号。app 依赖响应体是数组，「后面还有」
+ * GET /note 与 GET /note/recycle-bin 的截断信号。app 依赖响应体是数组，「后面还有」
  * 只能走响应头而不能把响应体改成 { items, hasMore }。
  */
 const HAS_MORE_HEADER = 'X-Has-More';
@@ -299,12 +300,55 @@ export class NoteController {
     return this.noteService.getNoteRanking(req.user.userId, query);
   }
 
+  // 必须先于 @Get(':id') / @Patch(':id') 声明（同 share-links 的顺序注释）。
+  @Get('recycle-bin')
+  @ApiOperation({
+    summary: 'List soft-deleted notes (FE#92 recycle bin)',
+    description: HAS_MORE_DESCRIPTION,
+  })
+  @ApiOkResponse({
+    type: [NoteSummaryDto],
+    headers: HAS_MORE_RESPONSE_HEADERS,
+  })
+  async listDeleted(
+    @Query() query: RecycleBinQueryDto,
+    @Req() req: RequestWithUser,
+    @Res({ passthrough: true }) res: Response,
+  ): Promise<NoteSummaryDto[]> {
+    const page = await this.noteService.listDeletedNotes(
+      req.user.userId,
+      query.page,
+      query.limit,
+    );
+    res.setHeader(HAS_MORE_HEADER, String(page.hasMore));
+    return page.items;
+  }
+
+  @Post(':id/restore')
+  @ApiOperation({ summary: 'Restore a soft-deleted note to ACTIVE' })
+  restore(@Param('id', ParseUUIDPipe) id: string, @Req() req: RequestWithUser) {
+    return this.noteService.restoreNote(req.user.userId, id);
+  }
+
+  @Delete(':id/permanent')
+  @HttpCode(HttpStatus.NO_CONTENT)
+  @ApiOperation({
+    summary: 'Permanently delete a note that is already in the recycle bin',
+  })
+  @ApiNoContentResponse()
+  purge(
+    @Param('id', ParseUUIDPipe) id: string,
+    @Req() req: RequestWithUser,
+  ): Promise<void> {
+    return this.noteService.purgeNote(req.user.userId, id);
+  }
+
   @Delete(':id')
   @HttpCode(HttpStatus.NO_CONTENT)
   @ApiOperation({
-    summary: 'Delete note permanently',
+    summary: 'Soft delete note',
     description:
-      'Not restorable. The note disappears for everyone at once; its rows are purged by the note cleanup job within minutes.',
+      'Moves the note to the recycle bin (status DELETED): it disappears for everyone else at once, the owner can restore it from GET /note/recycle-bin, and the note cleanup job purges it 30 days after deletion.',
   })
   @ApiNoContentResponse()
   deleteNote(

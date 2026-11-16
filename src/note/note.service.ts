@@ -22,6 +22,7 @@ import PDFDocument from 'pdfkit';
 import { Prisma } from 'src/generated/prisma';
 import { PrismaService } from 'src/prisma/prisma.service';
 import { MembershipPolicyService } from 'src/membership/membership-policy.service';
+import { purgeDeletedNote } from './note-purge';
 import {
   NOTE_MEDIA_TYPE_LIMITS,
   countNoteMediaByType,
@@ -401,6 +402,9 @@ type CollectedStateFields = Pick<
 
 /** 下架满这么久（绝对时长，不按上海日历）由 NoteCleanup 永久删除。 */
 export const NOTE_UNLISTED_RETENTION_MS = 60 * 24 * 60 * 60 * 1000;
+
+/** 删进回收站（DELETED）满这么久（绝对时长）由 NoteCleanup 永久删除；期间主人可恢复。 */
+export const NOTE_RECYCLE_BIN_RETENTION_MS = 30 * 24 * 60 * 60 * 1000;
 
 /**
  * 写入状态时的 unlistedAt：进入下架才起算 60 天；已经在下架的再设一遍（含编辑时
@@ -2823,7 +2827,7 @@ export class NoteService implements NoteCardProjector {
       rows.forEach((row) => states.set(row.id, row));
     }
 
-    // 收录链上的笔记被永久删除（主人删除 / 下架满 60 天，由 NoteCleanup 删行）后整行消失，
+    // 收录链上的笔记被永久删除（回收站「立即删除」/ 30 天到期 / 下架满 60 天）后整行消失，
     // 但 collectedFromNoteID 是普通列、仍指着它。查过却查不到的来源只能是被硬删了，
     // 按 DELETED 处理：不能因为「找不到父级」就退回副本自己的 ACTIVE 状态，
     // 让第三方在原笔记删除后还能读、分享、导出、再收藏副本。
@@ -5904,10 +5908,118 @@ export class NoteService implements NoteCardProjector {
     });
   }
 
+  /** FE#92 回收站：已软删笔记列表（新删在前）。 */
+  async listDeletedNotes(
+    ownerID: string,
+    page = 1,
+    limit = NOTE_LIST_DEFAULT_LIMIT,
+  ): Promise<NoteSummaryPage> {
+    const take = Math.min(limit, NOTE_LIST_DEFAULT_LIMIT);
+    const notes = await this.prisma.note.findMany({
+      where: { ownerID, status: 'DELETED' },
+      orderBy: { updatedAt: 'desc' },
+      // 多取一行只为判断 hasMore，不返回给调用方。
+      take: take + 1,
+      skip: (page - 1) * take,
+      select: NOTE_SUMMARY_SELECT,
+    });
+    return this.toSummaryPage(notes, take, ownerID);
+  }
+
   /**
-   * 删除即永久（2026-11 起没有回收站）：先标成 DELETED —— 所有读路径都排除它，
-   * 对所有人立刻消失，并广播给收藏者与聊天卡片 —— 行与媒体行由 NoteCleanup
-   * 几分钟内物理删除（purgeDeletedNote，收录链改指向在那里做）。
+   * FE#92 回收站：恢复软删笔记 → ACTIVE。deleteNote 未记录删除前状态
+   * （UNLISTED/ACTIVE 无从区分），统一回 ACTIVE —— 用户在列表里可再手动下架。
+   * 回到上架即清掉 unlistedAt（同 setStatus ACTIVE），下架的 60 天不带过来。
+   */
+  async restoreNote(ownerID: string, noteId: string): Promise<void> {
+    // round 3 review：收藏复制的笔记受「同源活跃副本唯一」局部索引约束 ——
+    // 删除旧副本→再次收藏→恢复旧副本会撞唯一索引，裂成一个裸 DB 冲突。
+    // 先查同源活跃副本，命中给可控 409。
+    const target = await this.prisma.note.findFirst({
+      where: { id: noteId, ownerID, status: 'DELETED' },
+      select: {
+        id: true,
+        collectedFromNoteID: true,
+        rootSourceNoteID: true,
+      },
+    });
+    if (!target) {
+      throw new NotFoundException({
+        message: 'Note not found',
+        errorCode: NoteErrorCode.NotFound,
+      });
+    }
+    if (target.collectedFromNoteID) {
+      const activeDuplicate = await this.prisma.note.findFirst({
+        where: {
+          ownerID,
+          collectedFromNoteID: target.collectedFromNoteID,
+          status: { not: 'DELETED' },
+          id: { not: noteId },
+        },
+        select: { id: true },
+      });
+      if (activeDuplicate) {
+        throw new ConflictException({
+          message: '该笔记的另一份收藏副本已存在，无需恢复',
+          errorCode: NoteErrorCode.AlreadyCollected,
+        });
+      }
+    }
+    let result: { count: number };
+    try {
+      result = await runSerializableTransaction(this.prisma, async (tx) => {
+        await this.membershipPolicy.lockUsers(tx, [ownerID]);
+        // Restoring a soft-deleted note re-consumes a storage slot, so it must
+        // pass the same quota gate as create/collect under the user lock —
+        // otherwise delete → create replacements → restore old ones grows past
+        // the cap, and concurrent restores could cross the boundary together.
+        await this.assertNoteStorageAvailable(tx, ownerID);
+        const restored = await tx.note.updateMany({
+          where: { id: noteId, ownerID, status: 'DELETED' },
+          data: { status: 'ACTIVE', unlistedAt: null },
+        });
+        if (restored.count > 0) {
+          await this.enqueueSourceStatusFanout(tx, this.noteRootID(target));
+        }
+        return restored;
+      });
+    } catch (error) {
+      if (prismaErrorCode(error) === 'P2002') {
+        throw new ConflictException({
+          message: '该笔记的另一份收藏副本已存在，无需恢复',
+          errorCode: NoteErrorCode.AlreadyCollected,
+        });
+      }
+      throw error;
+    }
+    if (result.count === 0) {
+      throw new NotFoundException({
+        message: 'Note not found',
+        errorCode: NoteErrorCode.NotFound,
+      });
+    }
+  }
+
+  /**
+   * 回收站「立即删除」：不等 30 天，直接永久删除。与到期清理共用
+   * purgeDeletedNote（收录链改指向、媒体对象保留等语义见那里）。
+   * 只认自己回收站里的笔记（status=DELETED），正常/下架笔记必须先删进回收站。
+   */
+  async purgeNote(ownerID: string, noteId: string): Promise<void> {
+    const removed = await purgeDeletedNote(this.prisma, noteId, { ownerID });
+    if (!removed) {
+      throw new NotFoundException({
+        message: 'Note not found',
+        errorCode: NoteErrorCode.NotFound,
+      });
+    }
+  }
+
+  /**
+   * 软删除进回收站：标成 DELETED —— 除主人的回收站列表外所有读路径都排除它，对他人
+   * 立刻消失，并广播给收藏者与聊天卡片。删除时刻就是 updatedAt（见 NoteCleanup）：
+   * 30 天内可恢复，到期由 NoteCleanup 物理删除（purgeDeletedNote，收录链改指向在那里做）。
    */
   async deleteNote(ownerID: string, noteId: string): Promise<void> {
     const owned = await this.requireOwnedNote(ownerID, noteId);
@@ -5925,9 +6037,9 @@ export class NoteService implements NoteCardProjector {
   }
 
   /**
-   * NoteCleanup 用：下架满 60 天的笔记按主人删除同样处理（标 DELETED + 广播），随后与其它
-   * 已删除笔记一起物理删除。条件写在 UPDATE 里：查出候选之后被重新上架、又被下架
-   * （unlistedAt 变新）的都不动。返回是否标记了。
+   * NoteCleanup 用：下架满 60 天的笔记按主人删除同样处理（标 DELETED + 广播），随后由
+   * NoteCleanup 当场物理删除 —— 不进回收站。条件写在 UPDATE 里：查出候选之后被重新上架、
+   * 又被下架（unlistedAt 变新）的都不动。返回是否标记了。
    */
   async expireUnlistedNote(
     note: { id: string; rootSourceNoteID: string | null },

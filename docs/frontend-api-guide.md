@@ -1077,7 +1077,7 @@ POST /coin/gift
 }
 ```
 
-**status 枚举值：** `ACTIVE`（上架）| `UNLISTED`（下架）| `DELETED`（已删除，等清理任务删行，不会再出现在任何读接口里）
+**status 枚举值：** `ACTIVE`（上架）| `UNLISTED`（下架）| `DELETED`（在回收站：只出现在主人的 `GET /note/recycle-bin` 里，其他读接口一律不返回；删除满 30 天永久删除）
 
 - 下架（`UNLISTED`）只是给读者看的状态：他人照常可读、可收藏、可转发，带着真实 `status`；主人要藏起来用 `available=false`。2026-11 起场地「下架」`workStatus=OFF_SHELF` 已并入这里，不再返回。
 - `unlistedAt`：这次下架的时刻，上架为 `null`；满 60 天（绝对时长）永久删除。
@@ -1135,7 +1135,7 @@ Authorization: Bearer <accessToken>
 - `page` 可选，默认 1（上限 500）
 - `limit` 可选，默认 500，上限 500
 
-**响应头：** `X-Has-More: true|false` —— 本页之后是否还有笔记。响应体始终是数组；为 `true` 时用下一个 `page` 继续拉取。回收站（`GET /note/recycle-bin`、`POST /note/:id/restore`、`DELETE /note/:id/permanent`）2026-11 已取消。
+**响应头：** `X-Has-More: true|false` —— 本页之后是否还有笔记。响应体始终是数组；为 `true` 时用下一个 `page` 继续拉取。`GET /note/recycle-bin`（回收站）同一分页口径与同一响应头。
 
 **Response 200：**
 ```json
@@ -1265,9 +1265,25 @@ DELETE /note/:id
 Authorization: Bearer <accessToken>
 ```
 
-> 永久删除，不可恢复：立刻对所有人消失，行与媒体行由清理任务几分钟内删掉（媒体对象按存储审计流程另行回收）。
+> 软删除，`status` 更新为 `DELETED`：进回收站，立刻对他人消失；30 天内可恢复，删除满 30 天由清理任务永久删除（媒体对象按存储审计流程另行回收）。已在回收站的再删一次是 404 `NOTE_NOT_FOUND`。
 
 **Response 204：** 无内容
+
+---
+
+### 回收站
+
+```
+GET /note/recycle-bin?page=1&limit=500
+POST /note/:id/restore
+DELETE /note/:id/permanent
+Authorization: Bearer <accessToken>
+```
+
+- `GET /note/recycle-bin`：主人自己 `status=DELETED` 的笔记，按删除时间新到旧。**Response 200：** `NoteSummary[]`（同 `GET /note`），分页参数与 `X-Has-More` 响应头同 `GET /note`。
+- `POST /note/:id/restore`：恢复回收站里的笔记，一律回到 `ACTIVE`（`unlistedAt` 为 `null`，删除前是下架的也一样）。**Response 201：** 无内容。不在自己回收站里 → 404 `NOTE_NOT_FOUND`；已经另有一份同源的收藏副本 → 409 `NOTE_RESTORE_DUPLICATE`；笔记数已到上限 → 403 `NOTE_STORAGE_QUOTA_REACHED`。
+- `DELETE /note/:id/permanent`：立即永久删除回收站里的笔记，不再等 30 天。**Response 204：** 无内容。不在自己回收站里（含上架 / 下架的笔记）→ 404 `NOTE_NOT_FOUND`。
+- 下架满 60 天的笔记直接永久删除，不进回收站。
 
 ---
 
