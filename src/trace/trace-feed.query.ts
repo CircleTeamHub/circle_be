@@ -29,6 +29,7 @@ import type { FeedCursor } from 'src/utils/feed-cursor';
 export type TraceFeedPageScan = {
   viewerId: string;
   authorIds: readonly string[];
+  snapshotAt: Date;
   cursor: FeedCursor | null;
   /** 页码模式跳过的行数；游标模式恒为 0。 */
   offset: number;
@@ -51,6 +52,7 @@ export function traceFeedPageQuery(scan: TraceFeedPageScan): Prisma.Sql {
       FROM "Trace" AS t
       WHERE t."fromID" = author."id"
         AND t."deleted" = false
+        AND t."createdAt" <= ${scan.snapshotAt}
         AND (t."fromID" = ${scan.viewerId}
              OR t."visibility" IN ('FRIENDS_ONLY', 'PUBLIC'))
         ${keyset}

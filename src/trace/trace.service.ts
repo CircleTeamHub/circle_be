@@ -149,6 +149,7 @@ export class TraceService {
     limit: number;
     hasMore: boolean;
     nextCursor: string | null;
+    snapshotAt: string;
   }> {
     const page = query.page ?? 1;
     const limit = query.limit ?? 20;
@@ -165,6 +166,14 @@ export class TraceService {
       ? normalizeUserIdAlias(query.authorId)
       : undefined;
 
+    // Trace.createdAt uses PostgreSQL now(); use the same clock and bound this
+    // feed to the returned watermark so later inserts are counted as new.
+    const [{ snapshotAt }] = await this.prisma.$queryRaw<
+      Array<{ snapshotAt: Date }>
+    >`
+      SELECT date_trunc('milliseconds', CURRENT_TIMESTAMP AT TIME ZONE 'UTC') AS "snapshotAt"
+    `;
+
     // 单用户相册：authorId 收窄到某个作者。作者必须对 viewer 可见
     // （本人或已接受好友且未被隐私屏蔽），否则返回空——不泄露存在性。
     // 相册只看一个作者，用单点查询判断，不再把 viewer 的全部好友（最多 5000）读出来；
@@ -180,6 +189,7 @@ export class TraceService {
           limit,
           hasMore: false,
           nextCursor: null,
+          snapshotAt: snapshotAt.toISOString(),
         };
       }
     } else {
@@ -197,6 +207,7 @@ export class TraceService {
     const countWhere = {
       deleted: false,
       fromID: authorId ? authorId : { in: visibleUserIds },
+      createdAt: { lte: snapshotAt },
       // PRIVATE is excluded for everyone but the author. PUBLIC isn't creatable
       // via CreateTraceDto (FRIENDS_ONLY | PRIVATE only) but is honored here on
       // purpose, so legacy / other-origin PUBLIC rows still surface — do not
@@ -217,6 +228,7 @@ export class TraceService {
         traceFeedPageQuery({
           viewerId: userId,
           authorIds: authorId ? [authorId] : visibleUserIds,
+          snapshotAt,
           cursor,
           offset: skip,
           take: useKeyset ? limit + 1 : limit,
@@ -285,7 +297,15 @@ export class TraceService {
         `returned=${traces.length} total=${total ?? '-'}`,
     );
 
-    return { items, total, page, limit, hasMore, nextCursor };
+    return {
+      items,
+      total,
+      page,
+      limit,
+      hasMore,
+      nextCursor,
+      snapshotAt: snapshotAt.toISOString(),
+    };
   }
 
   async getNewCount(

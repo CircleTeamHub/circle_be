@@ -566,6 +566,7 @@ describePostgres('trace feed lateral page (PostgreSQL)', () => {
     const newQuery = traceFeedPageQuery({
       viewerId: 'big-0',
       authorIds,
+      snapshotAt: new Date('2027-01-01T00:00:00.000Z'),
       cursor,
       offset: 0,
       take: 21,
