@@ -7,6 +7,7 @@ import { CircleController } from './circle.controller';
 import { CircleService } from './circle.service';
 import { CircleAdmissionPolicy } from './circle-admission-policy';
 import { CircleMemberLockService } from './circle-member-lock';
+import { UploadModule } from 'src/upload/upload.module';
 
 @Module({
   imports: [
@@ -14,6 +15,7 @@ import { CircleMemberLockService } from './circle-member-lock';
     CircleInvitationModule,
     MembershipPolicyModule,
     ChatModule,
+    UploadModule,
   ],
   controllers: [CircleController],
   providers: [CircleService, CircleAdmissionPolicy, CircleMemberLockService],

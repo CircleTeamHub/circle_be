@@ -18,6 +18,7 @@ import { NoteService } from 'src/note/note.service';
 import { plainToInstance } from 'class-transformer';
 import { validate } from 'class-validator';
 import { CreatePlazaPostDto } from './dto/circle-plaza.dto';
+import { UploadIntentService } from 'src/upload/upload-intent.service';
 
 describe('CirclePlazaService', () => {
   let service: CirclePlazaService;
@@ -113,6 +114,9 @@ describe('CirclePlazaService', () => {
   const notes = {
     projectPlazaNoteCards: jest.fn(),
   };
+  const uploadIntent = {
+    claim: jest.fn().mockResolvedValue(undefined),
+  };
 
   beforeEach(async () => {
     jest.clearAllMocks();
@@ -156,6 +160,8 @@ describe('CirclePlazaService', () => {
     prisma.circlePostCircle.findMany.mockResolvedValue([]);
     notes.projectPlazaNoteCards.mockReset();
     notes.projectPlazaNoteCards.mockResolvedValue(new Map());
+    uploadIntent.claim.mockReset();
+    uploadIntent.claim.mockResolvedValue(undefined);
 
     const module: TestingModule = await Test.createTestingModule({
       providers: [
@@ -169,6 +175,7 @@ describe('CirclePlazaService', () => {
         { provide: MembershipProgramService, useValue: membershipProgram },
         { provide: AvatarFrameService, useValue: avatarFrames },
         { provide: NoteService, useValue: notes },
+        { provide: UploadIntentService, useValue: uploadIntent },
       ],
     }).compile();
 
@@ -1167,6 +1174,7 @@ describe('CirclePlazaService', () => {
       new MembershipPolicyService(prisma as any),
       avatarFrames as any,
       notes as any,
+      uploadIntent as any,
     );
     prisma.circleMember.findMany.mockResolvedValue([
       {
@@ -1221,6 +1229,7 @@ describe('CirclePlazaService', () => {
       } as unknown as MembershipPolicyService,
       avatarFrames as unknown as AvatarFrameService,
       notes as unknown as NoteService,
+      uploadIntent as unknown as UploadIntentService,
     );
     const videos = [
       'https://media.example.test/posts/user-1/7f64c3a6-13ea-4dc8-9fa2-a651898d49fe.mp4',
@@ -1263,6 +1272,19 @@ describe('CirclePlazaService', () => {
     };
     const result = await videoService.createPost('user-1', input);
 
+    expect(uploadIntent.claim).toHaveBeenCalledWith(
+      prisma,
+      'user-1',
+      'PLAZA_POST',
+      videos,
+    );
+    expect(prisma.user.findUnique.mock.invocationCallOrder[0]).toBeLessThan(
+      uploadIntent.claim.mock.invocationCallOrder[0],
+    );
+    expect(uploadIntent.claim.mock.invocationCallOrder[0]).toBeLessThan(
+      prisma.circlePost.create.mock.invocationCallOrder[0],
+    );
+
     expect(prisma.circlePost.create).toHaveBeenCalledWith(
       expect.objectContaining({
         data: expect.objectContaining({
@@ -1273,6 +1295,13 @@ describe('CirclePlazaService', () => {
     );
     expect(result).toMatchObject({ images: [], videos });
     expect(result.expiresAt).toBe('2026-07-02T12:00:00.000Z');
+
+    prisma.circlePost.create.mockClear();
+    uploadIntent.claim.mockRejectedValueOnce(new Error('claim failed'));
+    await expect(videoService.createPost('user-1', input)).rejects.toThrow(
+      'claim failed',
+    );
+    expect(prisma.circlePost.create).not.toHaveBeenCalled();
     jest.useRealTimers();
   });
 
@@ -1412,6 +1441,7 @@ describe('CirclePlazaService', () => {
     ).rejects.toMatchObject({
       response: { errorCode: 'PLAZA_MEMBERSHIP_REQUIRED' },
     });
+    expect(uploadIntent.claim).not.toHaveBeenCalled();
     expect(prisma.circlePost.create).not.toHaveBeenCalled();
     expect(realtime.broadcastCirclePlazaUpdated).not.toHaveBeenCalled();
   });

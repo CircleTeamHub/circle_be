@@ -5,6 +5,7 @@ import { UserService } from './user.service';
 import { RealtimeModule } from 'src/realtime/realtime.module';
 import { PrivacySettingsModule } from 'src/privacy/privacy-settings.module';
 import { AvatarFrameModule } from 'src/avatar-frame/avatar-frame.module';
+import { UploadModule } from 'src/upload/upload.module';
 
 @Global()
 @Module({
@@ -13,6 +14,7 @@ import { AvatarFrameModule } from 'src/avatar-frame/avatar-frame.module';
     RealtimeModule,
     PrivacySettingsModule,
     AvatarFrameModule,
+    UploadModule,
   ],
   controllers: [UserController],
   providers: [UserService],

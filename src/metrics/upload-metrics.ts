@@ -1,6 +1,15 @@
-import { Counter, Histogram, Registry } from 'prom-client';
+import { Counter, Gauge, Histogram, Registry } from 'prom-client';
 
 export type UploadPresignLimitStore = 'redis' | 'memory' | 'bulkhead';
+export type UploadIntentFolder = 'avatars' | 'posts';
+export type UploadIntentEvent =
+  | 'created'
+  | 'claimed'
+  | 'rescued'
+  | 'due'
+  | 'deleted'
+  | 'delete_failed';
+export type UploadIntentMode = 'request' | 'report' | 'delete';
 
 export interface UploadMetrics {
   readonly registry: Registry;
@@ -9,6 +18,18 @@ export interface UploadMetrics {
     result: 'success' | 'failure',
     durationSeconds: number,
     sizeBytes: number,
+  ): void;
+  recordIntentEvent(
+    folder: UploadIntentFolder,
+    event: UploadIntentEvent,
+    mode: UploadIntentMode,
+    count?: number,
+  ): void;
+  setIntentPending(
+    folder: UploadIntentFolder,
+    mode: Exclude<UploadIntentMode, 'request'>,
+    count: number,
+    bytes: number,
   ): void;
 }
 
@@ -38,6 +59,24 @@ export function createUploadMetrics(): UploadMetrics {
     help: 'Bytes authorized by successful upload presigns.',
     registers: [registry],
   });
+  const intentEvents = new Counter({
+    name: 'upload_intent_events_total',
+    help: 'Upload intent lifecycle events by bounded folder, event and mode.',
+    labelNames: ['folder', 'event', 'mode'],
+    registers: [registry],
+  });
+  const intentPendingCount = new Gauge({
+    name: 'upload_intent_pending_count',
+    help: 'Current pending upload intent count by bounded folder and GC mode.',
+    labelNames: ['folder', 'mode'],
+    registers: [registry],
+  });
+  const intentPendingBytes = new Gauge({
+    name: 'upload_intent_pending_bytes',
+    help: 'Current pending upload intent bytes by bounded folder and GC mode.',
+    labelNames: ['folder', 'mode'],
+    registers: [registry],
+  });
 
   return {
     registry,
@@ -48,6 +87,13 @@ export function createUploadMetrics(): UploadMetrics {
       presignRequests.inc({ result });
       presignDuration.observe({ result }, durationSeconds);
       if (result === 'success') issuedBytes.inc(sizeBytes);
+    },
+    recordIntentEvent(folder, event, mode, count = 1) {
+      intentEvents.inc({ folder, event, mode }, count);
+    },
+    setIntentPending(folder, mode, count, bytes) {
+      intentPendingCount.set({ folder, mode }, count);
+      intentPendingBytes.set({ folder, mode }, bytes);
     },
   };
 }

@@ -299,6 +299,7 @@ describePostgres('trace feed lateral page (PostgreSQL)', () => {
       {} as never,
       privacy as never,
       { resolvePublicAppearances: () => Promise.resolve(new Map()) } as never,
+      { claim: async () => undefined } as never,
     );
 
     // ── 小数据集：对照用 ──────────────────────────────────────────────────

@@ -5,7 +5,9 @@ import {
   CHAT_MEDIA_KEY_FIELDS,
   CHAT_MEDIA_KEY_PREFIX,
 } from 'src/chat/chat.constants';
+import { jobMetrics } from 'src/metrics/job-metrics';
 import { StorageAuditService } from './storage-audit.service';
+import { UploadIntentService } from './upload-intent.service';
 import {
   REGULAR_CHAT_MEDIA_KEY_PREFIX,
   chatBurnArchiveIrregularRowsQuery,
@@ -147,18 +149,167 @@ describe('StorageAuditService', () => {
       objects: options.objects?.[prefix] ?? [],
     }));
     const objectKeyFromPublicUrl = jest.fn(() => null);
+    const deleteObjectByKey = jest.fn().mockResolvedValue(undefined);
+    const uploadIntent = {
+      reclaim: jest.fn().mockResolvedValue(undefined),
+    };
     const service = new StorageAuditService(
       prisma as never,
       {
         listObjects,
         objectKeyFromPublicUrl,
+        deleteObjectByKey,
       } as never,
+      uploadIntent as unknown as UploadIntentService,
     );
-    return { service, listObjects, prisma };
+    return {
+      service,
+      listObjects,
+      deleteObjectByKey,
+      prisma,
+      uploadIntent,
+    };
   }
 
   const old = new Date('2020-01-01T00:00:00.000Z');
   const now = new Date('2020-02-01T00:00:00.000Z');
+
+  it('passes the exact referenced snapshot to upload-intent reclamation', async () => {
+    const { service, uploadIntent } = harness({
+      objects: {
+        'posts/': [
+          {
+            key: 'posts/alice/untracked-orphan.jpg',
+            size: 1,
+            lastModified: old,
+          },
+        ],
+      },
+      referenced: {
+        user: [
+          {
+            id: 'alice',
+            avatarUrl: 'https://cdn.test/circle/avatars/alice.jpg',
+            avatarFrame: null,
+            cover: null,
+          },
+        ],
+        trace: [
+          {
+            id: 'moment-1',
+            images: [],
+            attachments: [{ type: 'video', key: 'posts/alice/video.mp4' }],
+          },
+        ],
+      },
+    });
+
+    await service.audit(now);
+
+    expect(uploadIntent.reclaim).toHaveBeenCalledTimes(1);
+    const [referenced, reclaimNow] = uploadIntent.reclaim.mock.calls[0] as [
+      Set<string>,
+      Date,
+    ];
+    expect(referenced).toEqual(
+      new Set(['avatars/alice.jpg', 'posts/alice/video.mp4']),
+    );
+    expect(reclaimNow).toBe(now);
+    expect([...referenced]).not.toEqual(
+      expect.arrayContaining([
+        'https://cdn.test/circle/avatars/alice.jpg',
+        'posts/<sample-hash>',
+      ]),
+    );
+  });
+
+  it('finishes the report-only bucket inventory before tracked reclamation', async () => {
+    const { service, listObjects, uploadIntent } = harness({
+      objects: {
+        'posts/': [
+          { key: 'posts/alice/old.jpg', size: 10, lastModified: old },
+          {
+            key: 'posts/alice/fresh.jpg',
+            size: 20,
+            lastModified: new Date(now.getTime() - 60_000),
+          },
+        ],
+      },
+    });
+    listObjects.mockImplementation(async (prefix: string) => {
+      expect(uploadIntent.reclaim).not.toHaveBeenCalled();
+      return {
+        objects:
+          prefix === 'posts/'
+            ? [
+                {
+                  key: 'posts/alice/old.jpg',
+                  size: 10,
+                  lastModified: old,
+                },
+                {
+                  key: 'posts/alice/fresh.jpg',
+                  size: 20,
+                  lastModified: new Date(now.getTime() - 60_000),
+                },
+              ]
+            : [],
+      };
+    });
+
+    expect(await service.audit(now)).toEqual({
+      scanned: 2,
+      orphanCount: 1,
+      orphanBytes: 10,
+    });
+    expect(uploadIntent.reclaim).toHaveBeenCalledTimes(1);
+  });
+
+  it('marks a reclaim exception as a handled audit failure without logging keys', async () => {
+    const secret = 'posts/user-123/private.jpg';
+    const { service, listObjects, uploadIntent } = harness({});
+    uploadIntent.reclaim.mockRejectedValue(
+      new Error(`delete failed: ${secret}`),
+    );
+    const logged: unknown[][] = [];
+    jest
+      .spyOn(
+        (
+          service as unknown as {
+            logger: { error: (...args: unknown[]) => void };
+          }
+        ).logger,
+        'error',
+      )
+      .mockImplementation((...args: unknown[]) => logged.push(args));
+    const recordRun = jest.spyOn(jobMetrics, 'recordRun');
+
+    expect(await service.audit(now)).toBeNull();
+
+    expect(listObjects).toHaveBeenCalled();
+    expect(recordRun).toHaveBeenCalledWith(
+      'storage_audit',
+      'failure',
+      expect.any(Number),
+      undefined,
+    );
+    expect(JSON.stringify(logged)).toContain('tracked-intent reclamation');
+    expect(JSON.stringify(logged)).not.toContain(secret);
+    recordRun.mockRestore();
+  });
+
+  it('never deletes arbitrary bucket orphans outside UploadIntentService', async () => {
+    const { service, deleteObjectByKey } = harness({
+      objects: {
+        'friends/': [
+          { key: 'friends/untracked/orphan.jpg', size: 10, lastModified: old },
+        ],
+      },
+    });
+
+    expect(await service.audit(now)).toMatchObject({ orphanCount: 1 });
+    expect(deleteObjectByKey).not.toHaveBeenCalled();
+  });
 
   it('keeps private saved stickers referenced independently of their original chat message', async () => {
     const { service } = harness({
@@ -517,6 +668,10 @@ describe('StorageAuditService', () => {
         expected.add(model);
       }
     }
+
+    // UploadIntent.fileUrl is GC bookkeeping for the object itself, not a
+    // durable business reference that is allowed to keep that object alive.
+    expected.delete('UploadIntent');
 
     for (const modelName of expected) {
       const accessor = modelName.charAt(0).toLowerCase() + modelName.slice(1);

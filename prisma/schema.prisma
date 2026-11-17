@@ -15,6 +15,21 @@ enum UserStatus {
   DELETED
 }
 
+enum UploadIntentStatus {
+  PENDING
+  DELETING
+  CLAIMED
+  DELETED
+}
+
+enum UploadIntentPurpose {
+  PROFILE_AVATAR
+  CIRCLE_AVATAR
+  PLAZA_POST
+  MOMENT
+  MOMENT_COMMENT
+}
+
 /// 客服类型。前四类对应 App 客服中心的四个入口，membership 收编原先独立的
 /// EXPO_PUBLIC_MEMBERSHIP_SUPPORT_USER_ID，不再让两套机制并存。
 enum SupportAgentCategory {
@@ -405,6 +420,27 @@ enum AdminGroupOperationStatus {
 }
 
 // ─── Core Models ──────────────────────────────────────────────────────────────
+
+model UploadIntent {
+  id               String              @id @default(uuid())
+  objectKey        String              @unique
+  fileUrl          String
+  userID           String
+  purpose          UploadIntentPurpose
+  folder           String
+  sizeBytes        Int
+  status           UploadIntentStatus  @default(PENDING)
+  expiresAt        DateTime
+  claimedAt        DateTime?
+  deleteLeaseUntil DateTime?
+  deletedAt        DateTime?
+  deleteAttempts   Int                 @default(0)
+  lastDeleteError  String?
+  createdAt        DateTime            @default(now())
+  updatedAt        DateTime            @updatedAt
+
+  @@index([status, expiresAt])
+}
 
 model User {
   customStickers CustomSticker[]

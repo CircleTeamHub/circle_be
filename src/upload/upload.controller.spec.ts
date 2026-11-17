@@ -20,6 +20,9 @@ describe('UploadController', () => {
   const uploadService = {
     presign: jest.fn(),
   };
+  const uploadIntent = {
+    track: jest.fn(),
+  };
   const redisService = {
     isEnabled: jest.fn(),
     incrementWithTtl: jest.fn(),
@@ -39,8 +42,10 @@ describe('UploadController', () => {
     jest.clearAllMocks();
     uploadService.presign.mockResolvedValue({
       uploadUrl: 'https://upload.example/avatar.png',
+      key: 'avatars/user-1/avatar.png',
       fileUrl: 'https://cdn.example/avatar.png',
     });
+    uploadIntent.track.mockResolvedValue(undefined);
     redisService.isEnabled.mockReturnValue(true);
     redisService.incrementWithTtl.mockResolvedValue(1);
   });
@@ -49,6 +54,7 @@ describe('UploadController', () => {
     const controller = new UploadController(
       uploadService as any,
       new UploadLimitService(redisService as unknown as RedisService),
+      uploadIntent as any,
     );
 
     await controller.presign(dto, req);
@@ -71,6 +77,7 @@ describe('UploadController', () => {
     const controller = new UploadController(
       uploadService as any,
       new UploadLimitService(redisService as unknown as RedisService),
+      uploadIntent as any,
     );
 
     await expect(controller.presign(dto, req)).rejects.toMatchObject({
@@ -87,6 +94,7 @@ describe('UploadController', () => {
     const controller = new UploadController(
       uploadService as any,
       new UploadLimitService(redisService as unknown as RedisService),
+      uploadIntent as any,
     );
 
     for (let index = 0; index < 20; index += 1) {
@@ -106,6 +114,7 @@ describe('UploadController', () => {
     const controller = new UploadController(
       uploadService as any,
       new UploadLimitService(redisService as unknown as RedisService),
+      uploadIntent as any,
     );
 
     for (let index = 0; index < 20; index += 1) {
@@ -124,6 +133,7 @@ describe('UploadController', () => {
     const controller = new UploadController(
       uploadService as any,
       new UploadLimitService(redisService as unknown as RedisService),
+      uploadIntent as any,
     );
 
     const results = await Promise.allSettled(
@@ -144,6 +154,7 @@ describe('UploadController', () => {
     const controller = new UploadController(
       uploadService as any,
       new UploadLimitService(redisService as unknown as RedisService),
+      uploadIntent as any,
     );
 
     await controller.presign(dto, req);
@@ -162,6 +173,7 @@ describe('UploadController', () => {
     const controller = new UploadController(
       uploadService as any,
       new UploadLimitService(redisService as unknown as RedisService),
+      uploadIntent as any,
     );
 
     await controller.presign(dto, req);
@@ -181,6 +193,7 @@ describe('UploadController', () => {
     const controller = new UploadController(
       uploadService as any,
       new UploadLimitService(redisService as unknown as RedisService),
+      uploadIntent as any,
     );
 
     await expect(controller.presign(dto, req)).rejects.toMatchObject({
@@ -212,5 +225,51 @@ describe('UploadController', () => {
     expect(description).toContain('key');
     expect(description).toContain('null');
     expect(description).not.toContain('永久访问地址');
+  });
+
+  it('tracks a purpose-tagged presign before returning it', async () => {
+    const controller = new UploadController(
+      uploadService as any,
+      new UploadLimitService(redisService as unknown as RedisService),
+      uploadIntent as any,
+    );
+
+    await expect(
+      controller.presign({ ...dto, purpose: 'PROFILE_AVATAR' }, req),
+    ).resolves.toMatchObject({ key: 'avatars/user-1/avatar.png' });
+
+    expect(uploadIntent.track).toHaveBeenCalledWith({
+      objectKey: 'avatars/user-1/avatar.png',
+      fileUrl: 'https://cdn.example/avatar.png',
+      userID: 'user-1',
+      purpose: 'PROFILE_AVATAR',
+      folder: 'avatars',
+      sizeBytes: 1024,
+    });
+  });
+
+  it('does not track legacy presigns without a purpose', async () => {
+    const controller = new UploadController(
+      uploadService as any,
+      new UploadLimitService(redisService as unknown as RedisService),
+      uploadIntent as any,
+    );
+
+    await controller.presign(dto, req);
+
+    expect(uploadIntent.track).not.toHaveBeenCalled();
+  });
+
+  it('fails the request when intent tracking fails', async () => {
+    uploadIntent.track.mockRejectedValueOnce(new Error('intent write failed'));
+    const controller = new UploadController(
+      uploadService as any,
+      new UploadLimitService(redisService as unknown as RedisService),
+      uploadIntent as any,
+    );
+
+    await expect(
+      controller.presign({ ...dto, purpose: 'PROFILE_AVATAR' }, req),
+    ).rejects.toThrow('intent write failed');
   });
 });

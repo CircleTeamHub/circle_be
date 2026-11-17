@@ -8,6 +8,7 @@ import { CirclePlazaService } from './circle-plaza.service';
 import { AvatarFrameModule } from 'src/avatar-frame/avatar-frame.module';
 import { AssistantModule } from 'src/assistant/assistant.module';
 import { NoteModule } from 'src/note/note.module';
+import { UploadModule } from 'src/upload/upload.module';
 
 @Module({
   imports: [
@@ -18,6 +19,7 @@ import { NoteModule } from 'src/note/note.module';
     AssistantModule,
     // 动态附带笔记的卡片投影（NoteService.projectPlazaNoteCards）。
     NoteModule,
+    UploadModule,
   ],
   controllers: [CirclePlazaController],
   providers: [CirclePlazaService, CirclePlazaCleanup],

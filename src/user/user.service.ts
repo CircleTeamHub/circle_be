@@ -29,6 +29,7 @@ import { createLoggingConfig } from 'src/logging/logging.config';
 import { logBusinessEvent } from 'src/logging/business-event.logger';
 import { isBlockedByStandaloneGroupPolicy } from 'src/chat/standalone-group-policy-gate';
 import { activeUserIdByAccountIdQuery } from './user-account-lookup.query';
+import { UploadIntentService } from 'src/upload/upload-intent.service';
 
 const URL_FIELDS: (keyof UpdateUserInput)[] = [
   'avatarUrl',
@@ -188,6 +189,7 @@ export class UserService {
     // phone/wechat/qq. PrivacySettingsModule is imported by UserModule.
     private privacySettings: PrivacySettingsService,
     private avatarFrames: AvatarFrameService,
+    private uploadIntents: UploadIntentService,
   ) {
     this.storagePublicObjectBases = storagePublicObjectBasesFromConfig(
       this.config,
@@ -433,6 +435,11 @@ export class UserService {
     await this.assertUserExists(id);
     const normalizedInput = normalizeUpdateInput(input);
     const user = await this.prisma.$transaction(async (tx) => {
+      if (normalizedInput.avatarUrl) {
+        await this.uploadIntents.claim(tx, id, 'PROFILE_AVATAR', [
+          normalizedInput.avatarUrl,
+        ]);
+      }
       // 响应按 SelfUserDto 序列化：与 /auth/me 同一份本人视图的列。
       const updated = await tx.user.update({
         where: { id },

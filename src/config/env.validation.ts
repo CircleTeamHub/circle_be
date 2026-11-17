@@ -344,6 +344,9 @@ export function createEnvValidationSchema(
     OBJECT_STORAGE_MANAGE_BUCKET: Joi.boolean().default(true),
     OBJECT_STORAGE_BUCKET_CONFIG_VERIFIED_EXTERNALLY:
       Joi.boolean().default(false),
+    UPLOAD_INTENT_GC_MODE: Joi.string()
+      .valid('report', 'delete')
+      .default('report'),
     OBJECT_STORAGE_DELIVERY_URL: Joi.when('NODE_ENV', {
       is: 'production',
       then: objectDeliveryUrlSchema(['https']).optional(),

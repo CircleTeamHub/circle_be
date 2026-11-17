@@ -56,6 +56,7 @@ import { buildImageMedia } from 'src/media/image-media';
 import { AssistantAlertDeliveryProcessor } from 'src/assistant/assistant-alert-delivery.processor';
 import { AssistantSubscriptionService } from 'src/assistant/assistant-subscription.service';
 import { NoteService } from 'src/note/note.service';
+import { UploadIntentService } from 'src/upload/upload-intent.service';
 import type { PlazaPostNoteCardDto } from 'src/note/dto/note.dto';
 import {
   activeUnexpiredPostWhere,
@@ -131,6 +132,7 @@ export class CirclePlazaService {
     private readonly membershipPolicy: MembershipPolicyService,
     private readonly avatarFrames: AvatarFrameService,
     private readonly notes: NoteService,
+    private readonly uploadIntents: UploadIntentService,
     @Optional()
     private readonly assistantSubscriptions?: AssistantSubscriptionService,
     @Optional()
@@ -374,6 +376,10 @@ export class CirclePlazaService {
         });
       }
 
+      await this.uploadIntents.claim(tx, userId, 'PLAZA_POST', [
+        ...(dto.images ?? []),
+        ...videos,
+      ]);
       const created = await tx.circlePost.create({
         data: {
           content: dto.content,

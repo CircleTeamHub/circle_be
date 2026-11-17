@@ -8,6 +8,7 @@ import {
   Max,
   MaxLength,
   Min,
+  ValidateBy,
 } from 'class-validator';
 
 // 图片/视频:所有目录通用。
@@ -75,6 +76,38 @@ export const UPLOAD_FOLDERS = [
 ] as const;
 export type UploadFolder = (typeof UPLOAD_FOLDERS)[number];
 
+export const UPLOAD_PURPOSES = [
+  'PROFILE_AVATAR',
+  'CIRCLE_AVATAR',
+  'PLAZA_POST',
+  'MOMENT',
+  'MOMENT_COMMENT',
+] as const;
+export type UploadPurpose = (typeof UPLOAD_PURPOSES)[number];
+
+export const UPLOAD_PURPOSE_FOLDERS: Readonly<
+  Record<UploadPurpose, Extract<UploadFolder, 'avatars' | 'posts'>>
+> = {
+  PROFILE_AVATAR: 'avatars',
+  CIRCLE_AVATAR: 'avatars',
+  PLAZA_POST: 'posts',
+  MOMENT: 'posts',
+  MOMENT_COMMENT: 'posts',
+};
+
+const IsPurposeFolderCompatible = () =>
+  ValidateBy({
+    name: 'isPurposeFolderCompatible',
+    validator: {
+      validate(purpose: unknown, args) {
+        if (!UPLOAD_PURPOSES.includes(purpose as UploadPurpose)) return true;
+        const folder = (args.object as PresignDto).folder ?? 'avatars';
+        return UPLOAD_PURPOSE_FOLDERS[purpose as UploadPurpose] === folder;
+      },
+      defaultMessage: () => 'purpose does not match folder',
+    },
+  });
+
 export class PresignDto {
   @ApiProperty({ example: 'avatar.jpg', description: '原始文件名' })
   @IsString()
@@ -110,4 +143,14 @@ export class PresignDto {
   @IsOptional()
   @IsIn(UPLOAD_FOLDERS)
   folder?: UploadFolder;
+
+  @ApiPropertyOptional({
+    example: 'PROFILE_AVATAR',
+    enum: UPLOAD_PURPOSES,
+    description: '上传用途；必须与 folder 对应',
+  })
+  @IsOptional()
+  @IsIn(UPLOAD_PURPOSES)
+  @IsPurposeFolderCompatible()
+  purpose?: UploadPurpose;
 }
