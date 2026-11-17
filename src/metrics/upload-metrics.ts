@@ -8,7 +8,9 @@ export type UploadIntentEvent =
   | 'rescued'
   | 'due'
   | 'deleted'
-  | 'delete_failed';
+  | 'delete_failed'
+  | 'would_rescue'
+  | 'would_delete';
 export type UploadIntentMode = 'request' | 'report' | 'delete';
 
 export interface UploadMetrics {
@@ -30,6 +32,10 @@ export interface UploadMetrics {
     mode: Exclude<UploadIntentMode, 'request'>,
     count: number,
     bytes: number,
+  ): void;
+  setIntentBacklog(
+    mode: Exclude<UploadIntentMode, 'request'>,
+    count: number,
   ): void;
 }
 
@@ -77,6 +83,12 @@ export function createUploadMetrics(): UploadMetrics {
     labelNames: ['folder', 'mode'],
     registers: [registry],
   });
+  const intentReclaimBacklog = new Gauge({
+    name: 'upload_intent_reclaim_backlog_count',
+    help: 'Due upload intents remaining after the bounded reclamation run.',
+    labelNames: ['mode'],
+    registers: [registry],
+  });
 
   return {
     registry,
@@ -94,6 +106,9 @@ export function createUploadMetrics(): UploadMetrics {
     setIntentPending(folder, mode, count, bytes) {
       intentPendingCount.set({ folder, mode }, count);
       intentPendingBytes.set({ folder, mode }, bytes);
+    },
+    setIntentBacklog(mode, count) {
+      intentReclaimBacklog.set({ mode }, count);
     },
   };
 }

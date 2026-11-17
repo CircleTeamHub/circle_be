@@ -111,6 +111,11 @@ function fakeAuditRaw(referenced: Record<string, unknown[]>) {
 
 describe('StorageAuditService', () => {
   const emptyRows = () => ({ findMany: jest.fn().mockResolvedValue([]) });
+  type AuditRedis = {
+    tryAcquireLease: jest.Mock;
+    renewLease: jest.Mock;
+    releaseLease: jest.Mock;
+  };
 
   function harness(options: {
     objects?: Record<
@@ -118,6 +123,7 @@ describe('StorageAuditService', () => {
       { key: string; size: number; lastModified: Date | null }[]
     >;
     referenced?: Record<string, unknown[]>;
+    redis?: AuditRedis;
   }) {
     const prisma = {
       $queryRaw: fakeAuditRaw(options.referenced ?? {}),
@@ -153,6 +159,11 @@ describe('StorageAuditService', () => {
     const uploadIntent = {
       reclaim: jest.fn().mockResolvedValue(undefined),
     };
+    const redis = options.redis ?? {
+      tryAcquireLease: jest.fn().mockResolvedValue('audit-owner'),
+      renewLease: jest.fn().mockResolvedValue(true),
+      releaseLease: jest.fn().mockResolvedValue(undefined),
+    };
     const service = new StorageAuditService(
       prisma as never,
       {
@@ -161,6 +172,7 @@ describe('StorageAuditService', () => {
         deleteObjectByKey,
       } as never,
       uploadIntent as unknown as UploadIntentService,
+      redis as never,
     );
     return {
       service,
@@ -168,6 +180,7 @@ describe('StorageAuditService', () => {
       deleteObjectByKey,
       prisma,
       uploadIntent,
+      redis,
     };
   }
 
@@ -309,6 +322,180 @@ describe('StorageAuditService', () => {
 
     expect(await service.audit(now)).toMatchObject({ orphanCount: 1 });
     expect(deleteObjectByKey).not.toHaveBeenCalled();
+  });
+
+  it('lets only one of two contenders run the full audit and marks the loser skipped', async () => {
+    const redis: AuditRedis = {
+      tryAcquireLease: jest
+        .fn()
+        .mockResolvedValueOnce('first-owner')
+        .mockResolvedValueOnce(null),
+      renewLease: jest.fn().mockResolvedValue(true),
+      releaseLease: jest.fn().mockResolvedValue(undefined),
+    };
+    const first = harness({ redis });
+    const second = harness({ redis });
+    let releaseFirst!: () => void;
+    let notifyStarted!: () => void;
+    const held = new Promise<void>((resolve) => {
+      releaseFirst = resolve;
+    });
+    const started = new Promise<void>((resolve) => {
+      notifyStarted = resolve;
+    });
+    let blocked = false;
+    first.listObjects.mockImplementation(async () => {
+      if (!blocked) {
+        blocked = true;
+        notifyStarted();
+        await held;
+      }
+      return { objects: [] };
+    });
+    const recordRun = jest.spyOn(jobMetrics, 'recordRun');
+    const winner = first.service.audit(now);
+    try {
+      await started;
+      expect(await second.service.audit(now)).toBeNull();
+      expect(second.listObjects).not.toHaveBeenCalled();
+      expect(second.uploadIntent.reclaim).not.toHaveBeenCalled();
+      expect(recordRun).toHaveBeenCalledWith(
+        'storage_audit',
+        'skipped',
+        expect.any(Number),
+        undefined,
+      );
+    } finally {
+      releaseFirst();
+      await winner;
+      recordRun.mockRestore();
+    }
+    expect(first.uploadIntent.reclaim).toHaveBeenCalledTimes(1);
+    expect(redis.releaseLease).toHaveBeenCalledWith(
+      'job-lease:storage_audit',
+      'first-owner',
+    );
+  });
+
+  it('runs fail-open when Redis cannot provide coordination', async () => {
+    const redis: AuditRedis = {
+      tryAcquireLease: jest.fn().mockResolvedValue(undefined),
+      renewLease: jest.fn(),
+      releaseLease: jest.fn(),
+    };
+    const { service, listObjects, uploadIntent } = harness({ redis });
+
+    expect(await service.audit(now)).toEqual({
+      scanned: 0,
+      orphanCount: 0,
+      orphanBytes: 0,
+    });
+    expect(redis.tryAcquireLease).toHaveBeenCalledWith(
+      'job-lease:storage_audit',
+      60_000,
+    );
+    expect(listObjects).toHaveBeenCalledTimes(7);
+    expect(uploadIntent.reclaim).toHaveBeenCalledTimes(1);
+    expect(redis.renewLease).not.toHaveBeenCalled();
+    expect(redis.releaseLease).not.toHaveBeenCalled();
+  });
+
+  it('renews the lease while a long bucket page is in flight', async () => {
+    jest.useFakeTimers();
+    const redis: AuditRedis = {
+      tryAcquireLease: jest.fn().mockResolvedValue('audit-owner'),
+      renewLease: jest.fn().mockResolvedValue(true),
+      releaseLease: jest.fn().mockResolvedValue(undefined),
+    };
+    const { service, listObjects, uploadIntent } = harness({ redis });
+    let finish!: () => void;
+    let notifyStarted!: () => void;
+    const held = new Promise<void>((resolve) => {
+      finish = resolve;
+    });
+    const started = new Promise<void>((resolve) => {
+      notifyStarted = resolve;
+    });
+    let blocked = false;
+    listObjects.mockImplementation(async () => {
+      if (!blocked) {
+        blocked = true;
+        notifyStarted();
+        await held;
+      }
+      return { objects: [] };
+    });
+    const round = service.audit(now);
+    try {
+      await started;
+      await jest.advanceTimersByTimeAsync(20_001);
+      expect(redis.renewLease).toHaveBeenCalledWith(
+        'job-lease:storage_audit',
+        'audit-owner',
+        60_000,
+      );
+      finish();
+      expect(await round).toEqual({
+        scanned: 0,
+        orphanCount: 0,
+        orphanBytes: 0,
+      });
+      expect(listObjects).toHaveBeenCalledTimes(7);
+      expect(uploadIntent.reclaim).toHaveBeenCalledTimes(1);
+    } finally {
+      finish();
+      await round;
+      jest.useRealTimers();
+    }
+  });
+
+  it('stops before the next page and skips reclaim after renewal loses ownership', async () => {
+    jest.useFakeTimers();
+    const redis: AuditRedis = {
+      tryAcquireLease: jest.fn().mockResolvedValue('audit-owner'),
+      renewLease: jest.fn().mockResolvedValue(false),
+      releaseLease: jest.fn().mockResolvedValue(undefined),
+    };
+    const { service, listObjects, uploadIntent } = harness({ redis });
+    let finish!: () => void;
+    let notifyStarted!: () => void;
+    const held = new Promise<void>((resolve) => {
+      finish = resolve;
+    });
+    const started = new Promise<void>((resolve) => {
+      notifyStarted = resolve;
+    });
+    listObjects.mockImplementation(async () => {
+      notifyStarted();
+      await held;
+      return { objects: [] };
+    });
+    const recordRun = jest.spyOn(jobMetrics, 'recordRun');
+    const round = service.audit(now);
+    try {
+      await started;
+      await jest.advanceTimersByTimeAsync(20_001);
+      finish();
+      expect(await round).toBeNull();
+      expect(listObjects).toHaveBeenCalledTimes(1);
+      expect(uploadIntent.reclaim).not.toHaveBeenCalled();
+      expect(recordRun).toHaveBeenCalledWith(
+        'storage_audit',
+        'skipped',
+        expect.any(Number),
+        undefined,
+      );
+      expect(
+        recordRun.mock.calls.some(
+          ([job, outcome]) => job === 'storage_audit' && outcome === 'failure',
+        ),
+      ).toBe(false);
+    } finally {
+      finish();
+      await round;
+      recordRun.mockRestore();
+      jest.useRealTimers();
+    }
   });
 
   it('keeps private saved stickers referenced independently of their original chat message', async () => {

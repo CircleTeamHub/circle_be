@@ -2,6 +2,7 @@ import { BadRequestException } from '@nestjs/common';
 import type { ConfigService } from '@nestjs/config';
 import type { Prisma } from 'src/generated/prisma';
 import type { PrismaService } from 'src/prisma/prisma.service';
+import { uploadMetrics } from 'src/metrics/upload-metrics';
 import type { UploadService } from './upload.service';
 import { UploadIntentService } from './upload-intent.service';
 
@@ -62,6 +63,7 @@ function harness(mode: 'report' | 'delete' = 'delete') {
       findMany: jest.fn().mockResolvedValue([]),
       updateMany: jest.fn().mockResolvedValue({ count: 1 }),
       deleteMany: jest.fn().mockResolvedValue({ count: 0 }),
+      count: jest.fn().mockResolvedValue(0),
       groupBy: jest.fn().mockResolvedValue([]),
     },
     user: { findMany: jest.fn().mockResolvedValue([]) },
@@ -385,6 +387,134 @@ describe('UploadIntentService.reclaim', () => {
     expect(h.prisma.uploadIntent.updateMany).not.toHaveBeenCalled();
     expect(h.prisma.uploadIntent.deleteMany).not.toHaveBeenCalled();
     expect(h.upload.deleteObjectByKey).not.toHaveBeenCalled();
+  });
+
+  it('classifies report candidates without any database mutation or object deletion', async () => {
+    const h = harness('report');
+    const snapshot = intent({
+      id: 'snapshot',
+      objectKey: 'posts/user-1/snapshot.jpg',
+    });
+    const fresh = intent({
+      id: 'fresh',
+      objectKey: 'posts/user-1/fresh.jpg',
+    });
+    const abandoned = intent({
+      id: 'abandoned',
+      objectKey: 'posts/user-1/abandoned.jpg',
+    });
+    h.prisma.uploadIntent.findMany.mockResolvedValue([
+      snapshot,
+      fresh,
+      abandoned,
+    ]);
+    h.prisma.trace.findMany.mockResolvedValue([
+      {
+        id: 'trace-1',
+        images: ['https://legacy-cdn.example/posts/user-1/fresh.jpg'],
+        attachments: null,
+      },
+    ]);
+    h.prisma.uploadIntent.count.mockResolvedValue(3);
+    const eventSpy = jest.spyOn(uploadMetrics, 'recordIntentEvent');
+    const backlogSpy = jest.spyOn(uploadMetrics, 'setIntentBacklog');
+
+    await h.service.reclaim(new Set(['posts/user-1/snapshot.jpg']), NOW);
+
+    expect(h.prisma.trace.findMany).toHaveBeenCalledTimes(1);
+    expect(eventSpy).toHaveBeenCalledWith('posts', 'would_rescue', 'report');
+    expect(eventSpy).toHaveBeenCalledWith('posts', 'would_delete', 'report');
+    expect(
+      eventSpy.mock.calls.filter(([, event]) => event === 'would_rescue'),
+    ).toHaveLength(2);
+    expect(backlogSpy).toHaveBeenCalledWith('report', 0);
+    expect(h.prisma.uploadIntent.updateMany).not.toHaveBeenCalled();
+    expect(h.prisma.uploadIntent.deleteMany).not.toHaveBeenCalled();
+    expect(h.upload.deleteObjectByKey).not.toHaveBeenCalled();
+    eventSpy.mockRestore();
+    backlogSpy.mockRestore();
+  });
+
+  it('uses an immutable id keyset when every lease in the first page is lost', async () => {
+    const h = harness();
+    const rows = Array.from({ length: 101 }, (_, index) =>
+      intent({
+        id: `intent-${String(index).padStart(3, '0')}`,
+        objectKey: `posts/user-1/${index}.jpg`,
+      }),
+    );
+    h.prisma.uploadIntent.findMany
+      .mockResolvedValueOnce(rows.slice(0, 100))
+      .mockResolvedValueOnce(rows.slice(100));
+    h.prisma.uploadIntent.updateMany.mockResolvedValue({ count: 0 });
+    h.prisma.uploadIntent.findUnique.mockResolvedValue(
+      intent({ status: 'CLAIMED' }),
+    );
+
+    await h.service.reclaim(new Set(), NOW);
+
+    expect(h.prisma.uploadIntent.findMany).toHaveBeenCalledTimes(2);
+    expect(h.prisma.uploadIntent.findMany).toHaveBeenNthCalledWith(
+      2,
+      expect.objectContaining({
+        where: {
+          AND: [
+            expect.objectContaining({ OR: expect.any(Array) }),
+            {
+              id: { gt: 'intent-099' },
+            },
+          ],
+        },
+        orderBy: { id: 'asc' },
+        take: 100,
+      }),
+    );
+    expect(h.prisma.uploadIntent.updateMany).toHaveBeenCalledTimes(101);
+    expect(h.upload.deleteObjectByKey).not.toHaveBeenCalled();
+  });
+
+  it('caps one run at 500 classified rows and exposes the remaining backlog', async () => {
+    const h = harness('report');
+    const pages = Array.from({ length: 5 }, (_, page) =>
+      Array.from({ length: 100 }, (_, offset) => {
+        const index = page * 100 + offset;
+        return intent({
+          id: `intent-${String(index).padStart(3, '0')}`,
+          objectKey: `posts/user-1/${index}.jpg`,
+        });
+      }),
+    );
+    for (const page of pages) {
+      h.prisma.uploadIntent.findMany.mockResolvedValueOnce(page);
+    }
+    h.prisma.uploadIntent.findMany.mockResolvedValueOnce([
+      intent({ id: 'intent-500', objectKey: 'posts/user-1/500.jpg' }),
+    ]);
+    h.prisma.uploadIntent.count.mockResolvedValue(501);
+    const backlogSpy = jest.spyOn(uploadMetrics, 'setIntentBacklog');
+
+    await h.service.reclaim(new Set(), NOW);
+
+    expect(h.prisma.uploadIntent.findMany).toHaveBeenCalledTimes(5);
+    expect(h.prisma.uploadIntent.findMany).toHaveBeenNthCalledWith(
+      5,
+      expect.objectContaining({
+        where: {
+          AND: [
+            expect.objectContaining({ OR: expect.any(Array) }),
+            {
+              id: { gt: 'intent-399' },
+            },
+          ],
+        },
+        orderBy: { id: 'asc' },
+        take: 100,
+      }),
+    );
+    expect(backlogSpy).toHaveBeenCalledWith('report', 1);
+    expect(h.prisma.uploadIntent.updateMany).not.toHaveBeenCalled();
+    expect(h.upload.deleteObjectByKey).not.toHaveBeenCalled();
+    backlogSpy.mockRestore();
   });
 
   it('durably rescues a snapshot-referenced intent before fresh checks', async () => {

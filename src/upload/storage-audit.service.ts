@@ -2,11 +2,14 @@ import { Injectable, Logger } from '@nestjs/common';
 import { CronExpression } from '@nestjs/schedule';
 import {
   reportHandledJobFailure,
+  reportJobSkipped,
   TrackedCron,
 } from '../metrics/tracked-cron.decorator';
 import { createHash } from 'crypto';
 import { PrismaService } from 'src/prisma/prisma.service';
 import { CHAT_MEDIA_KEY_FIELDS } from 'src/chat/chat.constants';
+import { type JobLeaseContext, runWithJobLease } from 'src/redis/job-lease';
+import { RedisService } from 'src/redis/redis.service';
 import { UploadService } from './upload.service';
 import { UploadIntentService } from './upload-intent.service';
 import {
@@ -19,6 +22,14 @@ import {
   chatMediaKeyReferencesQuery,
   noteCardSectionsPageQuery,
 } from './storage-audit.query';
+
+type StorageAuditResult = {
+  scanned: number;
+  orphanCount: number;
+  orphanBytes: number;
+};
+
+const STORAGE_AUDIT_LEASE_LOST = Symbol('storage-audit-lease-lost');
 
 /**
  * 存量对象盘点（**只报告，不删除**）。
@@ -77,81 +88,38 @@ export class StorageAuditService {
    */
   private static readonly REFERENCE_BATCH_SIZE = 1000;
 
+  /** Renewed by runWithJobLease every 20 seconds while a long inventory runs. */
+  private static readonly LEASE_TTL_MS = 60_000;
+
   constructor(
     private readonly prisma: PrismaService,
     private readonly upload: UploadService,
     private readonly uploadIntents: UploadIntentService,
+    private readonly redis: RedisService,
   ) {}
 
   @TrackedCron(CronExpression.EVERY_DAY_AT_5AM, 'storage_audit')
-  async audit(now: Date = new Date()): Promise<{
-    scanned: number;
-    orphanCount: number;
-    orphanBytes: number;
-  } | null> {
+  async audit(now: Date = new Date()): Promise<StorageAuditResult | null> {
+    let result: StorageAuditResult | null = null;
     try {
-      const referenced = await this.collectReferencedKeys();
-      const cutoff = new Date(
-        now.getTime() - StorageAuditService.GRACE_PERIOD_MS,
+      const ran = await runWithJobLease(
+        this.redis,
+        'storage_audit',
+        StorageAuditService.LEASE_TTL_MS,
+        async (_token, lease) => {
+          result = await this.auditOnce(now, lease);
+        },
       );
-
-      let scanned = 0;
-      let orphanCount = 0;
-      let orphanBytes = 0;
-      const samples: string[] = [];
-
-      for (const prefix of StorageAuditService.AUDITED_PREFIXES) {
-        let token: string | undefined;
-        do {
-          const page = await this.upload.listObjects(prefix, token);
-          token = page.nextContinuationToken;
-          const isFresh = (object: { lastModified: Date | null }) =>
-            Boolean(object.lastModified && object.lastModified > cutoff);
-          // 聊天媒体的规整引用不在 referenced 里：这一批还没判定的 chat/ key 一次反查。
-          const chatReferenced = await this.findReferencedChatKeys(
-            page.objects
-              .filter((object) => !isFresh(object))
-              .map((object) => object.key)
-              .filter((key) => !referenced.has(key)),
-          );
-          for (const object of page.objects) {
-            scanned += 1;
-            if (isFresh(object)) continue;
-            if (referenced.has(object.key)) continue;
-            if (chatReferenced.has(object.key)) continue;
-            orphanCount += 1;
-            orphanBytes += object.size;
-            if (samples.length < StorageAuditService.SAMPLE_SIZE) {
-              samples.push(this.redactKey(object.key));
-            }
-          }
-        } while (token);
-      }
-
-      try {
-        await this.uploadIntents.reclaim(referenced, now);
-        this.logger.log('storage audit: tracked-intent reclamation completed');
-      } catch {
-        // UploadIntentService owns deletion and row-level retries. A sweep-level
-        // failure still fails this handled cron run, but never copies a key or
-        // user-bearing dependency error into logs.
-        this.logger.error(
-          'storage audit failed during tracked-intent reclamation',
-        );
-        reportHandledJobFailure();
+      if (!ran) {
+        reportJobSkipped();
         return null;
       }
-
-      this.logger.log(
-        `storage audit: scanned=${scanned} orphaned=${orphanCount} ` +
-          `bytes=${orphanBytes} (bucket inventory report only; ` +
-          `tracked-intent reclamation is reported separately)`,
-      );
-      if (samples.length > 0) {
-        this.logger.log(`orphan samples: ${samples.join(', ')}`);
-      }
-      return { scanned, orphanCount, orphanBytes };
+      return result;
     } catch (err) {
+      if (err === STORAGE_AUDIT_LEASE_LOST) {
+        reportJobSkipped();
+        return null;
+      }
       // 盘点失败只影响这份账，不影响业务；明天的 cron 会重试。
       this.logger.error(
         'storage audit failed',
@@ -160,6 +128,83 @@ export class StorageAuditService {
       reportHandledJobFailure();
       return null;
     }
+  }
+
+  private async auditOnce(
+    now: Date,
+    lease: JobLeaseContext,
+  ): Promise<StorageAuditResult | null> {
+    this.ensureCurrentLease(lease);
+    const referenced = await this.collectReferencedKeys(lease);
+    const cutoff = new Date(
+      now.getTime() - StorageAuditService.GRACE_PERIOD_MS,
+    );
+
+    let scanned = 0;
+    let orphanCount = 0;
+    let orphanBytes = 0;
+    const samples: string[] = [];
+
+    for (const prefix of StorageAuditService.AUDITED_PREFIXES) {
+      let token: string | undefined;
+      do {
+        this.ensureCurrentLease(lease);
+        const page = await this.upload.listObjects(prefix, token);
+        this.ensureCurrentLease(lease);
+        token = page.nextContinuationToken;
+        const isFresh = (object: { lastModified: Date | null }) =>
+          Boolean(object.lastModified && object.lastModified > cutoff);
+        // 聊天媒体的规整引用不在 referenced 里：这一批还没判定的 chat/ key 一次反查。
+        const chatReferenced = await this.findReferencedChatKeys(
+          page.objects
+            .filter((object) => !isFresh(object))
+            .map((object) => object.key)
+            .filter((key) => !referenced.has(key)),
+        );
+        this.ensureCurrentLease(lease);
+        for (const object of page.objects) {
+          scanned += 1;
+          if (isFresh(object)) continue;
+          if (referenced.has(object.key)) continue;
+          if (chatReferenced.has(object.key)) continue;
+          orphanCount += 1;
+          orphanBytes += object.size;
+          if (samples.length < StorageAuditService.SAMPLE_SIZE) {
+            samples.push(this.redactKey(object.key));
+          }
+        }
+      } while (token);
+    }
+
+    this.ensureCurrentLease(lease);
+    try {
+      await this.uploadIntents.reclaim(referenced, now);
+    } catch {
+      // UploadIntentService owns deletion and row-level retries. A sweep-level
+      // failure still fails this handled cron run, but never copies a key or
+      // user-bearing dependency error into logs.
+      this.logger.error(
+        'storage audit failed during tracked-intent reclamation',
+      );
+      reportHandledJobFailure();
+      return null;
+    }
+    this.ensureCurrentLease(lease);
+    this.logger.log('storage audit: tracked-intent reclamation completed');
+
+    this.logger.log(
+      `storage audit: scanned=${scanned} orphaned=${orphanCount} ` +
+        `bytes=${orphanBytes} (bucket inventory report only; ` +
+        `tracked-intent reclamation is reported separately)`,
+    );
+    if (samples.length > 0) {
+      this.logger.log(`orphan samples: ${samples.join(', ')}`);
+    }
+    return { scanned, orphanCount, orphanBytes };
+  }
+
+  private ensureCurrentLease(lease?: JobLeaseContext): void {
+    if (lease && !lease.isCurrent()) throw STORAGE_AUDIT_LEASE_LOST;
   }
 
   /**
@@ -199,13 +244,16 @@ export class StorageAuditService {
   private async collectFrom<T extends { id: string }>(
     fetchPage: (cursor: string | undefined, take: number) => Promise<T[]>,
     extract: (row: T) => void,
+    lease?: JobLeaseContext,
   ): Promise<void> {
     let cursor: string | undefined;
     for (;;) {
+      this.ensureCurrentLease(lease);
       const rows = await fetchPage(
         cursor,
         StorageAuditService.REFERENCE_BATCH_SIZE,
       );
+      this.ensureCurrentLease(lease);
       for (const row of rows) extract(row);
       if (rows.length < StorageAuditService.REFERENCE_BATCH_SIZE) return;
       cursor = rows[rows.length - 1].id;
@@ -220,8 +268,14 @@ export class StorageAuditService {
    *
    * ⚠️ 漏掉任何一处引用来源，那批对象就会被误报。新增存 URL 的字段时必须同步这里。
    */
-  private async collectReferencedKeys(): Promise<Set<string>> {
+  private async collectReferencedKeys(
+    lease?: JobLeaseContext,
+  ): Promise<Set<string>> {
     const keys = new Set<string>();
+    const collect = <T extends { id: string }>(
+      fetchPage: (cursor: string | undefined, take: number) => Promise<T[]>,
+      extract: (row: T) => void,
+    ) => this.collectFrom(fetchPage, extract, lease);
     const add = (value: unknown) => {
       if (typeof value !== 'string' || value.length === 0) return;
       const key = this.toObjectKey(value);
@@ -251,7 +305,7 @@ export class StorageAuditService {
     // 逐表串行、分批读:十张表并发全量物化会一口吃满连接池,
     // 并把整份结果集留在内存里。这份账每天只跑一次,慢一点无所谓,
     // 把生产在 05:00 拖垮才是问题。
-    await this.collectFrom(
+    await collect(
       (cursor, take) =>
         this.prisma.user.findMany({
           select: { id: true, avatarUrl: true, avatarFrame: true, cover: true },
@@ -265,7 +319,7 @@ export class StorageAuditService {
         add(row.cover);
       },
     );
-    await this.collectFrom(
+    await collect(
       (cursor, take) =>
         this.prisma.avatarFrameAsset.findMany({
           select: { id: true, imageUrl: true },
@@ -275,7 +329,7 @@ export class StorageAuditService {
         }),
       (row) => add(row.imageUrl),
     );
-    await this.collectFrom(
+    await collect(
       (cursor, take) =>
         this.prisma.iconAsset.findMany({
           select: { id: true, imageUrl: true },
@@ -285,7 +339,7 @@ export class StorageAuditService {
         }),
       (row) => add(row.imageUrl),
     );
-    await this.collectFrom(
+    await collect(
       (cursor, take) =>
         this.prisma.adminAdvertisement.findMany({
           select: { id: true, imageUrl: true },
@@ -295,7 +349,7 @@ export class StorageAuditService {
         }),
       (row) => add(row.imageUrl),
     );
-    await this.collectFrom(
+    await collect(
       (cursor, take) =>
         this.prisma.friend.findMany({
           select: {
@@ -317,7 +371,7 @@ export class StorageAuditService {
         row.pendingPhotosBySender.forEach(add);
       },
     );
-    await this.collectFrom(
+    await collect(
       (cursor, take) =>
         this.prisma.circle.findMany({
           select: { id: true, avatarUrl: true, cover: true },
@@ -331,7 +385,7 @@ export class StorageAuditService {
       },
     );
     // 独立群聊的群头像(圈子群的头像在 Circle 上,上面已经收了)。
-    await this.collectFrom(
+    await collect(
       (cursor, take) =>
         this.prisma.chatConversation.findMany({
           where: { avatarUrl: { not: null } },
@@ -342,7 +396,7 @@ export class StorageAuditService {
         }),
       (row) => add(row.avatarUrl),
     );
-    await this.collectFrom(
+    await collect(
       (cursor, take) =>
         this.prisma.noteMedia.findMany({
           select: { id: true, url: true, posterUrl: true },
@@ -359,7 +413,7 @@ export class StorageAuditService {
     // Retain durable row references, including DELETED rows, consistently with
     // the existing NoteMedia scan. 只取 sections 里的两个名片数组，不把整列（正文、
     // contentJson 副本、媒体条目）搬回来。
-    await this.collectFrom(
+    await collect(
       (cursor, take) =>
         this.prisma.$queryRaw<NoteCardSectionsRow[]>(
           noteCardSectionsPageQuery(cursor, take),
@@ -376,7 +430,7 @@ export class StorageAuditService {
     // yet. Skipping this source is safe: the audit remains report-only, while
     // a real Prisma client always has noteDraft after the migration is applied.
     if (this.prisma.noteDraft) {
-      await this.collectFrom(
+      await collect(
         (cursor, take) =>
           this.prisma.noteDraft.findMany({
             select: { id: true, mediaKeys: true, sections: true },
@@ -393,7 +447,7 @@ export class StorageAuditService {
     // 下面三张刻意逐张写死,不走动态表名:storage-audit.service.spec.ts 用
     // `this.prisma.<table>.findMany` 的字面量守「十张表一个都不能漏」——
     // 漏一处就是那批对象被误报成孤儿,而这份账是用来授权删除的。
-    await this.collectFrom(
+    await collect(
       (cursor, take) =>
         this.prisma.trace.findMany({
           select: { id: true, images: true, attachments: true },
@@ -417,7 +471,7 @@ export class StorageAuditService {
         }
       },
     );
-    await this.collectFrom(
+    await collect(
       (cursor, take) =>
         this.prisma.traceComment.findMany({
           select: { id: true, images: true },
@@ -427,7 +481,7 @@ export class StorageAuditService {
         }),
       (row) => row.images.forEach(add),
     );
-    await this.collectFrom(
+    await collect(
       (cursor, take) =>
         this.prisma.circlePost.findMany({
           select: { id: true, images: true, videos: true },
@@ -440,7 +494,7 @@ export class StorageAuditService {
         row.videos.forEach(add);
       },
     );
-    await this.collectFrom(
+    await collect(
       (cursor, take) =>
         this.prisma.customSticker.findMany({
           select: { id: true, objectKey: true },
@@ -463,7 +517,7 @@ export class StorageAuditService {
         add((content as Record<string, unknown>)[field.key]);
       }
     };
-    await this.collectFrom(
+    await collect(
       (cursor, take) =>
         this.prisma.$queryRaw<ChatMediaContentRow[]>(
           chatMediaIrregularRowsQuery(cursor, take),
@@ -471,7 +525,7 @@ export class StorageAuditService {
       addChatMedia,
     );
     // Burn archive media remains referenced until the retention cleanup commits.
-    await this.collectFrom(
+    await collect(
       (cursor, take) =>
         this.prisma.$queryRaw<ChatMediaContentRow[]>(
           chatBurnArchiveIrregularRowsQuery(cursor, take),
@@ -481,7 +535,7 @@ export class StorageAuditService {
     // 充值收款码在第一次被机器人发送前还没有 ChatMessage 引用，但它已经是运营
     // 配置中的有效资产。漏掉这张表会把长期备用码误报成 chat/ 孤儿；未来若按
     // 盘点结果启用真正 GC，就会删掉仍处于启用/待启用状态的收款码。
-    await this.collectFrom(
+    await collect(
       (cursor, take) =>
         this.prisma.supportRechargePaymentCode.findMany({
           select: { id: true, objectKey: true },
@@ -494,7 +548,7 @@ export class StorageAuditService {
 
     // Release URLs currently point to GitHub/App Store; keep them in the URL inventory
     // so future storage source changes cannot silently bypass reference checks.
-    await this.collectFrom(
+    await collect(
       (cursor, take) =>
         this.prisma.consoleRelease.findMany({
           select: { id: true, url: true },

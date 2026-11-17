@@ -20,6 +20,7 @@ const DELETE_BACKOFF_BASE_MS = 60 * 1000;
 const DELETE_BACKOFF_MAX_MS = 24 * 60 * 60 * 1000;
 const TERMINAL_RETENTION_MS = 30 * 24 * 60 * 60 * 1000;
 const RECLAIM_BATCH_SIZE = 100;
+const RECLAIM_MAX_ROWS_PER_RUN = 500;
 const REFERENCE_SCAN_PAGE_SIZE = 100;
 const DELETE_ERROR_MAX_LENGTH = 500;
 const TRACKED_FOLDERS: readonly UploadIntentFolder[] = ['avatars', 'posts'];
@@ -126,136 +127,183 @@ export class UploadIntentService {
   ): Promise<void> {
     const mode = this.gcMode();
     await this.recordPendingGauges(mode);
+    let afterId: string | undefined;
+    let processed = 0;
+    while (processed < RECLAIM_MAX_ROWS_PER_RUN) {
+      const take = Math.min(
+        RECLAIM_BATCH_SIZE,
+        RECLAIM_MAX_ROWS_PER_RUN - processed,
+      );
+      const due = await this.prisma.uploadIntent.findMany({
+        where: afterId
+          ? { AND: [this.dueWhere(now), { id: { gt: afterId } }] }
+          : this.dueWhere(now),
+        orderBy: { id: 'asc' },
+        take,
+      });
+      if (due.length === 0) break;
 
-    const due = await this.prisma.uploadIntent.findMany({
-      where: {
-        OR: [
-          { status: 'PENDING', expiresAt: { lte: now } },
-          {
-            status: 'DELETING',
-            deleteLeaseUntil: { lte: now },
-          },
-        ],
-      },
-      orderBy: [{ expiresAt: 'asc' }, { id: 'asc' }],
-      take: RECLAIM_BATCH_SIZE,
-    });
-
-    for (const row of due) {
-      const folder = this.metricFolder(row.folder);
-      if (folder) uploadMetrics.recordIntentEvent(folder, 'due', mode);
+      processed += due.length;
+      for (const row of due) {
+        const folder = this.metricFolder(row.folder);
+        if (folder) uploadMetrics.recordIntentEvent(folder, 'due', mode);
+      }
+      await this.processDueBatch(due, referencedSnapshot, mode, now);
+      if (due.length < take) break;
+      afterId = due[due.length - 1].id;
     }
-    if (mode === 'report') return;
 
+    const dueAfterRun = await this.prisma.uploadIntent.count({
+      where: this.dueWhere(now),
+    });
+    const backlog =
+      mode === 'report' ? Math.max(0, dueAfterRun - processed) : dueAfterRun;
+    uploadMetrics.setIntentBacklog(mode, backlog);
+
+    if (mode === 'delete') {
+      const terminalCutoff = new Date(now.getTime() - TERMINAL_RETENTION_MS);
+      await this.prisma.uploadIntent.deleteMany({
+        where: {
+          OR: [
+            { status: 'CLAIMED', claimedAt: { lte: terminalCutoff } },
+            { status: 'DELETED', deletedAt: { lte: terminalCutoff } },
+          ],
+        },
+      });
+    }
+  }
+
+  private dueWhere(now: Date): Prisma.UploadIntentWhereInput {
+    return {
+      OR: [
+        { status: 'PENDING', expiresAt: { lte: now } },
+        { status: 'DELETING', deleteLeaseUntil: { lte: now } },
+      ],
+    };
+  }
+
+  private async processDueBatch(
+    due: readonly UploadIntent[],
+    referencedSnapshot: ReadonlySet<string>,
+    mode: Exclude<UploadIntentMode, 'request'>,
+    now: Date,
+  ): Promise<void> {
     const unreconciled: UploadIntent[] = [];
     for (const row of due) {
       if (referencedSnapshot.has(row.objectKey)) {
-        await this.rescue(row, now);
-        continue;
+        if (mode === 'delete') await this.rescue(row, now);
+      } else {
+        unreconciled.push(row);
       }
-      unreconciled.push(row);
     }
 
     const freshReferences = await this.collectFreshReferencedKeys(unreconciled);
+    if (mode === 'report') {
+      for (const row of due) {
+        const folder = this.metricFolder(row.folder);
+        if (!folder) continue;
+        const referenced =
+          referencedSnapshot.has(row.objectKey) ||
+          freshReferences.has(row.objectKey);
+        uploadMetrics.recordIntentEvent(
+          folder,
+          referenced ? 'would_rescue' : 'would_delete',
+          mode,
+        );
+      }
+      return;
+    }
+
     for (const row of unreconciled) {
       if (freshReferences.has(row.objectKey)) {
         await this.rescue(row, now);
-        continue;
+      } else {
+        await this.deleteUnreferenced(row, now, mode);
       }
+    }
+  }
 
-      const leaseUntil = this.newLeaseUntil(now);
-      const lease = await this.prisma.uploadIntent.updateMany({
-        where:
-          row.status === 'PENDING'
-            ? { id: row.id, status: 'PENDING', expiresAt: { lte: now } }
-            : {
-                id: row.id,
-                status: 'DELETING',
-                deleteLeaseUntil: row.deleteLeaseUntil,
-              },
+  private async deleteUnreferenced(
+    row: UploadIntent,
+    now: Date,
+    mode: 'delete',
+  ): Promise<void> {
+    const leaseUntil = this.newLeaseUntil(now);
+    const lease = await this.prisma.uploadIntent.updateMany({
+      where:
+        row.status === 'PENDING'
+          ? { id: row.id, status: 'PENDING', expiresAt: { lte: now } }
+          : {
+              id: row.id,
+              status: 'DELETING',
+              deleteLeaseUntil: row.deleteLeaseUntil,
+            },
+      data: {
+        status: 'DELETING',
+        deleteLeaseUntil: leaseUntil,
+        lastDeleteError: null,
+      },
+    });
+    if (lease.count !== 1) {
+      await this.prisma.uploadIntent.findUnique({ where: { id: row.id } });
+      return;
+    }
+
+    const ownLease = {
+      id: row.id,
+      status: 'DELETING' as const,
+      deleteLeaseUntil: leaseUntil,
+    };
+    try {
+      await this.upload.deleteObjectByKey(row.objectKey);
+    } catch (error) {
+      const attempts = row.deleteAttempts + 1;
+      const backoff = Math.min(
+        DELETE_BACKOFF_BASE_MS * 2 ** row.deleteAttempts,
+        DELETE_BACKOFF_MAX_MS,
+      );
+      try {
+        await this.prisma.uploadIntent.updateMany({
+          where: ownLease,
+          data: {
+            status: 'PENDING',
+            deleteAttempts: attempts,
+            lastDeleteError: this.errorMessage(error),
+            expiresAt: new Date(now.getTime() + backoff),
+            deleteLeaseUntil: null,
+          },
+        });
+      } catch {
+        // Preserve the lease for an idempotent retry after it expires.
+      }
+      const folder = this.metricFolder(row.folder);
+      if (folder)
+        uploadMetrics.recordIntentEvent(folder, 'delete_failed', mode);
+      return;
+    }
+
+    try {
+      const written = await this.prisma.uploadIntent.updateMany({
+        where: ownLease,
         data: {
-          status: 'DELETING',
-          deleteLeaseUntil: leaseUntil,
+          status: 'DELETED',
+          deletedAt: now,
+          deleteLeaseUntil: null,
           lastDeleteError: null,
         },
       });
-      if (lease.count !== 1) {
-        // A failed lease can mean a business transaction claimed the intent.
-        // Re-read before continuing and never delete without owning this lease.
-        await this.prisma.uploadIntent.findUnique({ where: { id: row.id } });
-        continue;
-      }
-
-      const ownLease = {
-        id: row.id,
-        status: 'DELETING' as const,
-        deleteLeaseUntil: leaseUntil,
-      };
-      try {
-        await this.upload.deleteObjectByKey(row.objectKey);
-      } catch (error) {
-        const attempts = row.deleteAttempts + 1;
-        const backoff = Math.min(
-          DELETE_BACKOFF_BASE_MS * 2 ** row.deleteAttempts,
-          DELETE_BACKOFF_MAX_MS,
-        );
-        try {
-          await this.prisma.uploadIntent.updateMany({
-            where: ownLease,
-            data: {
-              status: 'PENDING',
-              deleteAttempts: attempts,
-              lastDeleteError: this.errorMessage(error),
-              expiresAt: new Date(now.getTime() + backoff),
-              deleteLeaseUntil: null,
-            },
-          });
-        } catch {
-          // Preserve the DELETING lease. A later sweep can retry both the
-          // idempotent object delete and its durable state transition.
-        }
-        const folder = this.metricFolder(row.folder);
-        if (folder)
-          uploadMetrics.recordIntentEvent(folder, 'delete_failed', mode);
-        continue;
-      }
-
-      try {
-        const written = await this.prisma.uploadIntent.updateMany({
-          where: ownLease,
-          data: {
-            status: 'DELETED',
-            deletedAt: now,
-            deleteLeaseUntil: null,
-            lastDeleteError: null,
-          },
-        });
-        if (written.count === 1) {
-          const folder = this.metricFolder(row.folder);
-          if (folder) uploadMetrics.recordIntentEvent(folder, 'deleted', mode);
-        } else {
-          const folder = this.metricFolder(row.folder);
-          if (folder)
-            uploadMetrics.recordIntentEvent(folder, 'delete_failed', mode);
-        }
-      } catch {
-        // The object delete is idempotent. Keep the durable DELETING lease so a
-        // later sweep retries after expiry instead of inventing unleased state.
-        const folder = this.metricFolder(row.folder);
-        if (folder)
-          uploadMetrics.recordIntentEvent(folder, 'delete_failed', mode);
-      }
+      const folder = this.metricFolder(row.folder);
+      if (!folder) return;
+      uploadMetrics.recordIntentEvent(
+        folder,
+        written.count === 1 ? 'deleted' : 'delete_failed',
+        mode,
+      );
+    } catch {
+      const folder = this.metricFolder(row.folder);
+      if (folder)
+        uploadMetrics.recordIntentEvent(folder, 'delete_failed', mode);
     }
-
-    const terminalCutoff = new Date(now.getTime() - TERMINAL_RETENTION_MS);
-    await this.prisma.uploadIntent.deleteMany({
-      where: {
-        OR: [
-          { status: 'CLAIMED', claimedAt: { lte: terminalCutoff } },
-          { status: 'DELETED', deletedAt: { lte: terminalCutoff } },
-        ],
-      },
-    });
   }
 
   private keysForPurpose(
