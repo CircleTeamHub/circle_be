@@ -470,10 +470,11 @@ describe('UploadIntentService.reclaim', () => {
       }),
     );
     expect(h.prisma.uploadIntent.updateMany).toHaveBeenCalledTimes(101);
+    expect(h.prisma.trace.findMany).toHaveBeenCalledTimes(1);
     expect(h.upload.deleteObjectByKey).not.toHaveBeenCalled();
   });
 
-  it('caps one run at 500 classified rows and exposes the remaining backlog', async () => {
+  it('classifies one bounded report run and scans one purpose only once', async () => {
     const h = harness('report');
     const pages = Array.from({ length: 5 }, (_, page) =>
       Array.from({ length: 100 }, (_, offset) => {
@@ -490,8 +491,23 @@ describe('UploadIntentService.reclaim', () => {
     h.prisma.uploadIntent.findMany.mockResolvedValueOnce([
       intent({ id: 'intent-500', objectKey: 'posts/user-1/500.jpg' }),
     ]);
+    const firstReferencePage = Array.from({ length: 100 }, (_, index) => ({
+      id: `trace-${String(index).padStart(3, '0')}`,
+      images: index === 0 ? ['https://cdn.example/posts/user-1/0.jpg'] : [],
+      attachments: null,
+    }));
+    h.prisma.trace.findMany
+      .mockResolvedValueOnce(firstReferencePage as never)
+      .mockResolvedValueOnce([
+        {
+          id: 'trace-100',
+          images: ['https://cdn.example/posts/user-1/500.jpg'],
+          attachments: null,
+        },
+      ] as never);
     h.prisma.uploadIntent.count.mockResolvedValue(501);
     const backlogSpy = jest.spyOn(uploadMetrics, 'setIntentBacklog');
+    const eventSpy = jest.spyOn(uploadMetrics, 'recordIntentEvent');
 
     await h.service.reclaim(new Set(), NOW);
 
@@ -511,10 +527,18 @@ describe('UploadIntentService.reclaim', () => {
         take: 100,
       }),
     );
+    expect(h.prisma.trace.findMany).toHaveBeenCalledTimes(2);
+    expect(
+      eventSpy.mock.calls.filter(([, event]) => event === 'would_rescue'),
+    ).toHaveLength(1);
+    expect(
+      eventSpy.mock.calls.filter(([, event]) => event === 'would_delete'),
+    ).toHaveLength(499);
     expect(backlogSpy).toHaveBeenCalledWith('report', 1);
     expect(h.prisma.uploadIntent.updateMany).not.toHaveBeenCalled();
     expect(h.upload.deleteObjectByKey).not.toHaveBeenCalled();
     backlogSpy.mockRestore();
+    eventSpy.mockRestore();
   });
 
   it('durably rescues a snapshot-referenced intent before fresh checks', async () => {
