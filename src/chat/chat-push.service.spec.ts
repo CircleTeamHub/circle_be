@@ -30,7 +30,6 @@ function seat(
     muted: boolean;
     lastReadHeight: number;
     clearedBeforeHeight: number;
-    user: { groupOfflinePushEnabled: boolean };
   }> = {},
 ) {
   return {
@@ -38,9 +37,15 @@ function seat(
     muted: false,
     lastReadHeight: 0,
     clearedBeforeHeight: 0,
-    user: { groupOfflinePushEnabled: true },
     ...overrides,
   };
+}
+
+/** Field names Prisma accepts on a model; the mocks below accept anything. */
+function modelFields(model: string): Set<string> {
+  const found = Prisma.dmmf.datamodel.models.find(({ name }) => name === model);
+  if (!found) throw new Error(`no Prisma model ${model}`);
+  return new Set(found.fields.map(({ name }) => name));
 }
 
 function sqlText(call: unknown[]): string {
@@ -67,6 +72,7 @@ describe('ChatPushService', () => {
   const prisma = {
     $queryRaw: jest.fn().mockResolvedValue([]),
     chatMember: { findMany: jest.fn() },
+    user: { findMany: jest.fn() },
     chatMessage: { findMany: jest.fn() },
     chatConversation: { findUnique: jest.fn() },
     circle: { findUnique: jest.fn() },
@@ -106,6 +112,7 @@ describe('ChatPushService', () => {
       broadcast as never,
     );
     prisma.$queryRaw.mockResolvedValue([]);
+    prisma.user.findMany.mockResolvedValue([]);
     prisma.chatConversation.findUnique.mockResolvedValue({
       type: 'DIRECT',
       circleID: null,
@@ -149,21 +156,59 @@ describe('ChatPushService', () => {
         circleID: null,
       });
       prisma.chatMember.findMany.mockResolvedValue([
-        seat('disabled', { user: { groupOfflinePushEnabled: false } }),
+        seat('disabled'),
         seat('enabled'),
       ]);
+      prisma.user.findMany.mockResolvedValue([{ id: 'disabled' }]);
       await pushNow(msg());
+      expect(prisma.user.findMany).toHaveBeenCalledWith({
+        where: {
+          id: { in: ['disabled', 'enabled'] },
+          groupOfflinePushEnabled: false,
+        },
+        select: { id: true },
+      });
       expect(pushedUserIds()).toEqual(['enabled']);
     },
   );
 
   it('group offline preference does not suppress direct messages', async () => {
-    prisma.chatMember.findMany.mockResolvedValue([
-      seat('peer', { user: { groupOfflinePushEnabled: false } }),
-    ]);
+    prisma.chatMember.findMany.mockResolvedValue([seat('peer')]);
     await pushNow(msg());
+    expect(prisma.user.findMany).not.toHaveBeenCalled();
     expect(pushedUserIds()).toEqual(['peer']);
   });
+
+  // The prisma mock accepts any select, which is how a select on a relation
+  // ChatMember does not have shipped and failed every push at runtime.
+  it.each(['DIRECT', 'GROUP'])(
+    'only queries fields that exist on the Prisma models (%s)',
+    async (type) => {
+      prisma.chatConversation.findUnique.mockResolvedValue({
+        type,
+        circleID: null,
+      });
+      prisma.chatMember.findMany.mockResolvedValue([seat('u-peer')]);
+      await pushNow(msg());
+
+      for (const [model, findMany] of [
+        ['ChatMember', prisma.chatMember.findMany],
+        ['User', prisma.user.findMany],
+      ] as const) {
+        const fields = modelFields(model);
+        for (const [args] of findMany.mock.calls as Array<
+          [{ select: object }]
+        >) {
+          for (const key of Object.keys(args.select)) {
+            expect(fields).toContain(key);
+          }
+        }
+      }
+      expect(prisma.user.findMany).toHaveBeenCalledTimes(
+        type === 'GROUP' ? 1 : 0,
+      );
+    },
+  );
 
   it('attaches a per-recipient unread badge on small fanouts (G-18)', async () => {
     prisma.chatMember.findMany.mockResolvedValue([seat('u-peer')]);
@@ -306,11 +351,7 @@ describe('ChatPushService', () => {
           clearedBeforeHeight: { lt: 5 },
         },
         // 只取 ChatMember_fanout_idx 覆盖的列(见 fanout index migration spec)。
-        select: {
-          userID: true,
-          muted: true,
-          user: { select: { groupOfflinePushEnabled: true } },
-        },
+        select: { userID: true, muted: true },
       }),
     );
     expect(pushedUserIds()).toEqual(['u-peer']);
