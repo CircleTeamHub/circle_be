@@ -7275,6 +7275,38 @@ describe('NoteService', () => {
       expect(prisma.note.updateMany).not.toHaveBeenCalled();
     });
 
+    // 原件没了：恢复出来是一份谁都打不开、还占名额的笔记。拒绝，副本留在回收站。
+    it.each([
+      ['deleted into the bin', { status: 'DELETED' }],
+      ['purged for good', null],
+    ])(
+      '404s instead of restoring a collected copy whose original was %s',
+      async (_label, root) => {
+        prisma.note.findFirst
+          .mockResolvedValueOnce({
+            id: 'deleted-copy',
+            collectedFromNoteID: 'parent-copy',
+            rootSourceNoteID: 'source-note',
+          })
+          .mockResolvedValueOnce(null);
+        prisma.note.findUnique.mockResolvedValueOnce(root);
+
+        await expect(
+          service.restoreNote('user-1', 'deleted-copy'),
+        ).rejects.toMatchObject({
+          status: 404,
+          response: expect.objectContaining({
+            errorCode: NoteErrorCode.NotFound,
+          }),
+        });
+        expect(prisma.note.findUnique).toHaveBeenCalledWith({
+          where: { id: 'source-note' },
+          select: { status: true },
+        });
+        expect(prisma.note.updateMany).not.toHaveBeenCalled();
+      },
+    );
+
     it('maps a concurrent restore unique collision to NOTE_RESTORE_DUPLICATE', async () => {
       prisma.note.findFirst
         .mockResolvedValueOnce({
@@ -7303,6 +7335,7 @@ describe('NoteService', () => {
           rootSourceNoteID: 'source-note',
         })
         .mockResolvedValueOnce(null);
+      prisma.note.findUnique.mockResolvedValueOnce({ status: 'ACTIVE' });
       prisma.note.updateMany.mockResolvedValueOnce({ count: 1 });
 
       await service.restoreNote('user-1', 'deleted-copy');

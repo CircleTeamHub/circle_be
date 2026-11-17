@@ -6060,6 +6060,21 @@ export class NoteService implements NoteCardProjector {
           errorCode: NoteErrorCode.AlreadyCollected,
         });
       }
+      // 收藏副本的原件（收录链的根）已删除或已被彻底清掉：恢复出来也是一份谁都打不开的
+      // 笔记（读取按根的状态判已删除），还白占一个存储名额。直接拒绝，副本留在回收站里。
+      const rootID = this.noteRootID(target);
+      if (rootID !== target.id) {
+        const root = await this.prisma.note.findUnique({
+          where: { id: rootID },
+          select: { status: true },
+        });
+        if (!root || root.status === 'DELETED') {
+          throw new NotFoundException({
+            message: '原笔记已被删除，这份收藏无法恢复',
+            errorCode: NoteErrorCode.NotFound,
+          });
+        }
+      }
     }
     let result: { count: number };
     try {
