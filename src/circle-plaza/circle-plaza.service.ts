@@ -55,6 +55,8 @@ import { logBusinessEvent } from 'src/logging/business-event.logger';
 import { buildImageMedia } from 'src/media/image-media';
 import { AssistantAlertDeliveryProcessor } from 'src/assistant/assistant-alert-delivery.processor';
 import { AssistantSubscriptionService } from 'src/assistant/assistant-subscription.service';
+import { NoteService } from 'src/note/note.service';
+import type { PlazaPostNoteCardDto } from 'src/note/dto/note.dto';
 import {
   activeUnexpiredPostWhere,
   CIRCLE_POST_AUTO_END_MS,
@@ -128,6 +130,7 @@ export class CirclePlazaService {
     private readonly iconService: IconService,
     private readonly membershipPolicy: MembershipPolicyService,
     private readonly avatarFrames: AvatarFrameService,
+    private readonly notes: NoteService,
     @Optional()
     private readonly assistantSubscriptions?: AssistantSubscriptionService,
     @Optional()
@@ -291,12 +294,13 @@ export class CirclePlazaService {
     }
 
     if (dto.noteId) {
+      // 只收自己上架（ACTIVE）且可见的笔记：下架、已删除（回收站）、别人的笔记都拒。
       const note = await this.prisma.note.findFirst({
         where: {
           id: dto.noteId,
           ownerID: userId,
           available: true,
-          status: { not: 'DELETED' },
+          status: 'ACTIVE',
         },
         select: { id: true },
       });
@@ -308,6 +312,10 @@ export class CirclePlazaService {
         });
       }
     }
+    // 在建帖事务之前投影：投影失败时什么都没写，客户端重试不会重复发帖。
+    const noteCards = await this.notes.projectPlazaNoteCards(
+      dto.noteId ? [dto.noteId] : [],
+    );
 
     const expiresInHours =
       dto.expiresInHours ?? DEFAULT_CIRCLE_POST_EXPIRY_HOURS;
@@ -473,6 +481,7 @@ export class CirclePlazaService {
       true,
       displayIconsByAuthor.get(post.author.id) ?? [],
       avatarFrameAppearance,
+      noteCards,
     );
   }
 
@@ -681,18 +690,23 @@ export class CirclePlazaService {
         : null;
 
     const postIds = posts.map((p) => p.id);
-    const [mySignups, displayIconsByAuthor, appearances] = await Promise.all([
-      postIds.length
-        ? this.prisma.circlePostSignup.findMany({
-            where: { userID: viewerId, postID: { in: postIds } },
-            select: { postID: true },
-          })
-        : Promise.resolve([]),
-      this.getDisplayIconsByAuthorIds(posts.map((post) => post.author.id)),
-      this.avatarFrames.resolvePublicAppearances(
-        posts.map((post) => post.author.id),
-      ),
-    ]);
+    const [mySignups, displayIconsByAuthor, appearances, noteCards] =
+      await Promise.all([
+        postIds.length
+          ? this.prisma.circlePostSignup.findMany({
+              where: { userID: viewerId, postID: { in: postIds } },
+              select: { postID: true },
+            })
+          : Promise.resolve([]),
+        this.getDisplayIconsByAuthorIds(posts.map((post) => post.author.id)),
+        this.avatarFrames.resolvePublicAppearances(
+          posts.map((post) => post.author.id),
+        ),
+        // 整页一次批量投影，不按帖逐条查。
+        this.notes.projectPlazaNoteCards(
+          posts.flatMap((post) => (post.noteID ? [post.noteID] : [])),
+        ),
+      ]);
     const signedSet = new Set(mySignups.map((s) => s.postID));
 
     const items = posts.map((post) =>
@@ -703,6 +717,7 @@ export class CirclePlazaService {
         this.checkCanSignup(post, viewerEntitlements),
         displayIconsByAuthor.get(post.author.id) ?? [],
         appearances.get(post.author.id)?.avatarFrame ?? null,
+        noteCards,
       ),
     );
 
@@ -801,14 +816,16 @@ export class CirclePlazaService {
       });
     }
 
-    const [signed, displayIconsByAuthor, appearances] = await Promise.all([
-      this.prisma.circlePostSignup.findUnique({
-        where: { postID_userID: { postID: postId, userID: viewerId } },
-        select: { id: true },
-      }),
-      this.getDisplayIconsByAuthorIds([post.author.id]),
-      this.avatarFrames.resolvePublicAppearances([post.author.id]),
-    ]);
+    const [signed, displayIconsByAuthor, appearances, noteCards] =
+      await Promise.all([
+        this.prisma.circlePostSignup.findUnique({
+          where: { postID_userID: { postID: postId, userID: viewerId } },
+          select: { id: true },
+        }),
+        this.getDisplayIconsByAuthorIds([post.author.id]),
+        this.avatarFrames.resolvePublicAppearances([post.author.id]),
+        this.notes.projectPlazaNoteCards(post.noteID ? [post.noteID] : []),
+      ]);
 
     const viewerEntitlements: ViewerEntitlements | null = viewer
       ? {
@@ -825,6 +842,7 @@ export class CirclePlazaService {
       this.checkCanSignup(post, viewerEntitlements),
       displayIconsByAuthor.get(post.author.id) ?? [],
       appearances.get(post.author.id)?.avatarFrame ?? null,
+      noteCards,
     );
   }
 
@@ -843,9 +861,10 @@ export class CirclePlazaService {
         errorCode: PlazaErrorCode.PostNotFound,
       });
     }
-    const [icons, appearances] = await Promise.all([
+    const [icons, appearances, noteCards] = await Promise.all([
       this.getDisplayIconsByAuthorIds([authorId]),
       this.avatarFrames.resolvePublicAppearances([authorId]),
+      this.notes.projectPlazaNoteCards(post.noteID ? [post.noteID] : []),
     ]);
     return this.toPlazaPostDto(
       post,
@@ -854,6 +873,7 @@ export class CirclePlazaService {
       false,
       icons.get(authorId) ?? [],
       appearances.get(authorId)?.avatarFrame ?? null,
+      noteCards,
     );
   }
 
@@ -1819,6 +1839,8 @@ export class CirclePlazaService {
     canSignup: boolean,
     displayIcons: DisplayIconDto[],
     avatarFrameAppearance: AvatarFramePublicAppearance | null,
+    /** 这一页动态附带笔记的卡片（NoteService.projectPlazaNoteCards），按笔记 id。 */
+    noteCards: ReadonlyMap<string, PlazaPostNoteCardDto>,
   ): PlazaPostDto {
     return {
       id: post.id,
@@ -1831,6 +1853,7 @@ export class CirclePlazaService {
       cities: post.cities ?? (post.city ? [post.city] : []),
       isHorn: post.isHorn,
       noteId: post.noteID,
+      noteCard: (post.noteID && noteCards.get(post.noteID)) || null,
       restrictions: {
         vipLevel: post.vipRestriction,
         creditScore: post.creditRestriction,

@@ -14,12 +14,12 @@ import {
 
 /**
  * 笔记列表摘要改成「标量列 select + SQL 投影 + 只签封面」后，在真 PostgreSQL 上与原实现
- * 逐字段对照（listNotes / 公开的 resolveShareLink；回收站列表 2026-11 已取消）：
+ * 逐字段对照（listNotes / listDeletedNotes / 公开的 resolveShareLink）：
  * - 原实现照抄改造前的代码：NOTE_INCLUDE 整行 → 收录链 overlay → 补圈子 id → 全量签名
  *   → 原 mapSummary（逐行照抄在下面）；新实现就是 NoteService 本身，跑真的 PrismaClient；
  * - 覆盖纯文字、长文、开头大段空白（要补读正文）、预览 120 字边界、代理对、Unicode 空白、
  *   控制字符、带媒体 / 封面回退、带名片（含坏数据与旧圈子卡片）、各种显式分区与畸形
- *   sections、正文块数组、分组、收录副本、已删除、分享链接（访客视角）；
+ *   sections、正文块数组、分组、收录副本、回收站、分享链接（访客视角）；
  * - 两边的 DTO 序列化后逐字节相同（字段顺序也一样），并且新实现签名的对象只剩封面、
  *   搬回来的数据量小一个数量级。
  */
@@ -203,6 +203,18 @@ describePostgres('note list summaries (PostgreSQL)', () => {
       skip: (page - 1) * limit,
     });
     return oldPage(notes, limit, ownerID);
+  };
+
+  const oldListDeleted = async (ownerID: string, page = 1, limit = 500) => {
+    const take = Math.min(limit, NOTE_LIST_DEFAULT_LIMIT);
+    const notes = await prisma.note.findMany({
+      where: { ownerID, status: 'DELETED' },
+      orderBy: { updatedAt: 'desc' },
+      take: take + 1,
+      skip: (page - 1) * take,
+      include: NOTE_INCLUDE_BEFORE,
+    });
+    return oldPage(notes, take, ownerID);
   };
 
   const oldResolveShareLink = async (token: string) => {
@@ -632,7 +644,7 @@ describePostgres('note list summaries (PostgreSQL)', () => {
     });
     await note('n-copy-purged', { collectedFromNoteID: 'gone-forever' });
 
-    // ── 已删除（等 NoteCleanup 删行）──────────────────────────────────────────
+    // ── 回收站 ──────────────────────────────────────────────────────────────
     await note('d-1', { status: 'DELETED', counts: [1, 1, 0, 0] });
     await media('m-d1', 'd-1', 'IMAGE', 0);
     await note('d-2', {
@@ -750,6 +762,18 @@ describePostgres('note list summaries (PostgreSQL)', () => {
     await compare(
       () => service.listNotes('u1', { groupId: 'g1' }),
       () => oldListNotes('u1', { groupId: 'g1' }),
+    );
+  });
+
+  it('lists the recycle bin exactly like the full-row implementation', async () => {
+    const { expected } = await compare(
+      () => service.listDeletedNotes('u1'),
+      () => oldListDeleted('u1'),
+    );
+    expect((expected as { items: unknown[] }).items).toHaveLength(2);
+    await compare(
+      () => service.listDeletedNotes('u1', 2, 1),
+      () => oldListDeleted('u1', 2, 1),
     );
   });
 

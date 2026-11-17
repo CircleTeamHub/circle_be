@@ -58,6 +58,7 @@ describePostgres('circle plaza createPost hot row (PostgreSQL)', () => {
       { getDisplayIconsForUsers: async () => new Map() } as never,
       membership,
       { resolvePublicAppearances: async () => new Map() } as never,
+      { projectPlazaNoteCards: async () => new Map() } as never,
     );
   }, 60_000);
 

@@ -8,19 +8,24 @@ import {
 import { PrismaService } from 'src/prisma/prisma.service';
 import { prismaErrorCode } from 'src/utils/prisma-tx';
 import {
-  deletedNotesQuery,
+  expiredRecycleBinNotesQuery,
   expiredUnlistedNotesQuery,
   type NoteCleanupCursor,
   type NoteCleanupRow,
 } from './note-cleanup.query';
 import { purgeDeletedNote } from './note-purge';
-import { NOTE_UNLISTED_RETENTION_MS, NoteService } from './note.service';
+import {
+  NOTE_RECYCLE_BIN_RETENTION_MS,
+  NOTE_UNLISTED_RETENTION_MS,
+  NoteService,
+} from './note.service';
 
 /**
- * 笔记清理（2026-11 取消回收站后）：
- * 1. 下架（UNLISTED）满 60 天的笔记按主人删除处理 —— 标 DELETED 并广播给收藏者与聊天卡片；
- * 2. 全部已删除（DELETED）的笔记物理删除，不论删了多久：删除即永久，DELETED 只是
- *    「已对所有人消失、等这里删行」的中间态。每 10 分钟一轮。
+ * 笔记清理，每 10 分钟一轮，两种到期各归这里一处：
+ * 1. 下架（UNLISTED）满 60 天的笔记永久删除 —— 先标 DELETED 并广播给收藏者与聊天卡片，
+ *    再当场删行，不进回收站（60 天就是期限，不再多给 30 天）；
+ * 2. 回收站（DELETED）里删除满 30 天的笔记永久删除。30 天内主人可在回收站恢复或
+ *    「立即删除」（NoteService.restoreNote / purgeNote）。
  *
  * 删行走 purgeDeletedNote（含收录链改指向），只删 Postgres 行：MinIO 对象**必须**留下 ——
  * collectNote 快照复制沿用原作者的 objectKey，同一对象可能被原件与任意多个收藏副本共享，
@@ -39,6 +44,9 @@ export class NoteCleanup {
   @TrackedCron(CronExpression.EVERY_10_MINUTES, 'note_cleanup')
   async sweep(now: Date = new Date()): Promise<void> {
     const unlistedBefore = new Date(now.getTime() - NOTE_UNLISTED_RETENTION_MS);
+    const deletedBefore = new Date(
+      now.getTime() - NOTE_RECYCLE_BIN_RETENTION_MS,
+    );
     try {
       const expired = await this.drain(
         (after) =>
@@ -47,17 +55,26 @@ export class NoteCleanup {
             after,
             limit: NoteCleanup.BATCH_SIZE,
           }),
-        (row) => this.notes.expireUnlistedNote(row, unlistedBefore),
+        // 标记成功就以主人的名义当场删行（同回收站「立即删除」的守卫）。删行失败的
+        // 留在回收站里，30 天到期再删。
+        async (row) =>
+          (await this.notes.expireUnlistedNote(row, unlistedBefore)) &&
+          purgeDeletedNote(this.prisma, row.id, { ownerID: row.ownerID }),
       );
-      // 第 1 步刚标成 DELETED 的这一轮就删掉。
       const purged = await this.drain(
-        (after) => deletedNotesQuery({ after, limit: NoteCleanup.BATCH_SIZE }),
-        (row) => purgeDeletedNote(this.prisma, row.id),
+        (after) =>
+          expiredRecycleBinNotesQuery({
+            deletedBefore,
+            after,
+            limit: NoteCleanup.BATCH_SIZE,
+          }),
+        // 删除时按同一截止时间复核：查出候选后被恢复、又删进回收站的不动。
+        (row) => purgeDeletedNote(this.prisma, row.id, { deletedBefore }),
       );
       if (expired.failed + purged.failed > 0) reportHandledJobFailure();
       if (expired.done + purged.done > 0) {
         this.logger.log(
-          `expired ${expired.done} unlisted note(s), purged ${purged.done} deleted note(s)`,
+          `expired ${expired.done} unlisted note(s), purged ${purged.done} recycle-bin note(s)`,
         );
       }
     } catch (err) {

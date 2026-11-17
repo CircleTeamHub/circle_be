@@ -549,12 +549,33 @@ export class SetNoteSourceConversationDto {
 }
 
 /**
- * GET /note 的默认页大小，同时是 limit 的上限。
+ * GET /note 与 GET /note/recycle-bin 的默认页大小，同时是 limit 的上限。
  *
  * app 从不传 page/limit，且依赖响应体是数组：默认页必须装得下整本笔记 —— 以前默认
  * 50，第 51 条起被静默截掉。仍然装不下时由 controller 的 X-Has-More 响应头告知。
  */
 export const NOTE_LIST_DEFAULT_LIMIT = 500;
+
+export class RecycleBinQueryDto {
+  @ApiPropertyOptional({ default: 1 })
+  @IsOptional()
+  @Type(() => Number)
+  @IsInt()
+  @Min(1)
+  @Max(MAX_PAGE)
+  page = 1;
+
+  @ApiPropertyOptional({
+    default: NOTE_LIST_DEFAULT_LIMIT,
+    maximum: NOTE_LIST_DEFAULT_LIMIT,
+  })
+  @IsOptional()
+  @Type(() => Number)
+  @IsInt()
+  @Min(1)
+  @Max(NOTE_LIST_DEFAULT_LIMIT)
+  limit = NOTE_LIST_DEFAULT_LIMIT;
+}
 
 export class ListNotesQueryDto {
   @ApiPropertyOptional({ enum: NOTE_STATUS })
@@ -1122,6 +1143,47 @@ export class NoteSourceStateDto {
   /** This month's rating counters of the root; 0 for notes the viewer cannot read. */
   @ApiProperty() goodCount: number;
   @ApiProperty() badCount: number;
+}
+
+/**
+ * 圈子动态附带的笔记卡片（PlazaPostDto.noteCard），字段与 app 的 NoteCardData 一一对应。
+ * 访客视角，同聊天笔记卡片与榜单的摘要投影。他人读不到的笔记（已删除、不可见）只给标题与
+ * 状态，其余为空。
+ */
+export class PlazaPostNoteCardDto {
+  @ApiProperty() noteId: string;
+  @ApiProperty({ description: '笔记主人' }) ownerId: string;
+  @ApiProperty() title: string;
+  @ApiProperty({ type: String, nullable: true }) contentPreview: string | null;
+  @ApiProperty({
+    type: String,
+    nullable: true,
+    description: '现签的封面地址（同笔记摘要）',
+  })
+  coverUrl: string | null;
+  @ApiProperty({
+    type: [String],
+    description:
+      '前几张图片（最多 4 张）的短时签名地址，同聊天笔记卡片的四宫格',
+  })
+  previewUrls: string[];
+  @ApiProperty() imageCount: number;
+  @ApiProperty({ description: '同笔记摘要：含验证视频' }) videoCount: number;
+  @ApiProperty() showcaseCount: number;
+  @ApiProperty() hasText: boolean;
+  @ApiProperty() hasLocation: boolean;
+  @ApiProperty({
+    enum: ['WORKING', 'CLOSED', 'UNSET'],
+    nullable: true,
+    description: '收录链根此刻的场地状态；他人读不到的笔记为 null',
+  })
+  workStatus: 'WORKING' | 'CLOSED' | 'UNSET' | null;
+  @ApiProperty({
+    enum: ['ACTIVE', 'UNLISTED', 'DELETED'],
+    description:
+      '收录链根此刻的状态：下架照常可读（UNLISTED）；不可见（available=false）的也报 UNLISTED、只给标题，同 POST /note/source-states',
+  })
+  publicationStatus: 'ACTIVE' | 'UNLISTED' | 'DELETED';
 }
 
 export class CollectNoteResultDto {

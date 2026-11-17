@@ -22,6 +22,7 @@ import PDFDocument from 'pdfkit';
 import { Prisma } from 'src/generated/prisma';
 import { PrismaService } from 'src/prisma/prisma.service';
 import { MembershipPolicyService } from 'src/membership/membership-policy.service';
+import { purgeDeletedNote } from './note-purge';
 import {
   NOTE_MEDIA_TYPE_LIMITS,
   countNoteMediaByType,
@@ -95,6 +96,7 @@ import {
   NoteCardPeerDto,
   NoteWritableStatus,
   NoteWorkStatus,
+  PlazaPostNoteCardDto,
   SharedNoteListDto,
   UpdateNoteDto,
   UpdateNoteGroupDto,
@@ -401,6 +403,9 @@ type CollectedStateFields = Pick<
 
 /** 下架满这么久（绝对时长，不按上海日历）由 NoteCleanup 永久删除。 */
 export const NOTE_UNLISTED_RETENTION_MS = 60 * 24 * 60 * 60 * 1000;
+
+/** 删进回收站（DELETED）满这么久（绝对时长）由 NoteCleanup 永久删除；期间主人可恢复。 */
+export const NOTE_RECYCLE_BIN_RETENTION_MS = 30 * 24 * 60 * 60 * 1000;
 
 /**
  * 写入状态时的 unlistedAt：进入下架才起算 60 天；已经在下架的再设一遍（含编辑时
@@ -2823,7 +2828,7 @@ export class NoteService implements NoteCardProjector {
       rows.forEach((row) => states.set(row.id, row));
     }
 
-    // 收录链上的笔记被永久删除（主人删除 / 下架满 60 天，由 NoteCleanup 删行）后整行消失，
+    // 收录链上的笔记被永久删除（回收站「立即删除」/ 30 天到期 / 下架满 60 天）后整行消失，
     // 但 collectedFromNoteID 是普通列、仍指着它。查过却查不到的来源只能是被硬删了，
     // 按 DELETED 处理：不能因为「找不到父级」就退回副本自己的 ACTIVE 状态，
     // 让第三方在原笔记删除后还能读、分享、导出、再收藏副本。
@@ -3725,26 +3730,100 @@ export class NoteService implements NoteCardProjector {
     const byId = new Map(rows.map((row) => [row.id, row]));
     // 两次读取之间被永久删除的笔记直接少一名。
     const ordered = ranked.flatMap((row) => byId.get(row.id) ?? []);
-    const [items, previewKeys] = await Promise.all([
-      this.mapSummaryListResolved(ordered, viewerID),
-      this.notePreviewKeys(ordered.map((row) => row.id)),
-    ]);
     // 榜单用聊天卡片的样子展示：每条带前几张图的现签地址（同聊天卡片的四宫格）。
-    // presignNoteMedia 只拿 url 做去重键，这里直接用对象 key。
-    const keys = [...previewKeys.values()].flat();
-    const signed = await this.presignNoteMedia(
-      keys.map((objectKey) => ({ url: objectKey, objectKey })),
-    );
+    const [items, previewUrls] = await Promise.all([
+      this.mapSummaryListResolved(ordered, viewerID),
+      this.notePreviewUrls(ordered.map((row) => row.id)),
+    ]);
     return {
       month,
       city,
       items: items.map((item) => ({
         ...item,
-        previewUrls: (previewKeys.get(item.id) ?? []).flatMap(
-          (key) => signed.get(key) ?? [],
-        ),
+        previewUrls: previewUrls.get(item.id) ?? [],
       })),
     };
+  }
+
+  /**
+   * 圈子动态附带的笔记卡片（PlazaPostDto.noteCard）：与榜单同一套摘要投影
+   * （mapSummaryListResolved，访客视角，封面现签）+ 聊天卡片同款的四宫格预览图。
+   * 一页动态调一次，查询条数与动态条数无关。
+   * - 查不到的 id（已被永久删除）不在结果里，调用方给 null；
+   * - 他人读不到的笔记（已删除；不可见 available=false；收藏副本看收录链根此刻的状态，
+   *   同 requireDistributableForViewer）只给标题与状态：删除报 DELETED，不可见报 UNLISTED
+   *   （同 getSourceStates，不当存在性探针）；正文预览、计数、场地状态都不给，媒体不签；
+   * - 下架（UNLISTED）照常可读，报真实状态。
+   */
+  async projectPlazaNoteCards(
+    noteIds: readonly string[],
+  ): Promise<Map<string, PlazaPostNoteCardDto>> {
+    const ids = [...new Set(noteIds)];
+    const result = new Map<string, PlazaPostNoteCardDto>();
+    if (ids.length === 0) return result;
+    const rows = await this.prisma.note.findMany({
+      where: { id: { in: ids } },
+      select: NOTE_SUMMARY_SELECT,
+    });
+    if (rows.length === 0) return result;
+    // 收藏副本的覆盖层换成根的 status / available，会盖住副本自己这一行的 DELETED，
+    // 所以副本自己删了要单独判。
+    const effective = new Map(
+      (await this.overlayCollectedSourceState(rows)).map((note) => [
+        note.id,
+        note,
+      ]),
+    );
+    const readable: typeof rows = [];
+    for (const row of rows) {
+      const state = effective.get(row.id) ?? row;
+      const deleted = row.status === 'DELETED' || state.status === 'DELETED';
+      if (!deleted && row.available && state.available) {
+        readable.push(row);
+        continue;
+      }
+      result.set(row.id, {
+        noteId: row.id,
+        ownerId: row.ownerID,
+        title: row.title,
+        contentPreview: null,
+        coverUrl: null,
+        previewUrls: [],
+        imageCount: 0,
+        videoCount: 0,
+        showcaseCount: 0,
+        hasText: false,
+        hasLocation: false,
+        workStatus: null,
+        publicationStatus: deleted ? 'DELETED' : 'UNLISTED',
+      });
+    }
+    // 空字符串不会是任何笔记的主人：按访客视角生成摘要。
+    const [summaries, previewUrls] = await Promise.all([
+      this.mapSummaryListResolved(readable, ''),
+      this.notePreviewUrls(readable.map((row) => row.id)),
+    ]);
+    for (const summary of summaries) {
+      result.set(summary.id, {
+        noteId: summary.id,
+        ownerId: summary.ownerId,
+        title: summary.title,
+        contentPreview: summary.contentPreview,
+        coverUrl: summary.cover?.url ?? null,
+        previewUrls: previewUrls.get(summary.id) ?? [],
+        imageCount: summary.imageCount,
+        videoCount: summary.videoCount,
+        showcaseCount: summary.showcaseCount,
+        hasText: summary.hasText,
+        hasLocation: summary.hasLocation,
+        workStatus:
+          summary.workStatus === 'WORKING' || summary.workStatus === 'CLOSED'
+            ? summary.workStatus
+            : 'UNSET',
+        publicationStatus: summary.status,
+      });
+    }
+    return result;
   }
 
   /** 助手提醒附带名片用:只读收藏者自己、未删除的那份;没有就返回 null。 */
@@ -4826,6 +4905,26 @@ export class NoteService implements NoteCardProjector {
     return previewKeys;
   }
 
+  /** notePreviewKeys 签好的地址（榜单、圈子动态的笔记卡片用;聊天卡片在读聊天记录时另签）。 */
+  private async notePreviewUrls(
+    noteIds: string[],
+  ): Promise<Map<string, string[]>> {
+    if (noteIds.length === 0) return new Map();
+    const previewKeys = await this.notePreviewKeys(noteIds);
+    // presignNoteMedia 只拿 url 做去重键，这里直接用对象 key。
+    const signed = await this.presignNoteMedia(
+      [...previewKeys.values()]
+        .flat()
+        .map((objectKey) => ({ url: objectKey, objectKey })),
+    );
+    return new Map(
+      [...previewKeys].map(([noteId, keys]) => [
+        noteId,
+        keys.flatMap((key) => signed.get(key) ?? []),
+      ]),
+    );
+  }
+
   /**
    * Batched live status for chat note cards. Each id resolves through the
    * collect chain to its root, so a card for any hop reports the boss's
@@ -5904,10 +6003,133 @@ export class NoteService implements NoteCardProjector {
     });
   }
 
+  /** FE#92 回收站：已软删笔记列表（新删在前）。 */
+  async listDeletedNotes(
+    ownerID: string,
+    page = 1,
+    limit = NOTE_LIST_DEFAULT_LIMIT,
+  ): Promise<NoteSummaryPage> {
+    const take = Math.min(limit, NOTE_LIST_DEFAULT_LIMIT);
+    const notes = await this.prisma.note.findMany({
+      where: { ownerID, status: 'DELETED' },
+      orderBy: { updatedAt: 'desc' },
+      // 多取一行只为判断 hasMore，不返回给调用方。
+      take: take + 1,
+      skip: (page - 1) * take,
+      select: NOTE_SUMMARY_SELECT,
+    });
+    return this.toSummaryPage(notes, take, ownerID);
+  }
+
   /**
-   * 删除即永久（2026-11 起没有回收站）：先标成 DELETED —— 所有读路径都排除它，
-   * 对所有人立刻消失，并广播给收藏者与聊天卡片 —— 行与媒体行由 NoteCleanup
-   * 几分钟内物理删除（purgeDeletedNote，收录链改指向在那里做）。
+   * FE#92 回收站：恢复软删笔记 → ACTIVE。deleteNote 未记录删除前状态
+   * （UNLISTED/ACTIVE 无从区分），统一回 ACTIVE —— 用户在列表里可再手动下架。
+   * 回到上架即清掉 unlistedAt（同 setStatus ACTIVE），下架的 60 天不带过来。
+   */
+  async restoreNote(ownerID: string, noteId: string): Promise<void> {
+    // round 3 review：收藏复制的笔记受「同源活跃副本唯一」局部索引约束 ——
+    // 删除旧副本→再次收藏→恢复旧副本会撞唯一索引，裂成一个裸 DB 冲突。
+    // 先查同源活跃副本，命中给可控 409。
+    const target = await this.prisma.note.findFirst({
+      where: { id: noteId, ownerID, status: 'DELETED' },
+      select: {
+        id: true,
+        collectedFromNoteID: true,
+        rootSourceNoteID: true,
+      },
+    });
+    if (!target) {
+      throw new NotFoundException({
+        message: 'Note not found',
+        errorCode: NoteErrorCode.NotFound,
+      });
+    }
+    if (target.collectedFromNoteID) {
+      const activeDuplicate = await this.prisma.note.findFirst({
+        where: {
+          ownerID,
+          collectedFromNoteID: target.collectedFromNoteID,
+          status: { not: 'DELETED' },
+          id: { not: noteId },
+        },
+        select: { id: true },
+      });
+      if (activeDuplicate) {
+        throw new ConflictException({
+          message: '该笔记的另一份收藏副本已存在，无需恢复',
+          errorCode: NoteErrorCode.AlreadyCollected,
+        });
+      }
+      // 收藏副本的原件（收录链的根）已删除或已被彻底清掉：恢复出来也是一份谁都打不开的
+      // 笔记（读取按根的状态判已删除），还白占一个存储名额。直接拒绝，副本留在回收站里。
+      const rootID = this.noteRootID(target);
+      if (rootID !== target.id) {
+        const root = await this.prisma.note.findUnique({
+          where: { id: rootID },
+          select: { status: true },
+        });
+        if (!root || root.status === 'DELETED') {
+          throw new NotFoundException({
+            message: '原笔记已被删除，这份收藏无法恢复',
+            errorCode: NoteErrorCode.NotFound,
+          });
+        }
+      }
+    }
+    let result: { count: number };
+    try {
+      result = await runSerializableTransaction(this.prisma, async (tx) => {
+        await this.membershipPolicy.lockUsers(tx, [ownerID]);
+        // Restoring a soft-deleted note re-consumes a storage slot, so it must
+        // pass the same quota gate as create/collect under the user lock —
+        // otherwise delete → create replacements → restore old ones grows past
+        // the cap, and concurrent restores could cross the boundary together.
+        await this.assertNoteStorageAvailable(tx, ownerID);
+        const restored = await tx.note.updateMany({
+          where: { id: noteId, ownerID, status: 'DELETED' },
+          data: { status: 'ACTIVE', unlistedAt: null },
+        });
+        if (restored.count > 0) {
+          await this.enqueueSourceStatusFanout(tx, this.noteRootID(target));
+        }
+        return restored;
+      });
+    } catch (error) {
+      if (prismaErrorCode(error) === 'P2002') {
+        throw new ConflictException({
+          message: '该笔记的另一份收藏副本已存在，无需恢复',
+          errorCode: NoteErrorCode.AlreadyCollected,
+        });
+      }
+      throw error;
+    }
+    if (result.count === 0) {
+      throw new NotFoundException({
+        message: 'Note not found',
+        errorCode: NoteErrorCode.NotFound,
+      });
+    }
+  }
+
+  /**
+   * 回收站「立即删除」：不等 30 天，直接永久删除。与到期清理共用
+   * purgeDeletedNote（收录链改指向、媒体对象保留等语义见那里）。
+   * 只认自己回收站里的笔记（status=DELETED），正常/下架笔记必须先删进回收站。
+   */
+  async purgeNote(ownerID: string, noteId: string): Promise<void> {
+    const removed = await purgeDeletedNote(this.prisma, noteId, { ownerID });
+    if (!removed) {
+      throw new NotFoundException({
+        message: 'Note not found',
+        errorCode: NoteErrorCode.NotFound,
+      });
+    }
+  }
+
+  /**
+   * 软删除进回收站：标成 DELETED —— 除主人的回收站列表外所有读路径都排除它，对他人
+   * 立刻消失，并广播给收藏者与聊天卡片。删除时刻就是 updatedAt（见 NoteCleanup）：
+   * 30 天内可恢复，到期由 NoteCleanup 物理删除（purgeDeletedNote，收录链改指向在那里做）。
    */
   async deleteNote(ownerID: string, noteId: string): Promise<void> {
     const owned = await this.requireOwnedNote(ownerID, noteId);
@@ -5925,9 +6147,9 @@ export class NoteService implements NoteCardProjector {
   }
 
   /**
-   * NoteCleanup 用：下架满 60 天的笔记按主人删除同样处理（标 DELETED + 广播），随后与其它
-   * 已删除笔记一起物理删除。条件写在 UPDATE 里：查出候选之后被重新上架、又被下架
-   * （unlistedAt 变新）的都不动。返回是否标记了。
+   * NoteCleanup 用：下架满 60 天的笔记按主人删除同样处理（标 DELETED + 广播），随后由
+   * NoteCleanup 当场物理删除 —— 不进回收站。条件写在 UPDATE 里：查出候选之后被重新上架、
+   * 又被下架（unlistedAt 变新）的都不动。返回是否标记了。
    */
   async expireUnlistedNote(
     note: { id: string; rootSourceNoteID: string | null },

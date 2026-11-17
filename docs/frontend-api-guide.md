@@ -1077,7 +1077,7 @@ POST /coin/gift
 }
 ```
 
-**status 枚举值：** `ACTIVE`（上架）| `UNLISTED`（下架）| `DELETED`（已删除，等清理任务删行，不会再出现在任何读接口里）
+**status 枚举值：** `ACTIVE`（上架）| `UNLISTED`（下架）| `DELETED`（在回收站：只出现在主人的 `GET /note/recycle-bin` 里，其他读接口一律不返回；删除满 30 天永久删除）
 
 - 下架（`UNLISTED`）只是给读者看的状态：他人照常可读、可收藏、可转发，带着真实 `status`；主人要藏起来用 `available=false`。2026-11 起场地「下架」`workStatus=OFF_SHELF` 已并入这里，不再返回。
 - `unlistedAt`：这次下架的时刻，上架为 `null`；满 60 天（绝对时长）永久删除。
@@ -1135,7 +1135,7 @@ Authorization: Bearer <accessToken>
 - `page` 可选，默认 1（上限 500）
 - `limit` 可选，默认 500，上限 500
 
-**响应头：** `X-Has-More: true|false` —— 本页之后是否还有笔记。响应体始终是数组；为 `true` 时用下一个 `page` 继续拉取。回收站（`GET /note/recycle-bin`、`POST /note/:id/restore`、`DELETE /note/:id/permanent`）2026-11 已取消。
+**响应头：** `X-Has-More: true|false` —— 本页之后是否还有笔记。响应体始终是数组；为 `true` 时用下一个 `page` 继续拉取。`GET /note/recycle-bin`（回收站）同一分页口径与同一响应头。
 
 **Response 200：**
 ```json
@@ -1265,9 +1265,25 @@ DELETE /note/:id
 Authorization: Bearer <accessToken>
 ```
 
-> 永久删除，不可恢复：立刻对所有人消失，行与媒体行由清理任务几分钟内删掉（媒体对象按存储审计流程另行回收）。
+> 软删除，`status` 更新为 `DELETED`：进回收站，立刻对他人消失；30 天内可恢复，删除满 30 天由清理任务永久删除（媒体对象按存储审计流程另行回收）。已在回收站的再删一次是 404 `NOTE_NOT_FOUND`。
 
 **Response 204：** 无内容
+
+---
+
+### 回收站
+
+```
+GET /note/recycle-bin?page=1&limit=500
+POST /note/:id/restore
+DELETE /note/:id/permanent
+Authorization: Bearer <accessToken>
+```
+
+- `GET /note/recycle-bin`：主人自己 `status=DELETED` 的笔记，按删除时间新到旧。**Response 200：** `NoteSummary[]`（同 `GET /note`），分页参数与 `X-Has-More` 响应头同 `GET /note`。
+- `POST /note/:id/restore`：恢复回收站里的笔记，一律回到 `ACTIVE`（`unlistedAt` 为 `null`，删除前是下架的也一样）。**Response 201：** 无内容。不在自己回收站里 → 404 `NOTE_NOT_FOUND`；已经另有一份同源的收藏副本 → 409 `NOTE_RESTORE_DUPLICATE`；笔记数已到上限 → 403 `NOTE_STORAGE_QUOTA_REACHED`。
+- `DELETE /note/:id/permanent`：立即永久删除回收站里的笔记，不再等 30 天。**Response 204：** 无内容。不在自己回收站里（含上架 / 下架的笔记）→ 404 `NOTE_NOT_FOUND`。
+- 下架满 60 天的笔记直接永久删除，不进回收站。
 
 ---
 
@@ -1437,7 +1453,22 @@ Authorization: Bearer <accessToken>
   "city": "上海",
   "cities": ["上海"],
   "isHorn": false,
-  "noteId": null,
+  "noteId": "uuid",
+  "noteCard": {                   // 附带笔记的卡片；没带笔记或笔记已被永久删除时为 null
+    "noteId": "uuid",
+    "ownerId": "uuid",
+    "title": "老王烧烤",
+    "contentPreview": "人均 80，营业到凌晨两点",
+    "coverUrl": "https://...signed",
+    "previewUrls": ["https://...signed"],   // 前几张图（最多 4 张），同聊天笔记卡片
+    "imageCount": 3,
+    "videoCount": 1,              // 同笔记摘要，含验证视频
+    "showcaseCount": 0,
+    "hasText": true,
+    "hasLocation": true,
+    "workStatus": "WORKING",      // WORKING | CLOSED | UNSET；他人读不到的笔记为 null
+    "publicationStatus": "ACTIVE" // ACTIVE | UNLISTED | DELETED
+  },
   "restrictions": { "vipLevel": null, "creditScore": null, "fancyNumber": false },   // 互动门槛
   "signupCount": 3,
   "signedByMe": false,
@@ -1461,6 +1492,8 @@ Authorization: Bearer <accessToken>
   "expiresAt": "2026-09-01T06:00:00.000Z"
 }
 ```
+
+- `noteCard`：feed / feed/search / 发帖 / 帖子详情 / 我的帖子详情都带，访客视角（同聊天笔记卡片：主人的备注、名片不带）。笔记下架照常显示，`publicationStatus` 为 `UNLISTED`；他人读不到的笔记（已删除进回收站、主人设成不可见、收藏副本的原笔记已删除）只给 `noteId`、`ownerId`、`title` 与 `publicationStatus`（删除为 `DELETED`，不可见为 `UNLISTED`），其余为空值、`previewUrls` 为 `[]`，封面与图片不签名。
 
 `MyCirclePost`：`{ id, circleId, excerpt, firstImage, signupCount, unreadSignupCount, status, createdAt, expiresAt }`。
 `PostSignupItem`：`{ userId, nickname, avatarUrl, accountId, signedAt, seen, displayIcons, recognized }`。
@@ -1492,7 +1525,7 @@ Authorization: Bearer <accessToken>
 | `tags` | 否 | ≤ 5，去重，每项 ≤ 30 字 |
 | `circleIds` | 是（或旧字段 `circleId`） | UUID 数组 ≤ 50，去重，至少 1 个；第一个为主圈子 |
 | `cities` | 否（或旧字段 `city`） | ≤ 50，去重，每项 ≤ 100 字 |
-| `noteId` | 否 | UUID，关联笔记（无效时 `PLAZA_NOTE_INVALID`） |
+| `noteId` | 否 | UUID，关联笔记：只能是自己上架（`ACTIVE`）且可见的笔记；下架、已删除、别人的笔记都返回 400 `PLAZA_NOTE_INVALID` |
 | `isHorn` | 否 | 布尔，默认 `false` |
 | `expiresInHours` | 否 | 6–168，默认 6 |
 | `vipRestriction` / `signupVipRestriction` | 否 | 0–4，互动 / 报名的会员门槛 |

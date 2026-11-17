@@ -75,6 +75,7 @@ describePostgres('circle plaza signup transactions (PostgreSQL)', () => {
       {} as never,
       membership,
       {} as never,
+      { projectPlazaNoteCards: async () => new Map() } as never,
     );
   }, 60_000);
 

@@ -1,9 +1,13 @@
 import { NoteCleanup } from 'src/note/note-cleanup';
 import {
-  deletedNotesQuery,
+  expiredRecycleBinNotesQuery,
   expiredUnlistedNotesQuery,
 } from 'src/note/note-cleanup.query';
-import { NOTE_UNLISTED_RETENTION_MS, NoteService } from 'src/note/note.service';
+import {
+  NOTE_RECYCLE_BIN_RETENTION_MS,
+  NOTE_UNLISTED_RETENTION_MS,
+  NoteService,
+} from 'src/note/note.service';
 import { describePostgres, explainPlan } from './pg-test-db';
 import {
   type LiveSchema,
@@ -13,11 +17,11 @@ import {
 } from './live-prisma';
 
 /**
- * 取消回收站后的笔记清理（NoteCleanup）与下架合并迁移，在真 PostgreSQL + 真 PrismaClient 上：
- * - 候选查询：DELETED 不论删了多久全取；UNLISTED 只取 unlistedAt <= now − 60×24h（边界两侧
- *   各差 1 毫秒）；上架的不碰；两条都落在迁移里的部分索引上；
- * - 整轮跑完：到期下架笔记先标 DELETED、排上状态广播，再和其它已删除笔记一起删行
- *   （媒体行随外键级联），下游收藏副本留着；
+ * 笔记清理（NoteCleanup）与下架合并迁移，在真 PostgreSQL + 真 PrismaClient 上：
+ * - 候选查询：DELETED 只取 updatedAt < now − 30×24h（回收站到期）；UNLISTED 只取
+ *   unlistedAt <= now − 60×24h（边界两侧各差 1 毫秒）；上架的不碰；两条都落在迁移里的部分索引上；
+ * - 整轮跑完：到期下架笔记先标 DELETED、排上状态广播，再当场删行（不进回收站）；回收站里
+ *   到期的删行（媒体行随外键级联），还没到期的留着；下游收藏副本留着；
  * - 迁移 20261113130000 的数据改写：OFF_SHELF 的上架笔记转下架、旧标记清空、已下架的从部署时起算。
  */
 jest.setTimeout(60_000);
@@ -27,6 +31,9 @@ const COLLECTOR = 'collector';
 const NOW = new Date('2026-11-13T12:00:00.000Z');
 const CUTOFF = new Date(NOW.getTime() - NOTE_UNLISTED_RETENTION_MS);
 const ms = (offset: number) => new Date(CUTOFF.getTime() + offset);
+const DELETED_CUTOFF = new Date(NOW.getTime() - NOTE_RECYCLE_BIN_RETENTION_MS);
+const deletedMs = (offset: number) =>
+  new Date(DELETED_CUTOFF.getTime() + offset);
 
 /** 迁移文件里的一类语句（去注释、按分号切），照 Prisma 逐条执行的方式跑。 */
 function migrationStatements(name: string, keep: RegExp): string[] {
@@ -109,10 +116,19 @@ describePostgres('note cleanup on PostgreSQL', () => {
     );
   });
 
-  it('selects every deleted note and only 下架 notes at least 60 days old', async () => {
+  it('selects recycle-bin notes past 30 days and only 下架 notes at least 60 days old', async () => {
     await note('deleted-long-ago', {
       status: 'DELETED',
       updatedAt: new Date('2026-01-01T00:00:00.000Z'),
+    });
+    await note('deleted-1ms-past-30d', {
+      status: 'DELETED',
+      updatedAt: deletedMs(-1),
+    });
+    // 截止是严格小于：正好 30 天的、刚删的都还在回收站里。
+    await note('deleted-exactly-30d', {
+      status: 'DELETED',
+      updatedAt: deletedMs(0),
     });
     await note('deleted-just-now', { status: 'DELETED', updatedAt: NOW });
     await note('unlisted-past', { status: 'UNLISTED', unlistedAt: ms(-1) });
@@ -130,14 +146,17 @@ describePostgres('note cleanup on PostgreSQL', () => {
       unlistedBefore: CUTOFF,
       limit: 200,
     });
-    const deleted = deletedNotesQuery({ limit: 200 });
+    const deleted = expiredRecycleBinNotesQuery({
+      deletedBefore: DELETED_CUTOFF,
+      limit: 200,
+    });
     expect(await ids(expired.text, expired.values)).toEqual([
       'unlisted-past',
       'unlisted-exactly-60d',
     ]);
     expect(await ids(deleted.text, deleted.values)).toEqual([
       'deleted-long-ago',
-      'deleted-just-now',
+      'deleted-1ms-past-30d',
     ]);
   });
 
@@ -192,7 +211,7 @@ describePostgres('note cleanup on PostgreSQL', () => {
     }
   });
 
-  it('expires, fans out and purges in one run, leaving newer 下架 and on-shelf notes', async () => {
+  it('expires, fans out and purges in one run, leaving the recycle bin, newer 下架 and on-shelf notes', async () => {
     await note('deleted-old', {
       status: 'DELETED',
       updatedAt: new Date('2026-01-01T00:00:00.000Z'),
@@ -209,12 +228,18 @@ describePostgres('note cleanup on PostgreSQL', () => {
     });
     await note('unlisted-fresh', { status: 'UNLISTED', unlistedAt: ms(1) });
     await note('active', { status: 'ACTIVE' });
+    // 回收站里还没满 30 天：主人还能恢复，不删。
+    await note('deleted-recent', {
+      status: 'DELETED',
+      updatedAt: deletedMs(1),
+    });
 
     await cleanup.sweep(NOW);
 
     expect(await ids(`SELECT id FROM "Note" ORDER BY id`)).toEqual([
       'active',
       'copy-of-expired',
+      'deleted-recent',
       'unlisted-fresh',
     ]);
     expect(await ids(`SELECT id FROM "NoteMedia"`)).toEqual([]);

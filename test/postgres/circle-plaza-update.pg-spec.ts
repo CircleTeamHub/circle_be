@@ -125,6 +125,7 @@ describePostgres('circle plaza update dot (PostgreSQL)', () => {
         }),
       } as never,
       { resolvePublicAppearances: async () => new Map() } as never,
+      { projectPlazaNoteCards: async () => new Map() } as never,
     );
 
   const databaseNow = async () => {

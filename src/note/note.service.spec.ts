@@ -23,6 +23,7 @@ import { UploadService } from 'src/upload/upload.service';
 import { MembershipPolicyService } from 'src/membership/membership-policy.service';
 import { MembershipProgramService } from 'src/membership/membership-program.service';
 import { NoteService } from './note.service';
+import * as notePurge from './note-purge';
 import { NoteErrorCode } from 'src/common/app-error-codes';
 
 describe('NoteService', () => {
@@ -1584,6 +1585,26 @@ describe('NoteService', () => {
     expect(page.hasMore).toBe(false);
   });
 
+  it('lists up to 500 recycle-bin notes by default and reports hasMore', async () => {
+    prisma.note.findMany.mockResolvedValueOnce(
+      Array.from({ length: 501 }, (_, index) => listRow(index, 'DELETED')),
+    );
+
+    const page = await service.listDeletedNotes('user-1');
+
+    expect(prisma.note.findMany).toHaveBeenCalledWith(
+      expect.objectContaining({
+        where: { ownerID: 'user-1', status: 'DELETED' },
+        orderBy: { updatedAt: 'desc' },
+        take: 501,
+        skip: 0,
+      }),
+    );
+    expect(page.items).toHaveLength(500);
+    expect(page.items[0].status).toBe('DELETED');
+    expect(page.hasMore).toBe(true);
+  });
+
   it('fails note reads with 503 instead of exposing an unsigned media URL', async () => {
     prisma.note.findMany.mockResolvedValueOnce([
       {
@@ -1727,6 +1748,7 @@ describe('NoteService', () => {
     });
 
     it.each([
+      ['listDeletedNotes', () => service.listDeletedNotes('user-1')],
       [
         'listGroupBoundNotes',
         () => service.listGroupBoundNotes('user-1', 'conv-1'),
@@ -3116,8 +3138,8 @@ describe('NoteService', () => {
     );
   });
 
-  // 删除即永久：只标 DELETED（对所有人立刻消失）并广播；删行交给 NoteCleanup。
-  it('deletes a note for everyone at once and leaves the rows to the cleanup job', async () => {
+  // 软删进回收站：只标 DELETED（对他人立刻消失）并广播；30 天后由 NoteCleanup 删行。
+  it('soft deletes a note into the recycle bin', async () => {
     prisma.note.count.mockResolvedValue(51);
     prisma.note.findFirst.mockResolvedValueOnce({
       id: 'note-1',
@@ -7186,6 +7208,163 @@ describe('NoteService', () => {
 
       expect(own.remark).toBe('重要客户');
       expect(foreign.remark).toBeNull();
+    });
+  });
+
+  // 真正的删除（收录链改指向、唯一索引避让、只认回收站）在真库 e2e
+  // test/note-purge-chain.e2e-spec.ts 里验证；这里只守接口口径。
+  describe('purgeNote (recycle bin delete now)', () => {
+    it('purges through the shared recycle-bin delete with an owner guard', async () => {
+      const purge = jest
+        .spyOn(notePurge, 'purgeDeletedNote')
+        .mockResolvedValueOnce(true);
+
+      await service.purgeNote('user-1', 'note-1');
+
+      expect(purge).toHaveBeenCalledWith(prisma, 'note-1', {
+        ownerID: 'user-1',
+      });
+    });
+
+    it('404s for a note that is not in my recycle bin (active, foreign or missing)', async () => {
+      jest.spyOn(notePurge, 'purgeDeletedNote').mockResolvedValueOnce(false);
+
+      await expect(service.purgeNote('user-1', 'note-1')).rejects.toThrow(
+        NotFoundException,
+      );
+    });
+  });
+
+  describe('restoreNote (recycle bin)', () => {
+    it('404s with NOTE_NOT_FOUND when the note is not in my recycle bin', async () => {
+      prisma.note.findFirst.mockResolvedValueOnce(null);
+
+      await expect(
+        service.restoreNote('user-1', 'note-1'),
+      ).rejects.toMatchObject({
+        status: 404,
+        response: expect.objectContaining({
+          errorCode: NoteErrorCode.NotFound,
+        }),
+      });
+      expect(prisma.note.findFirst).toHaveBeenCalledWith(
+        expect.objectContaining({
+          where: { id: 'note-1', ownerID: 'user-1', status: 'DELETED' },
+        }),
+      );
+      expect(prisma.note.updateMany).not.toHaveBeenCalled();
+    });
+
+    it('409s with NOTE_RESTORE_DUPLICATE when another live copy of the same source exists', async () => {
+      prisma.note.findFirst
+        .mockResolvedValueOnce({
+          id: 'deleted-copy',
+          collectedFromNoteID: 'source-note',
+          rootSourceNoteID: 'source-note',
+        })
+        .mockResolvedValueOnce({ id: 'live-copy' });
+
+      await expect(
+        service.restoreNote('user-1', 'deleted-copy'),
+      ).rejects.toMatchObject({
+        status: 409,
+        response: expect.objectContaining({
+          errorCode: NoteErrorCode.AlreadyCollected,
+        }),
+      });
+      expect(prisma.note.updateMany).not.toHaveBeenCalled();
+    });
+
+    // 原件没了：恢复出来是一份谁都打不开、还占名额的笔记。拒绝，副本留在回收站。
+    it.each([
+      ['deleted into the bin', { status: 'DELETED' }],
+      ['purged for good', null],
+    ])(
+      '404s instead of restoring a collected copy whose original was %s',
+      async (_label, root) => {
+        prisma.note.findFirst
+          .mockResolvedValueOnce({
+            id: 'deleted-copy',
+            collectedFromNoteID: 'parent-copy',
+            rootSourceNoteID: 'source-note',
+          })
+          .mockResolvedValueOnce(null);
+        prisma.note.findUnique.mockResolvedValueOnce(root);
+
+        await expect(
+          service.restoreNote('user-1', 'deleted-copy'),
+        ).rejects.toMatchObject({
+          status: 404,
+          response: expect.objectContaining({
+            errorCode: NoteErrorCode.NotFound,
+          }),
+        });
+        expect(prisma.note.findUnique).toHaveBeenCalledWith({
+          where: { id: 'source-note' },
+          select: { status: true },
+        });
+        expect(prisma.note.updateMany).not.toHaveBeenCalled();
+      },
+    );
+
+    it('maps a concurrent restore unique collision to NOTE_RESTORE_DUPLICATE', async () => {
+      prisma.note.findFirst
+        .mockResolvedValueOnce({
+          id: 'deleted-copy',
+          collectedFromNoteID: 'source-note',
+        })
+        .mockResolvedValueOnce(null);
+      prisma.note.updateMany.mockRejectedValueOnce(
+        Object.assign(new Error('unique constraint'), { code: 'P2002' }),
+      );
+
+      await expect(
+        service.restoreNote('user-1', 'deleted-copy'),
+      ).rejects.toMatchObject({
+        response: expect.objectContaining({
+          errorCode: 'NOTE_RESTORE_DUPLICATE',
+        }),
+      });
+    });
+
+    it('restores to ACTIVE with unlistedAt cleared and enqueues the root fan-out in the same serializable transaction', async () => {
+      prisma.note.findFirst
+        .mockResolvedValueOnce({
+          id: 'deleted-copy',
+          collectedFromNoteID: 'parent-copy',
+          rootSourceNoteID: 'source-note',
+        })
+        .mockResolvedValueOnce(null);
+      prisma.note.findUnique.mockResolvedValueOnce({ status: 'ACTIVE' });
+      prisma.note.updateMany.mockResolvedValueOnce({ count: 1 });
+
+      await service.restoreNote('user-1', 'deleted-copy');
+
+      expect(prisma.$transaction).toHaveBeenCalledWith(expect.any(Function), {
+        isolationLevel: 'Serializable',
+      });
+      // 删除前是下架的也一律回上架：unlistedAt 随之清空，60 天不带过来。
+      expect(prisma.note.updateMany).toHaveBeenCalledWith({
+        where: { id: 'deleted-copy', ownerID: 'user-1', status: 'DELETED' },
+        data: { status: 'ACTIVE', unlistedAt: null },
+      });
+      expect(prisma.noteStatusFanoutOutbox.upsert).toHaveBeenCalledWith(
+        expect.objectContaining({ where: { rootNoteID: 'source-note' } }),
+      );
+    });
+
+    it('404s when the note left the recycle bin between the check and the write', async () => {
+      prisma.note.findFirst.mockResolvedValueOnce({
+        id: 'note-1',
+        collectedFromNoteID: null,
+        rootSourceNoteID: null,
+      });
+      prisma.note.updateMany.mockResolvedValueOnce({ count: 0 });
+
+      await expect(service.restoreNote('user-1', 'note-1')).rejects.toThrow(
+        NotFoundException,
+      );
+      expect(prisma.noteStatusFanoutOutbox.upsert).not.toHaveBeenCalled();
     });
   });
 });
