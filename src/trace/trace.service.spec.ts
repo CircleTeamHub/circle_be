@@ -82,6 +82,10 @@ const isFeedPage = (query: unknown) =>
 const isFriendScope = (query: unknown) =>
   typeof (query as Prisma.Sql | undefined)?.sql === 'string' &&
   (query as Prisma.Sql).sql.includes('AS "chatOnly"');
+const isFeedSnapshot = (query: unknown) =>
+  Array.isArray(query) &&
+  query.join('').includes('CURRENT_TIMESTAMP') &&
+  query.join('').includes('snapshotAt');
 
 describe('TraceService', () => {
   let service: TraceService;
@@ -126,17 +130,21 @@ describe('TraceService', () => {
    * 这一页的整行由 trace.findMany 按 id 回填（见 beforeEach）。
    */
   const feed = {
+    snapshotAt: new Date('2026-11-17T08:20:00.123Z'),
     friends: [] as MomentFriendScopeRow[],
     traces: [] as Array<{ id: string }>,
     likes: [] as TraceLikePreviewRow[],
     comments: [] as TraceCommentPreviewRow[],
   };
   const dispatchRaw = async (query: unknown) => {
+    if (isFeedSnapshot(query)) return [{ snapshotAt: feed.snapshotAt }];
     if (isFriendScope(query)) return feed.friends;
     if (isFeedPage(query)) return feed.traces.map(({ id }) => ({ id }));
     if (isLikePreview(query)) return feed.likes;
     if (isCommentPreview(query)) return feed.comments;
-    throw new Error('unexpected raw query');
+    throw new Error(
+      `unexpected raw query: ${Array.isArray(query) ? query.join('') : String((query as Prisma.Sql | undefined)?.sql)}`,
+    );
   };
   /** 点赞 / 评论预览走两条原生 SQL；按查询种类分流各自的结果行。 */
   const stubPreviews = (
@@ -212,6 +220,7 @@ describe('TraceService', () => {
     avatarFrames.resolvePublicAppearances.mockReset();
     avatarFrames.resolvePublicAppearances.mockResolvedValue(new Map());
     feed.friends = [];
+    feed.snapshotAt = new Date('2026-11-17T08:20:00.123Z');
     feed.traces = [];
     feed.likes = [];
     feed.comments = [];
@@ -1310,8 +1319,8 @@ describe('TraceService', () => {
     const [feedQuery] = prisma.trace.findMany.mock.calls[0];
     expect(feedQuery.include).not.toHaveProperty('likeStats');
     expect(feedQuery.include).not.toHaveProperty('comments');
-    // 好友范围、这一页的 id、点赞预览、评论预览：四条原生 SQL。
-    expect(prisma.$queryRaw).toHaveBeenCalledTimes(4);
+    // 数据库快照、好友范围、这一页的 id、点赞预览、评论预览：五条原生 SQL。
+    expect(prisma.$queryRaw).toHaveBeenCalledTimes(5);
     expect(prisma.$queryRaw).toHaveBeenCalledWith(
       traceLikePreviewQuery(['trace-1', 'trace-2'], 20),
     );
@@ -1330,6 +1339,28 @@ describe('TraceService', () => {
     expect(rawQueries.filter(isLikePreview)).toHaveLength(0);
     expect(rawQueries.filter(isCommentPreview)).toHaveLength(0);
     expect(prisma.trace.findMany).not.toHaveBeenCalled();
+  });
+
+  it('returns a database snapshot and excludes moments created after it', async () => {
+    prisma.trace.count.mockResolvedValue(0);
+    prisma.traceLikeStat.findMany.mockResolvedValue([]);
+
+    const result = await service.getFeed('viewer-1', { page: 1, limit: 20 });
+
+    expect(result).toHaveProperty('snapshotAt', feed.snapshotAt.toISOString());
+    const snapshotCall = prisma.$queryRaw.mock.calls.findIndex(([query]) =>
+      isFeedSnapshot(query),
+    );
+    const pageCall = prisma.$queryRaw.mock.calls.findIndex(([query]) =>
+      isFeedPage(query),
+    );
+    expect(snapshotCall).toBeGreaterThanOrEqual(0);
+    expect(snapshotCall).toBeLessThan(pageCall);
+    const pageQuery = prisma.$queryRaw.mock.calls[pageCall][0] as Prisma.Sql;
+    expect(pageQuery.values).toContain(feed.snapshotAt);
+    expect(prisma.trace.count).toHaveBeenCalledWith({
+      where: expect.objectContaining({ createdAt: { lte: feed.snapshotAt } }),
+    });
   });
 
   it('maps preview rows onto each trace with the mutual-friend filter and oldest-first comments', async () => {
@@ -1450,6 +1481,7 @@ describe('TraceService', () => {
       traceFeedPageQuery({
         viewerId: 'viewer-1',
         authorIds: ['viewer-1', 'friend-open', 'viewer-1'],
+        snapshotAt: feed.snapshotAt,
         cursor: null,
         offset: 0,
         take: 20,
@@ -1460,6 +1492,7 @@ describe('TraceService', () => {
       where: {
         deleted: false,
         fromID: { in: ['viewer-1', 'friend-open', 'viewer-1'] },
+        createdAt: { lte: feed.snapshotAt },
         OR: [
           { fromID: 'viewer-1' },
           { visibility: 'FRIENDS_ONLY' },
@@ -1602,6 +1635,7 @@ describe('TraceService', () => {
       traceFeedPageQuery({
         viewerId: 'viewer-1',
         authorIds: ['friend-1'],
+        snapshotAt: feed.snapshotAt,
         cursor: null,
         offset: 0,
         take: 20,
@@ -1664,6 +1698,7 @@ describe('TraceService', () => {
       traceFeedPageQuery({
         viewerId: 'viewer-1',
         authorIds: [authorId],
+        snapshotAt: feed.snapshotAt,
         cursor: null,
         offset: 0,
         take: 20,
@@ -1828,6 +1863,7 @@ describe('TraceService', () => {
       traceFeedPageQuery({
         viewerId: 'viewer-1',
         authorIds: ['viewer-1', 'friend-open'],
+        snapshotAt: feed.snapshotAt,
         cursor: null,
         offset: 0,
         take: 20,
@@ -1859,6 +1895,7 @@ describe('TraceService', () => {
       traceFeedPageQuery({
         viewerId: 'viewer-1',
         authorIds: ['viewer-1', 'friend-1'],
+        snapshotAt: feed.snapshotAt,
         cursor: {
           createdAt: new Date('2026-06-04T00:00:00.000Z'),
           id: 't4',
