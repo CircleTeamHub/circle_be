@@ -110,6 +110,7 @@ describePostgres('storage audit chat reverse lookup (PostgreSQL)', () => {
         $queryRaw: (query: Prisma.Sql) => run(query.text, query.values),
       } as unknown as PrismaService,
       upload as never,
+      { reclaim: async () => undefined } as never,
     );
 
   /** Prisma 调用现场编译成 SQL 再到隔离 schema 执行。 */
@@ -136,6 +137,7 @@ describePostgres('storage audit chat reverse lookup (PostgreSQL)', () => {
         note: { findMany: capturedFindMany('note') },
       } as unknown as PrismaService,
       upload as never,
+      { reclaim: async () => undefined } as never,
     );
 
   type Internals = {

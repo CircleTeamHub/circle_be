@@ -4,6 +4,7 @@ import { JwtGuard } from 'src/guards/jwt.guard';
 import type { RequestWithUser } from 'src/auth/types';
 import { uploadMetrics } from 'src/metrics/upload-metrics';
 import { UploadLimitService } from './upload-limit.service';
+import { UploadIntentService } from './upload-intent.service';
 import { PresignDto, UPLOAD_FOLDERS } from './dto/presign.dto';
 import { PUBLIC_READ_UPLOAD_FOLDERS, UploadService } from './upload.service';
 
@@ -21,6 +22,7 @@ export class UploadController {
   constructor(
     private readonly uploadService: UploadService,
     private readonly uploadLimit: UploadLimitService,
+    private readonly uploadIntent: UploadIntentService,
   ) {}
 
   @Post('presign')
@@ -45,6 +47,16 @@ export class UploadController {
         dto.folder ?? 'avatars',
         req.user.userId,
       );
+      if (dto.purpose) {
+        await this.uploadIntent.track({
+          objectKey: result.key,
+          fileUrl: result.fileUrl!,
+          userID: req.user.userId,
+          purpose: dto.purpose,
+          folder: dto.folder ?? 'avatars',
+          sizeBytes: dto.sizeBytes,
+        });
+      }
       uploadMetrics.observePresign(
         'success',
         Number(process.hrtime.bigint() - startedAt) / 1e9,

@@ -10,6 +10,7 @@ import { RealtimeService } from 'src/realtime/realtime.service';
 import { PrivacySettingsService } from 'src/privacy/privacy-settings.service';
 import { AvatarFrameService } from 'src/avatar-frame/avatar-frame.service';
 import { USER_ME_SELECT } from '../user.select';
+import { UploadIntentService } from 'src/upload/upload-intent.service';
 
 describe('UserService', () => {
   let service: UserService;
@@ -55,6 +56,9 @@ describe('UserService', () => {
   const avatarFrames = {
     resolvePublicAppearances: jest.fn(),
   };
+  const uploadIntent = {
+    claim: jest.fn().mockResolvedValue(undefined),
+  };
 
   async function buildService(
     overrides: { configGet?: (key: string) => string | null } = {},
@@ -70,6 +74,7 @@ describe('UserService', () => {
         { provide: RealtimeService, useValue: realtimeService },
         { provide: PrivacySettingsService, useValue: privacySettings },
         { provide: AvatarFrameService, useValue: avatarFrames },
+        { provide: UploadIntentService, useValue: uploadIntent },
       ],
     }).compile();
     return module.get<UserService>(UserService);
@@ -518,6 +523,34 @@ describe('UserService', () => {
         avatarUrl: 'http://10.0.0.195:9000/circle/avatars/me.png',
       });
       expect(prisma.user.update).toHaveBeenCalled();
+    });
+
+    it('claims the profile avatar in the same transaction before updating', async () => {
+      const avatarUrl = 'https://cdn.example.com/avatars/user-1/me.png';
+
+      await service.update('user-1', { avatarUrl });
+
+      expect(uploadIntent.claim).toHaveBeenCalledWith(
+        prisma,
+        'user-1',
+        'PROFILE_AVATAR',
+        [avatarUrl],
+      );
+      expect(uploadIntent.claim.mock.invocationCallOrder[0]).toBeLessThan(
+        prisma.user.update.mock.invocationCallOrder[0],
+      );
+    });
+
+    it('does not update the profile when claiming its avatar fails', async () => {
+      uploadIntent.claim.mockRejectedValueOnce(new Error('claim failed'));
+
+      await expect(
+        service.update('user-1', {
+          avatarUrl: 'https://cdn.example.com/avatars/user-1/me.png',
+        }),
+      ).rejects.toThrow('claim failed');
+
+      expect(prisma.user.update).not.toHaveBeenCalled();
     });
 
     it('accepts the virtual-hosted COS URL returned by presign', async () => {

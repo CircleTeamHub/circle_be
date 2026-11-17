@@ -69,6 +69,7 @@ describe('UserService.update normalization', () => {
       realtimeService as any,
       privacySettings as any,
       avatarFrames as any,
+      { claim: jest.fn() } as any,
     );
 
     await service.update('user-1', { birthday: '2018-04-04' });
@@ -93,6 +94,7 @@ describe('UserService.update normalization', () => {
       realtimeService as any,
       privacySettings as any,
       avatarFrames as any,
+      { claim: jest.fn() } as any,
     );
 
     await service.update('user-1', {
@@ -128,6 +130,7 @@ describe('UserService.update normalization', () => {
       realtimeService as any,
       privacySettings as any,
       avatarFrames as any,
+      { claim: jest.fn() } as any,
     );
 
     await service.update('user-1', {
@@ -155,6 +158,7 @@ describe('UserService.update normalization', () => {
       realtimeService as any,
       privacySettings as any,
       avatarFrames as any,
+      { claim: jest.fn() } as any,
     );
 
     await service.update('user-1', {
@@ -182,6 +186,7 @@ describe('UserService.update normalization', () => {
       realtimeService as any,
       privacySettings as any,
       avatarFrames as any,
+      { claim: jest.fn() } as any,
     );
 
     await service.update('user-1', {
@@ -209,6 +214,7 @@ describe('UserService.update normalization', () => {
       realtimeService as any,
       privacySettings as any,
       avatarFrames as any,
+      { claim: jest.fn() } as any,
     );
 
     await service.update('user-1', {
@@ -238,6 +244,7 @@ describe('UserService.update normalization', () => {
       realtimeService as any,
       privacySettings as any,
       avatarFrames as any,
+      { claim: jest.fn() } as any,
     );
 
     await service.update('user-1', { nickname: '   ' } as any);

@@ -52,6 +52,7 @@ describe('CirclePlazaService feed connection usage', () => {
     {
       projectPlazaNoteCards: jest.fn().mockResolvedValue(new Map()),
     } as unknown as NoteService,
+    { claim: jest.fn().mockResolvedValue(undefined) } as never,
   );
 
   beforeEach(() => {

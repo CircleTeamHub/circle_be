@@ -97,6 +97,7 @@ describe('trace comment mention notification flow', () => {
       realtime as unknown as RealtimeService,
       privacySettings,
       {} as any,
+      { claim: jest.fn().mockResolvedValue(undefined) } as any,
     );
 
     prisma.trace.findFirst.mockResolvedValue({

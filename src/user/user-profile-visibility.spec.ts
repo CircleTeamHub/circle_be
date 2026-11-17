@@ -38,6 +38,7 @@ describe('UserService.findOne profile visibility', () => {
     {} as never,
     privacySettings as never,
     avatarFrames as never,
+    { claim: jest.fn() } as never,
   );
 
   /** 只通过一个关着开关的独立群认识:群主是别人,本人是普通成员。 */
@@ -226,6 +227,7 @@ describe('UserService.findOne privacy settings reads', () => {
       {
         resolvePublicAppearances: jest.fn().mockResolvedValue(new Map()),
       } as never,
+      { claim: jest.fn() } as never,
     );
 
     await expect(service.findOne('target', 'viewer')).resolves.toMatchObject({

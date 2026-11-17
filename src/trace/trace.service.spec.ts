@@ -27,6 +27,7 @@ import {
   momentFriendScopeQuery,
   traceFeedPageQuery,
 } from './trace-feed.query';
+import { UploadIntentService } from 'src/upload/upload-intent.service';
 
 /** Minimal Trace row in the shape `getFeed`'s include produces. */
 function makeTraceRow(id: string, createdAt: Date) {
@@ -207,6 +208,9 @@ describe('TraceService', () => {
   const avatarFrames = {
     resolvePublicAppearances: jest.fn(),
   };
+  const uploadIntent = {
+    claim: jest.fn().mockResolvedValue(undefined),
+  };
 
   beforeEach(async () => {
     jest.clearAllMocks();
@@ -243,6 +247,7 @@ describe('TraceService', () => {
         { provide: RealtimeService, useValue: realtimeService },
         { provide: PrivacySettingsService, useValue: privacySettings },
         { provide: AvatarFrameService, useValue: avatarFrames },
+        { provide: UploadIntentService, useValue: uploadIntent },
       ],
     }).compile();
 
@@ -295,6 +300,21 @@ describe('TraceService', () => {
         }),
       }),
     );
+    expect(uploadIntent.claim).toHaveBeenCalledWith(
+      prisma,
+      'actor-1',
+      'MOMENT',
+      [
+        'https://cdn.example.com/posts/actor-1/photo.jpg',
+        'posts/actor-1/clip.mp4',
+        'posts/actor-1/poster.jpg',
+        'posts/actor-1/photo.jpg',
+        'posts/actor-1/clip2.mov',
+      ],
+    );
+    expect(uploadIntent.claim.mock.invocationCallOrder[0]).toBeLessThan(
+      prisma.trace.create.mock.invocationCallOrder[0],
+    );
     expect(result).toMatchObject({
       attachments: [
         {
@@ -312,6 +332,28 @@ describe('TraceService', () => {
         },
       ],
     });
+  });
+
+  it('does not create a moment when claiming its media fails', async () => {
+    uploadIntent.claim.mockRejectedValueOnce(new Error('claim failed'));
+    prisma.trace.create.mockResolvedValueOnce({
+      id: 'trace-claim-failure',
+      content: 'image',
+      images: ['https://cdn.example.com/posts/actor-1/photo.jpg'],
+      attachments: null,
+      visibility: 'FRIENDS_ONLY',
+      createdAt: new Date(),
+      from: { id: 'actor-1', nickname: 'Actor', avatarUrl: null },
+    });
+
+    await expect(
+      service.createTrace('actor-1', {
+        content: 'image',
+        images: ['https://cdn.example.com/posts/actor-1/photo.jpg'],
+      } as never),
+    ).rejects.toThrow('claim failed');
+
+    expect(prisma.trace.create).not.toHaveBeenCalled();
   });
 
   it('reads persisted mixed attachments through the existing moment detail visibility flow', async () => {
@@ -930,7 +972,35 @@ describe('TraceService', () => {
         }),
       }),
     );
+    expect(uploadIntent.claim).toHaveBeenCalledWith(
+      prisma,
+      'actor-1',
+      'MOMENT_COMMENT',
+      ['https://cdn.example/img.jpg'],
+    );
+    expect(uploadIntent.claim.mock.invocationCallOrder[0]).toBeLessThan(
+      prisma.traceComment.create.mock.invocationCallOrder[0],
+    );
     expect(result.images).toEqual(['https://cdn.example/img.jpg']);
+  });
+
+  it('does not create a comment when claiming its images fails', async () => {
+    prisma.trace.findFirst.mockResolvedValue({
+      id: 'trace-1',
+      fromID: 'actor-1',
+      deleted: false,
+      visibility: 'PUBLIC',
+    });
+    prisma.friend.findMany.mockResolvedValue([]);
+    uploadIntent.claim.mockRejectedValueOnce(new Error('claim failed'));
+
+    await expect(
+      service.addComment('actor-1', 'trace-1', {
+        images: ['https://cdn.example/img.jpg'],
+      }),
+    ).rejects.toThrow('claim failed');
+
+    expect(prisma.traceComment.create).not.toHaveBeenCalled();
   });
 
   it('rejects blank image entries instead of storing an empty image comment', async () => {

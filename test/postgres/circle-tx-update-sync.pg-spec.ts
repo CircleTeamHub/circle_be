@@ -106,6 +106,7 @@ describePostgres(
         sync,
         {} as never,
         groupEvents as never,
+        { claim: async () => undefined } as never,
       );
     }, 60_000);
 

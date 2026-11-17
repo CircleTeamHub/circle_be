@@ -8,6 +8,7 @@ import { createHash } from 'crypto';
 import { PrismaService } from 'src/prisma/prisma.service';
 import { CHAT_MEDIA_KEY_FIELDS } from 'src/chat/chat.constants';
 import { UploadService } from './upload.service';
+import { UploadIntentService } from './upload-intent.service';
 import {
   ChatMediaContentRow,
   ChatMediaKeyReferenceRow,
@@ -79,6 +80,7 @@ export class StorageAuditService {
   constructor(
     private readonly prisma: PrismaService,
     private readonly upload: UploadService,
+    private readonly uploadIntents: UploadIntentService,
   ) {}
 
   @TrackedCron(CronExpression.EVERY_DAY_AT_5AM, 'storage_audit')
@@ -126,9 +128,24 @@ export class StorageAuditService {
         } while (token);
       }
 
+      try {
+        await this.uploadIntents.reclaim(referenced, now);
+        this.logger.log('storage audit: tracked-intent reclamation completed');
+      } catch {
+        // UploadIntentService owns deletion and row-level retries. A sweep-level
+        // failure still fails this handled cron run, but never copies a key or
+        // user-bearing dependency error into logs.
+        this.logger.error(
+          'storage audit failed during tracked-intent reclamation',
+        );
+        reportHandledJobFailure();
+        return null;
+      }
+
       this.logger.log(
         `storage audit: scanned=${scanned} orphaned=${orphanCount} ` +
-          `bytes=${orphanBytes} (report only, nothing deleted)`,
+          `bytes=${orphanBytes} (bucket inventory report only; ` +
+          `tracked-intent reclamation is reported separately)`,
       );
       if (samples.length > 0) {
         this.logger.log(`orphan samples: ${samples.join(', ')}`);

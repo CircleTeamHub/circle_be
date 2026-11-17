@@ -35,6 +35,7 @@ import { createLoggingConfig } from 'src/logging/logging.config';
 import { logBusinessEvent } from 'src/logging/business-event.logger';
 import { buildImageMedia } from 'src/media/image-media';
 import { normalizeUserIdAlias } from 'src/user/user-id-alias';
+import { UploadIntentService } from 'src/upload/upload-intent.service';
 import type { Prisma } from 'src/generated/prisma';
 import {
   TraceCommentPreviewRow,
@@ -128,6 +129,7 @@ export class TraceService {
     private readonly realtimeService: RealtimeService,
     private readonly privacySettings: PrivacySettingsService,
     private readonly avatarFrames: AvatarFrameService,
+    private readonly uploadIntents: UploadIntentService,
   ) {
     this.storagePublicObjectBases = storagePublicObjectBasesFromConfig(
       this.config,
@@ -433,28 +435,40 @@ export class TraceService {
       userId,
     ]);
 
-    const trace = await this.prisma.trace.create({
-      data: {
-        content: dto.content,
-        images,
-        ...(attachments
-          ? { attachments: attachments as unknown as Prisma.InputJsonValue }
-          : {}),
-        visibility: dto.visibility ?? 'FRIENDS_ONLY',
-        type: 'MOMENT',
-        fromID: userId,
-      },
-      include: {
-        from: {
-          select: {
-            id: true,
-            nickname: true,
-            avatarUrl: true,
-            vipLevel: true,
-            vipExpiresAt: true,
+    const uploadValues = [
+      ...images,
+      ...(attachments ?? []).flatMap((attachment) => [
+        attachment.key,
+        ...(attachment.posterKey ? [attachment.posterKey] : []),
+      ]),
+    ];
+    const trace = await this.prisma.$transaction(async (tx) => {
+      await this.uploadIntents.claim(tx, userId, 'MOMENT', uploadValues);
+      return tx.trace.create({
+        data: {
+          content: dto.content,
+          images,
+          ...(attachments
+            ? {
+                attachments: attachments as unknown as Prisma.InputJsonValue,
+              }
+            : {}),
+          visibility: dto.visibility ?? 'FRIENDS_ONLY',
+          type: 'MOMENT',
+          fromID: userId,
+        },
+        include: {
+          from: {
+            select: {
+              id: true,
+              nickname: true,
+              avatarUrl: true,
+              vipLevel: true,
+              vipExpiresAt: true,
+            },
           },
         },
-      },
+      });
     });
 
     // #89：发布即向可见范围广播 feed poke，客户端由 30s 轮询改为事件驱动。
@@ -830,6 +844,7 @@ export class TraceService {
     const mentionedUserIds = mentionEligibility.eligibleUserIds;
 
     const comment = await this.prisma.$transaction(async (tx) => {
+      await this.uploadIntents.claim(tx, userId, 'MOMENT_COMMENT', images);
       const created = await tx.traceComment.create({
         data: {
           content,

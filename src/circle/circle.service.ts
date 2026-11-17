@@ -48,6 +48,7 @@ import {
 import { createLoggingConfig } from 'src/logging/logging.config';
 import { logBusinessEvent } from 'src/logging/business-event.logger';
 import { reportOperationalError } from 'src/logging/error-aggregation.service';
+import { UploadIntentService } from 'src/upload/upload-intent.service';
 
 // The SYSTEM icon catalogue grows with every icon ever shipped and is read
 // whole by its endpoint, so cap it instead of letting table size decide the
@@ -70,6 +71,7 @@ export class CircleService {
     private readonly chatCircleSync: ChatCircleSyncService,
     private readonly systemMessage: ChatSystemMessageService,
     private readonly groupEvents: ChatGroupEventService,
+    private readonly uploadIntents: UploadIntentService,
   ) {
     this.storagePublicObjectBases = storagePublicObjectBasesFromConfig(
       this.config,
@@ -101,6 +103,8 @@ export class CircleService {
       dto.categories ?? [],
       'category',
     );
+    const cities = this.normalizeStringList(dto.cities ?? [], 'city');
+    const tags = this.normalizeStringList(dto.tags ?? [], 'tag');
 
     const circle = await this.prisma.$transaction(async (tx) => {
       await this.membershipPolicy.lockUsers(tx, [userId]);
@@ -169,6 +173,12 @@ export class CircleService {
           policy.level,
         );
 
+      if (dto.avatarUrl) {
+        await this.uploadIntents.claim(tx, userId, 'CIRCLE_AVATAR', [
+          dto.avatarUrl,
+        ]);
+      }
+
       const created = await tx.circle.create({
         data: {
           name: dto.name,
@@ -176,9 +186,9 @@ export class CircleService {
           description: dto.description,
           avatarUrl: dto.avatarUrl ?? null,
           ownerID: userId,
-          cities: this.normalizeStringList(dto.cities ?? [], 'city'),
+          cities,
           rules: dto.rules ?? '',
-          tags: this.normalizeStringList(dto.tags ?? [], 'tag'),
+          tags,
           joinVipRestriction,
           joinCreditRestriction: dto.joinCreditRestriction ?? null,
           joinFancyRestriction: dto.joinFancyRestriction ?? false,
@@ -539,6 +549,11 @@ export class CircleService {
           ? { memberCanInvite: dto.memberCanInvite }
           : {}),
       };
+      if (dto.avatarUrl) {
+        await this.uploadIntents.claim(tx, userId, 'CIRCLE_AVATAR', [
+          dto.avatarUrl,
+        ]);
+      }
       if (Object.keys(data).length > 0) {
         await tx.circle.update({ where: { id: circleId }, data });
       }
@@ -981,9 +996,12 @@ export class CircleService {
   ): Promise<void> {
     await this.assertOwner(userId, circleId);
     this.assertAvatarUrlIsSafe(avatarUrl);
-    await this.prisma.circle.update({
-      where: { id: circleId },
-      data: { avatarUrl },
+    await this.prisma.$transaction(async (tx) => {
+      await this.uploadIntents.claim(tx, userId, 'CIRCLE_AVATAR', [avatarUrl]);
+      await tx.circle.update({
+        where: { id: circleId },
+        data: { avatarUrl },
+      });
     });
   }
 

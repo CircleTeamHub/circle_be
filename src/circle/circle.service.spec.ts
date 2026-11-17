@@ -26,6 +26,7 @@ import {
 } from './dto/circle.dto';
 import { CircleService } from './circle.service';
 import { GROUP_CAPACITY_HARD_LIMIT } from './circle-limits';
+import { UploadIntentService } from 'src/upload/upload-intent.service';
 
 describe('CircleService', () => {
   let service: CircleService;
@@ -96,6 +97,9 @@ describe('CircleService', () => {
     insertSystemMessageAfterLockedConversationInTx: jest.fn(),
     broadcastSystemMessage: jest.fn(),
   };
+  const uploadIntent = {
+    claim: jest.fn().mockResolvedValue(undefined),
+  };
   const directChatCircleSync = chatCircleSync as any;
   const directMembershipPolicy = new MembershipPolicyService(prisma as any);
   const directMemberLock = new CircleMemberLockService(directMembershipPolicy);
@@ -122,6 +126,7 @@ describe('CircleService', () => {
         { provide: ChatCircleSyncService, useValue: chatCircleSync },
         { provide: ChatSystemMessageService, useValue: chatSystemMessage },
         { provide: ChatGroupEventService, useValue: groupEvents },
+        { provide: UploadIntentService, useValue: uploadIntent },
       ],
     }).compile();
 
@@ -629,6 +634,7 @@ describe('CircleService', () => {
       directChatCircleSync,
       chatSystemMessage as any,
       groupEvents as any,
+      uploadIntent as any,
     );
     prisma.user.findUnique.mockResolvedValue({
       vipLevel: 3,
@@ -697,6 +703,76 @@ describe('CircleService', () => {
     memberCount: 1,
     postCount: 0,
     createdAt: new Date('2026-07-21T12:00:00.000Z'),
+  });
+
+  it('claims a new circle avatar in the create transaction', async () => {
+    const avatarUrl = 'https://cdn.example.com/avatars/user-1/circle.png';
+    prisma.user.findUnique.mockResolvedValue({
+      vipLevel: 1,
+      vipExpiresAt: null,
+    });
+    prisma.circle.create.mockResolvedValue({
+      ...circleRecord(200),
+      avatarUrl,
+    });
+
+    await service.createCircle('user-1', {
+      ...validCircle(),
+      avatarUrl,
+    });
+
+    expect(uploadIntent.claim).toHaveBeenCalledWith(
+      prisma,
+      'user-1',
+      'CIRCLE_AVATAR',
+      [avatarUrl],
+    );
+    expect(uploadIntent.claim.mock.invocationCallOrder[0]).toBeLessThan(
+      prisma.circle.create.mock.invocationCallOrder[0],
+    );
+  });
+
+  it.each([
+    ['cities', ['  ']],
+    ['cities', ['Paris', ' Paris ']],
+    ['tags', ['  ']],
+    ['tags', ['hiking', ' hiking ']],
+  ] as const)(
+    'does not claim the avatar when createCircle receives invalid %s',
+    async (field, values) => {
+      prisma.user.findUnique.mockResolvedValue({
+        vipLevel: 1,
+        vipExpiresAt: null,
+      });
+
+      await expect(
+        service.createCircle('user-1', {
+          ...validCircle(),
+          avatarUrl: 'https://cdn.example.com/avatars/user-1/circle.png',
+          [field]: [...values],
+        }),
+      ).rejects.toThrow(BadRequestException);
+
+      expect(uploadIntent.claim).not.toHaveBeenCalled();
+      expect(prisma.circle.create).not.toHaveBeenCalled();
+    },
+  );
+
+  it('does not create a circle when claiming its avatar fails', async () => {
+    prisma.user.findUnique.mockResolvedValue({
+      vipLevel: 1,
+      vipExpiresAt: null,
+    });
+    uploadIntent.claim.mockRejectedValueOnce(new Error('claim failed'));
+
+    await expect(
+      service.createCircle('user-1', {
+        ...validCircle(),
+        avatarUrl: 'https://cdn.example.com/avatars/user-1/circle.png',
+      }),
+    ).rejects.toThrow('claim failed');
+
+    expect(prisma.circle.create).not.toHaveBeenCalled();
   });
 
   it.each(membershipTiers)(
@@ -1081,6 +1157,7 @@ describe('CircleService', () => {
       directChatCircleSync,
       chatSystemMessage as any,
       groupEvents as any,
+      uploadIntent as any,
     );
     prisma.circle.findFirst.mockResolvedValue({
       id: 'circle-1',
@@ -1113,6 +1190,7 @@ describe('CircleService', () => {
       directChatCircleSync,
       chatSystemMessage as any,
       groupEvents as any,
+      uploadIntent as any,
     );
     prisma.circle.findFirst.mockResolvedValue({
       id: 'circle-1',
@@ -1149,6 +1227,7 @@ describe('CircleService', () => {
       directChatCircleSync,
       chatSystemMessage as any,
       groupEvents as any,
+      uploadIntent as any,
     );
     prisma.circle.findFirst.mockResolvedValue({
       id: 'circle-1',
@@ -1459,6 +1538,44 @@ describe('CircleService', () => {
 
     expect(prisma.circle.findMany).not.toHaveBeenCalled();
   });
+  it('claims a standalone avatar update in the same transaction', async () => {
+    const avatarUrl = 'https://cdn.example.com/avatars/owner-1/circle.png';
+    prisma.circle.findFirst.mockResolvedValue({
+      id: 'circle-1',
+      ownerID: 'owner-1',
+    });
+
+    await service.setCircleAvatar('owner-1', 'circle-1', avatarUrl);
+
+    expect(uploadIntent.claim).toHaveBeenCalledWith(
+      prisma,
+      'owner-1',
+      'CIRCLE_AVATAR',
+      [avatarUrl],
+    );
+    expect(uploadIntent.claim.mock.invocationCallOrder[0]).toBeLessThan(
+      prisma.circle.update.mock.invocationCallOrder[0],
+    );
+  });
+
+  it('does not update a standalone avatar when claiming it fails', async () => {
+    prisma.circle.findFirst.mockResolvedValue({
+      id: 'circle-1',
+      ownerID: 'owner-1',
+    });
+    uploadIntent.claim.mockRejectedValueOnce(new Error('claim failed'));
+
+    await expect(
+      service.setCircleAvatar(
+        'owner-1',
+        'circle-1',
+        'https://cdn.example.com/avatars/owner-1/circle.png',
+      ),
+    ).rejects.toThrow('claim failed');
+
+    expect(prisma.circle.update).not.toHaveBeenCalled();
+  });
+
   // ─── PATCH /circle/:id ──────────────────────────────────────────────────────
   //
   // FE 从 2026-04-22 起就在打这个地址(编辑圈子),#145 弃 OpenIM 后改群名/群公告
@@ -1528,6 +1645,44 @@ describe('CircleService', () => {
         actorId: 'owner-1',
       });
       expect(chatSystemMessage.broadcastSystemMessage).toHaveBeenCalledTimes(2);
+    });
+
+    it('claims an updated avatar in the same transaction', async () => {
+      const avatarUrl = 'https://cdn.example.com/avatars/owner-1/circle.png';
+      prisma.circleMember.findUnique.mockResolvedValue({
+        role: 'OWNER',
+        status: 'ACTIVE',
+      });
+
+      await service.updateCircle('owner-1', 'circle-1', {
+        avatarUrl,
+      } as UpdateCircleDto);
+
+      expect(uploadIntent.claim).toHaveBeenCalledWith(
+        prisma,
+        'owner-1',
+        'CIRCLE_AVATAR',
+        [avatarUrl],
+      );
+      expect(uploadIntent.claim.mock.invocationCallOrder[0]).toBeLessThan(
+        prisma.circle.update.mock.invocationCallOrder[0],
+      );
+    });
+
+    it('does not update circle settings when claiming a new avatar fails', async () => {
+      prisma.circleMember.findUnique.mockResolvedValue({
+        role: 'OWNER',
+        status: 'ACTIVE',
+      });
+      uploadIntent.claim.mockRejectedValueOnce(new Error('claim failed'));
+
+      await expect(
+        service.updateCircle('owner-1', 'circle-1', {
+          avatarUrl: 'https://cdn.example.com/avatars/owner-1/circle.png',
+        } as UpdateCircleDto),
+      ).rejects.toThrow('claim failed');
+
+      expect(prisma.circle.update).not.toHaveBeenCalled();
     });
 
     it('persists and broadcasts only a rename event for a name-only change', async () => {
@@ -2019,6 +2174,7 @@ describe('CircleService', () => {
         directChatCircleSync,
         chatSystemMessage as any,
         groupEvents as any,
+        uploadIntent as any,
       );
 
       await expect(

@@ -79,7 +79,9 @@ describe('StickerService', () => {
         chat as never,
         uploadLimit,
       ),
-      controller: new UploadController(upload as never, uploadLimit),
+      controller: new UploadController(upload as never, uploadLimit, {
+        track: jest.fn(),
+      } as never),
       rows,
       stickers,
       prisma,

@@ -21,4 +21,35 @@ describe('createUploadMetrics', () => {
     );
     expect(output).toMatch(/upload_presign_issued_bytes_total\s+1024/);
   });
+
+  it('records bounded upload-intent lifecycle events and pending gauges', async () => {
+    const metrics = createUploadMetrics();
+
+    metrics.recordIntentEvent('posts', 'created', 'request');
+    metrics.recordIntentEvent('posts', 'claimed', 'request');
+    metrics.recordIntentEvent('avatars', 'rescued', 'delete');
+    metrics.recordIntentEvent('posts', 'due', 'report', 2);
+    metrics.recordIntentEvent('posts', 'deleted', 'delete');
+    metrics.recordIntentEvent('posts', 'delete_failed', 'delete');
+    metrics.setIntentPending('posts', 'delete', 3, 4096);
+
+    const output = await metrics.registry.metrics();
+    for (const event of [
+      'created',
+      'claimed',
+      'rescued',
+      'due',
+      'deleted',
+      'delete_failed',
+    ]) {
+      expect(output).toContain(`event="${event}"`);
+    }
+    expect(output).toMatch(
+      /upload_intent_pending_count\{folder="posts",mode="delete"\}\s+3/,
+    );
+    expect(output).toMatch(
+      /upload_intent_pending_bytes\{folder="posts",mode="delete"\}\s+4096/,
+    );
+    expect(output).not.toMatch(/objectKey|object_key|userID|user_id/);
+  });
 });

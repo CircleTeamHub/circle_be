@@ -1,6 +1,65 @@
+import { readFileSync } from 'node:fs';
+import { resolve } from 'node:path';
 import { createEnvValidationSchema } from './env.validation';
 
 describe('createEnvValidationSchema', () => {
+  describe('upload intent garbage collection mode', () => {
+    const env = {
+      NODE_ENV: 'development',
+      DATABASE_URL: 'postgresql://test:test@localhost:5432/test',
+      SECRET: 'test-secret',
+    };
+
+    it('defaults to report mode', () => {
+      const { value, error } = createEnvValidationSchema(env).validate(env);
+
+      expect(error).toBeUndefined();
+      expect(value.UPLOAD_INTENT_GC_MODE).toBe('report');
+    });
+
+    it.each(['report', 'delete'])('accepts %s mode', (mode) => {
+      const { value, error } = createEnvValidationSchema(env).validate({
+        ...env,
+        UPLOAD_INTENT_GC_MODE: mode,
+      });
+
+      expect(error).toBeUndefined();
+      expect(value.UPLOAD_INTENT_GC_MODE).toBe(mode);
+    });
+
+    it.each(['DELETE', 'disabled', '', ' report '])(
+      'rejects invalid mode %j',
+      (mode) => {
+        const { error } = createEnvValidationSchema(env).validate({
+          ...env,
+          UPLOAD_INTENT_GC_MODE: mode,
+        });
+
+        expect(error?.message).toContain('UPLOAD_INTENT_GC_MODE');
+      },
+    );
+
+    it('keeps the production file as the rollout source without Compose overrides', () => {
+      const repositoryRoot = resolve(__dirname, '..', '..');
+      const productionEnv = readFileSync(
+        resolve(repositoryRoot, '.env.production.example'),
+        'utf8',
+      );
+      const productionCompose = readFileSync(
+        resolve(repositoryRoot, 'docker-compose.prod.yml'),
+        'utf8',
+      );
+      const releaseCompose = readFileSync(
+        resolve(repositoryRoot, 'docker-compose.release.yml'),
+        'utf8',
+      );
+
+      expect(productionEnv).toMatch(/^UPLOAD_INTENT_GC_MODE=report$/m);
+      expect(productionCompose).not.toContain('UPLOAD_INTENT_GC_MODE');
+      expect(releaseCompose).not.toContain('UPLOAD_INTENT_GC_MODE');
+    });
+  });
+
   describe('signed download proxy configuration', () => {
     const proxyEnv = {
       NODE_ENV: 'development',
