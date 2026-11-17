@@ -31,7 +31,10 @@ describe('createUploadMetrics', () => {
     metrics.recordIntentEvent('posts', 'due', 'report', 2);
     metrics.recordIntentEvent('posts', 'deleted', 'delete');
     metrics.recordIntentEvent('posts', 'delete_failed', 'delete');
+    metrics.recordIntentEvent('posts', 'would_rescue', 'report');
+    metrics.recordIntentEvent('posts', 'would_delete', 'report');
     metrics.setIntentPending('posts', 'delete', 3, 4096);
+    metrics.setIntentBacklog('report', 17);
 
     const output = await metrics.registry.metrics();
     for (const event of [
@@ -41,6 +44,8 @@ describe('createUploadMetrics', () => {
       'due',
       'deleted',
       'delete_failed',
+      'would_rescue',
+      'would_delete',
     ]) {
       expect(output).toContain(`event="${event}"`);
     }
@@ -49,6 +54,9 @@ describe('createUploadMetrics', () => {
     );
     expect(output).toMatch(
       /upload_intent_pending_bytes\{folder="posts",mode="delete"\}\s+4096/,
+    );
+    expect(output).toMatch(
+      /upload_intent_reclaim_backlog_count\{mode="report"\}\s+17/,
     );
     expect(output).not.toMatch(/objectKey|object_key|userID|user_id/);
   });

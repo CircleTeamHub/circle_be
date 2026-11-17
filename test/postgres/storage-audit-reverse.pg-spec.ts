@@ -101,6 +101,11 @@ describePostgres('storage audit chat reverse lookup (PostgreSQL)', () => {
       });
     },
   };
+  const redis = {
+    tryAcquireLease: async () => 'storage-audit-test-owner',
+    renewLease: async () => true,
+    releaseLease: async () => undefined,
+  };
 
   /** 新实现：$queryRaw 落到隔离 schema。 */
   const newService = () =>
@@ -111,6 +116,7 @@ describePostgres('storage audit chat reverse lookup (PostgreSQL)', () => {
       } as unknown as PrismaService,
       upload as never,
       { reclaim: async () => undefined } as never,
+      redis as never,
     );
 
   /** Prisma 调用现场编译成 SQL 再到隔离 schema 执行。 */
@@ -138,6 +144,7 @@ describePostgres('storage audit chat reverse lookup (PostgreSQL)', () => {
       } as unknown as PrismaService,
       upload as never,
       { reclaim: async () => undefined } as never,
+      redis as never,
     );
 
   type Internals = {
