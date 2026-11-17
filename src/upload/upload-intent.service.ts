@@ -129,11 +129,10 @@ export class UploadIntentService {
     await this.recordPendingGauges(mode);
     let afterId: string | undefined;
     let processed = 0;
-    while (processed < RECLAIM_MAX_ROWS_PER_RUN) {
-      const take = Math.min(
-        RECLAIM_BATCH_SIZE,
-        RECLAIM_MAX_ROWS_PER_RUN - processed,
-      );
+    const dueForRun: UploadIntent[] = [];
+    const maxRows = RECLAIM_MAX_ROWS_PER_RUN;
+    while (processed < maxRows) {
+      const take = Math.min(RECLAIM_BATCH_SIZE, maxRows - processed);
       const due = await this.prisma.uploadIntent.findMany({
         where: afterId
           ? { AND: [this.dueWhere(now), { id: { gt: afterId } }] }
@@ -144,14 +143,16 @@ export class UploadIntentService {
       if (due.length === 0) break;
 
       processed += due.length;
+      dueForRun.push(...due);
       for (const row of due) {
         const folder = this.metricFolder(row.folder);
         if (folder) uploadMetrics.recordIntentEvent(folder, 'due', mode);
       }
-      await this.processDueBatch(due, referencedSnapshot, mode, now);
       if (due.length < take) break;
       afterId = due[due.length - 1].id;
     }
+
+    await this.processDueBatch(dueForRun, referencedSnapshot, mode, now);
 
     const dueAfterRun = await this.prisma.uploadIntent.count({
       where: this.dueWhere(now),
