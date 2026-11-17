@@ -53,10 +53,8 @@ describe('chat member fanout index migration', () => {
       expect(source).toMatch(/leftAt: null/);
       expect(source).toMatch(/clearedBeforeHeight: \{ lt: /);
     }
-    // Member scalar fields stay covered; the user preference comes from the User relation.
+    // Only index-covered member columns; the group reminder switch is a separate User lookup.
     expect(broadcast).toMatch(/select: \{ userID: true \}/);
-    expect(push).toMatch(
-      /select:\s*\{\s*userID: true,\s*muted: true,\s*user: \{ select: \{ groupOfflinePushEnabled: true \} \},?\s*\}/,
-    );
+    expect(push).toMatch(/select: \{ userID: true, muted: true \}/);
   });
 });

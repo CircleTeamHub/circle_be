@@ -107,7 +107,6 @@ interface PendingPushWindow {
 interface PushSeat {
   userID: string;
   muted: boolean;
-  user: { groupOfflinePushEnabled: boolean };
 }
 
 interface PushConversation {
@@ -227,15 +226,27 @@ export class ChatPushService implements OnModuleDestroy {
       ]);
     if (!conversation || seats.length === 0) return;
 
+    // ChatMember has no relation to User, so the group reminder switch is a
+    // second lookup that only fetches the members who turned it off.
+    const groupPushOptOuts =
+      conversation.type === 'GROUP' || conversation.type === 'TEMP'
+        ? new Set(
+            (
+              await this.prisma.user.findMany({
+                where: {
+                  id: { in: seats.map((seat) => seat.userID) },
+                  groupOfflinePushEnabled: false,
+                },
+                select: { id: true },
+              })
+            ).map((user) => user.id),
+          )
+        : null;
     const chosen = new Map<string, ChatMessageDto>();
     // 正开着 App 的设备不在这里排除,而是在发送时按 token 跳过(见 sendToRecipients):
     // 电脑上开着网页版不该让手机收不到推送。
     for (const member of seats) {
-      if (
-        (conversation.type === 'GROUP' || conversation.type === 'TEMP') &&
-        !member.user.groupOfflinePushEnabled
-      )
-        continue;
+      if (groupPushOptOuts?.has(member.userID)) continue;
       const message = this.messageFor(window, member);
       if (!message || !stillVisible.has(message.id)) continue;
       if (message.sender?.id === member.userID) continue;
@@ -475,11 +486,7 @@ export class ChatPushService implements OnModuleDestroy {
         // watermark to discard a delayed delivery after history was cleared.
         clearedBeforeHeight: { lt: latestHeight },
       },
-      select: {
-        userID: true,
-        muted: true,
-        user: { select: { groupOfflinePushEnabled: true } },
-      },
+      select: { userID: true, muted: true },
       take: PUSH_TARGET_CAP,
     });
     if (seats.length >= PUSH_TARGET_CAP) {
