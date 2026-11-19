@@ -416,8 +416,8 @@ export interface ChatConversationDto {
   /** 独立群聊公告;圈子群/其他类型为 null(圈子群公告走圈子详情)。 */
   notice: string | null;
   noticePinned?: boolean;
-  /** 会话里置顶的那条消息;清空水位以下的、已撤回的都不再给。 */
-  pinnedMessage?: ChatPinnedMessageDto | null;
+  /** 会话里置顶的消息,最新置顶的在前;清空水位以下的不给,撤回的已经删掉。 */
+  pinnedMessages: ChatPinnedMessageDto[];
   /** 独立群聊头像;圈子群走 circle.avatarUrl;其他类型为 null。 */
   avatarUrl: string | null;
   /** 独立群聊的成员上限;圈子群/其他类型为 null(圈子容量走圈子详情)。 */
@@ -554,7 +554,7 @@ export interface ChatSyncPageDto {
   clearedBeforeHeight: number;
 }
 
-/** 置顶消息横幅:点它跳到这条消息。 */
+/** 置顶栏里的一条:点它跳到这条消息。 */
 export interface ChatPinnedMessageDto {
   messageId: string;
   height: number;

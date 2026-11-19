@@ -39,10 +39,12 @@ import {
   type StandaloneSeatLike,
   standaloneGroupRole,
 } from './chat-group-roles';
+import { toPinnedMessageDto } from './chat-group-settings.service';
 import type {
   ChatConversation,
   ChatMember,
   ChatMessage,
+  ChatPinnedMessage,
   Prisma,
 } from 'src/generated/prisma';
 import { CollectionType } from 'src/generated/prisma';
@@ -108,29 +110,14 @@ import type {
   ChatPinnedMessageDto,
 } from './chat.types';
 
-/** 会话行上的置顶消息;清空水位以下的(这个人已经看不到那条)不给。 */
-function pinnedMessageOf(
-  conversation: Pick<
-    ChatConversation,
-    | 'pinnedMessageID'
-    | 'pinnedMessageHeight'
-    | 'pinnedMessagePreview'
-    | 'pinnedMessageAt'
-  >,
+/** 置顶栏:清空水位以下的(这个人已经看不到那条)不给。rows 已按置顶时间倒序。 */
+function pinnedMessagesOf(
+  rows: readonly ChatPinnedMessage[] | undefined,
   floor: number,
-): ChatPinnedMessageDto | null {
-  if (
-    !conversation.pinnedMessageID ||
-    conversation.pinnedMessageHeight === null ||
-    conversation.pinnedMessageHeight <= floor
-  )
-    return null;
-  return {
-    messageId: conversation.pinnedMessageID,
-    height: conversation.pinnedMessageHeight,
-    preview: conversation.pinnedMessagePreview ?? '',
-    pinnedAt: (conversation.pinnedMessageAt ?? new Date(0)).toISOString(),
-  };
+): ChatPinnedMessageDto[] {
+  return (rows ?? [])
+    .filter((row) => row.height > floor)
+    .map(toPinnedMessageDto);
 }
 
 /** 圈子群在会话 DTO 上的展示信息(+ 成员邀请开关,策略 DTO 要用)。 */
@@ -2018,6 +2005,7 @@ export class ChatService {
       tempChats,
       circleRoles,
       memberCounts,
+      pinnedMessages,
     ] = await allWithConcurrency(CONVERSATION_LIST_QUERY_CONCURRENCY, [
       () => this.loadLastMessages(conversationIds, retentionWindows),
       () =>
@@ -2044,6 +2032,7 @@ export class ChatService {
         ),
       () => this.loadCircleRoles(userId, circleIds),
       () => this.loadGroupMemberCounts(groupIds),
+      () => this.loadPinnedMessages(conversationIds),
     ]);
 
     const lastRows = [...lastMessages.values()];
@@ -2109,7 +2098,10 @@ export class ChatService {
           directPeers.deliveredHeights.get(m.conversationID) ?? null,
         readHeight: m.lastReadHeight,
         clearedBeforeHeight: conversationFloor,
-        pinnedMessage: pinnedMessageOf(m.conversation, conversationFloor),
+        pinnedMessages: pinnedMessagesOf(
+          pinnedMessages.get(m.conversationID),
+          conversationFloor,
+        ),
         syncRevision: conversationSyncRevision(m.conversation),
         lastMessageAt: m.conversation.lastMessageAt?.toISOString() ?? null,
         joinedAt: m.joinedAt.toISOString(),
@@ -2848,29 +2840,31 @@ export class ChatService {
     );
     const viewer = NO_VIEWER_RETENTION;
     const retention = buildChatRetentionWindow(member.conversation, viewer);
-    const [lastMessages, unread, directPeers, tempChats] = await Promise.all([
-      this.loadLastMessages([conversationId], [retention]),
-      this.loadUnreadCounts(
-        userId,
-        [
-          {
-            conversationID: conversationId,
-            lastReadHeight: Math.max(member.lastReadHeight, floor),
-          },
-        ],
-        [retention],
-      ),
-      member.conversation.type === 'DIRECT'
-        ? this.loadDirectPeers(userId, [conversationId])
-        : Promise.resolve<DirectPeers>({
-            info: new Map(),
-            readHeights: new Map(),
-            deliveredHeights: new Map(),
-          }),
-      member.conversation.tempChatID
-        ? this.loadTempChatInfos([member.conversation.tempChatID])
-        : Promise.resolve(new Map<string, { id: string; title: string }>()),
-    ]);
+    const [lastMessages, unread, directPeers, tempChats, pinnedMessages] =
+      await Promise.all([
+        this.loadLastMessages([conversationId], [retention]),
+        this.loadUnreadCounts(
+          userId,
+          [
+            {
+              conversationID: conversationId,
+              lastReadHeight: Math.max(member.lastReadHeight, floor),
+            },
+          ],
+          [retention],
+        ),
+        member.conversation.type === 'DIRECT'
+          ? this.loadDirectPeers(userId, [conversationId])
+          : Promise.resolve<DirectPeers>({
+              info: new Map(),
+              readHeights: new Map(),
+              deliveredHeights: new Map(),
+            }),
+        member.conversation.tempChatID
+          ? this.loadTempChatInfos([member.conversation.tempChatID])
+          : Promise.resolve(new Map<string, { id: string; title: string }>()),
+        this.loadPinnedMessages([conversationId]),
+      ]);
     const rawLast = lastMessages.get(conversationId) ?? null;
     const last = rawLast && rawLast.height <= floor ? null : rawLast;
     let lastMessage: ChatMessageDto | null = null;
@@ -2926,7 +2920,10 @@ export class ChatService {
           : null,
         memberCounts.get(conversationId) ?? null,
       ),
-      pinnedMessage: pinnedMessageOf(member.conversation, floor),
+      pinnedMessages: pinnedMessagesOf(
+        pinnedMessages.get(conversationId),
+        floor,
+      ),
       burnDurationSec: member.burnDurationSec ?? null,
       burnStartedAt: member.burnStartedAt?.toISOString() ?? null,
       peerReadHeight: directPeers.readHeights.get(conversationId) ?? null,
@@ -2992,6 +2989,25 @@ export class ChatService {
    * 群在座人数(退群的座位有 leftAt,不计)。一次 groupBy 覆盖整页会话,
    * 不按会话逐个 count —— 会话列表是热路径。
    */
+  /** 这些会话的置顶,最新置顶的在前(一个会话最多 CHAT_PINNED_MESSAGES_MAX 条)。 */
+  private async loadPinnedMessages(
+    conversationIds: string[],
+  ): Promise<Map<string, ChatPinnedMessage[]>> {
+    const unique = [...new Set(conversationIds)];
+    if (unique.length === 0) return new Map();
+    const rows = await this.prisma.chatPinnedMessage.findMany({
+      where: { conversationID: { in: unique } },
+      orderBy: [{ pinnedAt: 'desc' }, { messageID: 'asc' }],
+    });
+    const byConversation = new Map<string, ChatPinnedMessage[]>();
+    for (const row of rows) {
+      const list = byConversation.get(row.conversationID);
+      if (list) list.push(row);
+      else byConversation.set(row.conversationID, [row]);
+    }
+    return byConversation;
+  }
+
   private async loadGroupMemberCounts(
     conversationIds: string[],
   ): Promise<Map<string, number>> {
@@ -3655,7 +3671,7 @@ export class ChatService {
     );
     const viewer = NO_VIEWER_RETENTION;
     const retention = buildChatRetentionWindow(conv, viewer);
-    const [unread, lastMessage] = await Promise.all([
+    const [unread, lastMessage, pinnedMessages] = await Promise.all([
       mine
         ? this.loadUnreadCounts(
             userId,
@@ -3672,6 +3688,8 @@ export class ChatService {
       // 恒 null 会把已有会话的预览抹成空白,与 GET /chat/conversations 打架。
       // 但清空水位之下的末条不算「真实末条」——(见 buildConversationDto)。
       this.loadLastMessageFor(conv.id, conv, userId, clearedFloor, retention),
+      // 命中已有的单聊时,置顶照样要回:客户端拿这个响应回填会话缓存。
+      this.loadPinnedMessages([conv.id]),
     ]);
     return {
       id: conv.id,
@@ -3705,6 +3723,10 @@ export class ChatService {
           ?.lastDeliveredHeight ?? null,
       readHeight: mine?.lastReadHeight ?? 0,
       clearedBeforeHeight: clearedFloor,
+      pinnedMessages: pinnedMessagesOf(
+        pinnedMessages.get(conv.id),
+        clearedFloor,
+      ),
       syncRevision: conversationSyncRevision(conv),
       lastMessageAt: conv.lastMessageAt?.toISOString() ?? null,
       joinedAt: mine?.joinedAt?.toISOString() ?? null,
@@ -4589,16 +4611,9 @@ export class ChatService {
         });
         let unpinned = false;
         if (claimed.count > 0) {
-          // 撤回的消息不能还挂在置顶横幅上。
-          const cleared = await tx.chatConversation.updateMany({
-            where: { id: conversationId, pinnedMessageID: messageId },
-            data: {
-              pinnedMessageID: null,
-              pinnedMessageHeight: null,
-              pinnedMessagePreview: null,
-              pinnedMessageAt: null,
-              pinnedMessageByID: null,
-            },
+          // 撤回的消息不能还挂在置顶栏上。
+          const cleared = await tx.chatPinnedMessage.deleteMany({
+            where: { conversationID: conversationId, messageID: messageId },
           });
           unpinned = cleared.count > 0;
           await this.media.queueDeletions(tx, mediaKeys);
@@ -4901,12 +4916,10 @@ export class ChatService {
           errorCode: ChatErrorCode.MessageNotFound,
         });
       }
-      // 编辑过的置顶消息,横幅上的预览跟着换成新正文。
-      const repinned = await tx.chatConversation.updateMany({
-        where: { id: conversationId, pinnedMessageID: messageId },
-        data: {
-          pinnedMessagePreview: messagePreviewText(current.type, nextContent),
-        },
+      // 编辑过的置顶消息,置顶栏上的预览跟着换成新正文。
+      const repinned = await tx.chatPinnedMessage.updateMany({
+        where: { conversationID: conversationId, messageID: messageId },
+        data: { preview: messagePreviewText(current.type, nextContent) },
       });
       pinChanged = repinned.count > 0;
       return tx.chatMessage.findUniqueOrThrow({

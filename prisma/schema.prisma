@@ -2725,8 +2725,8 @@ model ChatConversation {
   notice                 String?
   /// 群公告是否固定在聊天顶部滚动播报（独立群与圈子群）。
   noticePinned           Boolean              @default(false)
-  /// 置顶的那条消息(一个会话一条,群里群主/管理员可设,私聊双方可设);撤回即清。
-  /// 预览文案置顶时算好存下,会话列表不必为它再查消息表。
+  /// 已弃用:置顶改成一个会话多条,存在 ChatPinnedMessage(迁移 20261118120000 已把这里的
+  /// 数据搬过去)。蓝绿发布期间旧版本还会读这 5 列,下一个版本再删;新代码不读不写。
   pinnedMessageID        String?
   pinnedMessageHeight    Int?
   pinnedMessagePreview   String?
@@ -2787,6 +2787,7 @@ model ChatConversation {
   directAutoReplyStates ChatDirectAutoReplyState[]
   groupEvents           ChatGroupEvent[]
   joinBans              ChatGroupJoinBan[]
+  pinnedMessages        ChatPinnedMessage[]
   // burnDurationSec IS NOT NULL 的轮转扫描使用 migration 中的 partial index；
   // Prisma schema 无法表达 WHERE 条件。
 
@@ -3105,6 +3106,23 @@ model ChatGroupJoinBan {
   conversation ChatConversation @relation(fields: [conversationID], references: [id], onDelete: Cascade)
 
   @@id([conversationID, userID])
+}
+
+/// 会话里置顶的消息:一个会话最多 CHAT_PINNED_MESSAGES_MAX 条,群里群主/管理员可设,
+/// 私聊双方可设,会话里所有人都看得到;撤回即删。预览文案置顶时算好存下(编辑时跟着改),
+/// 会话列表不必为它再查消息表。消息只软删,不对 ChatMessage 建外键(那张热表加外键要锁表)。
+model ChatPinnedMessage {
+  conversationID String
+  messageID      String
+  height         Int
+  preview        String
+  pinnedAt       DateTime @default(now())
+  /// 不建 User 外键,同 ChatMessage.senderID。
+  pinnedByID     String
+
+  conversation ChatConversation @relation(fields: [conversationID], references: [id], onDelete: Cascade)
+
+  @@id([conversationID, messageID])
 }
 
 /// Pending invitations/applications never grant a ChatMember seat.

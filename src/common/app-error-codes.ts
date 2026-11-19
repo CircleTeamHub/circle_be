@@ -429,6 +429,8 @@ export const ChatErrorCode = {
   DeliveryIdConflict: 'CHAT_DELIVERY_ID_CONFLICT',
   // 双向清空申请已经同意或拒绝过(另一台设备先点了):不能再处理一次。
   ClearRequestHandled: 'CHAT_CLEAR_REQUEST_HANDLED',
+  // 会话里置顶的消息已达上限(CHAT_PINNED_MESSAGES_MAX):先取消一条再置顶。
+  PinLimitReached: 'CHAT_PIN_LIMIT_REACHED',
 } as const;
 
 // 二维码令牌:无效(不存在/已撤销/目标已不可用) / 已过期 / 该类型不支持此操作 /
