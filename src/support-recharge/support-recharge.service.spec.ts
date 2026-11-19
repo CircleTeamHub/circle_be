@@ -537,3 +537,63 @@ describe('SupportRechargeService admin response contract', () => {
     });
   });
 });
+
+describe('SupportRechargeService membership fulfillment target', () => {
+  const validate = (target: {
+    vipLevel: number;
+    vipExpiresAt: Date | null;
+  }) => {
+    const prisma = {
+      supportRechargeOrder: {
+        findUnique: jest.fn().mockResolvedValue({
+          id: 'order-1',
+          userID: 'user-1',
+          status: 'PENDING',
+        }),
+      },
+      user: {
+        findUnique: jest
+          .fn()
+          .mockResolvedValue({ status: 'ACTIVE', ...target }),
+      },
+    };
+    const service = new SupportRechargeService(
+      prisma as never,
+      {} as never,
+      {} as never,
+      {} as never,
+      {} as never,
+      {} as never,
+      {} as never,
+    );
+    return (
+      service as unknown as {
+        validateFulfillmentTarget: (
+          orderId: string,
+          input: unknown,
+        ) => Promise<void>;
+      }
+    ).validateFulfillmentTarget('order-1', {
+      fulfillmentType: 'MEMBERSHIP',
+      membershipLevel: 2,
+    });
+  };
+
+  it('lets a member whose tier has expired buy the same tier again', async () => {
+    await expect(
+      validate({
+        vipLevel: 2,
+        vipExpiresAt: new Date(Date.now() - 86_400_000),
+      }),
+    ).resolves.toBeUndefined();
+  });
+
+  it('still rejects a tier that is not above the active one', async () => {
+    await expect(
+      validate({
+        vipLevel: 2,
+        vipExpiresAt: new Date(Date.now() + 86_400_000),
+      }),
+    ).rejects.toThrow('会员等级必须高于用户当前等级');
+  });
+});

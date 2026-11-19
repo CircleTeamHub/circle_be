@@ -15,6 +15,7 @@ import {
   SupportRechargePaymentCode,
 } from 'src/generated/prisma';
 import { MembershipAdminService } from 'src/membership/membership-admin.service';
+import { resolveEffectiveMembershipLevel } from 'src/membership/membership.catalog';
 import { PrismaService } from 'src/prisma/prisma.service';
 import { RealtimeService } from 'src/realtime/realtime.service';
 import { UploadService } from 'src/upload/upload.service';
@@ -408,7 +409,7 @@ export class SupportRechargeService {
     }
     const target = await this.prisma.user.findUnique({
       where: { id: order.userID },
-      select: { status: true, vipLevel: true },
+      select: { status: true, vipLevel: true, vipExpiresAt: true },
     });
     if (!target || target.status !== 'ACTIVE') {
       throw new ConflictException({
@@ -418,7 +419,7 @@ export class SupportRechargeService {
     }
     if (
       input.fulfillmentType === 'MEMBERSHIP' &&
-      input.membershipLevel! <= target.vipLevel
+      input.membershipLevel! <= resolveEffectiveMembershipLevel(target)
     ) {
       throw new ConflictException({
         message: '会员等级必须高于用户当前等级',
