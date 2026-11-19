@@ -245,10 +245,7 @@ export class UploadIntentService {
         lastDeleteError: null,
       },
     });
-    if (lease.count !== 1) {
-      await this.prisma.uploadIntent.findUnique({ where: { id: row.id } });
-      return;
-    }
+    if (lease.count !== 1) return;
 
     const ownLease = {
       id: row.id,

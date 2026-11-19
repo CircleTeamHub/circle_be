@@ -4221,7 +4221,7 @@ export class NoteService implements NoteCardProjector {
    * 给他人私有对象无限续签」),所以转发笔记媒体必须真实拷贝而不是引用。
    * 单请求最多 ~100 个对象(两个分区各 50 上限),复制按下方常量限并发。
    *
-   * 读取授权与 getNote 完全一致(readableByViewer:自己的笔记,或 available 且 ACTIVE 的笔记)。
+   * 读取授权与 getNote 完全一致(readableByViewer:自己的笔记,或 available 且未删除的笔记,上架下架都算)。
    * sections JSON 里的 item 只有 objectKey 能对回本笔记 media 行时才算数 ——
    * 行在写入侧做过属主/豁免校验,挡住把外部 key 冻进 JSON 借拷贝洗白的路。
    * 拷贝出的对象生命周期归聊天侧:撤回/焚毁按消息 key 删,与笔记原件互不影响。

@@ -393,14 +393,6 @@ export const CONVERSATION_LIST_MAX = 100;
 /** 客户端单页可请求的会话数上限（ListConversationsQueryDto.limit）。 */
 export const CONVERSATION_LIST_LIMIT_MAX = 500;
 
-/**
- * 放宽/关闭焚毁前的兜底真删:分批处理的批量与批次上限。
- * 一次性 findMany 会把整段积压的完整 JSON content 拉进内存,后面再跟一条
- * 巨大的 IN 更新 —— 内存、查询参数上限、接口超时三样一起顶上来。
- */
-export const RELAX_PURGE_BATCH = 500;
-export const RELAX_PURGE_BATCHES_MAX = 20;
-
 /** 增量同步(GET /chat/conversations/:id/sync)单页上限。 */
 export const SYNC_PAGE_MAX = 200;
 
