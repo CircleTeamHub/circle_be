@@ -285,6 +285,7 @@ export const DYNAMIC_ROUTE_TEMPLATES = [
   '/api/v1/chat/conversations/:id/name',
   '/api/v1/chat/conversations/:id/notice',
   '/api/v1/chat/conversations/:id/pinned-message',
+  '/api/v1/chat/conversations/:id/pinned-message/:messageId',
   '/api/v1/chat/conversations/:id/clear-requests',
   '/api/v1/chat/conversations/:id/owner',
   '/api/v1/chat/conversations/:id/policies',

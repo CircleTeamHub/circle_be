@@ -1,5 +1,6 @@
 import {
   BadRequestException,
+  ConflictException,
   ForbiddenException,
   Injectable,
   Logger,
@@ -8,7 +9,11 @@ import {
 import { ConfigService } from '@nestjs/config';
 import { ChatErrorCode } from 'src/common/app-error-codes';
 import { PrismaService } from 'src/prisma/prisma.service';
-import type { ChatMember, Prisma } from 'src/generated/prisma';
+import type {
+  ChatMember,
+  ChatPinnedMessage,
+  Prisma,
+} from 'src/generated/prisma';
 import {
   isUrlFromStorage,
   storagePublicObjectBasesFromConfig,
@@ -28,6 +33,7 @@ import type {
   ChatPinnedMessageDto,
 } from './chat.types';
 import { messagePreviewText } from './chat-message-preview';
+import { CHAT_PINNED_MESSAGES_MAX } from './chat.constants';
 import { CircleMemberLockService } from 'src/circle/circle-member-lock';
 
 /** 锁后的会话行:群策略与全员禁言都从这份快照读、往这行写。 */
@@ -99,6 +105,34 @@ function assertPinnable(
     });
   }
   return row;
+}
+
+/** 置顶预览里笔记标题最多留几个字(和文本预览同一长度)。 */
+const PIN_NOTE_TITLE_MAX = 40;
+
+/**
+ * 置顶栏的预览:笔记卡片带上标题 —— 一个群置顶好几篇笔记时,只看「[笔记]」分不出是哪篇。
+ * 标题是发卡片那一刻的快照,和卡片本身一致。
+ */
+function pinPreviewText(type: string, content: unknown): string {
+  const label = messagePreviewText(type, content);
+  if (type !== 'note-card') return label;
+  const raw = (content as Record<string, unknown> | null)?.['title'];
+  const title = typeof raw === 'string' ? raw.trim() : '';
+  if (!title) return label;
+  return `${label} ${title.length > PIN_NOTE_TITLE_MAX ? `${title.slice(0, PIN_NOTE_TITLE_MAX)}…` : title}`;
+}
+
+/** 置顶行 → 置顶栏的一条(会话 DTO 也用它)。 */
+export function toPinnedMessageDto(
+  row: ChatPinnedMessage,
+): ChatPinnedMessageDto {
+  return {
+    messageId: row.messageID,
+    height: row.height,
+    preview: row.preview,
+    pinnedAt: row.pinnedAt.toISOString(),
+  };
 }
 
 /** PATCH /policies 可改的键;圈子群的 memberCanInvite 写在 Circle 上。 */
@@ -338,14 +372,17 @@ export class ChatGroupSettingsService {
   }
 
   /**
-   * 消息置顶:一个会话一条,置顶新的就替换旧的,messageId=null 取消置顶。
-   * 群里只有群主/管理员能设,私聊双方都能设;会话里所有人都看得到横幅。
+   * 置顶 / 取消置顶一条消息。一个会话最多 CHAT_PINNED_MESSAGES_MAX 条,满了要先取消一条;
+   * 已经置顶的再置顶、没置顶的取消都是空操作(不插提示)。
+   * 群里只有群主/管理员能设,私聊双方都能设;会话里所有人都看得到置顶栏。
    * 同事务插一条系统提示,它随消息分发让各端刷新会话(和群公告同一条路)。
+   * 返回置顶后的那条;取消置顶返回 null。
    */
   async setPinnedMessage(
     actorId: string,
     conversationId: string,
-    messageId: string | null,
+    messageId: string,
+    pin: boolean,
   ): Promise<ChatPinnedMessageDto | null> {
     const seat = await this.prisma.chatMember.findUnique({
       where: {
@@ -373,17 +410,17 @@ export class ChatGroupSettingsService {
       seat.clearedBeforeHeight,
       seat.conversation.clearedBeforeHeight,
     );
-    const target = messageId
-      ? assertPinnable(
-          await this.prisma.chatMessage.findUnique({
-            where: { id: messageId },
-            select: PINNABLE_MESSAGE_SELECT,
-          }),
-          conversationId,
-          floor,
-        )
-      : null;
-    const pinnedAt = new Date();
+    // 取消置顶不看消息本身:置顶之后它可能已经焚毁 / 清空到水位以下,照样要能取消。
+    if (pin) {
+      assertPinnable(
+        await this.prisma.chatMessage.findUnique({
+          where: { id: messageId },
+          select: PINNABLE_MESSAGE_SELECT,
+        }),
+        conversationId,
+        floor,
+      );
+    }
     let pinned: ChatPinnedMessageDto | null = null;
 
     const message = await this.prisma.$transaction(async (tx) => {
@@ -405,50 +442,61 @@ export class ChatGroupSettingsService {
           .find((id) => id !== actorId);
         if (peerId) await this.assertNotBlockedInTx(tx, actorId, peerId);
       }
-      // 锁内再核一次:锁外那次读到之后,这条消息可能刚被撤回 —— 撤回事务里
-      // 「清掉指向它的置顶」那步跑在我们写入之前,就会留下一个指向已撤回消息的横幅。
-      // 预览也用锁内这份算:中间若刚提交了一次编辑,横幅要是编辑后的文案。
-      if (target) {
+      const key = {
+        conversationID_messageID: {
+          conversationID: conversationId,
+          messageID: messageId,
+        },
+      };
+      if (pin) {
+        const existing = await tx.chatPinnedMessage.findUnique({ where: key });
+        if (existing) {
+          pinned = toPinnedMessageDto(existing);
+          return null;
+        }
+        // 上限在会话行锁内数,两个管理员同时置顶第 5、6 条也只进得去一条。
+        // 会话级清空水位以下的置顶谁都看不到了,不占名额。
+        const count = await tx.chatPinnedMessage.count({
+          where: {
+            conversationID: conversationId,
+            height: { gt: seat.conversation.clearedBeforeHeight },
+          },
+        });
+        if (count >= CHAT_PINNED_MESSAGES_MAX) {
+          throw new ConflictException({
+            message: `最多置顶 ${CHAT_PINNED_MESSAGES_MAX} 条消息`,
+            errorCode: ChatErrorCode.PinLimitReached,
+          });
+        }
+        // 锁内再核一次:锁外那次读到之后,这条消息可能刚被撤回 —— 撤回事务里
+        // 「删掉指向它的置顶」那步跑在我们写入之前,就会留下一条指向已撤回消息的置顶。
+        // 预览也用锁内这份算:中间若刚提交了一次编辑,置顶栏要是编辑后的文案。
         const fresh = assertPinnable(
           await tx.chatMessage.findUnique({
-            where: { id: target.id },
+            where: { id: messageId },
             select: PINNABLE_MESSAGE_SELECT,
           }),
           conversationId,
           floor,
         );
-        pinned = {
-          messageId: fresh.id,
-          height: fresh.height,
-          preview: messagePreviewText(fresh.type, fresh.content),
-          pinnedAt: pinnedAt.toISOString(),
-        };
-      }
-      const current = await tx.chatConversation.findUnique({
-        where: { id: conversationId },
-        select: { pinnedMessageID: true },
-      });
-      if ((current?.pinnedMessageID ?? null) === (target?.id ?? null))
-        return null;
-      await tx.chatConversation.update({
-        where: { id: conversationId },
-        data: target
-          ? {
-              pinnedMessageID: target.id,
-              pinnedMessageHeight: target.height,
-              pinnedMessagePreview: pinned?.preview ?? '',
-              pinnedMessageAt: pinnedAt,
-              pinnedMessageByID: actorId,
-            }
-          : {
-              pinnedMessageID: null,
-              pinnedMessageHeight: null,
-              pinnedMessagePreview: null,
-              pinnedMessageAt: null,
-              pinnedMessageByID: null,
+        pinned = toPinnedMessageDto(
+          await tx.chatPinnedMessage.create({
+            data: {
+              conversationID: conversationId,
+              messageID: fresh.id,
+              height: fresh.height,
+              preview: pinPreviewText(fresh.type, fresh.content),
+              pinnedByID: actorId,
             },
-      });
-      const kind = target ? 'message-pinned' : 'message-unpinned';
+          }),
+        );
+      } else {
+        const removed = await tx.chatPinnedMessage.deleteMany({
+          where: { conversationID: conversationId, messageID: messageId },
+        });
+        if (removed.count === 0) return null;
+      }
+      const kind = pin ? 'message-pinned' : 'message-unpinned';
       const notice =
         await this.systemMessage.insertSystemMessageAfterLockedConversationInTx(
           tx,

@@ -63,6 +63,12 @@ describe('ChatService', () => {
       findMany: jest.fn().mockResolvedValue([]),
     },
     chatMediaDeletion: { deleteMany: jest.fn() },
+    // 撤回 / 编辑会顺手看一眼置顶,会话 DTO 会带上置顶:默认都没有。
+    chatPinnedMessage: {
+      findMany: jest.fn().mockResolvedValue([]),
+      deleteMany: jest.fn().mockResolvedValue({ count: 0 }),
+      updateMany: jest.fn().mockResolvedValue({ count: 0 }),
+    },
     circle: { findMany: jest.fn() },
     block: { findFirst: jest.fn(), findMany: jest.fn().mockResolvedValue([]) },
     friend: { findFirst: jest.fn() },
@@ -3683,6 +3689,7 @@ describe('ChatService', () => {
         'loadTempChatInfos',
         'loadCircleRoles',
         'loadGroupMemberCounts',
+        'loadPinnedMessages',
       ].map((name) =>
         jest
           .spyOn(service as never, name as never)
@@ -3705,41 +3712,64 @@ describe('ChatService', () => {
       }
     });
 
-    // 前端整表刷新会整行覆盖会话:列表不带 pinnedMessage,冷启动后横幅就没了。
-    // 清空水位以下的那条照样对本人隐藏(与单会话接口同一口径)。
-    it('carries the pinned message on list rows and hides it below the viewer floor', async () => {
-      const pinnedColumns = {
-        pinnedMessageID: 'm9',
-        pinnedMessageHeight: 9,
-        pinnedMessagePreview: '置顶的话',
-        pinnedMessageAt: new Date('2026-11-06T00:00:00.000Z'),
-      };
+    // 前端整表刷新会整行覆盖会话:列表不带置顶,冷启动后置顶栏就没了。
+    // 一页的置顶一次查完(不按会话逐个查),最新置顶的在前;
+    // 清空水位以下的照样对本人隐藏(与单会话接口同一口径)。
+    it('carries every pin on list rows, newest first, hiding pins below the viewer floor', async () => {
+      const pin = (
+        conversationID: string,
+        messageID: string,
+        height: number,
+        at: string,
+      ) => ({
+        conversationID,
+        messageID,
+        height,
+        preview: `置顶 ${messageID}`,
+        pinnedAt: new Date(at),
+        pinnedByID: 'u1',
+      });
       prisma.chatMember.findMany.mockResolvedValueOnce([
-        membership({
-          conversation: { ...membership().conversation, ...pinnedColumns },
-        }),
+        membership(),
         membership({
           id: 'member-2',
           conversationID: 'conv-2',
           clearedBeforeHeight: 9,
-          conversation: {
-            ...membership().conversation,
-            id: 'conv-2',
-            ...pinnedColumns,
-          },
+          conversation: { ...membership().conversation, id: 'conv-2' },
         }),
+      ]);
+      prisma.chatPinnedMessage.findMany.mockResolvedValueOnce([
+        pin('conv-1', 'm9', 9, '2026-11-07T00:00:00.000Z'),
+        pin('conv-2', 'm12', 12, '2026-11-06T12:00:00.000Z'),
+        pin('conv-1', 'm3', 3, '2026-11-06T00:00:00.000Z'),
+        pin('conv-2', 'm9', 9, '2026-11-06T00:00:00.000Z'),
       ]);
       prisma.$queryRaw.mockResolvedValue([]);
 
       const page = await service.listConversationsPage('u1');
 
-      expect(page.conversations[0].pinnedMessage).toEqual({
-        messageId: 'm9',
-        height: 9,
-        preview: '置顶的话',
-        pinnedAt: '2026-11-06T00:00:00.000Z',
+      expect(prisma.chatPinnedMessage.findMany).toHaveBeenCalledTimes(1);
+      expect(prisma.chatPinnedMessage.findMany).toHaveBeenCalledWith({
+        where: { conversationID: { in: ['conv-1', 'conv-2'] } },
+        orderBy: [{ pinnedAt: 'desc' }, { messageID: 'asc' }],
       });
-      expect(page.conversations[1].pinnedMessage).toBeNull();
+      expect(page.conversations[0].pinnedMessages).toEqual([
+        {
+          messageId: 'm9',
+          height: 9,
+          preview: '置顶 m9',
+          pinnedAt: '2026-11-07T00:00:00.000Z',
+        },
+        {
+          messageId: 'm3',
+          height: 3,
+          preview: '置顶 m3',
+          pinnedAt: '2026-11-06T00:00:00.000Z',
+        },
+      ]);
+      expect(
+        page.conversations[1].pinnedMessages.map((p) => p.messageId),
+      ).toEqual(['m12']);
     });
 
     it('reports no more conversations when the page is not full', async () => {
@@ -4905,10 +4935,9 @@ describe('ChatService', () => {
           }),
         }),
       );
-      // 撤回的消息若正被置顶,横幅随之撤下。
-      expect(prisma.chatConversation.updateMany).toHaveBeenCalledWith({
-        where: { id: 'conv-1', pinnedMessageID: 'm1' },
-        data: expect.objectContaining({ pinnedMessageID: null }),
+      // 撤回的消息若正被置顶,置顶栏随之撤下这一条。
+      expect(prisma.chatPinnedMessage.deleteMany).toHaveBeenCalledWith({
+        where: { conversationID: 'conv-1', messageID: 'm1' },
       });
       // The durable deletion worker rechecks shared archive references.
       expect(media.drainPendingDeletions).toHaveBeenCalled();
@@ -4941,7 +4970,7 @@ describe('ChatService', () => {
         revokedAt: new Date(),
         revokedBy: 'u1',
       });
-      prisma.chatConversation.updateMany.mockResolvedValue({ count: 1 });
+      prisma.chatPinnedMessage.deleteMany.mockResolvedValueOnce({ count: 1 });
       prisma.chatMember.findMany.mockResolvedValue([
         { userID: 'u1' },
         { userID: 'u2' },
@@ -5437,14 +5466,14 @@ describe('ChatService', () => {
         content: { text: 'new text' },
         editedAt: new Date(),
       });
-      prisma.chatConversation.updateMany.mockResolvedValue({ count: 1 });
+      prisma.chatPinnedMessage.updateMany.mockResolvedValueOnce({ count: 1 });
       prisma.chatMember.findMany.mockResolvedValue([{ userID: 'u2' }]);
 
       await service.editMessage('u1', 'conv-1', 'm1', { text: 'new text' });
 
-      expect(prisma.chatConversation.updateMany).toHaveBeenCalledWith({
-        where: { id: 'conv-1', pinnedMessageID: 'm1' },
-        data: { pinnedMessagePreview: 'new text' },
+      expect(prisma.chatPinnedMessage.updateMany).toHaveBeenCalledWith({
+        where: { conversationID: 'conv-1', messageID: 'm1' },
+        data: { preview: 'new text' },
       });
       expect(broadcast.emitConversationChange).toHaveBeenCalledWith('u2', {
         kind: 'updated',

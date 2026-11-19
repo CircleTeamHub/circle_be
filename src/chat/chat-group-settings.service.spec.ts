@@ -1,4 +1,8 @@
-import { ForbiddenException, NotFoundException } from '@nestjs/common';
+import {
+  ConflictException,
+  ForbiddenException,
+  NotFoundException,
+} from '@nestjs/common';
 import { ChatErrorCode } from 'src/common/app-error-codes';
 import { ChatGroupSettingsService } from './chat-group-settings.service';
 
@@ -16,6 +20,12 @@ describe('ChatGroupSettingsService', () => {
     },
     chatConversation: { update: jest.fn(), findUnique: jest.fn() },
     chatMessage: { findUnique: jest.fn() },
+    chatPinnedMessage: {
+      findUnique: jest.fn(),
+      count: jest.fn(),
+      create: jest.fn(),
+      deleteMany: jest.fn(),
+    },
     circleMember: { findUnique: jest.fn() },
     circle: { findUnique: jest.fn(), update: jest.fn() },
     user: { findUnique: jest.fn() },
@@ -550,18 +560,41 @@ describe('ChatGroupSettingsService', () => {
       burnExpiresAt: null,
       ...overrides,
     });
+    const PINNED_AT = new Date('2026-11-18T00:00:00.000Z');
+    const pinRow = (overrides: Record<string, unknown> = {}) => ({
+      conversationID: 'conv-1',
+      messageID: 'msg-1',
+      height: 8,
+      preview: '周六上午九点集合',
+      pinnedAt: PINNED_AT,
+      pinnedByID: 'admin-1',
+      ...overrides,
+    });
     const arrangePin = (params: {
       actor: ReturnType<typeof seat>;
       row?: Record<string, unknown>;
-      current?: string | null;
+      /** 这条消息已经在置顶栏里。 */
+      alreadyPinned?: boolean;
+      /** 会话里已有的置顶条数(水位以上)。 */
+      count?: number;
       target?: Record<string, unknown> | null;
     }) => {
       arrange({
         actor: params.actor,
         row: { clearedBeforeHeight: 0, ...params.row },
       });
-      prisma.chatConversation.findUnique.mockResolvedValue({
-        pinnedMessageID: params.current ?? null,
+      prisma.chatPinnedMessage.findUnique.mockResolvedValue(
+        params.alreadyPinned ? pinRow() : null,
+      );
+      prisma.chatPinnedMessage.count.mockResolvedValue(params.count ?? 0);
+      prisma.chatPinnedMessage.create.mockImplementation(
+        async ({ data }: { data: Record<string, unknown> }) => ({
+          ...data,
+          pinnedAt: PINNED_AT,
+        }),
+      );
+      prisma.chatPinnedMessage.deleteMany.mockResolvedValue({
+        count: params.alreadyPinned ? 1 : 0,
       });
       prisma.chatMessage.findUnique.mockResolvedValue(
         params.target === undefined ? message() : params.target,
@@ -569,28 +602,30 @@ describe('ChatGroupSettingsService', () => {
     };
 
     it('a group admin pins a message for everyone and the change is announced', async () => {
-      arrangePin({ actor: seat('admin-1', { role: 'ADMIN' }) });
+      arrangePin({ actor: seat('admin-1', { role: 'ADMIN' }), count: 2 });
       const pinned = await service.setPinnedMessage(
         'admin-1',
         'conv-1',
         'msg-1',
+        true,
       );
-      expect(pinned).toEqual(
-        expect.objectContaining({
-          messageId: 'msg-1',
+      expect(pinned).toEqual({
+        messageId: 'msg-1',
+        height: 8,
+        preview: '周六上午九点集合',
+        pinnedAt: PINNED_AT.toISOString(),
+      });
+      // 已有的置顶不动,新的加进去。
+      expect(prisma.chatPinnedMessage.create).toHaveBeenCalledWith({
+        data: {
+          conversationID: 'conv-1',
+          messageID: 'msg-1',
           height: 8,
           preview: '周六上午九点集合',
-        }),
-      );
-      expect(prisma.chatConversation.update).toHaveBeenCalledWith({
-        where: { id: 'conv-1' },
-        data: expect.objectContaining({
-          pinnedMessageID: 'msg-1',
-          pinnedMessageHeight: 8,
-          pinnedMessagePreview: '周六上午九点集合',
-          pinnedMessageByID: 'admin-1',
-        }),
+          pinnedByID: 'admin-1',
+        },
       });
+      expect(prisma.chatPinnedMessage.deleteMany).not.toHaveBeenCalled();
       expect(
         systemMessage.insertSystemMessageAfterLockedConversationInTx,
       ).toHaveBeenCalledWith(prisma, 'conv-1', 10, {
@@ -607,11 +642,11 @@ describe('ChatGroupSettingsService', () => {
     it('an ordinary group member cannot pin', async () => {
       arrangePin({ actor: seat('member-1') });
       await expect(
-        service.setPinnedMessage('member-1', 'conv-1', 'msg-1'),
+        service.setPinnedMessage('member-1', 'conv-1', 'msg-1', true),
       ).rejects.toMatchObject({
         response: { errorCode: ChatErrorCode.GroupManagerOnly },
       });
-      expect(prisma.chatConversation.update).not.toHaveBeenCalled();
+      expect(prisma.chatPinnedMessage.create).not.toHaveBeenCalled();
     });
 
     it('either side of a private chat can pin, without a group log entry', async () => {
@@ -620,8 +655,8 @@ describe('ChatGroupSettingsService', () => {
         row: { type: 'DIRECT', ownerID: null },
       });
       prisma.$queryRaw.mockResolvedValue([{ nextHeight: 4 }]);
-      await service.setPinnedMessage('peer-1', 'conv-1', 'msg-1');
-      expect(prisma.chatConversation.update).toHaveBeenCalled();
+      await service.setPinnedMessage('peer-1', 'conv-1', 'msg-1', true);
+      expect(prisma.chatPinnedMessage.create).toHaveBeenCalled();
       expect(groupEvents.recordInTx).not.toHaveBeenCalled();
       expect(
         systemMessage.insertSystemMessageAfterLockedConversationInTx,
@@ -631,16 +666,17 @@ describe('ChatGroupSettingsService', () => {
       });
     });
 
-    // 拉黑不摘座位:被拉黑的一方不能再改对方看到的横幅、往对方会话里插提示。
-    it('refuses a private-chat pin when either side has blocked the other', async () => {
+    // 拉黑不摘座位:被拉黑的一方不能再改对方看到的置顶栏、往对方会话里插提示。
+    it('refuses a private-chat unpin when either side has blocked the other', async () => {
       arrangePin({
         actor: seat('peer-1'),
         row: { type: 'DIRECT', ownerID: null, directKey: 'peer-1:peer-2' },
+        alreadyPinned: true,
       });
       prisma.$queryRaw.mockResolvedValue([{ nextHeight: 4 }]);
       prisma.block.findFirst.mockResolvedValue({ id: 'block-1' });
       await expect(
-        service.setPinnedMessage('peer-1', 'conv-1', null),
+        service.setPinnedMessage('peer-1', 'conv-1', 'msg-1', false),
       ).rejects.toMatchObject({
         response: { errorCode: ChatErrorCode.Blocked },
       });
@@ -653,14 +689,14 @@ describe('ChatGroupSettingsService', () => {
         },
         select: { id: true },
       });
-      expect(prisma.chatConversation.update).not.toHaveBeenCalled();
+      expect(prisma.chatPinnedMessage.deleteMany).not.toHaveBeenCalled();
       expect(
         systemMessage.insertSystemMessageAfterLockedConversationInTx,
       ).not.toHaveBeenCalled();
     });
 
-    // 锁外读到之后、加锁之前刚提交了一次编辑:横幅要用锁内那份正文。
-    it('builds the banner preview from the row re-read under the lock', async () => {
+    // 锁外读到之后、加锁之前刚提交了一次编辑:置顶栏要用锁内那份正文。
+    it('builds the preview from the row re-read under the lock', async () => {
       arrangePin({ actor: seat('admin-1', { role: 'ADMIN' }) });
       prisma.chatMessage.findUnique
         .mockResolvedValueOnce(message())
@@ -669,12 +705,30 @@ describe('ChatGroupSettingsService', () => {
         'admin-1',
         'conv-1',
         'msg-1',
+        true,
       );
       expect(pinned?.preview).toBe('改成十点集合');
-      expect(prisma.chatConversation.update).toHaveBeenCalledWith({
-        where: { id: 'conv-1' },
-        data: expect.objectContaining({ pinnedMessagePreview: '改成十点集合' }),
+      expect(prisma.chatPinnedMessage.create).toHaveBeenCalledWith({
+        data: expect.objectContaining({ preview: '改成十点集合' }),
       });
+    });
+
+    // 一个群置顶好几篇笔记时,只看「[笔记]」分不出是哪篇。
+    it('a pinned note card shows its title in the preview', async () => {
+      arrangePin({
+        actor: seat('admin-1', { role: 'ADMIN' }),
+        target: message({
+          type: 'note-card',
+          content: { noteId: 'n1', title: '  周末羽毛球场地 ' },
+        }),
+      });
+      const pinned = await service.setPinnedMessage(
+        'admin-1',
+        'conv-1',
+        'msg-1',
+        true,
+      );
+      expect(pinned?.preview).toBe('[笔记] 周末羽毛球场地');
     });
 
     it.each([
@@ -683,7 +737,7 @@ describe('ChatGroupSettingsService', () => {
       ['a system notice', { type: 'system' }],
       ['a message from another conversation', { conversationID: 'conv-2' }],
       ['a message below the cleared history', { height: 0 }],
-      // 预览存在会话行上,焚毁后横幅里还会留着原文。
+      // 预览存在置顶行上,焚毁后置顶栏里还会留着原文。
       ['a burn-after-reading message', { burnDurationSec: 30 }],
       ['an expiring message', { burnExpiresAt: new Date() }],
     ])('refuses to pin %s', async (_case, overrides) => {
@@ -692,7 +746,7 @@ describe('ChatGroupSettingsService', () => {
         target: message(overrides),
       });
       await expect(
-        service.setPinnedMessage('admin-1', 'conv-1', 'msg-1'),
+        service.setPinnedMessage('admin-1', 'conv-1', 'msg-1', true),
       ).rejects.toMatchObject({
         response: { errorCode: ChatErrorCode.MessageNotFound },
       });
@@ -705,38 +759,70 @@ describe('ChatGroupSettingsService', () => {
         .mockResolvedValueOnce(message())
         .mockResolvedValueOnce(message({ revokedAt: new Date() }));
       await expect(
-        service.setPinnedMessage('admin-1', 'conv-1', 'msg-1'),
+        service.setPinnedMessage('admin-1', 'conv-1', 'msg-1', true),
       ).rejects.toMatchObject({
         response: { errorCode: ChatErrorCode.MessageNotFound },
       });
-      expect(prisma.chatConversation.update).not.toHaveBeenCalled();
+      expect(prisma.chatPinnedMessage.create).not.toHaveBeenCalled();
     });
 
-    it('pinning the already pinned message changes nothing and announces nothing', async () => {
+    it('pinning an already pinned message changes nothing and announces nothing', async () => {
       arrangePin({
         actor: seat('admin-1', { role: 'ADMIN' }),
-        current: 'msg-1',
+        alreadyPinned: true,
       });
-      await service.setPinnedMessage('admin-1', 'conv-1', 'msg-1');
-      expect(prisma.chatConversation.update).not.toHaveBeenCalled();
+      const pinned = await service.setPinnedMessage(
+        'admin-1',
+        'conv-1',
+        'msg-1',
+        true,
+      );
+      expect(pinned?.messageId).toBe('msg-1');
+      expect(prisma.chatPinnedMessage.create).not.toHaveBeenCalled();
       expect(systemMessage.broadcastSystemMessage).not.toHaveBeenCalled();
     });
 
-    it('unpinning clears the pin and announces it', async () => {
+    // 上限在会话行锁内数;会话级清空水位以下的置顶谁都看不到,不占名额。
+    it('refuses a sixth pin and counts only pins above the conversation floor', async () => {
       arrangePin({
         actor: seat('admin-1', { role: 'ADMIN' }),
-        current: 'msg-1',
+        row: { clearedBeforeHeight: 3 },
+        count: 5,
+      });
+      await expect(
+        service.setPinnedMessage('admin-1', 'conv-1', 'msg-1', true),
+      ).rejects.toMatchObject({
+        constructor: ConflictException,
+        response: { errorCode: ChatErrorCode.PinLimitReached },
+      });
+      expect(prisma.chatPinnedMessage.count).toHaveBeenCalledWith({
+        where: { conversationID: 'conv-1', height: { gt: 3 } },
+      });
+      expect(prisma.chatPinnedMessage.create).not.toHaveBeenCalled();
+      expect(
+        systemMessage.insertSystemMessageAfterLockedConversationInTx,
+      ).not.toHaveBeenCalled();
+    });
+
+    it('allows the fifth pin', async () => {
+      arrangePin({ actor: seat('admin-1', { role: 'ADMIN' }), count: 4 });
+      await service.setPinnedMessage('admin-1', 'conv-1', 'msg-1', true);
+      expect(prisma.chatPinnedMessage.create).toHaveBeenCalled();
+    });
+
+    // 置顶之后那条消息可能已经焚毁 / 清空到水位以下:不看消息本身,照样要能取消。
+    it('unpinning removes only that pin and announces it', async () => {
+      arrangePin({
+        actor: seat('admin-1', { role: 'ADMIN' }),
+        alreadyPinned: true,
         target: null,
       });
       await expect(
-        service.setPinnedMessage('admin-1', 'conv-1', null),
+        service.setPinnedMessage('admin-1', 'conv-1', 'msg-1', false),
       ).resolves.toBeNull();
-      expect(prisma.chatConversation.update).toHaveBeenCalledWith({
-        where: { id: 'conv-1' },
-        data: expect.objectContaining({
-          pinnedMessageID: null,
-          pinnedMessageHeight: null,
-        }),
+      expect(prisma.chatMessage.findUnique).not.toHaveBeenCalled();
+      expect(prisma.chatPinnedMessage.deleteMany).toHaveBeenCalledWith({
+        where: { conversationID: 'conv-1', messageID: 'msg-1' },
       });
       expect(
         systemMessage.insertSystemMessageAfterLockedConversationInTx,
@@ -746,10 +832,21 @@ describe('ChatGroupSettingsService', () => {
       });
     });
 
+    it('unpinning a message that is not pinned announces nothing', async () => {
+      arrangePin({ actor: seat('admin-1', { role: 'ADMIN' }) });
+      await expect(
+        service.setPinnedMessage('admin-1', 'conv-1', 'msg-1', false),
+      ).resolves.toBeNull();
+      expect(
+        systemMessage.insertSystemMessageAfterLockedConversationInTx,
+      ).not.toHaveBeenCalled();
+      expect(systemMessage.broadcastSystemMessage).not.toHaveBeenCalled();
+    });
+
     it('someone who left the conversation cannot pin', async () => {
       arrangePin({ actor: seat('gone-1', { leftAt: new Date() }) });
       await expect(
-        service.setPinnedMessage('gone-1', 'conv-1', 'msg-1'),
+        service.setPinnedMessage('gone-1', 'conv-1', 'msg-1', true),
       ).rejects.toBeInstanceOf(ForbiddenException);
     });
   });

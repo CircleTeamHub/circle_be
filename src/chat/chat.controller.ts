@@ -552,20 +552,23 @@ export class ChatController {
       req.user.userId,
       conversationId,
       body.messageId,
+      true,
     );
   }
 
-  @Delete('conversations/:id/pinned-message')
+  @Delete('conversations/:id/pinned-message/:messageId')
   @Throttle({ default: { limit: 30, ttl: 60_000 } })
-  @ApiOperation({ summary: '取消置顶(群主/管理员;私聊双方)' })
+  @ApiOperation({ summary: '取消置顶一条消息(群主/管理员;私聊双方)' })
   async unpinMessage(
     @Req() req: RequestWithUser,
     @Param('id', ParseUUIDPipe) conversationId: string,
+    @Param('messageId', ParseUUIDPipe) messageId: string,
   ): Promise<{ ok: true }> {
     await this.groupSettings.setPinnedMessage(
       req.user.userId,
       conversationId,
-      null,
+      messageId,
+      false,
     );
     return { ok: true };
   }

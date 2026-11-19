@@ -204,6 +204,9 @@ export const CHAT_REACTION_EMOJIS: readonly string[] = [
 /** 发送者本人的可撤回时间窗;圈主/管理员撤回群消息不受此限。 */
 export const CHAT_REVOKE_WINDOW_MS = 2 * 60_000;
 
+/** 一个会话最多置顶几条消息;客户端置顶栏展开后不用滚动。 */
+export const CHAT_PINNED_MESSAGES_MAX = 5;
+
 /** 个人房:登录即加入,用于跨会话的定向推送。 */
 export const userRoom = (userId: string): string => `u:${userId}`;
 
