@@ -1,5 +1,5 @@
 import * as argon2 from 'argon2';
-import { Prisma } from 'src/generated/prisma';
+import { Prisma, RefreshTokenRevocationReason } from 'src/generated/prisma';
 import {
   generateUniqueRegistrationCode,
   isAccountIdentifierClaimCollision,
@@ -159,7 +159,10 @@ export class AdminAccessService {
         throw new ConflictException('账号状态已变化，请刷新后重试');
       await tx.refreshToken.updateMany({
         where: { userId: userID, revokedAt: null },
-        data: { revokedAt: now },
+        data: {
+          revokedAt: now,
+          revocationReason: RefreshTokenRevocationReason.LOGOUT_ALL,
+        },
       });
       await tx.adminAuditLog.create({
         data: {
@@ -328,7 +331,10 @@ export class AdminAccessService {
         if (credentialsChanged)
           await tx.refreshToken.updateMany({
             where: { userId: userID, revokedAt: null },
-            data: { revokedAt: now },
+            data: {
+              revokedAt: now,
+              revocationReason: RefreshTokenRevocationReason.LOGOUT_ALL,
+            },
           });
         const result = await tx.adminAccess.upsert({
           where: { userID },
@@ -411,7 +417,10 @@ export class AdminAccessService {
       });
       await tx.refreshToken.updateMany({
         where: { userId: userID, revokedAt: null },
-        data: { revokedAt: now },
+        data: {
+          revokedAt: now,
+          revocationReason: RefreshTokenRevocationReason.LOGOUT_ALL,
+        },
       });
       await tx.adminAuditLog.create({
         data: {

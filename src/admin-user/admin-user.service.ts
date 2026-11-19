@@ -11,7 +11,11 @@ import {
 import type { AuthenticatedUser } from 'src/auth/types';
 import { SessionRevocationService } from 'src/auth/session-revocation.service';
 import { AdminUserErrorCode } from 'src/common/app-error-codes';
-import { Prisma, UserStatus } from 'src/generated/prisma';
+import {
+  Prisma,
+  RefreshTokenRevocationReason,
+  UserStatus,
+} from 'src/generated/prisma';
 import { logBusinessEvent } from 'src/logging/business-event.logger';
 import { createLoggingConfig } from 'src/logging/logging.config';
 import { PrismaService } from 'src/prisma/prisma.service';
@@ -547,7 +551,10 @@ export class AdminUserService {
     );
     await tx.refreshToken.updateMany({
       where: { userId, revokedAt: null },
-      data: { revokedAt },
+      data: {
+        revokedAt,
+        revocationReason: RefreshTokenRevocationReason.LOGOUT_ALL,
+      },
     });
     await tx.sessionRevocationOutbox.upsert({
       where: { userID: userId },

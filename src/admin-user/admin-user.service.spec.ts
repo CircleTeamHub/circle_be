@@ -558,7 +558,7 @@ describe('AdminUserService', () => {
       });
       expect(tx.refreshToken.updateMany).toHaveBeenCalledWith({
         where: { userId: 'other-admin', revokedAt: null },
-        data: { revokedAt: expect.any(Date) },
+        data: { revokedAt: expect.any(Date), revocationReason: 'LOGOUT_ALL' },
       });
       expect(audit.recordInTransaction).toHaveBeenCalledTimes(1);
     });
@@ -701,7 +701,10 @@ describe('AdminUserService', () => {
         if (revokesSessions) {
           expect(tx.refreshToken.updateMany).toHaveBeenCalledWith({
             where: { userId: 'user-1', revokedAt: null },
-            data: { revokedAt: expect.any(Date) },
+            data: {
+              revokedAt: expect.any(Date),
+              revocationReason: 'LOGOUT_ALL',
+            },
           });
           const revokedAt =
             tx.refreshToken.updateMany.mock.calls[0][0].data.revokedAt;
