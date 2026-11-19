@@ -9,6 +9,8 @@ describe('ChatBurnSweeperService', () => {
     chatBurnArchive: { findMany: jest.fn() },
     chatConversation: { findMany: jest.fn(), findUnique: jest.fn() },
     chatMessage: { findMany: jest.fn(), updateManyAndReturn: jest.fn() },
+    chatPinnedMessage: { deleteMany: jest.fn() },
+    chatMember: { findMany: jest.fn() },
   };
   const media = {
     deleteObjects: jest.fn().mockResolvedValue(undefined),
@@ -18,6 +20,7 @@ describe('ChatBurnSweeperService', () => {
   };
   const broadcast = {
     emitBurnedMessages: jest.fn().mockResolvedValue(undefined),
+    emitConversationChange: jest.fn(),
   };
   // 默认:没配 Redis(单实例)—— 租约拿不到协调、照常跑,游标只在内存里。
   const redis = {
@@ -55,6 +58,8 @@ describe('ChatBurnSweeperService', () => {
     media.deleteObjects.mockResolvedValue(undefined);
     media.releaseNoteImportReferences.mockResolvedValue(undefined);
     broadcast.emitBurnedMessages.mockResolvedValue(undefined);
+    prisma.chatPinnedMessage.deleteMany.mockResolvedValue({ count: 0 });
+    prisma.chatMember.findMany.mockResolvedValue([]);
     prisma.$transaction.mockImplementation(
       async (callback: (tx: typeof prisma) => unknown) => callback(prisma),
     );
@@ -625,6 +630,65 @@ describe('ChatBurnSweeperService', () => {
     expect(
       prisma.chatMessage.updateManyAndReturn.mock.invocationCallOrder[0],
     ).toBeLessThan(broadcast.emitBurnedMessages.mock.invocationCallOrder[0]);
+  });
+
+  // 置顶行存着预览原文:烧掉的消息还挂在置顶栏上,等于没烧干净,还白占一个名额。
+  it('unpins burned messages in the tombstone transaction and refreshes the seats', async () => {
+    prisma.chatConversation.findMany.mockResolvedValue([
+      { id: 'conv-1', burnDurationSec: 60 },
+    ]);
+    conversationPolicies.set('conv-1', { burnDurationSec: 60 });
+    prisma.chatMessage.findMany.mockResolvedValueOnce([
+      { id: 'm1', type: 'text', content: { text: 'pinned secret' } },
+      { id: 'm2', type: 'text', content: { text: 'other' } },
+    ]);
+    prisma.chatPinnedMessage.deleteMany.mockResolvedValue({ count: 1 });
+    prisma.chatMember.findMany.mockResolvedValue([
+      { userID: 'u1' },
+      { userID: 'u2' },
+    ]);
+
+    await service.sweep();
+
+    expect(prisma.chatPinnedMessage.deleteMany).toHaveBeenCalledWith({
+      where: { conversationID: 'conv-1', messageID: { in: ['m1', 'm2'] } },
+    });
+    // 和墓碑同一个事务:在会话行锁之后、墓碑之后。
+    expect(
+      prisma.chatMessage.updateManyAndReturn.mock.invocationCallOrder[0],
+    ).toBeLessThan(
+      prisma.chatPinnedMessage.deleteMany.mock.invocationCallOrder[0],
+    );
+    expect(prisma.chatMember.findMany).toHaveBeenCalledWith({
+      where: { conversationID: 'conv-1', leftAt: null },
+      select: { userID: true },
+    });
+    expect(broadcast.emitConversationChange).toHaveBeenCalledWith('u1', {
+      kind: 'updated',
+      conversationId: 'conv-1',
+      userId: 'u1',
+    });
+    expect(broadcast.emitConversationChange).toHaveBeenCalledWith('u2', {
+      kind: 'updated',
+      conversationId: 'conv-1',
+      userId: 'u2',
+    });
+  });
+
+  it('does not refresh the seats when no burned message was pinned', async () => {
+    prisma.chatConversation.findMany.mockResolvedValue([
+      { id: 'conv-1', burnDurationSec: 60 },
+    ]);
+    conversationPolicies.set('conv-1', { burnDurationSec: 60 });
+    prisma.chatMessage.findMany.mockResolvedValueOnce([
+      { id: 'm1', type: 'text', content: { text: 'old' } },
+    ]);
+
+    await service.sweep();
+
+    expect(prisma.chatPinnedMessage.deleteMany).toHaveBeenCalledTimes(1);
+    expect(prisma.chatMember.findMany).not.toHaveBeenCalled();
+    expect(broadcast.emitConversationChange).not.toHaveBeenCalled();
   });
 
   // 事务回滚了却已经播出去,对端会删掉服务端其实还留着的消息。

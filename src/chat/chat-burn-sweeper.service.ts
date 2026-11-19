@@ -193,6 +193,7 @@ export class ChatBurnSweeperService {
       const messageIds = rows.map((row) => row.id);
       let noteImportKeys: string[] = [];
       let ownedMediaKeys: string[] = [];
+      let pinsChanged = false;
       if (!lease.isCurrent()) return;
       const burned = await this.prisma.$transaction(async (tx) => {
         // 会话行锁先拿:消息行上的触发器要更新会话计数器。先锁一批消息行再等会话行,
@@ -222,6 +223,18 @@ export class ChatBurnSweeperService {
           select: { id: true, revision: true },
         });
         const burnedIds = new Set(tombstones.map((row) => row.id));
+        // 烧掉的消息不能还挂在置顶栏上:置顶行存着预览原文,留着就等于没烧干净,
+        // 还白占一个置顶名额。与撤回同一个事务口径(会话行锁已持有)。
+        const unpinned =
+          burnedIds.size > 0
+            ? await tx.chatPinnedMessage.deleteMany({
+                where: {
+                  conversationID: conversationId,
+                  messageID: { in: [...burnedIds] },
+                },
+              })
+            : { count: 0 };
+        pinsChanged = unpinned.count > 0;
         const allMediaKeys = rows
           .filter(
             (row) =>
@@ -268,6 +281,7 @@ export class ChatBurnSweeperService {
       if (burned === null) return;
       // 墓碑已提交才通知:事务回滚了却已经播出去,对端会删掉服务端其实还留着的消息。
       await this.announceBurned(conversationId, burned);
+      if (pinsChanged) await this.announcePinsChanged(conversationId);
       if (ownedMediaKeys.length > 0 || noteImportKeys.length > 0) {
         void this.media.drainPendingDeletions();
       }
@@ -294,6 +308,33 @@ export class ChatBurnSweeperService {
     } catch (error) {
       this.logger.warn(
         `burned-message announcement failed conversation=${conversationId}: ${
+          error instanceof Error ? error.name : 'unknown error'
+        }`,
+      );
+    }
+  }
+
+  /**
+   * 置顶栏少了几条:像撤回取消置顶那样给在座成员发 chat:conversation(kind=updated),
+   * 在线端据此重拉这个会话。焚毁通知本身不带置顶信息,不发的话在线端的置顶栏
+   * 要等下次拉会话才收敛。提交后尽力而为,失败只记日志。
+   */
+  private async announcePinsChanged(conversationId: string): Promise<void> {
+    try {
+      const seats = await this.prisma.chatMember.findMany({
+        where: { conversationID: conversationId, leftAt: null },
+        select: { userID: true },
+      });
+      for (const seat of seats) {
+        this.broadcast.emitConversationChange(seat.userID, {
+          kind: 'updated',
+          conversationId,
+          userId: seat.userID,
+        });
+      }
+    } catch (error) {
+      this.logger.warn(
+        `burned-pin refresh failed conversation=${conversationId}: ${
           error instanceof Error ? error.name : 'unknown error'
         }`,
       );

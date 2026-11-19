@@ -717,7 +717,10 @@ describe('ChatGroupSettingsService', () => {
     it('a pinned note card shows its title in the preview', async () => {
       arrangePin({
         actor: seat('admin-1', { role: 'ADMIN' }),
-        target: message({ type: 'note-card', content: { noteId: 'n1', title: '  周末羽毛球场地 ' } }),
+        target: message({
+          type: 'note-card',
+          content: { noteId: 'n1', title: '  周末羽毛球场地 ' },
+        }),
       });
       const pinned = await service.setPinnedMessage(
         'admin-1',
