@@ -1,4 +1,7 @@
-import { eligibleVerifierIdsQuery } from 'src/circle-invitation/eligible-verifiers.query';
+import {
+  eligibleVerifierIdsQuery,
+  mutualDirectChatQuery,
+} from 'src/circle-invitation/eligible-verifiers.query';
 import {
   describePostgres,
   explainPlan,
@@ -7,9 +10,10 @@ import {
 } from './pg-test-db';
 
 /**
- * 可挑验证人 = 本圈 ACTIVE 成员 ∩ 申请人的已接受好友 − 排除名单，按入圈先后。
- * 口径对齐旧实现（成员全量 + 两个 IN 查好友 + 内存求交）的每个分支；成本上不再把
- * 整圈成员搬出来，好友一侧走 Friend 的成对索引收窄。
+ * 可挑验证人 = 本圈 ACTIVE 成员 ∩ (申请人的已接受好友 ∪ 和申请人私聊过的人)
+ * − 排除名单，按入圈先后。好友一侧口径对齐旧实现（成员全量 + 两个 IN 查好友 +
+ * 内存求交）的每个分支；成本上不再把整圈成员搬出来，好友一侧走 Friend 的成对索引收窄。
+ * 「私聊过」= 私聊里双方都发过言、且申请人这边还能搜到。
  */
 describePostgres('circle eligible verifiers query (PostgreSQL)', () => {
   let s: IsolatedSchema;
@@ -59,11 +63,119 @@ describePostgres('circle eligible verifiers query (PostgreSQL)', () => {
     );
   };
 
+  const chatted = async (applicantId: string, peerId: string) => {
+    const q = mutualDirectChatQuery({ applicantId, peerId });
+    const { rows } = await s.db.query<{ chatted: boolean }>(q.text, q.values);
+    return rows[0].chatted;
+  };
+
+  type MessageSpec = {
+    from: string;
+    height: number;
+    deleted?: boolean;
+    revokedAt?: string;
+    burnExpiresAt?: string;
+    content?: Record<string, unknown>;
+  };
+
+  let messageRow = 0;
+  /** 申请人与 peer 的一段会话;默认 DIRECT、两个座位都在、没有清空过。 */
+  const conversation = async (
+    peer: string,
+    messages: MessageSpec[],
+    extra: {
+      type?: string;
+      conversationCleared?: number;
+      applicantCleared?: number;
+      applicantLeftAt?: string;
+    } = {},
+  ) => {
+    const id = `conv-${peer}-${extra.type ?? 'DIRECT'}`;
+    await s.db.query(
+      `INSERT INTO "ChatConversation" (id, type, "clearedBeforeHeight") VALUES ($1, $2, $3)`,
+      [id, extra.type ?? 'DIRECT', extra.conversationCleared ?? 0],
+    );
+    await s.db.query(
+      `INSERT INTO "ChatMember" (id, "conversationID", "userID", "clearedBeforeHeight", "leftAt")
+       VALUES ($1, $2, 'applicant', $3, $4), ($5, $2, $6, 0, NULL)`,
+      [
+        `seat-a-${id}`,
+        id,
+        extra.applicantCleared ?? 0,
+        extra.applicantLeftAt ?? null,
+        `seat-p-${id}`,
+        peer,
+      ],
+    );
+    for (const message of messages) {
+      messageRow += 1;
+      await s.db.query(
+        `INSERT INTO "ChatMessage"
+           (id, "conversationID", height, "senderID", content, "clientMessageId", deleted, "revokedAt", "burnExpiresAt")
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)`,
+        [
+          `msg-${messageRow}`,
+          id,
+          message.height,
+          message.from,
+          JSON.stringify(message.content ?? { text: 'hi' }),
+          `client-${messageRow}`,
+          message.deleted ?? false,
+          message.revokedAt ?? null,
+          message.burnExpiresAt ?? null,
+        ],
+      );
+    }
+  };
+
+  const block = async (blockerID: string, blockedID: string) => {
+    await s.db.query(
+      `INSERT INTO "Block" (id, "blockerID", "blockedID") VALUES ($1, $2, $3)`,
+      [`b-${blockerID}-${blockedID}`, blockerID, blockedID],
+    );
+  };
+
   beforeAll(async () => {
     s = await openIsolatedSchema('circle_eligible_verifiers');
     await s.db.query(`
       CREATE TYPE "CircleMemberStatus" AS ENUM ('ACTIVE', 'PENDING', 'REJECTED');
       CREATE TYPE "FriendState" AS ENUM ('PENDING', 'ACCEPTED', 'REJECTED', 'WITHDRAWN');
+      CREATE TYPE "ChatConversationType" AS ENUM ('DIRECT', 'GROUP', 'TEMP', 'SUPPORT');
+      CREATE TABLE "ChatConversation" (
+        id text PRIMARY KEY,
+        type "ChatConversationType" NOT NULL,
+        "clearedBeforeHeight" integer NOT NULL DEFAULT 0
+      );
+      CREATE TABLE "ChatMember" (
+        id text PRIMARY KEY,
+        "conversationID" text NOT NULL,
+        "userID" text NOT NULL,
+        "clearedBeforeHeight" integer NOT NULL DEFAULT 0,
+        "leftAt" timestamp(3)
+      );
+      CREATE UNIQUE INDEX "ChatMember_conversationID_userID_key"
+        ON "ChatMember" ("conversationID", "userID");
+      CREATE INDEX "ChatMember_userID_idx" ON "ChatMember" ("userID");
+      CREATE TABLE "ChatMessage" (
+        id text PRIMARY KEY,
+        "conversationID" text NOT NULL,
+        height integer NOT NULL,
+        "senderID" text,
+        content jsonb NOT NULL,
+        "clientMessageId" varchar(128),
+        deleted boolean NOT NULL DEFAULT false,
+        "revokedAt" timestamp(3),
+        "burnExpiresAt" timestamp(3)
+      );
+      CREATE UNIQUE INDEX "ChatMessage_conversationID_senderID_clientMessageId_key"
+        ON "ChatMessage" ("conversationID", "senderID", "clientMessageId");
+      CREATE TABLE "Block" (
+        id text PRIMARY KEY,
+        "blockerID" text NOT NULL,
+        "blockedID" text NOT NULL
+      );
+      CREATE UNIQUE INDEX "Block_blockerID_blockedID_key" ON "Block" ("blockerID", "blockedID");
+      CREATE INDEX "Block_blockedID_idx" ON "Block" ("blockedID");
       CREATE TABLE "CircleMember" (
         id text PRIMARY KEY,
         "userID" text NOT NULL,
@@ -92,7 +204,160 @@ describePostgres('circle eligible verifiers query (PostgreSQL)', () => {
   });
 
   beforeEach(async () => {
-    await s.db.query('TRUNCATE "CircleMember", "Friend"');
+    await s.db.query(
+      'TRUNCATE "CircleMember", "Friend", "ChatConversation", "ChatMember", "ChatMessage", "Block"',
+    );
+  });
+
+  it('admits a non-friend member once both sides have spoken in the direct chat', async () => {
+    await member('late-chatted', '2026-03-01 00:00:00');
+    await member('friend', '2026-02-01 00:00:00');
+    await member('early-chatted', '2026-01-01 00:00:00');
+    await member('applicant-only', '2026-01-02 00:00:00');
+    await member('peer-only', '2026-01-03 00:00:00');
+    await friend('applicant', 'friend');
+    await conversation('late-chatted', [
+      { from: 'applicant', height: 1 },
+      { from: 'late-chatted', height: 2 },
+    ]);
+    await conversation('early-chatted', [
+      { from: 'early-chatted', height: 1 },
+      { from: 'applicant', height: 2 },
+    ]);
+    // 申请人单方面发「你好」,对方没回 —— 不算。
+    await conversation('applicant-only', [
+      { from: 'applicant', height: 1 },
+      { from: 'applicant', height: 2 },
+    ]);
+    await conversation('peer-only', [{ from: 'peer-only', height: 1 }]);
+
+    expect(await eligible({})).toEqual([
+      'early-chatted',
+      'friend',
+      'late-chatted',
+    ]);
+    expect(await chatted('applicant', 'late-chatted')).toBe(true);
+    expect(await chatted('applicant', 'applicant-only')).toBe(false);
+    expect(await chatted('applicant', 'peer-only')).toBe(false);
+    // 好友但没私聊过:私聊判定本身不成立(加席时由好友那条放行)。
+    expect(await chatted('applicant', 'friend')).toBe(false);
+  });
+
+  it('only counts messages the applicant can still find', async () => {
+    const peers = [
+      'seat-cleared',
+      'conversation-cleared',
+      'deleted',
+      'revoked',
+      'burned',
+      'left-seat',
+      'burning-later',
+    ];
+    for (const [index, peer] of peers.entries()) {
+      await member(peer, `2026-01-0${index + 1} 00:00:00`);
+    }
+    // 对方那句在申请人自己的清空水位之下。
+    await conversation(
+      'seat-cleared',
+      [
+        { from: 'seat-cleared', height: 1 },
+        { from: 'applicant', height: 2 },
+      ],
+      { applicantCleared: 1 },
+    );
+    // 「删除所有人的记录」的会话水位。
+    await conversation(
+      'conversation-cleared',
+      [
+        { from: 'conversation-cleared', height: 1 },
+        { from: 'applicant', height: 2 },
+      ],
+      { conversationCleared: 1 },
+    );
+    await conversation('deleted', [
+      { from: 'deleted', height: 1, deleted: true },
+      { from: 'applicant', height: 2 },
+    ]);
+    await conversation('revoked', [
+      { from: 'revoked', height: 1, revokedAt: '2026-01-01 00:00:00' },
+      { from: 'applicant', height: 2 },
+    ]);
+    // 焚毁期限已过、清理任务还没来得及把它标成 deleted。
+    await conversation('burned', [
+      { from: 'burned', height: 1, burnExpiresAt: '2000-01-01 00:00:00' },
+      { from: 'applicant', height: 2 },
+    ]);
+    // 申请人这边的座位已退出,全局搜索也搜不到这段。
+    await conversation(
+      'left-seat',
+      [
+        { from: 'left-seat', height: 1 },
+        { from: 'applicant', height: 2 },
+      ],
+      { applicantLeftAt: '2026-01-01 00:00:00' },
+    );
+    // 还没到焚毁期限:现在还看得见,照算。
+    await conversation('burning-later', [
+      {
+        from: 'burning-later',
+        height: 1,
+        burnExpiresAt: '2999-01-01 00:00:00',
+      },
+      { from: 'applicant', height: 2 },
+    ]);
+
+    expect(await eligible({})).toEqual(['burning-later']);
+  });
+
+  it('ignores group chats, auto replies and blocked pairs in either direction', async () => {
+    for (const [index, peer] of [
+      'group-mate',
+      'auto-replier',
+      'blocked-by-applicant',
+      'blocked-applicant',
+    ].entries()) {
+      await member(peer, `2026-01-0${index + 1} 00:00:00`);
+    }
+    await conversation(
+      'group-mate',
+      [
+        { from: 'group-mate', height: 1 },
+        { from: 'applicant', height: 2 },
+      ],
+      { type: 'GROUP' },
+    );
+    // 对方开着自动回复:那是服务端代发,不是对方说的话。
+    await conversation('auto-replier', [
+      { from: 'applicant', height: 1 },
+      {
+        from: 'auto-replier',
+        height: 2,
+        content: { text: '我在忙', autoReply: true },
+      },
+    ]);
+    for (const peer of ['blocked-by-applicant', 'blocked-applicant']) {
+      await conversation(peer, [
+        { from: peer, height: 1 },
+        { from: 'applicant', height: 2 },
+      ]);
+    }
+    await block('applicant', 'blocked-by-applicant');
+    await block('blocked-applicant', 'applicant');
+
+    expect(await eligible({})).toEqual([]);
+    expect(await chatted('applicant', 'blocked-applicant')).toBe(false);
+  });
+
+  it('returns a member once when they are both a friend and a chat partner', async () => {
+    await member('both', '2026-01-01 00:00:00');
+    await friend('applicant', 'both');
+    await friend('both', 'applicant');
+    await conversation('both', [
+      { from: 'both', height: 1 },
+      { from: 'applicant', height: 2 },
+    ]);
+
+    expect(await eligible({})).toEqual(['both']);
   });
 
   it('intersects active members with accepted friends in either direction, by join order', async () => {

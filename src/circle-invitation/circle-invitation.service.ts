@@ -39,7 +39,10 @@ import {
   approvedInvitationsToReconcileQuery,
   pendingConsentDeliveriesQuery,
 } from './circle-invitation-cron.query';
-import { eligibleVerifierIdsQuery } from './eligible-verifiers.query';
+import {
+  eligibleVerifierIdsQuery,
+  mutualDirectChatQuery,
+} from './eligible-verifiers.query';
 
 // 验证卡片补偿的节流参数。宽限期给 inline 签发留出完成时间。
 //
@@ -982,14 +985,15 @@ export class CircleInvitationService {
   }
 
   /**
-   * 申请人可挑的验证人 = 本圈 ACTIVE 成员 ∩ 自己的好友 - 已占席的 - 自己。
+   * 申请人可挑的验证人 = 本圈 ACTIVE 成员 ∩ (自己的好友 ∪ 和自己私聊过的人)
+   * - 已占席的 - 自己。「私聊过」的口径见 eligible-verifiers.query。
    *
    * 选人页此前拉的是**全部好友**,不在圈里的也照列,点下去才被服务端一句
    * VerifierNotMember 打回;而资格规则本身归服务端所有,那就由服务端算好再给,
    * 前端不做集合运算 —— 否则同一条规则会在两个仓里各写一遍、各自漂移。
    *
    * 交集在一条 SQL 里算(eligibleVerifierIdsQuery):此前先把全圈 ACTIVE 成员(容量上限
-   * 3000)拉进内存,再拿两个 3000 项的 IN 去查好友表;现在好友集合是子查询,哪边小
+   * 3000)拉进内存,再拿两个 3000 项的 IN 去查好友表;现在关系集合是子查询,哪边小
    * 由规划器从哪边收窄,应用里只拿到交集的 id。
    *
    * 排除已占席时**不看状态**:addVerifier 的 AlreadyVerifier 判定同样不看状态
@@ -1096,7 +1100,7 @@ export class CircleInvitationService {
       ]);
 
       // 三个读并发发出(锁已持有),省一次往返 —— 校验顺序仍由下面的 if 决定。
-      const [invitation, membership, verifierIsFriend] = await Promise.all([
+      const [invitation, membership, verifierIsRelated] = await Promise.all([
         tx.circleInvitation.findUnique({
           where: { id: invitationId },
           include: { verifiers: true },
@@ -1109,7 +1113,7 @@ export class CircleInvitationService {
             },
           },
         }),
-        this.areFriends(application.applicantID, verifierId, tx),
+        this.isRelatedToApplicant(application.applicantID, verifierId, tx),
       ]);
       if (!invitation) {
         throw new NotFoundException({
@@ -1139,12 +1143,13 @@ export class CircleInvitationService {
         });
       }
 
-      // 资格是**交集**:既是好友、又在本圈里。这一半此前只靠选人页拉好友列表
+      // 资格是**交集**:在本圈里,且是好友或私聊过。这一半此前只靠选人页的列表
       // 这个 UI 约定撑着 —— 直接打这个接口就能把圈里任意 ACTIVE 成员塞成自己的
       // 验证人。规则归服务端,前端列表只是它的投影。
-      if (!verifierIsFriend) {
+      // 错误码沿用 VerifierNotFriend:它是对外契约,老客户端靠它出文案。
+      if (!verifierIsRelated) {
         throw new BadRequestException({
-          message: '验证人必须是你的好友，请更换验证人再尝试',
+          message: '验证人必须是你的好友或和你私聊过，请更换验证人再尝试',
           errorCode: CircleInvitationErrorCode.VerifierNotFriend,
         });
       }
@@ -1494,8 +1499,8 @@ export class CircleInvitationService {
         });
       }
 
-      // 加席之后退圈、加席之后解除好友,是同一形状:资格必须在投票这一刻重算,
-      // 不能信加席那次检查。
+      // 加席之后退圈、加席之后解除好友/拉黑/清空私聊,是同一形状:资格必须在
+      // 投票这一刻重算,不能信加席那次检查。
       //
       // 但闸只对**同意**设:反对票放不进人,却能把席位让出来(REJECTED 不计入
       // activeSlots),所以失去资格的人必须仍然能拒绝。挡掉拒绝的话那一席永远
@@ -1521,9 +1526,15 @@ export class CircleInvitationService {
           });
         }
 
-        if (!(await this.areFriends(application.applicantID, verifierId, tx))) {
+        if (
+          !(await this.isRelatedToApplicant(
+            application.applicantID,
+            verifierId,
+            tx,
+          ))
+        ) {
           throw new ForbiddenException({
-            message: '验证人必须是申请人的好友',
+            message: '验证人必须是申请人的好友或和申请人私聊过',
             errorCode: CircleInvitationErrorCode.VerifierNotFriend,
           });
         }
@@ -2333,5 +2344,22 @@ export class CircleInvitationService {
       select: { userID: true },
     });
     return record !== null;
+  }
+
+  /**
+   * 验证人资格的「关系」那一半:好友,或和申请人私聊过(口径见
+   * eligible-verifiers.query,与候选名单同一段 SQL)。好友先查:多数人走这条,
+   * 命中就省掉私聊那条查询。必须在加席/投票事务内、拿着这一对的 user lock 读。
+   */
+  private async isRelatedToApplicant(
+    applicantId: string,
+    verifierId: string,
+    tx: Prisma.TransactionClient,
+  ): Promise<boolean> {
+    if (await this.areFriends(applicantId, verifierId, tx)) return true;
+    const [row] = await tx.$queryRaw<Array<{ chatted: boolean }>>(
+      mutualDirectChatQuery({ applicantId, peerId: verifierId }),
+    );
+    return row?.chatted === true;
   }
 }

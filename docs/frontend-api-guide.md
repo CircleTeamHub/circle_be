@@ -1576,8 +1576,8 @@ Authorization: Bearer <accessToken>
 | GET | `/circle-invitation/my-applications` | 同上 | Invitation 数组 | 我作为申请人的申请 |
 | GET | `/circle-invitation/circle/:circleId/pending` | 同上 | Invitation 数组 | 仅 ACTIVE 的圈主 / 管理员（`INVITATION_OWNER_ADMIN_ONLY`） |
 | GET | `/circle-invitation/:id` | — | Invitation | 无权查看时 `INVITATION_VIEW_FORBIDDEN` |
-| GET | `/circle-invitation/:id/eligible-verifiers` | — | `{ id, nickname, avatarUrl, accountId }[]` | 仅申请人（`INVITATION_APPLICANT_ONLY`）；返回既是我好友、又是该圈 ACTIVE 成员的人 |
-| POST | `/circle-invitation/:id/add-verifier` | `{ verifierId }`（UUID） | `204` | 仅申请人；担保人须是好友（`INVITATION_VERIFIER_NOT_FRIEND`）且是圈子成员（`INVITATION_VERIFIER_NOT_MEMBER`）；名额已满 `INVITATION_SLOTS_FILLED`；重复添加 `INVITATION_ALREADY_VERIFIER` |
+| GET | `/circle-invitation/:id/eligible-verifiers` | — | `{ id, nickname, avatarUrl, accountId }[]` | 仅申请人（`INVITATION_APPLICANT_ONLY`）；返回该圈 ACTIVE 成员中，是我好友或和我私聊过（私聊里双方都发过言、我这边未清空，自动回复不算，任一方拉黑不算）的人 |
+| POST | `/circle-invitation/:id/add-verifier` | `{ verifierId }`（UUID） | `204` | 仅申请人；担保人须是好友或和申请人私聊过，口径同上（`INVITATION_VERIFIER_NOT_FRIEND`，码名沿用）且是圈子成员（`INVITATION_VERIFIER_NOT_MEMBER`）；名额已满 `INVITATION_SLOTS_FILLED`；重复添加 `INVITATION_ALREADY_VERIFIER` |
 | POST | `/circle-invitation/:id/respond` | `{ approve }`（布尔） | `204` | 担保人同意 / 拒绝；我没有待处理的担保 `INVITATION_NO_PENDING_VERIFICATION`；申请已结束 `INVITATION_NOT_PENDING` |
 | POST | `/circle-invitation/:id/admin-approve` | — | `204` | ACTIVE 的圈主 / 管理员跳过担保直接通过（`INVITATION_OWNER_ADMIN_ONLY`） |
 

@@ -16,7 +16,10 @@ import {
   approvedInvitationsToReconcileQuery,
   pendingConsentDeliveriesQuery,
 } from './circle-invitation-cron.query';
-import { eligibleVerifierIdsQuery } from './eligible-verifiers.query';
+import {
+  eligibleVerifierIdsQuery,
+  mutualDirectChatQuery,
+} from './eligible-verifiers.query';
 
 // 卡片签发已从请求路径脱钩(不能让聊天投递挡住 add-verifier 的响应),
 // 所以断言之前要把这一拍排空。
@@ -1852,7 +1855,21 @@ describe('CircleInvitationService', () => {
   // 规则只靠 SelectVerifierScreen 拉好友列表这个 UI 约定撑着:直接打
   // POST /circle-invitation/:id/add-verifier 就能把圈里任意 ACTIVE 成员塞成
   // 自己的验证人。这一组把交集的两半都钉在服务端。
-  describe('verifier eligibility (friend ∩ active member)', () => {
+  //
+  // 「关系」那一半后来放宽成:好友,或和申请人私聊过(双方都发过言,口径见
+  // eligible-verifiers.query 与它的 Postgres 用例)。
+  describe('verifier eligibility ((friend ∪ chatted) ∩ active member)', () => {
+    const chattedWithVerifier = mutualDirectChatQuery({
+      applicantId: 'applicant-1',
+      peerId: 'verifier-9',
+    });
+
+    // 只接管私聊判定那一条,流程里其余的 $queryRaw 仍走默认的空结果。
+    function arrangeChatted(chatted: boolean) {
+      prisma.$queryRaw.mockImplementation(async (query: Prisma.Sql) =>
+        query.sql === chattedWithVerifier.sql ? [{ chatted }] : [],
+      );
+    }
     function arrangeRespondSeat() {
       prisma.circleInvitation.findUnique
         .mockResolvedValueOnce({
@@ -1886,9 +1903,10 @@ describe('CircleInvitationService', () => {
       prisma.circleMember.findUnique.mockResolvedValue({ status: 'ACTIVE' });
     }
 
-    it('addVerifier rejects an active member who is not the applicant friend', async () => {
+    it('addVerifier rejects an active member who is neither a friend nor has chatted', async () => {
       arrangePendingInvitation();
       prisma.friend.findFirst.mockResolvedValue(null);
+      arrangeChatted(false);
 
       await expect(
         service.addVerifier('applicant-1', 'inv-1', 'verifier-9'),
@@ -1898,12 +1916,46 @@ describe('CircleInvitationService', () => {
         },
       });
 
+      expect(prisma.$queryRaw).toHaveBeenCalledWith(chattedWithVerifier);
       expect(prisma.circleInvitationVerifier.create).not.toHaveBeenCalled();
       expect(
         notificationService.createCircleInvitationNotification,
       ).not.toHaveBeenCalled();
       await flush();
       expect(chatMessages.insertServerMessage).not.toHaveBeenCalled();
+    });
+
+    it('addVerifier accepts a non-friend member who has chatted with the applicant', async () => {
+      arrangePendingInvitation();
+      prisma.friend.findFirst.mockResolvedValue(null);
+      arrangeChatted(true);
+
+      await expect(
+        service.addVerifier('applicant-1', 'inv-1', 'verifier-9'),
+      ).resolves.toBeUndefined();
+
+      // 私聊判定在拿到这一对的 user lock 之后、同一事务里读。
+      expect(prisma.$queryRaw).toHaveBeenCalledWith(chattedWithVerifier);
+      expect(prisma.$executeRaw.mock.invocationCallOrder[0]).toBeLessThan(
+        prisma.$queryRaw.mock.invocationCallOrder[0],
+      );
+      expect(prisma.circleInvitationVerifier.create).toHaveBeenCalledWith({
+        data: {
+          invitationID: 'inv-1',
+          verifierID: 'verifier-9',
+          addedByID: 'applicant-1',
+          status: 'PENDING',
+        },
+      });
+    });
+
+    it('addVerifier skips the chat lookup for a friend', async () => {
+      arrangePendingInvitation();
+
+      await service.addVerifier('applicant-1', 'inv-1', 'verifier-9');
+
+      expect(prisma.$queryRaw).not.toHaveBeenCalledWith(chattedWithVerifier);
+      expect(prisma.circleInvitationVerifier.create).toHaveBeenCalled();
     });
 
     it('does not allow the applicant to add the approved inviter again', async () => {
@@ -1990,6 +2042,7 @@ describe('CircleInvitationService', () => {
       // 加席时是好友,投票前解除了 —— 与「加席后退圈」同一形状,资格必须在
       // 投票这一刻重算,不能信加席那次检查。
       prisma.friend.findFirst.mockResolvedValue(null);
+      arrangeChatted(false);
 
       await expect(
         service.respond('verifier-9', 'inv-1', true),
@@ -1999,8 +2052,38 @@ describe('CircleInvitationService', () => {
         },
       });
 
+      expect(prisma.$queryRaw).toHaveBeenCalledWith(chattedWithVerifier);
       expect(prisma.circleInvitationVerifier.update).not.toHaveBeenCalled();
       expect(prisma.circleInvitation.updateMany).not.toHaveBeenCalled();
+    });
+
+    it('respond accepts approval from a non-friend verifier who has chatted with the applicant', async () => {
+      arrangeRespondSeat();
+      prisma.circleMember.findUnique.mockResolvedValue({ status: 'ACTIVE' });
+      prisma.circleInvitation.updateMany.mockResolvedValue({ count: 1 });
+      prisma.circleInvitation.findUnique.mockResolvedValue({
+        id: 'inv-1',
+        circleID: 'circle-1',
+        applicantID: 'applicant-1',
+        status: 'PENDING',
+        requiredCount: 10,
+        approvedCount: 2,
+        circle: { id: 'circle-1', name: 'Circle' },
+      });
+      prisma.friend.findFirst.mockResolvedValue(null);
+      arrangeChatted(true);
+
+      await expect(
+        service.respond('verifier-9', 'inv-1', true),
+      ).resolves.toBeUndefined();
+
+      expect(prisma.$queryRaw).toHaveBeenCalledWith(chattedWithVerifier);
+      expect(prisma.circleInvitationVerifier.update).toHaveBeenCalledWith(
+        expect.objectContaining({
+          where: { id: 'seat-1' },
+          data: expect.objectContaining({ status: 'APPROVED' }),
+        }),
+      );
     });
 
     it('respond approval takes the shared user lock before rechecking friendship', async () => {
