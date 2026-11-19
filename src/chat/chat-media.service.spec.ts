@@ -177,6 +177,35 @@ describe('ChatMediaService', () => {
       ]);
     });
 
+    // 发送方开着阅后即焚时卡片照样要带预览图,只是签名封顶在焚毁时长内。
+    it('signs previews for a note card sent with burn-after-reading on', async () => {
+      prisma.chatMessage.findMany.mockResolvedValue([
+        {
+          id: 'm1',
+          deleted: false,
+          revokedAt: null,
+          burnDurationSec: 60,
+          burnExpiresAt: null,
+        },
+      ]);
+      const message = dto({
+        id: 'm1',
+        type: 'note-card',
+        burnDurationSec: 60,
+        content: {
+          noteId: 'n1',
+          sourceNoteId: 'n1',
+          previewKeys: ['notes/u1/a.jpg'],
+        },
+      });
+      await service.attachMediaUrls([message]);
+      expect(message.content.previewUrls).toEqual([
+        'https://signed/notes/u1/a.jpg',
+      ]);
+      const [, ttl] = uploadService.createPresignedGetUrl.mock.calls[0];
+      expect(ttl).toBe(60);
+    });
+
     // 作者事后下架 / 删除:已发出的卡片不再续签,一页卡片只批量查一次根笔记。
     it('stops signing previews once the source root is no longer distributable', async () => {
       prisma.note.findMany.mockResolvedValue([
