@@ -1,9 +1,4 @@
-import {
-  ForbiddenException,
-  Injectable,
-  NotFoundException,
-  Optional,
-} from '@nestjs/common';
+import { Injectable, NotFoundException, Optional } from '@nestjs/common';
 import { Prisma } from 'src/generated/prisma';
 import { PrismaService } from 'src/prisma/prisma.service';
 import { MembershipErrorCode } from 'src/common/app-error-codes';
@@ -23,13 +18,6 @@ import {
 } from './membership-program.service';
 
 const MEMBERSHIP_USER_LOCK_PREFIX = 'membership-user:';
-
-export enum MembershipQuota {
-  GroupMembers = 'group-members',
-  JoinedCircles = 'joined-circles',
-  Notes = 'notes',
-  CityFilters = 'city-filters',
-}
 
 export interface EffectiveMembershipPolicy {
   level: MembershipLevel;
@@ -142,21 +130,5 @@ export class MembershipPolicyService {
         FROM unnest(ARRAY[${Prisma.join(keys)}]::text[]) AS keys(lock_key)
       `,
     );
-  }
-
-  assertQuotaAvailable(
-    quota: MembershipQuota,
-    currentCount: number,
-    limit: number,
-  ): void {
-    if (currentCount < limit) {
-      return;
-    }
-    throw new ForbiddenException({
-      message: `Membership ${quota.replace(/-/g, ' ')} quota reached`,
-      errorCode: 'MEMBERSHIP_QUOTA_REACHED',
-      quota,
-      limit,
-    });
   }
 }

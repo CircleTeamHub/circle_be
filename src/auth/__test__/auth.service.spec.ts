@@ -2956,6 +2956,45 @@ describe('AuthService', () => {
     ).rejects.toThrow(ForbiddenException);
   });
 
+  // 改码/关码时核对旧码与 /verify 共用同一份错误次数与锁定,否则持有会话的人
+  // 可以绕开 5 次上限,用这两个接口把 4~6 位安全码穷举出来再关掉。
+  it('counts wrong old codes on change/disable toward the same lockout', async () => {
+    users.push({
+      id: 'uuid-1',
+      accountId: 'testuser',
+      passwordHash: 'hash',
+      status: 'ACTIVE',
+      role: 'USER',
+      loginSecurityCodeHash: await argon2.hash('1234'),
+      securityCodeAttempts: 0,
+      securityCodeLockedUntil: null,
+    });
+
+    for (let i = 0; i < 2; i++) {
+      await expect(
+        service.disableLoginSecurityCode('uuid-1', '9999'),
+      ).rejects.toThrow(ForbiddenException);
+      await expect(
+        service.setLoginSecurityCode('uuid-1', '5678', '9999'),
+      ).rejects.toThrow(ForbiddenException);
+    }
+    expect(users[0].securityCodeAttempts).toBe(4);
+
+    await expect(
+      service.disableLoginSecurityCode('uuid-1', '9999'),
+    ).rejects.toThrow('安全码错误次数过多，请稍后再试');
+    expect(users[0].securityCodeLockedUntil).toBeInstanceOf(Date);
+
+    // 锁定期间拿着正确的旧码也不能关、不能改。
+    await expect(
+      service.disableLoginSecurityCode('uuid-1', '1234'),
+    ).rejects.toThrow('安全码错误次数过多，请稍后再试');
+    await expect(
+      service.setLoginSecurityCode('uuid-1', '5678', '1234'),
+    ).rejects.toThrow('安全码错误次数过多，请稍后再试');
+    expect(users[0].loginSecurityCodeHash).not.toBeNull();
+  });
+
   it('resets the failure counter after a successful verification', async () => {
     users.push({
       id: 'uuid-1',

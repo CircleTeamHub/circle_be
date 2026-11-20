@@ -35,7 +35,6 @@ type IdempotentGiftFingerprint = {
 const GIFT_MAX_SINGLE = 10_000;
 // Max coins a user can send per day (prevent drain attacks)
 const GIFT_DAILY_LIMIT = 50_000;
-// Upper bound on a single admin top-up — guards against fat-finger / Int overflow.
 
 @Injectable()
 export class CoinService {

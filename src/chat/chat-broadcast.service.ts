@@ -31,7 +31,11 @@ import type {
   ChatRevokeBroadcast,
   ChatTypingBroadcast,
 } from './chat.types';
-import { isGuestUserId, toGuestMessageView } from './chat-guest-view';
+import {
+  isGuestUserId,
+  toGuestMessageView,
+  toGuestRevokeView,
+} from './chat-guest-view';
 
 /**
  * 带发送者幂等键(d)的消息 → 发送者的个人房;编辑广播、系统消息等不带 d 的载荷
@@ -444,13 +448,47 @@ export class ChatBroadcastService implements OnModuleInit, OnModuleDestroy {
     );
   }
 
-  /** 消息撤回 → 会话房(发起者也收,靠它把本地气泡翻成灰条)。 */
-  emitRevoke(payload: ChatRevokeBroadcast): void {
+  /**
+   * 消息撤回 → 会话房(发起者也收,靠它把本地气泡翻成灰条)。
+   * 临时房传 guests:访客只进个人房(见 gateway),会话房的广播到不了他们。
+   */
+  emitRevoke(
+    payload: ChatRevokeBroadcast,
+    options: { guests?: boolean } = {},
+  ): void {
     const server = this.requireServer('emitRevoke');
     if (!server) return;
     server
       .to(conversationRoom(payload.conversationId))
       .emit(CHAT_EVENTS.revoke, payload);
+    if (options.guests) void this.emitRevokeToGuests(server, payload);
+  }
+
+  /** 在座访客逐个个人房补发访客视图(房主的账号 id 换成房间内别名)。 */
+  private async emitRevokeToGuests(
+    server: Server,
+    payload: ChatRevokeBroadcast,
+  ): Promise<void> {
+    try {
+      const seats = await this.prisma.chatMember.findMany({
+        where: { conversationID: payload.conversationId, leftAt: null },
+        select: { userID: true },
+      });
+      const rooms = seats
+        .map((seat) => seat.userID)
+        .filter(isGuestUserId)
+        .map(userRoom);
+      if (rooms.length === 0) return;
+      server.to(rooms).emit(CHAT_EVENTS.revoke, toGuestRevokeView(payload));
+    } catch (error) {
+      // 撤回已经提交、会话房也已广播;这里失败只影响访客页的实时更新,
+      // 访客重连补洞时仍会拿到已撤回的行。
+      this.logger.warn(
+        `revoke fan-out to temp-chat guests failed: ${
+          error instanceof Error ? error.message : String(error)
+        }`,
+      );
+    }
   }
 
   /** 本人会话成员关系变化(入座/退出/被移出) → 个人房定向。 */

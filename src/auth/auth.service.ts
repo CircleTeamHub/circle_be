@@ -11,7 +11,7 @@ import {
 } from '@nestjs/common';
 import { JwtService } from '@nestjs/jwt';
 import * as argon2 from 'argon2';
-import { Prisma } from 'src/generated/prisma';
+import { Prisma, RefreshTokenRevocationReason } from 'src/generated/prisma';
 import { PrismaService } from 'src/prisma/prisma.service';
 import { LoginDto } from './dto/login.dto';
 import { RegisterDto } from './dto/register.dto';
@@ -1476,7 +1476,10 @@ export class AuthService {
         }),
         this.prisma.refreshToken.updateMany({
           where: { userId: user.id, revokedAt: null },
-          data: { revokedAt: new Date() },
+          data: {
+            revokedAt: new Date(),
+            revocationReason: RefreshTokenRevocationReason.LOGOUT_ALL,
+          },
         }),
       ]);
       // access token 吊销标记（Redis）单独尽力：失败时 refresh 已死、access
@@ -1817,11 +1820,12 @@ export class AuthService {
         });
       }
       assertValidSecurityCode(oldSecurityCode, 'oldSecurityCode');
-      const oldCodeValid = await argon2.verify(
-        user.loginSecurityCodeHash,
+      // 走计次的那条核对:旧码输错与 /verify 共用同一份次数与锁定。
+      const { ok } = await this.verifyLoginSecurityCode(
+        userId,
         oldSecurityCode,
       );
-      if (!oldCodeValid) {
+      if (!ok) {
         throw new ForbiddenException({
           message: '当前安全码不正确',
           errorCode: AuthErrorCode.SecurityCodeInvalid,
@@ -1870,8 +1874,9 @@ export class AuthService {
       return;
     }
 
-    const valid = await argon2.verify(user.loginSecurityCodeHash, securityCode);
-    if (!valid) {
+    // 走计次的那条核对:输错与 /verify 共用同一份次数与锁定。
+    const { ok } = await this.verifyLoginSecurityCode(userId, securityCode);
+    if (!ok) {
       throw new ForbiddenException({
         message: '安全码不正确',
         errorCode: AuthErrorCode.SecurityCodeInvalid,

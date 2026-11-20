@@ -629,7 +629,8 @@ export class ChatController {
   @Get('conversations/:id/burn')
   @Throttle({ default: { limit: 60, ttl: 60_000 } })
   @ApiOperation({
-    summary: '读取会话级阅后即焚档位(与 POST 回执同形;私聊页进入时拉取)',
+    summary:
+      '读取本人在该会话的发送焚毁档位(与 POST 回执同形;私聊页进入时拉取)',
   })
   getBurnPolicy(
     @Req() req: RequestWithUser,
@@ -644,7 +645,8 @@ export class ChatController {
   @Post('conversations/:id/burn')
   @Throttle({ default: { limit: 10, ttl: 60_000 } })
   @ApiOperation({
-    summary: '会话级阅后即焚(任一方设置双方生效,变更留系统痕迹)',
+    summary:
+      '设置本人在该会话的发送焚毁档位(只作用于自己之后发出的消息,变更留系统痕迹)',
   })
   setBurnDuration(
     @Req() req: RequestWithUser,

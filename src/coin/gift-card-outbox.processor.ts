@@ -17,11 +17,11 @@ const MAX_ATTEMPTS = GIFT_CARD_MAX_ATTEMPTS;
 const BATCH = 50;
 
 /**
- * 转账卡片补偿（#100）。钱在 sendGift 里已强一致落库；卡片此前只靠客户端
- * IM 发送 —— 发卡失败即永久丢失（客户端无法为已结算的转账重发卡，重转会
- * 双花）。现在：客户端发卡成功后回执置位 cardDeliveredAt；创建 ≥2 分钟仍
- * 未置位的礼物由服务端补发同構卡片。补发与客户端卡片在极端竞态下可能各到
- * 一张 —— 语义是「多一张回执」而不是「多一笔钱」，可接受且一次性。
+ * 转账卡片补偿（#100）。钱在 sendGift 里已强一致落库；卡片由服务端在结算
+ * 提交后内联签发（CoinService.issueTransferCard），成功即置位
+ * cardDeliveredAt。这个定时任务是兜底：创建 ≥2 分钟仍未置位的礼物在这里
+ * 补发。两条路径共用 gift 派生的幂等键（gift_card_<id>），撞唯一约束时合并，
+ * 收款方只会看到一张卡。
  */
 @Injectable()
 export class GiftCardOutboxProcessor {
@@ -43,17 +43,14 @@ export class GiftCardOutboxProcessor {
       },
       orderBy: { createdAt: 'asc' },
       take: BATCH,
-      include: {
-        sender: { select: { id: true, nickname: true, avatarUrl: true } },
-      },
     });
 
     let delivered = 0;
     for (const gift of gifts) {
       // review 修复（先抢占后外呼）：条件 updateMany 抢到这一分钟的投递权
-      // 才发 —— 多副本同时扫表 / 客户端回执竞态时，输家 count=0 直接跳过，
-      // 不再出现「发完卡才发现别人已置位」的窗口。attempts 先记账：HTTP
-      // 超时但 OpenIM 已收下的情况也算一次尝试。
+      // 才发 —— 多副本同时扫表 / 与内联签发竞态时，输家 count=0 直接跳过，
+      // 不再出现「发完卡才发现别人已置位」的窗口。attempts 先记账：写入
+      // 超时但消息其实已落库的情况也算一次尝试。
       const claimed = await this.prisma.coinGift.updateMany({
         where: {
           id: gift.id,

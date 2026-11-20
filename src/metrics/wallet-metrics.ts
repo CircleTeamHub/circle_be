@@ -1,13 +1,5 @@
 import { Gauge, Registry } from 'prom-client';
 
-export const WALLET_RECONCILIATION_CHECKS = [
-  'ledger_mismatch',
-  'negative_balance',
-] as const;
-
-export type WalletReconciliationCheck =
-  (typeof WALLET_RECONCILIATION_CHECKS)[number];
-
 export interface WalletReconciliationResult {
   /** 参与核对的钱包数（含只有流水、没有钱包行的用户）。 */
   wallets: number;

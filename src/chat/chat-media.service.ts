@@ -743,7 +743,9 @@ export class ChatMediaService implements OnModuleDestroy {
   ): Promise<Map<string, { date: Date; ttl: number }>> {
     const burning = messages.filter(
       (message) =>
-        !!CHAT_MEDIA_KEY_FIELDS[message.type] &&
+        // 笔记卡片没有自己的媒体键,但预览图同样要按焚毁时长封顶签名。
+        (!!CHAT_MEDIA_KEY_FIELDS[message.type] ||
+          message.type === 'note-card') &&
         !!(message.burnExpiresAt || message.burnDurationSec),
     );
     const grants = new Map<string, { date: Date; ttl: number }>();

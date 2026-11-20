@@ -1,10 +1,7 @@
-import { ForbiddenException, NotFoundException } from '@nestjs/common';
+import { NotFoundException } from '@nestjs/common';
 import { Prisma } from 'src/generated/prisma';
 import { PrismaService } from 'src/prisma/prisma.service';
-import {
-  MembershipPolicyService,
-  MembershipQuota,
-} from './membership-policy.service';
+import { MembershipPolicyService } from './membership-policy.service';
 import { MembershipProgramService } from './membership-program.service';
 
 describe('MembershipPolicyService', () => {
@@ -127,25 +124,5 @@ describe('MembershipPolicyService', () => {
     await service.lockUsers(tx, []);
 
     expect(executeRaw).not.toHaveBeenCalled();
-  });
-
-  it('provides a reusable structured quota exception at the limit', () => {
-    expect(() =>
-      service.assertQuotaAvailable(MembershipQuota.Notes, 50, 50),
-    ).toThrow(ForbiddenException);
-
-    try {
-      service.assertQuotaAvailable(MembershipQuota.Notes, 50, 50);
-    } catch (error) {
-      expect((error as ForbiddenException).getResponse()).toEqual({
-        message: 'Membership notes quota reached',
-        errorCode: 'MEMBERSHIP_QUOTA_REACHED',
-        quota: 'notes',
-        limit: 50,
-      });
-    }
-    expect(() =>
-      service.assertQuotaAvailable(MembershipQuota.Notes, 49, 50),
-    ).not.toThrow();
   });
 });

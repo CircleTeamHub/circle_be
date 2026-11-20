@@ -3,7 +3,11 @@ import { PrismaExceptionFilter } from './filters/prisma-exception.filter';
 import { ResponseInterceptor } from './interceptors/response.interceptor';
 import { ErrorLoggingInterceptor } from './interceptors/error-logging.interceptor';
 import { RedisService } from './redis/redis.service';
-import { createWriteMethodLimiterMount, setupApp } from './setup';
+import {
+  createSecurityCodeWriteLimiterMount,
+  createWriteMethodLimiterMount,
+  setupApp,
+} from './setup';
 import { redisMetrics } from './redis/redis.metrics';
 import { uploadMetrics } from './metrics/upload-metrics';
 import { chatMetrics } from './chat/chat-metrics';
@@ -511,5 +515,36 @@ describe('setupApp circle-plaza limiter mount', () => {
     const blocked = await hit(mount, 'POST', '/posts');
     expect(blocked.next).not.toHaveBeenCalled();
     expect(blocked.res.status).toHaveBeenCalledWith(429);
+  });
+});
+
+describe('createSecurityCodeWriteLimiterMount', () => {
+  // 改码/关码核对的是 /verify 猜的同一个码:没有这把限流,并发猜测能跑赢 5 次锁定。
+  it('limits changing and disabling the code, and nothing else under the prefix', () => {
+    const limiter = jest.fn();
+    const mount = createSecurityCodeWriteLimiterMount(limiter as any);
+    const res = {} as any;
+
+    for (const method of ['PUT', 'DELETE']) {
+      limiter.mockClear();
+      const next = jest.fn();
+      const req = { method, path: '/' } as any;
+      mount(req, res, next);
+      expect(limiter).toHaveBeenCalledWith(req, res, next);
+      expect(next).not.toHaveBeenCalled();
+    }
+
+    limiter.mockClear();
+    for (const req of [
+      // App 锁屏门会轮询状态;算进配额会把正常使用限流。
+      { method: 'GET', path: '/' },
+      // /verify 有自己的挂载,这里再算一次就是一次请求扣两次。
+      { method: 'POST', path: '/verify' },
+    ]) {
+      const next = jest.fn();
+      mount(req as any, res, next);
+      expect(next).toHaveBeenCalledTimes(1);
+    }
+    expect(limiter).not.toHaveBeenCalled();
   });
 });
