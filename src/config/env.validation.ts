@@ -208,6 +208,14 @@ export function createEnvValidationSchema(
     JPUSH_APP_KEY: Joi.string().trim().min(1).optional(),
     JPUSH_MASTER_SECRET: Joi.string().trim().min(1).optional(),
     JPUSH_APNS_PRODUCTION: Joi.boolean().default(false),
+    WEB_PUSH_VAPID_PRIVATE_KEY: Joi.string()
+      .trim()
+      .pattern(/^[A-Za-z0-9_-]{43}$/)
+      .optional(),
+    WEB_PUSH_VAPID_SUBJECT: Joi.string()
+      .trim()
+      .uri({ scheme: ['https', 'mailto'] })
+      .optional(),
     // iOS 来电(PushKit VoIP)直连 APNs 的 .p8 凭据;三项要么都配、要么都不配。
     // 不配时来电只走 WS 与安卓透传。sandbox / production 按 token 登记时上报的环境选。
     APNS_KEY_ID: Joi.string().trim().min(1).optional(),
