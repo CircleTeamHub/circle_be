@@ -1,4 +1,5 @@
 import { CHAT_PUSH_COALESCE_MS, ChatPushService } from './chat-push.service';
+import { foregroundDeviceMarker } from './chat-presence.registry';
 import type { ChatMessageDto } from './chat.types';
 import { UNREAD_COUNT_CAP } from './chat.constants';
 import { Prisma } from 'src/generated/prisma';
@@ -421,6 +422,99 @@ describe('ChatPushService', () => {
     await pushNow(msg());
 
     expect(push.sendMessages).not.toHaveBeenCalled();
+  });
+
+  // 网页版握手不带推送 token,在线登记表里记的是设备标识:只挡这台电脑自己的
+  // Web Push 订阅,同一个人别的设备照推。
+  describe('browser devices', () => {
+    const sentTokens = (): string[] =>
+      push.sendMessages.mock.calls.flatMap(
+        ([messages]: [Array<{ token: string }>]) =>
+          messages.map((message) => message.token),
+      );
+
+    beforeEach(() => {
+      prisma.chatMember.findMany.mockResolvedValue([seat('u-on-web')]);
+      push.listActiveTokensForUsers.mockResolvedValue(
+        new Map([
+          [
+            'u-on-web',
+            [
+              {
+                token: 'web-subscription',
+                projectId: null,
+                provider: 'web_push',
+                deviceKey: 'browser-key',
+              },
+              {
+                token: 'jpush-registration',
+                projectId: null,
+                provider: 'jpush',
+                deviceKey: 'phone-key',
+              },
+              {
+                token: 'ExponentPushToken[tablet]',
+                projectId: null,
+                provider: 'expo',
+                deviceKey: 'tablet-key',
+              },
+            ],
+          ],
+        ]),
+      );
+    });
+
+    it('skips the Web Push subscription of a browser showing the app', async () => {
+      broadcast.getForegroundPushTokensInConversation.mockResolvedValue(
+        new Map([
+          ['u-on-web', new Set([foregroundDeviceMarker('browser-key')])],
+        ]),
+      );
+
+      await pushNow(msg());
+
+      expect(sentTokens()).toEqual([
+        'jpush-registration',
+        'ExponentPushToken[tablet]',
+      ]);
+    });
+
+    it('pushes to the browser once its tab is hidden or closed', async () => {
+      // 隐藏的标签页是后台租约,登记表不会把它算进前台。
+      broadcast.getForegroundPushTokensInConversation.mockResolvedValue(
+        new Map(),
+      );
+
+      await pushNow(msg());
+
+      expect(sentTokens()).toEqual([
+        'web-subscription',
+        'jpush-registration',
+        'ExponentPushToken[tablet]',
+      ]);
+    });
+
+    it('never lets a device marker silence native tokens', async () => {
+      broadcast.getForegroundPushTokensInConversation.mockResolvedValue(
+        new Map([
+          [
+            'u-on-web',
+            new Set([
+              foregroundDeviceMarker('phone-key'),
+              foregroundDeviceMarker('tablet-key'),
+            ]),
+          ],
+        ]),
+      );
+
+      await pushNow(msg());
+
+      expect(sentTokens()).toEqual([
+        'web-subscription',
+        'jpush-registration',
+        'ExponentPushToken[tablet]',
+      ]);
+    });
   });
 
   it('respects mute but lets mentions and atAll pierce it', async () => {

@@ -35,7 +35,8 @@ import { RedisService } from 'src/redis/redis.service';
  * 一律不算 —— 崩溃后最多 INSTANCE_HEARTBEAT_TTL_SECONDS 就恢复。
  *
  * 租约成员 = `实例 id|socket id|推送 token`(没有 token 为空)。推送按**设备**判断:
- * 只有正开着 App 的那台设备不推,电脑上开着网页版不影响手机收推送。
+ * 只有正开着 App 的那台设备不推,电脑上开着网页版不影响手机收推送。网页版握手不带
+ * token,登记的是 foregroundDeviceMarker(设备标识),只挡同一台设备的 Web Push。
  */
 const KEY_TTL_SECONDS = 90 * 60;
 const REFRESH_MS = 20 * 60 * 1000;
@@ -50,6 +51,14 @@ const onlineKey = (conversationId: string): string =>
 const backgroundKey = (userId: string): string => `chat:bg:z:${userId}`;
 const instanceKey = (instanceId: string): string =>
   `chat:instance:${instanceId}`;
+
+/**
+ * 没有 Expo token 的连接(网页版)以登录会话的设备标识代替 token 登记。deviceKey
+ * 是 sha256 十六进制,不含租约分隔符。
+ */
+export function foregroundDeviceMarker(deviceKey: string): string {
+  return `device:${deviceKey}`;
+}
 
 /** 租约成员拆回实例 id 与推送 token。旧版本写的是裸 socket id:两者都是 null。 */
 function parseLease(member: string): {
@@ -112,7 +121,7 @@ export class ChatPresenceRegistry implements OnModuleInit, OnModuleDestroy {
    * 连接建立第一步:登记一条连接租约,返回该用户的全局连接数(上限判据)。
    *
    * socketId 用 socket.id —— 断开时按它精确摘除。pushToken 是这台设备登记的推送
-   * token(网页版、老版本没有):它正开着 App 时推送跳过这台设备。null = Redis 不可用
+   * token(网页版是设备标识,老版本没有):它正开着 App 时推送跳过这台设备。null = Redis 不可用
    * (未配置,或这一刻连不上/命令失败),调用方回退本实例计数;超限时调用方
    * 要调 socketDisconnected 把这条租约撤回去。
    */
@@ -261,7 +270,8 @@ export class ChatPresenceRegistry implements OnModuleInit, OnModuleDestroy {
    * 这些 token 不推);null = Redis 不可用。
    *
    * 读不到某人的租约时当作他没有前台设备 —— 宁可多推一条,也不把人当成正盯着
-   * 屏幕而一条都不推。前台连接没带 token 的(网页版、老版本)不挡任何设备的推送。
+   * 屏幕而一条都不推。前台连接没带 token 的(老版本)不挡任何设备的推送;网页版的
+   * 设备标识只挡同一台设备的 Web Push。
    */
   async getForegroundPushTokens(
     conversationId: string,

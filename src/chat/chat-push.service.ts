@@ -7,6 +7,7 @@ import {
   type TokenDeliveryOutcome,
 } from 'src/notification/notification-push.service';
 import { ChatBroadcastService } from './chat-broadcast.service';
+import { foregroundDeviceMarker } from './chat-presence.registry';
 import { unreadBadgeQuery } from './chat-push-badge.query';
 import { CHAT_PUSH_CHANNEL_ID } from './chat.constants';
 import type { ChatMessageDto } from './chat.types';
@@ -37,7 +38,10 @@ const BADGE_TARGETS_MAX = 200;
 
 type TokensByUser = Map<string, PushTokenTarget[]>;
 
-/** 这个人这次真正要推的设备:去掉正开着 App 的那几台(消息已经实时送到上面了)。 */
+/**
+ * 这个人这次真正要推的设备:去掉正开着 App 的那几台(消息已经实时送到上面了)。
+ * 网页版按设备标识识别,只跳过它自己的 Web Push 订阅。
+ */
 function deliverableTokens(
   tokensByUser: TokensByUser,
   foregroundTokens: Map<string, Set<string>>,
@@ -45,7 +49,13 @@ function deliverableTokens(
 ): PushTokenTarget[] {
   const onScreen = foregroundTokens.get(userId);
   return (tokensByUser.get(userId) ?? []).filter(
-    (token) => !onScreen?.has(token.token),
+    (token) =>
+      !onScreen?.has(token.token) &&
+      !(
+        token.provider === 'web_push' &&
+        token.deviceKey &&
+        onScreen?.has(foregroundDeviceMarker(token.deviceKey))
+      ),
   );
 }
 

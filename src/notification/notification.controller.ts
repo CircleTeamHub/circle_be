@@ -155,6 +155,12 @@ export class NotificationController {
     );
   }
 
+  @Get('web-push-key')
+  @ApiOperation({ summary: 'Get the Web Push public application server key' })
+  webPushKey() {
+    return this.notificationService.getWebPushPublicKey();
+  }
+
   @Put('push-token')
   @ApiOperation({
     summary: 'Register or refresh the current device push token',

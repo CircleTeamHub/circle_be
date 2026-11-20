@@ -1,6 +1,7 @@
 import { PrismaService } from 'src/prisma/prisma.service';
 import { NotificationPushService } from './notification-push.service';
 import { deliveryMetrics } from 'src/metrics/delivery-metrics';
+import { createECDH, generateKeyPairSync, randomBytes } from 'node:crypto';
 
 jest.mock('src/logging/error-aggregation.service', () => ({
   reportOperationalError: jest.fn(),
@@ -56,6 +57,54 @@ describe('NotificationPushService (#88 per-token delivery)', () => {
   });
 
   const payload = { title: 'T', body: 'B', data: { notificationId: 'n1' } };
+
+  it('routes browser subscriptions to Web Push and disables an expired endpoint', async () => {
+    const signer = generateKeyPairSync('ec', { namedCurve: 'prime256v1' });
+    configValues.WEB_PUSH_VAPID_PRIVATE_KEY = signer.privateKey.export({
+      format: 'jwk',
+    }).d;
+    service = new NotificationPushService(
+      prisma as unknown as PrismaService,
+      config as any,
+    );
+    const endpoint = 'https://web.push.apple.com/fixture';
+    const browser = createECDH('prime256v1');
+    const token = JSON.stringify([
+      endpoint,
+      browser.generateKeys().toString('base64url'),
+      randomBytes(16).toString('base64url'),
+    ]);
+    fetchMock
+      .mockResolvedValueOnce(new Response(null, { status: 201 }))
+      .mockResolvedValueOnce(new Response(null, { status: 410 }));
+    const targets = [{ token, provider: 'web_push' as const, projectId: null }];
+    await expect(service.sendToTokens(targets, payload)).resolves.toEqual([
+      { token, status: 'SENT', receiptFinal: true },
+    ]);
+    await expect(
+      service.sendToTokens(targets, { ...payload, ttl: 300 }),
+    ).resolves.toEqual([
+      { token, status: 'TERMINAL', error: 'DeviceNotRegistered' },
+    ]);
+    expect(fetchMock.mock.calls.map(([url]) => url)).toEqual([
+      endpoint,
+      endpoint,
+    ]);
+    // 载荷的保留期原样带给推送服务(缺省 24 小时),高优先级唤醒休眠中的手机。
+    expect(
+      fetchMock.mock.calls.map(([, init]) => {
+        const { TTL, Urgency } = init.headers as Record<string, string>;
+        return { TTL, Urgency };
+      }),
+    ).toEqual([
+      { TTL: '86400', Urgency: 'high' },
+      { TTL: '300', Urgency: 'high' },
+    ]);
+    expect(prisma.devicePushToken.updateMany).toHaveBeenCalledWith({
+      where: { token: { in: [token] } },
+      data: { disabledAt: expect.any(Date) },
+    });
+  });
 
   describe('composeMessage', () => {
     it('uses the announcement title in phone push notifications', () => {

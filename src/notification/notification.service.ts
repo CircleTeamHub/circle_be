@@ -286,12 +286,31 @@ export class NotificationService {
     );
   }
 
+  getWebPushPublicKey(): { publicKey: string | null } {
+    return { publicKey: this.pushService?.getWebPushPublicKey() ?? null };
+  }
+
   private async registerPushTokenForDevice(
     tx: Prisma.TransactionClient,
     userId: string,
     dto: RegisterPushTokenDto,
     deviceKey: string | null,
   ): Promise<void> {
+    if (dto.provider === 'web_push') {
+      if (dto.platform !== 'web' || !dto.revocationSecret) {
+        throw new BadRequestException(
+          'Web Push requires a browser subscription and revocation secret',
+        );
+      }
+      if (!this.getWebPushPublicKey().publicKey) {
+        throw new ServiceUnavailableException('Web Push is not configured');
+      }
+      if (!deviceKey) {
+        throw new ForbiddenException(
+          'Web Push requires a signed-in browser device',
+        );
+      }
+    }
     if (
       dto.provider === 'jpush' &&
       this.pushService?.isJPushConfigured?.() === false

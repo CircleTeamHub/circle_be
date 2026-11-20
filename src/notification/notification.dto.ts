@@ -6,6 +6,7 @@ import {
 } from './notification.constants';
 import { Transform, Type } from 'class-transformer';
 import { MAX_PAGE } from 'src/common/pagination';
+import { MAX_WEB_PUSH_TOKEN_LENGTH, parseWebPushToken } from './web-push';
 import {
   IsBoolean,
   IsIn,
@@ -123,7 +124,12 @@ export class PublishSystemAnnouncementResponseDto {
 export const PUSH_TOKEN_PLATFORMS = ['ios', 'android', 'web'] as const;
 // apns_voip:iOS PushKit 的 VoIP token,只用于来电推送(直连 APNs,不经极光);
 // 聊天 / 通知推送的查询只认 expo 与 jpush,不会把它卷进去。
-export const PUSH_TOKEN_PROVIDERS = ['expo', 'jpush', 'apns_voip'] as const;
+export const PUSH_TOKEN_PROVIDERS = [
+  'expo',
+  'jpush',
+  'apns_voip',
+  'web_push',
+] as const;
 export const APNS_ENVIRONMENTS = ['development', 'production'] as const;
 export type ApnsEnvironment = (typeof APNS_ENVIRONMENTS)[number];
 
@@ -144,8 +150,13 @@ function pushTokenPattern(provider: PushTokenProvider | undefined): RegExp {
 class PushTokenShapeConstraint implements ValidatorConstraintInterface {
   validate(value: unknown, args: ValidationArguments) {
     if (typeof value !== 'string') return true;
+    if (!('provider' in args.object)) {
+      return value.length <= 512 || parseWebPushToken(value) !== null;
+    }
     const provider = (args.object as { provider?: PushTokenProvider }).provider;
-    return pushTokenPattern(provider).test(value);
+    return provider === 'web_push'
+      ? parseWebPushToken(value) !== null
+      : value.length <= 512 && pushTokenPattern(provider).test(value);
   }
 
   defaultMessage(args: ValidationArguments) {
@@ -153,7 +164,8 @@ class PushTokenShapeConstraint implements ValidatorConstraintInterface {
     if (provider === 'expo')
       return 'token must be an Expo push token (ExponentPushToken[...])';
     if (provider === 'apns_voip') return 'token must be a hex APNs token';
-    return 'token must not contain whitespace';
+    if (provider === 'web_push') return 'Invalid Web Push subscription';
+    return 'token must be at most 512 characters and must not contain whitespace';
   }
 }
 
@@ -161,12 +173,12 @@ export class RegisterPushTokenDto {
   // Expo token 使用稳定的 Expo 格式；JPush token 是 SDK 分配的
   // Registration ID，格式可能随版本和平台变化，只要求无空白。
   @ApiProperty({
-    maxLength: 512,
+    maxLength: MAX_WEB_PUSH_TOKEN_LENGTH,
     example: 'ExponentPushToken[xxxxxxxxxxxxxxxxxxxxxx] or 190e35e4f...',
   })
   @IsString()
   @IsNotEmpty()
-  @MaxLength(512)
+  @MaxLength(MAX_WEB_PUSH_TOKEN_LENGTH)
   @Validate(PushTokenShapeConstraint)
   token: string;
 
@@ -216,19 +228,21 @@ export class RegisterPushTokenDto {
 }
 
 export class DeletePushTokenDto {
-  @ApiProperty({ maxLength: 512 })
+  @ApiProperty({ maxLength: MAX_WEB_PUSH_TOKEN_LENGTH })
   @IsString()
   @IsNotEmpty()
-  @MaxLength(512)
+  @MaxLength(MAX_WEB_PUSH_TOKEN_LENGTH)
+  @Validate(PushTokenShapeConstraint)
   token: string;
 }
 
 export class RevokePushTokenDto {
-  @ApiProperty({ minLength: 1, maxLength: 512 })
+  @ApiProperty({ minLength: 1, maxLength: MAX_WEB_PUSH_TOKEN_LENGTH })
   @IsString()
   @IsNotEmpty()
   @MinLength(1)
-  @MaxLength(512)
+  @MaxLength(MAX_WEB_PUSH_TOKEN_LENGTH)
+  @Validate(PushTokenShapeConstraint)
   token: string;
 
   @ApiProperty({ minLength: 32, maxLength: 256 })

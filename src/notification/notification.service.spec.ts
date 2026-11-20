@@ -761,6 +761,37 @@ describe('NotificationService', () => {
   });
 
   describe('push tokens', () => {
+    it('requires an active browser device for Web Push enrollment', async () => {
+      const key = jest
+        .spyOn(service, 'getWebPushPublicKey')
+        .mockReturnValue({ publicKey: 'configured' });
+      const dto = {
+        token: 'web-subscription',
+        provider: 'web_push' as const,
+        platform: 'web' as const,
+        revocationSecret: 's'.repeat(64),
+      };
+      try {
+        await expect(
+          service.registerPushToken('user-1', dto),
+        ).rejects.toMatchObject({ status: 403 });
+        expect(prisma.devicePushToken.updateMany).not.toHaveBeenCalled();
+
+        prisma.refreshToken.findUnique.mockResolvedValue({
+          userId: 'user-1',
+          audience: 'APP',
+          deviceKey: 'browser-device',
+          revokedAt: null,
+        });
+        prisma.trustedDevice.findUnique.mockResolvedValue({ revokedAt: null });
+        prisma.devicePushToken.updateMany.mockResolvedValue({ count: 1 });
+        await expect(
+          service.registerPushToken('user-1', dto, 'session'),
+        ).resolves.toEqual({ deviceBound: true });
+      } finally {
+        key.mockRestore();
+      }
+    });
     it('rejects JPush registration when server credentials are absent', async () => {
       pushService.isJPushConfigured.mockReturnValue(false);
 

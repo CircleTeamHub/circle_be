@@ -11,6 +11,7 @@ import type { NotificationPushSource } from './notification.dto';
 import { createLoggingConfig } from 'src/logging/logging.config';
 import { logExternalCallFailure } from 'src/logging/external-service.logger';
 import { reportOperationalError } from 'src/logging/error-aggregation.service';
+import { createWebPushSender, parseWebPushToken } from './web-push';
 import {
   deliveryMetrics,
   type PushDeliveryResult,
@@ -28,6 +29,9 @@ const JPUSH_BATCH_SIZE = 1000;
 // 一次扇出里同时在途的 Expo 请求数:3000 人的群是 30 批,串行发太慢,全并发又会
 // 撞 Expo 的速率限制。
 const EXPO_SEND_CONCURRENCY = 4;
+const WEB_PUSH_SEND_CONCURRENCY = 16;
+// 载荷没带 ttl 时的 Web Push 保留期,与聊天推送的 24 小时一致。
+const WEB_PUSH_DEFAULT_TTL_SECONDS = 24 * 60 * 60;
 // 每个用户、每个 provider 最多推几台设备(按最近注册的算)。
 const MAX_ACTIVE_TOKENS_PER_PROVIDER = 20;
 const EXPO_MAX_ATTEMPTS = 3;
@@ -84,9 +88,11 @@ export type TokenDeliveryOutcome = {
 export type PushTokenTarget = {
   token: string;
   projectId: string | null;
-  provider?: 'expo' | 'jpush';
+  provider?: 'expo' | 'jpush' | 'web_push';
   platform?: 'ios' | 'android' | 'web';
   appVersion?: string | null;
+  /** 登录会话的设备标识:网页正开着时按它跳过这台设备的 Web Push。 */
+  deviceKey?: string | null;
 };
 
 export type ExpoPushPayload = {
@@ -181,7 +187,7 @@ function recordPushOutcomes(
   outcomes: readonly TokenDeliveryOutcome[],
 ): void {
   outcomes.forEach((outcome, index) => {
-    const provider = messages[index]?.provider === 'jpush' ? 'jpush' : 'expo';
+    const provider = messages[index]?.provider ?? 'expo';
     const result = pushDeliveryResult(outcome);
     recordPushDelivery(provider, result);
     // Expo 的 SENT ticket 仍在等异步 receipt；其余同步失败，以及没有异步
@@ -203,6 +209,7 @@ export class NotificationPushService {
   private readonly jpushAppKey: string;
   private readonly jpushMasterSecret: string;
   private readonly jpushApnsProduction: boolean;
+  private readonly webPush: ReturnType<typeof createWebPushSender>;
 
   constructor(
     private readonly prisma: PrismaService,
@@ -220,6 +227,15 @@ export class NotificationPushService {
       configuredJpushApnsProduction === true ||
       (typeof configuredJpushApnsProduction === 'string' &&
         configuredJpushApnsProduction.trim().toLowerCase() === 'true');
+    this.webPush = createWebPushSender(
+      this.config.get<string>('WEB_PUSH_VAPID_PRIVATE_KEY'),
+      this.config.get<string>('WEB_PUSH_VAPID_SUBJECT')?.trim() ||
+        'https://windnote.ai',
+    );
+  }
+
+  getWebPushPublicKey(): string | null {
+    return this.webPush?.publicKey ?? null;
   }
 
   isJPushConfigured(): boolean {
@@ -351,7 +367,9 @@ export class NotificationPushService {
     const byUser = new Map<string, PushTokenTarget[]>();
     if (userIds.length === 0) return byUser;
     const uniqueUserIds = [...new Set(userIds)];
-    const providers = ['expo', 'jpush'];
+    const providers = this.webPush
+      ? ['expo', 'jpush', 'web_push']
+      : ['expo', 'jpush'];
     // Cap per user/provider in SQL. Legacy rows can exceed the registration
     // limit, and pulling every one for a large group fan-out wastes DB and JS
     // memory before the same cap is applied below.
@@ -363,6 +381,7 @@ export class NotificationPushService {
         provider: string;
         platform: string;
         appVersion: string | null;
+        deviceKey: string | null;
       }>
     >(Prisma.sql`
       WITH ranked AS (
@@ -373,6 +392,7 @@ export class NotificationPushService {
           provider,
           platform,
           "appVersion",
+          "deviceKey",
           ROW_NUMBER() OVER (
             PARTITION BY "userID", provider
             ORDER BY "updatedAt" DESC, id DESC
@@ -382,7 +402,8 @@ export class NotificationPushService {
           AND provider IN (${Prisma.join(providers)})
           AND "disabledAt" IS NULL
       )
-      SELECT "userID", token, "projectId", provider, platform, "appVersion"
+      SELECT "userID", token, "projectId", provider, platform, "appVersion",
+        "deviceKey"
       FROM ranked
       WHERE token_rank <= ${MAX_ACTIVE_TOKENS_PER_PROVIDER}
       ORDER BY "userID", provider, token_rank
@@ -398,9 +419,10 @@ export class NotificationPushService {
       tokens.push({
         token: row.token,
         projectId: row.projectId,
-        provider: row.provider as 'expo' | 'jpush',
+        provider: row.provider as PushTokenTarget['provider'],
         platform: row.platform as 'ios' | 'android' | 'web',
         appVersion: row.appVersion,
+        deviceKey: row.deviceKey,
       });
       byUser.set(row.userID, tokens);
       countsByUserProvider.set(countKey, providerCount + 1);
@@ -460,7 +482,8 @@ export class NotificationPushService {
     type Indexed = { index: number; token: string; payload: ExpoPushPayload };
     const byProject = new Map<string, Indexed[]>();
     messages.forEach((message, index) => {
-      if (message.provider === 'jpush') return;
+      if (message.provider === 'jpush' || message.provider === 'web_push')
+        return;
       const key = message.projectId ?? '';
       const group = byProject.get(key) ?? [];
       group.push({ index, token: message.token, payload: message.payload });
@@ -480,6 +503,11 @@ export class NotificationPushService {
       .map((message, index) => ({ ...message, index }))
       .filter((message) => message.provider === 'jpush');
     const jpushPromise = this.sendJPushMessages(jpushMessages);
+    const webPushPromise = this.sendWebPushMessages(
+      messages
+        .map((message, index) => ({ ...message, index }))
+        .filter((message) => message.provider === 'web_push'),
+    );
     for (let i = 0; i < batches.length; i += EXPO_SEND_CONCURRENCY) {
       const chunk = batches.slice(i, i + EXPO_SEND_CONCURRENCY);
       const settled = await Promise.all(
@@ -496,9 +524,74 @@ export class NotificationPushService {
     jpushOutcomes.forEach(({ index, outcome }) => {
       outcomes[index] = outcome;
     });
+    for (const { index, outcome } of await webPushPromise)
+      outcomes[index] = outcome;
 
     recordPushOutcomes(messages, outcomes);
     await this.disableDeadTokens(outcomes);
+    return outcomes;
+  }
+
+  private async sendWebPushMessages(
+    messages: Array<{ index: number; token: string; payload: ExpoPushPayload }>,
+  ): Promise<Array<{ index: number; outcome: TokenDeliveryOutcome }>> {
+    const send = async ({
+      index,
+      token,
+      payload,
+    }: (typeof messages)[number]) => {
+      let outcome: TokenDeliveryOutcome;
+      const subscription = parseWebPushToken(token);
+      if (!subscription) {
+        outcome = { token, status: 'TERMINAL', error: 'DeviceNotRegistered' };
+      } else if (!this.webPush) {
+        outcome = { token, status: 'RETRYABLE', error: 'WebPushNotConfigured' };
+      } else {
+        try {
+          // Browser notifications can appear on a shared lock screen.
+          const status = await this.webPush.send(
+            subscription,
+            JSON.stringify({ type: 'chat' }),
+            payload.ttl ?? WEB_PUSH_DEFAULT_TTL_SECONDS,
+          );
+          if (status >= 200 && status < 300) {
+            outcome = { token, status: 'SENT', receiptFinal: true };
+          } else if (status === 404 || status === 410) {
+            outcome = {
+              token,
+              status: 'TERMINAL',
+              error: 'DeviceNotRegistered',
+            };
+          } else {
+            outcome = {
+              token,
+              status: 'RETRYABLE',
+              error: `WebPushHttp${status}`,
+            };
+          }
+        } catch {
+          outcome = {
+            token,
+            status: 'RETRYABLE',
+            error: 'WebPushTransportError',
+          };
+        }
+      }
+      return { index, outcome };
+    };
+    const outcomes: Array<{ index: number; outcome: TokenDeliveryOutcome }> =
+      [];
+    for (
+      let offset = 0;
+      offset < messages.length;
+      offset += WEB_PUSH_SEND_CONCURRENCY
+    ) {
+      outcomes.push(
+        ...(await Promise.all(
+          messages.slice(offset, offset + WEB_PUSH_SEND_CONCURRENCY).map(send),
+        )),
+      );
+    }
     return outcomes;
   }
 

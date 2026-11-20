@@ -169,6 +169,7 @@ export const STATIC_ROUTES = new Set([
   '/api/v1/notification/push-token/revoke',
   '/api/v1/notification/read-all',
   '/api/v1/notification/unread-summary',
+  '/api/v1/notification/web-push-key',
   '/api/v1/privacy/settings',
   '/api/v1/qr/tokens',
   '/api/v1/qr/tokens/rotate',
