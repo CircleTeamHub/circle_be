@@ -223,6 +223,25 @@ export function createWriteMethodLimiterMount(
   };
 }
 
+/**
+ * 改码(PUT)和关码(DELETE)都要核对旧码,猜的是 /verify 猜的同一个码,所以共用它的限流。
+ * 只管这两个方法:App 锁屏门会轮询 GET /auth/security-code;/verify 有自己的挂载,
+ * 这里放过,免得一次请求扣两次。
+ */
+export function createSecurityCodeWriteLimiterMount(
+  limiter: (req: any, res: any, next: any) => unknown,
+) {
+  return (req: any, res: any, next: any) => {
+    if (
+      (req.method === 'PUT' || req.method === 'DELETE') &&
+      (req.path === '/' || req.path === '')
+    ) {
+      return limiter(req, res, next);
+    }
+    return next();
+  };
+}
+
 /** Autosaves use an authenticated account budget in NoteController. */
 export function createNoteWriteLimiterMount(
   limiter: (req: any, res: any, next: any) => unknown,
@@ -515,6 +534,10 @@ export const setupApp = (app: INestApplication): ErrorAggregationProvider => {
   // endpoint did; registration no longer sends or verifies email codes.
   app.use('/api/v1/auth/password/reset-request', emailCodeLimiter);
   app.use('/api/v1/auth/security-code/verify', securityCodeVerifyLimiter);
+  app.use(
+    '/api/v1/auth/security-code',
+    createSecurityCodeWriteLimiterMount(securityCodeVerifyLimiter),
+  );
   app.use('/api/v1/user/search/account', accountSearchLimiter);
   app.use('/api/v1/friend/requests', friendRequestLimiter);
   // /coin/gift 下只剩「真发礼物」这一条路由 —— 卡片送达回执端点随客户端发卡

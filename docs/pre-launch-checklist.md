@@ -38,9 +38,8 @@ const level = program.enabled
 | `notes` | 500 |
 | `cityFilters` | 10 |
 
-返回的这个 level 会流向所有强制拦截路径,由各自的端点抛**不同**的错误码。注意
-`assertQuotaAvailable`(会抛 `MEMBERSHIP_QUOTA_REACHED`)**在生产代码中没有任何调用方**,
-只被单测引用 —— 按它做灰度校验、看板或客户端断言会漏掉全部真实拒绝:
+返回的这个 level 会流向所有强制拦截路径,由各自的端点抛**不同**的错误码(没有统一的
+`MEMBERSHIP_QUOTA_REACHED`;那个从未被生产代码调用的 `assertQuotaAvailable` 已删除):
 
 | 拦截路径 | 抛出位置 | 错误码 |
 |----------|----------|--------|
