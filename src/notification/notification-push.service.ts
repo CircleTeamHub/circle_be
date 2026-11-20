@@ -30,6 +30,8 @@ const JPUSH_BATCH_SIZE = 1000;
 // 撞 Expo 的速率限制。
 const EXPO_SEND_CONCURRENCY = 4;
 const WEB_PUSH_SEND_CONCURRENCY = 16;
+// 载荷没带 ttl 时的 Web Push 保留期,与聊天推送的 24 小时一致。
+const WEB_PUSH_DEFAULT_TTL_SECONDS = 24 * 60 * 60;
 // 每个用户、每个 provider 最多推几台设备(按最近注册的算)。
 const MAX_ACTIVE_TOKENS_PER_PROVIDER = 20;
 const EXPO_MAX_ATTEMPTS = 3;
@@ -89,6 +91,8 @@ export type PushTokenTarget = {
   provider?: 'expo' | 'jpush' | 'web_push';
   platform?: 'ios' | 'android' | 'web';
   appVersion?: string | null;
+  /** 登录会话的设备标识:网页正开着时按它跳过这台设备的 Web Push。 */
+  deviceKey?: string | null;
 };
 
 export type ExpoPushPayload = {
@@ -377,6 +381,7 @@ export class NotificationPushService {
         provider: string;
         platform: string;
         appVersion: string | null;
+        deviceKey: string | null;
       }>
     >(Prisma.sql`
       WITH ranked AS (
@@ -387,6 +392,7 @@ export class NotificationPushService {
           provider,
           platform,
           "appVersion",
+          "deviceKey",
           ROW_NUMBER() OVER (
             PARTITION BY "userID", provider
             ORDER BY "updatedAt" DESC, id DESC
@@ -396,7 +402,8 @@ export class NotificationPushService {
           AND provider IN (${Prisma.join(providers)})
           AND "disabledAt" IS NULL
       )
-      SELECT "userID", token, "projectId", provider, platform, "appVersion"
+      SELECT "userID", token, "projectId", provider, platform, "appVersion",
+        "deviceKey"
       FROM ranked
       WHERE token_rank <= ${MAX_ACTIVE_TOKENS_PER_PROVIDER}
       ORDER BY "userID", provider, token_rank
@@ -415,6 +422,7 @@ export class NotificationPushService {
         provider: row.provider as PushTokenTarget['provider'],
         platform: row.platform as 'ios' | 'android' | 'web',
         appVersion: row.appVersion,
+        deviceKey: row.deviceKey,
       });
       byUser.set(row.userID, tokens);
       countsByUserProvider.set(countKey, providerCount + 1);
@@ -544,7 +552,7 @@ export class NotificationPushService {
           const status = await this.webPush.send(
             subscription,
             JSON.stringify({ type: 'chat' }),
-            Math.min(payload.ttl ?? 60, 60),
+            payload.ttl ?? WEB_PUSH_DEFAULT_TTL_SECONDS,
           );
           if (status >= 200 && status < 300) {
             outcome = { token, status: 'SENT', receiptFinal: true };

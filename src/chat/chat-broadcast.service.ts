@@ -290,8 +290,9 @@ export class ChatBroadcastService implements OnModuleInit, OnModuleDestroy {
   /**
    * 会话成员里正开着 App 的设备 → 这些设备登记的推送 token(推送时跳过它们)。
    *
-   * 按设备而不是按人:电脑上开着网页版(没有推送 token)不挡手机的推送;只有手机
-   * 自己正开着 App 时才不推给这台手机。
+   * 按设备而不是按人:电脑上开着网页版不挡手机的推送;只有手机自己正开着 App 时
+   * 才不推给这台手机。网页版登记的是设备标识(foregroundDeviceMarker),只挡这台
+   * 电脑自己的 Web Push。
    */
   async getForegroundPushTokensInConversation(
     conversationId: string,

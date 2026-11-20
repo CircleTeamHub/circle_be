@@ -35,7 +35,10 @@ import {
 } from './chat.constants';
 import { DistributedRateLimiter } from './chat-rate-limiter';
 import { PRIVACY_SETTINGS_CHANGED_CHANNEL } from 'src/privacy/privacy-events';
-import { ChatPresenceRegistry } from './chat-presence.registry';
+import {
+  ChatPresenceRegistry,
+  foregroundDeviceMarker,
+} from './chat-presence.registry';
 import { createAdapter } from '@socket.io/redis-adapter';
 import { ChatBroadcastService } from './chat-broadcast.service';
 import { ChatPushService } from './chat-push.service';
@@ -1110,7 +1113,13 @@ export class ChatGateway implements OnModuleDestroy {
     // 租约 id 用 socket.id:断开时按它精确摘除,不会误伤同一用户在别处
     // 那条活着的连接(共享标量 DECR 会)。
     // 这台设备登记的推送 token:它正开着 App 时,推送只跳过它(按设备,不按人)。
-    const pushToken = this.handshakePushToken(socket);
+    // 网页版没有 Expo token,改登记会话的设备标识,跳过这台设备的 Web Push。
+    const deviceKey: unknown = socket.data.deviceKey;
+    const pushToken =
+      this.handshakePushToken(socket) ??
+      (typeof deviceKey === 'string'
+        ? foregroundDeviceMarker(deviceKey)
+        : null);
     socket.data.pushToken = pushToken;
     const globalCount = await this.presence.registerSocket(
       userId,

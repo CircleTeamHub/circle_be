@@ -8,7 +8,6 @@ import {
   sign,
 } from 'node:crypto';
 
-const pushHosts = new Set(['fcm.googleapis.com', 'web.push.apple.com']);
 export const MAX_WEB_PUSH_TOKEN_LENGTH = 2048;
 const keyPattern = /^[A-Za-z0-9_-]+$/;
 
@@ -24,6 +23,19 @@ function decodeKey(value: unknown, length: number): Buffer | null {
   return key.length === length && key.toString('base64url') === value
     ? key
     : null;
+}
+
+// The browsers' push services and the paths their subscription endpoints use.
+// Chrome Beta/Dev/Canary subscribe through jmt17.google.com; Windows (Edge)
+// issues regional hosts such as wns2-par02p.notify.windows.com.
+function isPushServiceEndpoint({ hostname, pathname }: URL): boolean {
+  if (hostname === 'fcm.googleapis.com' || hostname === 'jmt17.google.com')
+    return pathname.startsWith('/fcm/send/') || pathname.startsWith('/wp/');
+  if (hostname === 'updates.push.services.mozilla.com')
+    return pathname.startsWith('/wpush/');
+  if (/^[a-z0-9-]+\.notify\.windows\.com$/.test(hostname))
+    return pathname.startsWith('/w/');
+  return hostname === 'web.push.apple.com' && pathname !== '/';
 }
 
 // The token is a canonical tuple of browser-provided subscription values.
@@ -45,11 +57,8 @@ export function parseWebPushToken(token: string): WebPushSubscription | null {
       url.password ||
       url.port ||
       url.hash ||
-      !pushHosts.has(url.hostname) ||
-      url.pathname === '/' ||
-      endpoint !== url.href ||
-      (url.hostname === 'fcm.googleapis.com' &&
-        !url.pathname.startsWith('/fcm/send/'))
+      !isPushServiceEndpoint(url) ||
+      endpoint !== url.href
     )
       return null;
     const publicKey = decodeKey(p256dh, 65);
@@ -120,6 +129,8 @@ export function createWebPushSender(
           'Content-Encoding': 'aes128gcm',
           'Content-Type': 'application/octet-stream',
           TTL: String(ttl),
+          // RFC 8030 defaults to normal, which a dozing phone holds until it wakes.
+          Urgency: 'high',
         },
         body: new Uint8Array(
           encryptWebPush(subscription, Buffer.from(payload)),

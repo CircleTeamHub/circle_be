@@ -2,6 +2,7 @@ import { ForbiddenException, HttpException } from '@nestjs/common';
 import { ChatErrorCode } from 'src/common/app-error-codes';
 import { ChatGateway } from './chat.gateway';
 import type { ChatMetrics } from './chat-metrics';
+import { foregroundDeviceMarker } from './chat-presence.registry';
 import * as errorAggregation from '../logging/error-aggregation.service';
 
 type Handler = (...args: unknown[]) => void;
@@ -1198,6 +1199,40 @@ describe('ChatGateway', () => {
         );
         socket.handlers.get('disconnect')?.('client namespace disconnect');
       }
+    });
+
+    // 网页版没有 Expo token:按会话的设备标识登记,推送时只跳过这台设备的 Web Push。
+    it('registers the session device for a connection without an Expo token', async () => {
+      chatService.listConversationSeats.mockResolvedValue(seats('conv-1'));
+      // 握手中间件按校验过的会话把 deviceKey 钉在 socket.data 上。
+      const data = {
+        userId: 'u1',
+        authPayload: { sub: 'u1', accountId: 'acc1', aud: 'APP' },
+        deviceKey: 'browser-key',
+      };
+      const browser = fakeSocket({ data: { ...data } });
+      await gateway['handleConnection'](browser as never);
+      expect(presence.registerSocket).toHaveBeenLastCalledWith(
+        'u1',
+        'socket-1',
+        foregroundDeviceMarker('browser-key'),
+      );
+      browser.handlers.get('disconnect')?.('client namespace disconnect');
+
+      const phone = fakeSocket({
+        data: { ...data, deviceKey: 'phone-key' },
+        handshake: {
+          auth: { token: 'jwt', pushToken: 'ExponentPushToken[abc-123_x]' },
+          headers: {},
+        },
+      });
+      await gateway['handleConnection'](phone as never);
+      expect(presence.registerSocket).toHaveBeenLastCalledWith(
+        'u1',
+        'socket-1',
+        'ExponentPushToken[abc-123_x]',
+      );
+      phone.handlers.get('disconnect')?.('client namespace disconnect');
     });
 
     it('excludes blocked counterparties from the online broadcast', async () => {

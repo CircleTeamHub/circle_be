@@ -81,12 +81,24 @@ describe('NotificationPushService (#88 per-token delivery)', () => {
     await expect(service.sendToTokens(targets, payload)).resolves.toEqual([
       { token, status: 'SENT', receiptFinal: true },
     ]);
-    await expect(service.sendToTokens(targets, payload)).resolves.toEqual([
+    await expect(
+      service.sendToTokens(targets, { ...payload, ttl: 300 }),
+    ).resolves.toEqual([
       { token, status: 'TERMINAL', error: 'DeviceNotRegistered' },
     ]);
     expect(fetchMock.mock.calls.map(([url]) => url)).toEqual([
       endpoint,
       endpoint,
+    ]);
+    // 载荷的保留期原样带给推送服务(缺省 24 小时),高优先级唤醒休眠中的手机。
+    expect(
+      fetchMock.mock.calls.map(([, init]) => {
+        const { TTL, Urgency } = init.headers as Record<string, string>;
+        return { TTL, Urgency };
+      }),
+    ).toEqual([
+      { TTL: '86400', Urgency: 'high' },
+      { TTL: '300', Urgency: 'high' },
     ]);
     expect(prisma.devicePushToken.updateMany).toHaveBeenCalledWith({
       where: { token: { in: [token] } },

@@ -59,7 +59,9 @@ describe('Web Push', () => {
       .digest()
       .subarray(0, 12);
 
-    const decipher = createDecipheriv('aes-128-gcm', key, nonce);
+    const decipher = createDecipheriv('aes-128-gcm', key, nonce, {
+      authTagLength: 16,
+    });
     decipher.setAuthTag(record.subarray(-16));
     expect(
       Buffer.concat([
@@ -70,12 +72,36 @@ describe('Web Push', () => {
   });
 
   it.each([
+    'https://fcm.googleapis.com/fcm/send/fixture',
+    'https://fcm.googleapis.com/wp/fixture',
+    'https://jmt17.google.com/fcm/send/fixture',
+    'https://jmt17.google.com/wp/fixture',
+    'https://web.push.apple.com/fixture',
+    'https://updates.push.services.mozilla.com/wpush/v2/fixture',
+    'https://wns2-par02p.notify.windows.com/w/?token=fixture',
+  ])('accepts the browser push service endpoint %s', (url) => {
+    const { userKey, authKey } = browserFixture();
+    expect(
+      parseWebPushToken(JSON.stringify([url, userKey, authKey]))?.endpoint,
+    ).toBe(url);
+  });
+
+  it.each([
     'http://fcm.googleapis.com/fcm/send/fixture',
     'https://localhost/push',
     'https://fcm.googleapis.com.other.test/fcm/send/fixture',
     'https://fcm.googleapis.com:3443/fcm/send/fixture',
+    'https://fcm.googleapis.com/other/fixture',
+    'https://jmt17.google.com/other/fixture',
     'https://web.push.apple.com@other.test/push',
-  ])('rejects unsupported subscription endpoints', (url) => {
+    'https://web.push.apple.com/',
+    'https://updates.push.services.mozilla.com/other/fixture',
+    'https://notify.windows.com/w/?token=fixture',
+    'https://notify.windows.com.evil.test/w/?token=fixture',
+    'https://evilnotify.windows.com/w/?token=fixture',
+    'https://.notify.windows.com/w/?token=fixture',
+    'https://wns2-par02p.notify.windows.com/other?token=fixture',
+  ])('rejects unsupported subscription endpoint %s', (url) => {
     const { userKey, authKey } = browserFixture();
     expect(
       parseWebPushToken(JSON.stringify([url, userKey, authKey])),
@@ -113,7 +139,11 @@ describe('Web Push', () => {
       expect(request).toMatchObject({
         method: 'POST',
         redirect: 'error',
-        headers: { TTL: '60', 'Content-Encoding': 'aes128gcm' },
+        headers: {
+          TTL: '60',
+          'Content-Encoding': 'aes128gcm',
+          Urgency: 'high',
+        },
       });
       const authorization = new Headers(request?.headers).get('authorization')!;
       const [jwt, publicKey] = authorization
