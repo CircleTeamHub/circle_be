@@ -4645,14 +4645,19 @@ export class ChatService {
     if (mediaKeys.length > 0 || noteImportKeys.length > 0) {
       void this.media.drainPendingDeletions();
     }
-    this.broadcast.emitRevoke({
+    const revoke = {
       conversationId,
       messageId,
       revokedBy: userId,
       height: updated.height,
       senderId: updated.senderID,
       revision: updated.revision,
-    });
+    };
+    if (conversation.type === 'TEMP') {
+      this.broadcast.emitRevoke(revoke, { guests: true });
+    } else {
+      this.broadcast.emitRevoke(revoke);
+    }
     if (unpinned) await this.emitPinnedMessageChanged(conversationId);
     const senders = await this.resolveSenders(
       updated.senderID ? [updated.senderID] : [],

@@ -1,4 +1,4 @@
-import type { ChatMessageDto } from './chat.types';
+import type { ChatMessageDto, ChatRevokeBroadcast } from './chat.types';
 
 /**
  * Room-local stand-in for an account id in everything a temp-chat guest
@@ -44,4 +44,15 @@ export function toGuestMessageView(message: ChatMessageDto): ChatMessageDto {
     }));
   }
   return view;
+}
+
+/** The guest's view of a revoke: same aliasing as messages, for `revokedBy` and `senderId`. */
+export function toGuestRevokeView(
+  revoke: ChatRevokeBroadcast,
+): ChatRevokeBroadcast {
+  return {
+    ...revoke,
+    revokedBy: aliasAccountId(revoke.revokedBy),
+    senderId: revoke.senderId === null ? null : aliasAccountId(revoke.senderId),
+  };
 }

@@ -4960,6 +4960,30 @@ describe('ChatService', () => {
 
     // 撤回清掉了置顶:在线端只在收到置顶提示时才重拉会话,不通知的话横幅上会
     // 一直挂着撤回前的原文。给每个在座成员一条 chat:conversation(updated)。
+    // 临时房的访客不在会话房里:撤回要另外补发到他们的个人房。
+    it('asks the broadcast to reach guests when the revoke happens in a temp room', async () => {
+      const temp = membership();
+      prisma.chatMember.findUnique.mockResolvedValue({
+        ...temp,
+        conversation: { ...temp.conversation, type: 'TEMP' },
+      });
+      prisma.chatMessage.findUnique.mockResolvedValue(revokableRow());
+      prisma.chatMessage.updateMany.mockResolvedValue({ count: 1 });
+      prisma.chatMessage.findUniqueOrThrow.mockResolvedValue({
+        ...revokableRow(),
+        content: {},
+        revokedAt: new Date(),
+        revokedBy: 'u1',
+      });
+
+      await service.revokeMessage('u1', 'conv-1', 'm1');
+
+      expect(broadcast.emitRevoke).toHaveBeenCalledWith(
+        expect.objectContaining({ conversationId: 'conv-1', messageId: 'm1' }),
+        { guests: true },
+      );
+    });
+
     it('tells every seated member to refresh when the revoked message was pinned', async () => {
       prisma.chatMember.findUnique.mockResolvedValue(membership());
       prisma.chatMessage.findUnique.mockResolvedValue(revokableRow());

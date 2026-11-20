@@ -1122,6 +1122,51 @@ describe('ChatBroadcastService temp-chat guest view', () => {
     ]);
   });
 
+  // 访客只进个人房(见 gateway),会话房的撤回广播到不了他们 —— 房主撤回的消息会一直
+  // 留在访客屏幕上。
+  it('delivers a revoke to seated guests with the host id aliased', async () => {
+    const { service, emits } = harness(['host-1', GUEST_A, GUEST_B]);
+    const revoke = {
+      conversationId: 'conv-temp',
+      messageId: 'message-9',
+      revokedBy: 'host-1',
+      height: 9,
+      senderId: 'host-1',
+      revision: 3,
+    };
+
+    service.emitRevoke(revoke, { guests: true });
+    await new Promise((resolve) => setImmediate(resolve));
+
+    expect(emits).toEqual([
+      { rooms: 'c:conv-temp', event: 'chat:revoke', payload: revoke },
+      {
+        rooms: [`u:${GUEST_A}`, `u:${GUEST_B}`],
+        event: 'chat:revoke',
+        payload: { ...revoke, revokedBy: 'host', senderId: 'host' },
+      },
+    ]);
+  });
+
+  it('does not look up seats for a revoke outside a temp room', () => {
+    const prisma = prismaWithActiveUsers(['u1', 'u2']);
+    const to = jest.fn(() => ({ emit: jest.fn() }));
+    const service = new ChatBroadcastService({} as never, prisma as never);
+    service.setServer({ to } as never);
+
+    service.emitRevoke({
+      conversationId: 'conv-1',
+      messageId: 'm1',
+      revokedBy: 'u1',
+      height: 1,
+      senderId: 'u1',
+      revision: 2,
+    });
+
+    expect(prisma.chatMember.findMany).not.toHaveBeenCalled();
+    expect(to).toHaveBeenCalledTimes(1);
+  });
+
   it("keeps a guest's own delivery id and strips it for everyone else", async () => {
     const guestSender = {
       id: GUEST_A,
