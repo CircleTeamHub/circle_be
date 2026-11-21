@@ -10,6 +10,7 @@ import rateLimit, {
   type Options as RateLimitOptions,
 } from 'express-rate-limit';
 import { RedisService } from './redis/redis.service';
+import { refreshRateLimitKey } from './auth/web-session';
 import { PrismaService } from './prisma/prisma.service';
 import {
   createLivenessHandler,
@@ -54,10 +55,14 @@ const authLimiterOptions = {
   message: { message: 'Too many requests, please try again later.' },
 } satisfies Partial<RateLimitOptions>;
 
-/** Moderate limit for token refresh: 60 requests / 15 min per IP. */
+/**
+ * Moderate limit for token refresh: 60 requests / 15 min per IP, or per refresh
+ * token for web sessions (see refreshRateLimitKey).
+ */
 const refreshLimiterOptions = {
   windowMs: 15 * 60 * 1000,
   max: 60,
+  keyGenerator: refreshRateLimitKey,
   standardHeaders: true,
   legacyHeaders: false,
 } satisfies Partial<RateLimitOptions>;

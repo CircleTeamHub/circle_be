@@ -1,5 +1,6 @@
-import { randomBytes } from 'crypto';
+import { createHash, randomBytes } from 'crypto';
 import type { CookieOptions, Request, Response } from 'express';
+import { ipKeyGenerator } from 'express-rate-limit';
 import { hashDeviceId } from './device-trust.service';
 
 /**
@@ -85,4 +86,17 @@ export function moveRefreshTokenToCookie<T extends object>(
     maxAge: maxAgeMs,
   });
   return { accessToken: result.accessToken };
+}
+
+/**
+ * auth/refresh 的限流键。网页端每次加载页面都会拿 cookie 续签一次，按 IP 计数的话，
+ * 同一出口 IP（公司网络、运营商共享 IP）后面几十个人一刷新就会撞上限、被踢回登录页；
+ * 所以网页端按 refresh token（的哈希）计数。其余请求（原生 App、管理台、没带 cookie 的）
+ * 照旧按 IP。伪造随机 cookie 换键绕过也只能撞全局的每 IP 限流，猜中 token 不可能。
+ */
+export function refreshRateLimitKey(req: Request): string {
+  const token = isWebSession(req) ? readCookie(req, REFRESH_COOKIE) : null;
+  return token
+    ? `rt:${createHash('sha256').update(token).digest('hex')}`
+    : ipKeyGenerator(req.ip ?? '');
 }
