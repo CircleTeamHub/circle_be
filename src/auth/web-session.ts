@@ -47,19 +47,26 @@ export function clearRefreshCookie(res: Response): void {
   res.clearCookie(REFRESH_COOKIE, cookieOptions(REFRESH_COOKIE_PATH));
 }
 
-/**
- * 网页端设备 ID 的哈希（与原生的 X-Device-Id 同算法）。cookie 缺失或不合规时，
- * 给了 res 的路由当场发一个新 ID 并按它处理这次请求；只读路由不发。
- */
-export function webDeviceKey(req: Request, res?: Response): string | null {
-  const current = hashDeviceId(readCookie(req, DEVICE_COOKIE));
-  if (current || !res) return current;
-  const deviceId = randomBytes(32).toString('base64url');
+function setDeviceCookie(res: Response, deviceId: string): void {
   res.cookie(DEVICE_COOKIE, deviceId, {
     ...cookieOptions(API_PATH),
     maxAge: DEVICE_COOKIE_MAX_AGE_MS,
   });
-  return hashDeviceId(deviceId);
+}
+
+/**
+ * 网页端设备 ID 的哈希（与原生的 X-Device-Id 同算法）。给了 res 的路由（登录、续签等）：
+ * cookie 缺失或不合规时当场发一个新 ID 并按它处理这次请求；合规的原样重发一遍，把
+ * 400 天有效期往后顺延，常用的浏览器不会某天突然变成陌生设备。只读路由不发也不续。
+ */
+export function webDeviceKey(req: Request, res?: Response): string | null {
+  const existing = readCookie(req, DEVICE_COOKIE);
+  const current = hashDeviceId(existing);
+  if (!res) return current;
+  const deviceId =
+    current && existing ? existing : randomBytes(32).toString('base64url');
+  setDeviceCookie(res, deviceId);
+  return current ?? hashDeviceId(deviceId);
 }
 
 interface IssuedTokens {

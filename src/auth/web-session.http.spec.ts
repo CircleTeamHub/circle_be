@@ -152,14 +152,18 @@ describe('Auth web session cookies (HTTP)', () => {
       expect(contextOf(auth.login, 1).deviceKey).toBe(sha256(KNOWN_DEVICE));
     });
 
-    it('reuses a valid device cookie and ignores X-Device-Id', async () => {
+    it('reuses a valid device cookie, renews its expiry and ignores X-Device-Id', async () => {
       const res = await login()
         .set('X-Web-Session', '1')
         .set('X-Device-Id', 'header-device-0123456789')
         .set('Cookie', `circle_did=${KNOWN_DEVICE}`)
         .expect(201);
 
-      expect(setCookies(res).circle_did).toBeUndefined();
+      // Same id re-sent with a fresh 400-day Max-Age: a browser in regular use never
+      // turns into a stranger device just because its cookie aged out.
+      const renewed = setCookies(res).circle_did;
+      expect(cookieValue(renewed)).toBe(KNOWN_DEVICE);
+      expect(renewed).toContain(`Max-Age=${400 * 24 * 60 * 60}`);
       expect(contextOf(auth.login, 1).deviceKey).toBe(sha256(KNOWN_DEVICE));
     });
 
@@ -288,7 +292,8 @@ describe('Auth web session cookies (HTTP)', () => {
       const cookies = setCookies(res);
       expect(cookieValue(cookies.circle_rt)).toBe(NEW_REFRESH);
       expect(cookies.circle_rt).toContain('Path=/api/v1/auth');
-      expect(cookies.circle_did).toBeUndefined();
+      // The device cookie is only ever renewed with the same id, never replaced.
+      expect(cookieValue(cookies.circle_did)).toBe(KNOWN_DEVICE);
     });
 
     it('answers 401 and clears the refresh cookie when there is none', async () => {
@@ -305,7 +310,8 @@ describe('Auth web session cookies (HTTP)', () => {
       expect(cookies.circle_rt).toContain('Expires=Thu, 01 Jan 1970');
       expect(cookies.circle_rt).toContain('HttpOnly');
       expect(cookies.circle_rt).toContain('SameSite=Strict');
-      expect(cookies.circle_did).toBeUndefined();
+      // The device cookie is only ever renewed with the same id, never replaced.
+      expect(cookieValue(cookies.circle_did)).toBe(KNOWN_DEVICE);
     });
 
     it('clears the refresh cookie when the service rejects the token', async () => {
@@ -320,7 +326,8 @@ describe('Auth web session cookies (HTTP)', () => {
 
       const cookies = setCookies(res);
       expect(cookieValue(cookies.circle_rt)).toBe('');
-      expect(cookies.circle_did).toBeUndefined();
+      // The device cookie is only ever renewed with the same id, never replaced.
+      expect(cookieValue(cookies.circle_did)).toBe(KNOWN_DEVICE);
     });
 
     it('keeps the cookie on a superseded (409) attempt', async () => {
@@ -333,7 +340,10 @@ describe('Auth web session cookies (HTTP)', () => {
         .send({})
         .expect(409);
 
-      expect(res.headers['set-cookie']).toBeUndefined();
+      // Not terminal: circle_rt must survive for the retry (only the device cookie is renewed).
+      const cookies = setCookies(res);
+      expect(cookies.circle_rt).toBeUndefined();
+      expect(cookieValue(cookies.circle_did)).toBe(KNOWN_DEVICE);
     });
 
     it('ignores the cookie without X-Web-Session', async () => {

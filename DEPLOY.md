@@ -94,6 +94,15 @@ docker compose -f docker-compose.prod.yml up -d --build
 启动顺序由 `depends_on` 保证:`postgres` + `redis`(healthy)→ `migrate` + `minio-init`(跑完退出)→ `circle_be`。
 首次 `--build` 在 ARM 上约需几分钟。
 
+**用户 Web 必须与 API 同站。** 网页端的 refresh token 与设备 ID 放在 API 签发的
+HttpOnly cookie(`circle_rt`、`circle_did`,`SameSite=Strict`、不带 `Domain`)里,
+见 `src/auth/web-session.ts`。浏览器只在网页与 API 属于同一个可注册域名时才会带上
+`SameSite=Strict` cookie:`app.example.com` + `api.example.com` 可以;`app.example.com` +
+`api.example.net`,或挂在公共后缀列表(https://publicsuffix.org/list/)里的共享域名
+下各占一个子域,都不行 —— 登录看似成功,但每次刷新页面都会掉回登录页,而且不会报错。
+换域名时先核对这一点;现在的测试服 `app-…sslip.io` / `api-…sslip.io` 成立是因为
+`sslip.io` 不在公共后缀列表里。
+
 已有部署可再次运行 `gen-env.sh`:脚本会补齐 Redis 配置，并把 Admin/用户 Web
 来源幂等加入 `ALLOWED_ORIGINS`；不会轮换已有 Redis、监控、数据库、JWT、MinIO
 等密钥。重跑会获取与 Release 相同的单飞锁，并在存在未完成的 app env 事务时拒绝

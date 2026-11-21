@@ -118,6 +118,18 @@ function bodyRefreshToken(dto: SessionRefreshTokenDto): string {
   return dto.refreshToken;
 }
 
+/**
+ * 网页端会话模式（见 web-session.ts）：refresh token 写进 HttpOnly cookie `circle_rt`，
+ * 响应体只有 `{ accessToken }`；设备 ID 取自 cookie `circle_did`，不读 X-Device-Id。
+ */
+const ApiWebSessionHeader = () =>
+  ApiHeader({
+    name: 'X-Web-Session',
+    required: false,
+    description:
+      "Web client only, value '1'. The refresh token is set as the HttpOnly cookie circle_rt (Path=/api/v1/auth) and left out of the body, which is { accessToken } only; refresh/logout read it from the cookie with an empty body. The device id comes from the HttpOnly cookie circle_did instead of X-Device-Id.",
+  });
+
 @Controller('auth')
 @ApiTags('Auth')
 export class AuthController {
@@ -164,6 +176,7 @@ export class AuthController {
 
   @AnonymousAccess('Account registration')
   @Post('register')
+  @ApiWebSessionHeader()
   @ApiOperation({ summary: 'Register a new user' })
   @ApiBody({ type: RegisterDto })
   @ApiHeader({
@@ -189,6 +202,7 @@ export class AuthController {
 
   @AnonymousAccess('Password login')
   @Post('login')
+  @ApiWebSessionHeader()
   @ApiOperation({ summary: 'Login with email or user ID and password' })
   @ApiBody({ type: LoginDto })
   @ApiHeader({
@@ -214,6 +228,7 @@ export class AuthController {
 
   @AnonymousAccess('One-time trusted-device code')
   @Post('login-challenges/:challengeId/verify')
+  @ApiWebSessionHeader()
   @UseGuards(ThrottlerGuard)
   @Throttle({ default: { limit: 10, ttl: 60_000 } })
   @ApiOperation({
@@ -241,6 +256,7 @@ export class AuthController {
 
   @AnonymousAccess('Login challenge and security code')
   @Post('login-challenges/:challengeId/security-code')
+  @ApiWebSessionHeader()
   @UseGuards(ThrottlerGuard)
   @Throttle({ default: { limit: 10, ttl: 60_000 } })
   @ApiOperation({
@@ -287,6 +303,7 @@ export class AuthController {
 
   @AnonymousAccess('Login challenge and security answers')
   @Post('login-challenges/:challengeId/security-questions')
+  @ApiWebSessionHeader()
   @UseGuards(ThrottlerGuard)
   @Throttle({ default: { limit: 10, ttl: 60_000 } })
   @ApiOperation({
@@ -438,6 +455,7 @@ export class AuthController {
 
   @AnonymousAccess('Refresh token credential')
   @Post('refresh')
+  @ApiWebSessionHeader()
   @ApiOperation({ summary: 'Refresh an access token' })
   @ApiBody({ type: SessionRefreshTokenDto })
   @ApiHeader({
@@ -514,6 +532,7 @@ export class AuthController {
 
   @AnonymousAccess('Refresh token revocation')
   @Post('logout')
+  @ApiWebSessionHeader()
   @ApiOperation({ summary: 'Logout and revoke a refresh token' })
   @ApiBody({ type: SessionRefreshTokenDto })
   @ApiOkResponse({ description: 'Logout successful' })
