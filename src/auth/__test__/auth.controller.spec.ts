@@ -16,6 +16,9 @@ import { SetLoginSecurityCodeDto } from '../dto/login-security-code.dto';
 
 describe('AuthController', () => {
   let controller: AuthController;
+  // 原生 App 的请求：不带 X-Web-Session，响应对象不会被碰。
+  const nativeReq = { headers: {}, ip: null } as any;
+  const res = {} as any;
 
   const mockTokenPayload = {
     accessToken: 'access-token',
@@ -128,20 +131,25 @@ describe('AuthController', () => {
   });
 
   it('register returns tokens', async () => {
-    const result = await controller.register({
-      email: 'user@example.com',
-      password: 'password1',
-      confirmPassword: 'password1',
-      nickname: 'Test User',
-    } as any);
+    const result = await controller.register(
+      {
+        email: 'user@example.com',
+        password: 'password1',
+        confirmPassword: 'password1',
+        nickname: 'Test User',
+      } as any,
+      nativeReq,
+      res,
+    );
     expect(result).toEqual(mockTokenPayload);
   });
 
   it('login returns tokens', async () => {
-    const result = await controller.login({
-      email: 'user@example.com',
-      password: 'password1',
-    } as any);
+    const result = await controller.login(
+      { email: 'user@example.com', password: 'password1' } as any,
+      nativeReq,
+      res,
+    );
     expect(result).toEqual(mockTokenPayload);
   });
 
@@ -156,7 +164,7 @@ describe('AuthController', () => {
 
   it('refresh returns tokens', async () => {
     const dto: RefreshTokenDto = { refreshToken: 'refresh-token' };
-    const result = await controller.refresh(dto);
+    const result = await controller.refresh(dto, nativeReq, res);
     expect(result).toEqual(mockTokenPayload);
   });
 
@@ -275,10 +283,11 @@ describe('AuthController', () => {
     const refreshWith = async (headers: Record<string, string>) => {
       const refresh = jest.spyOn(mockAuthService, 'refresh');
       refresh.mockClear();
-      await controller.refresh({ refreshToken: 'refresh-token' }, {
-        headers,
-        ip: null,
-      } as any);
+      await controller.refresh(
+        { refreshToken: 'refresh-token' },
+        { headers, ip: null } as any,
+        res,
+      );
       return refresh.mock.calls[0][1 as never] as unknown as {
         rotationAttemptId?: string | null;
         requestReceivedAt?: Date;

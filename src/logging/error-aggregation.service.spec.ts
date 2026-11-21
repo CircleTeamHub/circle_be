@@ -513,10 +513,18 @@ describe('createSentryInitOptions', () => {
           },
         ],
       },
-      request: { headers: { authorization: 'Bearer secret' } },
+      request: {
+        headers: {
+          authorization: 'Bearer secret',
+          cookie: 'circle_rt=cookie-secret',
+        },
+      },
+      contexts: {
+        response: { headers: { 'set-cookie': 'circle_rt=set-cookie-secret' } },
+      },
     }) as Record<string, any>;
     expect(JSON.stringify(filtered)).not.toMatch(
-      /blue pineapple|Bearer secret/,
+      /blue pineapple|Bearer secret|cookie-secret/,
     );
     expect(filtered.exception.values[0].stacktrace.frames).toEqual([
       {
