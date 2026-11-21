@@ -60,6 +60,21 @@ describe('login challenge approver identity', () => {
     expect(deviceTrust.listPending).toHaveBeenCalledWith('u1', null);
   });
 
+  it('takes a web session device from its cookie, never from X-Device-Id', async () => {
+    const { controller, deviceTrust, req } = setup(null);
+    req.headers = { 'x-web-session': '1', 'x-device-id': RAW_DEVICE_ID };
+
+    await controller.pendingLoginChallenges(req as never);
+    expect(deviceTrust.listPending).toHaveBeenCalledWith('u1', null);
+
+    req.headers.cookie = `circle_did=${RAW_DEVICE_ID}`;
+    await expect(
+      controller.pendingLoginChallenges(req as never),
+    ).rejects.toMatchObject({
+      response: { errorCode: 'AUTH_SESSION_DEVICE_UNBOUND' },
+    });
+  });
+
   it('records the proxy-resolved IP, not a client-supplied X-Client-IP', async () => {
     const authService = { login: jest.fn().mockResolvedValue({}) };
     const controller = new AuthController(
@@ -74,6 +89,7 @@ describe('login challenge approver identity', () => {
         headers: { 'x-client-ip': '6.6.6.6', 'x-device-id': RAW_DEVICE_ID },
         ip: '203.0.113.9',
       } as never,
+      {} as never,
     );
     expect(authService.login).toHaveBeenCalledWith(
       expect.anything(),
@@ -103,6 +119,7 @@ describe('refresh session context', () => {
         headers: { 'x-device-id': RAW_DEVICE_ID, 'x-stable-device-id': stable },
         ip: '127.0.0.1',
       } as never,
+      {} as never,
     );
 
     expect(authService.refresh).toHaveBeenCalledWith(

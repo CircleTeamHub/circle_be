@@ -66,6 +66,25 @@ describe('log sanitizer', () => {
     expect(sanitizeLogText('release 1.2.3.4')).toContain('1.2.3.4');
   });
 
+  // 网页端会话的 refresh token / 设备 ID 走 Cookie 与 Set-Cookie 头。
+  it('redacts session cookies in request and response headers', () => {
+    const rt = 'a'.repeat(128);
+    const did = 'web-device-0123456789abcdef';
+    const result = sanitizeLogValue({
+      cookie: `circle_rt=${rt}; circle_did=${did}`,
+      'set-cookie': [`circle_rt=${rt}; Path=/api/v1/auth; HttpOnly`],
+      'Set-Cookie': `circle_did=${did}; Path=/api/v1`,
+    });
+    const text = sanitizeLogText(
+      `upstream failed Set-Cookie: circle_rt=${rt}; HttpOnly\nCookie: circle_did=${did}`,
+    );
+
+    for (const secret of [rt, did]) {
+      expect(JSON.stringify(result)).not.toContain(secret);
+      expect(text).not.toContain(secret);
+    }
+  });
+
   it('redacts arbitrary root logger prose while preserving structured events', () => {
     expect(
       JSON.stringify(

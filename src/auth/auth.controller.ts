@@ -1,6 +1,7 @@
 import { AnonymousAccess } from 'src/guards/anonymous-access.decorator';
 import { UserThrottlerGuard } from 'src/guards/user-throttler.guard';
 import {
+  BadRequestException,
   Body,
   ConflictException,
   Controller,
@@ -12,10 +13,12 @@ import {
   Post,
   Put,
   Req,
+  Res,
+  UnauthorizedException,
   UseGuards,
 } from '@nestjs/common';
 import { isUUID } from 'class-validator';
-import { Request } from 'express';
+import { Request, Response } from 'express';
 import { Throttle, ThrottlerGuard } from '@nestjs/throttler';
 import {
   ApiBearerAuth,
@@ -38,7 +41,10 @@ import {
   RequestPasswordResetDto,
   ResetPasswordDto,
 } from './dto/password-reset.dto';
-import { RefreshTokenDto } from './dto/refresh-token.dto';
+import {
+  RefreshTokenDto,
+  SessionRefreshTokenDto,
+} from './dto/refresh-token.dto';
 import { RegisterDto } from './dto/register.dto';
 import { ChangePasswordDto } from './dto/change-password.dto';
 import { ChangeAccountIdDto } from './dto/change-account-id.dto';
@@ -64,6 +70,14 @@ import { SelfUserDto } from 'src/user/dto/public-user.dto';
 import { Serialize } from 'src/decorators/serialize.decorator';
 import { SessionContext } from './refresh-token.service';
 import type { RequestWithUser } from './types';
+import {
+  clearRefreshCookie,
+  isWebSession,
+  moveRefreshTokenToCookie,
+  readCookie,
+  REFRESH_COOKIE,
+  webDeviceKey,
+} from './web-session';
 
 function getHeaderValue(value: string | string[] | undefined): string | null {
   if (Array.isArray(value)) {
@@ -72,7 +86,8 @@ function getHeaderValue(value: string | string[] | undefined): string | null {
   return value ?? null;
 }
 
-function getSessionContext(req?: Request): SessionContext {
+/** 传了 res 的路由（会发 token 的那几条）在网页端缺设备 cookie 时当场发一个。 */
+function getSessionContext(req?: Request, res?: Response): SessionContext {
   if (!req) {
     return {};
   }
@@ -84,13 +99,36 @@ function getSessionContext(req?: Request): SessionContext {
     // 按来源限流陌生设备验证、并展示在受信任设备的批准弹窗里。
     ip: req.ip ?? null,
     userAgent: getHeaderValue(req.headers['user-agent']),
-    // 客户端安全存储里的随机设备 ID，只以哈希形式进入服务端。
-    deviceKey: hashDeviceId(getHeaderValue(req.headers['x-device-id'])),
+    // 客户端安全存储里的随机设备 ID，只以哈希形式进入服务端。网页端的设备 ID
+    // 在 HttpOnly cookie 里（脚本拿不到，也就不会带 X-Device-Id）。
+    deviceKey: isWebSession(req)
+      ? webDeviceKey(req, res)
+      : hashDeviceId(getHeaderValue(req.headers['x-device-id'])),
     stableDeviceKey: hashStableDeviceId(
       getHeaderValue(req.headers['x-stable-device-id']),
     ),
   };
 }
+
+/** 原生 App 的 refresh token 仍在请求体里，缺了照旧 400。 */
+function bodyRefreshToken(dto: SessionRefreshTokenDto): string {
+  if (!dto.refreshToken) {
+    throw new BadRequestException('refreshToken should not be empty');
+  }
+  return dto.refreshToken;
+}
+
+/**
+ * 网页端会话模式（见 web-session.ts）：refresh token 写进 HttpOnly cookie `circle_rt`，
+ * 响应体只有 `{ accessToken }`；设备 ID 取自 cookie `circle_did`，不读 X-Device-Id。
+ */
+const ApiWebSessionHeader = () =>
+  ApiHeader({
+    name: 'X-Web-Session',
+    required: false,
+    description:
+      "Web client only, value '1'. The refresh token is set as the HttpOnly cookie circle_rt (Path=/api/v1/auth) and left out of the body, which is { accessToken } only; refresh/logout read it from the cookie with an empty body. The device id comes from the HttpOnly cookie circle_did instead of X-Device-Id.",
+  });
 
 @Controller('auth')
 @ApiTags('Auth')
@@ -125,8 +163,20 @@ export class AuthController {
     return null;
   }
 
+  /** 网页端：发出的 refresh token 写进 cookie，响应体只留 access token。 */
+  private respond<T extends object>(req: Request, res: Response, result: T) {
+    return isWebSession(req)
+      ? moveRefreshTokenToCookie(
+          res,
+          result,
+          this.refreshTokens.ttlMsFor('APP'),
+        )
+      : result;
+  }
+
   @AnonymousAccess('Account registration')
   @Post('register')
+  @ApiWebSessionHeader()
   @ApiOperation({ summary: 'Register a new user' })
   @ApiBody({ type: RegisterDto })
   @ApiHeader({
@@ -138,12 +188,21 @@ export class AuthController {
     description: 'User registered successfully',
     type: AuthTokensDto,
   })
-  register(@Body() dto: RegisterDto, @Req() req?: Request) {
-    return this.authService.register(dto, getSessionContext(req));
+  async register(
+    @Body() dto: RegisterDto,
+    @Req() req: Request,
+    @Res({ passthrough: true }) res: Response,
+  ) {
+    return this.respond(
+      req,
+      res,
+      await this.authService.register(dto, getSessionContext(req, res)),
+    );
   }
 
   @AnonymousAccess('Password login')
   @Post('login')
+  @ApiWebSessionHeader()
   @ApiOperation({ summary: 'Login with email or user ID and password' })
   @ApiBody({ type: LoginDto })
   @ApiHeader({
@@ -155,12 +214,21 @@ export class AuthController {
   @ApiForbiddenResponse({
     description: 'Invalid credentials or inactive account',
   })
-  login(@Body() dto: LoginDto, @Req() req?: Request) {
-    return this.authService.login(dto, getSessionContext(req));
+  async login(
+    @Body() dto: LoginDto,
+    @Req() req: Request,
+    @Res({ passthrough: true }) res: Response,
+  ) {
+    return this.respond(
+      req,
+      res,
+      await this.authService.login(dto, getSessionContext(req, res)),
+    );
   }
 
   @AnonymousAccess('One-time trusted-device code')
   @Post('login-challenges/:challengeId/verify')
+  @ApiWebSessionHeader()
   @UseGuards(ThrottlerGuard)
   @Throttle({ default: { limit: 10, ttl: 60_000 } })
   @ApiOperation({
@@ -169,20 +237,26 @@ export class AuthController {
   @ApiHeader({ name: 'x-device-id', required: true })
   @ApiBody({ type: LoginChallengeCodeDto })
   @ApiCreatedResponse({ type: AuthTokensDto })
-  verifyLoginChallenge(
+  async verifyLoginChallenge(
     @Param('challengeId', ParseUUIDPipe) challengeId: string,
     @Body() dto: LoginChallengeCodeDto,
     @Req() req: Request,
+    @Res({ passthrough: true }) res: Response,
   ) {
-    return this.authService.verifyLoginChallengeCode(
-      challengeId,
-      dto.code,
-      getSessionContext(req),
+    return this.respond(
+      req,
+      res,
+      await this.authService.verifyLoginChallengeCode(
+        challengeId,
+        dto.code,
+        getSessionContext(req, res),
+      ),
     );
   }
 
   @AnonymousAccess('Login challenge and security code')
   @Post('login-challenges/:challengeId/security-code')
+  @ApiWebSessionHeader()
   @UseGuards(ThrottlerGuard)
   @Throttle({ default: { limit: 10, ttl: 60_000 } })
   @ApiOperation({
@@ -191,15 +265,20 @@ export class AuthController {
   @ApiHeader({ name: 'x-device-id', required: true })
   @ApiBody({ type: LoginSecurityCodeDto })
   @ApiCreatedResponse({ type: AuthTokensDto })
-  verifyLoginChallengeSecurityCode(
+  async verifyLoginChallengeSecurityCode(
     @Param('challengeId', ParseUUIDPipe) challengeId: string,
     @Body() dto: LoginSecurityCodeDto,
     @Req() req: Request,
+    @Res({ passthrough: true }) res: Response,
   ) {
-    return this.authService.verifyLoginChallengeSecurityCode(
-      challengeId,
-      dto.securityCode,
-      getSessionContext(req),
+    return this.respond(
+      req,
+      res,
+      await this.authService.verifyLoginChallengeSecurityCode(
+        challengeId,
+        dto.securityCode,
+        getSessionContext(req, res),
+      ),
     );
   }
 
@@ -224,6 +303,7 @@ export class AuthController {
 
   @AnonymousAccess('Login challenge and security answers')
   @Post('login-challenges/:challengeId/security-questions')
+  @ApiWebSessionHeader()
   @UseGuards(ThrottlerGuard)
   @Throttle({ default: { limit: 10, ttl: 60_000 } })
   @ApiOperation({
@@ -233,15 +313,20 @@ export class AuthController {
   @ApiHeader({ name: 'x-device-id', required: true })
   @ApiBody({ type: VerifySecurityQuestionsDto })
   @ApiCreatedResponse({ type: AuthTokensDto })
-  verifyLoginChallengeSecurityQuestions(
+  async verifyLoginChallengeSecurityQuestions(
     @Param('challengeId', ParseUUIDPipe) challengeId: string,
     @Body() dto: VerifySecurityQuestionsDto,
     @Req() req: Request,
+    @Res({ passthrough: true }) res: Response,
   ) {
-    return this.authService.verifyLoginChallengeSecurityQuestions(
-      challengeId,
-      dto.answers,
-      getSessionContext(req),
+    return this.respond(
+      req,
+      res,
+      await this.authService.verifyLoginChallengeSecurityQuestions(
+        challengeId,
+        dto.answers,
+        getSessionContext(req, res),
+      ),
     );
   }
 
@@ -370,8 +455,9 @@ export class AuthController {
 
   @AnonymousAccess('Refresh token credential')
   @Post('refresh')
+  @ApiWebSessionHeader()
   @ApiOperation({ summary: 'Refresh an access token' })
-  @ApiBody({ type: RefreshTokenDto })
+  @ApiBody({ type: SessionRefreshTokenDto })
   @ApiHeader({
     name: 'x-device-name',
     required: false,
@@ -393,13 +479,35 @@ export class AuthController {
     description: 'Token refreshed successfully',
     type: AuthTokensDto,
   })
-  refresh(@Body() dto: RefreshTokenDto, @Req() req?: Request) {
-    const attemptId = getHeaderValue(req?.headers['idempotency-key']);
-    return this.authService.refresh(dto.refreshToken, {
-      ...getSessionContext(req),
+  async refresh(
+    @Body() dto: SessionRefreshTokenDto,
+    @Req() req: Request,
+    @Res({ passthrough: true }) res: Response,
+  ) {
+    const attemptId = getHeaderValue(req.headers['idempotency-key']);
+    const context = {
+      ...getSessionContext(req, res),
       rotationAttemptId: attemptId && isUUID(attemptId, '4') ? attemptId : null,
       requestReceivedAt: new Date(),
-    });
+    };
+    if (!isWebSession(req)) {
+      return this.authService.refresh(bodyRefreshToken(dto), context);
+    }
+    try {
+      const refreshToken = readCookie(req, REFRESH_COOKIE);
+      if (!refreshToken) {
+        throw new UnauthorizedException('Invalid or expired refresh token');
+      }
+      return this.respond(
+        req,
+        res,
+        await this.authService.refresh(refreshToken, context),
+      );
+    } catch (error) {
+      // 死掉的 refresh token 别让浏览器一直重放；设备 cookie 保留。
+      if (error instanceof UnauthorizedException) clearRefreshCookie(res);
+      throw error;
+    }
   }
 
   @AnonymousAccess('Admin refresh token credential')
@@ -424,11 +532,26 @@ export class AuthController {
 
   @AnonymousAccess('Refresh token revocation')
   @Post('logout')
+  @ApiWebSessionHeader()
   @ApiOperation({ summary: 'Logout and revoke a refresh token' })
-  @ApiBody({ type: RefreshTokenDto })
+  @ApiBody({ type: SessionRefreshTokenDto })
   @ApiOkResponse({ description: 'Logout successful' })
-  logout(@Body() dto: RefreshTokenDto, @Req() req?: Request) {
-    return this.authService.logout(dto.refreshToken, getSessionContext(req));
+  async logout(
+    @Body() dto: SessionRefreshTokenDto,
+    @Req() req: Request,
+    @Res({ passthrough: true }) res: Response,
+  ) {
+    if (!isWebSession(req)) {
+      return this.authService.logout(
+        bodyRefreshToken(dto),
+        getSessionContext(req),
+      );
+    }
+    const refreshToken = readCookie(req, REFRESH_COOKIE);
+    if (refreshToken) {
+      await this.authService.logout(refreshToken, getSessionContext(req));
+    }
+    clearRefreshCookie(res);
   }
 
   @Get('sessions')

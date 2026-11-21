@@ -1,0 +1,109 @@
+import { createHash, randomBytes } from 'crypto';
+import type { CookieOptions, Request, Response } from 'express';
+import { ipKeyGenerator } from 'express-rate-limit';
+import { hashDeviceId } from './device-trust.service';
+
+/**
+ * 网页端会话：refresh token 与设备 ID 放进本服务签发的 HttpOnly cookie，页面刷新
+ * 不再掉登录，也不会每次刷新都被当成陌生设备；脚本照样读不到这两样（防 XSS 偷走
+ * 长期凭证）。
+ *
+ * 只有带 `X-Web-Session: 1` 的请求才读写这些 cookie，其余请求（原生 App）一切照旧。
+ * 这个自定义头同时是 CSRF 防线：跨域页面要发它必须先过预检，而预检只放行
+ * ALLOWED_ORIGINS 里的来源。
+ */
+export const REFRESH_COOKIE = 'circle_rt';
+const DEVICE_COOKIE = 'circle_did';
+// setup.ts 的全局前缀 'api/v1'。
+const API_PATH = '/api/v1';
+const REFRESH_COOKIE_PATH = `${API_PATH}/auth`;
+// 浏览器把 cookie 有效期封顶在 400 天。
+const DEVICE_COOKIE_MAX_AGE_MS = 400 * 24 * 60 * 60 * 1000;
+
+export function isWebSession(req: Request): boolean {
+  return req.headers['x-web-session'] === '1';
+}
+
+export function readCookie(req: Request, name: string): string | null {
+  for (const pair of (req.headers.cookie ?? '').split(';')) {
+    const [key, ...value] = pair.split('=');
+    if (key.trim() === name) return value.join('=').trim();
+  }
+  return null;
+}
+
+/** 设置与清除必须用同一组属性，否则浏览器当成另一枚 cookie，清不掉。 */
+function cookieOptions(path: string): CookieOptions {
+  return {
+    httpOnly: true,
+    sameSite: 'strict',
+    // 本地开发走 http://localhost，带 Secure 浏览器就不存。
+    secure: process.env.NODE_ENV === 'production',
+    path,
+  };
+}
+
+export function clearRefreshCookie(res: Response): void {
+  res.clearCookie(REFRESH_COOKIE, cookieOptions(REFRESH_COOKIE_PATH));
+}
+
+function setDeviceCookie(res: Response, deviceId: string): void {
+  res.cookie(DEVICE_COOKIE, deviceId, {
+    ...cookieOptions(API_PATH),
+    maxAge: DEVICE_COOKIE_MAX_AGE_MS,
+  });
+}
+
+/**
+ * 网页端设备 ID 的哈希（与原生的 X-Device-Id 同算法）。给了 res 的路由（登录、续签等）：
+ * cookie 缺失或不合规时当场发一个新 ID 并按它处理这次请求；合规的原样重发一遍，把
+ * 400 天有效期往后顺延，常用的浏览器不会某天突然变成陌生设备。只读路由不发也不续。
+ */
+export function webDeviceKey(req: Request, res?: Response): string | null {
+  const existing = readCookie(req, DEVICE_COOKIE);
+  const current = hashDeviceId(existing);
+  if (!res) return current;
+  const deviceId =
+    current && existing ? existing : randomBytes(32).toString('base64url');
+  setDeviceCookie(res, deviceId);
+  return current ?? hashDeviceId(deviceId);
+}
+
+interface IssuedTokens {
+  accessToken: string;
+  refreshToken: string;
+}
+
+function hasTokens(result: object): result is IssuedTokens {
+  return 'refreshToken' in result;
+}
+
+/**
+ * 发了 token 的结果：refresh token 只进 cookie，响应体只留 access token。
+ * 没发 token 的结果（如陌生设备验证单）原样返回。
+ */
+export function moveRefreshTokenToCookie<T extends object>(
+  res: Response,
+  result: T,
+  maxAgeMs: number,
+): T | { accessToken: string } {
+  if (!hasTokens(result)) return result;
+  res.cookie(REFRESH_COOKIE, result.refreshToken, {
+    ...cookieOptions(REFRESH_COOKIE_PATH),
+    maxAge: maxAgeMs,
+  });
+  return { accessToken: result.accessToken };
+}
+
+/**
+ * auth/refresh 的限流键。网页端每次加载页面都会拿 cookie 续签一次，按 IP 计数的话，
+ * 同一出口 IP（公司网络、运营商共享 IP）后面几十个人一刷新就会撞上限、被踢回登录页；
+ * 所以网页端按 refresh token（的哈希）计数。其余请求（原生 App、管理台、没带 cookie 的）
+ * 照旧按 IP。伪造随机 cookie 换键绕过也只能撞全局的每 IP 限流，猜中 token 不可能。
+ */
+export function refreshRateLimitKey(req: Request): string {
+  const token = isWebSession(req) ? readCookie(req, REFRESH_COOKIE) : null;
+  return token
+    ? `rt:${createHash('sha256').update(token).digest('hex')}`
+    : ipKeyGenerator(req.ip ?? '');
+}

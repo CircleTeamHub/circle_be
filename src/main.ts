@@ -61,6 +61,9 @@ export function buildNestFactoryOptions() {
         'X-Device-Name',
         // 陌生设备登录验证的设备标识；网页端不放行就永远被当成陌生设备。
         'X-Device-Id',
+        // 网页端会话模式（refresh token / 设备 ID 走 HttpOnly cookie，见
+        // auth/web-session.ts）；跨域发它必须过预检，兼作 CSRF 防线。
+        'X-Web-Session',
         'Idempotency-Key',
         'X-Call-Invite-Created-At',
       ],

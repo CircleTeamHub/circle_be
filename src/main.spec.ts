@@ -176,6 +176,27 @@ describe('production HTTP CORS integration', () => {
     expect(blocked.headers['access-control-allow-origin']).toBeUndefined();
   });
 
+  // 网页端会话的 cookie 只在带 X-Web-Session 时才读：放行名单外的来源过不了这一步预检，
+  // 也就没法借用户的 cookie 发请求。
+  it('allows the X-Web-Session header only for the configured web origin', async () => {
+    const preflight = (origin: string) =>
+      request(app.getHttpServer())
+        .options('/cors-probe')
+        .set('Origin', origin)
+        .set('Access-Control-Request-Method', 'POST')
+        .set('Access-Control-Request-Headers', 'Content-Type, X-Web-Session');
+
+    const allowed = await preflight('https://web.example.test');
+    expect(allowed.status).toBe(204);
+    expect(allowed.headers['access-control-allow-credentials']).toBe('true');
+    expect(allowed.headers['access-control-allow-headers']).toContain(
+      'X-Web-Session',
+    );
+
+    const blocked = await preflight('https://evil.example.test');
+    expect(blocked.headers['access-control-allow-origin']).toBeUndefined();
+  });
+
   it('exposes the server request id to an allowed browser origin', async () => {
     const response = await request(app.getHttpServer())
       .get('/cors-probe')
@@ -236,6 +257,7 @@ describe('buildNestFactoryOptions', () => {
         'X-Request-Id',
         'X-Device-Name',
         'X-Device-Id',
+        'X-Web-Session',
         'Idempotency-Key',
         'X-Call-Invite-Created-At',
       ]),
