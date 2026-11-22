@@ -2248,8 +2248,9 @@ export class ChatService {
     });
     await this.seatMembersIntoRoom(conversation.id, [userId]);
     // 建群提示一条就够;成员名单首屏可见,不再逐人刷「加入群聊」。
+    // actorId:建群人自己的会话列表不因这条提示挂未读(未读查询按它排除)。
     void this.systemMessage
-      .emit(conversation.id, { kind: 'group-created' })
+      .emit(conversation.id, { kind: 'group-created', actorId: userId })
       .catch(() => undefined);
     void this.groupEvents.record(conversation.id, {
       kind: 'group-created',
@@ -2550,8 +2551,13 @@ export class ChatService {
       where: { id: conversation.id },
       data: { name: trimmed },
     });
+    // actorId:改名的人自己的会话列表不因这条提示挂未读(未读查询按它排除)。
     void this.systemMessage
-      .emit(conversation.id, { kind: 'group-renamed', name: trimmed })
+      .emit(conversation.id, {
+        kind: 'group-renamed',
+        actorId: userId,
+        name: trimmed,
+      })
       .catch(() => undefined);
     void this.groupEvents.record(conversation.id, {
       kind: 'group-renamed',
