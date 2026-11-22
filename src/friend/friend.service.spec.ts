@@ -2741,6 +2741,12 @@ describe('FriendService', () => {
 
     await service.blockUser('user-1', 'user-2');
 
+    // 同一对人之间可能还留着被拒绝的旧申请行(表上没有成对唯一约束):只取已通过的好友关系。
+    expect(prisma.friend.findFirst).toHaveBeenCalledWith(
+      expect.objectContaining({
+        where: expect.objectContaining({ state: FriendState.ACCEPTED }),
+      }),
+    );
     expect(prisma.block.create).toHaveBeenCalledWith({
       data: { blockerID: 'user-1', blockedID: 'user-2', remark: '大学室友' },
     });

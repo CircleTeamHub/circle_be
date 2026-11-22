@@ -1252,12 +1252,14 @@ export class FriendService {
           `;
         }
         // 好友关系马上要删,先把我给对方的备注记进拉黑记录,黑名单里才认得出是谁。
+        // 只看已通过的那一行:同一对人之间可能还留着被拒绝的旧申请(表上没有成对唯一约束)。
         const friendship = await tx.friend.findFirst({
           where: {
             OR: [
               { userID: blockerId, friendID: targetId },
               { userID: targetId, friendID: blockerId },
             ],
+            state: FriendState.ACCEPTED,
           },
           select: { userID: true, remarkA: true, remarkB: true },
         });
