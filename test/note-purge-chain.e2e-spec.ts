@@ -65,6 +65,47 @@ describeDatabase('Permanent delete keeps collected-copy chains intact', () => {
     return { a, b, c, stranger, root, relay, leaf };
   }
 
+  // 编辑已有笔记只能存回原笔记：原笔记永久删除后，没存的编辑草稿一起删掉，
+  // 否则外键 SetNull 让它变成「新笔记草稿」，下次补存就另发出一篇副本。
+  it('purging a note deletes its unsaved edit drafts and keeps consumed ones as submission records', async () => {
+    const owner = await user();
+    const target = await note(owner.id, null);
+    const other = await note(owner.id, null);
+    await prisma.note.update({
+      where: { id: target.id },
+      data: { status: 'DELETED' },
+    });
+    const draft = (sourceNoteID: string, consumed: boolean) =>
+      prisma.noteDraft.create({
+        data: {
+          ownerID: owner.id,
+          clientDraftID: randomUUID(),
+          sourceNoteID,
+          title: 'Unsaved edit',
+          ...(consumed
+            ? { consumedAt: new Date(), publishedNoteID: sourceNoteID }
+            : {}),
+        },
+      });
+    const unsaved = await draft(target.id, false);
+    const consumed = await draft(target.id, true);
+    const otherDraft = await draft(other.id, false);
+
+    await expect(
+      purgeDeletedNote(prisma, target.id, { ownerID: owner.id }),
+    ).resolves.toBe(true);
+
+    await expect(
+      prisma.noteDraft.findUnique({ where: { id: unsaved.id } }),
+    ).resolves.toBeNull();
+    await expect(
+      prisma.noteDraft.findUniqueOrThrow({ where: { id: consumed.id } }),
+    ).resolves.toMatchObject({ sourceNoteID: null });
+    await expect(
+      prisma.noteDraft.findUniqueOrThrow({ where: { id: otherDraft.id } }),
+    ).resolves.toMatchObject({ sourceNoteID: other.id });
+  });
+
   it('purging a middle copy re-points its downstream copy and keeps it readable', async () => {
     const { b, stranger, root, relay, leaf } = await chain();
     await prisma.note.update({

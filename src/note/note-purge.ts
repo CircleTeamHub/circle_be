@@ -11,8 +11,8 @@ export type NotePurgeGuard = { ownerID: string } | { deletedBefore: Date };
  * 永久删除一条回收站里的笔记（status=DELETED）。回收站「立即删除」、30 天到期清理与
  * 下架满 60 天的清理共用，语义必须一致。
  *
- * 只删 Postgres 行（NoteMedia / NoteGroupMembership 随外键级联）；MinIO 对象留给
- * StorageAudit —— 收藏副本可能共用同一个 objectKey。
+ * 只删 Postgres 行（NoteMedia / NoteGroupMembership 随外键级联，未消费的编辑草稿在下面
+ * 显式删）；MinIO 对象留给 StorageAudit —— 收藏副本可能共用同一个 objectKey。
  *
  * 收录链：副本的 collectedFromNoteID 记的是**直接来源**，读取时沿链走到根取实时
  * 状态，查不到的来源按「已被永久删除」处理。所以删的若是链中间的一份副本，要先
@@ -63,6 +63,13 @@ export async function purgeDeletedNote(
             )
           )`;
     }
+
+    // 编辑已有笔记只能存回原笔记：原笔记没了，没存的编辑草稿也就没有去处，一并删掉。
+    // 必须先删：笔记一删，外键 SetNull 会清空 sourceNoteID，草稿看起来就成了「新笔记草稿」，
+    // 客户端补存时会另发出一篇副本。已消费的草稿是提交结果的记录（幂等重放靠它），保留。
+    await tx.noteDraft.deleteMany({
+      where: { sourceNoteID: noteId, consumedAt: null },
+    });
 
     const removed = await tx.note.deleteMany({
       where: { id: noteId, status: 'DELETED' },
