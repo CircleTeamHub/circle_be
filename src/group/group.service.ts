@@ -802,11 +802,38 @@ export class GroupService {
       }
       circleID = circle.id;
     } else {
-      // 自研栈下群 = 圈子;OpenIM 时代的裸群不再可举报。
-      throw new NotFoundException({
-        message: 'Group not found',
-        errorCode: GroupErrorCode.NotFound,
+      // 独立群聊(新建群聊建的群,不属于任何圈子):举报对象就是群会话本身,
+      // 举报人必须仍在群里。其余(私聊、圈子会话、OpenIM 时代的裸群 id)一律 404。
+      const conversation = await this.prisma.chatConversation.findUnique({
+        where: { id: normalizedGroupID },
+        select: { id: true, type: true, circleID: true },
       });
+      if (
+        !conversation ||
+        conversation.type !== 'GROUP' ||
+        conversation.circleID !== null
+      ) {
+        throw new NotFoundException({
+          message: 'Group not found',
+          errorCode: GroupErrorCode.NotFound,
+        });
+      }
+      const seat = await this.prisma.chatMember.findUnique({
+        where: {
+          conversationID_userID: {
+            conversationID: conversation.id,
+            userID: reporterId,
+          },
+        },
+        select: { leftAt: true },
+      });
+      if (!seat || seat.leftAt !== null) {
+        throw new ForbiddenException({
+          message: 'Only active group members can report this group',
+          errorCode: GroupErrorCode.ReportNotActive,
+        });
+      }
+      reportGroupID = conversation.id;
     }
 
     // 只挡「同一举报仍在 PENDING」的重复；APPROVED/REJECTED 审结后允许再次举报新事件

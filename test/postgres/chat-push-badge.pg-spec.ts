@@ -60,7 +60,8 @@ describePostgres('push badge unread query (PostgreSQL)', () => {
       CREATE TABLE "ChatMessage" (
         id text PRIMARY KEY, "conversationID" text NOT NULL, height integer NOT NULL,
         "senderID" text, deleted boolean NOT NULL DEFAULT false,
-        "revokedAt" timestamp, "burnExpiresAt" timestamp
+        "revokedAt" timestamp, "burnExpiresAt" timestamp,
+        type text NOT NULL DEFAULT 'text', content jsonb NOT NULL DEFAULT '{}'
       );
       CREATE UNIQUE INDEX "ChatMessage_conversationID_height_key" ON "ChatMessage"("conversationID", height);
     `);
@@ -106,6 +107,20 @@ describePostgres('push badge unread query (PostgreSQL)', () => {
 
     // plain:5 + 未焚毁的 1;read / cleared 各剩水位之上的 1 条。
     expect(await badges(['me'])).toEqual({ me: 6 + 1 + 1 });
+  });
+
+  it('does not count system notices for my own actions', async () => {
+    await s.db.query(
+      `INSERT INTO "ChatMember" ("conversationID", "userID") VALUES ('g', 'me')`,
+    );
+    // 系统通知没有 senderID:我改的群名、我禁的言不该算我的未读;别人做的、没有操作人的照算。
+    await s.db
+      .query(`INSERT INTO "ChatMessage" (id, "conversationID", height, "senderID", type, content) VALUES
+      ('mine-1', 'g', 1, NULL, 'system', '{"kind":"group-renamed","actorId":"me"}'),
+      ('mine-2', 'g', 2, NULL, 'system', '{"kind":"member-silenced","actorId":"me"}'),
+      ('theirs', 'g', 3, NULL, 'system', '{"kind":"member-silenced","actorId":"peer"}'),
+      ('anon', 'g', 4, NULL, 'system', '{"kind":"member-joined"}')`);
+    expect(await badges(['me'])).toEqual({ me: 2 });
   });
 
   it('returns no row for a recipient with nothing unread and never mixes recipients', async () => {

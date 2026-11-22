@@ -121,6 +121,11 @@ export function unreadCountsQuery(
           )
           -- 自己发的消息不计未读。
           AND (m."senderID" IS NULL OR m."senderID" <> ${userId})
+          -- 系统通知没有 senderID,操作人在 content.actorId:自己改群名、设管理员、
+          -- 禁言产生的通知同样是「自己做的」,不该给自己挂未读。没有 actorId 的通知
+          -- (入群等)照算 —— 必须用 IS DISTINCT FROM,写成 NOT (... = ...) 会因 NULL
+          -- 把这些通知一起排除掉。
+          AND (m."type" <> 'system' OR m."content"->>'actorId' IS DISTINCT FROM ${userId})
         LIMIT ${UNREAD_COUNT_CAP}
       ) AS capped
     ) AS unread

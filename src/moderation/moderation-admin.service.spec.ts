@@ -178,3 +178,45 @@ describe('post report reporter identity', () => {
     ]);
   });
 });
+
+describe('ModerationAdminService.listGroupReports', () => {
+  it('names the standalone group chat for reports that have no circle', async () => {
+    // 独立群聊的举报 circleID 为空、groupID 是会话 id:审核员只看到一串 id 没法判断。
+    const prisma = {
+      groupReport: {
+        findMany: jest.fn().mockResolvedValue([
+          {
+            id: 'r1',
+            groupID: 'circle-group',
+            circleID: 'circle-1',
+            circle: { id: 'circle-1', name: '爬山圈' },
+          },
+          {
+            id: 'r2',
+            groupID: 'conv-standalone',
+            circleID: null,
+            circle: null,
+          },
+        ]),
+        count: jest.fn().mockResolvedValue(2),
+      },
+      chatConversation: {
+        findMany: jest
+          .fn()
+          .mockResolvedValue([{ id: 'conv-standalone', name: '周末饭搭子' }]),
+      },
+    };
+    const service = new ModerationAdminService(prisma as never, {} as never);
+
+    const result = await service.listGroupReports('PENDING' as never);
+
+    expect(prisma.chatConversation.findMany).toHaveBeenCalledWith({
+      where: { id: { in: ['conv-standalone'] }, type: 'GROUP', circleID: null },
+      select: { id: true, name: true },
+    });
+    expect(result.items.map((item) => item.conversation)).toEqual([
+      null,
+      { id: 'conv-standalone', name: '周末饭搭子' },
+    ]);
+  });
+});

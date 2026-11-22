@@ -28,6 +28,9 @@ export function unreadBadgeQuery(userIds: string[]): Prisma.Sql {
           AND (m."burnExpiresAt" IS NULL OR m."burnExpiresAt" > NOW())
           AND m."revokedAt" IS NULL
           AND (m."senderID" IS NULL OR m."senderID" <> cm."userID")
+          -- 自己操作产生的系统通知(content.actorId)不计未读,与会话列表同一口径;
+          -- 没有 actorId 的照算(IS DISTINCT FROM 防 NULL 把它们一起排除)。
+          AND (m."type" <> 'system' OR m."content"->>'actorId' IS DISTINCT FROM cm."userID")
         LIMIT ${UNREAD_COUNT_CAP}
       ) AS capped
     ) AS unread
