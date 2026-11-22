@@ -1251,6 +1251,21 @@ export class FriendService {
             SELECT pg_advisory_xact_lock(hashtextextended(${`call-user:${id}`}, 0))
           `;
         }
+        // 好友关系马上要删,先把我给对方的备注记进拉黑记录,黑名单里才认得出是谁。
+        const friendship = await tx.friend.findFirst({
+          where: {
+            OR: [
+              { userID: blockerId, friendID: targetId },
+              { userID: targetId, friendID: blockerId },
+            ],
+          },
+          select: { userID: true, remarkA: true, remarkB: true },
+        });
+        const remark = friendship
+          ? friendship.userID === blockerId
+            ? friendship.remarkA
+            : friendship.remarkB
+          : null;
         await tx.friend.deleteMany({
           where: {
             OR: [
@@ -1260,7 +1275,7 @@ export class FriendService {
           },
         });
         await tx.block.create({
-          data: { blockerID: blockerId, blockedID: targetId },
+          data: { blockerID: blockerId, blockedID: targetId, remark },
         });
       });
     } catch (error) {
@@ -1327,7 +1342,11 @@ export class FriendService {
       },
       take: BLOCKED_PAGE_SIZE,
     });
-    return blocks.map((b) => ({ ...b.blocked, blockedAt: b.createdAt }));
+    return blocks.map((b) => ({
+      ...b.blocked,
+      remark: b.remark,
+      blockedAt: b.createdAt,
+    }));
   }
 
   // ─── Remark ───────────────────────────────────────────────────────────────────

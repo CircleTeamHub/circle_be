@@ -2725,6 +2725,69 @@ describe('FriendService', () => {
     ).resolves.toBeUndefined();
   });
 
+  it('snapshots my remark for the friend into the block, since blocking deletes the friendship', async () => {
+    prisma.user.findUnique.mockResolvedValue({
+      id: 'user-2',
+      status: 'ACTIVE',
+    });
+    prisma.block.findUnique.mockResolvedValue(null);
+    // user-2 sent the request, so my (user-1) label for them is remarkB.
+    prisma.friend.findFirst.mockResolvedValue({
+      userID: 'user-2',
+      friendID: 'user-1',
+      remarkA: 'their label for me',
+      remarkB: '大学室友',
+    });
+
+    await service.blockUser('user-1', 'user-2');
+
+    expect(prisma.block.create).toHaveBeenCalledWith({
+      data: { blockerID: 'user-1', blockedID: 'user-2', remark: '大学室友' },
+    });
+  });
+
+  it('blocks a stranger without a remark', async () => {
+    prisma.user.findUnique.mockResolvedValue({
+      id: 'user-2',
+      status: 'ACTIVE',
+    });
+    prisma.block.findUnique.mockResolvedValue(null);
+    prisma.friend.findFirst.mockResolvedValue(null);
+
+    await service.blockUser('user-1', 'user-2');
+
+    expect(prisma.block.create).toHaveBeenCalledWith({
+      data: { blockerID: 'user-1', blockedID: 'user-2', remark: null },
+    });
+  });
+
+  it('lists blocked users with the remark I had for them', async () => {
+    const blockedAt = new Date('2026-11-20T08:00:00.000Z');
+    prisma.block.findMany.mockResolvedValue([
+      {
+        remark: '大学室友',
+        createdAt: blockedAt,
+        blocked: {
+          id: 'user-2',
+          accountId: 'a2',
+          nickname: 'Nick',
+          avatarUrl: null,
+        },
+      },
+    ]);
+
+    await expect(service.listBlocked('user-1')).resolves.toEqual([
+      {
+        id: 'user-2',
+        accountId: 'a2',
+        nickname: 'Nick',
+        avatarUrl: null,
+        remark: '大学室友',
+        blockedAt,
+      },
+    ]);
+  });
+
   it('marks exactly one friend activity as read for the viewer', async () => {
     prisma.friendActivity.updateMany.mockResolvedValue({ count: 1 });
 
