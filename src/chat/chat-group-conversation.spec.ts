@@ -474,8 +474,10 @@ describe('ChatService standalone group conversations', () => {
       })),
     });
     expect(broadcast.emitConversationChange).toHaveBeenCalledTimes(1);
+    // 带上操作人:建群人自己的会话列表不该因为这条提示挂未读。
     expect(systemMessage.emit).toHaveBeenCalledWith('conv-1', {
       kind: 'group-created',
+      actorId: 'owner-1',
     });
     expect(result).toBe(conversationDto);
   });
@@ -769,8 +771,10 @@ describe('ChatService standalone group conversations', () => {
       where: { id: 'conv-1' },
       data: { name: '新群名' },
     });
+    // 带上操作人:改名的人自己的会话列表不该因为这条提示挂未读(未读查询按 actorId 排除)。
     expect(systemMessage.emit).toHaveBeenCalledWith('conv-1', {
       kind: 'group-renamed',
+      actorId: 'owner-1',
       name: '新群名',
     });
   });

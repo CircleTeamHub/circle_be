@@ -36,6 +36,7 @@ describe('GroupService reportGroup', () => {
     conversationGroupMembership: { deleteMany: jest.Mock };
     circleInvitation: { updateMany: jest.Mock };
     chatConversation: { findUnique: jest.Mock };
+    chatMember: { findUnique: jest.Mock };
     adminAuditLog: { create: jest.Mock };
     groupReport: {
       findFirst: jest.Mock;
@@ -108,6 +109,7 @@ describe('GroupService reportGroup', () => {
       conversationGroupMembership: { deleteMany: jest.fn() },
       circleInvitation: { updateMany: jest.fn() },
       chatConversation: { findUnique: jest.fn().mockResolvedValue(null) },
+      chatMember: { findUnique: jest.fn().mockResolvedValue(null) },
       adminAuditLog: { create: jest.fn().mockResolvedValue(undefined) },
       groupReport: {
         findFirst: jest.fn(),
@@ -312,6 +314,88 @@ describe('GroupService reportGroup', () => {
     ).rejects.toThrow(NotFoundException);
 
     expect(prisma.groupReport.create).not.toHaveBeenCalled();
+  });
+
+  describe('standalone group chats (not tied to a circle)', () => {
+    // 独立群聊(新建群聊建的群)以前根本举报不了:前端没有 groupID 直接 return,
+    // 后端也只认圈子群。举报对象就是群会话本身。
+    beforeEach(() => {
+      prisma.circle.findFirst.mockResolvedValue(null);
+    });
+
+    it('lets an active member report it against the conversation', async () => {
+      prisma.chatConversation.findUnique.mockResolvedValue({
+        id: 'conv-standalone',
+        type: 'GROUP',
+        circleID: null,
+      });
+      prisma.chatMember.findUnique.mockResolvedValue({ leftAt: null });
+      prisma.groupReport.findFirst.mockResolvedValue(null);
+
+      await service.reportGroup('user-1', 'conv-standalone', {
+        category: 'spam',
+        description: 'ads everywhere',
+      });
+
+      expect(prisma.chatMember.findUnique).toHaveBeenCalledWith(
+        expect.objectContaining({
+          where: {
+            conversationID_userID: {
+              conversationID: 'conv-standalone',
+              userID: 'user-1',
+            },
+          },
+        }),
+      );
+      expect(prisma.groupReport.create).toHaveBeenCalledWith({
+        data: expect.objectContaining({
+          reporterID: 'user-1',
+          groupID: 'conv-standalone',
+          circleID: null,
+        }),
+      });
+    });
+
+    it.each([
+      ['never joined', null],
+      ['already left', { leftAt: new Date() }],
+    ])('refuses a reporter who %s', async (_label, seat) => {
+      prisma.chatConversation.findUnique.mockResolvedValue({
+        id: 'conv-standalone',
+        type: 'GROUP',
+        circleID: null,
+      });
+      prisma.chatMember.findUnique.mockResolvedValue(seat);
+
+      await expect(
+        service.reportGroup('user-1', 'conv-standalone', {
+          category: 'spam',
+          description: 'x',
+        }),
+      ).rejects.toThrow(ForbiddenException);
+      expect(prisma.groupReport.create).not.toHaveBeenCalled();
+    });
+
+    it.each([
+      ['a direct chat', { id: 'dm', type: 'DIRECT', circleID: null }],
+      [
+        'a circle conversation',
+        { id: 'cc', type: 'GROUP', circleID: 'circle-9' },
+      ],
+    ])(
+      'does not treat %s as a reportable standalone group',
+      async (_label, conv) => {
+        prisma.chatConversation.findUnique.mockResolvedValue(conv);
+
+        await expect(
+          service.reportGroup('user-1', conv.id, {
+            category: 'spam',
+            description: 'x',
+          }),
+        ).rejects.toThrow(NotFoundException);
+        expect(prisma.groupReport.create).not.toHaveBeenCalled();
+      },
+    );
   });
 
   it('rejects duplicate group reports for the same reporter/group/category', async () => {

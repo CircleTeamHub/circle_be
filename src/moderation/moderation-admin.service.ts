@@ -39,7 +39,34 @@ export class ModerationAdminService {
       }),
       this.prisma.groupReport.count({ where: { status } }),
     ]);
-    return { items, total, page, limit: take };
+    // 独立群聊的举报没有圈子(circleID 为空,groupID 是群会话 id):把群名带上,
+    // 审核员才知道举报的是哪个群。本页一次查完。
+    const standaloneIds = [
+      ...new Set(
+        items
+          .filter((item) => item.circleID === null)
+          .map((item) => item.groupID),
+      ),
+    ];
+    const conversations = standaloneIds.length
+      ? await this.prisma.chatConversation.findMany({
+          where: { id: { in: standaloneIds }, type: 'GROUP', circleID: null },
+          select: { id: true, name: true },
+        })
+      : [];
+    const conversationsById = new Map(conversations.map((c) => [c.id, c]));
+    return {
+      items: items.map((item) => ({
+        ...item,
+        conversation:
+          item.circleID === null
+            ? (conversationsById.get(item.groupID) ?? null)
+            : null,
+      })),
+      total,
+      page,
+      limit: take,
+    };
   }
 
   async listPostReports(status: ReportReviewStatus, page = 1, limit = 20) {

@@ -1678,6 +1678,9 @@ model Block {
   id        String   @id @default(uuid())
   blockerID String
   blockedID String
+  /// 拉黑那一刻拉黑者给对方的好友备注快照:拉黑会删掉好友关系,备注随之消失,
+  /// 黑名单只剩昵称就认不出是谁。
+  remark    String?
   createdAt DateTime @default(now())
   blocker   User     @relation("blocker", fields: [blockerID], references: [id], onDelete: Cascade)
   blocked   User     @relation("blocked", fields: [blockedID], references: [id], onDelete: Cascade)
