@@ -148,6 +148,18 @@ const POLICY_KEYS: readonly GroupPolicyKey[] = [
 ];
 
 /**
+ * 只记群日志、不往聊天里写灰字的开关:进群渠道和邀请权限是管理设置,普通成员
+ * 不需要看到谁改了它(群日志只有群主/管理员能看)。成员端的邀请按钮、群二维码
+ * 入口仍要跟着变 —— 没有灰字带新状态,改由提交后逐个在座成员发个人房 updated。
+ */
+const LOG_ONLY_POLICY_KEYS: ReadonlySet<GroupPolicyKey> = new Set([
+  'memberCanInvite',
+  'qrJoinEnabled',
+  'cardJoinEnabled',
+  'joinApprovalRequired',
+]);
+
+/**
  * 群设置(第二批):全员禁言开关、群主转让、独立群公告/头像、群策略开关。
  *
  * 与 ChatGroupAdminService 同一套锁序:先用锁外快照鉴权(非管理员碰不到会话行锁),
@@ -567,7 +579,8 @@ export class ChatGroupSettingsService {
   }
 
   /**
-   * 群策略开关(两种群;群主/管理员)。只写真正变化的键,每个变化一条提示 + 一条日志;
+   * 群策略开关(两种群;群主/管理员)。只写真正变化的键,每个变化一条日志;
+   * LOG_ONLY_POLICY_KEYS 之外的键另写一条聊天提示。
    * 圈子群的 memberCanInvite 是 Circle 的字段,写到那边(邀请闸门读的就是它)。
    */
   async updatePolicies(
@@ -605,15 +618,17 @@ export class ChatGroupSettingsService {
             data: { [key]: enabled },
           });
         }
-        const message =
-          await this.systemMessage.insertSystemMessageAfterLockedConversationInTx(
-            tx,
-            locked.id,
-            nextHeight,
-            { kind: 'group-policy-changed', actorId, policy: key, enabled },
-          );
-        nextHeight = message.height;
-        messages.push(message);
+        if (!LOG_ONLY_POLICY_KEYS.has(key)) {
+          const message =
+            await this.systemMessage.insertSystemMessageAfterLockedConversationInTx(
+              tx,
+              locked.id,
+              nextHeight,
+              { kind: 'group-policy-changed', actorId, policy: key, enabled },
+            );
+          nextHeight = message.height;
+          messages.push(message);
+        }
         await this.groupEvents.recordInTx(tx, locked.id, {
           kind: 'policy-changed',
           actorId,
@@ -622,11 +637,18 @@ export class ChatGroupSettingsService {
       }
       const next: ChatGroupPoliciesDto = { ...current };
       for (const key of changes) next[key] = patch[key] as boolean;
-      return { messages, policies: next };
+      return {
+        messages,
+        policies: next,
+        logOnlyChanged: changes.some((key) => LOG_ONLY_POLICY_KEYS.has(key)),
+      };
     });
 
     for (const message of result.messages) {
       await this.broadcastAfterCommit(message);
+    }
+    if (result.logOnlyChanged) {
+      await this.emitUpdatedToSeatedMembers(conversationId);
     }
     return result.policies;
   }
@@ -808,6 +830,35 @@ export class ChatGroupSettingsService {
       membersCanViewProfiles: locked.membersCanViewProfiles,
       membersCanAddFriends: locked.membersCanAddFriends,
     };
+  }
+
+  /**
+   * 逐个在座成员发个人房 updated,客户端重拉这一个会话(前端只认发给本人的事件,
+   * 所以不能发会话房)。收件人口径与系统消息广播一致:当前在座的 ChatMember。
+   */
+  private async emitUpdatedToSeatedMembers(
+    conversationId: string,
+  ): Promise<void> {
+    try {
+      const seats = await this.prisma.chatMember.findMany({
+        where: { conversationID: conversationId, leftAt: null },
+        select: { userID: true },
+      });
+      for (const { userID } of seats) {
+        this.broadcast.emitConversationChange(userID, {
+          kind: 'updated',
+          conversationId,
+          userId: userID,
+        });
+      }
+    } catch (error) {
+      // 开关与日志已提交;实时同步只做 best-effort,下一次拉会话列表会校准。
+      this.logger.warn(
+        `group policy member sync failed after commit (${
+          error instanceof Error ? error.name : 'unknown error'
+        })`,
+      );
+    }
   }
 
   private async broadcastAfterCommit(notice: ChatMessageDto): Promise<void> {

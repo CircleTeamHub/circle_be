@@ -18,8 +18,6 @@ import {
 import { GroupErrorCode } from 'src/common/app-error-codes';
 import { ChatCircleSyncService } from 'src/chat/chat-circle-sync.service';
 import { ChatGroupEventService } from 'src/chat/chat-group-event.service';
-import { ChatSystemMessageService } from 'src/chat/chat-system-message.service';
-import type { ChatMessageDto } from 'src/chat/chat.types';
 import { CircleAdmissionPolicy } from 'src/circle/circle-admission-policy';
 import { CircleMemberLockService } from 'src/circle/circle-member-lock';
 import { normalizeUserIdAlias } from 'src/user/user-id-alias';
@@ -69,7 +67,6 @@ export class GroupService {
     private readonly admissionPolicy: CircleAdmissionPolicy,
     private readonly memberLock: CircleMemberLockService,
     private readonly chatCircleSync: ChatCircleSyncService,
-    private readonly systemMessage: ChatSystemMessageService,
     private readonly groupEvents: ChatGroupEventService,
     private readonly config: ConfigService,
     private readonly circleInvitations: CircleInvitationService,
@@ -182,7 +179,6 @@ export class GroupService {
     const auditGroupID = this.auditGroupID(circle, normalizedGroupID);
     const roleResult = await runSerializableTransaction<{
       changed: boolean;
-      message: ChatMessageDto | null;
     }>(this.prisma, async (tx) => {
       // 先鉴权,再取锁、再查目标。反过来的话:非群主也能让服务端为任意 userID
       // 取一遍成员锁并做一次存在性查询,错误信息的差异就成了「此人是否在群里」
@@ -227,8 +223,8 @@ export class GroupService {
         select: { id: true },
       });
       const [lockedConversation] = conversation
-        ? await tx.$queryRaw<Array<{ id: string; nextHeight: number }>>`
-            SELECT "id", "nextHeight" FROM "ChatConversation"
+        ? await tx.$queryRaw<Array<{ id: string }>>`
+            SELECT "id" FROM "ChatConversation"
             WHERE "id" = ${conversation.id} FOR UPDATE
           `
         : [];
@@ -322,7 +318,7 @@ export class GroupService {
               reason: consoleReason,
             },
           });
-        return { changed: false, message: null };
+        return { changed: false };
       }
 
       await tx.circleMember.update({
@@ -346,21 +342,9 @@ export class GroupService {
           },
         },
       });
-      let message: ChatMessageDto | null = null;
       if (lockedConversation) {
-        message =
-          await this.systemMessage.insertSystemMessageAfterLockedConversationInTx(
-            tx,
-            lockedConversation.id,
-            lockedConversation.nextHeight,
-            {
-              kind: 'member-role-changed',
-              actorId,
-              targetUserId: normalizedTargetUserID,
-              role: nextRole,
-            },
-          );
-        // 群日志与角色写同事务(与系统提示一样:要么都成、要么都不成)。
+        // 设/撤管理员只记群日志(群主/管理员可见),不往聊天里写灰字;
+        // 与角色写同事务,要么都成、要么都不成。
         await this.groupEvents.recordInTx(tx, lockedConversation.id, {
           kind: 'member-role-changed',
           actorId,
@@ -369,20 +353,8 @@ export class GroupService {
         });
       }
       // 角色真值只在 CircleMember;聊天侧权限按圈子角色读时派生,无需外推。
-      return { changed: true, message };
+      return { changed: true };
     });
-
-    if (roleResult.message) {
-      try {
-        await this.systemMessage.broadcastSystemMessage(roleResult.message);
-      } catch (error) {
-        // 角色与审计行已经提交；实时投递只做 best-effort，且不记录可能含
-        // 用户/群组信息的底层错误正文。
-        this.logger.warn(
-          `group audit realtime delivery failed after commit (${error instanceof Error ? error.name : 'unknown error'})`,
-        );
-      }
-    }
 
     if (roleResult.changed) {
       if (!consoleReason)
@@ -458,11 +430,9 @@ export class GroupService {
     const auditGroupID = this.auditGroupID(circle, normalizedGroupID);
     const removalResult = await runSerializableTransaction<{
       conversationId: string | null;
-      message: ChatMessageDto | null;
       removedActiveMember: boolean;
     }>(this.prisma, async (tx) => {
       let conversationId: string | null = null;
-      let message: ChatMessageDto | null = null;
       // 先鉴权,再取锁。反过来的话:任何拿得到 groupID 的人都能让服务端先给这个
       // 圈子的会话行上一把排他锁,而发消息取号要的正是同一把锁 —— 一串注定
       // 403 的请求就能卡住整个群的消息投递,顺带还能拿锁竞争当侧信道。
@@ -495,8 +465,8 @@ export class GroupService {
         select: { id: true },
       });
       const [lockedConversation] = conversation
-        ? await tx.$queryRaw<Array<{ id: string; nextHeight: number }>>`
-            SELECT "id", "nextHeight" FROM "ChatConversation"
+        ? await tx.$queryRaw<Array<{ id: string }>>`
+            SELECT "id" FROM "ChatConversation"
             WHERE "id" = ${conversation.id} FOR UPDATE
           `
         : [];
@@ -581,18 +551,8 @@ export class GroupService {
           // 注意不要在这里覆盖 conversationId:它是 releaseSeatInTx 的返回值,
           // null 表示「这个人本来就没有座位」。覆盖掉的话,提交后会对一个他从没
           // 进过的会话跑一遍 detachSeat —— 跨节点抓一次 socket,并给他推一条
-          // 「已被移出该会话」。系统提示用锁行自己的 id,与座位有没有收回无关。
-          message =
-            await this.systemMessage.insertSystemMessageAfterLockedConversationInTx(
-              tx,
-              lockedConversation.id,
-              lockedConversation.nextHeight,
-              {
-                kind: 'member-removed',
-                actorId,
-                targetUserId: normalizedTargetUserID,
-              },
-            );
+          // 「已被移出该会话」。群日志用锁行自己的 id,与座位有没有收回无关。
+          // 踢人只记群日志(群主/管理员可见),不往聊天里写灰字。
           await this.groupEvents.recordInTx(tx, lockedConversation.id, {
             kind: 'member-removed',
             actorId,
@@ -611,7 +571,6 @@ export class GroupService {
       });
       return {
         conversationId,
-        message,
         // 只有真正在圈里的人才收「你已被移出圈子」;拒掉待审的申请不算。
         removedActiveMember: target?.status === CircleMemberStatus.ACTIVE,
       };
@@ -625,19 +584,6 @@ export class GroupService {
         'removed',
         false,
       );
-    }
-    if (removalResult.message) {
-      try {
-        await this.systemMessage.broadcastSystemMessageExcludingUsers(
-          removalResult.message,
-          [normalizedTargetUserID],
-        );
-      } catch (error) {
-        // 移除、座位与审计行已经提交；失败时禁止退回会话房广播。
-        this.logger.warn(
-          `group audit realtime delivery failed after commit (${error instanceof Error ? error.name : 'unknown error'})`,
-        );
-      }
     }
     if (removalResult.removedActiveMember) {
       // 踢出圈子群 = 移出圈子:知会进飞机(圈子通知),离线的人下次打开也看得到。

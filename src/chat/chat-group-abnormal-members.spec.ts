@@ -157,7 +157,6 @@ describe('ChatGroupAdminService.listAbnormalMembers', () => {
     prisma as never,
     {} as never,
     {} as never,
-    {} as never,
     membershipNoticesMock as never,
   );
   const seat = (userID: string, role = 'MEMBER') => ({

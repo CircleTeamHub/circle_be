@@ -9,7 +9,8 @@ import { ChatGroupSettingsService } from './chat-group-settings.service';
 /**
  * 群设置第二批:全员禁言开关、群主转让、独立群公告/头像、群策略开关。
  * 钉住:锁外先鉴权(非管理员碰不到会话行锁)、幂等不刷提示、圈子群的
- * memberCanInvite 写在 Circle、转让时新群主座位清零、头像 URL 只认本应用存储。
+ * memberCanInvite 写在 Circle、转让时新群主座位清零、头像 URL 只认本应用存储、
+ * 进群渠道/邀请权限四个开关只记群日志不写灰字(成员端靠个人房 updated 同步)。
  */
 describe('ChatGroupSettingsService', () => {
   const prisma = {
@@ -483,7 +484,7 @@ describe('ChatGroupSettingsService', () => {
   });
 
   describe('updatePolicies', () => {
-    it('writes only the keys that changed, one notice and log entry each', async () => {
+    it('writes only the keys that changed, one notice and log entry each for member-facing toggles', async () => {
       arrange({ actor: seat('owner-1') });
       const result = await service.updatePolicies('owner-1', 'conv-1', {
         membersCanAddFriends: false,
@@ -513,6 +514,77 @@ describe('ChatGroupSettingsService', () => {
         payload: { policy: 'membersCanAddFriends', enabled: false },
       });
       expect(systemMessage.broadcastSystemMessage).toHaveBeenCalledTimes(2);
+      // 灰字本身带着新状态,不用再逐人推 updated。
+      expect(broadcast.emitConversationChange).not.toHaveBeenCalled();
+    });
+
+    // 进群渠道/邀请权限是管理设置:只记群日志(群主/管理员可见),不往聊天里写灰字。
+    // 成员端的邀请按钮、群二维码入口仍要跟着变 —— 前端只认发给本人的 updated,逐人发。
+    it('logs the join/invite toggles without a chat notice and tells every seated member to refresh', async () => {
+      arrange({ actor: seat('owner-1') });
+      prisma.chatMember.findMany.mockResolvedValue([
+        { userID: 'owner-1' },
+        { userID: 'u-2' },
+      ]);
+      const result = await service.updatePolicies('owner-1', 'conv-1', {
+        qrJoinEnabled: false,
+        membersCanViewRoster: false,
+      });
+      expect(result).toMatchObject({
+        qrJoinEnabled: false,
+        membersCanViewRoster: false,
+      });
+      // 只有成员可见的那个开关写灰字,且取号不被只记日志的键占用。
+      expect(
+        systemMessage.insertSystemMessageAfterLockedConversationInTx,
+      ).toHaveBeenCalledTimes(1);
+      expect(
+        systemMessage.insertSystemMessageAfterLockedConversationInTx,
+      ).toHaveBeenCalledWith(prisma, 'conv-1', 10, {
+        kind: 'group-policy-changed',
+        actorId: 'owner-1',
+        policy: 'membersCanViewRoster',
+        enabled: false,
+      });
+      expect(groupEvents.recordInTx).toHaveBeenCalledWith(prisma, 'conv-1', {
+        kind: 'policy-changed',
+        actorId: 'owner-1',
+        payload: { policy: 'qrJoinEnabled', enabled: false },
+      });
+      expect(groupEvents.recordInTx).toHaveBeenCalledTimes(2);
+      expect(prisma.chatMember.findMany).toHaveBeenCalledWith({
+        where: { conversationID: 'conv-1', leftAt: null },
+        select: { userID: true },
+      });
+      expect(broadcast.emitConversationChange).toHaveBeenCalledTimes(2);
+      for (const userId of ['owner-1', 'u-2']) {
+        expect(broadcast.emitConversationChange).toHaveBeenCalledWith(userId, {
+          kind: 'updated',
+          conversationId: 'conv-1',
+          userId,
+        });
+      }
+    });
+
+    it('still returns the committed policies when the member refresh fan-out fails', async () => {
+      arrange({ actor: seat('owner-1') });
+      prisma.chatMember.findMany.mockRejectedValueOnce(
+        new Error('pool exhausted for u-2'),
+      );
+      const warn = jest
+        .spyOn((service as any).logger, 'warn')
+        .mockImplementation(() => undefined);
+      await expect(
+        service.updatePolicies('owner-1', 'conv-1', {
+          joinApprovalRequired: true,
+        }),
+      ).resolves.toMatchObject({ joinApprovalRequired: true });
+      expect(groupEvents.recordInTx).toHaveBeenCalledTimes(1);
+      expect(broadcast.emitConversationChange).not.toHaveBeenCalled();
+      expect(warn).toHaveBeenCalledWith(
+        'group policy member sync failed after commit (Error)',
+      );
+      warn.mockRestore();
     });
 
     it('routes memberCanInvite to the Circle row for circle groups', async () => {
@@ -535,6 +607,15 @@ describe('ChatGroupSettingsService', () => {
       );
       expect(prisma.chatConversation.update).not.toHaveBeenCalled();
       expect(result.memberCanInvite).toBe(false);
+      expect(
+        systemMessage.insertSystemMessageAfterLockedConversationInTx,
+      ).not.toHaveBeenCalled();
+      expect(systemMessage.broadcastSystemMessage).not.toHaveBeenCalled();
+      expect(groupEvents.recordInTx).toHaveBeenCalledWith(prisma, 'conv-1', {
+        kind: 'policy-changed',
+        actorId: 'admin-1',
+        payload: { policy: 'memberCanInvite', enabled: false },
+      });
     });
 
     it('rejects ordinary members before locking', async () => {

@@ -15,7 +15,8 @@ const membershipNoticesMock = {
  * - 先用锁外快照鉴权(非管理员碰不到会话行锁),锁后再用锁后快照重做一遍;
  * - 群主可动管理员/成员,管理员只能动普通成员,谁都动不了群主与自己;
  * - 独立群专属端点打到圈子群上显式拒绝;禁言对两种群都开放;
- * - 变更、系统提示、群日志三者同事务,广播在提交之后。
+ * - 变更与群日志同事务,不往聊天里写灰字(群日志只有群主/管理员能看);
+ *   当事人的个人房事件(updated / removed)在提交之后发。
  */
 describe('ChatGroupAdminService', () => {
   const prisma = {
@@ -34,33 +35,11 @@ describe('ChatGroupAdminService', () => {
     emitConversationChange: jest.fn(),
     removeUserFromConversation: jest.fn().mockResolvedValue(undefined),
   };
-  const systemMessage = {
-    insertSystemMessageAfterLockedConversationInTx: jest
-      .fn()
-      .mockImplementation(
-        async (
-          _tx: unknown,
-          conversationId: string,
-          lockedNextHeight: number,
-          content: unknown,
-        ) => ({
-          id: 'notice-1',
-          conversationId,
-          height: lockedNextHeight + 1,
-          content,
-        }),
-      ),
-    broadcastSystemMessage: jest.fn().mockResolvedValue(undefined),
-    broadcastSystemMessageExcludingUsers: jest
-      .fn()
-      .mockResolvedValue(undefined),
-  };
   const groupEvents = { recordInTx: jest.fn().mockResolvedValue(undefined) };
 
   const service = new ChatGroupAdminService(
     prisma as never,
     broadcast as never,
-    systemMessage as never,
     groupEvents as never,
     membershipNoticesMock as never,
   );
@@ -70,7 +49,6 @@ describe('ChatGroupAdminService', () => {
     type: 'GROUP',
     circleID: null,
     ownerID: 'owner-1',
-    nextHeight: 10,
     name: '读书会',
     ...overrides,
   });
@@ -177,7 +155,7 @@ describe('ChatGroupAdminService', () => {
       expect(prisma.chatMember.findUnique).not.toHaveBeenCalled();
     });
 
-    it('promotes a member: role, notice and log entry in one transaction, broadcast after', async () => {
+    it('promotes a member: role and group-log entry in one transaction, only the target is told', async () => {
       arrange({ actor: seat('owner-1'), target: seat('u-2') });
       await expect(
         service.setStandaloneMemberRole('owner-1', 'conv-1', 'u-2', 'ADMIN'),
@@ -186,21 +164,14 @@ describe('ChatGroupAdminService', () => {
         where: { id: 'seat-u-2' },
         data: { role: 'ADMIN' },
       });
-      expect(
-        systemMessage.insertSystemMessageAfterLockedConversationInTx,
-      ).toHaveBeenCalledWith(prisma, 'conv-1', 10, {
-        kind: 'member-role-changed',
-        actorId: 'owner-1',
-        targetUserId: 'u-2',
-        role: 'ADMIN',
-      });
       expect(groupEvents.recordInTx).toHaveBeenCalledWith(prisma, 'conv-1', {
         kind: 'member-role-changed',
         actorId: 'owner-1',
         targetIds: ['u-2'],
         payload: { role: 'ADMIN' },
       });
-      expect(systemMessage.broadcastSystemMessage).toHaveBeenCalledTimes(1);
+      // 不写聊天灰字:其他成员不收任何事件,只有当事人刷新自己的角色徽标。
+      expect(broadcast.emitConversationChange).toHaveBeenCalledTimes(1);
       expect(broadcast.emitConversationChange).toHaveBeenCalledWith('u-2', {
         kind: 'updated',
         conversationId: 'conv-1',
@@ -221,7 +192,7 @@ describe('ChatGroupAdminService', () => {
       );
       expect(prisma.chatMember.update).not.toHaveBeenCalled();
       expect(groupEvents.recordInTx).not.toHaveBeenCalled();
-      expect(systemMessage.broadcastSystemMessage).not.toHaveBeenCalled();
+      expect(broadcast.emitConversationChange).not.toHaveBeenCalled();
     });
 
     it('reports members that already left as not found', async () => {
@@ -289,17 +260,13 @@ describe('ChatGroupAdminService', () => {
         'admin-2',
         'conv-1',
       );
+      // 踢人只记群日志、不往聊天里写灰字:除了被移出的本人,谁都不收事件。
+      expect(broadcast.emitConversationChange).toHaveBeenCalledTimes(1);
       expect(broadcast.emitConversationChange).toHaveBeenCalledWith('admin-2', {
         kind: 'removed',
         conversationId: 'conv-1',
         userId: 'admin-2',
       });
-      // 被移出的人不收这条提示。
-      expect(
-        systemMessage.broadcastSystemMessageExcludingUsers,
-      ).toHaveBeenCalledWith(expect.objectContaining({ id: 'notice-1' }), [
-        'admin-2',
-      ]);
       // 但他会收到一条站内知会(离线也能看到),群名取锁后快照。
       expect(
         membershipNoticesMock.deliverMembershipNotices,
@@ -377,7 +344,6 @@ describe('ChatGroupAdminService', () => {
         status: 'ACTIVE',
         adminAccess: { role: 'SUPER_ADMIN' },
       });
-      systemMessage.broadcastSystemMessage.mockResolvedValue(undefined);
 
       await service.moderateAsAdministrator(
         'platform-admin',
@@ -391,6 +357,19 @@ describe('ChatGroupAdminService', () => {
       expect(
         membershipNoticesMock.deliverMembershipNotices,
       ).not.toHaveBeenCalled();
+      // 平台禁言同样只记群日志;被禁言的人靠 updated 看到输入区横幅。
+      expect(groupEvents.recordInTx).toHaveBeenCalledWith(prisma, 'conv-1', {
+        kind: 'member-silenced',
+        actorId: 'platform-admin',
+        targetIds: ['u-2'],
+        payload: {},
+      });
+      expect(broadcast.emitConversationChange).toHaveBeenCalledTimes(1);
+      expect(broadcast.emitConversationChange).toHaveBeenCalledWith('u-2', {
+        kind: 'updated',
+        conversationId: 'conv-1',
+        userId: 'u-2',
+      });
     });
   });
 
@@ -440,6 +419,8 @@ describe('ChatGroupAdminService', () => {
         targetIds: ['u-2'],
         payload: { durationSec: 600 },
       });
+      // 不写聊天灰字:只有被禁言的人收到 updated,好立刻看到输入区横幅。
+      expect(broadcast.emitConversationChange).toHaveBeenCalledTimes(1);
       expect(broadcast.emitConversationChange).toHaveBeenCalledWith('u-2', {
         kind: 'updated',
         conversationId: 'conv-1',
@@ -514,6 +495,7 @@ describe('ChatGroupAdminService', () => {
       });
       expect(prisma.chatMember.update).not.toHaveBeenCalled();
       expect(groupEvents.recordInTx).not.toHaveBeenCalled();
+      expect(broadcast.emitConversationChange).not.toHaveBeenCalled();
     });
 
     it('treats an expired timed silence as already lifted', async () => {
@@ -549,6 +531,12 @@ describe('ChatGroupAdminService', () => {
         kind: 'member-unsilenced',
         actorId: 'owner-1',
         targetIds: ['u-2'],
+      });
+      expect(broadcast.emitConversationChange).toHaveBeenCalledTimes(1);
+      expect(broadcast.emitConversationChange).toHaveBeenCalledWith('u-2', {
+        kind: 'updated',
+        conversationId: 'conv-1',
+        userId: 'u-2',
       });
     });
   });
