@@ -29,12 +29,11 @@ import {
   silencedUntilOf,
   standaloneGroupRole,
 } from './chat-group-roles';
-import { ChatSystemMessageService } from './chat-system-message.service';
 import type {
   ChatAbnormalMemberDto,
   ChatAbnormalMembersDto,
+  ChatGroupManagerDto,
   ChatMemberSilenceDto,
-  ChatMessageDto,
 } from './chat.types';
 import type { GroupMemberRoleInput } from './dto/group-admin.dto';
 
@@ -43,7 +42,6 @@ interface LockedGroupRow {
   type: string;
   circleID: string | null;
   ownerID: string | null;
-  nextHeight: number;
   name: string | null;
 }
 
@@ -59,6 +57,10 @@ interface ResolvedPair {
  * 圈子群的设角色/移出仍走 GroupService(它还要动 CircleMember、邀请、图标),
  * 这里对圈子群只提供禁言 —— 禁言状态在座位(ChatMember)上,两种群共用一张表。
  *
+ * 这些动作只记群日志(群主/管理员可见),不往聊天里写灰字:谁被移出、禁言、
+ * 设/撤管理员,普通成员不需要知道(与进群/退群同一口径)。当事人另有个人房事件
+ * (updated / removed)和站内知会。
+ *
  * 锁序与 ChatService 的退群/清空一致:**先鉴权(锁外快照)再取会话行锁**,锁后用
  * 锁后快照重做一遍授权。锁外那次不是多余的:它挡住非管理员让服务端为任意目标
  * 上锁、拿错误差异探测「此人在不在群里」。
@@ -70,7 +72,6 @@ export class ChatGroupAdminService {
   constructor(
     private readonly prisma: PrismaService,
     private readonly broadcast: ChatBroadcastService,
-    private readonly systemMessage: ChatSystemMessageService,
     private readonly groupEvents: ChatGroupEventService,
     private readonly notifications: NotificationService,
   ) {}
@@ -91,7 +92,7 @@ export class ChatGroupAdminService {
       });
     }
 
-    const notice = await this.prisma.$transaction(async (tx) => {
+    const changed = await this.prisma.$transaction(async (tx) => {
       const locked = await this.lockGroup(tx, conversationId);
       this.assertStandalone(locked);
       const { actorRole, targetRole, targetSeat } = await this.resolvePair(
@@ -113,29 +114,21 @@ export class ChatGroupAdminService {
           errorCode: ChatErrorCode.GroupTargetProtected,
         });
       }
-      if (seat.role === role) return null;
+      if (seat.role === role) return false;
       await tx.chatMember.update({
         where: { id: seat.id },
         data: { role },
       });
-      const message =
-        await this.systemMessage.insertSystemMessageAfterLockedConversationInTx(
-          tx,
-          locked.id,
-          locked.nextHeight,
-          { kind: 'member-role-changed', actorId, targetUserId, role },
-        );
       await this.groupEvents.recordInTx(tx, locked.id, {
         kind: 'member-role-changed',
         actorId,
         targetIds: [targetUserId],
         payload: { role },
       });
-      return message;
+      return true;
     });
 
-    if (notice) {
-      await this.broadcastAfterCommit(notice);
+    if (changed) {
       // 目标的会话 DTO 没变,但 ChatInfo 的角色徽标/管理入口要刷新:
       // 个人房 updated 事件让客户端重拉。
       this.broadcast.emitConversationChange(targetUserId, {
@@ -162,7 +155,7 @@ export class ChatGroupAdminService {
     const preflight = await this.preflightStandalone(conversationId, actorId);
     this.assertManager(preflight.actorRole);
 
-    const { notice, groupName } = await this.prisma.$transaction(async (tx) => {
+    const groupName = await this.prisma.$transaction(async (tx) => {
       const locked = await this.lockGroup(tx, conversationId);
       this.assertStandalone(locked);
       const { actorRole, targetRole, targetSeat } = await this.resolvePair(
@@ -180,23 +173,15 @@ export class ChatGroupAdminService {
         where: { id: seat.id },
         data: { leftAt: new Date(), role: 'MEMBER' },
       });
-      const message =
-        await this.systemMessage.insertSystemMessageAfterLockedConversationInTx(
-          tx,
-          locked.id,
-          locked.nextHeight,
-          { kind: 'member-removed', actorId, targetUserId },
-        );
       await this.groupEvents.recordInTx(tx, locked.id, {
         kind: 'member-removed',
         actorId,
         targetIds: [targetUserId],
       });
-      return { notice: message, groupName: locked.name?.trim() ?? '' };
+      return locked.name?.trim() ?? '';
     });
 
-    // 先离房、再通知本人 UI、最后把提示播给其余成员(被移出的人不收)。
-    // 与圈子群踢人(ChatCircleSyncService.detachSeat)同一顺序。
+    // 先离房、再通知本人 UI。与圈子群踢人(ChatCircleSyncService.detachSeat)同一顺序。
     try {
       await this.broadcast.removeUserFromConversation(
         targetUserId,
@@ -220,17 +205,6 @@ export class ChatGroupAdminService {
       toUserIds: [targetUserId],
       content: groupName,
     });
-    try {
-      await this.systemMessage.broadcastSystemMessageExcludingUsers(notice, [
-        targetUserId,
-      ]);
-    } catch (error) {
-      this.logger.warn(
-        `remove member realtime delivery failed after commit (${
-          error instanceof Error ? error.name : 'unknown error'
-        })`,
-      );
-    }
   }
 
   /** 禁言(两种群):durationSec = null 表示直到解除。重复禁言 = 覆盖时长。 */
@@ -250,7 +224,7 @@ export class ChatGroupAdminService {
     const preflight = await this.preflightGroup(conversationId, actorId);
     this.assertManager(preflight.actorRole);
 
-    const { notice, seat } = await this.prisma.$transaction(async (tx) => {
+    const seat = await this.prisma.$transaction(async (tx) => {
       const locked = await this.lockGroup(tx, conversationId);
       const { actorRole, targetRole, targetSeat } = await this.resolvePair(
         tx,
@@ -272,23 +246,15 @@ export class ChatGroupAdminService {
               : new Date(now.getTime() + durationSec * 1000),
         },
       });
-      const message =
-        await this.systemMessage.insertSystemMessageAfterLockedConversationInTx(
-          tx,
-          locked.id,
-          locked.nextHeight,
-          { kind: 'member-silenced', actorId, targetUserId, durationSec },
-        );
       await this.groupEvents.recordInTx(tx, locked.id, {
         kind: 'member-silenced',
         actorId,
         targetIds: [targetUserId],
         payload: { durationSec },
       });
-      return { notice: message, seat: updated };
+      return updated;
     });
 
-    await this.broadcastAfterCommit(notice);
     // 被禁言的人要立刻看到输入区横幅:个人房 updated 让客户端重拉会话 DTO。
     this.broadcast.emitConversationChange(targetUserId, {
       kind: 'updated',
@@ -308,7 +274,7 @@ export class ChatGroupAdminService {
     const preflight = await this.preflightGroup(conversationId, actorId);
     this.assertManager(preflight.actorRole);
 
-    const { notice, seat } = await this.prisma.$transaction(async (tx) => {
+    const { changed, seat } = await this.prisma.$transaction(async (tx) => {
       const locked = await this.lockGroup(tx, conversationId);
       const { actorRole, targetRole, targetSeat } = await this.resolvePair(
         tx,
@@ -320,29 +286,21 @@ export class ChatGroupAdminService {
       const current = this.requireTargetSeat(targetSeat, targetRole);
       this.assertCanManage(actorRole, targetRole);
       if (!isSeatSilenced(current)) {
-        return { notice: null, seat: current };
+        return { changed: false, seat: current };
       }
       const updated = await tx.chatMember.update({
         where: { id: current.id },
         data: { silencedAt: null, silencedUntil: null },
       });
-      const message =
-        await this.systemMessage.insertSystemMessageAfterLockedConversationInTx(
-          tx,
-          locked.id,
-          locked.nextHeight,
-          { kind: 'member-unsilenced', actorId, targetUserId },
-        );
       await this.groupEvents.recordInTx(tx, locked.id, {
         kind: 'member-unsilenced',
         actorId,
         targetIds: [targetUserId],
       });
-      return { notice: message, seat: updated };
+      return { changed: true, seat: updated };
     });
 
-    if (notice) {
-      await this.broadcastAfterCommit(notice);
+    if (changed) {
       this.broadcast.emitConversationChange(targetUserId, {
         kind: 'updated',
         conversationId,
@@ -443,6 +401,55 @@ export class ChatGroupAdminService {
     return { ...empty, members };
   }
 
+  /**
+   * 群主和管理员是谁:聊天里给他们的发言标【群主】【管理员】。在座成员都能读,
+   * 不受「显示群成员」开关限制 —— 只回 userId 和角色,他们一发言身份本来就公开;
+   * 名字头像照旧来自消息本身。只算还在群里的人。
+   */
+  async listManagers(
+    viewerId: string,
+    conversationId: string,
+  ): Promise<ChatGroupManagerDto[]> {
+    const { circleID, ownerID } = await this.preflightGroup(
+      conversationId,
+      viewerId,
+    );
+    if (!circleID) {
+      const seats = await this.prisma.chatMember.findMany({
+        where: {
+          conversationID: conversationId,
+          leftAt: null,
+          OR: [{ role: 'ADMIN' }, ...(ownerID ? [{ userID: ownerID }] : [])],
+        },
+        select: { userID: true },
+      });
+      return seats.map((seat) => ({
+        userId: seat.userID,
+        role: seat.userID === ownerID ? 'OWNER' : 'ADMIN',
+      }));
+    }
+    const managers = await this.prisma.circleMember.findMany({
+      where: { circleID, status: 'ACTIVE', role: { in: ['OWNER', 'ADMIN'] } },
+      select: { userID: true, role: true },
+    });
+    if (managers.length === 0) return [];
+    const seated = await this.prisma.chatMember.findMany({
+      where: {
+        conversationID: conversationId,
+        leftAt: null,
+        userID: { in: managers.map((row) => row.userID) },
+      },
+      select: { userID: true },
+    });
+    const seatedIds = new Set(seated.map((seat) => seat.userID));
+    return managers
+      .filter((row) => seatedIds.has(row.userID))
+      .map((row) => ({
+        userId: row.userID,
+        role: row.role === 'OWNER' ? 'OWNER' : 'ADMIN',
+      }));
+  }
+
   /** Console entry; ordinary group APIs retain their membership checks. */
   async moderateAsAdministrator(
     actorId: string,
@@ -522,41 +529,13 @@ export class ChatGroupAdminService {
             : action === 'mute'
               ? 'member-silenced'
               : 'member-unsilenced';
-      const notice =
-        await this.systemMessage.insertSystemMessageAfterLockedConversationInTx(
-          tx,
-          locked.id,
-          locked.nextHeight,
-          action === 'role'
-            ? {
-                kind: 'member-role-changed',
-                actorId,
-                targetUserId,
-                role: role!,
-              }
-            : action === 'mute'
-              ? {
-                  kind: 'member-silenced',
-                  actorId,
-                  targetUserId,
-                  durationSec: null,
-                }
-              : {
-                  kind:
-                    action === 'remove'
-                      ? 'member-removed'
-                      : 'member-unsilenced',
-                  actorId,
-                  targetUserId,
-                },
-        );
       await this.groupEvents.recordInTx(tx, locked.id, {
         kind,
         actorId,
         targetIds: [targetUserId],
         payload: action === 'role' ? { role: role! } : {},
       });
-      return { notice, groupName: locked.name?.trim() ?? '' };
+      return { groupName: locked.name?.trim() ?? '' };
     });
     if (result) {
       if (action === 'remove') {
@@ -568,15 +547,7 @@ export class ChatGroupAdminService {
         } catch {
           this.logger.warn('Admin member room detach failed');
         }
-        try {
-          await this.systemMessage.broadcastSystemMessageExcludingUsers(
-            result.notice,
-            [targetUserId],
-          );
-        } catch {
-          this.logger.warn('Admin member notification failed');
-        }
-      } else await this.broadcastAfterCommit(result.notice);
+      }
       this.broadcast.emitConversationChange(targetUserId, {
         kind: action === 'remove' ? 'removed' : 'updated',
         conversationId,
@@ -723,7 +694,7 @@ export class ChatGroupAdminService {
     conversationId: string,
   ): Promise<LockedGroupRow> {
     const locked = await tx.$queryRaw<LockedGroupRow[]>`
-      SELECT "id", "type", "circleID", "ownerID", "nextHeight", "name"
+      SELECT "id", "type", "circleID", "ownerID", "name"
       FROM "ChatConversation"
       WHERE "id" = ${conversationId} FOR UPDATE`;
     if (locked.length === 0 || locked[0].type !== 'GROUP') {
@@ -775,19 +746,6 @@ export class ChatGroupAdminService {
       targetRole: roleOf(targetUserId),
       targetSeat,
     };
-  }
-
-  private async broadcastAfterCommit(notice: ChatMessageDto): Promise<void> {
-    try {
-      await this.systemMessage.broadcastSystemMessage(notice);
-    } catch (error) {
-      // 变更与事件已提交;实时投递只做 best-effort,且不记录可能含用户标识的正文。
-      this.logger.warn(
-        `group admin realtime delivery failed after commit (${
-          error instanceof Error ? error.name : 'unknown error'
-        })`,
-      );
-    }
   }
 
   private toSilenceDto(userId: string, seat: ChatMember): ChatMemberSilenceDto {

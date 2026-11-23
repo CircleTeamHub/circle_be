@@ -75,6 +75,7 @@ import type {
   ChatAbnormalMembersDto,
   ChatConversationDto,
   ChatGroupEventsPageDto,
+  ChatGroupManagerDto,
   ChatGroupPoliciesDto,
   ChatHistoryPageDto,
   ChatMemberDto,
@@ -322,6 +323,20 @@ export class ChatController {
     @Param('id', ParseUUIDPipe) conversationId: string,
   ): Promise<ChatMemberDto[]> {
     return this.chatService.listMembers(req.user.userId, conversationId);
+  }
+
+  @Get('conversations/:id/managers')
+  @Throttle({ default: { limit: 60, ttl: 60_000 } })
+  @ApiOperation({
+    summary: '群主与管理员名单(在座成员可读,不受「显示群成员」限制)',
+    description:
+      '只回 userId 与角色,客户端据此给聊天里他们的发言标身份;只含仍在群里的人。非群聊返回 404 CHAT_CONVERSATION_NOT_FOUND。',
+  })
+  listManagers(
+    @Req() req: RequestWithUser,
+    @Param('id', ParseUUIDPipe) conversationId: string,
+  ): Promise<ChatGroupManagerDto[]> {
+    return this.groupAdmin.listManagers(req.user.userId, conversationId);
   }
 
   @Get('conversations/:id/abnormal-members')

@@ -200,7 +200,6 @@ describe('cross-user HTTP authorization matrix', () => {
             {} as any,
             {} as any,
             {} as any,
-            {} as any,
             config,
             {} as any,
             membershipNoticesMock as never,
