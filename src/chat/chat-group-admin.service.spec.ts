@@ -540,4 +540,91 @@ describe('ChatGroupAdminService', () => {
       });
     });
   });
+
+  /** 聊天里给群主/管理员的发言标身份:普通成员也要拿得到,不受「显示群成员」限制。 */
+  describe('listManagers', () => {
+    it('lists the standalone owner and seated admins to an ordinary member', async () => {
+      prisma.chatMember.findUnique.mockResolvedValue({
+        ...seat('u-2'),
+        conversation: conversation({ membersCanViewRoster: false }),
+      });
+      prisma.chatMember.findMany.mockResolvedValue([
+        seat('owner-1'),
+        seat('admin-1', { role: 'ADMIN' }),
+      ]);
+      await expect(service.listManagers('u-2', 'conv-1')).resolves.toEqual([
+        { userId: 'owner-1', role: 'OWNER' },
+        { userId: 'admin-1', role: 'ADMIN' },
+      ]);
+      expect(prisma.chatMember.findMany).toHaveBeenCalledWith({
+        where: {
+          conversationID: 'conv-1',
+          leftAt: null,
+          OR: [{ role: 'ADMIN' }, { userID: 'owner-1' }],
+        },
+        select: { userID: true },
+      });
+    });
+
+    it('lists only circle managers who still hold a seat in the group', async () => {
+      prisma.chatMember.findUnique.mockResolvedValue({
+        ...seat('u-2'),
+        conversation: conversation({ circleID: 'circle-1', ownerID: null }),
+      });
+      prisma.circleMember.findUnique.mockResolvedValue({
+        role: 'MEMBER',
+        status: 'ACTIVE',
+      });
+      prisma.circleMember.findMany.mockResolvedValue([
+        { userID: 'c-owner', role: 'OWNER' },
+        { userID: 'c-admin', role: 'ADMIN' },
+        { userID: 'c-admin-away', role: 'ADMIN' },
+      ]);
+      prisma.chatMember.findMany.mockResolvedValue([
+        { userID: 'c-owner' },
+        { userID: 'c-admin' },
+      ]);
+      await expect(service.listManagers('u-2', 'conv-1')).resolves.toEqual([
+        { userId: 'c-owner', role: 'OWNER' },
+        { userId: 'c-admin', role: 'ADMIN' },
+      ]);
+      expect(prisma.circleMember.findMany).toHaveBeenCalledWith({
+        where: {
+          circleID: 'circle-1',
+          status: 'ACTIVE',
+          role: { in: ['OWNER', 'ADMIN'] },
+        },
+        select: { userID: true, role: true },
+      });
+      expect(prisma.chatMember.findMany).toHaveBeenCalledWith({
+        where: {
+          conversationID: 'conv-1',
+          leftAt: null,
+          userID: { in: ['c-owner', 'c-admin', 'c-admin-away'] },
+        },
+        select: { userID: true },
+      });
+    });
+
+    it('skips the seat lookup when the circle has no managers', async () => {
+      prisma.chatMember.findUnique.mockResolvedValue({
+        ...seat('u-2'),
+        conversation: conversation({ circleID: 'circle-1', ownerID: null }),
+      });
+      prisma.circleMember.findMany.mockResolvedValue([]);
+      await expect(service.listManagers('u-2', 'conv-1')).resolves.toEqual([]);
+      expect(prisma.chatMember.findMany).not.toHaveBeenCalled();
+    });
+
+    it('rejects someone who has left the group', async () => {
+      prisma.chatMember.findUnique.mockResolvedValue({
+        ...seat('u-2', { leftAt: new Date() }),
+        conversation: conversation(),
+      });
+      await expect(service.listManagers('u-2', 'conv-1')).rejects.toMatchObject(
+        { response: { errorCode: ChatErrorCode.NotMember } },
+      );
+      expect(prisma.chatMember.findMany).not.toHaveBeenCalled();
+    });
+  });
 });

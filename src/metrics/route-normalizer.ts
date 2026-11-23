@@ -273,6 +273,7 @@ export const DYNAMIC_ROUTE_TEMPLATES = [
   '/api/v1/chat/conversations/:id/dissolve',
   '/api/v1/chat/conversations/:id/events',
   '/api/v1/chat/conversations/:id/leave',
+  '/api/v1/chat/conversations/:id/managers',
   '/api/v1/chat/conversations/:id/members',
   '/api/v1/chat/conversations/:id/members/:userId',
   '/api/v1/chat/conversations/:id/members/:userId/role',

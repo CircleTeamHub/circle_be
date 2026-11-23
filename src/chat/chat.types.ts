@@ -277,6 +277,12 @@ export interface ChatMemberDto {
   silencedUntil: string | null;
 }
 
+/** 群主/管理员一行(GET /chat/conversations/:id/managers),聊天里给他们的发言标身份。 */
+export interface ChatGroupManagerDto {
+  userId: string;
+  role: 'OWNER' | 'ADMIN';
+}
+
 /** 禁言/解除禁言的响应:目标成员的最新禁言状态。 */
 export interface ChatMemberSilenceDto {
   userId: string;

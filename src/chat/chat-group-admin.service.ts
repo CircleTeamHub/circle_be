@@ -32,6 +32,7 @@ import {
 import type {
   ChatAbnormalMemberDto,
   ChatAbnormalMembersDto,
+  ChatGroupManagerDto,
   ChatMemberSilenceDto,
 } from './chat.types';
 import type { GroupMemberRoleInput } from './dto/group-admin.dto';
@@ -398,6 +399,55 @@ export class ChatGroupAdminService {
       .filter((member): member is ChatAbnormalMemberDto => member !== null)
       .sort(compareAbnormalMembers);
     return { ...empty, members };
+  }
+
+  /**
+   * 群主和管理员是谁:聊天里给他们的发言标【群主】【管理员】。在座成员都能读,
+   * 不受「显示群成员」开关限制 —— 只回 userId 和角色,他们一发言身份本来就公开;
+   * 名字头像照旧来自消息本身。只算还在群里的人。
+   */
+  async listManagers(
+    viewerId: string,
+    conversationId: string,
+  ): Promise<ChatGroupManagerDto[]> {
+    const { circleID, ownerID } = await this.preflightGroup(
+      conversationId,
+      viewerId,
+    );
+    if (!circleID) {
+      const seats = await this.prisma.chatMember.findMany({
+        where: {
+          conversationID: conversationId,
+          leftAt: null,
+          OR: [{ role: 'ADMIN' }, ...(ownerID ? [{ userID: ownerID }] : [])],
+        },
+        select: { userID: true },
+      });
+      return seats.map((seat) => ({
+        userId: seat.userID,
+        role: seat.userID === ownerID ? 'OWNER' : 'ADMIN',
+      }));
+    }
+    const managers = await this.prisma.circleMember.findMany({
+      where: { circleID, status: 'ACTIVE', role: { in: ['OWNER', 'ADMIN'] } },
+      select: { userID: true, role: true },
+    });
+    if (managers.length === 0) return [];
+    const seated = await this.prisma.chatMember.findMany({
+      where: {
+        conversationID: conversationId,
+        leftAt: null,
+        userID: { in: managers.map((row) => row.userID) },
+      },
+      select: { userID: true },
+    });
+    const seatedIds = new Set(seated.map((seat) => seat.userID));
+    return managers
+      .filter((row) => seatedIds.has(row.userID))
+      .map((row) => ({
+        userId: row.userID,
+        role: row.role === 'OWNER' ? 'OWNER' : 'ADMIN',
+      }));
   }
 
   /** Console entry; ordinary group APIs retain their membership checks. */
