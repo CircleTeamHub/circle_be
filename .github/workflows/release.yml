@@ -448,6 +448,7 @@ jobs:
             Dockerfile.caddy
             docker-compose.prod.yml
             docker-compose.release.yml
+            docker-compose.replicas.yml
             docker-compose.admin-release.yml
           sparse-checkout-cone-mode: false
 

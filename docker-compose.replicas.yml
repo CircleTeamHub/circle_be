@@ -1,0 +1,80 @@
+# 多实例 overlay —— 每种颜色的第 2..4 个后端容器。
+#
+# 只有 .env 里 CIRCLE_BE_REPLICAS 大于 1(或上一次发版留下了副本)时,
+# deploy/release-deploy.sh 才会带上本文件;默认(不设或设为 1)时发版脚本
+# 完全不加载它,compose 配置和执行的命令与引入本文件之前一样。
+#
+# 为什么是写死的 2..4 而不是 `--scale`:
+# - `--scale` 要求去掉 container_name,而 Caddy 上游、Prometheus 的 DNS 发现、
+#   caddy-entrypoint.sh 的重启恢复都靠固定的容器名认颜色;
+# - 上限 4 是单机的实际上限:再多就该拆机器了,那时这套单机蓝绿本身也要换。
+#
+# 每个副本:
+# - extends 复用 circle_be 的全部配置(与 circle_be_green 同一写法);
+# - 固定且互不重叠的容器名 circle-be-<色>-<序号>,Caddy 在同色的容器之间做
+#   负载均衡(deploy/Caddyfile.admin 的 circle_be_lb_pool);
+# - 自己的日志卷:两个进程不能轮转同一批文件。日志采集 overlay
+#   (monitoring/docker-compose.logs.yml)目前只挂 blue/green 两个卷,副本的文件
+#   日志暂不进 Loki,见 docs/multi-instance-backend.md。
+services:
+  circle_be_2:
+    container_name: circle-be-blue-2
+    extends:
+      file: docker-compose.prod.yml
+      service: circle_be
+    image: ${CIRCLE_BE_IMAGE:?export CIRCLE_BE_IMAGE, e.g. via deploy/release-deploy.sh}
+    volumes:
+      - app_logs_blue_2:/app/logs
+
+  circle_be_3:
+    container_name: circle-be-blue-3
+    extends:
+      file: docker-compose.prod.yml
+      service: circle_be
+    image: ${CIRCLE_BE_IMAGE:?export CIRCLE_BE_IMAGE, e.g. via deploy/release-deploy.sh}
+    volumes:
+      - app_logs_blue_3:/app/logs
+
+  circle_be_4:
+    container_name: circle-be-blue-4
+    extends:
+      file: docker-compose.prod.yml
+      service: circle_be
+    image: ${CIRCLE_BE_IMAGE:?export CIRCLE_BE_IMAGE, e.g. via deploy/release-deploy.sh}
+    volumes:
+      - app_logs_blue_4:/app/logs
+
+  circle_be_green_2:
+    container_name: circle-be-green-2
+    extends:
+      file: docker-compose.prod.yml
+      service: circle_be
+    image: ${CIRCLE_BE_IMAGE:?export CIRCLE_BE_IMAGE, e.g. via deploy/release-deploy.sh}
+    volumes:
+      - app_logs_green_2:/app/logs
+
+  circle_be_green_3:
+    container_name: circle-be-green-3
+    extends:
+      file: docker-compose.prod.yml
+      service: circle_be
+    image: ${CIRCLE_BE_IMAGE:?export CIRCLE_BE_IMAGE, e.g. via deploy/release-deploy.sh}
+    volumes:
+      - app_logs_green_3:/app/logs
+
+  circle_be_green_4:
+    container_name: circle-be-green-4
+    extends:
+      file: docker-compose.prod.yml
+      service: circle_be
+    image: ${CIRCLE_BE_IMAGE:?export CIRCLE_BE_IMAGE, e.g. via deploy/release-deploy.sh}
+    volumes:
+      - app_logs_green_4:/app/logs
+
+volumes:
+  app_logs_blue_2:
+  app_logs_blue_3:
+  app_logs_blue_4:
+  app_logs_green_2:
+  app_logs_green_3:
+  app_logs_green_4:

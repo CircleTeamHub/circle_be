@@ -54,6 +54,7 @@ test('manual rollback keeps current trusted deploy tooling with the historical a
     'Dockerfile.caddy',
     'docker-compose.prod.yml',
     'docker-compose.release.yml',
+    'docker-compose.replicas.yml',
     'docker-compose.admin-release.yml',
   ];
   const workflow = fs.readFileSync(
@@ -251,6 +252,7 @@ test('the overlay marks a tree only when its tooling comes from another commit',
       'Dockerfile.caddy',
       'docker-compose.prod.yml',
       'docker-compose.release.yml',
+      'docker-compose.replicas.yml',
       'docker-compose.admin-release.yml',
     ]) {
       const destination = path.join(trusted, file);

@@ -37,6 +37,9 @@ done
 install -m 0644 "$SOURCE_ROOT/Dockerfile.caddy" "$TARGET_ROOT/Dockerfile.caddy"
 install -m 0644 "$SOURCE_ROOT/docker-compose.prod.yml" "$TARGET_ROOT/docker-compose.prod.yml"
 install -m 0644 "$SOURCE_ROOT/docker-compose.release.yml" "$TARGET_ROOT/docker-compose.release.yml"
+# release-deploy.sh loads it whenever CIRCLE_BE_REPLICAS > 1 or a color still has
+# recorded replicas; a historical tree without it could not retire them.
+install -m 0644 "$SOURCE_ROOT/docker-compose.replicas.yml" "$TARGET_ROOT/docker-compose.replicas.yml"
 install -m 0644 "$SOURCE_ROOT/docker-compose.admin-release.yml" "$TARGET_ROOT/docker-compose.admin-release.yml"
 
 # Mark a tree whose tooling differs from its own source (a manual rollback or an

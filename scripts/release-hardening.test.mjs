@@ -436,7 +436,7 @@ test('downtime deployment restores the live app after migration or reversible st
   );
   assert.match(
     deploy,
-    /if ! compose up -d --no-build --no-deps "\$standby"; then[\s\S]*restore_live/,
+    /if ! compose up -d --no-build --no-deps \$\(color_members "\$standby"\); then[\s\S]*restore_live/,
   );
 });
 
@@ -962,7 +962,7 @@ test('release selection and active-color state fail closed', () => {
     /entrypoint: \['\/bin\/sh', '\/usr\/local\/bin\/caddy-entrypoint\.sh'\]/,
   );
   assert.doesNotMatch(compose, /caddy run --resume/);
-  assert.match(caddyEntrypoint, /circle-be-\(blue\|green\):3000/);
+  assert.match(caddyEntrypoint, /circle-be-\(blue\|green\)\(-\[2-4\]\)\?:3000/);
   assert.match(caddyEntrypoint, /export CIRCLE_BE_UPSTREAM=/);
   assert.match(
     caddyEntrypoint,
@@ -1017,6 +1017,103 @@ test('Caddy restart preserves only the active upstream and loads the current Cad
 
   assert.equal(invalid.status, 1);
   assert.match(invalid.stderr, /does not identify the active blue\/green backend/);
+});
+
+test('Caddy restart restores every replica of the active color and the pool', (t) => {
+  const directory = mkdtempSync(join(tmpdir(), 'circle-caddy-'));
+  const autosave = join(directory, 'autosave.json');
+  const fakeCaddy = join(directory, 'caddy');
+  const entrypoint = fileURLToPath(
+    new URL('../deploy/caddy-entrypoint.sh', import.meta.url),
+  );
+  t.after(() => rmSync(directory, { recursive: true, force: true }));
+  writeFileSync(
+    fakeCaddy,
+    '#!/bin/sh\nprintf "%s|%s\\n" "$CIRCLE_BE_UPSTREAM" "${CIRCLE_BE_LB:-unset}"\n',
+  );
+  chmodSync(fakeCaddy, 0o755);
+  const run = (upstreams) => {
+    // 三处 reverse_proxy 各存一份上游,autosave 里同一个端点会出现多次。
+    writeFileSync(autosave, JSON.stringify({ a: upstreams, b: upstreams }));
+    return spawnSync('/bin/sh', [entrypoint], {
+      encoding: 'utf8',
+      env: {
+        ...process.env,
+        CADDY_AUTOSAVE_FILE: autosave,
+        PATH: `${directory}:${process.env.PATH}`,
+      },
+    });
+  };
+
+  const single = run(['circle-be-blue:3000']);
+  assert.equal(single.status, 0, single.stderr);
+  assert.equal(single.stdout.trim(), 'circle-be-blue:3000|unset');
+
+  const pooled = run(['circle-be-green:3000', 'circle-be-green-2:3000']);
+  assert.equal(pooled.status, 0, pooled.stderr);
+  assert.equal(
+    pooled.stdout.trim(),
+    'circle-be-green:3000 circle-be-green-2:3000|pool',
+  );
+  // 与发版脚本传入的顺序一致(基础容器在前):顺序不同就是不同的配置,下一次发版
+  // 开头的对齐 reload 会白白断开全部 WebSocket。
+  const shuffled = run([
+    'circle-be-blue-3:3000',
+    'circle-be-blue:3000',
+    'circle-be-blue-2:3000',
+  ]);
+  assert.equal(
+    shuffled.stdout.trim(),
+    'circle-be-blue:3000 circle-be-blue-2:3000 circle-be-blue-3:3000|pool',
+  );
+
+  // 两种颜色混在一起说明切流状态不可信,宁可起不来也不猜。
+  const mixed = run(['circle-be-blue:3000', 'circle-be-green-2:3000']);
+  assert.equal(mixed.status, 1);
+  assert.match(mixed.stderr, /multiple active blue\/green backends/);
+});
+
+test('backend replicas reuse the color contract and stay opt-in', () => {
+  const replicas = read('docker-compose.replicas.yml');
+  const deploy = read('deploy/release-deploy.sh');
+  const caddy = read('deploy/Caddyfile.admin');
+  const prometheus = read('monitoring/prometheus/prometheus.prod.yml');
+
+  for (const [service, container, volume] of [2, 3, 4].flatMap((index) => [
+    [`circle_be_${index}`, `circle-be-blue-${index}`, `app_logs_blue_${index}`],
+    [
+      `circle_be_green_${index}`,
+      `circle-be-green-${index}`,
+      `app_logs_green_${index}`,
+    ],
+  ])) {
+    const block = replicas.match(
+      new RegExp(`\\n  ${service}:\\n([\\s\\S]*?)(?=\\n  \\w|\\nvolumes:)`),
+    );
+    assert.ok(block, `${service} must be defined`);
+    assert.match(block[1], new RegExp(`container_name: ${container}\\n`));
+    assert.match(block[1], /file: docker-compose\.prod\.yml\n\s+service: circle_be\n/);
+    assert.match(block[1], /image: \$\{CIRCLE_BE_IMAGE:\?/);
+    // 两个进程不能轮转同一批日志文件。
+    assert.match(block[1], new RegExp(`- ${volume}:/app/logs\\n`));
+    assert.match(replicas, new RegExp(`\\n  ${volume}:\\n`));
+    // Prometheus 必须逐个容器抓:计数器是每进程一份。
+    assert.ok(prometheus.includes(`- '${container}'`), `${container} is not scraped`);
+  }
+
+  // 默认不加载 overlay:只有实例数大于 1 或留有副本记录时才带上。
+  assert.match(
+    deploy,
+    /replica_compose_files=\(\)[\s\S]*replica_compose_files=\(-f docker-compose\.replicas\.yml\)/,
+  );
+  assert.match(deploy, /\[\[ ! "\$backend_replicas" =~ \^\[1-4\]\$ \]\]/);
+  // 单上游时三处 reverse_proxy 导入的是空片段。
+  assert.match(caddy, /\(circle_be_lb_single\) \{\n\}/);
+  assert.equal(
+    caddy.match(/import circle_be_lb_\{\$CIRCLE_BE_LB:single\}/g)?.length,
+    3,
+  );
+  assert.match(deploy, /caddy_env\+=\(-e CIRCLE_BE_LB=pool\)/);
 });
 
 test('backend workflow and server use the same strict version format', () => {
