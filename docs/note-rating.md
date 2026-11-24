@@ -104,13 +104,19 @@ the rater, their credit and registration date.
 
 ## Monthly ranking (大众点评榜)
 
-`GET /note/ranking?city=&limit=` (default 50, max 100) reads this month's
+`GET /note/ranking?city=&board=&limit=` (default 50, max 100) reads this month's
 `NoteRatingMonthly` rows (`(month, goodCount)` index) and returns
 `{ month, city, items: NoteSummaryDto[] }`. Only source notes (`collectedFromNoteID IS NULL`)
-that are `ACTIVE` + `available` and have at least one good rating this month appear.
+that are `ACTIVE` + `available` appear.
 The nationwide list ignores `Note.city`; `?city=` keeps only notes whose owner chose that city.
-Order: good desc, bad asc, `updatedAt` desc, id. Items are mapped from the
-requester's point of view, like `GET /note/:id`. The SQL is `src/note/note-ranking.query.ts`;
+
+- `board=good` (default, 好评榜): at least one good rating this month.
+  Order: good desc, bad asc, `updatedAt` desc, id.
+- `board=bad` (差评榜): at least one bad rating this month, with or without good ratings.
+  Order: bad desc, good asc, `updatedAt` desc, id. It reads the month through the same
+  index and sorts that month's rows; there is no `(month, badCount)` index.
+
+Items are mapped from the requester's point of view, like `GET /note/:id`. The SQL is `src/note/note-ranking.query.ts`;
 the real-database regression is `test/postgres/note-ranking.pg-spec.ts`.
 
 ## Deferred

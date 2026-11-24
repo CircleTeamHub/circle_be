@@ -9,7 +9,7 @@ import { noteRankingQuery } from './note-ranking.query';
 import { NoteService } from './note.service';
 
 /**
- * 大众点评月榜。资格与排序在 noteRankingQuery 的 SQL 里，真库行为（各类排除、同分排序、
+ * 大众点评月榜（好评榜 / 差评榜）。资格与排序在 noteRankingQuery 的 SQL 里，真库行为（各类排除、同分排序、
  * 上月不计）由 test/postgres/note-ranking.pg-spec.ts 跑；这里锁住 SQL 的形状、service
  * 的名次保持与视角映射，以及路由顺序和查询参数校验。
  */
@@ -17,7 +17,12 @@ describe('noteRankingQuery', () => {
   const flat = (query: Prisma.Sql) => query.text.replace(/\s+/g, ' ');
 
   it('keeps only ACTIVE, available source notes with good ratings this month', () => {
-    const query = noteRankingQuery({ month: '2026-11', city: null, limit: 50 });
+    const query = noteRankingQuery({
+      month: '2026-11',
+      city: null,
+      board: 'good',
+      limit: 50,
+    });
     const sql = flat(query);
 
     expect(sql).toContain('FROM "NoteRatingMonthly" r JOIN "Note" n');
@@ -35,6 +40,7 @@ describe('noteRankingQuery', () => {
     const query = noteRankingQuery({
       month: '2026-11',
       city: '上海',
+      board: 'good',
       limit: 10,
     });
 
@@ -45,12 +51,38 @@ describe('noteRankingQuery', () => {
 
   it('orders deterministically and limits in the database', () => {
     const sql = flat(
-      noteRankingQuery({ month: '2026-11', city: null, limit: 5 }),
+      noteRankingQuery({
+        month: '2026-11',
+        city: null,
+        board: 'good',
+        limit: 5,
+      }),
     );
 
     expect(sql).toContain(
       'ORDER BY r."goodCount" DESC, r."badCount" ASC, n."updatedAt" DESC, n."id" ASC LIMIT $2',
     );
+  });
+
+  it('ranks the bad board by bad ratings, with the same eligibility', () => {
+    const query = noteRankingQuery({
+      month: '2026-11',
+      city: '上海',
+      board: 'bad',
+      limit: 5,
+    });
+    const sql = flat(query);
+
+    expect(sql).toContain('r."badCount" > 0');
+    // 零好评的笔记照样上差评榜。
+    expect(sql).not.toContain('r."goodCount" > 0');
+    expect(sql).toContain(`n."status" = 'ACTIVE'`);
+    expect(sql).toContain('n."available" = true');
+    expect(sql).toContain('n."collectedFromNoteID" IS NULL');
+    expect(sql).toContain(
+      'ORDER BY r."badCount" DESC, r."goodCount" ASC, n."updatedAt" DESC, n."id" ASC LIMIT $3',
+    );
+    expect(query.values).toEqual(['2026-11', '上海', 5]);
   });
 });
 
@@ -155,6 +187,7 @@ describe('NoteService.getNoteRanking', () => {
 
     const result = await service.getNoteRanking('viewer', {
       city: '上海',
+      board: 'good',
       limit: 3,
     });
 
@@ -174,7 +207,10 @@ describe('NoteService.getNoteRanking', () => {
   it('maps every item as the requesting viewer sees it', async () => {
     const { service } = fixture(['note-a', 'note-b']);
 
-    const { items } = await service.getNoteRanking('viewer', { limit: 50 });
+    const { items } = await service.getNoteRanking('viewer', {
+      board: 'good',
+      limit: 50,
+    });
     const [other, own] = items;
 
     expect(other).toMatchObject({
@@ -205,7 +241,10 @@ describe('NoteService.getNoteRanking', () => {
   it('carries the first four note images as signed previews, like the chat note card', async () => {
     const { service, prisma, upload } = fixture(['note-a', 'note-b']);
 
-    const { items } = await service.getNoteRanking('viewer', { limit: 50 });
+    const { items } = await service.getNoteRanking('viewer', {
+      board: 'good',
+      limit: 50,
+    });
 
     expect(prisma.noteMedia.findMany).toHaveBeenCalledWith(
       expect.objectContaining({
@@ -234,7 +273,10 @@ describe('NoteService.getNoteRanking', () => {
   it('reports the nationwide list as city null and skips the reads when nothing is ranked', async () => {
     const { service, prisma } = fixture([]);
 
-    const result = await service.getNoteRanking('viewer', { limit: 50 });
+    const result = await service.getNoteRanking('viewer', {
+      board: 'good',
+      limit: 50,
+    });
 
     expect(result).toEqual({
       month: expect.stringMatching(/^\d{4}-\d{2}$/),
@@ -243,6 +285,20 @@ describe('NoteService.getNoteRanking', () => {
     });
     expect(prisma.$queryRaw.mock.calls[0][0].values).toHaveLength(2);
     expect(prisma.note.findMany).not.toHaveBeenCalled();
+  });
+
+  it('ranks the requested board', async () => {
+    const { service, prisma } = fixture(['note-a']);
+
+    await service.getNoteRanking('viewer', { board: 'good', limit: 50 });
+    await service.getNoteRanking('viewer', { board: 'bad', limit: 50 });
+
+    const rankingSql = prisma.$queryRaw.mock.calls
+      .map(([query]) => query.sql)
+      .filter((sql) => sql.includes('"NoteRatingMonthly"'));
+    expect(rankingSql).toHaveLength(2);
+    expect(rankingSql[0]).toContain('r."goodCount" > 0');
+    expect(rankingSql[1]).toContain('r."badCount" > 0');
   });
 });
 
@@ -301,12 +357,23 @@ describe('GET /note/ranking', () => {
     });
   });
 
-  it('is not swallowed by GET /note/:id and defaults to the nationwide top 50', async () => {
+  it('is not swallowed by GET /note/:id and defaults to the nationwide good-rating top 50', async () => {
     const res = await fetch(`${baseUrl}/note/ranking`);
 
     expect(res.status).toBe(200);
     expect(noteService.getNote).not.toHaveBeenCalled();
     expect(noteService.getNoteRanking).toHaveBeenCalledWith('user-1', {
+      board: 'good',
+      limit: 50,
+    });
+  });
+
+  it('passes board=bad to the service', async () => {
+    const res = await fetch(`${baseUrl}/note/ranking?board=bad`);
+
+    expect(res.status).toBe(200);
+    expect(noteService.getNoteRanking).toHaveBeenCalledWith('user-1', {
+      board: 'bad',
       limit: 50,
     });
   });
@@ -319,6 +386,7 @@ describe('GET /note/ranking', () => {
     expect(res.status).toBe(200);
     expect(noteService.getNoteRanking).toHaveBeenCalledWith('user-1', {
       city: '上海',
+      board: 'good',
       limit: 10,
     });
   });
@@ -328,6 +396,7 @@ describe('GET /note/ranking', () => {
 
     expect(noteService.getNoteRanking).toHaveBeenCalledWith('user-1', {
       city: null,
+      board: 'good',
       limit: 50,
     });
   });
@@ -338,6 +407,8 @@ describe('GET /note/ranking', () => {
     ['limit=abc'],
     [`city=${'x'.repeat(33)}`],
     ['sort=bad'],
+    ['board=worst'],
+    ['board='],
   ])('rejects ?%s with 400', async (query) => {
     const res = await fetch(`${baseUrl}/note/ranking?${query}`);
 

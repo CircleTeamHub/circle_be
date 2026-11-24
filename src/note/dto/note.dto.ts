@@ -988,9 +988,23 @@ export class SharedNoteListDto {
 export const NOTE_RANKING_DEFAULT_LIMIT = 50;
 export const NOTE_RANKING_MAX_LIMIT = 100;
 
+/** good = 好评榜（本月好评最多），bad = 差评榜（本月差评最多）。 */
+export const NOTE_RANKING_BOARDS = ['good', 'bad'] as const;
+export type NoteRankingBoard = (typeof NOTE_RANKING_BOARDS)[number];
+
 export class NoteRankingQueryDto {
   @NoteCity('Only notes in this city. Absent or empty = nationwide.')
   city?: string | null;
+
+  @ApiPropertyOptional({
+    enum: NOTE_RANKING_BOARDS,
+    default: 'good',
+    description:
+      'good = most good ratings this month, bad = most bad ratings this month.',
+  })
+  @IsOptional()
+  @IsIn(NOTE_RANKING_BOARDS)
+  board: NoteRankingBoard = 'good';
 
   @ApiPropertyOptional({
     default: NOTE_RANKING_DEFAULT_LIMIT,
@@ -1031,7 +1045,7 @@ export class NoteRankingDto {
   @ApiProperty({
     type: [NoteRankingItemDto],
     description:
-      '本月好评数降序（同分按差评少、最近更新、id），只含上架且公开的原笔记；城市榜只含主人选了该城市的',
+      '好评榜按本月好评数降序（同分按差评少、最近更新、id），差评榜按本月差评数降序（同分按好评少、最近更新、id）；只含上架且公开的原笔记；城市榜只含主人选了该城市的',
   })
   items: NoteRankingItemDto[];
 }

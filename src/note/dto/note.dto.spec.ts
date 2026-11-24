@@ -644,12 +644,23 @@ describe('NoteRankingQueryDto', () => {
     };
   };
 
-  it('defaults to the nationwide list of 50', () => {
+  it('defaults to the nationwide good-rating list of 50', () => {
     const { dto, errors } = parse({});
     expect(errors).toEqual([]);
     expect(dto.city).toBeUndefined();
+    expect(dto.board).toBe('good');
     expect(dto.limit).toBe(NOTE_RANKING_DEFAULT_LIMIT);
     expect(NOTE_RANKING_DEFAULT_LIMIT).toBe(50);
+  });
+
+  it('accepts the two boards and nothing else', () => {
+    expect(parse({ board: 'good' }).dto.board).toBe('good');
+    expect(parse({ board: 'bad' })).toMatchObject({
+      dto: { board: 'bad' },
+      errors: [],
+    });
+    expect(parse({ board: 'worst' }).errors).toEqual(['board']);
+    expect(parse({ board: '' }).errors).toEqual(['board']);
   });
 
   it('trims the city and treats an empty one as nationwide', () => {
