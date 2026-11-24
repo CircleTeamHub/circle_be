@@ -73,7 +73,7 @@ describe('UploadController', () => {
   });
 
   it('rejects presign requests after the Redis-backed user limit is exceeded', async () => {
-    redisService.incrementWithTtl.mockResolvedValue(21);
+    redisService.incrementWithTtl.mockResolvedValue(41);
     const controller = new UploadController(
       uploadService as any,
       new UploadLimitService(redisService as unknown as RedisService),
@@ -97,12 +97,12 @@ describe('UploadController', () => {
       uploadIntent as any,
     );
 
-    for (let index = 0; index < 20; index += 1) {
+    for (let index = 0; index < 40; index += 1) {
       await controller.presign(dto, req);
     }
-    expect(uploadService.presign).toHaveBeenCalledTimes(20);
+    expect(uploadService.presign).toHaveBeenCalledTimes(40);
 
-    // The 21st is throttled with 429 (not a 503 fail-closed).
+    // The 41st is throttled with 429 (not a 503 fail-closed).
     await expect(controller.presign(dto, req)).rejects.toMatchObject({
       status: HttpStatus.TOO_MANY_REQUESTS,
     });
@@ -117,7 +117,7 @@ describe('UploadController', () => {
       uploadIntent as any,
     );
 
-    for (let index = 0; index < 20; index += 1) {
+    for (let index = 0; index < 40; index += 1) {
       await controller.presign(dto, req);
     }
 
@@ -125,7 +125,7 @@ describe('UploadController', () => {
       status: HttpStatus.TOO_MANY_REQUESTS,
     });
     expect(redisService.incrementWithTtl).not.toHaveBeenCalled();
-    expect(uploadService.presign).toHaveBeenCalledTimes(20);
+    expect(uploadService.presign).toHaveBeenCalledTimes(40);
   });
 
   it('enforces the local fallback exactly under concurrent Redis failures', async () => {
@@ -136,17 +136,21 @@ describe('UploadController', () => {
       uploadIntent as any,
     );
 
-    const results = await Promise.allSettled(
-      Array.from({ length: 25 }, () => controller.presign(dto, req)),
-    );
+    // Two waves: one wave must stay under the Redis in-flight bulkhead (32),
+    // which is a separate gate and would otherwise reject before the counter.
+    const wave = (length: number) =>
+      Promise.allSettled(
+        Array.from({ length }, () => controller.presign(dto, req)),
+      );
+    const results = [...(await wave(30)), ...(await wave(15))];
 
     expect(
       results.filter((result) => result.status === 'fulfilled'),
-    ).toHaveLength(20);
+    ).toHaveLength(40);
     expect(
       results.filter((result) => result.status === 'rejected'),
     ).toHaveLength(5);
-    expect(uploadService.presign).toHaveBeenCalledTimes(20);
+    expect(uploadService.presign).toHaveBeenCalledTimes(40);
   });
 
   it('does not retry Redis on every request during its fallback cooldown', async () => {

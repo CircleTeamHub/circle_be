@@ -15,15 +15,20 @@ import {
 @Injectable()
 export class UploadLimitService {
   /**
-   * Per-user presign rate limit: max 20 requests per minute.
+   * Per-user presign rate limit: max 40 requests per minute.
    * Keyed by userId so distributed users don't share quota,
    * and a stolen token can't spam the bucket at full global speed.
+   *
+   * An image costs two presigns (the original plus its thumbnail) in chat and,
+   * since note cover thumbnails, in notes too — so 40 is 20 images a minute.
+   * People routinely add a dozen or more images while editing one note; at 20
+   * the second batch of ten failed. DAILY_ISSUED_BYTES_LIMIT still caps volume.
    */
   private readonly userPresignCounts = new Map<
     string,
     { count: number; resetAt: number }
   >();
-  private static readonly PRESIGN_LIMIT = 20;
+  private static readonly PRESIGN_LIMIT = 40;
   private static readonly PRESIGN_WINDOW_MS = 60_000;
   private static readonly PRESIGN_WINDOW_SECONDS =
     UploadLimitService.PRESIGN_WINDOW_MS / 1000;
