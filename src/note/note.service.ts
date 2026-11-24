@@ -231,7 +231,13 @@ type NoteRow = {
   rootSourceNoteID: string | null;
   createdAt: Date;
   updatedAt: Date;
-  coverMedia: { id: string; type: NoteMediaType; url: string } | null;
+  coverMedia: {
+    id: string;
+    type: NoteMediaType;
+    url: string;
+    objectKey: string;
+    posterUrl: string | null;
+  } | null;
   groupMemberships: Array<{ group: { id: string; name: string } }>;
   media: NoteMediaRow[];
 };
@@ -300,6 +306,8 @@ const NOTE_INCLUDE = {
       id: true,
       type: true,
       url: true,
+      objectKey: true,
+      posterUrl: true,
     },
   },
   groupMemberships: {
@@ -389,7 +397,13 @@ type NoteSummaryFacts = {
   contactItems: Array<Record<string, unknown>> | null;
   groupItems: Array<Record<string, unknown>> | null;
   hasLocation: boolean;
-  cover: { id: string; type: NoteMediaType; url: string } | null;
+  /** thumbUrl 是未签名的小图地址，已确认与封面同属主；没有小图时为 null。 */
+  cover: {
+    id: string;
+    type: NoteMediaType;
+    url: string;
+    thumbUrl: string | null;
+  } | null;
 };
 
 /** 收录链 overlay 读写的列。 */
@@ -689,9 +703,10 @@ export class NoteService implements NoteCardProjector {
     const primaryKeys = new Set(media.map((item) => item.objectKey));
     const posterKeys = new Set(
       media
-        .map((item) =>
+        .flatMap((item) => [
           this.uploadService?.objectKeyFromPublicUrl(item.posterUrl),
-        )
+          item.thumbObjectKey,
+        ])
         .filter(Boolean),
     );
     return {
@@ -917,6 +932,8 @@ export class NoteService implements NoteCardProjector {
             `${section} section has an incompatible media type`,
           );
         sectionKeys.push(item.objectKey);
+        // 还没发布的小图只存在于草稿里：进清单才会被归属校验、被审计认作在用。
+        if (item.thumbObjectKey) posterKeys.push(item.thumbObjectKey);
         if (item.posterUrl) {
           assertUrlsFromStorage(
             [item.posterUrl],
@@ -1828,6 +1845,18 @@ export class NoteService implements NoteCardProjector {
         'posterUrl must reference the same owner as its objectKey',
       );
     }
+
+    // 小图的 key 是客户端直接给的，同样必须躺在原图自己的属主目录里。
+    const invalidThumb = media.find((item) => {
+      if (!item.thumbObjectKey) return false;
+      const prefix = this.noteMediaOwnerPrefix(item.objectKey);
+      return !prefix || !item.thumbObjectKey.startsWith(prefix);
+    });
+    if (invalidThumb) {
+      throw new BadRequestException(
+        'thumbObjectKey must reference the same owner as its objectKey',
+      );
+    }
   }
 
   /** `notes/{uid}/{file}` → `notes/{uid}/`；形状不符返回 null（不放行）。 */
@@ -1847,6 +1876,16 @@ export class NoteService implements NoteCardProjector {
    * 反推不出 key（非本站 URL）时返回 false —— 那种情况由 assertMediaUrlsAreSafe
    * 的同源检查负责，不归这里管。
    */
+  /**
+   * 封面图片的小图地址：图片媒体的 posterUrl 存的是客户端随原图上传的小图。
+   * 反推不出本站 key、或 key 不在封面自己的属主目录下，一律当作没有小图。
+   */
+  private coverThumbUrl(objectKey: unknown, posterUrl: unknown): string | null {
+    if (typeof posterUrl !== 'string' || !posterUrl) return null;
+    if (!this.uploadService?.objectKeyFromPublicUrl(posterUrl)) return null;
+    return this.isForeignPosterKey(objectKey, posterUrl) ? null : posterUrl;
+  }
+
   private isForeignPosterKey(objectKey: unknown, posterUrl: unknown): boolean {
     const posterKey = this.uploadService?.objectKeyFromPublicUrl(
       typeof posterUrl === 'string' ? posterUrl : null,
@@ -2484,15 +2523,21 @@ export class NoteService implements NoteCardProjector {
     // 客户端 edit 时会回传读到的签名 url；写入前 strip 掉 query，只存持久 base url
     //（读取时才现签短时 URL）。base url 本无 query，strip 无副作用。没带 url 的按
     // objectKey 补出来，见 resolveMediaUrl。
-    derivedMedia = derivedMedia.map((item) => ({
-      ...item,
-      url: this.resolveMediaUrl(item),
-      ...(typeof (item as { posterUrl?: unknown }).posterUrl === 'string'
-        ? {
-            posterUrl: (item as { posterUrl: string }).posterUrl.split('?')[0],
-          }
-        : {}),
-    }));
+    // 图片的小图只带 key（thumbObjectKey），在这里拼成 posterUrl，之后与视频封面走同一条
+    // 校验、签名、删除链路。编辑回传的已有 posterUrl 优先。
+    derivedMedia = derivedMedia.map((item) => {
+      let posterUrl: string | undefined;
+      if (typeof (item as { posterUrl?: unknown }).posterUrl === 'string') {
+        posterUrl = (item as { posterUrl: string }).posterUrl.split('?')[0];
+      } else if (item.type === 'IMAGE' && item.thumbObjectKey) {
+        posterUrl = this.resolveMediaUrl({ objectKey: item.thumbObjectKey });
+      }
+      return {
+        ...item,
+        url: this.resolveMediaUrl(item),
+        ...(posterUrl ? { posterUrl } : {}),
+      };
+    });
 
     // 片段本身已逐块/逐格 trim 过，这里**不能**再 trim 整段：首个单元格为空时正文
     // 以 \t 开头，整段 trim 会把它的列位吃掉，两列表退化成一列。
@@ -2966,7 +3011,17 @@ export class NoteService implements NoteCardProjector {
       contactItems: sections.contacts?.items ?? null,
       groupItems: sections.groups?.items ?? null,
       hasLocation: availability.hasLocation,
-      cover: coverMedia,
+      cover: coverMedia
+        ? {
+            id: coverMedia.id,
+            type: coverMedia.type,
+            url: coverMedia.url,
+            thumbUrl: this.coverThumbUrl(
+              coverMedia.objectKey,
+              coverMedia.posterUrl,
+            ),
+          }
+        : null,
     };
   }
 
@@ -2991,6 +3046,13 @@ export class NoteService implements NoteCardProjector {
     const contactItems = isOwner ? (facts.contactItems ?? []) : [];
     const groupItems = isOwner ? (facts.groupItems ?? []) : [];
     const coverMedia = facts.cover;
+    // 没签出名的小图不给：私有对象的未签名地址客户端也拉不到，退回原图即可。
+    let coverThumbUrl: string | undefined;
+    if (coverMedia?.thumbUrl) {
+      coverThumbUrl = presignedUrls
+        ? presignedUrls.get(coverMedia.thumbUrl)
+        : coverMedia.thumbUrl;
+    }
 
     return {
       id: note.id,
@@ -3019,6 +3081,7 @@ export class NoteService implements NoteCardProjector {
               (presignedUrls && typeof coverMedia.url === 'string'
                 ? presignedUrls.get(coverMedia.url)
                 : undefined) ?? coverMedia.url,
+            ...(coverThumbUrl ? { thumbUrl: coverThumbUrl } : {}),
           }
         : null,
       imageCount: note.imageCount,
@@ -3335,12 +3398,27 @@ export class NoteService implements NoteCardProjector {
     const coverTargets = effectiveNotes.flatMap((note) => {
       const { row } = projections.get(note.id)!;
       // 原先只签 note.media 里的 url：封面行属于这条笔记、url 与 objectKey 都非空。
-      return row.coverId &&
-        row.coverNoteID === note.id &&
-        row.coverUrl &&
-        row.coverObjectKey
-        ? [{ url: row.coverUrl, objectKey: row.coverObjectKey }]
-        : [];
+      if (
+        !row.coverId ||
+        row.coverNoteID !== note.id ||
+        !row.coverUrl ||
+        !row.coverObjectKey
+      ) {
+        return [];
+      }
+      const thumbUrl = this.coverThumbUrl(
+        row.coverObjectKey,
+        row.coverPosterUrl,
+      );
+      const thumbKey = thumbUrl
+        ? this.uploadService?.objectKeyFromPublicUrl(thumbUrl)
+        : null;
+      return [
+        { url: row.coverUrl, objectKey: row.coverObjectKey },
+        ...(thumbUrl && thumbKey
+          ? [{ url: thumbUrl, objectKey: thumbKey }]
+          : []),
+      ];
     });
     const [presigned, ratingsOf] = await Promise.all([
       this.presignNoteMedia(coverTargets),
@@ -3368,7 +3446,15 @@ export class NoteService implements NoteCardProjector {
         hasLocation: row.hasLocation,
         cover:
           row.coverId && row.coverType && row.coverUrl !== null
-            ? { id: row.coverId, type: row.coverType, url: row.coverUrl }
+            ? {
+                id: row.coverId,
+                type: row.coverType,
+                url: row.coverUrl,
+                thumbUrl: this.coverThumbUrl(
+                  row.coverObjectKey,
+                  row.coverPosterUrl,
+                ),
+              }
             : null,
       };
       return this.buildSummaryDto(

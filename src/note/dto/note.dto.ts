@@ -152,6 +152,20 @@ export class CreateNoteMediaDto {
   @IsUrl({ require_tld: false })
   posterUrl?: string;
 
+  /**
+   * 图片随原图一起上传的小图的 object key（列表封面用它，不必下载原图）。
+   * 客户端在私有目录拿不到地址，所以只给 key：服务端校验它与 objectKey 同属主后，
+   * 拼成 posterUrl 落库。只对 IMAGE 生效。
+   */
+  @ApiPropertyOptional()
+  @IsOptional()
+  @IsString()
+  @MaxLength(255)
+  @Matches(/^(?!.*\.\.)[A-Za-z0-9._/-]+$/, {
+    message: 'thumbObjectKey contains invalid characters',
+  })
+  thumbObjectKey?: string;
+
   @ApiProperty()
   @IsInt()
   @Min(0)
@@ -905,6 +919,8 @@ export class NoteSummaryDto {
     id: string;
     type: NoteMediaType;
     url: string;
+    /** 封面的小图（列表用）；老笔记没有，客户端退回 url。 */
+    thumbUrl?: string;
   } | null;
   @ApiProperty() imageCount: number;
   @ApiProperty() videoCount: number;

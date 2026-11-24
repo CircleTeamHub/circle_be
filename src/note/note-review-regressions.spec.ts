@@ -902,6 +902,52 @@ describe('note review regressions', () => {
     expect(result.mediaCount).toBe(1);
   });
 
+  // 小图只在草稿里时也得进清单：存储审计按清单认对象，漏了它就会被当成孤儿清掉，
+  // 发布后的封面就成了一个 404。它不是一条媒体，不能把 mediaCount 撑大。
+  it('inventories an image thumbnail saved with a draft without counting it as media', async () => {
+    const { service } = fixture();
+    const result = await service.saveNoteDraft('owner', 'thumb-draft', {
+      sections: {
+        media: {
+          items: [
+            {
+              type: 'IMAGE',
+              objectKey: 'notes/owner/big.jpg',
+              thumbObjectKey: 'notes/owner/thumb-big.jpg',
+              sortOrder: 0,
+            },
+          ],
+        },
+      },
+    } as any);
+
+    expect(result.mediaKeys).toEqual([
+      'notes/owner/big.jpg',
+      'notes/owner/thumb-big.jpg',
+    ]);
+    expect(result.mediaCount).toBe(1);
+  });
+
+  it("rejects a draft thumbnail key from another user's directory", async () => {
+    const { service } = fixture();
+    await expect(
+      service.saveNoteDraft('owner', 'foreign-thumb', {
+        sections: {
+          media: {
+            items: [
+              {
+                type: 'IMAGE',
+                objectKey: 'notes/owner/big.jpg',
+                thumbObjectKey: 'notes/another/private.jpg',
+                sortOrder: 0,
+              },
+            ],
+          },
+        },
+      } as any),
+    ).rejects.toBeInstanceOf(BadRequestException);
+  });
+
   it('rejects foreign media keys inside contentJson', async () => {
     const { service, upload } = fixture();
     await expect(
