@@ -297,6 +297,9 @@ function harness(approval = true, crowded = true) {
     .fn()
     .mockResolvedValue({ id: 'direct' });
   tx.groupAdmissionDelivery.update = jest.fn().mockResolvedValue({});
+  tx.groupAdmissionDelivery.findUnique = jest
+    .fn()
+    .mockResolvedValue({ deliveredAt: null });
   tx.groupAdmissionDelivery.updateMany = jest
     .fn()
     .mockResolvedValue({ count: 0 });
@@ -975,6 +978,45 @@ describe('Group admission small-group direct join', () => {
 });
 
 describe('Group admission durable delivery', () => {
+  it('skips a delivery another instance finished while this one waited for the group lock', async () => {
+    const h = harness();
+    await h.service.invite('owner', 'g', ['guest']);
+    // 两个进程在同一轮取到同一条;对方持有群会话行锁投递完并提交,本进程拿到锁
+    // 之后重读,这条已经带着 deliveredAt。
+    h.tx.groupAdmissionDelivery.findMany.mockResolvedValue([
+      {
+        id: 'joined-job',
+        admission: h.admissions.get('a0'),
+        recipientID: 'guest',
+        actorID: 'owner',
+        event: 'INVITED',
+        attempts: 0,
+      },
+    ]);
+    h.tx.groupAdmissionDelivery.findUnique.mockResolvedValue({
+      deliveredAt: new Date(),
+    });
+    h.broadcast.joinUserToConversation.mockClear();
+    h.broadcast.emitConversationChange.mockClear();
+    const failures = await deliveryRuns('failure');
+
+    await h.service.flush();
+
+    expect(h.tx.groupAdmissionDelivery.findUnique).toHaveBeenCalledWith({
+      where: { id: 'joined-job' },
+      select: { deliveredAt: true },
+    });
+    expect(
+      h.notifications.deliverGroupAdmissionNotification,
+    ).not.toHaveBeenCalled();
+    expect(h.messages.insertServerMessage).not.toHaveBeenCalled();
+    expect(h.broadcast.joinUserToConversation).not.toHaveBeenCalled();
+    expect(h.broadcast.emitConversationChange).not.toHaveBeenCalled();
+    expect(h.tx.groupAdmissionDelivery.update).not.toHaveBeenCalled();
+    // 输掉的一方不是失败:不能记成 failure,也不能把重试计数加一。
+    expect(await deliveryRuns('failure')).toBe(failures);
+  });
+
   it('does not deliver queued invitation cards after the owner seat was dissolved', async () => {
     const h = harness();
     await h.service.invite('owner', 'g', ['guest']);

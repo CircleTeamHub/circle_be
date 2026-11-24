@@ -1122,6 +1122,14 @@ export class GroupAdmissionService {
                   });
                   return;
                 }
+                // 多实例下另一个进程会在同一轮取到同一条。它持有上面那把群会话
+                // 行锁直到提交,所以等到锁之后重读就能看到它写的 deliveredAt;
+                // 不重读的话,通知的实时事件和邀请卡片会原样再广播一遍。
+                const current = await tx.groupAdmissionDelivery.findUnique({
+                  where: { id: job.id },
+                  select: { deliveredAt: true },
+                });
+                if (!current || current.deliveredAt) return;
                 const a = await tx.groupAdmission.findUnique({
                   where: { id: job.admission.id },
                 });
