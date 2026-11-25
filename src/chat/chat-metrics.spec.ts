@@ -10,6 +10,7 @@ describe('ChatMetrics', () => {
     metrics.observeAuthFailure('invalid_token');
     metrics.observeEvent('send', 'success');
     metrics.observeEvent('send', 'rate_limited');
+    metrics.observeEvent('send', 'overloaded');
     metrics.observeAckDuration('send', 0.025);
     metrics.observeBroadcast('message', 0.01);
 
@@ -28,6 +29,9 @@ describe('ChatMetrics', () => {
     );
     expect(output).toMatch(
       /chat_messages_received_total\{action="send",result="rate_limited"\}\s+1/,
+    );
+    expect(output).toMatch(
+      /chat_messages_received_total\{action="send",result="overloaded"\}\s+1/,
     );
     expect(output).toMatch(
       /chat_message_ack_duration_seconds_count\{action="send"\}\s+1/,

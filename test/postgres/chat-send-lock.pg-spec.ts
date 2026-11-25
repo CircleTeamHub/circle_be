@@ -94,7 +94,8 @@ describePostgres('chat send critical section and direct read lock', () => {
     await live.db.query(`
       TRUNCATE "User", "ChatConversation", "ChatMember", "ChatMessage", "Block",
         "UserPrivacySetting", "SupportAgent", "ChatDirectAutoReplyJob",
-        "SupportRechargeJob", "CircleMember", "AccountIdentifier" CASCADE;
+        "SupportRechargeJob", "CircleMember", "AccountIdentifier", "TempChat",
+        "TempChatGuest" CASCADE;
     `);
     await seedUsers(live.db, ['a', 'b', 'c']);
     await live.db.query(`
@@ -132,7 +133,7 @@ describePostgres('chat send critical section and direct read lock', () => {
     ).rows;
 
   describe('send', () => {
-    it('keeps only authorization, idempotency and writes inside the DIRECT lock', async () => {
+    it('keeps only one recheck statement and the writes inside the DIRECT lock', async () => {
       const result = await send('a', 'dm', 'd1');
       expect(result.reused).toBe(false);
       expect(result.message.height).toBe(1);
@@ -140,22 +141,74 @@ describePostgres('chat send critical section and direct read lock', () => {
       const inside = statementsAfter(live.statements, isLock).map(
         (statement) => statement.sql,
       );
-      // 原来:座位、会话(include)、拉黑、幂等、焚毁座位再读、INSERT、会话 UPDATE、
-      // 自动回复开关、充值客服、隐藏会话 UPDATE —— 10 条。
-      expect(inside).toHaveLength(5);
-      expect(
-        inside.filter((sql) => /FROM "[^"]+"\."ChatMember"/.test(sql)),
-      ).toHaveLength(1);
-      expect(inside.some((sql) => /"Block"/.test(sql))).toBe(true);
+      // 最早是 10 条;上一轮收到 5 条(座位、拉黑、幂等、INSERT、会话 UPDATE)。
+      // 现在座位 + 拉黑 + 幂等合成一条复查,剩 3 条。
+      expect(inside).toHaveLength(3);
+      expect(inside[0]).toMatch(/FROM "ChatMember"/);
+      expect(inside[0]).toMatch(/"Block"/);
+      expect(inside[0]).toMatch(/"clientMessageId"/);
+      expect(inside[1]).toMatch(/INSERT INTO "[^"]+"\."ChatMessage"/);
       expect(
         inside.some((sql) => /UserPrivacySetting|SupportAgent/.test(sql)),
       ).toBe(false);
     });
 
-    it('keeps the GROUP lock to seat, idempotency and writes', async () => {
+    it('keeps the GROUP lock to one recheck statement and the writes', async () => {
       await send('a', 'grp', 'g1');
       const inside = statementsAfter(live.statements, isLock);
-      expect(inside).toHaveLength(4);
+      expect(inside).toHaveLength(3);
+    });
+
+    // 往返次数预算:每多一次往返,后端单核就多花一份「发起查询」的开销(压测里
+    // 这部分占忙碌 CPU 的一半以上)。往发送路径加查询之前先看这个数。
+    // 7 = 锁外预检 | BEGIN、锁行、锁内复查、INSERT、推进、COMMIT。
+    // 原来私聊 16(另有焚毁档位那次读被本文件的桩吃掉)、群 12。
+    it.each([
+      ['DIRECT', 'dm'],
+      ['GROUP', 'grp'],
+    ])('spends 7 database round trips on a %s send', async (_type, id) => {
+      await send('a', id, 'budget');
+      // 记录器把 COMMIT 记两次(引擎发出的那条语句 + 适配器的 commit 钩子),只算一次。
+      const roundTrips = live.statements
+        .map((statement) => statement.sql)
+        .filter(
+          (sql, index, all) => sql !== 'COMMIT' || all[index - 1] !== sql,
+        );
+      expect(roundTrips).toHaveLength(7);
+    });
+
+    it('carries the sender nickname and group alias without a query after commit', async () => {
+      await live.db.query(
+        `UPDATE "ChatMember" SET alias = '阿甲' WHERE id = 'grp-a'`,
+      );
+      const result = await send('a', 'grp', 'g1');
+      expect(result.message.sender).toEqual({
+        id: 'a',
+        nickname: 'a',
+        avatarUrl: null,
+        alias: '阿甲',
+      });
+      expect(live.statements[live.statements.length - 1].sql).toBe('COMMIT');
+    });
+
+    it("stamps the sender's own self-destruct window on the message", async () => {
+      await live.db.query(`
+        INSERT INTO "UserPrivacySetting" (id, "userID", "messageSelfDestructSec", "updatedAt")
+        VALUES ('ps-a', 'a', 3600, now());
+      `);
+      await send('a', 'dm', 'd1');
+      await send('b', 'dm', 'd2');
+      expect(
+        (
+          await live.db.query(
+            `SELECT "senderID", "burnDurationSec" FROM "ChatMessage"
+             WHERE "conversationID" = 'dm' ORDER BY height`,
+          )
+        ).rows,
+      ).toEqual([
+        { senderID: 'a', burnDurationSec: 3600 },
+        { senderID: 'b', burnDurationSec: null },
+      ]);
     });
 
     it('advances the counter, clears hidden seats and leaves the row exactly as before', async () => {
@@ -202,6 +255,83 @@ describePostgres('chat send critical section and direct read lock', () => {
         ForbiddenException,
       );
       expect(await messages('dm')).toHaveLength(1);
+    });
+
+    // 禁言到期时间从合并语句里读回来之后仍要是能比较的时间:到期的放行,没到期的拦。
+    it('lets an expired silence through and rejects one that is still running', async () => {
+      await live.db.query(`
+        UPDATE "ChatMember" SET "silencedAt" = now() - interval '2 hours',
+          "silencedUntil" = now() - interval '1 hour' WHERE id = 'grp-b';
+        UPDATE "ChatMember" SET "silencedAt" = now(),
+          "silencedUntil" = now() + interval '1 hour' WHERE id = 'grp-c';
+      `);
+      expect((await send('b', 'grp', 'g1')).message.height).toBe(1);
+      await expect(send('c', 'grp', 'g2')).rejects.toMatchObject({
+        response: { errorCode: 'CHAT_MEMBER_SILENCED' },
+      });
+      expect(await messages('grp')).toHaveLength(1);
+    });
+
+    it('rejects a sender with no seat, or a seat that has left, before taking the lock', async () => {
+      await live.db.query(
+        `UPDATE "ChatMember" SET "leftAt" = now() WHERE id = 'grp-b'`,
+      );
+      for (const [sender, conversationId] of [
+        ['c', 'dm'],
+        ['b', 'grp'],
+      ]) {
+        await expect(
+          send(sender, conversationId, `x-${sender}`),
+        ).rejects.toMatchObject({ response: { errorCode: 'CHAT_NOT_MEMBER' } });
+      }
+      expect(live.statements.some((statement) => isLock(statement.sql))).toBe(
+        false,
+      );
+    });
+
+    // 自己和自己的单聊没有对端:不查拉黑、不入队,哪怕本人开着自动回复。
+    it('treats a DIRECT conversation with oneself as having no peer', async () => {
+      await live.db.query(`
+        INSERT INTO "ChatConversation" (id, type, "directKey", "nextHeight", "updatedAt")
+        VALUES ('self', 'DIRECT', 'a:a', 0, now());
+        INSERT INTO "ChatMember" (id, "conversationID", "userID") VALUES ('self-a', 'self', 'a');
+        INSERT INTO "UserPrivacySetting" (id, "userID", "directMessageAutoReplyEnabled", "directMessageAutoReplyText", "updatedAt")
+        VALUES ('ps-a', 'a', true, '稍后回复', now());
+        INSERT INTO "SupportAgent" (id, category, "userID") VALUES ('sa-a', 'recharge', 'a');
+      `);
+      const result = await send('a', 'self', 's1');
+      expect(result.message.height).toBe(1);
+      expect(result.enqueuedJobs).toEqual({
+        directAutoReplyJobId: null,
+        supportRechargeJobId: null,
+      });
+    });
+
+    // 临时房访客没有 User 行:昵称来自 TempChatGuest,房间结束后拒发。
+    it('sends for a temp-room guest and rejects once the room has ended', async () => {
+      await live.db.query(`
+        INSERT INTO "TempChat" (id, "groupId", "hostUserId", "expiresAt", "updatedAt")
+        VALUES ('room', 'room-group', 'a', now() + interval '1 hour', now());
+        INSERT INTO "TempChatGuest" (id, "tempChatId", "imUserId", "displayName")
+        VALUES ('guest-row', 'room', 'guest-1', '访客小王');
+        INSERT INTO "ChatConversation" (id, type, "tempChatID", "nextHeight", "updatedAt")
+        VALUES ('tmp', 'TEMP', 'room', 0, now());
+        INSERT INTO "ChatMember" (id, "conversationID", "userID") VALUES
+          ('tmp-a', 'tmp', 'a'), ('tmp-g', 'tmp', 'guest-1');
+      `);
+      const result = await send('guest-1', 'tmp', 't1');
+      expect(result.message.sender).toEqual({
+        id: 'guest-1',
+        nickname: '访客小王',
+        avatarUrl: null,
+        alias: null,
+      });
+
+      await live.db.query(`UPDATE "TempChat" SET status = 'ENDED'`);
+      await expect(send('guest-1', 'tmp', 't2')).rejects.toMatchObject({
+        response: { errorCode: 'CHAT_CONVERSATION_NOT_FOUND' },
+      });
+      expect(await messages('tmp')).toHaveLength(1);
     });
 
     it('enqueues jobs only when eligible, inside the send transaction', async () => {
@@ -256,6 +386,20 @@ describePostgres('chat send critical section and direct read lock', () => {
       expect(await jobs()).toHaveLength(2);
     });
 
+    it('does not enqueue for a whitespace-only auto reply or a recharge agent whose account is not active', async () => {
+      await live.db.query(`
+        INSERT INTO "UserPrivacySetting" (id, "userID", "directMessageAutoReplyEnabled", "directMessageAutoReplyText", "updatedAt")
+        VALUES ('ps-b', 'b', true, E' \n\u3000', now());
+        INSERT INTO "SupportAgent" (id, category, "userID") VALUES ('sa-b', 'recharge', 'b');
+        UPDATE "User" SET status = 'BANNED' WHERE id = 'b';
+      `);
+      const result = await send('a', 'dm', 'd1');
+      expect(result.enqueuedJobs).toEqual({
+        directAutoReplyJobId: null,
+        supportRechargeJobId: null,
+      });
+    });
+
     it('returns the stored row on an idempotent retry without enqueuing again', async () => {
       await live.db.query(`
         INSERT INTO "UserPrivacySetting" (id, "userID", "directMessageAutoReplyEnabled", "directMessageAutoReplyText", "updatedAt")
@@ -273,6 +417,16 @@ describePostgres('chat send critical section and direct read lock', () => {
           )
         ).rows[0].n,
       ).toBe(1);
+    });
+
+    it('refuses a retry of the same delivery id that carries different content', async () => {
+      await send('a', 'dm', 'd1', 'first');
+      await expect(send('a', 'dm', 'd1', 'second')).rejects.toMatchObject({
+        response: { errorCode: 'CHAT_DELIVERY_ID_CONFLICT' },
+      });
+      expect(await messages('dm')).toEqual([
+        { height: 1, senderID: 'a', text: 'first' },
+      ]);
     });
 
     describe('concurrently', () => {
@@ -298,6 +452,52 @@ describePostgres('chat send critical section and direct read lock', () => {
           ).rows[0].nextHeight,
         ).toBe(6);
       });
+
+      // 另一个事务先占住会话行锁:发送已经过了锁外预检、卡在取锁上。这时把发送者
+      // 拉黑 / 移出 / 禁言再放锁,落库前的锁内复查必须拦住,且不推进计数器。
+      it.each([
+        [
+          'blocked by the peer',
+          'dm',
+          `INSERT INTO "Block" (id, "blockerID", "blockedID") VALUES ('blk', 'b', 'a')`,
+        ],
+        [
+          'removed from the group',
+          'grp',
+          `UPDATE "ChatMember" SET "leftAt" = now() WHERE id = 'grp-a'`,
+        ],
+        [
+          'silenced in the group',
+          'grp',
+          `UPDATE "ChatMember" SET "silencedAt" = now() WHERE id = 'grp-b'`,
+        ],
+      ])(
+        'rejects a sender %s between the pre-check and the lock',
+        async (_what, conversationId, change) => {
+          const sender = /grp-b/.test(change) ? 'b' : 'a';
+          await other.query('BEGIN');
+          await other.query(
+            `SELECT id FROM "ChatConversation" WHERE id = $1 FOR UPDATE`,
+            [conversationId],
+          );
+          const sending = send(sender, conversationId, 'late');
+          const outcome =
+            expect(sending).rejects.toBeInstanceOf(ForbiddenException);
+          await waitUntilBlocked(live.db, (query) => /FOR UPDATE/.test(query));
+          await other.query(change);
+          await other.query('COMMIT');
+          await outcome;
+          expect(await messages(conversationId)).toHaveLength(0);
+          expect(
+            (
+              await live.db.query(
+                `SELECT "nextHeight" FROM "ChatConversation" WHERE id = $1`,
+                [conversationId],
+              )
+            ).rows[0].nextHeight,
+          ).toBe(0);
+        },
+      );
 
       it('turns a racing duplicate into an idempotent reuse rather than a unique violation', async () => {
         // 另一个事务先占住会话行锁,两次同 d 的发送都排在它后面。

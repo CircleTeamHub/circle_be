@@ -771,6 +771,19 @@ groups:
           runbook_url: https://github.com/CircleTeamHub/circle_be/blob/main/docs/runbooks/alerts.md#chatratelimitspike
           summary: 'Self-hosted chat rate-limited events > 5/s for 5m'
 
+      # 逐用户限流是 rate_limited;overloaded 是后端在途发送已满、主动拒收
+      # (CHAT_SEND_MAX_IN_FLIGHT)。正常流量碰不到这个上限,所以阈值是「有就报」。
+      # 窗口取 1m 而不是 5m:5m 的 rate 在最后一次拒收之后还会正 5 分钟,一次几秒的
+      # 尖峰就能撑过 for 并在恢复后继续挂着。1m + for 2m ≈ 拒收确实持续了一两分钟。
+      - alert: ChatSendOverloaded
+        expr: sum(rate(chat_messages_received_total{result="overloaded"}[1m])) > 0
+        for: 2m
+        labels:
+          severity: warning
+        annotations:
+          runbook_url: https://github.com/CircleTeamHub/circle_be/blob/main/docs/runbooks/alerts.md#chatsendoverloaded
+          summary: 'The backend kept shedding chat sends for about 2m: more messages arrive than one instance can persist'
+
       # A flood or group broadcast can exhaust a container before the backend
       # itself reports high latency. Keep this resource-level guardrail.
       # 分母加 `> 0` 是必须的 —— 无上限容器的 limit 为 0，不过滤会得到 +Inf 从而永远告警。

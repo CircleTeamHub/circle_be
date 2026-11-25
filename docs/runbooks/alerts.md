@@ -689,6 +689,20 @@
 - 集中在 `typing` / `read` / `presence`：多半是客户端在循环发事件，对照 App 发版时间。
 - 集中在 `send`：刷屏或机器人，限流在按设计工作，按账号处理。
 
+### ChatSendOverloaded
+
+**含义**：（warning）后端持续一两分钟都在拒收聊天消息（按 1 分钟窗口算拒收速率大于 0，且保持 2 分钟；停止拒收后约 1 分钟恢复）。同时在处理的发送达到上限（每个实例 64 条，`CHAT_SEND_MAX_IN_FLIGHT`）后，新来的发送立刻被拒而不是排队，App 会在 3 秒后用同一个幂等键自动重发。正常流量碰不到这个上限，响了就是进来的消息比一个实例落库和投递的速度快。
+
+**先看**：
+- `sum(rate(chat_messages_received_total{action="send"}[1m])) by (result)`：`overloaded` 占多少、`success` 每秒多少（2 核测试服的稳定上限约每秒 40 条）。
+- 后端容器 CPU 是否贴着一个核；`circle_db_pool_waiting` 是否持续大于 0；`histogram_quantile(0.95, sum(rate(chat_message_ack_duration_seconds_bucket[1m])) by (le))`。
+- 应用日志里的 `chat_action_failed` 事件：`errorName` / `errorCode` 是落库失败的错误类名和机器码（等不到数据库连接、语句超时等会在这里体现）。
+
+**常见原因与处置**：
+- 流量真的超过了单实例承载：后端只用一个核，加实例或加核才有用；调大连接池帮助有限。
+- 数据库变慢（慢查询、锁等待、磁盘）：每条发送占连接的时间变长，同样的流量也会堆满。先看数据库侧的慢查询与锁。
+- 有账号或脚本在灌消息：对照 `ChatRateLimitSpike`，按账号处理。
+
 ### ContainerMemoryNearLimit
 
 **含义**：（warning）某个容器（`name` 标签）的 working set 超过其内存上限的 90%，持续 5 分钟。没设上限的容器不在此列。

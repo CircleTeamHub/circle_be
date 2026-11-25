@@ -49,6 +49,7 @@ describe('realtime connection logging', () => {
       } as never,
       realtime as never,
       sessions as never,
+      { get: jest.fn() } as never,
     );
     warn = jest.spyOn(gateway['logger'], 'warn').mockImplementation();
     error = jest.spyOn(gateway['logger'], 'error').mockImplementation();

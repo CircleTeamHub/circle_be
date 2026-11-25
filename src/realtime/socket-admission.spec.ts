@@ -1,4 +1,9 @@
-import { SocketAdmission } from './socket-admission';
+import {
+  DEFAULT_WS_MAX_CONNECTIONS,
+  resolveWsMaxConnections,
+  SocketAdmission,
+} from './socket-admission';
+
 import { createGatewayMetrics } from '../metrics/gateway-metrics';
 
 describe('WebSocket resource admission', () => {
@@ -91,3 +96,17 @@ it.each(['chat', 'realtime'] as const)(
     }
   },
 );
+
+describe('resolveWsMaxConnections', () => {
+  it('uses a configured positive integer', () => {
+    expect(resolveWsMaxConnections('5000')).toBe(5000);
+    expect(resolveWsMaxConnections(800)).toBe(800);
+  });
+
+  it.each([undefined, '', 'abc', '0', '-1', '12.5', 'guest-secret'])(
+    'falls back to the default for %p',
+    (value) => {
+      expect(resolveWsMaxConnections(value)).toBe(DEFAULT_WS_MAX_CONNECTIONS);
+    },
+  );
+});

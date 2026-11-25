@@ -151,6 +151,8 @@ export function createEnvValidationSchema(
     // timeout — pg waits forever for a free slot by default, so a saturated
     // pool hangs requests instead of surfacing an error.
     DATABASE_POOL_MAX: Joi.number().integer().min(1).default(10),
+    // 每个实例、每条 WebSocket 通道(聊天 / 实时)最多同时保持的连接数。
+    WS_MAX_CONNECTIONS: Joi.number().integer().min(1).default(2000),
     DATABASE_POOL_ACQUIRE_TIMEOUT_MS: Joi.number()
       .integer()
       .min(1)

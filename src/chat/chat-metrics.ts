@@ -1,7 +1,16 @@
 import { Counter, Gauge, Histogram, Registry } from 'prom-client';
 
 export type ChatAction = 'send' | 'read' | 'typing' | 'presence';
-export type ChatEventResult = 'success' | 'failure' | 'rate_limited';
+/**
+ * rate_limited = 这个用户发得太快(逐用户配额);overloaded = 后端在途发送已满,
+ * 主动拒收(见 CHAT_SEND_MAX_IN_FLIGHT)。两者分开,是为了能区分「有人刷屏」和
+ * 「后端扛不住了」。
+ */
+export type ChatEventResult =
+  | 'success'
+  | 'failure'
+  | 'rate_limited'
+  | 'overloaded';
 export type ChatBroadcastAction = 'message' | 'read' | 'typing' | 'presence';
 export type ChatConnectionRejectionReason =
   | 'per_user_limit'
@@ -53,6 +62,7 @@ const CHAT_RESULTS = new Set<ChatEventResult>([
   'success',
   'failure',
   'rate_limited',
+  'overloaded',
 ]);
 const BROADCAST_ACTIONS = new Set<ChatBroadcastAction>([
   'message',

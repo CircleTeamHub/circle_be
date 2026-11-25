@@ -17,6 +17,31 @@ const membershipNoticesMock = {
   deliverMembershipNotices: jest.fn().mockResolvedValue(undefined),
 };
 
+// 发送路径把几次读合成了两条原生语句(锁外预检、锁内复查)。SQL 本身由
+// test/postgres/chat-send-lock.pg-spec.ts 在真库上验;单测只关心服务拿到结果行
+// 之后怎么判,所以把这两个查询构造器换成带参数的标记,由下面的 $queryRaw 桩按
+// 语义拼出结果行。
+jest.mock('./chat-send-lock.query', () => ({
+  ...jest.requireActual('./chat-send-lock.query'),
+  sendPreflightQuery: (conversationId: string, senderUserId: string) => ({
+    stub: 'sendPreflight',
+    conversationId,
+    senderUserId,
+  }),
+  lockedSendRecheckQuery: (
+    conversationId: string,
+    senderUserId: string,
+    peerUserId: string | null,
+    clientMessageId: string,
+  ) => ({
+    stub: 'lockedSendRecheck',
+    conversationId,
+    senderUserId,
+    peerUserId,
+    clientMessageId,
+  }),
+}));
+
 // 「早就开启过」的边界:让查看者窗口真正生效,又不干扰用例本身要断言的 cutoff。
 const LONG_AGO = new Date('2019-01-01T00:00:00.000Z');
 
@@ -151,6 +176,127 @@ describe('ChatService', () => {
   // tx 即 prisma 本身,tx.* 委托到同一批 mock。
   const runTx = async (cb: (tx: typeof prisma) => unknown) => cb(prisma);
 
+  /**
+   * 锁外预检读到的发送者(User 行的昵称头像);null = 没有 User 行(临时房访客)。
+   * 每个用例开头重置成 u1。
+   */
+  let preflightSender: { nickname: string; avatarUrl: string | null } | null;
+
+  /**
+   * $queryRaw 的桩。发送路径的两条合并语句按语义从同一批表级 mock 取数 ——
+   * 用例照旧用 chatMember(座位 + 会话)/ block / userPrivacySetting /
+   * supportAgent / chatMessage 的 mock 摆数据,同一个 mock 上的取数先后与真实
+   * 语句的先后一致(座位:锁外一次、锁内一次;拉黑同理)。锁行那条语句默认读回
+   * 锁外看到的同一份会话列加计数器 3;要模拟「等锁期间会话变了」的用例自己覆盖。
+   * 其余原生查询保持原来的默认:返回 [{ nextHeight: 3 }],列表类集合查询读不到
+   * conversationID 字段时得到 undefined 键,查找自然落空,等价「无行」。
+   */
+  let lockedConversation: Record<string, unknown>;
+  const rawQueryStub = async (query: {
+    sql?: string;
+    stub?: string;
+    conversationId?: string;
+    senderUserId?: string;
+    peerUserId?: string | null;
+    clientMessageId?: string;
+  }): Promise<unknown[]> => {
+    const seatWhere = {
+      conversationID_userID: {
+        conversationID: query.conversationId,
+        userID: query.senderUserId,
+      },
+    };
+    if (query?.stub === 'sendPreflight') {
+      const seat = await prisma.chatMember.findUnique({
+        where: seatWhere,
+        include: { conversation: true },
+      });
+      if (!seat) return [];
+      const { conversation } = seat;
+      const peerUserId: string | null =
+        (conversation.type === 'DIRECT'
+          ? (conversation.directKey as string | null)
+              ?.split(':')
+              .find((id) => id !== query.senderUserId)
+          : null) ?? null;
+      const policy = await privacySettings.getSelfDestructPolicy(
+        query.senderUserId,
+      );
+      const peerSettings = peerUserId
+        ? await prisma.userPrivacySetting.findUnique({
+            where: { userID: peerUserId },
+          })
+        : null;
+      lockedConversation = {
+        type: conversation.type,
+        directKey: conversation.directKey,
+        circleID: conversation.circleID,
+        ownerID: conversation.ownerID ?? null,
+        muteAllAt: conversation.muteAllAt ?? null,
+        tempChatID: conversation.tempChatID,
+      };
+      return [
+        {
+          userID: seat.userID,
+          role: seat.role ?? 'MEMBER',
+          leftAt: seat.leftAt,
+          silencedAt: seat.silencedAt ?? null,
+          silencedUntil: seat.silencedUntil ?? null,
+          alias: seat.alias ?? null,
+          ...lockedConversation,
+          burnDurationSec: conversation.burnDurationSec,
+          burnStartedAt: conversation.burnStartedAt,
+          peerUserId,
+          selfDestructSec: policy.sec,
+          senderNickname: preflightSender?.nickname ?? null,
+          senderAvatarUrl: preflightSender?.avatarUrl ?? null,
+          blocked: peerUserId ? Boolean(await prisma.block.findFirst()) : false,
+          autoReplyEnabled:
+            peerSettings?.directMessageAutoReplyEnabled ?? false,
+          autoReplyText: peerSettings?.directMessageAutoReplyText ?? '',
+          rechargeAgent: peerUserId
+            ? Boolean(await prisma.supportAgent.findFirst())
+            : false,
+        },
+      ];
+    }
+    if (query?.stub === 'lockedSendRecheck') {
+      const seat = await prisma.chatMember.findUnique({ where: seatWhere });
+      if (!seat) return [];
+      const existing = await prisma.chatMessage.findUnique({
+        where: {
+          conversationID_senderID_clientMessageId: {
+            conversationID: query.conversationId,
+            senderID: query.senderUserId,
+            clientMessageId: query.clientMessageId,
+          },
+        },
+      });
+      // 命中幂等时服务会按 id 把整行读回来:把这行再排进同一个 mock。
+      if (existing)
+        prisma.chatMessage.findUnique.mockResolvedValueOnce(existing);
+      return [
+        {
+          userID: seat.userID,
+          role: seat.role ?? 'MEMBER',
+          leftAt: seat.leftAt,
+          silencedAt: seat.silencedAt ?? null,
+          silencedUntil: seat.silencedUntil ?? null,
+          burnDurationSec: seat.burnDurationSec ?? null,
+          alias: seat.alias ?? null,
+          blocked: query.peerUserId
+            ? Boolean(await prisma.block.findFirst())
+            : false,
+          existingMessageId: existing?.id ?? null,
+        },
+      ];
+    }
+    if (query?.sql?.includes('FOR UPDATE')) {
+      return [{ ...lockedConversation, nextHeight: 3 }];
+    }
+    return [{ nextHeight: 3 }];
+  };
+
   const membership = (overrides: Record<string, unknown> = {}) => ({
     id: 'member-1',
     conversationID: 'conv-1',
@@ -230,9 +376,9 @@ describe('ChatService', () => {
       expiresAt: new Date(Date.now() + 60_000),
     });
     prisma.tempChatGuest.findMany.mockResolvedValue([]);
-    // 默认返回发号计数器行(G-05 行锁读)。列表类集合查询($queryRaw 复用同一 mock)
-    // 读不到 conversationID 字段时得到 undefined 键,查找自然落空,等价「无行」。
-    prisma.$queryRaw.mockResolvedValue([{ nextHeight: 3 }]);
+    preflightSender = { nickname: '一波', avatarUrl: null };
+    lockedConversation = {};
+    prisma.$queryRaw.mockImplementation(rawQueryStub as never);
     prisma.chatMediaDeletion.deleteMany.mockResolvedValue({ count: 1 });
     prisma.chatMember.updateManyAndReturn.mockResolvedValue([]);
     // 群昵称(ChatMember.alias)按 (会话, 用户) 批量取:默认没人设。
@@ -398,7 +544,6 @@ describe('ChatService', () => {
   it('allocates height from the conversation counter under a row lock', async () => {
     prisma.chatMember.findUnique.mockResolvedValue(membership());
     prisma.chatMessage.findUnique.mockResolvedValue(null);
-    prisma.$queryRaw.mockResolvedValue([{ nextHeight: 3 }]);
     prisma.chatMessage.create.mockResolvedValue(createdRow);
     prisma.chatConversation.update.mockResolvedValue({});
 
@@ -429,7 +574,6 @@ describe('ChatService', () => {
   it('stamps the current sender personal card on every note-card share', async () => {
     prisma.chatMember.findUnique.mockResolvedValue(membership());
     prisma.chatMessage.findUnique.mockResolvedValue(null);
-    prisma.$queryRaw.mockResolvedValue([{ nextHeight: 3 }]);
     prisma.chatMessage.create.mockResolvedValue({
       ...createdRow,
       type: 'note-card',
@@ -511,7 +655,6 @@ describe('ChatService', () => {
   it('drops an unverified group snapshot instead of trusting a forged card', async () => {
     prisma.chatMember.findUnique.mockResolvedValue(membership());
     prisma.chatMessage.findUnique.mockResolvedValue(null);
-    prisma.$queryRaw.mockResolvedValue([{ nextHeight: 3 }]);
     prisma.chatMessage.create.mockResolvedValue(createdRow);
     prisma.chatConversation.update.mockResolvedValue({});
     prisma.user.findUnique.mockResolvedValue({
@@ -559,7 +702,6 @@ describe('ChatService', () => {
   it('stamps note-card work status from the live root of the collect chain', async () => {
     prisma.chatMember.findUnique.mockResolvedValue(membership());
     prisma.chatMessage.findUnique.mockResolvedValue(null);
-    prisma.$queryRaw.mockResolvedValue([{ nextHeight: 3 }]);
     prisma.chatMessage.create.mockResolvedValue(createdRow);
     prisma.chatConversation.update.mockResolvedValue({});
     prisma.user.findUnique.mockResolvedValue(null);
@@ -617,7 +759,6 @@ describe('ChatService', () => {
   it('stamps note-card preview keys from the note and drops client-supplied ones', async () => {
     prisma.chatMember.findUnique.mockResolvedValue(membership());
     prisma.chatMessage.findUnique.mockResolvedValue(null);
-    prisma.$queryRaw.mockResolvedValue([{ nextHeight: 3 }]);
     prisma.chatMessage.create.mockResolvedValue(createdRow);
     prisma.chatConversation.update.mockResolvedValue({});
     prisma.user.findUnique.mockResolvedValue(null);
@@ -679,7 +820,6 @@ describe('ChatService', () => {
   it('stamps no preview keys when the collected copy root is no longer distributable', async () => {
     prisma.chatMember.findUnique.mockResolvedValue(membership());
     prisma.chatMessage.findUnique.mockResolvedValue(null);
-    prisma.$queryRaw.mockResolvedValue([{ nextHeight: 3 }]);
     prisma.chatMessage.create.mockResolvedValue(createdRow);
     prisma.chatConversation.update.mockResolvedValue({});
     prisma.user.findUnique.mockResolvedValue(null);
@@ -721,7 +861,6 @@ describe('ChatService', () => {
   it('stamps a 下架 root as UNLISTED and still carries its preview keys', async () => {
     prisma.chatMember.findUnique.mockResolvedValue(membership());
     prisma.chatMessage.findUnique.mockResolvedValue(null);
-    prisma.$queryRaw.mockResolvedValue([{ nextHeight: 3 }]);
     prisma.chatMessage.create.mockResolvedValue(createdRow);
     prisma.chatConversation.update.mockResolvedValue({});
     prisma.user.findUnique.mockResolvedValue(null);
@@ -760,7 +899,6 @@ describe('ChatService', () => {
   it('drops client-supplied card status when the sender cannot read the note', async () => {
     prisma.chatMember.findUnique.mockResolvedValue(membership());
     prisma.chatMessage.findUnique.mockResolvedValue(null);
-    prisma.$queryRaw.mockResolvedValue([{ nextHeight: 3 }]);
     prisma.chatMessage.create.mockResolvedValue(createdRow);
     prisma.chatConversation.update.mockResolvedValue({});
     prisma.user.findUnique.mockResolvedValue(null);
@@ -794,7 +932,6 @@ describe('ChatService', () => {
   it('does not fail a note-card send when the sender profile is unavailable', async () => {
     prisma.chatMember.findUnique.mockResolvedValue(membership());
     prisma.chatMessage.findUnique.mockResolvedValue(null);
-    prisma.$queryRaw.mockResolvedValue([{ nextHeight: 3 }]);
     prisma.chatMessage.create.mockResolvedValue(createdRow);
     prisma.chatConversation.update.mockResolvedValue({});
     prisma.user.findUnique.mockResolvedValue(null);
@@ -817,7 +954,6 @@ describe('ChatService', () => {
   it('keeps sending a note-card when the profile snapshot lookup fails', async () => {
     prisma.chatMember.findUnique.mockResolvedValue(membership());
     prisma.chatMessage.findUnique.mockResolvedValue(null);
-    prisma.$queryRaw.mockResolvedValue([{ nextHeight: 3 }]);
     prisma.chatMessage.create.mockResolvedValue(createdRow);
     prisma.chatConversation.update.mockResolvedValue({});
     prisma.user.findUnique.mockRejectedValue(new Error('profile store down'));
@@ -837,7 +973,10 @@ describe('ChatService', () => {
     );
   });
 
+  // 有 User 行的发送者,昵称头像随锁外预检读回,提交之后不再查库;只有临时房访客
+  // (没有 User 行)还会在提交后去查,这条降级路径就剩他们。
   it('still returns the message when post-commit sender enrichment fails', async () => {
+    preflightSender = null;
     prisma.chatMember.findUnique.mockResolvedValue(membership());
     prisma.chatMessage.findUnique.mockResolvedValue(null);
     prisma.chatMessage.aggregate.mockResolvedValue({ _max: { height: 3 } });
@@ -1526,7 +1665,6 @@ describe('ChatService', () => {
     it('persists with height = counter + 1 and returns the dto', async () => {
       prisma.chatMember.findUnique.mockResolvedValue(membership());
       prisma.chatMessage.findUnique.mockResolvedValue(null);
-      prisma.$queryRaw.mockResolvedValue([{ nextHeight: 3 }]);
       prisma.chatMessage.create.mockResolvedValue(createdRow);
       prisma.chatConversation.update.mockResolvedValue({});
 
@@ -1687,15 +1825,7 @@ describe('ChatService', () => {
 
       const result = await service.sendMessage('u1', sendPayload());
 
-      expect(prisma.supportAgent.findFirst).toHaveBeenCalledWith({
-        where: {
-          category: 'recharge',
-          userID: 'agent-1',
-          enabled: true,
-          user: { status: 'ACTIVE' },
-        },
-        select: { id: true },
-      });
+      // 「在岗的充值客服」的判定条件在预检语句里,由 chat-send-lock.pg-spec 在真库上验。
       expect(prisma.supportRechargeJob.create).toHaveBeenCalledWith({
         data: { sourceMessageID: 'msg-1' },
         select: { id: true },
@@ -1714,7 +1844,7 @@ describe('ChatService', () => {
       );
     });
 
-    it('never looks up a recharge agent for message types the agent cannot handle', async () => {
+    it('does not enqueue a recharge job for message types the agent cannot handle', async () => {
       prisma.chatMember.findUnique.mockResolvedValue(
         membership({
           conversation: {
@@ -1740,7 +1870,6 @@ describe('ChatService', () => {
         }),
       );
 
-      expect(prisma.supportAgent.findFirst).not.toHaveBeenCalled();
       expect(prisma.supportRechargeJob.create).not.toHaveBeenCalled();
     });
 
@@ -1763,7 +1892,6 @@ describe('ChatService', () => {
 
       jest.clearAllMocks();
       prisma.$transaction.mockImplementation(runTx as never);
-      prisma.$queryRaw.mockResolvedValue([{ nextHeight: 3 }]);
       prisma.chatMember.findUnique.mockResolvedValue(membership());
       prisma.chatMessage.findUnique.mockResolvedValue(null);
       prisma.chatMessage.create.mockResolvedValue(createdRow);
@@ -1832,6 +1960,10 @@ describe('ChatService', () => {
 
       expect(result.reused).toBe(true);
       expect(result.message.id).toBe('msg-1');
+      // 复查语句只带回命中的消息 id,整行按这个 id 读回。
+      expect(prisma.chatMessage.findUnique).toHaveBeenLastCalledWith({
+        where: { id: 'msg-1' },
+      });
       // 群消息复用:群里从来不入队,网关什么都不用 kick。
       expect(result.enqueuedJobs).toEqual({
         directAutoReplyJobId: null,
@@ -1885,10 +2017,30 @@ describe('ChatService', () => {
       expect(result.reused).toBe(true);
     });
 
+    // 发送者的昵称头像随锁外预检读回,群昵称来自锁内复查读到的座位:提交之后不再
+    // 为发送者查库(原来是 User + ChatMember 两次往返)。
+    it('builds the sender from the pre-check and the locked seat without a query after commit', async () => {
+      prisma.chatMember.findUnique.mockResolvedValue(
+        membership({ alias: '阿甲' }),
+      );
+      prisma.chatMessage.findUnique.mockResolvedValue(null);
+      prisma.chatMessage.create.mockResolvedValue(createdRow);
+
+      const result = await service.sendMessage('u1', sendPayload());
+
+      expect(result.message.sender).toEqual({
+        id: 'u1',
+        nickname: '一波',
+        avatarUrl: null,
+        alias: '阿甲',
+      });
+      expect(prisma.user.findMany).not.toHaveBeenCalled();
+      expect(prisma.chatMember.findMany).not.toHaveBeenCalled();
+    });
+
     it('stores the request fingerprint with a new message', async () => {
       prisma.chatMember.findUnique.mockResolvedValue(membership());
       prisma.chatMessage.findUnique.mockResolvedValue(null);
-      prisma.$queryRaw.mockResolvedValue([{ nextHeight: 3 }]);
       prisma.chatMessage.create.mockResolvedValue(createdRow);
       prisma.chatConversation.update.mockResolvedValue({});
 
@@ -2057,32 +2209,34 @@ describe('ChatService', () => {
         }),
       );
       prisma.chatMessage.findUnique.mockResolvedValue(null);
-      prisma.$queryRaw.mockResolvedValueOnce([
-        {
-          nextHeight: 3,
-          type: 'GROUP',
-          directKey: null,
-          circleID: null,
-          ownerID: 'owner-9',
-          muteAllAt: new Date(),
-          tempChatID: null,
-        },
-      ]);
+      const isLock = (query: { sql?: string }) =>
+        query.sql?.includes('FOR UPDATE') ?? false;
+      // 只有锁行那条语句读到「全员禁言已打开」;锁外预检时还没开。
+      prisma.$queryRaw.mockImplementation(((query: { sql?: string }) =>
+        isLock(query)
+          ? Promise.resolve([
+              {
+                nextHeight: 3,
+                type: 'GROUP',
+                directKey: null,
+                circleID: null,
+                ownerID: 'owner-9',
+                muteAllAt: new Date(),
+                tempChatID: null,
+              },
+            ])
+          : rawQueryStub(query)) as never);
 
       await expect(
         service.sendMessage('u1', sendPayload()),
       ).rejects.toMatchObject({
         response: { errorCode: ChatErrorCode.ConversationMuted },
       });
-      const lock = prisma.$queryRaw.mock.calls[0][0] as { sql: string };
-      expect(lock.sql).toContain('"muteAllAt"');
-      expect(lock.sql).toContain('FOR UPDATE');
+      const lock = (prisma.$queryRaw.mock.calls as [{ sql?: string }][])
+        .map(([query]) => query)
+        .find(isLock);
+      expect(lock?.sql).toContain('"muteAllAt"');
       expect(prisma.chatMessage.create).not.toHaveBeenCalled();
-      // 锁外 requireMembershipSeat 一次 + 锁内复查一次;复查不再 include 会话。
-      expect(prisma.chatMember.findUnique).toHaveBeenCalledTimes(2);
-      expect(prisma.chatMember.findUnique.mock.calls[1][0]).not.toHaveProperty(
-        'include',
-      );
     });
 
     it('blocks sensitive words before any DB write', async () => {

@@ -1,9 +1,10 @@
 import { ForbiddenException, HttpException } from '@nestjs/common';
 import { ChatErrorCode } from 'src/common/app-error-codes';
-import { ChatGateway } from './chat.gateway';
+import { CHAT_SEND_MAX_IN_FLIGHT, ChatGateway } from './chat.gateway';
 import type { ChatMetrics } from './chat-metrics';
 import { foregroundDeviceMarker } from './chat-presence.registry';
 import * as errorAggregation from '../logging/error-aggregation.service';
+import { sanitizeLogValue } from '../logging/log-sanitizer';
 
 type Handler = (...args: unknown[]) => void;
 
@@ -1645,6 +1646,39 @@ describe('ChatGateway', () => {
     });
   });
 
+  // 默认 2000 是按慢核定的;核更快的机器靠 WS_MAX_CONNECTIONS 调大,不用白开实例。
+  describe('connection budget', () => {
+    const build = (value: unknown) => {
+      const config = {
+        get: jest.fn((key: string) =>
+          key === 'WS_MAX_CONNECTIONS' ? value : 'guest-secret',
+        ),
+      };
+      return new ChatGateway(
+        jwtService as never,
+        sessionVerifier as never,
+        chatService as never,
+        broadcast as never,
+        chatPush as never,
+        redisService as never,
+        prisma as never,
+        config as never,
+        presence as never,
+        supportRecharge as never,
+        directAutoReply as never,
+      );
+    };
+
+    it('takes the per-instance connection cap from WS_MAX_CONNECTIONS', () => {
+      expect((build('5000') as any).admission.maxConnections).toBe(5000);
+    });
+
+    it('keeps 2000 when the variable is missing or malformed', () => {
+      expect((build(undefined) as any).admission.maxConnections).toBe(2000);
+      expect((build('lots') as any).admission.maxConnections).toBe(2000);
+    });
+  });
+
   describe('handleSend', () => {
     const payload = {
       conversationId: 'conv-1',
@@ -1918,6 +1952,216 @@ describe('ChatGateway', () => {
         /unexpected-user|conv-1|blue pineapple|hi/,
       );
       report.mockRestore();
+    });
+
+    // 生产日志的格式化器会把 error 级别的整条字符串抹成 [redacted]:原来这条日志
+    // 拼的是「用户 + 会话 + 堆栈」的字符串,压垮那次 6696 条里一条原因都看不到。
+    it('logs an unexpected failure as structured fields that survive the log sanitizer', async () => {
+      jest
+        .spyOn(errorAggregation, 'reportOperationalError')
+        .mockImplementation(() => undefined);
+      const logged = jest
+        .spyOn((gateway as any).logger, 'error')
+        .mockImplementation(() => undefined);
+      const failure = Object.assign(
+        new Error(
+          'timeout exceeded when trying to connect; text=blue pineapple',
+        ),
+        { code: 'P2024' },
+      );
+      failure.name = 'PrismaClientKnownRequestError';
+      chatService.sendMessage.mockRejectedValue(failure);
+
+      await gateway['handleSend'](
+        fakeSocket() as never,
+        'unexpected-user',
+        payload as never,
+        jest.fn(),
+      );
+
+      expect(logged).toHaveBeenCalledTimes(1);
+      const entry = logged.mock.calls[0][0] as Record<string, unknown>;
+      // 与 winston 的 safeFormat 同一道脱敏:对象连同 level / context 一起过。
+      const written = sanitizeLogValue({
+        ...entry,
+        level: 'error',
+        context: 'ChatGateway',
+      });
+      expect(written).toMatchObject({
+        event: 'chat_action_failed',
+        action: 'send',
+        errorName: 'PrismaClientKnownRequestError',
+        errorCode: 'P2024',
+      });
+      expect(JSON.stringify(written)).not.toMatch(
+        /unexpected-user|conv-1|blue pineapple|timeout exceeded/,
+      );
+    });
+
+    it('leaves the error code out of the log when it is not a short machine code', async () => {
+      jest
+        .spyOn(errorAggregation, 'reportOperationalError')
+        .mockImplementation(() => undefined);
+      const logged = jest
+        .spyOn((gateway as any).logger, 'error')
+        .mockImplementation(() => undefined);
+      chatService.sendMessage.mockRejectedValue(
+        Object.assign(new Error('boom'), {
+          code: 'user u1 said blue pineapple',
+        }),
+      );
+
+      await gateway['handleSend'](
+        fakeSocket() as never,
+        'u1',
+        payload as never,
+        jest.fn(),
+      );
+
+      expect(logged.mock.calls[0][0]).toMatchObject({
+        errorName: 'Error',
+        errorCode: undefined,
+      });
+    });
+
+    describe('in-flight budget', () => {
+      const sent = {
+        // reused:不广播,名额在 sendMessage 落定后立刻归还。
+        reused: true,
+        enqueuedJobs: NOTHING_ENQUEUED,
+        message: { id: 'm', conversationId: 'conv-1', height: 1, d: 'd1' },
+      };
+      type Settle = {
+        resolve: (value: unknown) => void;
+        reject: (error: Error) => void;
+      };
+
+      /** 把在途名额占满:每个发送都停在 sendMessage 上,返回各自的落定开关。 */
+      async function fillBudget(): Promise<{
+        settles: Settle[];
+        running: Promise<void>[];
+      }> {
+        const settles: Settle[] = [];
+        chatService.sendMessage.mockImplementation(
+          () =>
+            new Promise((resolve, reject) => settles.push({ resolve, reject })),
+        );
+        // 每个发送用不同的用户,避开逐用户的发送限流(20 条 / 10 秒)。
+        const running = Array.from(
+          { length: CHAT_SEND_MAX_IN_FLIGHT },
+          (_, i) =>
+            gateway['handleSend'](
+              fakeSocket() as never,
+              `busy-${i}`,
+              payload as never,
+              jest.fn(),
+            ),
+        );
+        while (settles.length < CHAT_SEND_MAX_IN_FLIGHT) {
+          await new Promise((resolve) => setImmediate(resolve));
+        }
+        return { settles, running };
+      }
+
+      it('sheds a new send at once when the budget is full, without touching the service', async () => {
+        const { settles, running } = await fillBudget();
+        const ack = jest.fn();
+
+        await gateway['handleSend'](
+          fakeSocket() as never,
+          'late-user',
+          payload as never,
+          ack,
+        );
+
+        expect(ack).toHaveBeenCalledWith(
+          expect.objectContaining({
+            ok: false,
+            code: ChatErrorCode.RateLimited,
+          }),
+        );
+        expect(chatService.sendMessage).toHaveBeenCalledTimes(
+          CHAT_SEND_MAX_IN_FLIGHT,
+        );
+        // 与逐用户限流分开计数:这一条是「后端扛不住了」,不是「这个人发太快」。
+        expect(metrics.observeEvent).toHaveBeenCalledWith('send', 'overloaded');
+        expect(metrics.observeEvent).not.toHaveBeenCalledWith(
+          'send',
+          'rate_limited',
+        );
+
+        settles.forEach(({ resolve }) => resolve(sent));
+        await Promise.all(running);
+      });
+
+      it('returns the slot when a send finishes, whether it succeeded or failed', async () => {
+        jest
+          .spyOn(errorAggregation, 'reportOperationalError')
+          .mockImplementation(() => undefined);
+        jest
+          .spyOn((gateway as any).logger, 'error')
+          .mockImplementation(() => undefined);
+        const { settles, running } = await fillBudget();
+        settles[0].resolve(sent);
+        settles[1].reject(new Error('db down'));
+        await Promise.all(running.slice(0, 2));
+
+        // 腾出两个名额:接下来两条照常进服务层。
+        chatService.sendMessage.mockResolvedValue(sent);
+        const acks = [jest.fn(), jest.fn()];
+        const admitted = acks.map((ack, i) =>
+          gateway['handleSend'](
+            fakeSocket() as never,
+            `next-${i}`,
+            payload as never,
+            ack,
+          ),
+        );
+        await Promise.all(admitted);
+        for (const ack of acks) {
+          expect(ack).toHaveBeenCalledWith(
+            expect.objectContaining({ ok: true }),
+          );
+        }
+
+        settles.slice(2).forEach(({ resolve }) => resolve(sent));
+        await Promise.all(running);
+        expect((gateway as any).sendsInFlight).toBe(0);
+      });
+
+      // 进了 handleSend 又没走到服务层的两条早退路径,同样要把名额还回去。
+      it('keeps no slot for a send turned away by the per-user limiter or the guest gate', async () => {
+        chatService.sendMessage.mockResolvedValue(sent);
+        for (let i = 0; i < 21; i += 1) {
+          await gateway['handleSend'](
+            fakeSocket() as never,
+            'flood-user-2',
+            payload as never,
+            jest.fn(),
+          );
+        }
+        const guestAck = jest.fn();
+        await gateway['handleSend'](
+          fakeSocket({
+            data: { userId: 'guest-1', guestConversationId: 'conv-1' },
+          }) as never,
+          'guest-1',
+          { ...payload, type: 'note-card' } as never,
+          guestAck,
+        );
+
+        expect(metrics.observeEvent).toHaveBeenCalledWith(
+          'send',
+          'rate_limited',
+        );
+        expect(guestAck).toHaveBeenCalledWith(
+          expect.objectContaining({
+            ok: false,
+            code: ChatErrorCode.InvalidPayload,
+          }),
+        );
+        expect((gateway as any).sendsInFlight).toBe(0);
+      });
     });
 
     it('rate limits per authenticated user with an explicit ack code', async () => {
