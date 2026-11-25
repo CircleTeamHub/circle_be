@@ -89,13 +89,17 @@ export class UploadLimitService {
       const countKey = `rl:upload-presign:user:${userId}`;
       let count: number | null = null;
       let issuedBytes: number | null = null;
+      let retryAfterSeconds: number | null = null;
       try {
         this.redisInFlight += 1;
         count = await this.redisService.incrementWithTtl(
           countKey,
           UploadLimitService.PRESIGN_WINDOW_SECONDS,
         );
-        if (count !== null && count <= UploadLimitService.PRESIGN_LIMIT) {
+        if (count !== null && count > UploadLimitService.PRESIGN_LIMIT) {
+          retryAfterSeconds =
+            await this.redisService.secondsUntilExpiry(countKey);
+        } else if (count !== null) {
           issuedBytes = await this.redisService.incrementWithTtl(
             `rl:upload-presign-bytes:user:${userId}`,
             UploadLimitService.DAILY_WINDOW_SECONDS,
@@ -103,7 +107,8 @@ export class UploadLimitService {
           );
         }
       } catch {
-        count = null;
+        if (count !== null && count <= UploadLimitService.PRESIGN_LIMIT)
+          count = null;
       } finally {
         this.redisInFlight -= 1;
         if (probingRecovery) this.redisProbeInFlight = false;
@@ -114,8 +119,7 @@ export class UploadLimitService {
           // 读不到剩余时间就按整个窗口算:多等几秒,好过让客户端立刻再撞一次。
           throw this.tooManyPresignRequests(
             'redis',
-            (await this.redisService.secondsUntilExpiry(countKey)) ??
-              UploadLimitService.PRESIGN_WINDOW_SECONDS,
+            retryAfterSeconds ?? UploadLimitService.PRESIGN_WINDOW_SECONDS,
           );
         }
         if (issuedBytes !== null) {

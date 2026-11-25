@@ -126,6 +126,30 @@ describe('UploadController', () => {
       });
     });
 
+    it('keeps Redis expiry lookups inside the in-flight budget', async () => {
+      redisService.incrementWithTtl.mockResolvedValue(41);
+      let finishExpiry!: (seconds: number) => void;
+      const expiry = new Promise<number>((resolve) => {
+        finishExpiry = resolve;
+      });
+      redisService.secondsUntilExpiry.mockReturnValue(expiry);
+      const controller = build();
+      const inFlight = Array.from({ length: 32 }, () => limited(controller));
+
+      await Promise.resolve();
+      const overflow = limited(controller);
+      finishExpiry(23);
+
+      await expect(overflow).resolves.toMatchObject({
+        details: { retryAfterSeconds: 1 },
+      });
+      await expect(Promise.all(inFlight)).resolves.toEqual(
+        Array.from({ length: 32 }, () =>
+          expect.objectContaining({ details: { retryAfterSeconds: 23 } }),
+        ),
+      );
+    });
+
     it('reports the seconds left in the in-memory window', async () => {
       redisService.isEnabled.mockReturnValue(false);
       const controller = build();
