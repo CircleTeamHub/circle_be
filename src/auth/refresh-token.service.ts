@@ -19,6 +19,7 @@ import {
 } from 'src/metrics/tracked-cron.decorator';
 import { PrismaService } from 'src/prisma/prisma.service';
 import { SessionRevocationService } from './session-revocation.service';
+import { WebSessionChangedException } from './web-session-changed.exception';
 
 const DEFAULT_REFRESH_TOKEN_TTL_DAYS = 7;
 // 管理台会话故意比用户短一个量级（#91 目标区间 8-24h）：一枚被偷的 admin
@@ -86,6 +87,8 @@ export type SessionContext = {
   rotationAttemptId?: string | null;
   /** 请求到达服务端的时间：用来认出排队太久、已被后来的重试取代的旧请求。 */
   requestReceivedAt?: Date;
+  /** The access token's sid from an already signed-in browser tab. */
+  expectedSessionId?: string;
 };
 
 export type RefreshTokenAudience = 'APP' | 'ADMIN';
@@ -799,6 +802,7 @@ export class RefreshTokenService {
     const record = await tx.refreshToken.findUnique({
       where: { token: tokenHash },
       select: {
+        id: true,
         userId: true,
         deviceName: true,
         ip: true,
@@ -814,6 +818,7 @@ export class RefreshTokenService {
     if (!record || record.audience !== audience || record.userId !== owner) {
       throw new UnauthorizedException('Invalid or expired refresh token');
     }
+    await this.assertWebSessionBinding(tx, record, context?.expectedSessionId);
 
     const now = new Date();
     if (record.expiredAt <= now) {
@@ -947,7 +952,35 @@ export class RefreshTokenService {
    * 撤销 refresh token 所在的会话族。返回实际结束了活跃会话的归属（否则 null），
    * 供调用方补审计日志（#90 —— admin 登出此前完全无痕）。
    */
-  async revoke(token: string): Promise<{
+  private async assertWebSessionBinding(
+    client: RefreshTokenClient,
+    current: {
+      id: string;
+      userId: string;
+      familyId: string;
+      audience: RefreshTokenAudience;
+    },
+    expectedSessionId?: string,
+  ): Promise<void> {
+    if (!expectedSessionId || expectedSessionId === current.id) return;
+    // Rotating a token changes its sid. All tabs in the same login family can
+    // still refresh or log out; a newly signed-in session has a different family.
+    const expected = await client.refreshToken.findFirst({
+      where: {
+        id: expectedSessionId,
+        userId: current.userId,
+        familyId: current.familyId,
+        audience: current.audience,
+      },
+      select: { id: true },
+    });
+    if (!expected) throw new WebSessionChangedException();
+  }
+
+  async revoke(
+    token: string,
+    expectedSessionId?: string,
+  ): Promise<{
     userId: string;
     audience: RefreshTokenAudience;
     sessionId: string;
@@ -957,9 +990,14 @@ export class RefreshTokenService {
     // rotation. Family revocation re-reads the row under that lock.
     const existing = await this.prisma.refreshToken.findUnique({
       where: { token: tokenHash },
-      select: { id: true, userId: true, audience: true },
+      select: { id: true, userId: true, audience: true, familyId: true },
     });
     if (!existing) return null;
+    await this.assertWebSessionBinding(
+      this.prisma,
+      existing,
+      expectedSessionId,
+    );
     const revoked = await this.revokeSessionFamily(
       existing.userId,
       existing.id,

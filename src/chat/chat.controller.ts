@@ -571,6 +571,25 @@ export class ChatController {
     );
   }
 
+  @Delete('conversations/:id/pinned-message')
+  @Throttle({ default: { limit: 30, ttl: 60_000 } })
+  @ApiOperation({
+    summary: '旧版取消置顶(群主/管理员;私聊双方)',
+    description: '按请求处理时的会话置顶顺序，取消当前用户可见的第一条置顶。',
+  })
+  async unpinLegacyMessage(
+    @Req() req: RequestWithUser,
+    @Param('id', ParseUUIDPipe) conversationId: string,
+  ): Promise<{ ok: true }> {
+    await this.groupSettings.setPinnedMessage(
+      req.user.userId,
+      conversationId,
+      null,
+      false,
+    );
+    return { ok: true };
+  }
+
   @Delete('conversations/:id/pinned-message/:messageId')
   @Throttle({ default: { limit: 30, ttl: 60_000 } })
   @ApiOperation({ summary: '取消置顶一条消息(群主/管理员;私聊双方)' })

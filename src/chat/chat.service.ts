@@ -63,6 +63,7 @@ import {
   MAX_CONTENT_BYTES,
   MAX_TEXT_LENGTH,
   CHAT_EDIT_WINDOW_MS,
+  CHAT_PINNED_MESSAGE_ORDER,
   CHAT_REACTION_EMOJIS,
   CHAT_REVOKE_WINDOW_MS,
   MEDIA_MESSAGE_TYPES,
@@ -111,17 +112,17 @@ import type {
   VisibleChatMessage,
   ChatSenderInfo,
   ChatSendPayload,
-  ChatPinnedMessageDto,
 } from './chat.types';
 
 /** 置顶栏:清空水位以下的(这个人已经看不到那条)不给。rows 已按置顶时间倒序。 */
-function pinnedMessagesOf(
+function pinnedMessageFields(
   rows: readonly ChatPinnedMessage[] | undefined,
   floor: number,
-): ChatPinnedMessageDto[] {
-  return (rows ?? [])
+): Pick<ChatConversationDto, 'pinnedMessages' | 'pinnedMessage'> {
+  const pinnedMessages = (rows ?? [])
     .filter((row) => row.height > floor)
     .map(toPinnedMessageDto);
+  return { pinnedMessages, pinnedMessage: pinnedMessages[0] ?? null };
 }
 
 /** 圈子群在会话 DTO 上的展示信息(+ 成员邀请开关,策略 DTO 要用)。 */
@@ -2084,7 +2085,7 @@ export class ChatService {
           directPeers.deliveredHeights.get(m.conversationID) ?? null,
         readHeight: m.lastReadHeight,
         clearedBeforeHeight: conversationFloor,
-        pinnedMessages: pinnedMessagesOf(
+        ...pinnedMessageFields(
           pinnedMessages.get(m.conversationID),
           conversationFloor,
         ),
@@ -2912,10 +2913,7 @@ export class ChatService {
           : null,
         memberCounts.get(conversationId) ?? null,
       ),
-      pinnedMessages: pinnedMessagesOf(
-        pinnedMessages.get(conversationId),
-        floor,
-      ),
+      ...pinnedMessageFields(pinnedMessages.get(conversationId), floor),
       burnDurationSec: member.burnDurationSec ?? null,
       burnStartedAt: member.burnStartedAt?.toISOString() ?? null,
       peerReadHeight: directPeers.readHeights.get(conversationId) ?? null,
@@ -2989,7 +2987,7 @@ export class ChatService {
     if (unique.length === 0) return new Map();
     const rows = await this.prisma.chatPinnedMessage.findMany({
       where: { conversationID: { in: unique } },
-      orderBy: [{ pinnedAt: 'desc' }, { messageID: 'asc' }],
+      orderBy: CHAT_PINNED_MESSAGE_ORDER,
     });
     const byConversation = new Map<string, ChatPinnedMessage[]>();
     for (const row of rows) {
@@ -3715,10 +3713,7 @@ export class ChatService {
           ?.lastDeliveredHeight ?? null,
       readHeight: mine?.lastReadHeight ?? 0,
       clearedBeforeHeight: clearedFloor,
-      pinnedMessages: pinnedMessagesOf(
-        pinnedMessages.get(conv.id),
-        clearedFloor,
-      ),
+      ...pinnedMessageFields(pinnedMessages.get(conv.id), clearedFloor),
       syncRevision: conversationSyncRevision(conv),
       lastMessageAt: conv.lastMessageAt?.toISOString() ?? null,
       joinedAt: mine?.joinedAt?.toISOString() ?? null,

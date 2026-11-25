@@ -78,6 +78,7 @@ import {
   REFRESH_COOKIE,
   webDeviceKey,
 } from './web-session';
+import { WebSessionChangedException } from './web-session-changed.exception';
 
 function getHeaderValue(value: string | string[] | undefined): string | null {
   if (Array.isArray(value)) {
@@ -118,6 +119,17 @@ function bodyRefreshToken(dto: SessionRefreshTokenDto): string {
   return dto.refreshToken;
 }
 
+function webSessionBinding(
+  req: Request,
+  allowRestore = false,
+): string | undefined {
+  const authorization = getHeaderValue(req.headers.authorization) ?? '';
+  const binding = /^WebSession (\S+)$/i.exec(authorization)?.[1];
+  if (allowRestore && binding === 'restore') return undefined;
+  if (binding && isUUID(binding, '4')) return binding;
+  throw new WebSessionChangedException();
+}
+
 /**
  * 网页端会话模式（见 web-session.ts）：refresh token 写进 HttpOnly cookie `circle_rt`，
  * 响应体只有 `{ accessToken }`；设备 ID 取自 cookie `circle_did`，不读 X-Device-Id。
@@ -127,7 +139,7 @@ const ApiWebSessionHeader = () =>
     name: 'X-Web-Session',
     required: false,
     description:
-      "Web client only, value '1'. The refresh token is set as the HttpOnly cookie circle_rt (Path=/api/v1/auth) and left out of the body, which is { accessToken } only; refresh/logout read it from the cookie with an empty body. The device id comes from the HttpOnly cookie circle_did instead of X-Device-Id.",
+      "Web client only, value '1'. The refresh token is set as the HttpOnly cookie circle_rt (Path=/api/v1/auth); the response exposes only accessToken. Refresh and logout require Authorization: WebSession <session UUID>. A cold-start refresh uses Authorization: WebSession restore. The device id comes from the HttpOnly cookie circle_did instead of X-Device-Id.",
   });
 
 @Controller('auth')
@@ -501,7 +513,10 @@ export class AuthController {
       return this.respond(
         req,
         res,
-        await this.authService.refresh(refreshToken, context),
+        await this.authService.refresh(refreshToken, {
+          ...context,
+          expectedSessionId: webSessionBinding(req, true),
+        }),
       );
     } catch (error) {
       // 死掉的 refresh token 别让浏览器一直重放；设备 cookie 保留。
@@ -549,7 +564,10 @@ export class AuthController {
     }
     const refreshToken = readCookie(req, REFRESH_COOKIE);
     if (refreshToken) {
-      await this.authService.logout(refreshToken, getSessionContext(req));
+      await this.authService.logout(refreshToken, {
+        ...getSessionContext(req),
+        expectedSessionId: webSessionBinding(req),
+      });
     }
     clearRefreshCookie(res);
   }
