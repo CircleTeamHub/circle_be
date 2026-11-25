@@ -23,6 +23,7 @@ describe('ChatGroupSettingsService', () => {
     chatMessage: { findUnique: jest.fn() },
     chatPinnedMessage: {
       findUnique: jest.fn(),
+      findFirst: jest.fn(),
       count: jest.fn(),
       create: jest.fn(),
       deleteMany: jest.fn(),
@@ -922,6 +923,76 @@ describe('ChatGroupSettingsService', () => {
         systemMessage.insertSystemMessageAfterLockedConversationInTx,
       ).not.toHaveBeenCalled();
       expect(systemMessage.broadcastSystemMessage).not.toHaveBeenCalled();
+    });
+
+    it('legacy unpin selects only the first pin above the current floor after locking', async () => {
+      const actor = seat('admin-1', { role: 'ADMIN', clearedBeforeHeight: 7 });
+      arrangePin({
+        actor,
+        row: { clearedBeforeHeight: 8 },
+        alreadyPinned: true,
+      });
+      prisma.chatMember.findUnique.mockResolvedValueOnce({
+        ...actor,
+        clearedBeforeHeight: 0,
+        conversation: locked({ clearedBeforeHeight: 0 }),
+      });
+      prisma.chatPinnedMessage.findFirst.mockResolvedValue(
+        pinRow({ messageID: 'visible-pin', height: 9 }),
+      );
+
+      await service.setPinnedMessage('admin-1', 'conv-1', null, false);
+
+      expect(prisma.chatPinnedMessage.findFirst).toHaveBeenCalledWith({
+        where: { conversationID: 'conv-1', height: { gt: 8 } },
+        orderBy: [{ pinnedAt: 'desc' }, { messageID: 'asc' }],
+        select: { messageID: true },
+      });
+      expect(prisma.$queryRaw.mock.invocationCallOrder[0]).toBeLessThan(
+        prisma.chatPinnedMessage.findFirst.mock.invocationCallOrder[0],
+      );
+      expect(prisma.chatPinnedMessage.deleteMany).toHaveBeenCalledTimes(1);
+      expect(prisma.chatPinnedMessage.deleteMany).toHaveBeenCalledWith({
+        where: { conversationID: 'conv-1', messageID: 'visible-pin' },
+      });
+      expect(groupEvents.recordInTx).toHaveBeenCalledWith(prisma, 'conv-1', {
+        kind: 'message-unpinned',
+        actorId: 'admin-1',
+      });
+      expect(systemMessage.broadcastSystemMessage).toHaveBeenCalledTimes(1);
+    });
+
+    it('legacy unpin leaves pins at or below the private chat viewer floor alone', async () => {
+      arrangePin({
+        actor: seat('peer-1', { clearedBeforeHeight: 8 }),
+        row: {
+          type: 'DIRECT',
+          directKey: 'peer-1:peer-2',
+          clearedBeforeHeight: 2,
+        },
+      });
+      prisma.chatPinnedMessage.findFirst.mockResolvedValue(null);
+
+      await service.setPinnedMessage('peer-1', 'conv-1', null, false);
+
+      expect(prisma.chatPinnedMessage.findFirst).toHaveBeenCalledWith(
+        expect.objectContaining({
+          where: { conversationID: 'conv-1', height: { gt: 8 } },
+        }),
+      );
+      expect(prisma.chatPinnedMessage.deleteMany).not.toHaveBeenCalled();
+      expect(systemMessage.broadcastSystemMessage).not.toHaveBeenCalled();
+    });
+
+    it('legacy unpin checks the group manager role before selecting a pin', async () => {
+      arrangePin({ actor: seat('member-1') });
+      await expect(
+        service.setPinnedMessage('member-1', 'conv-1', null, false),
+      ).rejects.toMatchObject({
+        response: { errorCode: ChatErrorCode.GroupManagerOnly },
+      });
+      expect(prisma.chatPinnedMessage.findFirst).not.toHaveBeenCalled();
+      expect(prisma.chatPinnedMessage.deleteMany).not.toHaveBeenCalled();
     });
 
     it('someone who left the conversation cannot pin', async () => {

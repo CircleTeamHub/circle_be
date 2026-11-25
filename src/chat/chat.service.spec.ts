@@ -325,6 +325,20 @@ describe('ChatService', () => {
     ...overrides,
   });
 
+  const pin = (
+    conversationID: string,
+    messageID: string,
+    height: number,
+    at: string,
+  ) => ({
+    conversationID,
+    messageID,
+    height,
+    preview: `置顶 ${messageID}`,
+    pinnedAt: new Date(at),
+    pinnedByID: 'u1',
+  });
+
   /** 已读 / 送达回执的钳位读会话行上的 nextHeight。 */
   const seatAt = (nextHeight: number, type = 'GROUP') =>
     membership({
@@ -3086,6 +3100,25 @@ describe('ChatService', () => {
       expect(dto.lastMessage).toMatchObject({ id: 'msg-7', height: 7 });
     });
 
+    it('returns the first visible pin in the legacy field when opening an existing direct chat', async () => {
+      prisma.user.findUnique.mockResolvedValue(peer);
+      prisma.block.findFirst.mockResolvedValue(null);
+      prisma.chatConversation.findUnique.mockResolvedValue({
+        ...conversationRow,
+        clearedBeforeHeight: 3,
+      });
+      prisma.chatMessage.findFirst.mockResolvedValue(null);
+      prisma.chatPinnedMessage.findMany.mockResolvedValueOnce([
+        pin('conv-9', 'hidden-pin', 3, '2026-11-07T00:00:00.000Z'),
+        pin('conv-9', 'visible-pin', 8, '2026-11-06T00:00:00.000Z'),
+      ]);
+
+      const dto = await service.getOrCreateDirectConversation('u1', 'u2');
+
+      expect(dto.pinnedMessages).toMatchObject([{ messageId: 'visible-pin' }]);
+      expect(dto).toMatchObject({ pinnedMessage: dto.pinnedMessages[0] });
+    });
+
     it('creates with a sorted directKey and both member rows', async () => {
       prisma.user.findUnique.mockResolvedValue(peer);
       prisma.block.findFirst.mockResolvedValue(null);
@@ -3870,34 +3903,23 @@ describe('ChatService', () => {
     // 一页的置顶一次查完(不按会话逐个查),最新置顶的在前;
     // 清空水位以下的照样对本人隐藏(与单会话接口同一口径)。
     it('carries every pin on list rows, newest first, hiding pins below the viewer floor', async () => {
-      const pin = (
-        conversationID: string,
-        messageID: string,
-        height: number,
-        at: string,
-      ) => ({
-        conversationID,
-        messageID,
-        height,
-        preview: `置顶 ${messageID}`,
-        pinnedAt: new Date(at),
-        pinnedByID: 'u1',
+      const filteredMembership = membership({
+        id: 'member-2',
+        conversationID: 'conv-2',
+        clearedBeforeHeight: 9,
+        conversation: { ...membership().conversation, id: 'conv-2' },
       });
       prisma.chatMember.findMany.mockResolvedValueOnce([
         membership(),
-        membership({
-          id: 'member-2',
-          conversationID: 'conv-2',
-          clearedBeforeHeight: 9,
-          conversation: { ...membership().conversation, id: 'conv-2' },
-        }),
+        filteredMembership,
       ]);
-      prisma.chatPinnedMessage.findMany.mockResolvedValueOnce([
+      const pins = [
         pin('conv-1', 'm9', 9, '2026-11-07T00:00:00.000Z'),
+        pin('conv-2', 'm9', 9, '2026-11-07T00:00:00.000Z'),
         pin('conv-2', 'm12', 12, '2026-11-06T12:00:00.000Z'),
         pin('conv-1', 'm3', 3, '2026-11-06T00:00:00.000Z'),
-        pin('conv-2', 'm9', 9, '2026-11-06T00:00:00.000Z'),
-      ]);
+      ];
+      prisma.chatPinnedMessage.findMany.mockResolvedValueOnce(pins);
       prisma.$queryRaw.mockResolvedValue([]);
 
       const page = await service.listConversationsPage('u1');
@@ -3924,6 +3946,20 @@ describe('ChatService', () => {
       expect(
         page.conversations[1].pinnedMessages.map((p) => p.messageId),
       ).toEqual(['m12']);
+      expect(page.conversations).toMatchObject([
+        { pinnedMessage: page.conversations[0].pinnedMessages[0] },
+        { pinnedMessage: page.conversations[1].pinnedMessages[0] },
+      ]);
+
+      prisma.chatMember.findUnique.mockResolvedValueOnce(filteredMembership);
+      prisma.chatPinnedMessage.findMany.mockResolvedValueOnce(
+        pins.filter((row) => row.conversationID === 'conv-2'),
+      );
+      const detail = await service.getConversation('u1', 'conv-2');
+      expect(detail).toMatchObject({
+        pinnedMessages: page.conversations[1].pinnedMessages,
+        pinnedMessage: page.conversations[1].pinnedMessages[0],
+      });
     });
 
     it('reports no more conversations when the page is not full', async () => {
@@ -3934,6 +3970,10 @@ describe('ChatService', () => {
 
       expect(page.hasMore).toBe(false);
       expect(page.conversations).toHaveLength(1);
+      expect(page.conversations[0]).toMatchObject({
+        pinnedMessage: null,
+        pinnedMessages: [],
+      });
     });
 
     it('pushes viewer retention into preview and unread queries', async () => {
@@ -4638,6 +4678,7 @@ describe('ChatService', () => {
 
     it('syncs seats on access and returns the conversation dto', async () => {
       prisma.circleMember.findUnique.mockResolvedValue({ status: 'ACTIVE' });
+      prisma.circleMember.findMany.mockResolvedValue([]);
       circleSync.ensureCircleConversation.mockResolvedValue('conv-g');
       prisma.chatMember.findUnique.mockResolvedValue({
         ...membership(),
@@ -4653,6 +4694,10 @@ describe('ChatService', () => {
       });
       prisma.chatMessage.findFirst.mockResolvedValue(null);
       prisma.chatMessage.count.mockResolvedValue(0);
+      prisma.chatPinnedMessage.findMany.mockResolvedValueOnce([
+        pin('conv-g', 'm8', 8, '2026-11-07T00:00:00.000Z'),
+        pin('conv-g', 'm3', 3, '2026-11-06T00:00:00.000Z'),
+      ]);
 
       const dto = await service.getOrCreateCircleConversation('u1', 'circle-1');
 
@@ -4664,6 +4709,8 @@ describe('ChatService', () => {
         type: 'GROUP',
         circleId: 'circle-1',
         unreadCount: 0,
+        pinnedMessage: { messageId: 'm8' },
+        pinnedMessages: [{ messageId: 'm8' }, { messageId: 'm3' }],
       });
     });
   });

@@ -424,6 +424,8 @@ export interface ChatConversationDto {
   noticePinned?: boolean;
   /** 会话里置顶的消息,最新置顶的在前;清空水位以下的不给,撤回的已经删掉。 */
   pinnedMessages: ChatPinnedMessageDto[];
+  /** 兼容旧客户端。取 pinnedMessages 的第一条，无可见置顶时为 null。 */
+  pinnedMessage: ChatPinnedMessageDto | null;
   /** 独立群聊头像;圈子群走 circle.avatarUrl;其他类型为 null。 */
   avatarUrl: string | null;
   /** 独立群聊的成员上限;圈子群/其他类型为 null(圈子容量走圈子详情)。 */

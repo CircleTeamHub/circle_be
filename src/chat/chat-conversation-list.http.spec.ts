@@ -29,9 +29,10 @@ import { IdempotencyService } from 'src/idempotency/idempotency.service';
  * - 带 cursor（`?cursor=` 空串 = 从头开始）：按 conversationID 升序的键集分页，
  *   还有下一页时多一个 X-Next-Cursor。
  */
-describe('GET /chat/conversations HTTP pipeline', () => {
+describe('/chat/conversations HTTP pipeline', () => {
   const ROUTE = '/api/v1/chat/conversations';
   const LAST_ID = '3f2a9c1e-7b4d-4e8a-9c0f-1a2b3c4d5e6f';
+  const MESSAGE_ID = '3fa85f64-5717-4562-b3fc-2c963f66afa6';
 
   let app: INestApplication;
   const chatService = {
@@ -39,6 +40,7 @@ describe('GET /chat/conversations HTTP pipeline', () => {
     listConversationsKeysetPage: jest.fn(),
     getConversation: jest.fn(),
   };
+  const groupSettings = { setPinnedMessage: jest.fn() };
   const logger: LoggerService = {
     log: jest.fn(),
     error: jest.fn(),
@@ -80,7 +82,7 @@ describe('GET /chat/conversations HTTP pipeline', () => {
         { provide: GroupAdmissionService, useValue: {} },
         { provide: ChatGroupAdminService, useValue: {} },
         { provide: ChatGroupEventService, useValue: {} },
-        { provide: ChatGroupSettingsService, useValue: {} },
+        { provide: ChatGroupSettingsService, useValue: groupSettings },
         { provide: ChatClearRequestService, useValue: {} },
       ],
     })
@@ -111,6 +113,34 @@ describe('GET /chat/conversations HTTP pipeline', () => {
 
   afterEach(async () => {
     await app.close();
+  });
+
+  it('accepts the legacy delete without a message id', async () => {
+    const response = await request(app.getHttpServer())
+      .delete(`${ROUTE}/${LAST_ID}/pinned-message`)
+      .expect(200);
+
+    expect(response.body).toEqual({ ok: true });
+    expect(groupSettings.setPinnedMessage).toHaveBeenCalledWith(
+      'viewer-1',
+      LAST_ID,
+      null,
+      false,
+    );
+  });
+
+  it('keeps the modern delete scoped to the supplied message id', async () => {
+    const response = await request(app.getHttpServer())
+      .delete(`${ROUTE}/${LAST_ID}/pinned-message/${MESSAGE_ID}`)
+      .expect(200);
+
+    expect(response.body).toEqual({ ok: true });
+    expect(groupSettings.setPinnedMessage).toHaveBeenCalledWith(
+      'viewer-1',
+      LAST_ID,
+      MESSAGE_ID,
+      false,
+    );
   });
 
   it('keeps the legacy activity-ordered list when no cursor is sent', async () => {

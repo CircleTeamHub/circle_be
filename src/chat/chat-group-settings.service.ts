@@ -33,7 +33,10 @@ import type {
   ChatPinnedMessageDto,
 } from './chat.types';
 import { messagePreviewText } from './chat-message-preview';
-import { CHAT_PINNED_MESSAGES_MAX } from './chat.constants';
+import {
+  CHAT_PINNED_MESSAGE_ORDER,
+  CHAT_PINNED_MESSAGES_MAX,
+} from './chat.constants';
 import { CircleMemberLockService } from 'src/circle/circle-member-lock';
 
 /** 锁后的会话行:群策略与全员禁言都从这份快照读、往这行写。 */
@@ -393,16 +396,18 @@ export class ChatGroupSettingsService {
   async setPinnedMessage(
     actorId: string,
     conversationId: string,
-    messageId: string,
-    pin: boolean,
+    ...[messageId, pin]:
+      | [messageId: string, pin: boolean]
+      | [messageId: null, pin: false]
   ): Promise<ChatPinnedMessageDto | null> {
-    const seat = await this.prisma.chatMember.findUnique({
-      where: {
-        conversationID_userID: {
-          conversationID: conversationId,
-          userID: actorId,
-        },
+    const seatKey = {
+      conversationID_userID: {
+        conversationID: conversationId,
+        userID: actorId,
       },
+    };
+    const seat = await this.prisma.chatMember.findUnique({
+      where: seatKey,
       include: { conversation: true },
     });
     if (!seat || seat.leftAt) {
@@ -454,14 +459,15 @@ export class ChatGroupSettingsService {
           .find((id) => id !== actorId);
         if (peerId) await this.assertNotBlockedInTx(tx, actorId, peerId);
       }
-      const key = {
-        conversationID_messageID: {
-          conversationID: conversationId,
-          messageID: messageId,
-        },
-      };
       if (pin) {
-        const existing = await tx.chatPinnedMessage.findUnique({ where: key });
+        const existing = await tx.chatPinnedMessage.findUnique({
+          where: {
+            conversationID_messageID: {
+              conversationID: conversationId,
+              messageID: messageId,
+            },
+          },
+        });
         if (existing) {
           pinned = toPinnedMessageDto(existing);
           return null;
@@ -503,8 +509,41 @@ export class ChatGroupSettingsService {
           }),
         );
       } else {
+        let targetId = messageId;
+        if (targetId === null) {
+          // 旧客户端没有传消息 ID，按请求处理时的可见顺序选第一条。
+          const currentSeat = await tx.chatMember.findUnique({
+            where: seatKey,
+            select: {
+              leftAt: true,
+              clearedBeforeHeight: true,
+              conversation: { select: { clearedBeforeHeight: true } },
+            },
+          });
+          if (!currentSeat || currentSeat.leftAt) {
+            throw new ForbiddenException({
+              message: '不是会话成员',
+              errorCode: ChatErrorCode.NotMember,
+            });
+          }
+          const visiblePin = await tx.chatPinnedMessage.findFirst({
+            where: {
+              conversationID: conversationId,
+              height: {
+                gt: Math.max(
+                  currentSeat.clearedBeforeHeight,
+                  currentSeat.conversation.clearedBeforeHeight,
+                ),
+              },
+            },
+            orderBy: CHAT_PINNED_MESSAGE_ORDER,
+            select: { messageID: true },
+          });
+          if (!visiblePin) return null;
+          targetId = visiblePin.messageID;
+        }
         const removed = await tx.chatPinnedMessage.deleteMany({
-          where: { conversationID: conversationId, messageID: messageId },
+          where: { conversationID: conversationId, messageID: targetId },
         });
         if (removed.count === 0) return null;
       }
