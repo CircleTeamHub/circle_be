@@ -87,50 +87,52 @@ export class UploadLimitService {
       const probingRecovery = this.redisRetryAt > 0;
       if (probingRecovery) this.redisProbeInFlight = true;
       const countKey = `rl:upload-presign:user:${userId}`;
-      let count: number | null = null;
-      let issuedBytes: number | null = null;
-      let retryAfterSeconds: number | null = null;
+      this.redisInFlight += 1;
       try {
-        this.redisInFlight += 1;
-        count = await this.redisService.incrementWithTtl(
-          countKey,
-          UploadLimitService.PRESIGN_WINDOW_SECONDS,
-        );
-        if (count !== null && count > UploadLimitService.PRESIGN_LIMIT) {
-          retryAfterSeconds =
-            await this.redisService.secondsUntilExpiry(countKey);
-        } else if (count !== null) {
-          issuedBytes = await this.redisService.incrementWithTtl(
-            `rl:upload-presign-bytes:user:${userId}`,
-            UploadLimitService.DAILY_WINDOW_SECONDS,
-            sizeBytes,
+        let count: number | null = null;
+        let issuedBytes: number | null = null;
+        try {
+          count = await this.redisService.incrementWithTtl(
+            countKey,
+            UploadLimitService.PRESIGN_WINDOW_SECONDS,
           );
-        }
-      } catch {
-        if (count !== null && count <= UploadLimitService.PRESIGN_LIMIT)
+          if (count !== null && count <= UploadLimitService.PRESIGN_LIMIT) {
+            issuedBytes = await this.redisService.incrementWithTtl(
+              `rl:upload-presign-bytes:user:${userId}`,
+              UploadLimitService.DAILY_WINDOW_SECONDS,
+              sizeBytes,
+            );
+          }
+        } catch {
           count = null;
+        } finally {
+          if (probingRecovery) this.redisProbeInFlight = false;
+        }
+        if (count !== null) {
+          this.redisRetryAt = 0;
+          if (count > UploadLimitService.PRESIGN_LIMIT) {
+            // The counter proves recovery. Keep the slot for the TTL lookup
+            // without changing recovery state after it completes.
+            const retryAfterSeconds = await this.redisService
+              .secondsUntilExpiry(countKey)
+              .catch(() => null);
+            throw this.tooManyPresignRequests(
+              'redis',
+              retryAfterSeconds ?? UploadLimitService.PRESIGN_WINDOW_SECONDS,
+            );
+          }
+          if (issuedBytes !== null) {
+            if (issuedBytes > UploadLimitService.DAILY_ISSUED_BYTES_LIMIT) {
+              throw this.tooManyPresignRequests('redis');
+            }
+            return;
+          }
+        }
+        this.redisRetryAt =
+          Date.now() + UploadLimitService.REDIS_RETRY_COOLDOWN_MS;
       } finally {
         this.redisInFlight -= 1;
-        if (probingRecovery) this.redisProbeInFlight = false;
       }
-      if (count !== null) {
-        this.redisRetryAt = 0;
-        if (count > UploadLimitService.PRESIGN_LIMIT) {
-          // 读不到剩余时间就按整个窗口算:多等几秒,好过让客户端立刻再撞一次。
-          throw this.tooManyPresignRequests(
-            'redis',
-            retryAfterSeconds ?? UploadLimitService.PRESIGN_WINDOW_SECONDS,
-          );
-        }
-        if (issuedBytes !== null) {
-          if (issuedBytes > UploadLimitService.DAILY_ISSUED_BYTES_LIMIT) {
-            throw this.tooManyPresignRequests('redis');
-          }
-          return;
-        }
-      }
-      this.redisRetryAt =
-        Date.now() + UploadLimitService.REDIS_RETRY_COOLDOWN_MS;
       // Redis is configured but errored (null): degrade to per-instance
       // in-memory limiting instead of failing the upload (503). This keeps the
       // limiter active and never fully fails open, consistent with how the

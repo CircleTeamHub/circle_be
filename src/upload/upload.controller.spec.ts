@@ -49,6 +49,7 @@ describe('UploadController', () => {
     uploadIntent.track.mockResolvedValue(undefined);
     redisService.isEnabled.mockReturnValue(true);
     redisService.incrementWithTtl.mockResolvedValue(1);
+    redisService.secondsUntilExpiry.mockResolvedValue(null);
   });
 
   it('uses Redis to enforce a per-user presign limit when configured', async () => {
@@ -148,6 +149,55 @@ describe('UploadController', () => {
           expect.objectContaining({ details: { retryAfterSeconds: 23 } }),
         ),
       );
+    });
+
+    it('restores shared limits as soon as the recovery counter succeeds', async () => {
+      jest.useFakeTimers();
+      try {
+        const controller = build();
+        redisService.incrementWithTtl.mockResolvedValueOnce(null);
+        await controller.presign(dto, req);
+        jest.advanceTimersByTime(2_000);
+
+        redisService.incrementWithTtl.mockResolvedValue(41);
+        let finishExpiry!: (seconds: number) => void;
+        const expiry = new Promise<number>((resolve) => {
+          finishExpiry = resolve;
+        });
+        redisService.secondsUntilExpiry.mockReturnValue(expiry);
+        const recovery = limited(controller);
+        await Promise.resolve();
+        const duringExpiry = limited(controller);
+        finishExpiry(23);
+
+        await expect(Promise.all([recovery, duringExpiry])).resolves.toEqual([
+          expect.objectContaining({ details: { retryAfterSeconds: 23 } }),
+          expect.objectContaining({ details: { retryAfterSeconds: 23 } }),
+        ]);
+        expect(uploadService.presign).toHaveBeenCalledTimes(1);
+      } finally {
+        jest.useRealTimers();
+      }
+    });
+
+    it('preserves a newer Redis cooldown when an earlier expiry lookup finishes', async () => {
+      redisService.incrementWithTtl
+        .mockResolvedValueOnce(41)
+        .mockResolvedValueOnce(null);
+      let finishExpiry!: (seconds: number) => void;
+      const expiry = new Promise<number>((resolve) => {
+        finishExpiry = resolve;
+      });
+      redisService.secondsUntilExpiry.mockReturnValue(expiry);
+      const controller = build();
+      const limitedRequest = limited(controller);
+      await Promise.resolve();
+      await controller.presign(dto, req);
+      finishExpiry(23);
+      await limitedRequest;
+
+      await controller.presign(dto, req);
+      expect(redisService.incrementWithTtl).toHaveBeenCalledTimes(2);
     });
 
     it('reports the seconds left in the in-memory window', async () => {
