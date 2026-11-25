@@ -622,12 +622,14 @@ export class RedisService implements OnModuleInit, OnModuleDestroy {
     }
 
     try {
-      const seconds = await client.ttl(key);
-      return seconds > 0 ? seconds : null;
+      const milliseconds = await client.pttl(key);
+      return milliseconds >= 0
+        ? Math.max(1, Math.ceil(milliseconds / 1000))
+        : null;
     } catch (error) {
       this.recordCommandFailure('get', error);
       this.logger.warn(
-        `Redis ttl failed for ${key}: ${this.formatError(error)}`,
+        `Redis pttl failed for ${key}: ${this.formatError(error)}`,
       );
       return null;
     }
