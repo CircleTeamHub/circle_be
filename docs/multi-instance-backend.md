@@ -323,23 +323,37 @@ Redis：每进程 7 条连接（命令连接兼适配器发布、适配器订阅
 3. **Compose 配置**：`docker-compose.prod.yml`、`docker-compose.release.yml` 一个字节
    没动；N=1 时发版脚本不加载 `docker-compose.replicas.yml`。
 
-仓库里常驻的守卫是
-`test_single_replica_default_never_touches_the_replica_overlay`：默认发版的命令里不能
-出现副本 overlay 和 `CIRCLE_BE_LB`，也不能写副本记录。第 1、2 条的比对脚本和产物在
-本次任务的共享笔记目录里（`prove-n1-identical.sh`）。
+上面第 1 条比的是全部场景，但要拿着旧脚本才能重跑（比对脚本 `prove-n1-identical.sh`
+在本次任务的共享笔记目录里）。留在仓库里、每次 CI 都跑的是三条：
+
+- `test/fixtures/release-deploy-single-replica.commands`：用**改动前的脚本**录下的
+  默认发版 31 条 docker 命令，
+  `test_single_replica_release_runs_the_recorded_docker_commands` 逐条对照。
+- `test_single_replica_default_never_touches_the_replica_overlay`：默认发版不加载
+  副本 overlay、不传 `CIRCLE_BE_LB`、不写副本记录。
+- `scripts/check-caddy-backend-pool.sh`（CI 在构建出 Caddy 镜像后跑）：把负载均衡
+  那一节和三处 import 从 Caddyfile 里删掉 —— 删完与改动前的文件逐字节相同 —— 两份
+  各 `caddy adapt`，JSON 必须逐字节相同；再用两个上游加 `CIRCLE_BE_LB=pool` 跑
+  `caddy validate`，并确认三处反代都拿到全部上游、`least_conn` 和探活。只有真实的
+  Caddy 能回答「import 的名字里能不能展开环境变量、空片段合不合法」。
 
 ### 6.4 测试与本机 N=2 验证
 
-- `test/release-deploy.spec.sh`：原 53 条 + 新增 10 条多实例用例（起两个副本并入池、
+- `test/release-deploy.spec.sh`：原 53 条 + 新增 11 条（默认命令序列的基准对照，以及
+  10 条多实例用例：起两个副本并入池、
   下一次发版停掉旧色全部副本、实例数改回 1、一个副本不健康整色失败、烟测失败整色
   回滚、停机模式先停全部副本、非法配置在任何 docker 命令之前被拒、正在重启的副本
-  留在池里、残留副本删不掉就停下），63 条全过。
+  留在池里、残留副本删不掉就停下），64 条全过。
 - `scripts/release-hardening.test.mjs`：改 2 处断言（脚本文本变了），新增 2 条
   （Caddy 重启恢复整个池、副本契约）。
 - Linux 容器里按 CI 的部署测试步骤各跑一遍原版和新版：都是全绿（新版 37 / 20 / 77 +
-  发版 63 条）。本机 macOS 上有 3 组在未改动的 main 上就失败（系统自带 bash 3.2、
+  发版 64 条）。本机 macOS 上有 3 组在未改动的 main 上就失败（系统自带 bash 3.2、
   `/etc` 是软链、没有 `flock`），与本次改动无关。
 - `src/chat/group-admission*.spec.ts`：65 条通过。
+- `test/postgres/group-admission-delivery-dedup.pg-spec.ts`（真库，PostgreSQL 16、
+  `read committed`）：两个服务实例取到同一条投递，赢家持锁停在投递里，确认输家已经
+  排进锁队列后放行；只投递一次、不消耗重试次数。去掉修复后这条用例失败（输家多投
+  一次），说明重复在真库上确实会发生。
 
 本机 N=2（Docker Desktop，从这个工作区构建的生产镜像，三份 compose 文件原样叠加，
 独立的 compose 项目，用完已拆除）：
@@ -402,6 +416,7 @@ GHCR digest 镜像和 `flock`），脚本逻辑只有桩测试覆盖；没有做
 | `@Throttle` 跨实例共享 | 148 个入口的行为变更 | 2.1 |
 | 适配器晚挂载 / 就绪探针 | 改启动顺序和健康检查语义 | 第 3 节 |
 | `REDIS_REQUIRED=true` 启动竞态 | 与多实例无关的既有问题，但它是多实例的前置 | 8.2 |
+| 「某个副本掉了」的告警 | `absent(up{job="circle-be"})` 只在**全部**后端都没了才响，N>1 时掉一个副本没有告警（Caddy 的探活会绕开它，用户无感，但容量少了 1/N）。Prometheus 不知道期望的副本数：用「比过去一段时间少」来猜，会在发版换色和主动缩容时误报，过了窗口又自己消掉 | 让后端导出期望副本数（或由发版脚本写一个 textfile 指标），再加 `count(up{job="circle-be"} == 1) < 期望数`。只影响 N>1，开多实例之前补上 |
 | 副本的文件日志进 Loki | 日志 overlay 用 `external: true` 的卷，静态加上副本的卷会让**没开多实例的主机起不来日志栈** | 另写一个 `monitoring/docker-compose.logs.replicas.yml`，只在开了多实例的主机上叠加；`alloy/config.alloy` 的路径通配同步加上。在那之前副本的日志只在 `docker logs` 里 |
 | `stop_grace_period` | 会改变 N=1 的配置 | 第 5 节 |
 | 服务端显式 `transports: ['websocket']` | 行为变更 | 第 3 节 |

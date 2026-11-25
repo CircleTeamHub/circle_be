@@ -1267,6 +1267,26 @@ test_single_replica_default_never_touches_the_replica_overlay() {
   ! grep -q 'docker-compose.replicas.yml\|CIRCLE_BE_LB' "$TEST_COMMAND_LOG"
 }
 
+# 默认(单实例)发版执行的 docker 命令序列,逐条钉在基准文件里。这份基准是用引入
+# 多实例之前的 release-deploy.sh 跑同一个场景录下来的:它一变,就说明没开多实例的
+# 主机上发版行为变了 —— 那必须是有意为之,并同步更新基准文件。
+# (迁移预检那条 `node -e <脚本>` 只保留到 -e,脚本正文不属于这里要钉的东西。)
+test_single_replica_release_runs_the_recorded_docker_commands() {
+  local golden="$ROOT_DIR/test/fixtures/release-deploy-single-replica.commands"
+  new_case
+  printf 'running\n' > "$TEST_STATE_DIR/circle_be"
+  printf 'running\n' > "$TEST_STATE_DIR/caddy"
+  run_release || { cat "$CASE_DIR/release.log" >&2; return 1; }
+  sed -E 's/( node -e ).*/\1<script>/' "$TEST_COMMAND_LOG" > "$CASE_DIR/commands.normalized"
+  if [ "${UPDATE_RELEASE_COMMAND_FIXTURE:-0}" = "1" ]; then
+    cp "$CASE_DIR/commands.normalized" "$golden"
+  fi
+  diff -u "$golden" "$CASE_DIR/commands.normalized" >&2 || {
+    echo "single-replica release no longer runs the recorded docker commands" >&2
+    return 1
+  }
+}
+
 test_two_replicas_are_started_pooled_and_recorded() {
   new_case
   printf 'CIRCLE_BE_REPLICAS=2\n' >> "$COMPOSE_ENV_FILE"
@@ -1511,6 +1531,7 @@ for test_name in \
   test_irreversible_state_failure_stays_in_maintenance \
   test_irreversible_smoke_failure_stays_in_maintenance \
   test_single_replica_default_never_touches_the_replica_overlay \
+  test_single_replica_release_runs_the_recorded_docker_commands \
   test_two_replicas_are_started_pooled_and_recorded \
   test_next_release_retires_every_replica_of_the_old_color \
   test_lowering_replicas_to_one_removes_old_replicas_and_the_overlay \

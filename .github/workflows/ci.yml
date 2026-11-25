@@ -433,6 +433,14 @@ jobs:
             -v "$PWD/deploy/Caddyfile.admin:/etc/caddy/Caddyfile:ro" \
             circle-caddy:ci caddy validate --config /etc/caddy/Caddyfile --adapter caddyfile
 
+      # Backend replicas are opt-in (CIRCLE_BE_REPLICAS). With one backend per
+      # color the pool hook in the Caddyfile must adapt to exactly the config it
+      # had without it; with several, the upstream list and CIRCLE_BE_LB=pool
+      # that release-deploy.sh passes must validate. Only the real binary can
+      # tell whether an env placeholder inside an import name expands.
+      - name: Check the backend pool hook with the built image
+        run: bash scripts/check-caddy-backend-pool.sh circle-caddy:ci
+
       - name: Trivy image scan
         uses: aquasecurity/trivy-action@a9c7b0f06e461e9d4b4d1711f154ee024b8d7ab8 # v0.36.0
         with:
