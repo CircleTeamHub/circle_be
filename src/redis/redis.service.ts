@@ -613,6 +613,28 @@ export class RedisService implements OnModuleInit, OnModuleDestroy {
     }
   }
 
+  /** 这个键还有多少秒过期;键不存在、没有过期时间或 Redis 不可用时返回 null。 */
+  async secondsUntilExpiry(key: string): Promise<number | null> {
+    const client = await this.getCommandClient();
+    if (!client) {
+      this.recordUnavailable('get');
+      return null;
+    }
+
+    try {
+      const milliseconds = await client.pttl(key);
+      return milliseconds >= 0
+        ? Math.max(1, Math.ceil(milliseconds / 1000))
+        : null;
+    } catch (error) {
+      this.recordCommandFailure('get', error);
+      this.logger.warn(
+        `Redis pttl failed for ${key}: ${this.formatError(error)}`,
+      );
+      return null;
+    }
+  }
+
   async incrementWithTtl(
     key: string,
     ttlSeconds: number,

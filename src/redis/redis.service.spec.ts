@@ -57,8 +57,40 @@ describe('RedisService', () => {
     await expect(
       service.incrementWithTtl('rl:upload-presign:user:user-1', 60),
     ).resolves.toBeNull();
+    await expect(
+      service.secondsUntilExpiry('upload-limit'),
+    ).resolves.toBeNull();
     expect(service.createRateLimitStore('global')).toBeUndefined();
   });
+
+  it.each([
+    [60_000, 60],
+    [2_300, 3],
+    [300, 1],
+    [0, 1],
+    [-1, null],
+    [-2, null],
+  ])(
+    'rounds expiry upward (%s ms → %s seconds)',
+    async (milliseconds, expected) => {
+      const service = new RedisService();
+      const client = {
+        ttl: jest
+          .fn()
+          .mockResolvedValue(
+            milliseconds < 0
+              ? milliseconds
+              : Math.floor((milliseconds + 500) / 1000),
+          ),
+        pttl: jest.fn().mockResolvedValue(milliseconds),
+      };
+      jest.spyOn(service as any, 'getCommandClient').mockResolvedValue(client);
+
+      await expect(service.secondsUntilExpiry('upload-limit')).resolves.toBe(
+        expected,
+      );
+    },
+  );
 
   describe('job leases', () => {
     it('reports no coordination (undefined) when Redis is not configured', async () => {

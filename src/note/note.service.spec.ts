@@ -173,6 +173,7 @@ describe('NoteService', () => {
       coverType: cover?.type ?? null,
       coverUrl: cover?.url ?? null,
       coverObjectKey: cover?.objectKey ?? null,
+      coverPosterUrl: cover?.posterUrl ?? null,
       coverNoteID: cover ? (cover.noteID === null ? null : id) : null,
     };
   };
@@ -1745,6 +1746,76 @@ describe('NoteService', () => {
         ),
       });
       expect(item.showcaseCount).toBe(1);
+    });
+
+    // 列表每行只画一张 72pt 的封面，却要下载整张原图。图片媒体的 posterUrl 存的是
+    // 客户端上传的小图，摘要里签好名一起给，列表就不必再碰原图。
+    it('signs the cover thumbnail next to the original', async () => {
+      const cover = {
+        ...mediaRow('img-0', 'IMAGE', 0),
+        posterUrl:
+          'https://api.example.com/circle/notes/user-1/img-0-thumb.jpg',
+      };
+      prisma.note.findMany.mockResolvedValueOnce([
+        { ...richRow, media: [cover] },
+      ]);
+
+      const [item] = (await service.listNotes('user-1', {})).items;
+
+      expect(item.cover).toEqual({
+        id: 'img-0',
+        type: 'IMAGE',
+        url: expect.stringContaining(
+          'https://signed.example.com/notes/user-1/img-0.jpg',
+        ),
+        thumbUrl: expect.stringContaining(
+          'https://signed.example.com/notes/user-1/img-0-thumb.jpg',
+        ),
+      });
+    });
+
+    it("never signs a cover thumbnail that points at another user's object", async () => {
+      const cover = {
+        ...mediaRow('img-0', 'IMAGE', 0),
+        posterUrl: 'https://api.example.com/circle/notes/victim/secret.jpg',
+      };
+      prisma.note.findMany.mockResolvedValueOnce([
+        { ...richRow, media: [cover] },
+      ]);
+
+      const [item] = (await service.listNotes('user-1', {})).items;
+
+      expect(
+        uploadService.createPresignedGetUrl.mock.calls.map(
+          (call: unknown[]) => call[0],
+        ),
+      ).toEqual(['notes/user-1/img-0.jpg']);
+      expect(item.cover).not.toHaveProperty('thumbUrl');
+    });
+
+    it('gives the detail response the same cover thumbnail as the list', async () => {
+      const cover = {
+        ...mediaRow('img-0', 'IMAGE', 0),
+        noteID: richRow.id,
+        posterUrl:
+          'https://api.example.com/circle/notes/user-1/img-0-thumb.jpg',
+      };
+      prisma.note.findFirst.mockResolvedValueOnce({
+        ...richRow,
+        sections: null,
+        media: [cover],
+        coverMedia: cover,
+      });
+
+      const detail = await service.getNote('user-1', richRow.id);
+
+      expect(detail.cover).toEqual(
+        expect.objectContaining({
+          thumbUrl: expect.stringContaining(
+            'https://signed.example.com/notes/user-1/img-0-thumb.jpg',
+          ),
+        }),
+      );
     });
 
     it.each([
@@ -4059,6 +4130,83 @@ describe('NoteService', () => {
       'http://10.0.0.195:9000/circle/notes/user-1/with-url.jpg',
       'http://10.0.0.195:9000/circle/notes/user-1/null-url.jpg',
     ]);
+  });
+
+  describe('image thumbnails uploaded next to the original', () => {
+    const guardedService = () =>
+      new NoteService(
+        prisma as any,
+        {
+          get: jest.fn((key: string) =>
+            key === 'MINIO_PUBLIC_URL' ? 'http://10.0.0.195:9000' : null,
+          ),
+        } as any,
+        new MembershipPolicyService(prisma as any),
+        chatService as any,
+      );
+    const stubCreate = () => {
+      prisma.note.create.mockResolvedValueOnce({ id: 'note-1' });
+      prisma.note.update.mockResolvedValueOnce({
+        id: 'note-1',
+        title: 't',
+        content: null,
+        status: 'ACTIVE',
+        available: true,
+        pinned: false,
+        imageCount: 1,
+        videoCount: 0,
+        mediaCount: 1,
+        createdAt: new Date(),
+        updatedAt: new Date(),
+        coverMedia: null,
+        groupMemberships: [],
+        media: [],
+      });
+    };
+
+    it('stores the thumbnail as the poster of its image', async () => {
+      stubCreate();
+
+      await guardedService().createNote('user-1', {
+        title: 'thumb note',
+        media: [
+          {
+            type: 'IMAGE',
+            objectKey: 'notes/user-1/big.jpg',
+            thumbObjectKey: 'notes/user-1/big-thumb.jpg',
+            sortOrder: 0,
+          },
+        ],
+      } as any);
+
+      const [row] = prisma.noteMedia.createMany.mock.calls.at(-1)?.[0].data;
+      expect(row).toEqual(
+        expect.objectContaining({
+          objectKey: 'notes/user-1/big.jpg',
+          posterUrl: 'http://10.0.0.195:9000/circle/notes/user-1/big-thumb.jpg',
+        }),
+      );
+      expect(row).not.toHaveProperty('thumbObjectKey');
+    });
+
+    it("rejects a thumbnail key from another user's directory", async () => {
+      await expect(
+        guardedService().createNote('user-1', {
+          title: 'thumb note',
+          media: [
+            {
+              type: 'IMAGE',
+              objectKey: 'notes/user-1/big.jpg',
+              thumbObjectKey: 'notes/victim/secret.jpg',
+              sortOrder: 0,
+            },
+          ],
+        } as any),
+      ).rejects.toThrow(
+        'thumbObjectKey must reference the same owner as its objectKey',
+      );
+      expect(prisma.noteMedia.createMany).not.toHaveBeenCalled();
+    });
   });
 
   // 同一条口径必须覆盖正文块：App 把 presign.fileUrl 原样塞进块 props 时，私有目录上

@@ -894,4 +894,53 @@ describePostgres('note list summaries (PostgreSQL)', () => {
     const newBytes = JSON.stringify([newRows, projected]).length;
     expect(newBytes * 10).toBeLessThan(oldBytes);
   }, 120_000);
+
+  // 封面的小图只能来自封面那一行：指定的封面没有小图时，不能拿「第一张图」的小图顶上。
+  it('projects the thumbnail of the cover row itself and signs it for the list', async () => {
+    const thumb = (id: string) =>
+      `https://api.test/circle/notes/u1/${id}-thumb.jpg`;
+    await note('n-thumb-chosen', {
+      ownerID: 'u-thumb',
+      coverMediaID: 'mt-b',
+      counts: [2, 2, 0, 0],
+    });
+    await media('mt-a', 'n-thumb-chosen', 'IMAGE', 0);
+    await media('mt-b', 'n-thumb-chosen', 'IMAGE', 1, thumb('mt-b'));
+    await note('n-thumb-plain-cover', {
+      ownerID: 'u-thumb',
+      coverMediaID: 'mt-d',
+      counts: [2, 2, 0, 0],
+    });
+    await media('mt-c', 'n-thumb-plain-cover', 'IMAGE', 0, thumb('mt-c'));
+    await media('mt-d', 'n-thumb-plain-cover', 'IMAGE', 1);
+    await note('n-thumb-fallback', {
+      ownerID: 'u-thumb',
+      counts: [1, 1, 0, 0],
+    });
+    await media('mt-e', 'n-thumb-fallback', 'IMAGE', 0, thumb('mt-e'));
+
+    const { items } = await service.listNotes('u-thumb', {});
+
+    expect(
+      Object.fromEntries(items.map((item) => [item.id, item.cover])),
+    ).toEqual({
+      'n-thumb-chosen': {
+        id: 'mt-b',
+        type: 'IMAGE',
+        url: 'https://signed.test/notes/u1/mt-b.bin',
+        thumbUrl: 'https://signed.test/notes/u1/mt-b-thumb.jpg',
+      },
+      'n-thumb-plain-cover': {
+        id: 'mt-d',
+        type: 'IMAGE',
+        url: 'https://signed.test/notes/u1/mt-d.bin',
+      },
+      'n-thumb-fallback': {
+        id: 'mt-e',
+        type: 'IMAGE',
+        url: 'https://signed.test/notes/u1/mt-e.bin',
+        thumbUrl: 'https://signed.test/notes/u1/mt-e-thumb.jpg',
+      },
+    });
+  });
 });

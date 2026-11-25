@@ -51,6 +51,8 @@ export type NoteSummaryProjectionRow = {
   coverType: NoteMediaType | null;
   coverUrl: string | null;
   coverObjectKey: string | null;
+  /** 封面图片自带的小图（NoteMedia.posterUrl）；没有时列表退回原图。 */
+  coverPosterUrl: string | null;
   coverNoteID: string | null;
 };
 
@@ -105,6 +107,9 @@ export function noteSummaryProjectionQuery(
            COALESCE(chosen."type", fallback."type") AS "coverType",
            COALESCE(chosen."url", fallback."url") AS "coverUrl",
            COALESCE(chosen."objectKey", fallback."objectKey") AS "coverObjectKey",
+           CASE WHEN chosen."id" IS NOT NULL THEN chosen."posterUrl"
+                ELSE fallback."posterUrl"
+           END AS "coverPosterUrl",
            COALESCE(chosen."noteID", fallback."noteID") AS "coverNoteID"
     FROM "Note" AS n
     LEFT JOIN LATERAL jsonb_to_record(
@@ -114,7 +119,8 @@ export function noteSummaryProjectionQuery(
     LEFT JOIN "NoteMedia" AS chosen
       ON chosen."id" = n."coverMediaID" AND chosen."type" = 'IMAGE'
     LEFT JOIN LATERAL (
-      SELECT fm."id", fm."type", fm."url", fm."objectKey", fm."noteID"
+      SELECT fm."id", fm."type", fm."url", fm."objectKey", fm."posterUrl",
+             fm."noteID"
       FROM "NoteMedia" AS fm
       WHERE fm."noteID" = n."id" AND fm."type" = 'IMAGE'
       ORDER BY fm."sortOrder" ASC
