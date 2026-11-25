@@ -3710,8 +3710,9 @@ export class NoteService implements NoteCardProjector {
   }
 
   /**
-   * 大众点评月榜：本月好评最多的原笔记（可按城市筛）。资格与排序都在 noteRankingQuery
-   * 里做完；这里按名次读摘要行，用请求者视角映射（他人笔记的备注、名片照常隐藏）。
+   * 大众点评月榜：本月好评最多（好评榜）或差评最多（差评榜）的原笔记，可按城市筛。资格与
+   * 排序都在 noteRankingQuery 里做完；这里按名次读摘要行，用请求者视角映射（他人笔记的
+   * 备注、名片照常隐藏）。
    */
   async getNoteRanking(
     viewerID: string,
@@ -3720,7 +3721,12 @@ export class NoteService implements NoteCardProjector {
     const { month } = ratingCalendar(new Date());
     const city = query.city ?? null;
     const ranked = await this.prisma.$queryRaw<Array<{ id: string }>>(
-      noteRankingQuery({ month, city, limit: query.limit }),
+      noteRankingQuery({
+        month,
+        city,
+        board: query.board,
+        limit: query.limit,
+      }),
     );
     if (ranked.length === 0) return { month, city, items: [] };
     const rows = await this.prisma.note.findMany({

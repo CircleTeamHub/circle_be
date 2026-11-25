@@ -288,9 +288,10 @@ export class NoteController {
   // 必须先于 @Get(':id') 声明（同 share-links 的顺序注释）。
   @Get('ranking')
   @ApiOperation({
-    summary: 'Monthly 大众点评 ranking: notes with the most good ratings',
+    summary:
+      'Monthly 大众点评 ranking: notes with the most good (or bad) ratings',
     description:
-      'Current Shanghai month. Only ACTIVE + available source notes. Absent `city` = nationwide, whether or not the owner chose a city; `city` narrows to notes whose owner chose that city.',
+      'Current Shanghai month. Only ACTIVE + available source notes. Absent `city` = nationwide, whether or not the owner chose a city; `city` narrows to notes whose owner chose that city. `board=bad` ranks by bad ratings instead (default `good`).',
   })
   @ApiOkResponse({ type: NoteRankingDto })
   getRanking(

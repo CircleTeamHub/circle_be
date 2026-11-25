@@ -1,3 +1,4 @@
+import type { NoteRankingBoard } from 'src/note/dto/note.dto';
 import { NoteService } from 'src/note/note.service';
 import { noteRankingQuery } from 'src/note/note-ranking.query';
 import { ratingCalendar } from 'src/note-rating/note-rating-calendar';
@@ -9,9 +10,10 @@ import { type LiveSchema, openLiveSchema, seedUsers } from './live-prisma';
  * schema.prisma 现场生成（含 Note.city 和 (month, goodCount) 索引），排名 SQL 就是
  * service 里那一条（noteRankingQuery），再走真实的摘要读取与映射。
  *
- * - 资格：只收本月好评 > 0、ACTIVE + available 的原笔记；下架、隐藏、删除、收藏副本、
- *   零好评、只有上月计数的都不上榜；没选城市的只上全国榜；
+ * - 资格：只收本月好评 > 0（差评榜：差评 > 0）、ACTIVE + available 的原笔记；下架、隐藏、
+ *   删除、收藏副本、只有上月计数的都不上榜；没选城市的只上全国榜；
  * - 排序：好评降序 → 差评升序 → 最近更新 → id，LIMIT 在库里做；
+ * - 差评榜：差评降序 → 好评升序 → 最近更新 → id；零好评的照样上榜，零差评的不上；
  * - 按城市筛选；映射用请求者视角（他人的备注不外发）。
  */
 jest.setTimeout(60_000);
@@ -97,29 +99,34 @@ describePostgres('note ranking on PostgreSQL', () => {
     await note('cd-same-b', { city: '成都' }, thisMonth(3, 1));
     await note('cd-same-a', { city: '成都' }, thisMonth(3, 1));
     // 没选城市：照样上全国榜，任何城市榜都没有它。
-    await note('no-city', { city: null }, thisMonth(7, 0));
+    await note('no-city', { city: null }, thisMonth(7, 1));
 
-    // ── 不上榜（每条好评都比上榜的多，漏掉任何一个过滤就会排到最前面）──────────
-    await note('unavailable', { available: false }, thisMonth(20, 0));
-    await note('unlisted', { status: 'UNLISTED' }, thisMonth(20, 0));
-    await note('deleted', { status: 'DELETED' }, thisMonth(20, 0));
+    // ── 两张榜都不上（好评、差评都比上榜的多，漏掉任何一个过滤就会排到最前面）────
+    await note('unavailable', { available: false }, thisMonth(20, 20));
+    await note('unlisted', { status: 'UNLISTED' }, thisMonth(20, 20));
+    await note('deleted', { status: 'DELETED' }, thisMonth(20, 20));
     await note(
       'collected-copy',
       { ownerID: VIEWER, collectedFromNoteID: 'sh-top' },
-      thisMonth(20, 0),
+      thisMonth(20, 20),
     );
-    await note('zero-good', {}, thisMonth(0, 5));
     await note('last-month', {}, [
-      { month: previousMonthOf(month), good: 20, bad: 0 },
+      { month: previousMonthOf(month), good: 20, bad: 20 },
     ]);
+    // 零好评：不上好评榜，差评榜第一。
+    await note('zero-good', {}, thisMonth(0, 5));
   });
 
   afterAll(async () => {
     await live?.close();
   });
 
-  const ids = async (city: string | null, limit = 50) =>
-    (await service.getNoteRanking(VIEWER, { city, limit })).items.map(
+  const ids = async (
+    city: string | null,
+    limit = 50,
+    board: NoteRankingBoard = 'good',
+  ) =>
+    (await service.getNoteRanking(VIEWER, { city, board, limit })).items.map(
       (item) => item.id,
     );
 
@@ -151,16 +158,40 @@ describePostgres('note ranking on PostgreSQL', () => {
 
   it('applies the limit in the database', async () => {
     expect(await ids(null, 2)).toEqual(['sh-top', 'no-city']);
-    const { rows } = await live.db.query<{ id: string }>(
-      noteRankingQuery({ month, city: null, limit: 1 }).text,
-      noteRankingQuery({ month, city: null, limit: 1 }).values,
-    );
+    const top = noteRankingQuery({
+      month,
+      city: null,
+      board: 'good',
+      limit: 1,
+    });
+    const { rows } = await live.db.query<{ id: string }>(top.text, top.values);
     expect(rows).toEqual([{ id: 'sh-top' }]);
+  });
+
+  it('ranks the bad board by bad ratings with the same eligibility', async () => {
+    // 差评 5 → 3 → 2（更新更晚的在前）→ 1（好评少的在前，再按 id）；
+    // 零差评的 sh-tie-fewer-bad 不上榜。
+    expect(await ids(null, 50, 'bad')).toEqual([
+      'zero-good',
+      'sh-top',
+      'cd-tie-newer',
+      'sh-tie-older',
+      'cd-same-a',
+      'cd-same-b',
+      'no-city',
+    ]);
+    expect(await ids('成都', 50, 'bad')).toEqual([
+      'cd-tie-newer',
+      'cd-same-a',
+      'cd-same-b',
+    ]);
+    expect(await ids(null, 2, 'bad')).toEqual(['zero-good', 'sh-top']);
   });
 
   it('returns this month, the city and viewer-scoped summaries', async () => {
     const result = await service.getNoteRanking(VIEWER, {
       city: '上海',
+      board: 'good',
       limit: 1,
     });
 
@@ -176,20 +207,27 @@ describePostgres('note ranking on PostgreSQL', () => {
       badCount: 3,
     });
     const [own] = (
-      await service.getNoteRanking(OWNER, { city: '上海', limit: 1 })
+      await service.getNoteRanking(OWNER, {
+        city: '上海',
+        board: 'good',
+        limit: 1,
+      })
     ).items;
     expect(own).toMatchObject({ canEdit: true, remark: 'owner only' });
   });
 
-  it('can read the month straight off the (month, goodCount) index', async () => {
-    const query = noteRankingQuery({ month, city: '上海', limit: 50 });
-    await live.db.query('SET enable_seqscan = off');
-    try {
-      expect(await explainPlan(live.db, query.text, query.values)).toContain(
-        'NoteRatingMonthly_month_goodCount_idx',
-      );
-    } finally {
-      await live.db.query('RESET enable_seqscan');
-    }
-  });
+  it.each(['good', 'bad'] as const)(
+    'can read the month straight off the (month, goodCount) index for the %s board',
+    async (board) => {
+      const query = noteRankingQuery({ month, city: '上海', board, limit: 50 });
+      await live.db.query('SET enable_seqscan = off');
+      try {
+        expect(await explainPlan(live.db, query.text, query.values)).toContain(
+          'NoteRatingMonthly_month_goodCount_idx',
+        );
+      } finally {
+        await live.db.query('RESET enable_seqscan');
+      }
+    },
+  );
 });
