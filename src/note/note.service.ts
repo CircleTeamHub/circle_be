@@ -19,6 +19,7 @@ import { createHash, randomBytes, randomUUID } from 'crypto';
 import { normalizeUserIdAlias } from 'src/user/user-id-alias';
 import { existsSync } from 'fs';
 import PDFDocument from 'pdfkit';
+import { renderNoteLongImage, type NoteLongImagePart } from './note-long-image';
 import { Prisma } from 'src/generated/prisma';
 import { PrismaService } from 'src/prisma/prisma.service';
 import { MembershipPolicyService } from 'src/membership/membership-policy.service';
@@ -1423,140 +1424,132 @@ export class NoteService implements NoteCardProjector {
     });
   }
 
-  /**
-   * 长图导出使用 SVG 容器：正文按文本排版，图片媒体嵌成 data URI，避免把
-   * 带权限的短时 URL 写进长期文件。视频不能被 SVG 携带，仍只保留一个媒体标签。
-   * presignedUrls 仍用于 buildSectionsFromRow，确保无法嵌入的历史媒体不会回退到
-   * 私有原始直链。
-   */
-  private async createLongImageSvg(
-    note: NoteRow,
-    presignedUrls?: Map<string, string>,
-  ) {
-    const sections = this.buildSectionsFromRow(note, presignedUrls);
-    const exportMedia = this.getExportSectionMedia(sections);
-    const mediaByKey = new Map(
+  private async createLongImagePng(note: NoteRow) {
+    const sections = this.buildSectionsFromRow(note);
+    const layout = sections.text.contentJson?.find(
+      (block): block is Record<string, unknown> =>
+        this.isRecord(block) && block.type === 'noteLayout',
+    );
+    const metadata = this.isRecord(layout?.props) ? layout.props : {};
+    const kinds = ['text', 'image', 'video', 'showcase', 'audio', 'location'];
+    const saved = metadata.blocks ?? metadata.instances;
+    const order = Array.isArray(metadata.order) ? metadata.order : kinds;
+    const regions: Array<{ id: string; kind: string }> = Array.isArray(saved)
+      ? saved
+          .filter(
+            (block) =>
+              this.isRecord(block) &&
+              typeof block.id === 'string' &&
+              kinds.includes(block.kind),
+          )
+          .map((block) => ({ id: block.id, kind: block.kind }))
+      : order
+          .filter((kind) => kinds.includes(kind))
+          .map((kind, index) => ({ id: `${kind}-${index + 1}`, kind }));
+    const textBlocks = Array.isArray(metadata.textBlocks)
+      ? metadata.textBlocks.filter(
+          (block) =>
+            this.isRecord(block) &&
+            typeof block.id === 'string' &&
+            Array.isArray(block.content),
+        )
+      : [];
+    const mediaBlocks = Array.isArray(metadata.mediaBlocks)
+      ? metadata.mediaBlocks.filter(
+          (block) =>
+            this.isRecord(block) &&
+            typeof block.id === 'string' &&
+            Array.isArray(block.objectKeys),
+        )
+      : [];
+    // Legacy notes duplicate ordinary images into showcase when that section is absent.
+    const stored = this.isRecord(note.sections) ? note.sections : {};
+    const explicitShowcase =
+      this.isRecord(stored.showcase) && Array.isArray(stored.showcase.items);
+    const itemsFor = (kind: string) => {
+      if (kind === 'image' || kind === 'video') {
+        const mediaType = kind === 'image' ? 'IMAGE' : 'VIDEO';
+        return sections.media.items.filter((item) => item.type === mediaType);
+      }
+      if (kind === 'showcase')
+        return explicitShowcase ? sections.showcase.items : [];
+      if (kind === 'audio') return sections.audio?.items ?? [];
+      return [];
+    };
+    for (const kind of kinds) {
+      let hasContent = itemsFor(kind).length > 0;
+      if (kind === 'text') hasContent = Boolean(sections.text.content?.trim());
+      if (kind === 'location')
+        hasContent = isSendableNoteLocation(sections.location);
+      if (hasContent && !regions.some((region) => region.kind === kind))
+        regions.push({ id: `legacy-${kind}`, kind });
+    }
+    const inventory = new Map(
       (note.media ?? []).map((item) => [item.objectKey, item]),
     );
-    const textLines = [
-      note.title,
-      '',
-      // 一个换行一个 <text>：SVG 默认 xml:space 会把 <text> 里的换行整个**吞掉**
-      // （不是换成空格），整段塞一个 <text> 会让表格行和后面的段落首尾粘在一起。
-      ...(sections.text.content ?? '').split(NOTE_LINE_SEPARATOR),
-      ...(sections.location
-        ? [
-            '',
-            `位置: ${sections.location.title ?? ''}`,
-            sections.location.address ?? '',
-          ]
-        : []),
-    ].filter((line) => line != null);
-
-    const safeImageMime = (item: any, media: NoteMediaRow | undefined) => {
-      const mime = media?.mimeType ?? item.mimeType;
-      if (
-        typeof mime === 'string' &&
-        /^(image\/(?:jpeg|jpg|png|gif|webp|avif))$/i.test(mime)
-      ) {
-        return mime.toLowerCase() === 'image/jpg' ? 'image/jpeg' : mime;
-      }
-      const source = String(
-        media?.objectKey ?? item.objectKey ?? item.url ?? '',
-      )
-        .split('?')[0]
-        .split('#')[0]
-        .toLowerCase();
-      const extension = source.slice(source.lastIndexOf('.') + 1);
-      const byExtension: Record<string, string> = {
-        jpg: 'image/jpeg',
-        jpeg: 'image/jpeg',
-        png: 'image/png',
-        gif: 'image/gif',
-        webp: 'image/webp',
-        avif: 'image/avif',
-      };
-      return byExtension[extension] ?? null;
-    };
-
-    const text = textLines
-      .map(
-        (line, index) =>
-          `<text x="40" y="${60 + index * 34}" font-size="${index === 0 ? 28 : 18}" fill="#111827">${escapeXml(String(line))}</text>`,
-      )
-      .join('');
-    let cursor = 60 + textLines.length * 34;
-    let embeddedBytes = 0;
-    const mediaMarkup: string[] = [];
-    for (const [index, item] of exportMedia.entries()) {
-      const objectKey =
-        typeof item.objectKey === 'string' ? item.objectKey : undefined;
-      const media = objectKey ? mediaByKey.get(objectKey) : undefined;
-      const label =
-        item.type === 'VIDEO' ? `视频 ${index + 1}` : `图片 ${index + 1}`;
-      cursor += 18;
-      mediaMarkup.push(
-        `<text x="40" y="${cursor}" font-size="18" fill="#111827">${escapeXml(label)}</text>`,
-      );
-      cursor += 18;
-
-      const mime = safeImageMime(item, media);
-      const canEmbed =
-        item.type === 'IMAGE' &&
-        mime &&
-        media?.objectKey &&
-        embeddedBytes < MAX_EXPORT_TOTAL_MEDIA_BYTES &&
-        (media.size == null || media.size <= MAX_EXPORT_SINGLE_MEDIA_BYTES);
-      if (!canEmbed || !this.uploadService) {
-        cursor += 22;
-        continue;
-      }
-
-      try {
-        const image = await this.uploadService.downloadObjectBuffer(
-          media.objectKey,
-          MAX_EXPORT_SINGLE_MEDIA_BYTES,
-        );
-        if (
-          !Buffer.isBuffer(image) ||
-          image.byteLength === 0 ||
-          embeddedBytes + image.byteLength > MAX_EXPORT_TOTAL_MEDIA_BYTES
-        ) {
-          cursor += 22;
-          continue;
+    const firstText = regions.find((region) => region.kind === 'text')?.id;
+    const parts: NoteLongImagePart[] = [];
+    for (const region of regions) {
+      if (region.kind === 'text') {
+        const block = textBlocks.find((entry) => entry.id === region.id);
+        let text = region.id === firstText ? (sections.text.content ?? '') : '';
+        if (block)
+          text = this.extractBlockText(block.content).join(NOTE_LINE_SEPARATOR);
+        if (text.trim()) parts.push({ type: 'text', text });
+      } else if (region.kind === 'location') {
+        if (isSendableNoteLocation(sections.location)) {
+          const text = [sections.location?.title, sections.location?.address]
+            .filter(Boolean)
+            .join(NOTE_LINE_SEPARATOR);
+          if (text) parts.push({ type: 'text', text });
         }
-        embeddedBytes += image.byteLength;
-        const width = 820;
-        const sourceWidth = Number(item.width ?? media.width ?? width);
-        const sourceHeight = Number(
-          item.height ?? media.height ?? width * 0.75,
-        );
-        const ratio =
-          Number.isFinite(sourceWidth) &&
-          Number.isFinite(sourceHeight) &&
-          sourceWidth > 0 &&
-          sourceHeight > 0
-            ? sourceHeight / sourceWidth
-            : 0.75;
-        const imageHeight = Math.min(
-          900,
-          Math.max(160, Math.round(width * ratio)),
-        );
-        const dataUri = `data:${mime};base64,${image.toString('base64')}`;
-        mediaMarkup.push(
-          `<image x="40" y="${cursor}" width="${width}" height="${imageHeight}" preserveAspectRatio="xMidYMid meet" href="${dataUri}" />`,
-        );
-        cursor += imageHeight + 24;
-      } catch {
-        // Keep the export usable when one stale/deleted media object cannot be
-        // embedded; the remaining note content should still be exported.
-        cursor += 22;
+      } else {
+        const target = region.kind === 'showcase' ? 'showcase' : 'media';
+        const peers = regions.filter((entry) => entry.kind === region.kind);
+        for (const item of itemsFor(region.kind)) {
+          const url = typeof item.url === 'string' ? item.url : null;
+          const key =
+            typeof item.objectKey === 'string'
+              ? item.objectKey
+              : this.uploadService?.objectKeyFromPublicUrl(url);
+          const owner = mediaBlocks.find(
+            (block) =>
+              block.target === target && block.objectKeys.includes(key),
+          );
+          const regionId =
+            peers.find((peer) => peer.id === owner?.id)?.id ?? peers[0]?.id;
+          if (regionId !== region.id) continue;
+          const media = key ? inventory.get(key) : undefined;
+          if (!media || media.type !== item.type) {
+            throw new BadRequestException({
+              message: 'Export media is not part of this note',
+              errorCode: NoteErrorCode.ExportNoMedia,
+            });
+          }
+          const video = media.type === 'VIDEO';
+          const posterKey =
+            video && !this.isForeignPosterKey(media.objectKey, media.posterUrl)
+              ? this.uploadService?.objectKeyFromPublicUrl(media.posterUrl)
+              : null;
+          let label = '图片';
+          if (media.type === 'AUDIO') label = '录音';
+          if (video) label = region.kind === 'showcase' ? '展示视频' : '视频';
+          parts.push({
+            type: 'media',
+            label,
+            key: media.type === 'IMAGE' ? media.objectKey : (posterKey ?? null),
+            video,
+          });
+        }
       }
     }
-
-    const height = Math.max(320, cursor + 40);
-    return Buffer.from(
-      `<svg xmlns="http://www.w3.org/2000/svg" width="900" height="${height}" viewBox="0 0 900 ${height}"><rect width="900" height="${height}" fill="#ffffff"/>${text}${mediaMarkup.join('')}</svg>`,
+    if (!this.uploadService)
+      throw new ServiceUnavailableException('File export is not configured');
+    return renderNoteLongImage(note.title, parts, (key) =>
+      this.uploadService!.downloadObjectBuffer(
+        key,
+        MAX_EXPORT_SINGLE_MEDIA_BYTES,
+      ),
     );
   }
 
@@ -5322,9 +5315,9 @@ export class NoteService implements NoteCardProjector {
         ? this.uploadExportArtifact({
             ownerID: note.ownerID,
             noteID: note.id,
-            filename: `${basename}.svg`,
-            mimeType: 'image/svg+xml',
-            body: await this.createLongImageSvg(note, presignedUrls),
+            filename: `${basename}.png`,
+            mimeType: 'image/png',
+            body: await this.createLongImagePng(note),
             contentFingerprint,
           })
         : this.uploadExportArtifact({
