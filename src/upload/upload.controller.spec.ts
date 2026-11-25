@@ -26,6 +26,7 @@ describe('UploadController', () => {
   const redisService = {
     isEnabled: jest.fn(),
     incrementWithTtl: jest.fn(),
+    secondsUntilExpiry: jest.fn(),
   };
 
   const req = {
@@ -85,6 +86,66 @@ describe('UploadController', () => {
     });
     expect(uploadService.presign).not.toHaveBeenCalled();
     expect(recordUploadPresignLimited).toHaveBeenCalledWith('redis');
+  });
+
+  // 被按分钟限流的客户端要知道等多久:一次选 30 张图要 60 个凭证,超出的那部分
+  // 等窗口过去再要,而不是直接失败。每日流量额度用完则不给等待时间 —— 等也没用。
+  describe('how long a limited client should wait', () => {
+    const limited = async (controller: UploadController) =>
+      controller.presign(dto, req).then(
+        () => {
+          throw new Error('expected the presign to be limited');
+        },
+        (error: { getResponse: () => unknown }) => error.getResponse(),
+      );
+    const build = () =>
+      new UploadController(
+        uploadService as any,
+        new UploadLimitService(redisService as unknown as RedisService),
+        uploadIntent as any,
+      );
+
+    it('reports the seconds left in the Redis window', async () => {
+      redisService.incrementWithTtl.mockResolvedValue(41);
+      redisService.secondsUntilExpiry.mockResolvedValue(23);
+
+      expect(await limited(build())).toMatchObject({
+        details: { retryAfterSeconds: 23 },
+      });
+      expect(redisService.secondsUntilExpiry).toHaveBeenCalledWith(
+        'rl:upload-presign:user:user-1',
+      );
+    });
+
+    it('falls back to the whole window when the remaining time cannot be read', async () => {
+      redisService.incrementWithTtl.mockResolvedValue(41);
+      redisService.secondsUntilExpiry.mockResolvedValue(null);
+
+      expect(await limited(build())).toMatchObject({
+        details: { retryAfterSeconds: 60 },
+      });
+    });
+
+    it('reports the seconds left in the in-memory window', async () => {
+      redisService.isEnabled.mockReturnValue(false);
+      const controller = build();
+      for (let i = 0; i < 40; i += 1) await controller.presign(dto, req);
+
+      const body = (await limited(controller)) as {
+        details: { retryAfterSeconds: number };
+      };
+      expect(body.details.retryAfterSeconds).toBeGreaterThan(0);
+      expect(body.details.retryAfterSeconds).toBeLessThanOrEqual(60);
+    });
+
+    it('gives no wait time once the daily byte budget is spent', async () => {
+      redisService.incrementWithTtl
+        .mockResolvedValueOnce(1)
+        .mockResolvedValueOnce(1024 * 1024 * 1024 + 1);
+
+      expect(await limited(build())).not.toHaveProperty('details');
+      expect(redisService.secondsUntilExpiry).not.toHaveBeenCalled();
+    });
   });
 
   it('falls back to in-memory limiting when Redis is configured but errors', async () => {

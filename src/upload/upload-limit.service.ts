@@ -81,16 +81,18 @@ export class UploadLimitService {
         return;
       }
       if (this.redisInFlight >= UploadLimitService.MAX_REDIS_IN_FLIGHT) {
-        throw this.tooManyPresignRequests('bulkhead');
+        // 只是这一瞬间挤:让客户端一秒后再要。
+        throw this.tooManyPresignRequests('bulkhead', 1);
       }
       const probingRecovery = this.redisRetryAt > 0;
       if (probingRecovery) this.redisProbeInFlight = true;
+      const countKey = `rl:upload-presign:user:${userId}`;
       let count: number | null = null;
       let issuedBytes: number | null = null;
       try {
         this.redisInFlight += 1;
         count = await this.redisService.incrementWithTtl(
-          `rl:upload-presign:user:${userId}`,
+          countKey,
           UploadLimitService.PRESIGN_WINDOW_SECONDS,
         );
         if (count !== null && count <= UploadLimitService.PRESIGN_LIMIT) {
@@ -109,7 +111,12 @@ export class UploadLimitService {
       if (count !== null) {
         this.redisRetryAt = 0;
         if (count > UploadLimitService.PRESIGN_LIMIT) {
-          throw this.tooManyPresignRequests('redis');
+          // 读不到剩余时间就按整个窗口算:多等几秒,好过让客户端立刻再撞一次。
+          throw this.tooManyPresignRequests(
+            'redis',
+            (await this.redisService.secondsUntilExpiry(countKey)) ??
+              UploadLimitService.PRESIGN_WINDOW_SECONDS,
+          );
         }
         if (issuedBytes !== null) {
           if (issuedBytes > UploadLimitService.DAILY_ISSUED_BYTES_LIMIT) {
@@ -141,7 +148,10 @@ export class UploadLimitService {
       });
     } else {
       if (entry.count >= UploadLimitService.PRESIGN_LIMIT) {
-        throw this.tooManyPresignRequests('memory');
+        throw this.tooManyPresignRequests(
+          'memory',
+          Math.max(1, Math.ceil((entry.resetAt - now) / 1000)),
+        );
       }
 
       entry.count += 1;
@@ -164,12 +174,22 @@ export class UploadLimitService {
     issued.bytes += sizeBytes;
   }
 
+  /**
+   * retryAfterSeconds:按分钟的次数限流才给 —— 客户端等这么久再要就能过(一次选
+   * 30 张图要 60 个凭证,超出的那部分等窗口过去,而不是直接失败)。每日流量额度用完
+   * 时不给:等也没用,客户端应当照常报错。随响应体的 data 下发。
+   */
   private tooManyPresignRequests(
     store: UploadPresignLimitStore,
+    retryAfterSeconds?: number,
   ): HttpException {
     uploadMetrics.recordPresignLimited(store);
+    const message =
+      'Too many upload requests. Please wait before requesting more upload URLs.';
     return new HttpException(
-      'Too many upload requests. Please wait before requesting more upload URLs.',
+      retryAfterSeconds === undefined
+        ? message
+        : { message, details: { retryAfterSeconds } },
       HttpStatus.TOO_MANY_REQUESTS,
     );
   }
