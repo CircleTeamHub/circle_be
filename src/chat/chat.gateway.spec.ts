@@ -1646,6 +1646,39 @@ describe('ChatGateway', () => {
     });
   });
 
+  // 默认 2000 是按慢核定的;核更快的机器靠 WS_MAX_CONNECTIONS 调大,不用白开实例。
+  describe('connection budget', () => {
+    const build = (value: unknown) => {
+      const config = {
+        get: jest.fn((key: string) =>
+          key === 'WS_MAX_CONNECTIONS' ? value : 'guest-secret',
+        ),
+      };
+      return new ChatGateway(
+        jwtService as never,
+        sessionVerifier as never,
+        chatService as never,
+        broadcast as never,
+        chatPush as never,
+        redisService as never,
+        prisma as never,
+        config as never,
+        presence as never,
+        supportRecharge as never,
+        directAutoReply as never,
+      );
+    };
+
+    it('takes the per-instance connection cap from WS_MAX_CONNECTIONS', () => {
+      expect((build('5000') as any).admission.maxConnections).toBe(5000);
+    });
+
+    it('keeps 2000 when the variable is missing or malformed', () => {
+      expect((build(undefined) as any).admission.maxConnections).toBe(2000);
+      expect((build('lots') as any).admission.maxConnections).toBe(2000);
+    });
+  });
+
   describe('handleSend', () => {
     const payload = {
       conversationId: 'conv-1',

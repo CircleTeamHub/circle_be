@@ -33,6 +33,7 @@ describe('websocket upgrade coexistence (/realtime + /chat-ws)', () => {
         wasClosedForRevocation: () => false,
       } as never,
       { verify: jest.fn() } as never,
+      { get: jest.fn() } as never,
     );
 
     httpServer = createServer();

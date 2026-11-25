@@ -1,5 +1,23 @@
 import { gatewayMetrics } from '../metrics/gateway-metrics';
 
+/**
+ * 每个实例、每条通道(聊天 / 实时各算各的)最多同时保持多少条连接。
+ *
+ * 默认 2000 是按慢核定的:压测里 600 条空闲连接约占 0.12 核、16MB。核更快、内存更
+ * 多的机器可以用环境变量 WS_MAX_CONNECTIONS 调大;不调的话 1 万人在线至少要 5 个
+ * 实例才放得下,等于白开实例。
+ */
+export const DEFAULT_WS_MAX_CONNECTIONS = 2000;
+
+/** 配置值不是正整数(没配、写错)就用默认值。 */
+export function resolveWsMaxConnections(value: unknown): number {
+  const parsed =
+    typeof value === 'number' ? value : Number(String(value ?? ''));
+  return Number.isInteger(parsed) && parsed > 0
+    ? parsed
+    : DEFAULT_WS_MAX_CONNECTIONS;
+}
+
 /** Per-process resource budget; edge rate limits separately bound requests per IP. */
 export class SocketAdmission {
   private readonly connections = new Map<
@@ -9,7 +27,7 @@ export class SocketAdmission {
   private pending = 0;
 
   constructor(
-    private readonly maxConnections = 2000,
+    private readonly maxConnections = DEFAULT_WS_MAX_CONNECTIONS,
     private readonly maxPending = 128,
     private readonly authTimeoutMs = 10_000,
     private readonly channel?: 'chat' | 'realtime',

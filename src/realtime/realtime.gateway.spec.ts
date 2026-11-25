@@ -173,6 +173,7 @@ describe('RealtimeGateway failure logging privacy', () => {
           .mockResolvedValue({ verdict: 'active', identity: null }),
         verify: jest.fn().mockResolvedValue('active'),
       } as any,
+      { get: jest.fn() } as never,
     );
     const socket = Object.assign(new EventEmitter(), {
       readyState: WebSocket.OPEN,
@@ -268,6 +269,7 @@ describe('RealtimeGateway session revocation', () => {
         revocation,
         verifierPrisma as unknown as PrismaService,
       ),
+      { get: jest.fn() } as never,
     );
 
     httpServer = createServer();

@@ -1,4 +1,5 @@
 import { Injectable, Logger, OnModuleDestroy } from '@nestjs/common';
+import { ConfigService } from '@nestjs/config';
 import { JwtService } from '@nestjs/jwt';
 import type { IncomingMessage, Server } from 'http';
 import type { Duplex } from 'stream';
@@ -22,7 +23,7 @@ import {
 import { WarnSampler } from 'src/logging/warn-sampler';
 
 import { resolveCorsOriginChecker } from 'src/config/cors-origin';
-import { SocketAdmission } from './socket-admission';
+import { resolveWsMaxConnections, SocketAdmission } from './socket-admission';
 
 const HEARTBEAT_INTERVAL_MS = 30_000;
 const MAX_CONNECTIONS_PER_USER = 5;
@@ -136,12 +137,7 @@ type VerifiedToken = {
 export class RealtimeGateway implements OnModuleDestroy {
   private readonly logger = new Logger(RealtimeGateway.name);
   private server: WebSocketServer | null = null;
-  private readonly admission = new SocketAdmission(
-    2000,
-    128,
-    10_000,
-    'realtime',
-  );
+  private readonly admission: SocketAdmission;
   /** noServer 模式下自己挂/自己摘 'upgrade' 监听,两个引用都要留着。 */
   private httpServer: Server | null = null;
   private upgradeHandler: UpgradeHandler | null = null;
@@ -169,7 +165,15 @@ export class RealtimeGateway implements OnModuleDestroy {
     private readonly jwtService: JwtService,
     private readonly realtimeService: RealtimeService,
     private readonly sessions: SessionVerifier,
-  ) {}
+    configService: ConfigService,
+  ) {
+    this.admission = new SocketAdmission(
+      resolveWsMaxConnections(configService.get('WS_MAX_CONNECTIONS')),
+      128,
+      10_000,
+      'realtime',
+    );
+  }
 
   attach(httpServer: Server) {
     if (this.server) {

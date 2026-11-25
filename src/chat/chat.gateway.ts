@@ -46,7 +46,10 @@ import { ChatPushService } from './chat-push.service';
 import { ChatSupportRechargeProcessor } from './chat-support-recharge.processor';
 import { ChatDirectAutoReplyProcessor } from './chat-direct-auto-reply.processor';
 import { ChatService, type EnqueuedSendJobs } from './chat.service';
-import { SocketAdmission } from 'src/realtime/socket-admission';
+import {
+  resolveWsMaxConnections,
+  SocketAdmission,
+} from 'src/realtime/socket-admission';
 import {
   chatMetrics as defaultChatMetrics,
   type ChatAuthFailureReason,
@@ -202,7 +205,7 @@ export class ChatGateway implements OnModuleDestroy {
   private readonly logger = new Logger(ChatGateway.name);
   private metrics: ChatMetrics = defaultChatMetrics;
   private io: Server | null = null;
-  private readonly admission = new SocketAdmission(2000, 128, 10_000, 'chat');
+  private readonly admission: SocketAdmission;
   /** 正在处理的 chat:send 条数,见 CHAT_SEND_MAX_IN_FLIGHT。 */
   private sendsInFlight = 0;
 
@@ -283,6 +286,12 @@ export class ChatGateway implements OnModuleDestroy {
     private readonly supportRecharge: ChatSupportRechargeProcessor,
     private readonly directAutoReply: ChatDirectAutoReplyProcessor,
   ) {
+    this.admission = new SocketAdmission(
+      resolveWsMaxConnections(configService.get('WS_MAX_CONNECTIONS')),
+      128,
+      10_000,
+      'chat',
+    );
     const make = (
       name: keyof typeof CHAT_RATE_LIMITS,
     ): DistributedRateLimiter =>
