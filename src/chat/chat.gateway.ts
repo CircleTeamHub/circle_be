@@ -20,6 +20,7 @@ import { RedisService } from 'src/redis/redis.service';
 import { PrismaService } from 'src/prisma/prisma.service';
 import { ChatErrorCode, type AppErrorCode } from 'src/common/app-error-codes';
 import { reportOperationalError } from 'src/logging/error-aggregation.service';
+import { sanitizeLogValue } from 'src/logging/log-sanitizer';
 import {
   CONNECTION_TRACE_HEADER,
   resolveConnectionTraceId,
@@ -104,6 +105,24 @@ type EngineConnectionError = {
 };
 
 const GUEST_CLIENT_TYPE_SET = new Set<string>(GUEST_CLIENT_MESSAGE_TYPES);
+
+/**
+ * 同时在处理的 chat:send 上限(每进程)。到了上限,新来的发送立刻被拒收,不进服务层。
+ *
+ * 为什么要有:后端只有一个核,发得比处理得快时,请求不会被拒绝,只会越堆越多 ——
+ * 每条都要等数据库连接(池默认 10 个),等满 10 秒才超时。压测里每秒 40 条时一切
+ * 正常,到 50 条就成了断崖:堆了一千多个在等连接的请求,65% 的发送超时,连拉会话
+ * 列表都要 12 秒。堆积本身还在吃 CPU,越堆越处理不过来。
+ *
+ * 取 64 的依据:稳定档(每秒 40 条,确认 p95 约 0.5 秒)的在途数平均个位数、瞬时
+ * 二十出头,64 留了约三倍余量,正常流量碰不到;碰到的时候排在最后的那条最多再等
+ * 一两秒(64 条 ÷ 每秒约 40 条),而不是 10 秒。
+ *
+ * 名额从进 handleSend 占到投递结束才还,不是 ack 发出就还:ack 之后的实时投递还要
+ * 查一次收件人,同样占数据库和这一个核。被拒的客户端收到的是限流码,App 会在几秒
+ * 后用同一个幂等键自动重发,不会丢消息。
+ */
+export const CHAT_SEND_MAX_IN_FLIGHT = 64;
 const CHAT_AUTH_FAILURE_REASONS: ReadonlySet<ChatAuthFailureReason> = new Set([
   'missing_token',
   'invalid_token',
@@ -184,6 +203,8 @@ export class ChatGateway implements OnModuleDestroy {
   private metrics: ChatMetrics = defaultChatMetrics;
   private io: Server | null = null;
   private readonly admission = new SocketAdmission(2000, 128, 10_000, 'chat');
+  /** 正在处理的 chat:send 条数,见 CHAT_SEND_MAX_IN_FLIGHT。 */
+  private sendsInFlight = 0;
 
   // G-04:限流走 Redis ZSET 滑动窗口(跨实例全局配额),Redis 缺席回退每实例本地。
   private readonly sendLimiter: DistributedRateLimiter;
@@ -1432,6 +1453,14 @@ export class ChatGateway implements OnModuleDestroy {
     ack?: AckFn<ChatSendAck>,
   ): Promise<void> {
     const reply = this.ackOnce(ack);
+    // 放在逐用户限流之前:过载时连那一次 Redis 往返也省掉。错误码沿用限流那个 ——
+    // 客户端对它的处理正是这里要的(提示稍后再试、不上报),不值得为此新增一个码。
+    if (this.sendsInFlight >= CHAT_SEND_MAX_IN_FLIGHT) {
+      this.metrics.observeEvent('send', 'overloaded');
+      reply(this.ackError(ChatErrorCode.RateLimited, '服务繁忙,请稍后再试'));
+      return;
+    }
+    this.sendsInFlight += 1;
     const startedAt = process.hrtime.bigint();
     try {
       if (!(await this.sendLimiter.tryAcquire(userId))) {
@@ -1484,8 +1513,9 @@ export class ChatGateway implements OnModuleDestroy {
       this.kickSendJobs(result.message.id, result.enqueuedJobs);
     } catch (error) {
       this.metrics.observeEvent('send', 'failure');
-      reply(this.toAckError(error, 'send', userId, payload?.conversationId));
+      reply(this.toAckError(error, 'send'));
     } finally {
+      this.sendsInFlight -= 1;
       this.metrics.observeAckDuration(
         'send',
         Number(process.hrtime.bigint() - startedAt) / 1e9,
@@ -1577,7 +1607,7 @@ export class ChatGateway implements OnModuleDestroy {
       }
     } catch (error) {
       this.metrics.observeEvent('read', 'failure');
-      reply(this.toAckError(error, 'read', userId, payload?.conversationId));
+      reply(this.toAckError(error, 'read'));
     } finally {
       this.metrics.observeAckDuration(
         'read',
@@ -1660,9 +1690,7 @@ export class ChatGateway implements OnModuleDestroy {
         });
       }
     } catch (error) {
-      reply(
-        this.toAckError(error, 'reaction', userId, payload?.conversationId),
-      );
+      reply(this.toAckError(error, 'reaction'));
     }
   }
 
@@ -1708,7 +1736,7 @@ export class ChatGateway implements OnModuleDestroy {
         );
       }
     } catch (error) {
-      reply(this.toAckError(error, 'edit', userId, payload?.conversationId));
+      reply(this.toAckError(error, 'edit'));
     }
   }
 
@@ -1738,7 +1766,7 @@ export class ChatGateway implements OnModuleDestroy {
       await this.chatService.revokeMessage(userId, conversationId, messageId);
       reply({ ok: true });
     } catch (error) {
-      reply(this.toAckError(error, 'revoke', userId, payload?.conversationId));
+      reply(this.toAckError(error, 'revoke'));
     }
   }
 
@@ -1943,12 +1971,7 @@ export class ChatGateway implements OnModuleDestroy {
    * 服务层的 Nest 异常({message, errorCode})→ socket ack。
    * REST 与 socket 共用同一套错误码,前端 serverErrors 词表一次覆盖两个面。
    */
-  private toAckError(
-    error: unknown,
-    action: string,
-    userId: string,
-    conversationId?: string,
-  ): ChatAckError {
+  private toAckError(error: unknown, action: string): ChatAckError {
     if (error instanceof HttpException) {
       const response = error.getResponse();
       if (error.getStatus() < 500) {
@@ -1971,11 +1994,25 @@ export class ChatGateway implements OnModuleDestroy {
       operation: action,
       kind: 'websocket',
     });
-    this.logger.error(
-      `chat ${action} failed user=${userId} conversation=${conversationId ?? '-'}: ${
-        error instanceof Error ? (error.stack ?? error.message) : String(error)
-      }`,
-    );
+    // 结构化字段,不拼字符串:日志格式化器会把 error 级别的整条 message 抹成
+    // [redacted],原来那句「用户 + 会话 + 堆栈」在生产日志里一个字都留不下来。
+    // 只带能定位原因又不涉及人的东西:错误类名、短机器码(Prisma 的 P2024、
+    // Postgres 的 SQLSTATE、Node 的 ETIMEDOUT 这类)、只剩「文件:行号」的堆栈。
+    // 用户和会话不进日志,上面那次上报里有完整上下文。
+    const code =
+      typeof error === 'object' && error !== null && 'code' in error
+        ? error.code
+        : undefined;
+    this.logger.error({
+      event: 'chat_action_failed',
+      action,
+      errorName: error instanceof Error ? error.name : 'UnknownError',
+      errorCode:
+        typeof code === 'string' && /^[A-Z0-9_]{1,32}$/.test(code)
+          ? code
+          : undefined,
+      error: error instanceof Error ? sanitizeLogValue(error) : undefined,
+    });
     return this.ackError(ChatErrorCode.InvalidPayload, '请求失败');
   }
 }
