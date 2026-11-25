@@ -14,6 +14,6 @@ export class RefreshTokenDto {
 
 /**
  * POST auth/refresh 与 auth/logout：网页端（X-Web-Session: 1）的 refresh token 在
- * cookie 里，请求体为空；其余请求仍必须带，由控制器把关。管理台路由继续用上面的必填版。
+ * cookie 里，绑定信息走 Authorization 头，正文继续为空。原生 App 必须提交 refresh token。
  */
 export class SessionRefreshTokenDto extends PartialType(RefreshTokenDto) {}

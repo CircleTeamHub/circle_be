@@ -3039,6 +3039,15 @@ describe('AuthService', () => {
     await service.logout('some-refresh-token');
     expect(mockRefreshTokenService.revoke).toHaveBeenCalledWith(
       'some-refresh-token',
+      undefined,
+    );
+  });
+
+  it('keeps the Web session binding when delegating logout', async () => {
+    await service.logout('some-refresh-token', { expectedSessionId: 'sid-1' });
+    expect(mockRefreshTokenService.revoke).toHaveBeenCalledWith(
+      'some-refresh-token',
+      'sid-1',
     );
   });
 

@@ -392,6 +392,57 @@ describe('RefreshTokenService', () => {
     expect(revocation.revokeUser).toHaveBeenCalledWith('user-1');
   });
 
+  describe('browser session binding', () => {
+    it('leaves another account’s token untouched when refreshing from an old tab', async () => {
+      const first = await service.create('user-1');
+      const second = await service.create('user-2');
+      const context = {
+        rotationAttemptId: null,
+        expectedSessionId: first.sessionId,
+      };
+
+      await expect(service.rotate(second.token, context)).rejects.toMatchObject(
+        {
+          response: { errorCode: 'AUTH_WEB_SESSION_CHANGED' },
+        },
+      );
+      expect(records).toHaveLength(2);
+      expect(
+        records.find(({ id }) => id === second.sessionId).revokedAt,
+      ).toBeNull();
+    });
+
+    it('accepts a tab whose access token names an earlier rotation of the same family', async () => {
+      const first = await service.create('user-1');
+      const current = await service.rotate(first.token);
+      const context = {
+        rotationAttemptId: null,
+        expectedSessionId: first.sessionId,
+      };
+
+      await expect(
+        service.rotate(current.token, context),
+      ).resolves.toMatchObject({
+        userId: 'user-1',
+        kind: 'rotated',
+      });
+    });
+
+    it('does not revoke a different login family on logout, even for the same account', async () => {
+      const first = await service.create('user-1');
+      const second = await service.create('user-1');
+
+      await expect(
+        service.revoke(second.token, first.sessionId),
+      ).rejects.toMatchObject({
+        response: { errorCode: 'AUTH_WEB_SESSION_CHANGED' },
+      });
+      expect(
+        records.find(({ id }) => id === second.sessionId).revokedAt,
+      ).toBeNull();
+    });
+  });
+
   it('revokes a single active session for the owning user', async () => {
     const now = new Date();
     records.push(

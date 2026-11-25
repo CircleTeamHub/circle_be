@@ -14,11 +14,13 @@ import { AuthService } from './auth.service';
 import { DeviceTrustService } from './device-trust.service';
 import { RefreshTokenService } from './refresh-token.service';
 import { SecurityQuestionsService } from './security-questions.service';
+import { WebSessionChangedException } from './web-session-changed.exception';
 
 const SEVEN_DAYS_MS = 7 * 24 * 60 * 60 * 1000;
 const OLD_REFRESH = 'a'.repeat(128);
 const NEW_REFRESH = 'b'.repeat(128);
 const CHALLENGE_ID = '10000000-0000-4000-8000-000000000001';
+const EXPECTED_SESSION = '10000000-0000-4000-8000-000000000002';
 const KNOWN_DEVICE = 'web-device-0123456789abcdef';
 const ISSUED = { accessToken: 'access-token', refreshToken: NEW_REFRESH };
 
@@ -278,6 +280,7 @@ describe('Auth web session cookies (HTTP)', () => {
       const res = await refresh()
         .set('Cookie', `circle_rt=${OLD_REFRESH}; circle_did=${KNOWN_DEVICE}`)
         .set('Idempotency-Key', attempt)
+        .set('Authorization', `WebSession ${EXPECTED_SESSION}`)
         .send({})
         .expect(201);
 
@@ -286,6 +289,7 @@ describe('Auth web session cookies (HTTP)', () => {
         expect.objectContaining({
           deviceKey: sha256(KNOWN_DEVICE),
           rotationAttemptId: attempt,
+          expectedSessionId: EXPECTED_SESSION,
         }),
       );
       expect(res.body.data).toEqual({ accessToken: 'access-token' });
@@ -294,6 +298,16 @@ describe('Auth web session cookies (HTTP)', () => {
       expect(cookies.circle_rt).toContain('Path=/api/v1/auth');
       // The device cookie is only ever renewed with the same id, never replaced.
       expect(cookieValue(cookies.circle_did)).toBe(KNOWN_DEVICE);
+    });
+
+    it('rejects legacy web refresh without changing the browser cookie', async () => {
+      const res = await refresh()
+        .set('Cookie', `circle_rt=${OLD_REFRESH}; circle_did=${KNOWN_DEVICE}`)
+        .send({})
+        .expect(409);
+
+      expect(auth.refresh).not.toHaveBeenCalled();
+      expect(setCookies(res).circle_rt).toBeUndefined();
     });
 
     it('answers 401 and clears the refresh cookie when there is none', async () => {
@@ -321,6 +335,7 @@ describe('Auth web session cookies (HTTP)', () => {
 
       const res = await refresh()
         .set('Cookie', `circle_rt=${OLD_REFRESH}; circle_did=${KNOWN_DEVICE}`)
+        .set('Authorization', 'WebSession restore')
         .send({})
         .expect(401);
 
@@ -337,6 +352,7 @@ describe('Auth web session cookies (HTTP)', () => {
 
       const res = await refresh()
         .set('Cookie', `circle_rt=${OLD_REFRESH}; circle_did=${KNOWN_DEVICE}`)
+        .set('Authorization', 'WebSession restore')
         .send({})
         .expect(409);
 
@@ -382,23 +398,56 @@ describe('Auth web session cookies (HTTP)', () => {
     });
   });
 
+  it.each(['refresh', 'logout'] as const)(
+    'preserves the current cookie when bound web %s rejects a stale tab',
+    async (action) => {
+      auth[action].mockRejectedValueOnce(new WebSessionChangedException());
+      const res = await request(app.getHttpServer())
+        .post(`/api/v1/auth/${action}`)
+        .set('X-Web-Session', '1')
+        .set('Cookie', `circle_rt=${OLD_REFRESH}; circle_did=${KNOWN_DEVICE}`)
+        .set('Authorization', `WebSession ${EXPECTED_SESSION}`)
+        .send({})
+        .expect(409);
+
+      expect(res.body.errorCode).toBe('AUTH_WEB_SESSION_CHANGED');
+      expect(setCookies(res).circle_rt).toBeUndefined();
+    },
+  );
+
   describe('logout', () => {
     it('revokes the cookie token and clears only the refresh cookie', async () => {
       const res = await request(app.getHttpServer())
         .post('/api/v1/auth/logout')
         .set('X-Web-Session', '1')
         .set('Cookie', `circle_rt=${OLD_REFRESH}; circle_did=${KNOWN_DEVICE}`)
+        .set('Authorization', `WebSession ${EXPECTED_SESSION}`)
         .send({})
         .expect(201);
 
       expect(auth.logout).toHaveBeenCalledWith(
         OLD_REFRESH,
-        expect.objectContaining({ deviceKey: sha256(KNOWN_DEVICE) }),
+        expect.objectContaining({
+          deviceKey: sha256(KNOWN_DEVICE),
+          expectedSessionId: EXPECTED_SESSION,
+        }),
       );
       const cookies = setCookies(res);
       expect(cookieValue(cookies.circle_rt)).toBe('');
       expect(cookies.circle_rt).toContain('Path=/api/v1/auth');
       expect(cookies.circle_did).toBeUndefined();
+    });
+
+    it('rejects legacy web logout without clearing or revoking the current cookie', async () => {
+      const res = await request(app.getHttpServer())
+        .post('/api/v1/auth/logout')
+        .set('X-Web-Session', '1')
+        .set('Cookie', `circle_rt=${OLD_REFRESH}; circle_did=${KNOWN_DEVICE}`)
+        .send({})
+        .expect(409);
+
+      expect(auth.logout).not.toHaveBeenCalled();
+      expect(setCookies(res).circle_rt).toBeUndefined();
     });
 
     it('clears the refresh cookie even when it is already gone', async () => {

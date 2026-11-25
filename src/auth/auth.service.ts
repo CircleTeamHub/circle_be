@@ -1136,7 +1136,10 @@ export class AuthService {
     refreshToken: string,
     sessionContext?: SessionContext,
   ): Promise<void> {
-    const revoked = await this.refreshTokenService.revoke(refreshToken);
+    const revoked = await this.refreshTokenService.revoke(
+      refreshToken,
+      sessionContext?.expectedSessionId,
+    );
     // 管理台登出此前完全无痕（#90）：事后取证时连「会话何时结束」都答不上来。
     // 普通用户登出量大且低敏，保持不记；ADMIN 会话必须留痕。
     // review 修复（round 2）：带上 ip/userAgent/sessionId —— 没有来源信息，
