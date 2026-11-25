@@ -232,6 +232,15 @@ Alertmanager 的 `*.url`、`metrics_token`、`probe-targets/*.yml`)被 rsync 排
 挂载的配置;部署根目录本身在整个同步过程中(包括同步失败时)始终是 0700,
 本机其他账号碰不到按默认 umask 建出来的本机密钥。
 
+**每色多个后端实例(可选,默认关)**:主机的 `.env` 里加 `CIRCLE_BE_REPLICAS=2`(1–4,
+不写就是 1)后,下一次发版会为新色起 N 个容器(`circle-be-<色>`、`circle-be-<色>-2`…,
+定义在 `docker-compose.replicas.yml`),全部健康后 Caddy 一次切到 N 个上游并启用负载均衡
+与探活;任一副本不健康整色失败,旧色不动。每色实际起了几个记在
+`.release/replicas-<颜色>`,改回 1 再发一次版即恢复单实例。不设时发版脚本不加载副本
+overlay,执行的命令与配置和以前完全一样。核对清单、容量推算和上线前必须确认的事项见
+[docs/multi-instance-backend.md](docs/multi-instance-backend.md);**回滚到不认识副本的
+旧 tag 之前,先把实例数改回 1 并发一次版**。
+
 **迁移兼容性要求**:蓝绿窗口内旧代码会短暂运行在新 schema 上,迁移必须向后兼容
 (expand/contract:先加列/表,删除留到后续版本)。确实不兼容时,手动触发 workflow
 勾选 `downtime: true`(先停旧版本再迁移,接受短暂停机;此模式下若失败,
@@ -760,7 +769,7 @@ cd ~/openim-docker && docker compose down   # 确认新栈跑通后再执行;卷
 
 | 限制 | 现状为什么可接受 | 触发条件 | 升级路径 |
 |---|---|---|---|
-| **单实例实时**:socket.io 房间广播是进程内的,多实例互相看不见对方的连接 | 当前单机蓝绿,任一时刻只有一色在服务。切换瞬间旧色上未断开的长连接收不到新色广播,但旧色随发版即停,客户端断线重连后按 height 补拉收敛,不丢消息 | circle_be 需要 >1 个实例同时服务(横向扩容/多机) | 加 socket.io Redis adapter。广播已收口在 `src/chat/chat-broadcast.service.ts` 一个类里,改动面可控;Redis 本身已在栈内 |
+| **单机多实例**:房间广播、踢下线、在线状态已经走 Redis(socket.io Redis adapter + 发布订阅),代码可以多实例;但每色仍只跑 1 个后端进程 | Node 单进程只用一个核;测试服 2 核且库同机,没有余量给第二个进程 | 单进程 CPU 长期超过 60%(约 40 条消息/秒)且主机有空闲的核 | `.env` 里设 `CIRCLE_BE_REPLICAS=2..4`,下一次发版每色起 N 个容器、Caddy 在它们之间负载均衡。**先读 [docs/multi-instance-backend.md](docs/multi-instance-backend.md) 第 8 节的上线前确认项**(`@Throttle` 是每实例一份、`REDIS_REQUIRED=true` 的启动竞态、Redis 成为实时投递的硬依赖) |
 | **每会话写串行**:height 用 `pg_advisory_xact_lock` 串行分配,单会话吞吐有上限 | 这是消息序正确性的代价(height 单调无洞);极热单群消息洪峰会排队,普通群/单聊无感 | 出现真实的超热大群且发送延迟可感知 | 先量化(慢查询/锁等待监控),再考虑按会话分片或批量分配;**别在没有数据前动它** |
 | **客户端无本地消息库**:消息真值在服务端,内存每会话只留 200 条 | 比 OpenIM 本地 SQLite 简单一个量级;弱网下翻更早历史不可用,但已拉内容可看,重连按 height 增量补 | 用户明确需要离线读历史 | chat-core store 后面补一层客户端持久化缓存;height 键集天然支持增量同步,**协议不用改** |
 

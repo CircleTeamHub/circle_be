@@ -1,0 +1,31 @@
+compose -f docker-compose.prod.yml -f docker-compose.release.yml ps -q --status running caddy 
+compose -f docker-compose.prod.yml -f docker-compose.release.yml exec -T caddy caddy list-modules 
+compose -f docker-compose.prod.yml -f docker-compose.release.yml pull --quiet circle_be migrate 
+image inspect ghcr.io/circleteamhub/circle_be@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa 
+compose -f docker-compose.prod.yml -f docker-compose.release.yml ps -q --status running circle_be 
+compose -f docker-compose.prod.yml -f docker-compose.release.yml ps -q --status running circle_be_green 
+compose -f docker-compose.prod.yml -f docker-compose.release.yml ps -q --status running circle_be 
+inspect --format \{\{.Name\}\} cid-circle_be 
+compose -f docker-compose.prod.yml -f docker-compose.release.yml ps -q --status running caddy 
+compose -f docker-compose.prod.yml -f docker-compose.release.yml exec -T -e CIRCLE_BE_UPSTREAM=circle-be-blue:3000 caddy caddy validate --config /etc/caddy/Caddyfile --adapter caddyfile 
+compose -f docker-compose.prod.yml -f docker-compose.release.yml exec -T -e CIRCLE_BE_UPSTREAM=circle-be-blue:3000 caddy caddy reload --config /etc/caddy/Caddyfile --adapter caddyfile 
+reload circle-be-blue:3000
+compose -f docker-compose.prod.yml -f docker-compose.release.yml run --rm --no-deps migrate node -e <script>
+compose -f docker-compose.prod.yml -f docker-compose.release.yml ps -q --status running postgres 
+compose -f docker-compose.prod.yml -f docker-compose.release.yml run --rm migrate 
+compose -f docker-compose.prod.yml -f docker-compose.release.yml up -d --no-build --no-deps circle_be_green 
+compose -f docker-compose.prod.yml -f docker-compose.release.yml ps -q circle_be_green 
+inspect --format \{\{.State.Health.Status\}\} cid-circle_be_green 
+compose -f docker-compose.prod.yml -f docker-compose.release.yml ps -q --status running circle_be_green 
+inspect --format \{\{.Name\}\} cid-circle_be_green 
+compose -f docker-compose.prod.yml -f docker-compose.release.yml ps -q --status running caddy 
+compose -f docker-compose.prod.yml -f docker-compose.release.yml exec -T -e CIRCLE_BE_UPSTREAM=circle-be-green:3000 caddy caddy validate --config /etc/caddy/Caddyfile --adapter caddyfile 
+compose -f docker-compose.prod.yml -f docker-compose.release.yml exec -T -e CIRCLE_BE_UPSTREAM=circle-be-green:3000 caddy caddy reload --config /etc/caddy/Caddyfile --adapter caddyfile 
+reload circle-be-green:3000
+compose -f docker-compose.prod.yml -f docker-compose.release.yml ps -q --status running caddy 
+smoke circle-be-green:3000
+compose -f docker-compose.prod.yml -f docker-compose.release.yml ps -q --status running circle_be 
+compose -f docker-compose.prod.yml -f docker-compose.release.yml stop circle_be 
+compose -f docker-compose.prod.yml -f docker-compose.release.yml rm -f circle_be 
+image inspect --format \{\{.Id\}\} ghcr.io/circleteamhub/circle_be@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa 
+image ls --no-trunc --format \{\{.ID\}\} ghcr.io/circleteamhub/circle_be 

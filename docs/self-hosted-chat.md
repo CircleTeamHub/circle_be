@@ -181,6 +181,6 @@ REST 面沿用 ThrottlerGuard 每路由限流。
 - temp-chat 重接(guest 身份 → socket 鉴权的第二形态)+ chat-history 模块
   从 OpenIM 查询改为本表 SQL。
 - 媒体:content 存 object key,读时 presign(复用 notes 的 presign-on-read)。
-- 多实例:`@socket.io/redis-adapter`(依赖未装,单实例阶段不需要)。**未做**,
-  见 remediation G-04 —— 且 adapter 之外还有四处进程内状态要一并改。
+- 多实例:`@socket.io/redis-adapter` 已接入(G-04),进程内状态也已逐项核对;
+  每色跑多个实例的部署支持与上线前确认项见 `docs/multi-instance-backend.md`。
 - FE serverErrors 词表补 `CHAT_*` 五语种词条(接线批次一并做)。

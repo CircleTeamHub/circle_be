@@ -80,8 +80,23 @@ scrape_configs:
     # `up` series disappears rather than going to 0 — so `up == 0` cannot catch
     # a fully-down backend. That gap is covered by the CircleBeNoTarget
     # (absent()) alert in alerts.yml. Do not remove it.
+    #
+    # ── More than one backend per colour ─────────────────────────────────
+    # With CIRCLE_BE_REPLICAS > 1 (docker-compose.replicas.yml) each colour also
+    # runs circle-be-<colour>-2..4. They are listed here unconditionally: on a
+    # single-instance host those names are NXDOMAIN and add no target, exactly
+    # like the retired colour. Every process keeps its own counters, so each
+    # replica must be its own target — never scrape them through a shared alias.
     dns_sd_configs:
-      - names: ['circle-be-blue', 'circle-be-green']
+      - names:
+          - 'circle-be-blue'
+          - 'circle-be-green'
+          - 'circle-be-blue-2'
+          - 'circle-be-blue-3'
+          - 'circle-be-blue-4'
+          - 'circle-be-green-2'
+          - 'circle-be-green-3'
+          - 'circle-be-green-4'
         type: A
         port: 3000
         refresh_interval: 15s
@@ -97,13 +112,14 @@ scrape_configs:
     relabel_configs:
       # Without this, `instance` is the container IP, which changes on every
       # release and fragments every per-instance series. __meta_dns_name is the
-      # name we asked for, i.e. a stable circle-be-blue / circle-be-green.
+      # name we asked for, i.e. a stable circle-be-blue / circle-be-green
+      # (circle-be-blue-2 … for replicas).
       - source_labels: [__meta_dns_name]
         target_label: instance
       # Lets you tell the colours apart mid-release (and keeps the two targets'
       # series distinct, so they never collide on a duplicate instance label).
       - source_labels: [__meta_dns_name]
-        regex: 'circle-be-(blue|green)'
+        regex: 'circle-be-(blue|green)(-[2-4])?'
         target_label: color
         replacement: '${1}'
 

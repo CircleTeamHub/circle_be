@@ -17,7 +17,7 @@ last_arg() {
 }
 
 new_case() {
-  unset RELEASE_DOWNTIME RELEASE_IRREVERSIBLE_MIGRATION RELEASE_MARKER_PATH RELEASE_SCHEMA_COMPATIBILITY SCHEMA_COMPATIBILITY_PATH RUNTIME_COMPATIBILITY_PATH COMPOSE_ENV_FILE APP_ENV_FILE APP_ENV_GID ENV_STAMP_FAIL KILL_AFTER_ENV_STAGE KILL_BEFORE_CADDY_RELOAD KILL_AFTER_CUTOVER_COMPLETE KILL_AFTER_CADDY_RELOAD KILL_AFTER_CADDY_RELOAD_TARGET TERM_AFTER_CADDY_RELOAD TERM_AFTER_CADDY_RELOAD_TARGET EXPECTED_SMOKE_UPSTREAM IMAGE_MISSING MIGRATE_FAIL CONTRACT_PROBE_STATE DANGEROUS_MIGRATION_APPLIED START_FAIL HEALTH_FAIL SMOKE_CODE SMOKE_CONTENT_TYPE CADDY_RELOAD_FAIL_TARGET PERSIST_FAIL_COLOR CADDY_NO_RATE_LIMIT CADDY_LIST_MODULES_FAIL CADDY_MODULES_TRAILING_LINES || true
+  unset RELEASE_DOWNTIME RELEASE_IRREVERSIBLE_MIGRATION RELEASE_MARKER_PATH RELEASE_SCHEMA_COMPATIBILITY SCHEMA_COMPATIBILITY_PATH RUNTIME_COMPATIBILITY_PATH COMPOSE_ENV_FILE APP_ENV_FILE APP_ENV_GID ENV_STAMP_FAIL KILL_AFTER_ENV_STAGE KILL_BEFORE_CADDY_RELOAD KILL_AFTER_CUTOVER_COMPLETE KILL_AFTER_CADDY_RELOAD KILL_AFTER_CADDY_RELOAD_TARGET TERM_AFTER_CADDY_RELOAD TERM_AFTER_CADDY_RELOAD_TARGET EXPECTED_SMOKE_UPSTREAM IMAGE_MISSING MIGRATE_FAIL CONTRACT_PROBE_STATE DANGEROUS_MIGRATION_APPLIED START_FAIL HEALTH_FAIL SMOKE_CODE SMOKE_CONTENT_TYPE CADDY_RELOAD_FAIL_TARGET PERSIST_FAIL_COLOR CADDY_NO_RATE_LIMIT CADDY_LIST_MODULES_FAIL CADDY_MODULES_TRAILING_LINES HEALTH_FAIL_SERVICE RM_FAIL_SERVICE || true
   CASE_DIR="$(mktemp -d)"
   export CASE_DIR
   export TEST_STATE_DIR="$CASE_DIR/services"
@@ -42,6 +42,14 @@ last_arg() {
 
 service_file() { printf '%s/%s' "$TEST_STATE_DIR" "$1"; }
 
+# 命令行里的服务名(不带 - 的参数)。多实例发版一次会传一种颜色的全部成员。
+service_args() {
+  local value
+  for value in "$@"; do
+    case "$value" in -*) ;; *) printf '%s\n' "$value" ;; esac
+  done
+}
+
 if [ "${1:-}" = "compose" ]; then
   shift
   while [ "${1:-}" = "-f" ]; do shift 2; done
@@ -50,7 +58,15 @@ if [ "${1:-}" = "compose" ]; then
   case "$subcommand" in
     ps)
       service="$(last_arg "$@")"
+      # `ps -aq`:任何状态的容器都算(发版脚本用它找回正在重启的副本)。
+      if printf '%s\n' "$*" | grep -q -- '-aq'; then
+        [ ! -e "$(service_file "$service")" ] || printf 'cid-%s\n' "$service"
+        exit 0
+      fi
       if [ "${HEALTH_FAIL:-0}" = "1" ] && [ "$service" != "circle_be" ] &&
+        ! printf '%s\n' "$*" | grep -q -- '--status running'; then
+        :
+      elif [ "${HEALTH_FAIL_SERVICE:-}" = "$service" ] &&
         ! printf '%s\n' "$*" | grep -q -- '--status running'; then
         :
       elif [ "$(cat "$(service_file "$service")" 2>/dev/null || true)" = "running" ]; then
@@ -59,21 +75,26 @@ if [ "${1:-}" = "compose" ]; then
       ;;
     pull|logs) ;;
     stop)
-      service="$(last_arg "$@")"
-      printf 'stopped\n' > "$(service_file "$service")"
+      for service in $(service_args "$@"); do
+        printf 'stopped\n' > "$(service_file "$service")"
+      done
       ;;
     start)
-      service="$(last_arg "$@")"
-      printf 'running\n' > "$(service_file "$service")"
+      for service in $(service_args "$@"); do
+        printf 'running\n' > "$(service_file "$service")"
+      done
       ;;
     up)
-      service="$(last_arg "$@")"
       [ "${START_FAIL:-0}" != "1" ] || exit 41
-      printf 'running\n' > "$(service_file "$service")"
+      for service in $(service_args "$@"); do
+        printf 'running\n' > "$(service_file "$service")"
+      done
       ;;
     rm)
-      service="$(last_arg "$@")"
-      rm -f "$(service_file "$service")"
+      for service in $(service_args "$@"); do
+        [ "${RM_FAIL_SERVICE:-}" != "$service" ] || exit 48
+        rm -f "$(service_file "$service")"
+      done
       ;;
     run)
       if printf '%s\n' "$*" | grep -q '20260913001000_add_chat_message_deleted_at'; then
@@ -184,11 +205,15 @@ if [ "${1:-}" = "inspect" ]; then
     case "$service" in
       circle_be) printf '/circle-be-blue\n' ;;
       circle_be_green) printf '/circle-be-green\n' ;;
+      circle_be_[2-4]) printf '/circle-be-blue-%s\n' "${service##*_}" ;;
+      circle_be_green_[2-4]) printf '/circle-be-green-%s\n' "${service##*_}" ;;
       *) exit 92 ;;
     esac
     exit 0
   fi
   if [ "${HEALTH_FAIL:-0}" = "1" ] && [ "$service" != "circle_be" ]; then
+    printf 'starting\n'
+  elif [ "${HEALTH_FAIL_SERVICE:-}" = "$service" ]; then
     printf 'starting\n'
   elif [ "$(cat "$(service_file "$service")" 2>/dev/null || true)" = "running" ]; then
     printf 'healthy\n'
@@ -317,6 +342,8 @@ run_release() {
     DANGEROUS_MIGRATION_APPLIED="${DANGEROUS_MIGRATION_APPLIED:-1}" \
     START_FAIL="${START_FAIL:-0}" \
     HEALTH_FAIL="${HEALTH_FAIL:-0}" \
+    HEALTH_FAIL_SERVICE="${HEALTH_FAIL_SERVICE:-}" \
+    RM_FAIL_SERVICE="${RM_FAIL_SERVICE:-}" \
     SMOKE_CODE="${SMOKE_CODE:-401}" \
     SMOKE_CONTENT_TYPE="${SMOKE_CONTENT_TYPE:-application/json}" \
     CADDY_RELOAD_FAIL_TARGET="${CADDY_RELOAD_FAIL_TARGET:-}" \
@@ -1212,6 +1239,242 @@ test_irreversible_smoke_failure_stays_in_maintenance() {
   assert_maintenance && assert_not_restarted
 }
 
+# ── 每色多个后端实例(CIRCLE_BE_REPLICAS)────────────────────────────
+# 默认(不设)时发版脚本不能多出任何东西:不加载副本 overlay、不传 CIRCLE_BE_LB、
+# 不写副本记录。引入多实例时用未改动的本套件逐条比对过新旧脚本的 docker 命令,
+# 这条用例把那个结论钉在仓库里。
+test_single_replica_default_never_touches_the_replica_overlay() {
+  new_case
+  printf 'running\n' > "$TEST_STATE_DIR/circle_be"
+  printf 'running\n' > "$TEST_STATE_DIR/caddy"
+  run_release || { cat "$CASE_DIR/release.log" >&2; return 1; }
+  assert_running circle_be_green && assert_absent circle_be || return 1
+  ! grep -q 'docker-compose.replicas.yml' "$TEST_COMMAND_LOG" || {
+    echo "single-replica release loaded the replica overlay" >&2
+    return 1
+  }
+  ! grep -q 'CIRCLE_BE_LB' "$TEST_COMMAND_LOG" || {
+    echo "single-replica release selected the load-balancing pool" >&2
+    return 1
+  }
+  [ -z "$(find "$RELEASE_STATE_DIR" -name 'replicas-*')" ] || {
+    echo "single-replica release wrote a replica record" >&2
+    return 1
+  }
+  printf 'CIRCLE_BE_REPLICAS=1\n' >> "$COMPOSE_ENV_FILE"
+  : > "$TEST_COMMAND_LOG"
+  run_release || { cat "$CASE_DIR/release.log" >&2; return 1; }
+  ! grep -q 'docker-compose.replicas.yml\|CIRCLE_BE_LB' "$TEST_COMMAND_LOG"
+}
+
+# 默认(单实例)发版执行的 docker 命令序列,逐条钉在基准文件里。这份基准是用引入
+# 多实例之前的 release-deploy.sh 跑同一个场景录下来的:它一变,就说明没开多实例的
+# 主机上发版行为变了 —— 那必须是有意为之,并同步更新基准文件。
+# (迁移预检那条 `node -e <脚本>` 只保留到 -e,脚本正文不属于这里要钉的东西。)
+test_single_replica_release_runs_the_recorded_docker_commands() {
+  local golden="$ROOT_DIR/test/fixtures/release-deploy-single-replica.commands"
+  new_case
+  printf 'running\n' > "$TEST_STATE_DIR/circle_be"
+  printf 'running\n' > "$TEST_STATE_DIR/caddy"
+  run_release || { cat "$CASE_DIR/release.log" >&2; return 1; }
+  sed -E 's/( node -e ).*/\1<script>/' "$TEST_COMMAND_LOG" > "$CASE_DIR/commands.normalized"
+  if [ "${UPDATE_RELEASE_COMMAND_FIXTURE:-0}" = "1" ]; then
+    cp "$CASE_DIR/commands.normalized" "$golden"
+  fi
+  diff -u "$golden" "$CASE_DIR/commands.normalized" >&2 || {
+    echo "single-replica release no longer runs the recorded docker commands" >&2
+    return 1
+  }
+}
+
+test_two_replicas_are_started_pooled_and_recorded() {
+  new_case
+  printf 'CIRCLE_BE_REPLICAS=2\n' >> "$COMPOSE_ENV_FILE"
+  printf 'running\n' > "$TEST_STATE_DIR/circle_be"
+  printf 'running\n' > "$TEST_STATE_DIR/caddy"
+  run_release || { cat "$CASE_DIR/release.log" >&2; return 1; }
+  assert_running circle_be_green && assert_running circle_be_green_2 &&
+    assert_absent circle_be && assert_active_color circle_be_green || return 1
+  [ "$(cat "$RELEASE_STATE_DIR/replicas-circle_be_green")" = "2" ] || {
+    echo "expected the standby replica count to be recorded" >&2
+    return 1
+  }
+  # 两个副本一条命令起来,健康门禁之后才切流,切流时两个端点都在上游里并启用池。
+  assert_command_before 'up -d --no-build --no-deps circle_be_green circle_be_green_2' \
+    'reload circle-be-green:3000 circle-be-green-2:3000' || return 1
+  assert_command_before 'reload circle-be-green:3000 circle-be-green-2:3000' 'stop circle_be' || return 1
+  grep -q 'CIRCLE_BE_LB=pool' "$TEST_COMMAND_LOG" || {
+    echo "expected the load-balancing pool to be selected" >&2
+    return 1
+  }
+  # 只有一个实例的旧色对齐时仍是单上游、不带池。
+  grep 'caddy reload' "$TEST_COMMAND_LOG" | grep 'CIRCLE_BE_UPSTREAM=circle-be-blue:3000' |
+    grep -vq 'CIRCLE_BE_LB' || {
+    echo "single live upstream must not select the pool" >&2
+    return 1
+  }
+  # 这次发版的每条 compose 命令都带副本 overlay。
+  ! grep '^compose ' "$TEST_COMMAND_LOG" | grep -vq 'docker-compose.replicas.yml' || {
+    echo "a compose command ran without the replica overlay" >&2
+    grep '^compose ' "$TEST_COMMAND_LOG" | grep -v 'docker-compose.replicas.yml' >&2
+    return 1
+  }
+}
+
+test_next_release_retires_every_replica_of_the_old_color() {
+  new_case
+  printf 'CIRCLE_BE_REPLICAS=3\n' >> "$COMPOSE_ENV_FILE"
+  for service in circle_be_green circle_be_green_2 caddy; do
+    printf 'running\n' > "$TEST_STATE_DIR/$service"
+  done
+  printf 'circle_be_green\n' > "$RELEASE_STATE_DIR/active-color"
+  printf '2\n' > "$RELEASE_STATE_DIR/replicas-circle_be_green"
+  run_release || { cat "$CASE_DIR/release.log" >&2; return 1; }
+  assert_running circle_be && assert_running circle_be_2 && assert_running circle_be_3 &&
+    assert_absent circle_be_green && assert_absent circle_be_green_2 &&
+    assert_active_color circle_be || return 1
+  [ "$(cat "$RELEASE_STATE_DIR/replicas-circle_be")" = "3" ] &&
+    [ ! -e "$RELEASE_STATE_DIR/replicas-circle_be_green" ] || {
+    echo "replica records do not match the running colors" >&2
+    return 1
+  }
+  grep -q '^reload circle-be-green:3000 circle-be-green-2:3000$' "$TEST_COMMAND_LOG" &&
+    grep -q '^reload circle-be-blue:3000 circle-be-blue-2:3000 circle-be-blue-3:3000$' "$TEST_COMMAND_LOG"
+}
+
+# 把实例数改回 1:上一色的副本靠记录文件找到并清掉,之后回到不带 overlay 的命令。
+test_lowering_replicas_to_one_removes_old_replicas_and_the_overlay() {
+  new_case
+  for service in circle_be_green circle_be_green_2 caddy; do
+    printf 'running\n' > "$TEST_STATE_DIR/$service"
+  done
+  printf 'circle_be_green\n' > "$RELEASE_STATE_DIR/active-color"
+  printf '2\n' > "$RELEASE_STATE_DIR/replicas-circle_be_green"
+  run_release || { cat "$CASE_DIR/release.log" >&2; return 1; }
+  assert_running circle_be && assert_absent circle_be_2 &&
+    assert_absent circle_be_green && assert_absent circle_be_green_2 || return 1
+  [ -z "$(find "$RELEASE_STATE_DIR" -name 'replicas-*')" ] || {
+    echo "replica records survived the return to one instance" >&2
+    return 1
+  }
+  grep 'caddy reload' "$TEST_COMMAND_LOG" | tail -n 1 | grep 'CIRCLE_BE_UPSTREAM=circle-be-blue:3000' |
+    grep -vq 'CIRCLE_BE_LB' || return 1
+  : > "$TEST_COMMAND_LOG"
+  run_release || { cat "$CASE_DIR/release.log" >&2; return 1; }
+  ! grep -q 'docker-compose.replicas.yml\|CIRCLE_BE_LB' "$TEST_COMMAND_LOG"
+}
+
+test_one_unhealthy_replica_fails_the_whole_standby() {
+  new_case
+  printf 'CIRCLE_BE_REPLICAS=2\n' >> "$COMPOSE_ENV_FILE"
+  printf 'running\n' > "$TEST_STATE_DIR/circle_be"
+  printf 'running\n' > "$TEST_STATE_DIR/caddy"
+  HEALTH_FAIL_SERVICE=circle_be_green_2
+  ! run_release || return 1
+  assert_running circle_be && assert_absent circle_be_green &&
+    assert_absent circle_be_green_2 && assert_active_color circle_be || return 1
+  [ ! -e "$RELEASE_STATE_DIR/replicas-circle_be_green" ] || {
+    echo "a removed standby kept its replica record" >&2
+    return 1
+  }
+  ! grep -q 'reload circle-be-green' "$TEST_COMMAND_LOG"
+}
+
+test_smoke_failure_rolls_back_and_removes_every_standby_replica() {
+  new_case
+  printf 'CIRCLE_BE_REPLICAS=2\n' >> "$COMPOSE_ENV_FILE"
+  for service in circle_be circle_be_2 caddy; do
+    printf 'running\n' > "$TEST_STATE_DIR/$service"
+  done
+  printf 'circle_be\n' > "$RELEASE_STATE_DIR/active-color"
+  printf '2\n' > "$RELEASE_STATE_DIR/replicas-circle_be"
+  SMOKE_CODE=500
+  ! run_release || return 1
+  assert_running circle_be && assert_running circle_be_2 &&
+    assert_absent circle_be_green && assert_absent circle_be_green_2 &&
+    assert_active_color circle_be || return 1
+  [ "$(cat "$RELEASE_STATE_DIR/replicas-circle_be")" = "2" ] &&
+    [ ! -e "$RELEASE_STATE_DIR/replicas-circle_be_green" ] || return 1
+  assert_command_before 'reload circle-be-green:3000 circle-be-green-2:3000' \
+    'rm -sf circle_be_green circle_be_green_2' || return 1
+  grep '^reload ' "$TEST_COMMAND_LOG" | tail -n 1 |
+    grep -qx 'reload circle-be-blue:3000 circle-be-blue-2:3000'
+}
+
+test_downtime_release_stops_every_live_replica_before_migrating() {
+  new_case
+  printf 'CIRCLE_BE_REPLICAS=2\n' >> "$COMPOSE_ENV_FILE"
+  for service in circle_be circle_be_2 caddy; do
+    printf 'running\n' > "$TEST_STATE_DIR/$service"
+  done
+  printf 'circle_be\n' > "$RELEASE_STATE_DIR/active-color"
+  printf '2\n' > "$RELEASE_STATE_DIR/replicas-circle_be"
+  RELEASE_DOWNTIME=1
+  run_release || { cat "$CASE_DIR/release.log" >&2; return 1; }
+  assert_command_before 'stop circle_be circle_be_2' 'run --rm migrate' || return 1
+  assert_running circle_be_green && assert_running circle_be_green_2 &&
+    assert_absent circle_be && assert_absent circle_be_2
+}
+
+test_invalid_replica_settings_are_rejected_before_any_docker_command() {
+  local value
+  for value in 0 5 two '2 '; do
+    new_case
+    printf 'CIRCLE_BE_REPLICAS=%s\n' "$value" >> "$COMPOSE_ENV_FILE"
+    printf 'running\n' > "$TEST_STATE_DIR/circle_be"
+    printf 'running\n' > "$TEST_STATE_DIR/caddy"
+    ! run_release || { echo "CIRCLE_BE_REPLICAS=$value was accepted" >&2; return 1; }
+    grep -q 'CIRCLE_BE_REPLICAS' "$CASE_DIR/release.log" || return 1
+    [ ! -s "$TEST_COMMAND_LOG" ] || { echo "docker ran for CIRCLE_BE_REPLICAS=$value" >&2; return 1; }
+  done
+  new_case
+  printf 'running\n' > "$TEST_STATE_DIR/circle_be"
+  printf 'running\n' > "$TEST_STATE_DIR/caddy"
+  printf '9\n' > "$RELEASE_STATE_DIR/replicas-circle_be"
+  ! run_release || return 1
+  grep -q 'Invalid backend replica record' "$CASE_DIR/release.log" && [ ! -s "$TEST_COMMAND_LOG" ]
+}
+
+# 在役色的一个副本此刻没在跑(崩溃后正被 docker 拉起):对齐 Caddy 时它必须留在池里。
+# 把它丢掉会让 Caddy 悄悄收窄到剩下的实例,这次发版若在切流前失败,就一直窄到下次发版。
+test_restarting_live_replica_stays_in_the_caddy_pool() {
+  new_case
+  printf 'CIRCLE_BE_REPLICAS=2\n' >> "$COMPOSE_ENV_FILE"
+  printf 'running\n' > "$TEST_STATE_DIR/circle_be"
+  printf 'stopped\n' > "$TEST_STATE_DIR/circle_be_2"
+  printf 'running\n' > "$TEST_STATE_DIR/caddy"
+  printf 'circle_be\n' > "$RELEASE_STATE_DIR/active-color"
+  printf '2\n' > "$RELEASE_STATE_DIR/replicas-circle_be"
+  MIGRATE_FAIL=1
+  ! run_release || return 1
+  grep '^reload ' "$TEST_COMMAND_LOG" | tail -n 1 |
+    grep -qx 'reload circle-be-blue:3000 circle-be-blue-2:3000' || {
+    echo "expected the restarting replica to stay in the pool" >&2
+    cat "$TEST_COMMAND_LOG" >&2
+    return 1
+  }
+  grep 'caddy reload' "$TEST_COMMAND_LOG" | tail -n 1 | grep -q 'CIRCLE_BE_LB=pool'
+}
+
+# 备色残留的副本删不掉时必须停下并保留记录:继续走会把记录改小,删不掉的容器
+# 从此没人管。
+test_unremovable_stale_standby_replica_stops_the_release() {
+  new_case
+  printf 'CIRCLE_BE_REPLICAS=2\n' >> "$COMPOSE_ENV_FILE"
+  printf 'running\n' > "$TEST_STATE_DIR/circle_be"
+  printf 'stopped\n' > "$TEST_STATE_DIR/circle_be_green_3"
+  printf 'running\n' > "$TEST_STATE_DIR/caddy"
+  printf '3\n' > "$RELEASE_STATE_DIR/replicas-circle_be_green"
+  RM_FAIL_SERVICE=circle_be_green_3
+  ! run_release || return 1
+  [ "$(cat "$RELEASE_STATE_DIR/replicas-circle_be_green")" = "3" ] || {
+    echo "the stale replica record was rewritten although removal failed" >&2
+    return 1
+  }
+  assert_running circle_be || return 1
+  ! grep -q 'up -d --no-build' "$TEST_COMMAND_LOG"
+}
+
 failures=0
 for test_name in \
   test_migration_failure_restores_downtime_live_color \
@@ -1266,7 +1529,18 @@ for test_name in \
   test_irreversible_health_failure_stays_in_maintenance \
   test_irreversible_proxy_failure_stays_in_maintenance \
   test_irreversible_state_failure_stays_in_maintenance \
-  test_irreversible_smoke_failure_stays_in_maintenance; do
+  test_irreversible_smoke_failure_stays_in_maintenance \
+  test_single_replica_default_never_touches_the_replica_overlay \
+  test_single_replica_release_runs_the_recorded_docker_commands \
+  test_two_replicas_are_started_pooled_and_recorded \
+  test_next_release_retires_every_replica_of_the_old_color \
+  test_lowering_replicas_to_one_removes_old_replicas_and_the_overlay \
+  test_one_unhealthy_replica_fails_the_whole_standby \
+  test_smoke_failure_rolls_back_and_removes_every_standby_replica \
+  test_downtime_release_stops_every_live_replica_before_migrating \
+  test_invalid_replica_settings_are_rejected_before_any_docker_command \
+  test_restarting_live_replica_stays_in_the_caddy_pool \
+  test_unremovable_stale_standby_replica_stops_the_release; do
   if "$test_name"; then
     echo "PASS $test_name"
   else

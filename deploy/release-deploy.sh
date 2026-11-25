@@ -15,6 +15,10 @@
 #   RELEASE_SCHEMA_COMPATIBILITY 必填(由 launcher 传入),发布镜像支持的 schema
 #                      兼容级别。
 #
+# 主机本地配置(Compose env 文件,默认 .env):
+#   CIRCLE_BE_REPLICAS 可选,每种颜色起几个后端容器(1..4,默认 1)。大于 1 时
+#                      Caddy 在同色的容器之间做负载均衡,见下方「每色后端实例数」。
+#
 # 发版契约:
 # - 只接受 v* 版本 tag;
 # - 只动应用面(circle_be 蓝/绿 + 一次性 migrate);postgres/redis/minio/
@@ -235,26 +239,115 @@ exit_after_cutover_decision() {
   exit "$status"
 }
 
+# ── 每色后端实例数 ──────────────────────────────────────────────
+# 实例数是这台主机的属性(核数、内存),不是某个版本的属性,所以和 API_DOMAIN 一样
+# 放在主机本地的 Compose env 文件里,不走发版参数。
+#
+# 「颜色」仍然只有 circle_be / circle_be_green 两个;一种颜色的成员是它的基础服务
+# 加上 docker-compose.replicas.yml 里的 <颜色>_2..<颜色>_N。某种颜色实际起了几个
+# 记在 $RELEASE_STATE_DIR/replicas-<颜色>(只在大于 1 时存在,先于 `compose up`
+# 写入):被中断的发版、改小实例数之后的下一次发版,都靠它找全要停、要删、要切流的
+# 容器。
+#
+# 实例数是 1 且没有这两个记录文件时,下面的一切都退化成引入多实例之前的命令:
+# 不加载 docker-compose.replicas.yml,不传 CIRCLE_BE_LB,也不写任何新状态
+# (test/release-deploy.spec.sh 逐条比对了执行的 docker 命令)。
+backend_replicas="$(awk -F= '$1 == "CIRCLE_BE_REPLICAS" { value = $2 } END { print value }' "$COMPOSE_ENV_FILE")"
+backend_replicas="${backend_replicas:-1}"
+if [[ ! "$backend_replicas" =~ ^[1-4]$ ]]; then
+  echo "CIRCLE_BE_REPLICAS in $COMPOSE_ENV_FILE must be an integer from 1 to 4 (got: $backend_replicas)" >&2
+  exit 1
+fi
+replica_compose_files=()
+for replica_record in "$RELEASE_STATE_DIR/replicas-circle_be" "$RELEASE_STATE_DIR/replicas-circle_be_green"; do
+  [ -e "$replica_record" ] || continue
+  if ! grep -qx '[2-4]' "$replica_record"; then
+    echo "Invalid backend replica record: $replica_record (expected 2..4)." >&2
+    echo "Compare it with 'docker ps -a --filter name=circle-be-' and repair or remove it before releasing." >&2
+    exit 1
+  fi
+  replica_compose_files=(-f docker-compose.replicas.yml)
+done
+if [ "$backend_replicas" -gt 1 ]; then
+  replica_compose_files=(-f docker-compose.replicas.yml)
+fi
+
 compose() {
-  docker compose -f docker-compose.prod.yml -f docker-compose.release.yml "$@"
+  docker compose -f docker-compose.prod.yml -f docker-compose.release.yml \
+    ${replica_compose_files[@]+"${replica_compose_files[@]}"} "$@"
 }
 
 running() {
   compose ps -q --status running "$1" 2>/dev/null || true
 }
 
+# 一种颜色的全部服务名,基础服务在前。
+color_members() {
+  local color="$1" count index
+  count="$(cat "$RELEASE_STATE_DIR/replicas-$color" 2>/dev/null || echo 1)"
+  printf '%s\n' "$color"
+  for ((index = 2; index <= count; index++)); do
+    printf '%s_%s\n' "$color" "$index"
+  done
+}
+
+record_color_replicas() {
+  local color="$1" count="$2" record="$RELEASE_STATE_DIR/replicas-$1" temp
+  if [ "$count" -le 1 ]; then
+    rm -f "$record"
+    return 0
+  fi
+  mkdir -p "$RELEASE_STATE_DIR"
+  temp="$record.tmp.$$"
+  printf '%s\n' "$count" > "$temp"
+  mv -f "$temp" "$record"
+}
+
+# 该颜色里正在跑的容器;任一成员在跑即非空。
+color_running() {
+  local member
+  for member in $(color_members "$1"); do
+    running "$member"
+  done
+}
+
+# 停掉并删除整种颜色。
+remove_color() {
+  # shellcheck disable=SC2046
+  compose rm -sf $(color_members "$1") || return 1
+  rm -f "$RELEASE_STATE_DIR/replicas-$1"
+}
+
+# 该颜色各成员的容器端点,空格分隔 —— 原样交给 Caddyfile 的
+# {$CIRCLE_BE_UPSTREAM},每个地址成为一个上游。
+#
+# 多实例时,此刻没在跑(崩溃后正在被 docker 拉起)的成员也留在池里:丢掉它会把
+# Caddy 悄悄收窄到剩下的实例,一直到下一次发版;留着的话 circle_be_lb_pool 的
+# 探活会绕开它,它回来后自动恢复,而且配置没变、reload 不会断开任何连接。
 container_upstream() {
-  local cid name
-  cid="$(running "$1")"
-  if [ -z "$cid" ]; then
+  local members member cid name upstreams="" live_members=0
+  members="$(color_members "$1")"
+  for member in $members; do
+    cid="$(running "$member")"
+    if [ -n "$cid" ]; then
+      live_members=$((live_members + 1))
+    elif [ "$members" = "$1" ]; then
+      continue
+    else
+      cid="$(compose ps -aq "$member" 2>/dev/null | head -n 1)"
+      [ -n "$cid" ] || continue
+    fi
+    if ! name="$(docker inspect --format '{{.Name}}' "$cid")" || [ -z "$name" ]; then
+      echo "Could not resolve the container endpoint for $member" >&2
+      return 1
+    fi
+    upstreams="${upstreams:+$upstreams }${name#/}:3000"
+  done
+  if [ "$live_members" -eq 0 ]; then
     echo "$1 has no running container" >&2
     return 1
   fi
-  if ! name="$(docker inspect --format '{{.Name}}' "$cid")" || [ -z "$name" ]; then
-    echo "Could not resolve the container endpoint for $1" >&2
-    return 1
-  fi
-  printf '%s:3000\n' "${name#/}"
+  printf '%s\n' "$upstreams"
 }
 
 recorded_live_color() {
@@ -335,17 +428,23 @@ CADDY_MSG
 
 switch_proxy() {
   local target
+  local -a caddy_env
   target="$(container_upstream "$1")" || return 1
   if [ -z "$(running caddy)" ]; then
     echo "Caddy is not running; refusing to change the active app color." >&2
     return 1
   fi
-  if ! compose exec -T -e "CIRCLE_BE_UPSTREAM=$target" caddy \
+  caddy_env=(-e "CIRCLE_BE_UPSTREAM=$target")
+  # 多于一个上游才启用 Caddyfile 的 circle_be_lb_pool(重试、摘除、探活)。
+  case "$target" in
+    *' '*) caddy_env+=(-e CIRCLE_BE_LB=pool) ;;
+  esac
+  if ! compose exec -T "${caddy_env[@]}" caddy \
     caddy validate --config /etc/caddy/Caddyfile --adapter caddyfile; then
     echo "Caddy validation failed for upstream $target." >&2
     return 1
   fi
-  compose exec -T -e "CIRCLE_BE_UPSTREAM=$target" caddy \
+  compose exec -T "${caddy_env[@]}" caddy \
     caddy reload --config /etc/caddy/Caddyfile --adapter caddyfile
 }
 
@@ -420,20 +519,25 @@ prune_old_release_images() {
 }
 
 ensure_recovery_color_healthy() {
-  local color="$1" cid health attempt
-  cid="$(running "$color")"
-  if [ -z "$cid" ]; then
-    compose start "$color" || return 1
-    cid="$(running "$color")"
-  fi
-  [ -n "$cid" ] || return 1
-  for attempt in $(seq 1 24); do
-    health="$(docker inspect --format '{{if .State.Health}}{{.State.Health.Status}}{{else}}{{.State.Status}}{{end}}' "$cid" 2>/dev/null || true)"
-    [ "$health" = "healthy" ] && return 0
-    sleep 5
+  local color="$1" member cid health attempt
+  for member in $(color_members "$color"); do
+    cid="$(running "$member")"
+    if [ -z "$cid" ]; then
+      compose start "$member" || return 1
+      cid="$(running "$member")"
+    fi
+    [ -n "$cid" ] || return 1
+    health=""
+    for attempt in $(seq 1 24); do
+      health="$(docker inspect --format '{{if .State.Health}}{{.State.Health.Status}}{{else}}{{.State.Status}}{{end}}' "$cid" 2>/dev/null || true)"
+      [ "$health" = "healthy" ] && break
+      sleep 5
+    done
+    if [ "$health" != "healthy" ]; then
+      echo "Recovery color $color is not healthy; preserving recovery state" >&2
+      return 1
+    fi
   done
-  echo "Recovery color $color is not healthy; preserving recovery state" >&2
-  return 1
 }
 
 finish_recovered_rollback() {
@@ -504,8 +608,8 @@ if ! docker image inspect "$CIRCLE_BE_IMAGE" >/dev/null 2>&1; then
 fi
 
 # ── 识别在役颜色 ────────────────────────────────────────────────
-blue="$(running circle_be)"
-green="$(running circle_be_green)"
+blue="$(color_running circle_be)"
+green="$(color_running circle_be_green)"
 proxy_aligned=0
 if [ -n "$blue" ] && [ -n "$green" ]; then
   recorded_live="$(recorded_live_color)"
@@ -529,7 +633,7 @@ if [ -n "$blue" ] && [ -n "$green" ]; then
   fi
   proxy_aligned=1
   persist_active_color "$live"
-  compose rm -sf "$standby"
+  remove_color "$standby"
   if [ "$standby" = "circle_be" ]; then
     blue=""
   else
@@ -558,24 +662,27 @@ if [ -n "$live" ]; then
 fi
 echo "==> Live color: ${live:-none}; deploying $RELEASE_TAG to: $standby"
 
+# 等一种颜色的全部成员健康;几个成员共用同一个超时预算。
 wait_healthy() {
-  local svc="$1" timeout="$2" cid status deadline
-  cid="$(compose ps -q "$svc" 2>/dev/null | head -n 1)"
-  if [ -z "$cid" ]; then
-    echo "$svc has no container to wait for" >&2
-    return 1
-  fi
-  deadline=$(($(date +%s) + timeout))
-  while :; do
-    status="$(docker inspect --format '{{.State.Health.Status}}' "$cid" 2>/dev/null || echo unknown)"
-    if [ "$status" = "healthy" ]; then
-      return 0
-    fi
-    if [ "$(date +%s)" -ge "$deadline" ]; then
-      echo "$svc did not become healthy within ${timeout}s (last status: $status)" >&2
+  local color="$1" timeout="$2" svc cid status deadline=""
+  for svc in $(color_members "$color"); do
+    cid="$(compose ps -q "$svc" 2>/dev/null | head -n 1)"
+    if [ -z "$cid" ]; then
+      echo "$svc has no container to wait for" >&2
       return 1
     fi
-    sleep 5
+    [ -n "$deadline" ] || deadline=$(($(date +%s) + timeout))
+    while :; do
+      status="$(docker inspect --format '{{.State.Health.Status}}' "$cid" 2>/dev/null || echo unknown)"
+      if [ "$status" = "healthy" ]; then
+        break
+      fi
+      if [ "$(date +%s)" -ge "$deadline" ]; then
+        echo "$svc did not become healthy within ${timeout}s (last status: $status)" >&2
+        return 1
+      fi
+      sleep 5
+    done
   done
 }
 
@@ -587,10 +694,13 @@ ensure_live() {
     echo "CRITICAL: previous app env access could not be restored" >&2
     return 1
   fi
-  if [ -z "$(running "$live")" ] && ! compose start "$live"; then
-    echo "CRITICAL: previous version $live could not be restarted" >&2
-    return 1
-  fi
+  local member
+  for member in $(color_members "$live"); do
+    if [ -z "$(running "$member")" ] && ! compose start "$member"; then
+      echo "CRITICAL: previous version $live could not be restarted" >&2
+      return 1
+    fi
+  done
   if ! wait_healthy "$live" 120; then
     echo "CRITICAL: previous version $live did not return healthy" >&2
     return 1
@@ -625,11 +735,13 @@ irreversible_boundary_crossed() {
 enter_irreversible_maintenance() {
   echo "CRITICAL: irreversible contract is applied or could not be proven unapplied; refusing to restart the previous binary." >&2
   echo "Keeping the service in maintenance for a forward fix or database restore." >&2
-  if [ -n "${standby:-}" ] && [ -n "$(running "$standby")" ]; then
-    compose stop "$standby" || true
+  # shellcheck disable=SC2046
+  if [ -n "${standby:-}" ] && [ -n "$(color_running "$standby")" ]; then
+    compose stop $(color_members "$standby") || true
   fi
-  if [ -n "${live:-}" ] && [ -n "$(running "$live")" ]; then
-    compose stop "$live" || true
+  # shellcheck disable=SC2046
+  if [ -n "${live:-}" ] && [ -n "$(color_running "$live")" ]; then
+    compose stop $(color_members "$live") || true
   fi
   # 旧二进制已明确不可回滚；不再保留可能沿用历史宽松权限的密钥副本。
   commit_app_env_transaction || true
@@ -801,7 +913,8 @@ fi
 # ── 停机模式:先停旧色再迁移(仅不向后兼容迁移使用)──────────────
 if [ "${RELEASE_DOWNTIME:-0}" = "1" ] && [ -n "$live" ]; then
   echo "==> Downtime mode: stopping $live before migration"
-  compose stop "$live"
+  # shellcheck disable=SC2046
+  compose stop $(color_members "$live")
 fi
 
 # Persist the boundary before the irreversible command. If the process is
@@ -907,20 +1020,45 @@ if [ -f "$APP_ENV_FILE" ]; then
 fi
 
 # ── 起新色并等健康 ──────────────────────────────────────────────
-echo "==> Starting $standby"
-if ! compose up -d --no-build --no-deps "$standby"; then
+# 备色此刻不在役。它若还带着副本记录,那是上一次失败或被中断的发版留下的:
+# 先把多出来的容器清掉,再按这次的实例数重新记录。
+stale_standby_replicas="$(color_members "$standby" | tail -n +2)"
+if [ -n "$stale_standby_replicas" ]; then
+  # 删不掉就停在这里、保留记录:接着往下走会把记录改小甚至删掉,剩下的容器
+  # 就再也没人管了(继续用旧镜像连库、跑定时任务)。
+  # shellcheck disable=SC2086
+  if ! compose rm -sf $stale_standby_replicas; then
+    echo "Could not remove leftover replicas of $standby; keeping their record for the next release" >&2
+    handle_post_migration_failure
+    exit 1
+  fi
+fi
+if ! record_color_replicas "$standby" "$backend_replicas"; then
+  echo "Could not record the replica count for $standby" >&2
+  handle_post_migration_failure
+  exit 1
+fi
+if [ "$backend_replicas" -gt 1 ]; then
+  echo "==> Starting $standby with $backend_replicas backend replicas"
+else
+  echo "==> Starting $standby"
+fi
+# shellcheck disable=SC2046
+if ! compose up -d --no-build --no-deps $(color_members "$standby"); then
   echo "Failed to create $standby" >&2
-  compose logs --tail 200 "$standby" >&2 || true
-  compose rm -sf "$standby" || true
+  # shellcheck disable=SC2046
+  compose logs --tail 200 $(color_members "$standby") >&2 || true
+  remove_color "$standby" || true
   handle_post_migration_failure
   exit 1
 fi
 if ! wait_healthy "$standby" 300; then
-  compose logs --tail 200 "$standby" >&2 || true
+  # shellcheck disable=SC2046
+  compose logs --tail 200 $(color_members "$standby") >&2 || true
   if irreversible_boundary_crossed; then
     enter_irreversible_maintenance
   else
-    compose rm -sf "$standby" || true
+    remove_color "$standby" || true
     restore_live || true
   fi
   exit 1
@@ -956,7 +1094,7 @@ if [ "$switch_proxy_status" -ne 0 ]; then
       echo "warning: preserving interrupted rollback for the next release" >&2
       exit_after_cutover_decision 1
     fi
-    compose rm -sf "$standby" || true
+    remove_color "$standby" || true
   else
     echo "warning: no previous version exists; leaving standby running" >&2
   fi
@@ -975,7 +1113,7 @@ if ! persist_active_color "$standby"; then
       exit_after_cutover_decision 1
     fi
     cutover_activated=0
-    compose rm -sf "$standby" || true
+    remove_color "$standby" || true
   else
     echo "warning: no previous version exists; leaving standby running" >&2
   fi
@@ -992,11 +1130,14 @@ if smoke; then
     exit "$deferred_cutover_exit"
   fi
   if [ -n "$live" ]; then
-    if [ -n "$(running "$live")" ]; then
+    if [ -n "$(color_running "$live")" ]; then
       echo "==> Public smoke passed; stopping $live"
-      compose stop "$live"
+      # shellcheck disable=SC2046
+      compose stop $(color_members "$live")
     fi
-    compose rm -f "$live"
+    # shellcheck disable=SC2046
+    compose rm -f $(color_members "$live")
+    rm -f "$RELEASE_STATE_DIR/replicas-$live"
   fi
   echo "==> Release $RELEASE_TAG deployed: $standby is live on $CIRCLE_BE_IMAGE"
   prune_old_release_images ||
@@ -1010,7 +1151,8 @@ if smoke; then
   fi
 else
   echo "==> Smoke test failed; rolling back to previous version" >&2
-  compose logs --tail 100 "$standby" >&2 || true
+  # shellcheck disable=SC2046
+  compose logs --tail 100 $(color_members "$standby") >&2 || true
   if irreversible_boundary_crossed; then
     enter_irreversible_maintenance
     exit_after_cutover_decision 1
@@ -1022,7 +1164,7 @@ else
       exit_after_cutover_decision 1
     fi
     cutover_activated=0
-    compose rm -sf "$standby" || true
+    remove_color "$standby" || true
     echo "==> Rolled back: $live restored" >&2
   else
     echo "warning: no previous version exists; leaving the healthy standby running" >&2
