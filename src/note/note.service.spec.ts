@@ -23,6 +23,14 @@ import { UploadService } from 'src/upload/upload.service';
 import { MembershipPolicyService } from 'src/membership/membership-policy.service';
 import { MembershipProgramService } from 'src/membership/membership-program.service';
 import { NoteService } from './note.service';
+import { renderNoteLongImage } from './note-long-image';
+jest.mock('./note-long-image', () => ({
+  renderNoteLongImage: jest.fn(async (_title, parts, load) => {
+    for (const part of parts)
+      if (part.type === 'media' && part.key) await load(part.key);
+    return Buffer.from('89504e470d0a1a0a', 'hex');
+  }),
+}));
 import * as notePurge from './note-purge';
 import { NoteErrorCode } from 'src/common/app-error-codes';
 
@@ -2271,6 +2279,233 @@ describe('NoteService', () => {
   // 但带媒体的笔记在导出前会现签一批预签名 URL,签名每次都不同,这些 URL 直接
   // 嵌在 SVG/PDF 里 —— 若拿 body 去算哈希,key 每次都变,每导出一次就多留一个
   // 永久对象,防磁盘耗尽的整个机制形同虚设。指纹必须取自稳定量。
+  it('exports a PNG with all images, repeated text regions and an authorized video poster in saved order', async () => {
+    const media = ['a', 'b', 'c', 'd', 'e'].map((id) => ({
+      id,
+      type: 'IMAGE',
+      objectKey: `notes/user-1/${id}.png`,
+      url: `https://cdn.example.com/circle/notes/user-1/${id}.png`,
+      mimeType: 'image/png',
+      size: 10,
+      sortOrder: 0,
+    }));
+    const video = {
+      id: 'v',
+      type: 'VIDEO',
+      objectKey: 'notes/user-1/v.mp4',
+      url: 'https://cdn.example.com/circle/notes/user-1/v.mp4',
+      posterUrl: 'https://cdn.example.com/circle/notes/user-1/poster.png',
+      sortOrder: 5,
+    };
+    const layout = {
+      type: 'noteLayout',
+      props: {
+        blocks: [
+          { id: 'i1', kind: 'image' },
+          { id: 't1', kind: 'text' },
+          { id: 'i2', kind: 'image' },
+          { id: 't2', kind: 'text' },
+          { id: 'v', kind: 'video' },
+          { id: 'loc', kind: 'location' },
+        ],
+        textBlocks: [
+          {
+            id: 't1',
+            content: [
+              {
+                type: 'paragraph',
+                content: [{ type: 'text', text: '第一段' }],
+              },
+            ],
+          },
+          {
+            id: 't2',
+            content: [
+              {
+                type: 'paragraph',
+                content: [{ type: 'text', text: '第二段' }],
+              },
+            ],
+          },
+        ],
+        mediaBlocks: [
+          { id: 'i1', target: 'media', objectKeys: [media[0].objectKey] },
+          {
+            id: 'i2',
+            target: 'media',
+            objectKeys: media.slice(1).map((item) => item.objectKey),
+          },
+        ],
+      },
+    };
+    const row = {
+      id: 'ordered-export',
+      ownerID: 'user-1',
+      title: '整篇笔记',
+      status: 'ACTIVE',
+      available: true,
+      content: '合并正文',
+      contentJson: [layout],
+      media: [...media, video],
+      groupMemberships: [],
+      sections: {
+        text: { content: '合并正文', contentJson: [layout] },
+        media: { items: [...media, video] },
+        showcase: { items: [] },
+        location: { title: '公园', address: '一号路' },
+      },
+      createdAt: new Date(),
+      updatedAt: new Date(),
+    };
+    prisma.note.findFirst.mockResolvedValueOnce(row);
+    uploadService.uploadBuffer.mockResolvedValueOnce({ size: 8 });
+    const result = await service.createNoteExport('user-1', row.id, {
+      format: 'IMAGE',
+    });
+    expect(result).toMatchObject({
+      filename: '整篇笔记.png',
+      mimeType: 'image/png',
+    });
+    expect(jest.mocked(renderNoteLongImage).mock.calls[0][1]).toEqual([
+      { type: 'media', label: '图片', key: media[0].objectKey, video: false },
+      { type: 'text', text: '第一段' },
+      ...media.slice(1).map((item) => ({
+        type: 'media',
+        label: '图片',
+        key: item.objectKey,
+        video: false,
+      })),
+      { type: 'text', text: '第二段' },
+      {
+        type: 'media',
+        label: '视频',
+        key: 'notes/user-1/poster.png',
+        video: true,
+      },
+      { type: 'text', text: '公园\n一号路' },
+    ]);
+    expect(uploadService.downloadObjectBuffer).not.toHaveBeenCalledWith(
+      video.objectKey,
+      expect.anything(),
+    );
+    expect(uploadService.uploadBuffer.mock.calls[0][0]).toMatchObject({
+      contentType: 'image/png',
+    });
+  });
+
+  it('retains coordinate-only locations in the long image', async () => {
+    await (service as any).createLongImagePng({
+      title: '位置笔记',
+      media: [],
+      sections: { location: { latitude: 31.23, longitude: 121.47 } },
+    });
+    expect(jest.mocked(renderNoteLongImage).mock.calls[0][1]).toContainEqual({
+      type: 'text',
+      text: '31.23, 121.47',
+    });
+  });
+
+  it('exports a photo once when legacy creation stores it in both media and showcase', async () => {
+    const photo = {
+      type: 'IMAGE' as const,
+      objectKey: 'notes/user-1/legacy.png',
+      url: 'https://cdn.example.com/circle/notes/user-1/legacy.png',
+      sortOrder: 0,
+    };
+    const row = {
+      id: 'legacy-photo',
+      ownerID: 'user-1',
+      title: 'Legacy photo',
+      status: 'ACTIVE',
+      available: true,
+      createdAt: new Date(),
+      updatedAt: new Date(),
+      groupMemberships: [],
+      media: [photo],
+    };
+    prisma.note.create.mockImplementationOnce(async ({ data }) => ({
+      ...row,
+      ...data,
+    }));
+    prisma.note.update.mockImplementationOnce(async () => ({
+      ...row,
+      ...prisma.note.create.mock.calls[0][0].data,
+    }));
+    await service.createNote('user-1', { title: row.title, media: [photo] });
+    const saved = await prisma.note.update.mock.results[0].value;
+    expect(saved.sections.media.items).toHaveLength(1);
+    expect(saved.sections.showcase.items).toHaveLength(1);
+    prisma.note.findFirst.mockResolvedValueOnce(saved);
+    uploadService.uploadBuffer.mockResolvedValueOnce({ size: 8 });
+    uploadService.downloadObjectBuffer.mockClear();
+
+    await service.createNoteExport('user-1', row.id, { format: 'IMAGE' });
+
+    expect(jest.mocked(renderNoteLongImage).mock.calls[0][1]).toEqual([
+      { type: 'media', label: '图片', key: photo.objectKey, video: false },
+    ]);
+    expect(uploadService.downloadObjectBuffer).toHaveBeenCalledTimes(1);
+  });
+
+  it('recovers legacy mixed-media videos immediately after the image region like the detail page', async () => {
+    const media = [
+      { type: 'IMAGE', objectKey: 'notes/user-1/image.png' },
+      { type: 'VIDEO', objectKey: 'notes/user-1/video.mp4' },
+    ];
+    const layout = { type: 'noteLayout', props: { order: ['image', 'text'] } };
+    await (service as any).createLongImagePng({
+      title: '旧笔记',
+      media,
+      sections: {
+        text: { content: '正文', contentJson: [layout] },
+        media: { items: media },
+      },
+    });
+    expect(jest.mocked(renderNoteLongImage).mock.calls[0][1]).toEqual([
+      {
+        type: 'media',
+        label: '图片',
+        key: 'notes/user-1/image.png',
+        video: false,
+      },
+      { type: 'media', label: '视频', key: null, video: true },
+      { type: 'text', text: '正文' },
+    ]);
+  });
+
+  it('rejects a section image outside the note inventory without downloading it', async () => {
+    await expect(
+      (service as any).createLongImagePng({
+        title: '笔记',
+        media: [],
+        sections: {
+          media: {
+            items: [{ type: 'IMAGE', objectKey: 'notes/other/private.png' }],
+          },
+          showcase: { items: [] },
+        },
+      }),
+    ).rejects.toBeInstanceOf(BadRequestException);
+    expect(uploadService.downloadObjectBuffer).not.toHaveBeenCalled();
+  });
+
+  it('does not download video posters belonging to a different owner', async () => {
+    const video = {
+      type: 'VIDEO',
+      objectKey: 'notes/user-1/v.mp4',
+      posterUrl: 'https://cdn.example.com/circle/notes/other/private.png',
+    };
+    await (service as any).createLongImagePng({
+      title: '笔记',
+      media: [video],
+      sections: { media: { items: [video] }, showcase: { items: [] } },
+    });
+    expect(jest.mocked(renderNoteLongImage).mock.calls[0][1]).toEqual([
+      { type: 'media', label: '视频', key: null, video: true },
+    ]);
+    expect(uploadService.downloadObjectBuffer).not.toHaveBeenCalled();
+  });
+
   it('reuses one object key across repeated exports of an unchanged media note', async () => {
     const mediaNote = () => ({
       id: 'note-stable',
@@ -2408,9 +2643,7 @@ describe('NoteService', () => {
     });
   });
 
-  // 长图和 PDF 都必须走 presign-on-read；长图会把可下载的图片字节嵌进 SVG，
-  // 不能把私有原始 URL 写进长期导出件。
-  it('presigns media urls embedded in the long-image (SVG) export', async () => {
+  it('renders the long image from authorized storage keys without putting media URLs into the artifact', async () => {
     prisma.note.findFirst.mockResolvedValueOnce({
       id: 'note-svg-presign',
       ownerID: 'user-1',
@@ -2452,16 +2685,21 @@ describe('NoteService', () => {
       scope: 'ALL',
     } as never);
 
-    const body = (
-      uploadService.uploadBuffer.mock.calls[0][0].body as Buffer
-    ).toString();
-    expect(body).toContain('data:image/png;base64,ZW1iZWRkZWQtaW1hZ2U=');
-    // 长图现在把图片字节嵌入 SVG，不把带权限的签名 URL 写进长期文件。
-    expect(body).not.toContain('https://signed.example.com/notes/user-1/1.png');
-    // 原始直链也不该出现在导出件里 —— 它对收件人是 403。
-    expect(body).not.toContain(
-      'https://cdn.example.com/circle/notes/user-1/1.png',
+    expect(jest.mocked(renderNoteLongImage).mock.calls[0][1]).toContainEqual({
+      type: 'media',
+      key: 'notes/user-1/1.png',
+      label: '图片',
+      video: false,
+    });
+    expect(uploadService.downloadObjectBuffer).toHaveBeenCalledWith(
+      'notes/user-1/1.png',
+      8 * 1024 * 1024,
     );
+    expect(
+      uploadService.uploadBuffer.mock.calls[0][0].body
+        .subarray(0, 8)
+        .toString('hex'),
+    ).toBe('89504e470d0a1a0a');
   });
 
   it('includes showcase-only media in PDF and long-image exports', async () => {
@@ -2545,19 +2783,15 @@ describe('NoteService', () => {
     });
 
     const pdfBody = uploadService.uploadBuffer.mock.calls[0][0].body as Buffer;
-    const svgBody = uploadService.uploadBuffer.mock.calls[1][0].body as Buffer;
     expect(pdfBody.toString('latin1')).toContain(
       'https://signed.example.com/notes/user-1/show.png',
     );
-    expect(svgBody.toString()).toContain(
-      'data:image/png;base64,ZW1iZWRkZWQtc2hvd2Nhc2UtaW1hZ2U=',
-    );
-    expect(svgBody.toString()).not.toContain(
-      'https://signed.example.com/notes/user-1/show.png',
-    );
-    expect(svgBody.toString()).not.toContain(
-      'https://cdn.example.com/show.png',
-    );
+    expect(jest.mocked(renderNoteLongImage).mock.calls[0][1]).toContainEqual({
+      type: 'media',
+      label: '图片',
+      key: 'notes/user-1/show.png',
+      video: false,
+    });
   });
 
   it('rejects export requests whose selected media exceed safe limits', async () => {
@@ -4595,19 +4829,10 @@ describe('NoteService', () => {
         format: 'IMAGE',
         scope: 'ALL',
       } as never);
-      const svg = (
-        uploadService.uploadBuffer.mock.calls[0][0].body as Buffer
-      ).toString();
-      const textNodes = [...svg.matchAll(/<text[^>]*>([^<]*)<\/text>/g)].map(
-        (match) => match[1],
-      );
-      // 长图导出一行一个 <text>：SVG 默认 xml:space 会把 <text> 里的换行整个吞掉
-      //（不是换成空格），不拆行的话「总结」会直接粘在 D 后面。
-      expect(textNodes).toEqual(
-        expect.arrayContaining(['A\tB', 'C\tD', '总结']),
-      );
-      expect(textNodes.indexOf('总结')).toBe(textNodes.indexOf('C\tD') + 1);
-      expect(textNodes.filter((node) => node.includes('\n'))).toEqual([]);
+      expect(jest.mocked(renderNoteLongImage).mock.calls[0][1]).toContainEqual({
+        type: 'text',
+        text: 'A\tB\nC\tD\n总结',
+      });
 
       const pdfText = jest.spyOn(PDFDocument.prototype, 'text');
       try {

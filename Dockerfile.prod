@@ -33,7 +33,7 @@ WORKDIR /app
 # updates here, the same way Dockerfile.caddy runs `apk upgrade --no-cache`.
 RUN apt-get update \
     && DEBIAN_FRONTEND=noninteractive apt-get upgrade -y \
-    && apt-get install -y --no-install-recommends openssl \
+    && apt-get install -y --no-install-recommends openssl fonts-noto-cjk fonts-noto-color-emoji \
     && rm -rf /var/lib/apt/lists/*
 
 # Keep the numeric identity stable: named log volumes retain ownership across
