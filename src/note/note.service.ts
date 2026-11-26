@@ -1466,13 +1466,24 @@ export class NoteService implements NoteCardProjector {
     const stored = this.isRecord(note.sections) ? note.sections : {};
     const explicitShowcase =
       this.isRecord(stored.showcase) && Array.isArray(stored.showcase.items);
+    const ordinaryImageKeys = new Set(
+      sections.media.items
+        .filter((item) => item.type === 'IMAGE')
+        .map((item) => item.objectKey ?? item.url),
+    );
     const itemsFor = (kind: string) => {
       if (kind === 'image' || kind === 'video') {
         const mediaType = kind === 'image' ? 'IMAGE' : 'VIDEO';
         return sections.media.items.filter((item) => item.type === mediaType);
       }
       if (kind === 'showcase')
-        return explicitShowcase ? sections.showcase.items : [];
+        return explicitShowcase
+          ? sections.showcase.items.filter(
+              (item) =>
+                item.type !== 'IMAGE' ||
+                !ordinaryImageKeys.has(item.objectKey ?? item.url),
+            )
+          : [];
       if (kind === 'audio') return sections.audio?.items ?? [];
       return [];
     };

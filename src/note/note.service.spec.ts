@@ -2405,6 +2405,48 @@ describe('NoteService', () => {
     });
   });
 
+  it('exports a photo once when legacy creation stores it in both media and showcase', async () => {
+    const photo = {
+      type: 'IMAGE' as const,
+      objectKey: 'notes/user-1/legacy.png',
+      url: 'https://cdn.example.com/circle/notes/user-1/legacy.png',
+      sortOrder: 0,
+    };
+    const row = {
+      id: 'legacy-photo',
+      ownerID: 'user-1',
+      title: 'Legacy photo',
+      status: 'ACTIVE',
+      available: true,
+      createdAt: new Date(),
+      updatedAt: new Date(),
+      groupMemberships: [],
+      media: [photo],
+    };
+    prisma.note.create.mockImplementationOnce(async ({ data }) => ({
+      ...row,
+      ...data,
+    }));
+    prisma.note.update.mockImplementationOnce(async () => ({
+      ...row,
+      ...prisma.note.create.mock.calls[0][0].data,
+    }));
+    await service.createNote('user-1', { title: row.title, media: [photo] });
+    const saved = await prisma.note.update.mock.results[0].value;
+    expect(saved.sections.media.items).toHaveLength(1);
+    expect(saved.sections.showcase.items).toHaveLength(1);
+    prisma.note.findFirst.mockResolvedValueOnce(saved);
+    uploadService.uploadBuffer.mockResolvedValueOnce({ size: 8 });
+    uploadService.downloadObjectBuffer.mockClear();
+
+    await service.createNoteExport('user-1', row.id, { format: 'IMAGE' });
+
+    expect(jest.mocked(renderNoteLongImage).mock.calls[0][1]).toEqual([
+      { type: 'media', label: '图片', key: photo.objectKey, video: false },
+    ]);
+    expect(uploadService.downloadObjectBuffer).toHaveBeenCalledTimes(1);
+  });
+
   it('recovers legacy mixed-media videos immediately after the image region like the detail page', async () => {
     const media = [
       { type: 'IMAGE', objectKey: 'notes/user-1/image.png' },
