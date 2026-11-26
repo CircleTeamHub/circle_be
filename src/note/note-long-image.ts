@@ -1,5 +1,6 @@
 import { PayloadTooLargeException } from '@nestjs/common';
 import sharp, { type OverlayOptions } from 'sharp';
+import { Worker } from 'node:worker_threads';
 import { NoteErrorCode } from 'src/common/app-error-codes';
 
 export type NoteLongImagePart =
@@ -84,7 +85,7 @@ export async function renderNoteLongImage(
     let input: Buffer;
     if (part.key) {
       const bytes = await loadImage(part.key);
-      const image = sharp(bytes, { limitInputPixels: MAX_PIXELS });
+      let image = sharp(bytes, { limitInputPixels: MAX_PIXELS });
       const meta = await image.metadata();
       const rotated = meta.orientation >= 5;
       const width = rotated ? meta.height : meta.width;
@@ -92,6 +93,55 @@ export async function renderNoteLongImage(
       checkHeight(
         cursor + Math.ceil((CONTENT_WIDTH * sourceHeight) / width) + PADDING,
       );
+      if (meta.format === 'heif' && meta.compression === 'hevc') {
+        // Prebuilt Sharp cannot decode HEVC; keep its synchronous WASM decoder off the API thread.
+        const decoded = await new Promise<{
+          width: number;
+          height: number;
+          data: Uint8ClampedArray;
+        }>((resolve, reject) => {
+          const worker = new Worker(
+            `
+            const { parentPort, workerData } = require('node:worker_threads');
+            (async () => {
+              const image = await require(workerData.decoder)({ buffer: workerData.bytes });
+              parentPort.postMessage(image, [image.data.buffer]);
+              parentPort.close();
+            })();
+          `,
+            {
+              eval: true,
+              workerData: { decoder: require.resolve('heic-decode'), bytes },
+            },
+          );
+          let result:
+            | { width: number; height: number; data: Uint8ClampedArray }
+            | undefined;
+          const timer = setTimeout(() => {
+            void worker.terminate();
+          }, 15_000);
+          worker.once('message', (message) => {
+            result = message;
+          });
+          worker.once('error', reject);
+          worker.once('exit', (code) => {
+            clearTimeout(timer);
+            if (code === 0 && result) resolve(result);
+            else reject(new Error('HEIC image decoding failed'));
+          });
+        });
+        image = sharp(
+          Buffer.from(
+            decoded.data.buffer,
+            decoded.data.byteOffset,
+            decoded.data.byteLength,
+          ),
+          {
+            raw: { width: decoded.width, height: decoded.height, channels: 4 },
+            limitInputPixels: MAX_PIXELS,
+          },
+        );
+      }
       const result = await image
         .rotate()
         .resize({ width: CONTENT_WIDTH })

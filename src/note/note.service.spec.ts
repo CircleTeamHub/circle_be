@@ -2393,6 +2393,44 @@ describe('NoteService', () => {
     });
   });
 
+  it('retains coordinate-only locations in the long image', async () => {
+    await (service as any).createLongImagePng({
+      title: '位置笔记',
+      media: [],
+      sections: { location: { latitude: 31.23, longitude: 121.47 } },
+    });
+    expect(jest.mocked(renderNoteLongImage).mock.calls[0][1]).toContainEqual({
+      type: 'text',
+      text: '31.23, 121.47',
+    });
+  });
+
+  it('recovers legacy mixed-media videos immediately after the image region like the detail page', async () => {
+    const media = [
+      { type: 'IMAGE', objectKey: 'notes/user-1/image.png' },
+      { type: 'VIDEO', objectKey: 'notes/user-1/video.mp4' },
+    ];
+    const layout = { type: 'noteLayout', props: { order: ['image', 'text'] } };
+    await (service as any).createLongImagePng({
+      title: '旧笔记',
+      media,
+      sections: {
+        text: { content: '正文', contentJson: [layout] },
+        media: { items: media },
+      },
+    });
+    expect(jest.mocked(renderNoteLongImage).mock.calls[0][1]).toEqual([
+      {
+        type: 'media',
+        label: '图片',
+        key: 'notes/user-1/image.png',
+        video: false,
+      },
+      { type: 'media', label: '视频', key: null, video: true },
+      { type: 'text', text: '正文' },
+    ]);
+  });
+
   it('rejects a section image outside the note inventory without downloading it', async () => {
     await expect(
       (service as any).createLongImagePng({

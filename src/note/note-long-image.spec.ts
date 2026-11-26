@@ -1,10 +1,24 @@
 import sharp from 'sharp';
+import { readFileSync } from 'node:fs';
+import { join } from 'node:path';
 import { renderNoteLongImage } from './note-long-image';
 
 const picture = (background: string, width = 200, height = 100) =>
   sharp({ create: { width, height, channels: 3, background } })
     .png()
     .toBuffer();
+
+test('exports a real HEVC-compressed HEIC using the deployed prebuilt Sharp runtime', async () => {
+  const bytes = readFileSync(join(__dirname, 'fixtures/rainbow-451x461.heic'));
+  const output = await renderNoteLongImage(
+    'HEIC 笔记',
+    [{ type: 'media', label: '图片', key: 'photo.heic' }],
+    async () => bytes,
+  );
+  const meta = await sharp(output).metadata();
+  expect(meta).toMatchObject({ format: 'png', width: 1320 });
+  expect(meta.height).toBeGreaterThan(1280);
+});
 
 test('renders every image into a single full-width PNG without cropping portraits', async () => {
   const images = {

@@ -1481,8 +1481,15 @@ export class NoteService implements NoteCardProjector {
       if (kind === 'text') hasContent = Boolean(sections.text.content?.trim());
       if (kind === 'location')
         hasContent = isSendableNoteLocation(sections.location);
-      if (hasContent && !regions.some((region) => region.kind === kind))
-        regions.push({ id: `legacy-${kind}`, kind });
+      if (hasContent && !regions.some((region) => region.kind === kind)) {
+        const recovered = { id: `legacy-${kind}`, kind };
+        const imageIndex = regions.findIndex(
+          (region) => region.kind === 'image',
+        );
+        if (kind === 'video' && imageIndex >= 0)
+          regions.splice(imageIndex + 1, 0, recovered);
+        else regions.push(recovered);
+      }
     }
     const inventory = new Map(
       (note.media ?? []).map((item) => [item.objectKey, item]),
@@ -1498,9 +1505,16 @@ export class NoteService implements NoteCardProjector {
         if (text.trim()) parts.push({ type: 'text', text });
       } else if (region.kind === 'location') {
         if (isSendableNoteLocation(sections.location)) {
-          const text = [sections.location?.title, sections.location?.address]
+          let text = [sections.location?.title, sections.location?.address]
             .filter(Boolean)
             .join(NOTE_LINE_SEPARATOR);
+          if (
+            !text &&
+            typeof sections.location?.latitude === 'number' &&
+            typeof sections.location?.longitude === 'number'
+          ) {
+            text = `${sections.location.latitude}, ${sections.location.longitude}`;
+          }
           if (text) parts.push({ type: 'text', text });
         }
       } else {
